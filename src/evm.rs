@@ -1,18 +1,37 @@
-//! EVM parsing helpers.
+//! Shared EVM utilities for payment methods.
 //!
-//! Provides functions to parse EVM-specific types from strings.
+//! This module provides common EVM types and parsing helpers used by
+//! EVM-based payment methods like Tempo.
+//!
+//! # Re-exports
+//!
+//! For convenience, this module re-exports core alloy primitives:
+//!
+//! ```ignore
+//! use mpay::evm::{Address, U256};
+//! ```
+//!
+//! # Examples
+//!
+//! ```
+//! use mpay::evm::{parse_address, parse_amount};
+//!
+//! let addr = parse_address("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2").unwrap();
+//! let amount = parse_amount("1000000").unwrap();
+//! ```
 
-use alloy::primitives::{Address, U256};
 use std::str::FromStr;
 
 use crate::error::{MppError, Result};
+
+pub use alloy::primitives::{Address, U256};
 
 /// Parse an Ethereum address from a string.
 ///
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::protocol::methods::evm::parse_address;
+/// use mpay::evm::parse_address;
 ///
 /// let addr = parse_address("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2").unwrap();
 /// ```
@@ -26,7 +45,7 @@ pub fn parse_address(s: &str) -> Result<Address> {
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::protocol::methods::evm::parse_amount;
+/// use mpay::evm::parse_amount;
 ///
 /// let amount = parse_amount("1000000").unwrap();
 /// assert_eq!(amount.to_string(), "1000000");
@@ -52,7 +71,7 @@ mod tests {
     #[test]
     fn test_parse_address_invalid() {
         assert!(parse_address("not-an-address").is_err());
-        assert!(parse_address("0x123").is_err()); // too short
+        assert!(parse_address("0x123").is_err());
     }
 
     #[test]

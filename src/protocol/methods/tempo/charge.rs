@@ -3,26 +3,36 @@
 //! Provides Tempo-specific accessors for ChargeRequest, including 2D nonces
 //! and TIP-20 fee token support.
 
-use alloy::primitives::U256;
-
 use super::types::TempoMethodDetails;
 use crate::error::{MppError, Result};
+use crate::evm::{parse_address, parse_amount, Address, U256};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::methods::evm::EvmChargeExt;
 
 /// Extension trait for ChargeRequest with Tempo-specific accessors.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// use mpp_rs::protocol::intents::ChargeRequest;
-/// use mpp_rs::protocol::methods::tempo::TempoChargeExt;
+/// use mpay::protocol::intents::ChargeRequest;
+/// use mpay::protocol::methods::tempo::TempoChargeExt;
 ///
 /// let req: ChargeRequest = challenge.request.decode()?;
 /// let nonce_key = req.nonce_key();
 /// let fee_token = req.fee_token_address();
 /// ```
-pub trait TempoChargeExt: EvmChargeExt {
+pub trait TempoChargeExt {
+    /// Get the amount as a typed U256.
+    fn amount_u256(&self) -> Result<U256>;
+
+    /// Get the recipient address as a typed Address.
+    fn recipient_address(&self) -> Result<Address>;
+
+    /// Get the currency/asset address as a typed Address.
+    fn currency_address(&self) -> Result<Address>;
+
+    /// Get chain ID from methodDetails.
+    fn chain_id(&self) -> Option<u64>;
+
     /// Parse the method_details as Tempo-specific details.
     fn tempo_method_details(&self) -> Result<TempoMethodDetails>;
 
@@ -51,6 +61,29 @@ pub trait TempoChargeExt: EvmChargeExt {
 }
 
 impl TempoChargeExt for ChargeRequest {
+    fn amount_u256(&self) -> Result<U256> {
+        parse_amount(&self.amount)
+    }
+
+    fn recipient_address(&self) -> Result<Address> {
+        let recipient = self
+            .recipient
+            .as_ref()
+            .ok_or_else(|| MppError::InvalidChallenge("No recipient specified".to_string()))?;
+        parse_address(recipient)
+    }
+
+    fn currency_address(&self) -> Result<Address> {
+        parse_address(&self.currency)
+    }
+
+    fn chain_id(&self) -> Option<u64> {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("chainId"))
+            .and_then(|v| v.as_u64())
+    }
+
     fn tempo_method_details(&self) -> Result<TempoMethodDetails> {
         match &self.method_details {
             Some(value) => serde_json::from_value(value.clone()).map_err(|e| {

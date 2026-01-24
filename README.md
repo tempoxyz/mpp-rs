@@ -1,87 +1,143 @@
-# mpp-rs
+# mpay
 
-**Micropayments Protocol for Rust** - A library for implementing the Web Payment Auth protocol (IETF draft-ietf-httpauth-payment).
+Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ietf-httpauth-payment/).
 
-This is the Rust equivalent of [mpay](https://github.com/tempoxyz/mpay) (TypeScript).
+## Design Principles
 
-## Installation
+- **Protocol-first** — Core types (`Challenge`, `Credential`, `Receipt`) map directly to HTTP headers
+- **Zero-copy parsing** — Efficient header parsing without unnecessary allocations
+- **Pluggable methods** — Payment networks are feature-gated (Tempo included by default)
+- **Minimal dependencies** — Core has minimal deps; features add what you need
+- **Designed for extension** — `Method` and `Intent` are traits. Implement them for custom payment methods.
+
+## Quick Start
+
+### Parse a Challenge (Server → Client)
+
+```rust
+use mpay::Challenge;
+
+let header = r#"Payment realm="api.example.com", id="abc123", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIn0""#;
+let challenge = Challenge::from_www_authenticate(header)?;
+
+println!("Method: {}", challenge.method);
+println!("Intent: {}", challenge.intent);
+```
+
+### Create a Credential (Client → Server)
+
+```rust
+use mpay::Credential;
+
+let credential = Credential {
+    id: challenge.id.clone(),
+    source: Some("did:pkh:eip155:8453:0x123...".into()),
+    payload: serde_json::json!({"hash": "0xabc..."}),
+};
+
+let auth_header = credential.to_authorization();
+```
+
+### Parse a Receipt (Server → Client)
+
+```rust
+use mpay::Receipt;
+
+let receipt = Receipt::from_payment_receipt(header)?;
+assert_eq!(receipt.status, "success");
+```
+
+## API Reference
+
+### Core
+
+#### `Challenge`
+
+A parsed payment challenge from a `WWW-Authenticate` header.
+
+```rust
+use mpay::Challenge;
+
+let challenge = Challenge {
+    id: "challenge-id".into(),
+    method: "tempo".into(),
+    intent: "charge".into(),
+    request: serde_json::json!({"amount": "1000000", "asset": "0x...", "destination": "0x..."}),
+};
+
+let header = challenge.to_www_authenticate("api.example.com");
+let parsed = Challenge::from_www_authenticate(&header)?;
+```
+
+#### `Credential`
+
+The credential sent in the `Authorization` header.
+
+```rust
+use mpay::Credential;
+
+let credential = Credential {
+    id: "challenge-id".into(),
+    payload: serde_json::json!({"hash": "0x..."}),
+    source: Some("did:pkh:eip155:1:0x...".into()),
+};
+
+let header = credential.to_authorization();
+let parsed = Credential::from_authorization(&header)?;
+```
+
+#### `Receipt`
+
+Payment receipt returned after successful verification.
+
+```rust
+use mpay::Receipt;
+
+let receipt = Receipt {
+    status: "success".into(),
+    timestamp: Some("2024-01-20T12:00:00Z".into()),
+    reference: Some("0x...".into()),
+};
+
+let header = receipt.to_payment_receipt();
+let parsed = Receipt::from_payment_receipt(&header)?;
+```
+
+## Install
 
 ```toml
 [dependencies]
-mpp-rs = { git = "https://github.com/tempoxyz/mpp-rs" }
+mpay = "0.1"
 ```
 
 ## Feature Flags
 
 | Feature | Description |
 |---------|-------------|
-| `evm` | EVM blockchain support (default) |
-| `tempo` | Tempo blockchain support (includes `evm`) |
-| `keystore` | Keystore format encryption/decryption |
-| `utils` | Encoding utilities (bs58, hex, base64) |
-| `client` | High-level HTTP client |
-| `http-client` | Low-level HTTP client support |
-| `tower-middleware` | Tower middleware for servers |
-| `reqwest-middleware` | Reqwest middleware for clients |
+| `tempo` | Tempo blockchain support (default, includes `evm`) |
+| `evm` | Shared EVM utilities (Address, U256, parsing) |
+| `utils` | Encoding utilities (hex, base64) |
 
-## Usage
+## What's NOT Included
 
-### Parsing a Payment Challenge
+Network registries, currency formatting, keystore management, HTTP clients, and middleware are out of scope for this library.
 
-```rust
-use mpp_rs::{Challenge, Intent};
+## Examples
 
-let header = r#"Payment method="tempo" intent="charge" request="eyJhbW91bnQiOiIxMDAwMDAwIn0""#;
-let challenge = Challenge::parse_www_authenticate(header)?;
+See the [examples/](./examples/) directory for integration patterns with common HTTP libraries:
 
-// Decode the charge request
-let charge: Intent::ChargeRequest = challenge.request.decode()?;
-println!("Amount: {}", charge.amount);
+- [reqwest client](./examples/reqwest-client.md) — Client-side 402 handling
+- [axum server](./examples/axum-server.md) — Server-side payment gating
+- [tower middleware](./examples/tower-middleware.md) — Reusable middleware layer
+- [hyper low-level](./examples/hyper-low-level.md) — Direct hyper integration
+
+## Development
+
+```bash
+cargo build         # Build with default features (tempo)
+cargo test          # Run tests
+cargo doc --open    # Generate and view documentation
 ```
-
-### Creating a Payment Credential
-
-```rust
-use mpp_rs::{Credential, PrivateKeySigner, Signer};
-
-// Use your own signer (mpp-rs re-exports alloy's Signer trait)
-let signer: PrivateKeySigner = "0x...".parse()?;
-
-let credential = Credential::PaymentCredential::with_source(
-    challenge.to_echo(),
-    &format!("did:pkh:eip155:{}:{:#x}", chain_id, signer.address()),
-    Credential::PaymentPayload::transaction("0x...signed_tx"),
-);
-
-let auth_header = Credential::format_authorization(&credential)?;
-```
-
-### Keystore Operations
-
-```rust
-use mpp_rs::keystore::{encrypt_keystore, decrypt_keystore};
-
-// Encrypt a private key (mpp-rs only handles the format, not paths)
-let json = encrypt_keystore(&private_key_bytes, "password")?;
-
-// Decrypt later
-let key_bytes = decrypt_keystore(&json, "password")?;
-```
-
-## Design Principles
-
-1. **Batteries Included**: Re-exports `Signer` trait and `PrivateKeySigner` from alloy
-2. **No Path Management**: Keystore module only handles format, not file paths
-3. **Consumer Owns Signing**: Accepts `impl Signer` or `Arc<dyn Signer>` - you provide the signer
-4. **mpay-style Exports**: Namespaced modules like `Challenge`, `Credential`, `Receipt`, `Intent`
-
-## Separation from purl
-
-mpp-rs is the protocol library. purl is the CLI that uses mpp-rs and owns:
-- Keystore management (paths, listing, caching)
-- Config file loading (TOML, platform paths)
-- Password prompting
-- CLI commands
 
 ## License
 

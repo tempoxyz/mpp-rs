@@ -16,8 +16,8 @@ use super::types::{Base64UrlJson, IntentName, MethodName, PayloadType, ReceiptSt
 /// # Examples
 ///
 /// ```ignore
-/// use mpp_rs::protocol::core::{PaymentChallenge, parse_www_authenticate};
-/// use mpp_rs::protocol::intents::ChargeRequest;
+/// use mpay::protocol::core::{PaymentChallenge, parse_www_authenticate};
+/// use mpay::protocol::intents::ChargeRequest;
 ///
 /// let challenge = parse_www_authenticate(header)?;
 /// if challenge.intent.is_charge() {

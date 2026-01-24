@@ -16,8 +16,8 @@
 //! # Examples
 //!
 //! ```ignore
-//! use mpp_rs::protocol::intents::ChargeRequest;
-//! use mpp_rs::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
+//! use mpay::protocol::intents::ChargeRequest;
+//! use mpay::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
 //!
 //! let req: ChargeRequest = challenge.request.decode()?;
 //! let nonce_key = req.nonce_key();

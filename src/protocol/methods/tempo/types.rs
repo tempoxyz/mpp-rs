@@ -1,9 +1,9 @@
 //! Tempo-specific types for Web Payment Auth.
 
-use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
 
 use super::CHAIN_ID;
+use crate::evm::U256;
 
 /// Tempo method-specific details in payment requests.
 ///
@@ -14,7 +14,7 @@ use super::CHAIN_ID;
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::protocol::methods::tempo::TempoMethodDetails;
+/// use mpay::protocol::methods::tempo::TempoMethodDetails;
 ///
 /// let details = TempoMethodDetails {
 ///     chain_id: Some(88153),

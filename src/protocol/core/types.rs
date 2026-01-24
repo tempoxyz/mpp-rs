@@ -3,6 +3,7 @@
 //! This module contains foundational types that have ZERO heavy dependencies -
 //! only serde, serde_json, and thiserror. No alloy, no blockchain-specific types.
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::ops::Deref;
@@ -18,13 +19,14 @@ use crate::error::{MppError, Result};
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::protocol::core::MethodName;
+/// use mpay::protocol::core::MethodName;
 ///
 /// let method: MethodName = "tempo".into();
 /// assert_eq!(method.as_str(), "tempo");
 /// assert!(method.eq_ignore_ascii_case("TEMPO"));
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct MethodName(String);
 
 impl MethodName {
@@ -70,18 +72,6 @@ impl From<String> for MethodName {
     }
 }
 
-impl Serialize for MethodName {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for MethodName {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        String::deserialize(deserializer).map(Self)
-    }
-}
-
 /// Payment intent identifier (newtype over String).
 ///
 /// Represents a payment intent like "charge", "authorize", "subscription", etc.
@@ -91,13 +81,14 @@ impl<'de> Deserialize<'de> for MethodName {
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::protocol::core::IntentName;
+/// use mpay::protocol::core::IntentName;
 ///
 /// let intent: IntentName = "charge".into();
 /// assert_eq!(intent.as_str(), "charge");
 /// assert!(intent.is_charge());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct IntentName(String);
 
 impl IntentName {
@@ -153,18 +144,6 @@ impl From<String> for IntentName {
     }
 }
 
-impl Serialize for IntentName {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for IntentName {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
-        String::deserialize(deserializer).map(Self)
-    }
-}
-
 /// A JSON value encoded as base64url.
 ///
 /// This type owns the raw base64url string and can decode it to a JSON Value
@@ -174,7 +153,7 @@ impl<'de> Deserialize<'de> for IntentName {
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::protocol::core::Base64UrlJson;
+/// use mpay::protocol::core::Base64UrlJson;
 /// use serde_json::json;
 ///
 /// // Create from JSON value
@@ -254,96 +233,16 @@ impl<'de> Deserialize<'de> for Base64UrlJson {
     }
 }
 
-const BASE64URL_CHARS: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/// Encode bytes to base64url (URL-safe, no padding).
-pub fn base64url_encode(input: &[u8]) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-
-        output.push(BASE64URL_CHARS[b0 >> 2] as char);
-        output.push(BASE64URL_CHARS[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-
-        if chunk.len() > 1 {
-            output.push(BASE64URL_CHARS[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        }
-        if chunk.len() > 2 {
-            output.push(BASE64URL_CHARS[b2 & 0x3f] as char);
-        }
-    }
-
-    output
+/// Encode bytes as base64url (no padding).
+pub fn base64url_encode(data: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Decode base64url to bytes (handles both padded and unpadded).
+/// Decode a base64url string (no padding) to bytes.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Build decode table
-    let mut decode_table = [255u8; 128];
-    for (i, &c) in BASE64URL_CHARS.iter().enumerate() {
-        decode_table[c as usize] = i as u8;
-    }
-    // Also accept + and / for standard base64 compatibility
-    decode_table[b'+' as usize] = 62;
-    decode_table[b'/' as usize] = 63;
-
-    // Strip padding
-    let input = input.trim_end_matches('=');
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-
-    let chars: Vec<u8> = input
-        .bytes()
-        .map(|c| {
-            if c >= 128 {
-                255
-            } else {
-                decode_table[c as usize]
-            }
-        })
-        .collect();
-
-    // Check for invalid characters
-    if chars.contains(&255) {
-        return Err(MppError::InvalidBase64Url(
-            "Invalid character in base64url".to_string(),
-        ));
-    }
-
-    for chunk in chars.chunks(4) {
-        let len = chunk.len();
-        if len < 2 {
-            return Err(MppError::InvalidBase64Url(
-                "Invalid base64url length".to_string(),
-            ));
-        }
-
-        let b0 = chunk[0] as usize;
-        let b1 = chunk[1] as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-        let b3 = chunk.get(3).copied().unwrap_or(0) as usize;
-
-        output.push(((b0 << 2) | (b1 >> 4)) as u8);
-        if len > 2 {
-            output.push((((b1 & 0x0f) << 4) | (b2 >> 2)) as u8);
-        }
-        if len > 3 {
-            output.push((((b2 & 0x03) << 6) | b3) as u8);
-        }
-    }
-
-    Ok(output)
+    URL_SAFE_NO_PAD
+        .decode(input)
+        .map_err(|e| MppError::InvalidBase64Url(format!("Invalid base64url: {}", e)))
 }
 
 /// Payment protocol detected from HTTP 402 response.

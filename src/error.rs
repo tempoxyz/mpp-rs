@@ -112,6 +112,7 @@ pub enum MppError {
     },
 
     /// Simple signing error for backwards compatibility
+    #[deprecated(note = "Use Signing variant with context instead")]
     #[error("Signing error: {0}")]
     SigningSimple(String),
 
@@ -123,14 +124,6 @@ pub enum MppError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// TOML parsing error
-    #[error("TOML parsing error: {0}")]
-    TomlParse(#[from] toml::de::Error),
-
-    /// TOML serialization error
-    #[error("TOML serialization error: {0}")]
-    TomlSerialize(#[from] toml::ser::Error),
-
     /// Hex decoding error
     #[cfg(feature = "utils")]
     #[error("Hex decoding error: {0}")]
@@ -140,11 +133,6 @@ pub enum MppError {
     #[cfg(feature = "utils")]
     #[error("Base64 decoding error: {0}")]
     Base64Decode(#[from] base64::DecodeError),
-
-    /// Base58 decoding error
-    #[cfg(feature = "utils")]
-    #[error("Base58 decoding error: {0}")]
-    Base58Decode(#[from] bs58::decode::Error),
 
     // ==================== Web Payment Auth Errors ====================
     /// Unsupported payment method
@@ -180,11 +168,6 @@ pub enum MppError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Reqwest error
-    #[cfg(feature = "http-client")]
-    #[error("HTTP request error: {0}")]
-    Reqwest(#[from] reqwest::Error),
-
     /// Invalid UTF-8 in response
     #[error("Invalid UTF-8 in response body")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
@@ -207,7 +190,9 @@ impl MppError {
     }
 
     /// Create a signing error with just a message (backwards compat)
+    #[deprecated(note = "Use signing_with_context instead")]
     pub fn signing(msg: impl Into<String>) -> Self {
+        #[allow(deprecated)]
         Self::SigningSimple(msg.into())
     }
 

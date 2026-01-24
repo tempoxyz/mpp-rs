@@ -19,8 +19,7 @@
 //!                              │
 //! ┌────────────────────────────▼────────────────────────────────────┐
 //! │                      Intents Layer (always available)            │
-//! │  ChargeRequest, AuthorizeRequest, SubscriptionRequest           │
-//! │  (All string fields - no blockchain types)                      │
+//! │  ChargeRequest (string fields - no blockchain types)            │
 //! └────────────────────────────┬────────────────────────────────────┘
 //!                              │
 //! ┌────────────────────────────▼────────────────────────────────────┐
@@ -42,8 +41,8 @@
 //! ## Parse a challenge (core layer only)
 //!
 //! ```ignore
-//! use mpp_rs::protocol::core::*;
-//! use mpp_rs::protocol::intents::ChargeRequest;
+//! use mpay::protocol::core::*;
+//! use mpay::protocol::intents::ChargeRequest;
 //!
 //! let challenge = parse_www_authenticate(header)?;
 //! if challenge.intent.is_charge() {
@@ -55,8 +54,8 @@
 //! ## EVM-specific accessors (with "evm" feature)
 //!
 //! ```ignore
-//! use mpp_rs::protocol::intents::ChargeRequest;
-//! use mpp_rs::protocol::methods::evm::{EvmChargeExt, Address, U256};
+//! use mpay::protocol::intents::ChargeRequest;
+//! use mpay::protocol::methods::evm::{EvmChargeExt, Address, U256};
 //!
 //! let req: ChargeRequest = challenge.request.decode()?;
 //! let amount: U256 = req.amount_u256()?;
@@ -66,8 +65,8 @@
 //! ## Tempo-specific accessors (with "tempo" feature)
 //!
 //! ```ignore
-//! use mpp_rs::protocol::intents::ChargeRequest;
-//! use mpp_rs::protocol::methods::tempo::TempoChargeExt;
+//! use mpay::protocol::intents::ChargeRequest;
+//! use mpay::protocol::methods::tempo::TempoChargeExt;
 //!
 //! let req: ChargeRequest = challenge.request.decode()?;
 //! let nonce_key = req.nonce_key();

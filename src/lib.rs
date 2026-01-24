@@ -1,41 +1,36 @@
-//! mpp-rs - Micropayments Protocol for Rust
+//! mpay - Micropayments Protocol for Rust
 //!
 //! A Rust library for implementing the Web Payment Auth protocol
 //! (IETF draft-ietf-httpauth-payment).
 //!
 //! # Architecture
 //!
-//! mpp-rs provides a layered architecture similar to the TypeScript mpay library:
+//! mpay provides a thin protocol layer matching the TypeScript mpay library:
 //!
 //! - **Protocol Layer**: Core types for challenges, credentials, and receipts
 //! - **Methods Layer**: Payment method implementations (tempo, evm, stripe)
-//! - **Intents Layer**: Payment intent types (charge, authorize, subscription)
+//! - **Intents Layer**: Payment intent types (charge)
 //!
 //! # Feature Flags
 //!
 //! - `evm`: EVM blockchain support (Ethereum, Base, Polygon, etc.)
 //! - `tempo`: Tempo blockchain support (includes `evm`)
-//! - `keystore`: Keystore format encryption/decryption (no path management)
-//! - `client`: High-level HTTP client with payment handling
-//! - `http-client`: Low-level HTTP client support
-//! - `tower-middleware`: Tower middleware for servers
-//! - `reqwest-middleware`: Reqwest middleware for clients
-//! - `middleware`: All middleware features
+//! - `stripe`: Stripe payment method support
 //!
 //! # Exports
 //!
 //! Following the mpay pattern, core types are exported as namespaced modules:
 //!
 //! ```ignore
-//! use mpp_rs::{Challenge, Credential, Receipt, Intent, Method};
+//! use mpay::{Challenge, Credential, Receipt, Intent, Method};
 //! ```
 //!
 //! # Signer Integration
 //!
-//! mpp-rs re-exports alloy's signer types for convenience:
+//! mpay re-exports alloy's signer types for convenience:
 //!
 //! ```ignore
-//! use mpp_rs::{Signer, PrivateKeySigner};
+//! use mpay::{Signer, PrivateKeySigner};
 //! ```
 //!
 //! Consumers provide their own signer implementation. The library does not
@@ -45,44 +40,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ==================== Core Modules (always available) ====================
 
-pub mod currency;
 pub mod error;
-// Explorer moved to purl - it's UI-only, not core protocol
 pub mod protocol;
 pub mod utils;
 
 // ==================== Feature-gated Modules ====================
 
-pub mod network;
-
 #[cfg(feature = "evm")]
 pub mod crypto;
 
 #[cfg(feature = "evm")]
-pub mod money;
-
-#[cfg(feature = "keystore")]
-pub mod keystore;
-
-// TODO: Middleware module needs redesign to accept generic Signer
-// #[cfg(any(feature = "tower-middleware", feature = "reqwest-middleware"))]
-// pub mod middleware;
+pub mod evm;
 
 // ==================== Re-exports ====================
 
 // Error types
 pub use error::{MppError, Result, ResultExt, SigningContext};
-
-// Currency
-pub use currency::{currencies, Currency};
-
-// Network
-pub use network::{
-    evm_chain_ids, get_evm_chain_id, get_network, is_evm_network, networks, resolve_network_alias,
-    ChainType, GasConfig, Network, NetworkInfo, TokenConfig,
-};
-
-
 
 // ==================== Protocol Namespace Exports (mpay style) ====================
 // Following mpay's export pattern with PascalCase module names
@@ -112,7 +85,7 @@ pub mod Receipt {
 /// Intent types for payment requests
 #[allow(non_snake_case)]
 pub mod Intent {
-    pub use crate::protocol::intents::{AuthorizeRequest, ChargeRequest, SubscriptionRequest};
+    pub use crate::protocol::intents::ChargeRequest;
 }
 
 /// Schema types for protocol encoding
@@ -128,14 +101,8 @@ pub mod Schema {
 /// Payment method implementations
 #[allow(non_snake_case)]
 pub mod Method {
-    #[cfg(feature = "evm")]
-    pub use crate::protocol::methods::evm;
-
     #[cfg(feature = "tempo")]
     pub use crate::protocol::methods::tempo;
-
-    #[cfg(feature = "stripe")]
-    pub use crate::protocol::methods::stripe;
 }
 
 // ==================== Alloy Re-exports (batteries included) ====================
@@ -151,24 +118,3 @@ pub use alloy_signer_local::PrivateKeySigner;
 /// Re-export common alloy primitives
 #[cfg(feature = "evm")]
 pub use alloy::primitives::{Address, U256};
-
-// ==================== Money Module Exports ====================
-
-#[cfg(feature = "evm")]
-pub use money::{format_u256_trimmed, format_u256_with_decimals, Money, TokenId};
-
-// ==================== Keystore Exports ====================
-
-#[cfg(feature = "keystore")]
-pub use keystore::{decrypt_keystore, encrypt_keystore, Keystore};
-
-// ==================== Middleware Exports ====================
-// TODO: Middleware exports after module redesign
-// #[cfg(any(feature = "tower-middleware", feature = "reqwest-middleware"))]
-// pub use middleware::{PaymentHandler, PaymentHandlerConfig};
-//
-// #[cfg(feature = "tower-middleware")]
-// pub use middleware::{PaymentLayer, PaymentService};
-//
-// #[cfg(feature = "reqwest-middleware")]
-// pub use middleware::PaymentMiddleware;

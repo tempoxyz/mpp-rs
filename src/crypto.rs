@@ -1,7 +1,5 @@
 //! Cryptographic utilities for key generation
 
-#![cfg(feature = "evm")]
-
 use crate::error::{MppError, Result};
 
 /// EVM private key length in bytes
@@ -12,7 +10,7 @@ const EVM_PRIVATE_KEY_BYTES: usize = 32;
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::crypto::{KeyGenerator, EvmKeyGenerator};
+/// use mpay::crypto::{KeyGenerator, EvmKeyGenerator};
 ///
 /// // Generate an EVM key
 /// let (private_key, address) = EvmKeyGenerator::generate().unwrap();
@@ -42,7 +40,7 @@ pub trait KeyGenerator {
 /// # Examples
 ///
 /// ```
-/// use mpp_rs::crypto::{KeyGenerator, EvmKeyGenerator};
+/// use mpay::crypto::{KeyGenerator, EvmKeyGenerator};
 ///
 /// let (private_key, address) = EvmKeyGenerator::generate().unwrap();
 /// assert_eq!(private_key.len(), 64);
@@ -90,7 +88,7 @@ pub fn generate_evm_key() -> Result<(String, String)> {
 ///
 /// # Example
 /// ```
-/// use mpp_rs::crypto::derive_evm_address;
+/// use mpay::crypto::derive_evm_address;
 ///
 /// let key_bytes = hex::decode("1234567890123456789012345678901234567890123456789012345678901234").unwrap();
 /// let address = derive_evm_address(&key_bytes).unwrap();
@@ -98,6 +96,14 @@ pub fn generate_evm_key() -> Result<(String, String)> {
 /// ```
 pub fn derive_evm_address(private_key_bytes: &[u8]) -> Result<String> {
     use alloy_signer_local::PrivateKeySigner;
+
+    if private_key_bytes.len() != EVM_PRIVATE_KEY_BYTES {
+        return Err(MppError::InvalidKey(format!(
+            "Private key must be {} bytes, got {}",
+            EVM_PRIVATE_KEY_BYTES,
+            private_key_bytes.len()
+        )));
+    }
 
     let key_hex = hex::encode(private_key_bytes);
     let signer: PrivateKeySigner = key_hex
@@ -146,5 +152,20 @@ mod tests {
 
         let invalid_key = "0x12345";
         assert!(validate_evm_key(invalid_key).is_err());
+    }
+
+    #[test]
+    fn test_derive_evm_address_invalid_length() {
+        let too_short = vec![0u8; 16];
+        let result = derive_evm_address(&too_short);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("must be 32 bytes"));
+
+        let too_long = vec![0u8; 64];
+        let result = derive_evm_address(&too_long);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("must be 32 bytes"));
     }
 }

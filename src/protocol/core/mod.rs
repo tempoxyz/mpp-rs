@@ -13,8 +13,7 @@
 //! - **Core** (this module): Protocol envelope types that work with any payment
 //!   method or intent. Generic over method/intent names.
 //! - **Intents** (`protocol::intents`): Intent-specific request types like
-//!   `ChargeRequest`, `AuthorizeRequest`, `SubscriptionRequest`. Still no
-//!   blockchain deps.
+//!   `ChargeRequest`. Still no blockchain deps.
 //! - **Methods** (`protocol::methods`): Method-specific types and helpers.
 //!   Feature-gated with blockchain dependencies (e.g., `alloy` for EVM).
 //!
@@ -44,14 +43,14 @@
 //! # Examples
 //!
 //! ```ignore
-//! use mpp_rs::protocol::core::*;
+//! use mpay::protocol::core::*;
 //!
 //! // Parse a challenge
 //! let challenge = parse_www_authenticate(header)?;
 //! println!("Method: {}, Intent: {}", challenge.method, challenge.intent);
 //!
 //! // Decode the request to a typed struct
-//! use mpp_rs::protocol::intents::ChargeRequest;
+//! use mpay::protocol::intents::ChargeRequest;
 //! if challenge.intent.is_charge() {
 //!     let req: ChargeRequest = challenge.request.decode()?;
 //!     println!("Amount: {}", req.amount);
