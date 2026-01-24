@@ -1,7 +1,6 @@
 //! Network registry with support for both built-in and custom networks.
 
 use crate::currency::Currency;
-use crate::explorer::ExplorerConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -69,15 +68,6 @@ struct BuiltinNetwork {
     rpc_url: &'static str,
     /// Alternative network identifiers (e.g., CAIP-2 formats)
     aliases: &'static [&'static str],
-    /// Explorer URL configuration (base_url, explorer_type)
-    explorer: Option<(&'static str, ExplorerKind)>,
-}
-
-/// Explorer types for static initialization
-#[derive(Debug, Clone, Copy)]
-enum ExplorerKind {
-    Etherscan,
-    Tempo,
 }
 
 /// Default built-in networks defined in code
@@ -90,7 +80,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Ethereum",
         rpc_url: "https://eth.llamarpc.com",
         aliases: &["eip155:1"],
-        explorer: Some(("https://etherscan.io", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::ETHEREUM_SEPOLIA,
@@ -100,7 +89,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Ethereum Sepolia",
         rpc_url: "https://ethereum-sepolia-rpc.publicnode.com",
         aliases: &["eip155:11155111"],
-        explorer: Some(("https://sepolia.etherscan.io", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::BASE,
@@ -110,7 +98,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Base",
         rpc_url: "https://mainnet.base.org",
         aliases: &["eip155:8453"],
-        explorer: Some(("https://basescan.org", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::BASE_SEPOLIA,
@@ -120,7 +107,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Base Sepolia",
         rpc_url: "https://sepolia.base.org",
         aliases: &["eip155:84532"],
-        explorer: Some(("https://sepolia.basescan.org", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::AVALANCHE,
@@ -130,7 +116,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Avalanche C-Chain",
         rpc_url: "https://api.avax.network/ext/bc/C/rpc",
         aliases: &["eip155:43114"],
-        explorer: Some(("https://snowtrace.io", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::AVALANCHE_FUJI,
@@ -140,7 +125,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Avalanche Fuji",
         rpc_url: "https://api.avax-test.network/ext/bc/C/rpc",
         aliases: &["eip155:43113"],
-        explorer: Some(("https://testnet.snowtrace.io", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::POLYGON,
@@ -150,7 +134,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Polygon",
         rpc_url: "https://polygon-rpc.com",
         aliases: &["eip155:137"],
-        explorer: Some(("https://polygonscan.com", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::ARBITRUM,
@@ -160,7 +143,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Arbitrum One",
         rpc_url: "https://arb1.arbitrum.io/rpc",
         aliases: &["eip155:42161"],
-        explorer: Some(("https://arbiscan.io", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::OPTIMISM,
@@ -170,7 +152,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Optimism",
         rpc_url: "https://mainnet.optimism.io",
         aliases: &["eip155:10"],
-        explorer: Some(("https://optimistic.etherscan.io", ExplorerKind::Etherscan)),
     },
     BuiltinNetwork {
         id: networks::TEMPO,
@@ -180,7 +161,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Tempo",
         rpc_url: "https://rpc.tempo.xyz",
         aliases: &["eip155:4217"],
-        explorer: Some(("https://explorer.tempo.xyz", ExplorerKind::Tempo)),
     },
     BuiltinNetwork {
         id: networks::TEMPO_MODERATO,
@@ -190,7 +170,6 @@ const BUILTIN_NETWORKS: &[BuiltinNetwork] = &[
         display_name: "Tempo Moderato (Testnet)",
         rpc_url: "https://rpc.moderato.tempo.xyz",
         aliases: &["eip155:42431"],
-        explorer: Some(("https://explorer.moderato.tempo.xyz", ExplorerKind::Tempo)),
     },
 ];
 
@@ -221,8 +200,6 @@ pub struct NetworkInfo {
     pub display_name: String,
     /// RPC endpoint URL for blockchain interactions
     pub rpc_url: String,
-    /// Block explorer configuration (optional)
-    pub explorer: Option<ExplorerConfig>,
 }
 
 impl NetworkInfo {
@@ -262,18 +239,12 @@ impl NetworkRegistry {
         let mut aliases = HashMap::new();
 
         for builtin in BUILTIN_NETWORKS {
-            let explorer = builtin.explorer.map(|(base_url, kind)| match kind {
-                ExplorerKind::Etherscan => ExplorerConfig::etherscan(base_url),
-                ExplorerKind::Tempo => ExplorerConfig::tempo(base_url),
-            });
-
             let info = NetworkInfo {
                 chain_type: builtin.chain_type,
                 chain_id: builtin.chain_id,
                 mainnet: builtin.mainnet,
                 display_name: builtin.display_name.to_string(),
                 rpc_url: builtin.rpc_url.to_string(),
-                explorer,
             };
             networks.insert(builtin.id.to_string(), info);
 

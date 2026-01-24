@@ -65,7 +65,6 @@ src/
 ├── money.rs         # TokenId, Money (feature = "evm")
 ├── crypto.rs        # Key generation (feature = "evm")
 ├── keystore.rs      # Encrypt/decrypt only (feature = "keystore")
-├── explorer.rs      # Block explorer URL formatting
 └── utils.rs         # Hex/address utilities
 ```
 

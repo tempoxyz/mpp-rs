@@ -47,7 +47,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod currency;
 pub mod error;
-pub mod explorer;
+// Explorer moved to purl - it's UI-only, not core protocol
 pub mod protocol;
 pub mod utils;
 
@@ -82,8 +82,7 @@ pub use network::{
     ChainType, GasConfig, Network, NetworkInfo, TokenConfig,
 };
 
-// Explorer
-pub use explorer::{ExplorerConfig, ExplorerType};
+
 
 // ==================== Protocol Namespace Exports (mpay style) ====================
 // Following mpay's export pattern with PascalCase module names
