@@ -129,9 +129,10 @@ See the [examples/](./examples/) directory for integration patterns with common 
 ## Development
 
 ```bash
-cargo build         # Build with default features (tempo)
-cargo test          # Run tests
-cargo doc --open    # Generate and view documentation
+make build      # Build with default features (tempo)
+make test       # Run tests
+make check      # Format check, clippy, test, and build
+make fix        # Auto-fix formatting and clippy warnings
 ```
 
 ## License
