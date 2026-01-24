@@ -118,10 +118,6 @@ mpay = "0.1"
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
 | `utils` | Encoding utilities (hex, base64) |
 
-## What's NOT Included
-
-Network registries, currency formatting, keystore management, HTTP clients, and middleware are out of scope for this library.
-
 ## Examples
 
 See the [examples/](./examples/) directory for integration patterns with common HTTP libraries:
