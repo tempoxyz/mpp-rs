@@ -126,11 +126,6 @@ Network registries, currency formatting, keystore management, HTTP clients, and 
 
 See the [examples/](./examples/) directory for integration patterns with common HTTP libraries:
 
-- [reqwest client](./examples/reqwest-client.md) — Client-side 402 handling
-- [axum server](./examples/axum-server.md) — Server-side payment gating
-- [tower middleware](./examples/tower-middleware.md) — Reusable middleware layer
-- [hyper low-level](./examples/hyper-low-level.md) — Direct hyper integration
-
 ## Development
 
 ```bash
