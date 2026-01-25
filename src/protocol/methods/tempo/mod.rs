@@ -7,11 +7,36 @@
 //!
 //! - [`TempoMethodDetails`]: Tempo-specific method details (2D nonces, fee payer)
 //! - [`TempoChargeExt`]: Extension trait for ChargeRequest with Tempo-specific accessors
+//! - [`transaction::TempoTransactionParams`]: Transaction params for `tempo_sendTransaction`
+//! - [`transaction::SubmissionMethod`]: Determines which RPC method to use
 //!
 //! # Constants
 //!
 //! - [`CHAIN_ID`]: Tempo Moderato chain ID (88153)
 //! - [`METHOD_NAME`]: Payment method name ("tempo")
+//!
+//! # Fee Sponsorship
+//!
+//! When a ChargeRequest has `feePayer: true` in method_details, the transaction
+//! should be submitted via `tempo_sendTransaction` instead of `eth_sendRawTransaction`.
+//! Use [`transaction::SubmissionMethod::from_charge_request`] to determine the
+//! appropriate submission method.
+//!
+//! ```
+//! use mpay::protocol::core::parse_www_authenticate;
+//! use mpay::protocol::intents::ChargeRequest;
+//! use mpay::protocol::methods::tempo::{TempoChargeExt, transaction::SubmissionMethod};
+//!
+//! # let req = ChargeRequest {
+//! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
+//! #     expires: None, description: None, external_id: None,
+//! #     method_details: Some(serde_json::json!({"feePayer": true})),
+//! # };
+//! let method = SubmissionMethod::from_charge_request(&req);
+//! if req.fee_payer() {
+//!     assert_eq!(method.method_name(), "tempo_sendTransaction");
+//! }
+//! ```
 //!
 //! # Examples
 //!
@@ -28,9 +53,11 @@
 //! ```
 
 pub mod charge;
+pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
+pub use transaction::{SubmissionMethod, TempoSendTransactionRequest, TempoTransactionParams};
 pub use types::TempoMethodDetails;
 
 /// Tempo Moderato testnet chain ID.
