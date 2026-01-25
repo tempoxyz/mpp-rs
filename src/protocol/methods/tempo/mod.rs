@@ -8,27 +8,23 @@
 //! - [`TempoMethodDetails`]: Tempo-specific method details (2D nonces, fee payer)
 //! - [`TempoChargeExt`]: Extension trait for ChargeRequest with Tempo-specific accessors
 //! - [`transaction::TempoTransactionParams`]: Transaction params for building transactions
-//! - [`transaction::SubmissionMethod`]: Determines which RPC method to use
 //!
 //! # Constants
 //!
 //! - [`CHAIN_ID`]: Tempo Moderato chain ID (88153)
 //! - [`METHOD_NAME`]: Payment method name ("tempo")
 //!
+//! # Transaction Format
+//!
+//! All Tempo payments use TempoTransaction (type 0x76) format. The client builds
+//! and signs a TempoTransaction, returns it as a `transaction` credential, and the
+//! server submits it via `tempo_sendTransaction`.
+//!
 //! # Fee Sponsorship
 //!
-//! When a ChargeRequest has `feePayer: true` in method_details, the correct flow is:
-//!
-//! 1. **Server** sends a challenge with `feePayer: true` and optionally `feePayerUrl`
-//! 2. **Client** builds a TempoTransaction (type 0x76) with fee payer placeholder,
-//!    signs it, and returns it as a `transaction` credential (NOT broadcast)
-//! 3. **Server** receives the signed transaction and forwards to the fee payer
-//!    service (either `feePayerUrl` or the default testnet sponsor)
-//! 4. **Fee payer** adds its signature and broadcasts the transaction
-//! 5. **Server** verifies the receipt and transfer logs
-//!
-//! **Important**: The client does NOT submit the transaction directly. The server
-//! is responsible for forwarding to the fee payer service.
+//! When `feePayer: true` is set, the server forwards the signed transaction to a
+//! fee payer service (either `feePayerUrl` or the default testnet sponsor) which
+//! adds its signature and broadcasts.
 //!
 //! ```
 //! use mpay::protocol::intents::ChargeRequest;
@@ -69,7 +65,7 @@ pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
-pub use transaction::{SubmissionMethod, TempoSendTransactionRequest, TempoTransactionParams};
+pub use transaction::{TempoSendTransactionRequest, TempoTransactionParams, TEMPO_SEND_TRANSACTION_METHOD};
 pub use types::{TempoMethodDetails, DEFAULT_FEE_PAYER_URL};
 
 /// Tempo Moderato testnet chain ID.
