@@ -7,11 +7,44 @@
 //!
 //! - [`TempoMethodDetails`]: Tempo-specific method details (2D nonces, fee payer)
 //! - [`TempoChargeExt`]: Extension trait for ChargeRequest with Tempo-specific accessors
+//! - [`transaction::TempoTransactionParams`]: Transaction params for building transactions
 //!
 //! # Constants
 //!
 //! - [`CHAIN_ID`]: Tempo Moderato chain ID (88153)
 //! - [`METHOD_NAME`]: Payment method name ("tempo")
+//!
+//! # Transaction Format
+//!
+//! All Tempo payments use TempoTransaction (type 0x76) format. The client builds
+//! and signs a TempoTransaction, returns it as a `transaction` credential, and the
+//! server submits it via `tempo_sendTransaction`.
+//!
+//! # Fee Sponsorship
+//!
+//! When `feePayer: true` is set, the server forwards the signed transaction to a
+//! fee payer service (either `feePayerUrl` or the default testnet sponsor) which
+//! adds its signature and broadcasts.
+//!
+//! ```
+//! use mpay::protocol::intents::ChargeRequest;
+//! use mpay::protocol::methods::tempo::TempoChargeExt;
+//!
+//! # let req = ChargeRequest {
+//! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
+//! #     expires: None, description: None, external_id: None,
+//! #     method_details: Some(serde_json::json!({
+//! #         "feePayer": true,
+//! #         "feePayerUrl": "https://sponsor.moderato.tempo.xyz"
+//! #     })),
+//! # };
+//! if req.fee_payer() {
+//!     // Client should build and sign a TempoTransaction (0x76),
+//!     // then return it as a "transaction" credential.
+//!     // The server will forward to fee_payer_url for broadcasting.
+//!     let fee_payer_url = req.fee_payer_url();
+//! }
+//! ```
 //!
 //! # Examples
 //!
@@ -28,10 +61,14 @@
 //! ```
 
 pub mod charge;
+pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
-pub use types::TempoMethodDetails;
+pub use transaction::{
+    TempoSendTransactionRequest, TempoTransactionParams, TEMPO_SEND_TRANSACTION_METHOD,
+};
+pub use types::{TempoMethodDetails, DEFAULT_FEE_PAYER_URL};
 
 /// Tempo Moderato testnet chain ID.
 pub const CHAIN_ID: u64 = 88153;

@@ -30,7 +30,8 @@
 //!
 //! mpay re-exports alloy's signer types for convenience:
 //!
-//! ```no_run
+#![cfg_attr(feature = "evm", doc = "```no_run")]
+#![cfg_attr(not(feature = "evm"), doc = "```ignore")]
 //! use mpay::{Signer, PrivateKeySigner};
 //! # fn main() {}
 //! ```

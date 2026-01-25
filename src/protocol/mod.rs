@@ -54,7 +54,8 @@
 //!
 //! ## EVM-specific accessors (with "evm" feature)
 //!
-//! ```
+#![cfg_attr(feature = "tempo", doc = "```")]
+#![cfg_attr(not(feature = "tempo"), doc = "```ignore")]
 //! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
 //! use mpay::protocol::methods::tempo::TempoChargeExt;
@@ -68,7 +69,8 @@
 //!
 //! ## Tempo-specific accessors (with "tempo" feature)
 //!
-//! ```
+#![cfg_attr(feature = "tempo", doc = "```")]
+#![cfg_attr(not(feature = "tempo"), doc = "```ignore")]
 //! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
 //! use mpay::protocol::methods::tempo::TempoChargeExt;
