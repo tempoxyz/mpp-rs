@@ -65,7 +65,9 @@ pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
-pub use transaction::{TempoSendTransactionRequest, TempoTransactionParams, TEMPO_SEND_TRANSACTION_METHOD};
+pub use transaction::{
+    TempoSendTransactionRequest, TempoTransactionParams, TEMPO_SEND_TRANSACTION_METHOD,
+};
 pub use types::{TempoMethodDetails, DEFAULT_FEE_PAYER_URL};
 
 /// Tempo Moderato testnet chain ID.
