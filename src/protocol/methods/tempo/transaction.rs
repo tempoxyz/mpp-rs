@@ -1,39 +1,35 @@
-//! Tempo transaction types for `tempo_sendTransaction` RPC method.
+//! Tempo transaction types for building and submitting transactions.
 //!
-//! This module provides types for building transactions that use Tempo's
-//! native `tempo_sendTransaction` RPC method, which supports fee sponsorship
-//! and other Tempo-specific features not available with `eth_sendRawTransaction`.
+//! This module provides types for building Tempo transactions. These are used
+//! by the **server** when it needs to forward client-signed transactions to
+//! a fee payer service or submit them directly.
 //!
-//! # Fee Sponsorship
+//! # Fee Sponsorship Flow
 //!
-//! When `fee_payer` is set to `true`, the transaction should be submitted via
-//! `tempo_sendTransaction` instead of `eth_sendRawTransaction`. The fee payer
-//! service will sign the transaction to cover gas fees on behalf of the sender.
+//! When `fee_payer` is `true` in a ChargeRequest, the correct flow is:
+//!
+//! 1. **Client** builds a TempoTransaction (type 0x76) with fee payer placeholder,
+//!    signs it, and returns it as a `transaction` credential (NOT broadcast)
+//! 2. **Server** receives the signed transaction and forwards to the fee payer
+//!    service via `eth_sendRawTransaction`
+//! 3. **Fee payer** adds its signature and broadcasts the transaction
+//!
+//! **Important**: The client does NOT submit the transaction directly.
+//!
+//! # Types
+//!
+//! - [`TempoTransactionParams`]: Parameters for building a transaction request
+//! - [`TempoSendTransactionRequest`]: JSON-RPC request for `tempo_sendTransaction`
+//! - [`SubmissionMethod`]: Indicates which RPC method the server should use
 //!
 //! # Examples
 //!
-//! ## Building a sponsored transaction request
-//!
-//! ```
-//! use mpay::protocol::methods::tempo::transaction::{
-//!     TempoTransactionParams, TempoSendTransactionRequest,
-//! };
-//!
-//! let params = TempoTransactionParams::new("0xSenderAddress", "0xRecipientAddress")
-//!     .with_value("1000000")
-//!     .with_fee_payer(true);
-//!
-//! // Convert to JSON-RPC request for tempo_sendTransaction
-//! let request = TempoSendTransactionRequest::new(params);
-//! let json = serde_json::to_value(&request).unwrap();
-//! ```
-//!
-//! ## Using with ChargeRequest
+//! ## Server-side: Forward sponsored transaction
 //!
 //! ```
 //! use mpay::protocol::intents::ChargeRequest;
 //! use mpay::protocol::methods::tempo::TempoChargeExt;
-//! use mpay::protocol::methods::tempo::transaction::TempoTransactionParams;
+//! use mpay::protocol::methods::tempo::transaction::SubmissionMethod;
 //!
 //! # let req = ChargeRequest {
 //! #     amount: "1000000".into(),
@@ -42,10 +38,11 @@
 //! #     expires: None, description: None, external_id: None,
 //! #     method_details: Some(serde_json::json!({"feePayer": true})),
 //! # };
-//! if req.fee_payer() {
-//!     // Build a sponsored transaction
-//!     let params = TempoTransactionParams::from_charge_request(&req, "0xSenderAddress");
-//!     // Submit via tempo_sendTransaction
+//! // Server receives a "transaction" credential with client-signed tx bytes
+//! let method = SubmissionMethod::from_charge_request(&req);
+//! if method == SubmissionMethod::TempoSendTransaction {
+//!     // Forward to fee_payer_url (server responsibility, not client)
+//!     let url = req.fee_payer_url();
 //! }
 //! ```
 

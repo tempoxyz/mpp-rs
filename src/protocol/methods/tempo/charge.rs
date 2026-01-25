@@ -38,8 +38,18 @@ pub trait TempoChargeExt {
     /// Parse the method_details as Tempo-specific details.
     fn tempo_method_details(&self) -> Result<TempoMethodDetails>;
 
-    /// Check if server pays transaction fees (Tempo-specific feature).
+    /// Check if fee sponsorship is enabled.
+    ///
+    /// When true, the client should build and sign a TempoTransaction (type 0x76)
+    /// with a fee payer placeholder, then return it as a `transaction` credential.
+    /// The server will forward this to the fee payer service for broadcasting.
     fn fee_payer(&self) -> bool;
+
+    /// Get the fee payer service URL.
+    ///
+    /// Returns the configured `feePayerUrl` from methodDetails, or the default
+    /// testnet sponsor URL if not specified.
+    fn fee_payer_url(&self) -> Option<String>;
 
     /// Get the 2D nonce key.
     ///
@@ -103,6 +113,14 @@ impl TempoChargeExt for ChargeRequest {
             .unwrap_or(false)
     }
 
+    fn fee_payer_url(&self) -> Option<String> {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("feePayerUrl"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
     fn nonce_key(&self) -> U256 {
         self.method_details
             .as_ref()
@@ -157,6 +175,7 @@ mod tests {
             method_details: Some(serde_json::json!({
                 "chainId": 88153,
                 "feePayer": true,
+                "feePayerUrl": "https://custom.sponsor.xyz",
                 "nonceKey": "42",
                 "feeToken": "0xDEF",
                 "validBefore": "2025-01-01T00:00:00Z"
@@ -184,6 +203,21 @@ mod tests {
             ..test_charge_request()
         };
         assert!(!req_no_fee.fee_payer());
+    }
+
+    #[test]
+    fn test_fee_payer_url() {
+        let req = test_charge_request();
+        assert_eq!(
+            req.fee_payer_url(),
+            Some("https://custom.sponsor.xyz".to_string())
+        );
+
+        let req_no_url = ChargeRequest {
+            method_details: Some(serde_json::json!({"feePayer": true})),
+            ..test_charge_request()
+        };
+        assert_eq!(req_no_url.fee_payer_url(), None);
     }
 
     #[test]
