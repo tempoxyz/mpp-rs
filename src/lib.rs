@@ -21,16 +21,18 @@
 //!
 //! Following the mpay pattern, core types are exported as namespaced modules:
 //!
-//! ```ignore
+//! ```no_run
 //! use mpay::{Challenge, Credential, Receipt, Intent, Method};
+//! # fn main() {}
 //! ```
 //!
 //! # Signer Integration
 //!
 //! mpay re-exports alloy's signer types for convenience:
 //!
-//! ```ignore
+//! ```no_run
 //! use mpay::{Signer, PrivateKeySigner};
+//! # fn main() {}
 //! ```
 //!
 //! Consumers provide their own signer implementation. The library does not

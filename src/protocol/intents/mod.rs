@@ -13,14 +13,15 @@
 //!
 //! Use `PaymentChallenge.request.decode::<T>()` to decode the request to a typed struct:
 //!
-//! ```ignore
-//! use mpay::protocol::core::PaymentChallenge;
+//! ```
+//! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
 //!
-//! let challenge = parse_www_authenticate(header)?;
+//! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
+//! let challenge = parse_www_authenticate(header).unwrap();
 //! if challenge.intent.is_charge() {
-//!     let req: ChargeRequest = challenge.request.decode()?;
-//!     println!("Amount: {}, Currency: {}", req.amount, req.currency);
+//!     let req: ChargeRequest = challenge.request.decode().unwrap();
+//!     println!("Amount: {}, Currency: {:?}", req.amount, req.currency);
 //! }
 //! ```
 

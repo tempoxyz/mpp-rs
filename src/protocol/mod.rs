@@ -40,37 +40,43 @@
 //!
 //! ## Parse a challenge (core layer only)
 //!
-//! ```ignore
+//! ```
 //! use mpay::protocol::core::*;
 //! use mpay::protocol::intents::ChargeRequest;
 //!
-//! let challenge = parse_www_authenticate(header)?;
+//! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
+//! let challenge = parse_www_authenticate(header).unwrap();
 //! if challenge.intent.is_charge() {
-//!     let req: ChargeRequest = challenge.request.decode()?;
+//!     let req: ChargeRequest = challenge.request.decode().unwrap();
 //!     println!("Amount: {}", req.amount);
 //! }
 //! ```
 //!
 //! ## EVM-specific accessors (with "evm" feature)
 //!
-//! ```ignore
+//! ```
+//! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
-//! use mpay::protocol::methods::evm::{EvmChargeExt, Address, U256};
+//! use mpay::protocol::methods::tempo::TempoChargeExt;
+//! use mpay::evm::U256;
 //!
-//! let req: ChargeRequest = challenge.request.decode()?;
-//! let amount: U256 = req.amount_u256()?;
-//! let recipient: Address = req.recipient_address()?;
+//! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiIweDEyMyIsInJlY2lwaWVudCI6IjB4NDU2In0""#;
+//! let challenge = parse_www_authenticate(header).unwrap();
+//! let req: ChargeRequest = challenge.request.decode().unwrap();
+//! let amount: U256 = req.amount_u256().unwrap();
 //! ```
 //!
 //! ## Tempo-specific accessors (with "tempo" feature)
 //!
-//! ```ignore
+//! ```
+//! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
 //! use mpay::protocol::methods::tempo::TempoChargeExt;
 //!
-//! let req: ChargeRequest = challenge.request.decode()?;
+//! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
+//! let challenge = parse_www_authenticate(header).unwrap();
+//! let req: ChargeRequest = challenge.request.decode().unwrap();
 //! let nonce_key = req.nonce_key();
-//! let fee_token = req.fee_token();
 //! ```
 
 pub mod core;

@@ -111,11 +111,6 @@ pub enum MppError {
         context: SigningContext,
     },
 
-    /// Simple signing error for backwards compatibility
-    #[deprecated(note = "Use Signing variant with context instead")]
-    #[error("Signing error: {0}")]
-    SigningSimple(String),
-
     /// Address parsing error
     #[error("Invalid address: {0}")]
     InvalidAddress(String),
@@ -187,13 +182,6 @@ impl MppError {
             source: Box::new(source),
             context,
         }
-    }
-
-    /// Create a signing error with just a message (backwards compat)
-    #[deprecated(note = "Use signing_with_context instead")]
-    pub fn signing(msg: impl Into<String>) -> Self {
-        #[allow(deprecated)]
-        Self::SigningSimple(msg.into())
     }
 
     /// Add network context to an existing error
@@ -361,12 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn test_signing_simple_display() {
-        let err = MppError::SigningSimple("Failed to sign transaction".to_string());
-        assert_eq!(err.to_string(), "Signing error: Failed to sign transaction");
-    }
-
-    #[test]
     fn test_invalid_address_display() {
         let err = MppError::InvalidAddress("Not a valid address".to_string());
         assert_eq!(err.to_string(), "Invalid address: Not a valid address");
@@ -412,13 +394,6 @@ mod tests {
     fn test_invalid_did_display() {
         let err = MppError::InvalidDid("Not a valid DID".to_string());
         assert_eq!(err.to_string(), "Invalid DID: Not a valid DID");
-    }
-
-    #[test]
-    fn test_signing_constructor() {
-        let err = MppError::signing("test error");
-        assert!(matches!(err, MppError::SigningSimple(_)));
-        assert_eq!(err.to_string(), "Signing error: test error");
     }
 
     #[test]

@@ -15,11 +15,14 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
+//! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
 //! use mpay::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
 //!
-//! let req: ChargeRequest = challenge.request.decode()?;
+//! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
+//! let challenge = parse_www_authenticate(header).unwrap();
+//! let req: ChargeRequest = challenge.request.decode().unwrap();
 //! let nonce_key = req.nonce_key();
 //! assert_eq!(CHAIN_ID, 88153);
 //! ```

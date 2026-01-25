@@ -7,8 +7,9 @@
 //!
 //! For convenience, this module re-exports core alloy primitives:
 //!
-//! ```ignore
+//! ```no_run
 //! use mpay::evm::{Address, U256};
+//! # fn main() {}
 //! ```
 //!
 //! # Examples

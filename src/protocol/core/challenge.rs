@@ -15,13 +15,14 @@ use super::types::{Base64UrlJson, IntentName, MethodName, PayloadType, ReceiptSt
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
 /// use mpay::protocol::core::{PaymentChallenge, parse_www_authenticate};
 /// use mpay::protocol::intents::ChargeRequest;
 ///
-/// let challenge = parse_www_authenticate(header)?;
+/// let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
+/// let challenge = parse_www_authenticate(header).unwrap();
 /// if challenge.intent.is_charge() {
-///     let req: ChargeRequest = challenge.request.decode()?;
+///     let req: ChargeRequest = challenge.request.decode().unwrap();
 ///     println!("Amount: {}", req.amount);
 /// }
 /// ```

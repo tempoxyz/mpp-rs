@@ -14,6 +14,20 @@ use super::types::{base64url_decode, base64url_encode, Base64UrlJson, IntentName
 use crate::error::{MppError, Result};
 use std::collections::HashMap;
 
+/// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
+const MAX_TOKEN_LEN: usize = 16 * 1024;
+
+/// Escape a string for use in a quoted-string header value.
+/// Rejects CRLF to prevent header injection attacks.
+fn escape_quoted_value(s: &str) -> Result<String> {
+    if s.contains('\r') || s.contains('\n') {
+        return Err(MppError::InvalidChallenge(
+            "Header value contains invalid CRLF characters".to_string(),
+        ));
+    }
+    Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Header name for payment challenges (from server)
 pub const WWW_AUTHENTICATE_HEADER: &str = "www-authenticate";
 
@@ -101,36 +115,44 @@ fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use mpay::protocol::core::parse_www_authenticate;
+///
 /// let header = r#"Payment id="abc123", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwMCJ9""#;
-/// let challenge = parse_www_authenticate(header)?;
+/// let challenge = parse_www_authenticate(header).unwrap();
 /// assert_eq!(challenge.id, "abc123");
 /// ```
 pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     // Trim leading whitespace (tolerate per RFC 7235)
     let header = header.trim_start();
 
-    // Case-insensitive scheme matching
-    if header.len() < 8 {
-        return Err(MppError::InvalidChallenge("Header too short".to_string()));
-    }
+    // Case-insensitive scheme matching using strip_prefix to avoid UTF-8 boundary panics
+    let rest = header
+        .strip_prefix("Payment")
+        .or_else(|| header.strip_prefix("payment"))
+        .or_else(|| header.strip_prefix("PAYMENT"))
+        .or_else(|| {
+            // Fallback for other case variations
+            if header.len() >= 7
+                && header
+                    .get(..7)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Payment"))
+            {
+                header.get(7..)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| MppError::InvalidChallenge("Expected 'Payment' scheme".to_string()))?;
 
-    let scheme = &header[..7];
-    if !scheme.eq_ignore_ascii_case("Payment") {
-        return Err(MppError::InvalidChallenge(format!(
-            "Expected 'Payment' scheme, got: {}",
-            scheme
-        )));
-    }
-
-    // Check for space after scheme
-    if !header[7..].starts_with(' ') && !header[7..].starts_with('\t') {
-        return Err(MppError::InvalidChallenge(
-            "Expected space after 'Payment' scheme".to_string(),
-        ));
-    }
-
-    let params_str = header[8..].trim_start();
+    // Check for whitespace after scheme
+    let params_str = rest
+        .strip_prefix(' ')
+        .or_else(|| rest.strip_prefix('\t'))
+        .ok_or_else(|| {
+            MppError::InvalidChallenge("Expected space after 'Payment' scheme".to_string())
+        })?
+        .trim_start();
     let params = parse_auth_params(params_str);
 
     // Extract required fields
@@ -182,7 +204,9 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```
+/// use mpay::protocol::core::parse_www_authenticate_all;
+///
 /// let headers = vec![
 ///     "Bearer token",
 ///     "Payment id=\"abc\", realm=\"api\", method=\"tempo\", intent=\"charge\", request=\"e30\"",
@@ -211,32 +235,55 @@ pub fn parse_www_authenticate_all<'a>(
 ///
 /// # Examples
 ///
-/// ```ignore
-/// let challenge = PaymentChallenge { ... };
-/// let header = format_www_authenticate(&challenge)?;
-/// // Returns: Payment id="abc123", realm="api", method="tempo", ...
+/// ```
+/// use mpay::protocol::core::{PaymentChallenge, format_www_authenticate};
+/// use mpay::protocol::core::types::Base64UrlJson;
+///
+/// let challenge = PaymentChallenge {
+///     id: "abc123".to_string(),
+///     realm: "api".to_string(),
+///     method: "tempo".into(),
+///     intent: "charge".into(),
+///     request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+///     digest: None,
+///     expires: None,
+///     description: None,
+/// };
+/// let header = format_www_authenticate(&challenge).unwrap();
+/// assert!(header.starts_with("Payment id=\"abc123\""));
 /// ```
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
+    // Escape all quoted values to prevent header injection
     let mut parts = vec![
-        format!("id=\"{}\"", challenge.id),
-        format!("realm=\"{}\"", challenge.realm),
-        format!("method=\"{}\"", challenge.method),
-        format!("intent=\"{}\"", challenge.intent),
-        format!("request=\"{}\"", challenge.request.raw()),
+        format!("id=\"{}\"", escape_quoted_value(&challenge.id)?),
+        format!("realm=\"{}\"", escape_quoted_value(&challenge.realm)?),
+        format!(
+            "method=\"{}\"",
+            escape_quoted_value(challenge.method.as_str())?
+        ),
+        format!(
+            "intent=\"{}\"",
+            escape_quoted_value(challenge.intent.as_str())?
+        ),
+        format!(
+            "request=\"{}\"",
+            escape_quoted_value(challenge.request.raw())?
+        ),
     ];
 
     if let Some(ref digest) = challenge.digest {
-        parts.push(format!("digest=\"{}\"", digest));
+        parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
     }
 
     if let Some(ref expires) = challenge.expires {
-        parts.push(format!("expires=\"{}\"", expires));
+        parts.push(format!("expires=\"{}\"", escape_quoted_value(expires)?));
     }
 
     if let Some(ref description) = challenge.description {
-        // Escape quotes in description
-        let escaped = description.replace('"', "\\\"");
-        parts.push(format!("description=\"{}\"", escaped));
+        parts.push(format!(
+            "description=\"{}\"",
+            escape_quoted_value(description)?
+        ));
     }
 
     Ok(format!("Payment {}", parts.join(", ")))
@@ -248,11 +295,22 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// let headers = format_www_authenticate_many(&[challenge1, challenge2])?;
-/// for header in headers {
-///     response.append_header("WWW-Authenticate", header);
-/// }
+/// ```
+/// use mpay::protocol::core::{PaymentChallenge, format_www_authenticate_many};
+/// use mpay::protocol::core::types::Base64UrlJson;
+///
+/// let challenge = PaymentChallenge {
+///     id: "abc123".to_string(),
+///     realm: "api".to_string(),
+///     method: "tempo".into(),
+///     intent: "charge".into(),
+///     request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+///     digest: None,
+///     expires: None,
+///     description: None,
+/// };
+/// let headers = format_www_authenticate_many(&[challenge]).unwrap();
+/// assert_eq!(headers.len(), 1);
 /// ```
 pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<Vec<String>> {
     challenges.iter().map(format_www_authenticate).collect()
@@ -264,19 +322,35 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
     let header = header.trim_start();
 
-    if header.len() < 8 {
-        return Err(MppError::InvalidChallenge("Header too short".to_string()));
-    }
+    // Case-insensitive scheme matching using strip_prefix to avoid UTF-8 boundary panics
+    let rest = header
+        .strip_prefix("Payment")
+        .or_else(|| header.strip_prefix("payment"))
+        .or_else(|| header.strip_prefix("PAYMENT"))
+        .or_else(|| {
+            // Fallback for other case variations
+            if header.len() >= 7
+                && header
+                    .get(..7)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("Payment"))
+            {
+                header.get(7..)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| MppError::InvalidChallenge("Expected 'Payment' scheme".to_string()))?;
 
-    let scheme = &header[..7];
-    if !scheme.eq_ignore_ascii_case("Payment") {
+    let token = rest.trim();
+
+    // Enforce size limit to prevent memory exhaustion DoS
+    if token.len() > MAX_TOKEN_LEN {
         return Err(MppError::InvalidChallenge(format!(
-            "Expected 'Payment' scheme, got: {}",
-            scheme
+            "Token exceeds maximum length of {} bytes",
+            MAX_TOKEN_LEN
         )));
     }
 
-    let token = header[7..].trim();
     let decoded = base64url_decode(token)?;
     let credential: PaymentCredential = serde_json::from_slice(&decoded)
         .map_err(|e| MppError::InvalidChallenge(format!("Invalid credential JSON: {}", e)))?;
@@ -297,7 +371,17 @@ pub fn format_authorization(credential: &PaymentCredential) -> Result<String> {
 ///
 /// Format: `<base64url-json>`
 pub fn parse_receipt(header: &str) -> Result<PaymentReceipt> {
-    let decoded = base64url_decode(header.trim())?;
+    let token = header.trim();
+
+    // Enforce size limit to prevent memory exhaustion DoS
+    if token.len() > MAX_TOKEN_LEN {
+        return Err(MppError::InvalidChallenge(format!(
+            "Receipt exceeds maximum length of {} bytes",
+            MAX_TOKEN_LEN
+        )));
+    }
+
+    let decoded = base64url_decode(token)?;
     let receipt: PaymentReceipt = serde_json::from_slice(&decoded)
         .map_err(|e| MppError::InvalidChallenge(format!("Invalid receipt JSON: {}", e)))?;
 

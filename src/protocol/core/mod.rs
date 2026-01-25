@@ -42,17 +42,18 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```
 //! use mpay::protocol::core::*;
 //!
 //! // Parse a challenge
-//! let challenge = parse_www_authenticate(header)?;
+//! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
+//! let challenge = parse_www_authenticate(header).unwrap();
 //! println!("Method: {}, Intent: {}", challenge.method, challenge.intent);
 //!
 //! // Decode the request to a typed struct
 //! use mpay::protocol::intents::ChargeRequest;
 //! if challenge.intent.is_charge() {
-//!     let req: ChargeRequest = challenge.request.decode()?;
+//!     let req: ChargeRequest = challenge.request.decode().unwrap();
 //!     println!("Amount: {}", req.amount);
 //! }
 //!
@@ -62,7 +63,7 @@
 //!     "did:pkh:eip155:88153:0x123",
 //!     PaymentPayload::transaction("0xsigned_tx"),
 //! );
-//! let auth_header = format_authorization(&credential)?;
+//! let auth_header = format_authorization(&credential).unwrap();
 //! ```
 
 pub mod challenge;
