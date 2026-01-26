@@ -1,8 +1,72 @@
-# tower Middleware Example
+# Middleware Examples
 
-Using `mpay` with [tower](https://docs.rs/tower) for reusable payment middleware.
+Using `mpay` with middleware for automatic 402 handling.
 
-## Dependencies
+## Client-Side: reqwest-middleware
+
+With the `middleware` feature, use `PaymentMiddleware` for automatic 402
+handling on all requests.
+
+### Dependencies
+
+```toml
+[dependencies]
+mpay = { version = "0.1", features = ["middleware", "tempo"] }
+reqwest = { version = "0.12", features = ["json"] }
+reqwest-middleware = "0.4"
+tokio = { version = "1", features = ["full"] }
+```
+
+### Usage
+
+```rust
+use mpay::http::{PaymentMiddleware, TempoProvider};
+use mpay::PrivateKeySigner;
+use reqwest_middleware::ClientBuilder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set up your signer
+    let signer = PrivateKeySigner::random();
+    
+    // Create a Tempo payment provider
+    let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+    
+    // Build client with payment middleware
+    let client = ClientBuilder::new(reqwest::Client::new())
+        .with(PaymentMiddleware::new(provider))
+        .build();
+    
+    // All requests automatically handle 402 responses
+    let resp = client
+        .get("https://api.example.com/paid-resource")
+        .send()
+        .await?;
+    
+    println!("Status: {}", resp.status());
+    println!("Body: {}", resp.text().await?);
+    
+    Ok(())
+}
+```
+
+### Comparison: Middleware vs Extension Trait
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| `PaymentMiddleware` | Automatic for all requests | Less control per-request |
+| `PaymentExt` trait | Opt-in per request | Must call `.send_with_payment()` |
+
+Use **middleware** when you want all requests to automatically pay.
+Use **extension trait** when you want explicit control over which requests pay.
+
+---
+
+## Server-Side: tower Layer
+
+For server-side payment requirements using [tower](https://docs.rs/tower).
+
+### Dependencies
 
 ```toml
 [dependencies]
@@ -10,13 +74,13 @@ mpay = "0.1"
 tower = "0.4"
 tower-http = "0.5"
 http = "1"
-pin-project-lite = "0.2"
+axum = "0.7"
 ```
 
-## Payment Layer
+### Payment Layer
 
 ```rust
-use mpay::{Challenge, Credential, Receipt};
+use mpay::{Challenge, Credential};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
@@ -54,7 +118,7 @@ impl<S> Layer<S> for PaymentLayer {
 }
 ```
 
-## Payment Service
+### Payment Service
 
 ```rust
 use http::{Request, Response, StatusCode};
@@ -82,7 +146,7 @@ where
         // Check for valid payment credential
         if let Some(auth) = req.headers().get("authorization") {
             if let Ok(auth_str) = auth.to_str() {
-                if let Ok(credential) = Credential::from_authorization(auth_str) {
+                if let Ok(credential) = Credential::parse_authorization(auth_str) {
                     if self.verify_payment(&credential) {
                         // Payment valid - proceed to inner service
                         return PaymentFuture::Authorized(self.inner.call(req));
@@ -104,27 +168,34 @@ where
 }
 
 impl<S> PaymentService<S> {
-    fn create_challenge(&self) -> Challenge {
-        Challenge {
+    fn create_challenge(&self) -> Challenge::PaymentChallenge {
+        Challenge::PaymentChallenge {
             id: uuid::Uuid::new_v4().to_string(),
-            method: self.config.method.clone(),
+            realm: self.config.realm.clone(),
+            method: self.config.method.clone().into(),
             intent: "charge".into(),
-            request: serde_json::json!({
+            request: mpay::Schema::Base64UrlJson::from_value(&serde_json::json!({
                 "amount": self.config.amount,
-                "asset": self.config.asset,
-                "destination": self.config.destination,
-            }),
+                "currency": self.config.asset,
+                "recipient": self.config.destination,
+            })).unwrap(),
+            digest: None,
+            expires: None,
+            description: None,
         }
     }
 
-    fn verify_payment(&self, credential: &Credential) -> bool {
-        // Implement your verification logic
+    fn verify_payment(&self, credential: &Credential::PaymentCredential) -> bool {
+        // Implement your verification logic:
+        // 1. Check transaction hash on-chain
+        // 2. Verify amount matches
+        // 3. Verify recipient matches
         true
     }
 }
 ```
 
-## Usage with axum
+### Usage with axum
 
 ```rust
 use axum::{routing::get, Router};
@@ -143,7 +214,7 @@ let app = Router::new()
     .layer(ServiceBuilder::new().layer(PaymentLayer::new(payment_config)));
 ```
 
-## Selective Application
+### Selective Application
 
 ```rust
 let free_routes = Router::new()

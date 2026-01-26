@@ -1,0 +1,238 @@
+//! Payment provider trait and implementations.
+//!
+//! The `PaymentProvider` trait abstracts over payment execution, allowing
+//! different payment methods (Tempo, Stripe, etc.) to be used with the
+//! HTTP client extensions.
+
+use crate::error::MppError;
+use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use std::future::Future;
+
+/// Trait for payment providers that can execute payments for challenges.
+///
+/// Implement this trait to add support for custom payment methods.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mpay::http::PaymentProvider;
+/// use mpay::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
+/// use mpay::MppError;
+///
+/// #[derive(Clone)]
+/// struct MyProvider { /* ... */ }
+///
+/// impl PaymentProvider for MyProvider {
+///     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+///         // 1. Parse the challenge request
+///         // 2. Execute payment (sign tx, call API, etc.)
+///         // 3. Return credential with proof
+///         let echo = challenge.to_echo();
+///         Ok(PaymentCredential::new(echo, PaymentPayload::hash("0x...")))
+///     }
+/// }
+/// ```
+pub trait PaymentProvider: Clone + Send + Sync {
+    /// Execute payment for the given challenge and return a credential.
+    ///
+    /// This method should:
+    /// 1. Parse the challenge request for payment details
+    /// 2. Execute the payment (sign transaction, call API, etc.)
+    /// 3. Build and return a `PaymentCredential` with the proof
+    fn pay(
+        &self,
+        challenge: &PaymentChallenge,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
+}
+
+#[allow(dead_code)]
+fn assert_payment_provider_is_object_safe<P: PaymentProvider>() {}
+
+/// Tempo payment provider using EVM signing.
+///
+/// Executes payments on the Tempo blockchain by building and signing
+/// transactions for the charge request.
+///
+/// This provider:
+/// 1. Parses the charge request from the challenge
+/// 2. Builds and signs a transaction using the provided signer
+/// 3. Submits it via the RPC endpoint
+/// 4. Returns a credential with the transaction hash
+///
+/// # Examples
+///
+/// ```ignore
+/// use mpay::http::TempoProvider;
+/// use mpay::PrivateKeySigner;
+///
+/// let signer = PrivateKeySigner::from_bytes(&key)?;
+/// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+///
+/// // Use with PaymentExt
+/// let resp = client
+///     .get("https://api.example.com/paid")
+///     .send_with_payment(&provider)
+///     .await?;
+/// ```
+#[cfg(feature = "tempo")]
+#[derive(Clone)]
+pub struct TempoProvider {
+    signer: alloy_signer_local::PrivateKeySigner,
+    rpc_url: reqwest::Url,
+}
+
+#[cfg(feature = "tempo")]
+impl TempoProvider {
+    /// Create a new Tempo provider with the given signer and RPC URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC URL is invalid.
+    pub fn new(
+        signer: alloy_signer_local::PrivateKeySigner,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
+        let url = rpc_url
+            .as_ref()
+            .parse()
+            .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?;
+        Ok(Self {
+            signer,
+            rpc_url: url,
+        })
+    }
+
+    /// Get a reference to the signer.
+    pub fn signer(&self) -> &alloy_signer_local::PrivateKeySigner {
+        &self.signer
+    }
+
+    /// Get the RPC URL.
+    pub fn rpc_url(&self) -> &reqwest::Url {
+        &self.rpc_url
+    }
+}
+
+#[cfg(feature = "tempo")]
+impl PaymentProvider for TempoProvider {
+    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        use crate::protocol::core::PaymentPayload;
+        use crate::protocol::intents::ChargeRequest;
+        use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
+        use alloy::network::EthereumWallet;
+        use alloy::providers::{Provider, ProviderBuilder};
+
+        let charge: ChargeRequest = challenge.request.decode()?;
+        let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
+        let address = self.signer.address();
+
+        let wallet = EthereumWallet::from(self.signer.clone());
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_http(self.rpc_url.clone());
+
+        let actual_chain_id = provider
+            .get_chain_id()
+            .await
+            .map_err(|e| MppError::Http(format!("failed to get chain ID: {}", e)))?;
+
+        if actual_chain_id != expected_chain_id {
+            return Err(MppError::ChainIdMismatch {
+                expected: expected_chain_id,
+                got: actual_chain_id,
+            });
+        }
+
+        let recipient = charge.recipient_address()?;
+        let amount = charge.amount_u256()?;
+        let currency = charge.currency_address()?;
+
+        let tx_hash = if currency == alloy::primitives::Address::ZERO {
+            let tx = alloy::rpc::types::TransactionRequest::default()
+                .to(recipient)
+                .value(amount);
+
+            let pending = provider
+                .send_transaction(tx)
+                .await
+                .map_err(|e| MppError::Http(format!("transaction send failed: {}", e)))?;
+
+            let tx_hash = *pending.tx_hash();
+
+            let receipt = pending
+                .get_receipt()
+                .await
+                .map_err(|e| MppError::Http(format!("failed to get receipt: {}", e)))?;
+
+            if !receipt.status() {
+                return Err(MppError::TransactionReverted(format!(
+                    "transaction {:#x} reverted",
+                    tx_hash
+                )));
+            }
+
+            tx_hash
+        } else {
+            use alloy::sol;
+
+            sol! {
+                #[sol(rpc)]
+                interface IERC20 {
+                    function transfer(address to, uint256 amount) external returns (bool);
+                }
+            }
+
+            let token = IERC20::new(currency, &provider);
+            let pending = token
+                .transfer(recipient, amount)
+                .send()
+                .await
+                .map_err(|e| MppError::Http(format!("token transfer send failed: {}", e)))?;
+
+            let tx_hash = *pending.tx_hash();
+
+            let receipt = pending
+                .get_receipt()
+                .await
+                .map_err(|e| MppError::Http(format!("failed to get receipt: {}", e)))?;
+
+            if !receipt.status() {
+                return Err(MppError::TransactionReverted(format!(
+                    "token transfer {:#x} reverted",
+                    tx_hash
+                )));
+            }
+
+            tx_hash
+        };
+
+        let echo = challenge.to_echo();
+
+        Ok(PaymentCredential::with_source(
+            echo,
+            format!("did:pkh:eip155:{}:{}", expected_chain_id, address),
+            PaymentPayload::hash(format!("{:#x}", tx_hash)),
+        ))
+    }
+}
+
+#[cfg(all(test, feature = "tempo"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tempo_provider_new() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
+
+        assert_eq!(provider.rpc_url().as_str(), "https://rpc.example.com/");
+        assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn test_tempo_provider_invalid_url() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let result = TempoProvider::new(signer, "not a url");
+        assert!(result.is_err());
+    }
+}

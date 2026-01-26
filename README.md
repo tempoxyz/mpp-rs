@@ -117,6 +117,38 @@ mpay = "0.1"
 | `tempo` | Tempo blockchain support (default, includes `evm`) |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
 | `utils` | Encoding utilities (hex, base64) |
+| `http` | HTTP client support with `PaymentExt` extension trait for reqwest |
+| `middleware` | reqwest-middleware support with `PaymentMiddleware` for automatic 402 handling |
+
+## HTTP Client Support
+
+### Extension Trait (recommended)
+
+Enable the `http` feature for the `PaymentExt` trait:
+
+```rust
+use mpay::http::{PaymentExt, TempoProvider};
+
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+
+let resp = client
+    .get("https://api.example.com/paid")
+    .send_with_payment(&provider)
+    .await?;
+```
+
+### Middleware (automatic)
+
+Enable the `middleware` feature for automatic 402 handling:
+
+```rust
+use mpay::http::{PaymentMiddleware, TempoProvider};
+use reqwest_middleware::ClientBuilder;
+
+let client = ClientBuilder::new(reqwest::Client::new())
+    .with(PaymentMiddleware::new(provider))
+    .build();
+```
 
 ## Examples
 

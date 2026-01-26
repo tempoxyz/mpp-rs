@@ -55,6 +55,9 @@ pub mod crypto;
 #[cfg(feature = "evm")]
 pub mod evm;
 
+#[cfg(feature = "http")]
+pub mod http;
+
 // ==================== Re-exports ====================
 
 // Error types

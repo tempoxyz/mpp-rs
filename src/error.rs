@@ -99,6 +99,18 @@ pub enum MppError {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// Chain ID mismatch between challenge and provider
+    #[error("Chain ID mismatch: challenge requires {expected}, provider connected to {got}")]
+    ChainIdMismatch { expected: u64, got: u64 },
+
+    /// Transaction was confirmed but reverted
+    #[error("Transaction reverted: {0}")]
+    TransactionReverted(String),
+
+    /// Failed to format credential for Authorization header
+    #[error("Failed to format credential: {0}")]
+    CredentialFormat(String),
+
     /// Unsupported HTTP method
     #[error("Unsupported HTTP method: {0}")]
     UnsupportedHttpMethod(String),
