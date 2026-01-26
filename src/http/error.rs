@@ -12,6 +12,9 @@ pub enum HttpError {
     /// Failed to parse challenge from WWW-Authenticate header
     InvalidChallenge(String),
 
+    /// Failed to format credential for Authorization header
+    InvalidCredential(String),
+
     /// Request could not be cloned (required for retry)
     CloneFailed,
 
@@ -30,6 +33,7 @@ impl fmt::Display for HttpError {
                 write!(f, "402 response missing WWW-Authenticate header")
             }
             Self::InvalidChallenge(msg) => write!(f, "invalid challenge: {}", msg),
+            Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),
             Self::CloneFailed => write!(f, "request could not be cloned for retry"),
             Self::Payment(e) => write!(f, "payment failed: {}", e),
             #[cfg(feature = "http")]

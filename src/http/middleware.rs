@@ -2,7 +2,9 @@
 //!
 //! Provides `PaymentMiddleware` for use with `reqwest_middleware::ClientBuilder`.
 
+use anyhow::Context;
 use async_trait::async_trait;
+use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
@@ -60,52 +62,41 @@ where
             return Ok(resp);
         }
 
-        let retry_req = retry_req.ok_or_else(|| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "request could not be cloned for payment retry"
-            ))
-        })?;
+        let retry_req = retry_req
+            .context("request could not be cloned for payment retry")
+            .map_err(reqwest_middleware::Error::Middleware)?;
 
         let www_auth = resp
             .headers()
-            .get("www-authenticate")
-            .ok_or_else(|| {
-                reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    "402 response missing WWW-Authenticate header"
-                ))
-            })?
+            .get(WWW_AUTHENTICATE)
+            .context("402 response missing WWW-Authenticate header")
+            .map_err(reqwest_middleware::Error::Middleware)?
             .to_str()
-            .map_err(|e| {
-                reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    "invalid WWW-Authenticate header: {}",
-                    e
-                ))
-            })?;
+            .context("invalid WWW-Authenticate header")
+            .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let challenge = parse_www_authenticate(www_auth).map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!("invalid challenge: {}", e))
-        })?;
+        let challenge = parse_www_authenticate(www_auth)
+            .context("invalid challenge")
+            .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let credential = self.provider.pay(&challenge).await.map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!("payment failed: {}", e))
-        })?;
+        let credential = self
+            .provider
+            .pay(&challenge)
+            .await
+            .context("payment failed")
+            .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let auth_header = format_authorization(&credential).map_err(|e| {
-            reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                "failed to format credential: {}",
-                e
-            ))
-        })?;
+        let auth_header = format_authorization(&credential)
+            .context("failed to format credential")
+            .map_err(reqwest_middleware::Error::Middleware)?;
 
         let mut retry_req = retry_req;
         retry_req.headers_mut().insert(
             AUTHORIZATION_HEADER,
-            auth_header.parse().map_err(|e| {
-                reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    "invalid authorization header: {}",
-                    e
-                ))
-            })?,
+            auth_header
+                .parse()
+                .context("invalid authorization header")
+                .map_err(reqwest_middleware::Error::Middleware)?,
         );
 
         next.run(retry_req, extensions).await

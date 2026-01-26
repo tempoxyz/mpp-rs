@@ -2,6 +2,7 @@
 //!
 //! Provides `.send_with_payment()` method for opt-in per-request payment handling.
 
+use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::error::HttpError;
@@ -64,7 +65,7 @@ impl PaymentExt for RequestBuilder {
 
         let www_auth = resp
             .headers()
-            .get("www-authenticate")
+            .get(WWW_AUTHENTICATE)
             .ok_or(HttpError::MissingChallenge)?
             .to_str()
             .map_err(|e| HttpError::InvalidChallenge(e.to_string()))?;
@@ -75,7 +76,7 @@ impl PaymentExt for RequestBuilder {
         let credential = provider.pay(&challenge).await?;
 
         let auth_header = format_authorization(&credential)
-            .map_err(|e| HttpError::InvalidChallenge(e.to_string()))?;
+            .map_err(|e| HttpError::InvalidCredential(e.to_string()))?;
 
         let retry_resp = retry_builder
             .header(AUTHORIZATION_HEADER, auth_header)
