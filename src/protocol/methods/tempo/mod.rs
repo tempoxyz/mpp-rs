@@ -7,7 +7,8 @@
 //!
 //! - [`TempoMethodDetails`]: Tempo-specific method details (2D nonces, fee payer)
 //! - [`TempoChargeExt`]: Extension trait for ChargeRequest with Tempo-specific accessors
-//! - [`transaction::TempoTransactionParams`]: Transaction params for building transactions
+//! - [`TempoTransactionRequest`]: Transaction request builder (from tempo-alloy)
+//! - [`TempoTransaction`]: Full Tempo transaction type 0x76 (from tempo-primitives)
 //!
 //! # Constants
 //!
@@ -66,7 +67,8 @@ pub mod types;
 
 pub use charge::TempoChargeExt;
 pub use transaction::{
-    TempoSendTransactionRequest, TempoTransactionParams, TEMPO_SEND_TRANSACTION_METHOD,
+    Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
+    TEMPO_TX_TYPE_ID,
 };
 pub use types::{TempoMethodDetails, DEFAULT_FEE_PAYER_URL};
 
