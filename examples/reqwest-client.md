@@ -6,13 +6,59 @@ Using `mpay` with [reqwest](https://docs.rs/reqwest) for client-side 402 handlin
 
 ```toml
 [dependencies]
-mpay = "0.1"
+mpay = { version = "0.1", features = ["http", "tempo"] }
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
-serde_json = "1"
 ```
 
-## Basic 402 Handling
+## Using PaymentExt (Recommended)
+
+The `PaymentExt` trait provides a `.send_with_payment()` method for opt-in
+per-request payment handling. This is the most idiomatic Rust approach.
+
+```rust
+use mpay::http::{PaymentExt, TempoProvider};
+use mpay::PrivateKeySigner;
+use reqwest::Client;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set up your signer (from private key, hardware wallet, etc.)
+    let signer = PrivateKeySigner::random();
+    
+    // Create a Tempo payment provider
+    let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+    
+    // Use standard reqwest client
+    let client = Client::new();
+    
+    // Make a request - automatically handles 402 responses
+    let resp = client
+        .get("https://api.example.com/paid-resource")
+        .send_with_payment(&provider)
+        .await?;
+    
+    println!("Status: {}", resp.status());
+    println!("Body: {}", resp.text().await?);
+    
+    Ok(())
+}
+```
+
+## Flow
+
+When using `.send_with_payment()`:
+
+1. Initial request is sent
+2. If response is 402 Payment Required:
+   - Challenge is parsed from `WWW-Authenticate` header
+   - Provider executes payment (signs and broadcasts transaction)
+   - Request is retried with credential in `Authorization` header
+3. Final response is returned
+
+## Manual 402 Handling
+
+For full control, handle the 402 flow manually:
 
 ```rust
 use mpay::{Challenge, Credential};
@@ -33,22 +79,23 @@ async fn fetch_paid_resource(
             .ok_or("missing www-authenticate")?
             .to_str()?;
 
-        let challenge = Challenge::from_www_authenticate(header)?;
+        let challenge = Challenge::parse_www_authenticate(header)?;
 
         // Execute payment (your logic here)
         let tx_hash = execute_payment(&challenge).await?;
 
         // Build credential
-        let credential = Credential {
-            id: challenge.id,
-            source: Some("did:pkh:eip155:8453:0xYourAddress".into()),
-            payload: serde_json::json!({ "hash": tx_hash }),
-        };
+        let credential = Credential::PaymentCredential::with_source(
+            challenge.to_echo(),
+            "did:pkh:eip155:88153:0xYourAddress",
+            Credential::PaymentPayload::hash(tx_hash),
+        );
 
         // Retry with payment credential
+        let auth_header = Credential::format_authorization(&credential)?;
         let resp = client
             .get(url)
-            .header("authorization", credential.to_authorization())
+            .header("authorization", auth_header)
             .send()
             .await?;
 
@@ -67,10 +114,11 @@ use mpay::{Challenge, Credential, Receipt};
 async fn fetch_with_receipt(
     client: &Client,
     url: &str,
-) -> Result<(String, Option<Receipt>), Box<dyn std::error::Error>> {
+    auth_header: &str,
+) -> Result<(String, Option<Receipt::PaymentReceipt>), Box<dyn std::error::Error>> {
     let resp = client
         .get(url)
-        .header("authorization", credential.to_authorization())
+        .header("authorization", auth_header)
         .send()
         .await?;
 
@@ -79,50 +127,37 @@ async fn fetch_with_receipt(
         .headers()
         .get("payment-receipt")
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| Receipt::from_payment_receipt(h).ok());
+        .and_then(|h| Receipt::parse_receipt(h).ok());
 
     Ok((resp.text().await?, receipt))
 }
 ```
 
-## Retry Wrapper
+## Custom Provider
+
+Implement `PaymentProvider` for custom payment methods:
 
 ```rust
-use mpay::{Challenge, Credential};
+use mpay::http::PaymentProvider;
+use mpay::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
+use mpay::MppError;
 
-struct PayingClient {
-    client: Client,
-    wallet: Wallet,
+#[derive(Clone)]
+struct MyProvider {
+    api_key: String,
 }
 
-impl PayingClient {
-    /// Automatically handles 402 responses
-    pub async fn get(&self, url: &str) -> Result<Response, Error> {
-        let resp = self.client.get(url).send().await?;
-
-        if resp.status() == StatusCode::PAYMENT_REQUIRED {
-            let challenge = self.parse_challenge(&resp)?;
-            let credential = self.pay_challenge(&challenge).await?;
-
-            return self
-                .client
-                .get(url)
-                .header("authorization", credential.to_authorization())
-                .send()
-                .await;
-        }
-
-        Ok(resp)
-    }
-
-    async fn pay_challenge(&self, challenge: &Challenge) -> Result<Credential, Error> {
-        let tx_hash = self.wallet.send_payment(&challenge.request).await?;
-
-        Ok(Credential {
-            id: challenge.id.clone(),
-            source: Some(self.wallet.did()),
-            payload: serde_json::json!({ "hash": tx_hash }),
-        })
+impl PaymentProvider for MyProvider {
+    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        // Your payment logic here
+        // 1. Parse the challenge request
+        // 2. Execute payment via your method
+        // 3. Return credential with proof
+        
+        Ok(PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::hash("0x..."),
+        ))
     }
 }
 ```
