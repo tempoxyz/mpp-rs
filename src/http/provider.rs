@@ -51,13 +51,19 @@ fn assert_payment_provider_is_object_safe<P: PaymentProvider>() {}
 /// Tempo payment provider using EVM signing.
 ///
 /// Executes payments on the Tempo blockchain by building and signing
-/// transactions for the charge request.
+/// TempoTransactions (type 0x76) for charge requests.
 ///
 /// This provider:
 /// 1. Parses the charge request from the challenge
-/// 2. Builds and signs a transaction using the provided signer
-/// 3. Submits it via the RPC endpoint
+/// 2. Builds and signs a TempoTransaction using the provided signer
+/// 3. Submits it via the Tempo RPC endpoint
 /// 4. Returns a credential with the transaction hash
+///
+/// # Features
+///
+/// - **2D Nonces**: Supports parallel transaction streams via `nonce_key`
+/// - **TIP-20 Fees**: Supports paying gas fees in TIP-20 tokens via `fee_token`
+/// - **ERC-20 Transfers**: Handles both native transfers and ERC-20 token transfers
 ///
 /// # Examples
 ///
@@ -118,20 +124,21 @@ impl PaymentProvider for TempoProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
-        use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
-        use alloy::network::EthereumWallet;
+        use crate::protocol::methods::tempo::{TempoChargeExt, TempoTransactionRequest, CHAIN_ID};
+        use alloy::network::{EthereumWallet, ReceiptResponse, TransactionBuilder};
         use alloy::providers::{Provider, ProviderBuilder};
+        use tempo_alloy::TempoNetwork;
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
         let address = self.signer.address();
 
         let wallet = EthereumWallet::from(self.signer.clone());
-        let provider = ProviderBuilder::new()
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .wallet(wallet)
             .connect_http(self.rpc_url.clone());
 
-        let actual_chain_id = provider
+        let actual_chain_id: u64 = provider
             .get_chain_id()
             .await
             .map_err(|e| MppError::Http(format!("failed to get chain ID: {}", e)))?;
@@ -147,10 +154,22 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
+        let nonce_key = charge.nonce_key();
+        let fee_token = charge
+            .fee_token()
+            .and_then(|s| crate::evm::parse_address(&s).ok());
+
         let tx_hash = if currency == alloy::primitives::Address::ZERO {
-            let tx = alloy::rpc::types::TransactionRequest::default()
-                .to(recipient)
-                .value(amount);
+            let mut tx = TempoTransactionRequest::default();
+            tx.set_to(recipient);
+            tx.set_value(amount);
+
+            if !nonce_key.is_zero() {
+                tx.set_nonce_key(nonce_key);
+            }
+            if let Some(fee_token_addr) = fee_token {
+                tx = tx.with_fee_token(fee_token_addr);
+            }
 
             let pending = provider
                 .send_transaction(tx)
@@ -174,6 +193,7 @@ impl PaymentProvider for TempoProvider {
             tx_hash
         } else {
             use alloy::sol;
+            use tempo_alloy::rpc::TempoCallBuilderExt;
 
             sol! {
                 #[sol(rpc)]
@@ -183,8 +203,17 @@ impl PaymentProvider for TempoProvider {
             }
 
             let token = IERC20::new(currency, &provider);
-            let pending = token
-                .transfer(recipient, amount)
+
+            let mut call = token.transfer(recipient, amount);
+
+            if !nonce_key.is_zero() {
+                call = call.nonce_key(nonce_key);
+            }
+            if let Some(fee_token_addr) = fee_token {
+                call = call.fee_token(fee_token_addr);
+            }
+
+            let pending = call
                 .send()
                 .await
                 .map_err(|e| MppError::Http(format!("token transfer send failed: {}", e)))?;
