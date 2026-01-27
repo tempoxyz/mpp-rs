@@ -61,9 +61,8 @@ fn assert_payment_provider_is_object_safe<P: PaymentProvider>() {}
 ///
 /// # Features
 ///
-/// - **2D Nonces**: Supports parallel transaction streams via `nonce_key`
-/// - **TIP-20 Fees**: Supports paying gas fees in TIP-20 tokens via `fee_token`
 /// - **ERC-20 Transfers**: Handles both native transfers and ERC-20 token transfers
+/// - **Fee Sponsorship**: Supports server-paid fees when `feePayer: true`
 ///
 /// # Examples
 ///
@@ -154,22 +153,10 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        let nonce_key = charge.nonce_key();
-        let fee_token = charge
-            .fee_token()
-            .and_then(|s| crate::evm::parse_address(&s).ok());
-
         let tx_hash = if currency == alloy::primitives::Address::ZERO {
             let mut tx = TempoTransactionRequest::default();
             tx.set_to(recipient);
             tx.set_value(amount);
-
-            if !nonce_key.is_zero() {
-                tx.set_nonce_key(nonce_key);
-            }
-            if let Some(fee_token_addr) = fee_token {
-                tx = tx.with_fee_token(fee_token_addr);
-            }
 
             let pending = provider
                 .send_transaction(tx)
@@ -193,7 +180,6 @@ impl PaymentProvider for TempoProvider {
             tx_hash
         } else {
             use alloy::sol;
-            use tempo_alloy::rpc::TempoCallBuilderExt;
 
             sol! {
                 #[sol(rpc)]
@@ -203,15 +189,7 @@ impl PaymentProvider for TempoProvider {
             }
 
             let token = IERC20::new(currency, &provider);
-
-            let mut call = token.transfer(recipient, amount);
-
-            if !nonce_key.is_zero() {
-                call = call.nonce_key(nonce_key);
-            }
-            if let Some(fee_token_addr) = fee_token {
-                call = call.fee_token(fee_token_addr);
-            }
+            let call = token.transfer(recipient, amount);
 
             let pending = call
                 .send()
