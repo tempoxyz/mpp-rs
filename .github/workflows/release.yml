@@ -17,7 +17,6 @@ jobs:
       - name: Changelogs
         uses: wevm/changelogs-rs@master
         with:
-          version: changelogs version
           conventional-commit: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
