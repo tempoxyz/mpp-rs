@@ -85,11 +85,11 @@ pub trait PaymentProvider: Clone + Send + Sync {
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::client::tempo::Provider;
+/// use mpay::client::TempoProvider;
 /// use mpay::PrivateKeySigner;
 ///
 /// let signer = PrivateKeySigner::from_bytes(&key)?;
-/// let provider = Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+/// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 ///
 /// // Use with PaymentExt
 /// let resp = client

@@ -17,7 +17,7 @@ The `Fetch` trait provides a `.send_with_payment()` method for opt-in
 per-request payment handling. This is the most idiomatic Rust approach.
 
 ```rust
-use mpay::client::{Fetch, tempo};
+use mpay::client::{Fetch, TempoProvider};
 use mpay::PrivateKeySigner;
 use reqwest::Client;
 
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = PrivateKeySigner::random();
     
     // Create a Tempo payment provider
-    let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+    let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
     
     // Use standard reqwest client
     let client = Client::new();

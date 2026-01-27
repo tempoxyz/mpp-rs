@@ -6,14 +6,14 @@
 //!
 //! - [`PaymentProvider`]: Trait for payment providers
 //! - [`Fetch`]: Extension trait for reqwest with `.send_with_payment()` method (requires `http`)
-//! - [`tempo`]: Tempo-specific provider (requires `tempo`)
+//! - [`TempoProvider`]: Tempo blockchain provider (requires `tempo` + `http`)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use mpay::client::{Fetch, PaymentProvider, tempo};
+//! use mpay::client::{Fetch, TempoProvider};
 //!
-//! let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+//! let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 //! let resp = client.get(url).send_with_payment(&provider).await?;
 //! ```
 
@@ -26,8 +26,5 @@ pub use crate::http::PaymentExt as Fetch;
 #[cfg(feature = "middleware")]
 pub use crate::http::PaymentMiddleware;
 
-/// Tempo-specific client provider.
 #[cfg(all(feature = "tempo", feature = "http"))]
-pub mod tempo {
-    pub use crate::http::TempoProvider as Provider;
-}
+pub use crate::http::TempoProvider;

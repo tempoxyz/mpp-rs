@@ -388,15 +388,15 @@ async fn paid_resource<M: ChargeMethod>(
 }
 ```
 
-## Built-in: tempo::ChargeMethod
+## Built-in: TempoChargeMethod
 
-mpay-rs includes `tempo::ChargeMethod` for Tempo blockchain verification:
+mpay-rs includes `TempoChargeMethod` for Tempo blockchain verification:
 
 ```rust
-use mpay::server::tempo::ChargeMethod;
+use mpay::server::TempoChargeMethod;
 use mpay::Intent::ChargeRequest;
 
-let method = ChargeMethod::new("https://rpc.moderato.tempo.xyz")
+let method = TempoChargeMethod::new("https://rpc.moderato.tempo.xyz")
     .with_timeout(30);
 
 // The method name

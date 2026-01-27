@@ -7,23 +7,23 @@
 //! - [`ChargeMethod`]: Trait for verifying charge intent payments
 //! - [`VerificationError`]: Error type for verification failures
 //! - [`ErrorCode`]: Error codes for programmatic handling
-//! - [`tempo`]: Tempo-specific verification (requires `tempo`)
+//! - [`TempoChargeMethod`]: Tempo blockchain verification (requires `tempo`)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use mpay::server::{ChargeMethod, tempo};
+//! use mpay::server::{ChargeMethod, TempoChargeMethod};
 //!
-//! let method = tempo::ChargeMethod::new(provider);
+//! let method = TempoChargeMethod::new(provider);
 //! let receipt = method.verify(&credential, &request).await?;
 //! ```
 
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
 
-/// Tempo-specific server verification.
 #[cfg(feature = "tempo")]
-pub mod tempo {
-    pub use crate::protocol::methods::tempo::{
-        ChargeMethod, TempoChargeExt, TempoMethodDetails, CHAIN_ID, METHOD_NAME,
-    };
-}
+pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
+
+#[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::{
+    TempoChargeExt, TempoMethodDetails, CHAIN_ID, METHOD_NAME,
+};

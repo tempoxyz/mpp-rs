@@ -140,7 +140,7 @@ let request = ChargeRequest {
 Method traits verify payment credentials with typed schemas using alloy's Provider:
 
 ```rust
-use mpay::server::{ChargeMethod, tempo};
+use mpay::server::{ChargeMethod, TempoChargeMethod};
 use alloy::providers::ProviderBuilder;
 
 // Create an alloy provider
@@ -148,7 +148,7 @@ let provider = ProviderBuilder::new()
     .connect_http("https://rpc.moderato.tempo.xyz".parse()?);
 
 // Create the charge method with the provider
-let method = tempo::ChargeMethod::new(provider);
+let method = TempoChargeMethod::new(provider);
 
 // Verify a payment
 let receipt = method.verify(&credential, &request).await?;
@@ -159,9 +159,9 @@ let receipt = method.verify(&credential, &request).await?;
 PaymentProvider creates credentials for challenges:
 
 ```rust
-use mpay::client::{PaymentProvider, tempo};
+use mpay::client::{PaymentProvider, TempoProvider};
 
-let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 
 // Check support
 assert!(provider.supports("tempo", "charge"));
@@ -211,9 +211,9 @@ mpay = { version = "0.1", default-features = false }
 Enable the `http` feature for the `Fetch` trait:
 
 ```rust
-use mpay::client::{Fetch, tempo};
+use mpay::client::{Fetch, TempoProvider};
 
-let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 
 let resp = client
     .get("https://api.example.com/paid")
@@ -226,10 +226,10 @@ let resp = client
 Enable the `middleware` feature for automatic 402 handling:
 
 ```rust
-use mpay::client::{PaymentMiddleware, tempo};
+use mpay::client::{PaymentMiddleware, TempoProvider};
 use reqwest_middleware::ClientBuilder;
 
-let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 let client = ClientBuilder::new(reqwest::Client::new())
     .with(PaymentMiddleware::new(provider))
     .build();

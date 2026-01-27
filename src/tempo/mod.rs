@@ -1,6 +1,6 @@
 //! Tempo blockchain types and utilities.
 //!
-//! This module re-exports Tempo-specific types for both client and server use.
+//! This module re-exports Tempo-specific types for convenience.
 //!
 //! # Exports
 //!
@@ -9,10 +9,9 @@
 //! - Transaction types: [`TempoTransaction`], [`TempoTransactionRequest`]
 //! - Constants: [`CHAIN_ID`], [`METHOD_NAME`]
 //!
-//! # Submodules
-//!
-//! - [`client`]: Client-side Tempo provider (requires `client` + `http`)
-//! - [`server`]: Server-side Tempo verification (requires `server`)
+//! For client/server specific types, use:
+//! - `mpay::client::TempoProvider` (requires `client` + `http`)
+//! - `mpay::server::TempoChargeMethod` (requires `server`)
 //!
 //! # Example
 //!
@@ -33,16 +32,7 @@ pub use crate::protocol::methods::tempo::{
 };
 
 #[cfg(feature = "server")]
-pub use crate::protocol::methods::tempo::ChargeMethod;
+pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 
-/// Client-side Tempo provider.
 #[cfg(all(feature = "client", feature = "http"))]
-pub mod client {
-    pub use crate::http::TempoProvider as Provider;
-}
-
-/// Server-side Tempo verification.
-#[cfg(feature = "server")]
-pub mod server {
-    pub use crate::protocol::methods::tempo::ChargeMethod;
-}
+pub use crate::http::TempoProvider;

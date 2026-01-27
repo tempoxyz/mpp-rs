@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["full"] }
 ### Usage
 
 ```rust
-use mpay::client::{PaymentMiddleware, tempo};
+use mpay::client::{PaymentMiddleware, TempoProvider};
 use mpay::PrivateKeySigner;
 use reqwest_middleware::ClientBuilder;
 
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = PrivateKeySigner::random();
     
     // Create a Tempo payment provider
-    let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+    let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
     
     // Build client with payment middleware
     let client = ClientBuilder::new(reqwest::Client::new())
