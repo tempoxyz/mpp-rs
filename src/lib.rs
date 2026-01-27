@@ -88,9 +88,10 @@ pub mod Receipt {
     pub use crate::protocol::core::{format_receipt, parse_receipt, PaymentReceipt, ReceiptStatus};
 }
 
-/// Intent types for payment requests
+/// Intent types for payment requests and server-side verification
 #[allow(non_snake_case)]
 pub mod Intent {
+    pub use crate::protocol::intent::{Intent, VerificationError};
     pub use crate::protocol::intents::ChargeRequest;
 }
 
@@ -104,9 +105,11 @@ pub mod Schema {
     };
 }
 
-/// Payment method implementations
+/// Payment method implementations and client-side trait
 #[allow(non_snake_case)]
 pub mod Method {
+    pub use crate::protocol::method::Method;
+
     #[cfg(feature = "tempo")]
     pub use crate::protocol::methods::tempo;
 }

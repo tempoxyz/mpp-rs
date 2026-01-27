@@ -82,5 +82,7 @@
 //! ```
 
 pub mod core;
+pub mod intent;
 pub mod intents;
+pub mod method;
 pub mod methods;

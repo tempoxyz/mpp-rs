@@ -60,10 +60,14 @@
 //! ```
 
 pub mod charge;
+#[cfg(feature = "http")]
+pub mod intent;
 pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
+#[cfg(feature = "http")]
+pub use intent::TempoChargeIntent;
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,

@@ -246,6 +246,26 @@ pub struct PaymentReceipt {
 }
 
 impl PaymentReceipt {
+    /// Create a successful payment receipt.
+    pub fn success(method: impl Into<MethodName>, reference: impl Into<String>) -> Self {
+        Self {
+            status: ReceiptStatus::Success,
+            method: method.into(),
+            timestamp: now_iso8601(),
+            reference: reference.into(),
+        }
+    }
+
+    /// Create a failed payment receipt.
+    pub fn failed(method: impl Into<MethodName>, error_msg: &str) -> Self {
+        Self {
+            status: ReceiptStatus::Failed,
+            method: method.into(),
+            timestamp: now_iso8601(),
+            reference: format!("error: {}", error_msg),
+        }
+    }
+
     /// Check if the payment was successful.
     pub fn is_success(&self) -> bool {
         self.status == ReceiptStatus::Success
@@ -255,6 +275,57 @@ impl PaymentReceipt {
     pub fn is_failed(&self) -> bool {
         self.status == ReceiptStatus::Failed
     }
+}
+
+fn now_iso8601() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+
+    let mut year = 1970i32;
+    let mut remaining = days as i64;
+    loop {
+        let days_in_year = if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days: [i64; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    for &md in &month_days {
+        if remaining < md {
+            break;
+        }
+        remaining -= md;
+        month += 1;
+    }
+    let day = remaining + 1;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
 }
 
 #[cfg(test)]
