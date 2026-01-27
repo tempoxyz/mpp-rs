@@ -139,7 +139,9 @@ where
                 })?;
 
             let to_addr = tx.inner.to().ok_or_else(|| {
-                VerificationError::invalid_recipient("Transaction has no recipient (contract creation)")
+                VerificationError::invalid_recipient(
+                    "Transaction has no recipient (contract creation)",
+                )
             })?;
 
             if to_addr != expected_recipient {
@@ -279,11 +281,10 @@ where
             }
 
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
-            let actual_chain_id = this
-                .provider
-                .get_chain_id()
-                .await
-                .map_err(|e| VerificationError::new(format!("Failed to fetch chain ID: {}", e)))?;
+            let actual_chain_id =
+                this.provider.get_chain_id().await.map_err(|e| {
+                    VerificationError::new(format!("Failed to fetch chain ID: {}", e))
+                })?;
 
             if actual_chain_id != expected_chain_id {
                 return Err(VerificationError::with_code(

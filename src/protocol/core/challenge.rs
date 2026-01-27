@@ -243,6 +243,14 @@ pub struct PaymentReceipt {
 
     /// Transaction hash or reference
     pub reference: String,
+
+    /// Block number (optional, for display purposes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<String>,
+
+    /// Error message (optional, for failed payments)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl PaymentReceipt {
@@ -253,6 +261,8 @@ impl PaymentReceipt {
             method: method.into(),
             timestamp: now_iso8601(),
             reference: reference.into(),
+            block_number: None,
+            error: None,
         }
     }
 
@@ -262,7 +272,9 @@ impl PaymentReceipt {
             status: ReceiptStatus::Failed,
             method: method.into(),
             timestamp: now_iso8601(),
-            reference: format!("error: {}", error_msg),
+            reference: String::new(),
+            block_number: None,
+            error: Some(error_msg.to_string()),
         }
     }
 
@@ -420,6 +432,8 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc".to_string(),
+            block_number: None,
+            error: None,
         };
         assert!(success.is_success());
         assert!(!success.is_failed());
@@ -429,6 +443,8 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "".to_string(),
+            block_number: None,
+            error: Some("Payment failed".to_string()),
         };
         assert!(!failed.is_success());
         assert!(failed.is_failed());
