@@ -84,3 +84,4 @@
 pub mod core;
 pub mod intents;
 pub mod methods;
+pub mod traits;

@@ -14,7 +14,7 @@ categories = ["web-programming", "authentication", "cryptography"]
 [features]
 default = ["tempo"]
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives"]
+tempo = ["evm", "tempo-alloy", "tempo-primitives", "chrono", "tokio", "http"]
 utils = ["hex", "rand"]
 http = ["reqwest"]
 middleware = ["http", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
@@ -35,6 +35,10 @@ alloy-signer-local = { version = "1.2", optional = true }
 # Tempo dependencies (optional, git-based)
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo", default-features = false, optional = true }
 tempo-primitives = { git = "https://github.com/tempoxyz/tempo", default-features = false, features = ["serde"], optional = true }
+
+# Time and async dependencies (optional)
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"], optional = true }
+tokio = { version = "1", features = ["time"], optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.12", features = ["json"], optional = true }

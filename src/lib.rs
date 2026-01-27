@@ -92,6 +92,7 @@ pub mod Receipt {
 #[allow(non_snake_case)]
 pub mod Intent {
     pub use crate::protocol::intents::ChargeRequest;
+    pub use crate::protocol::traits::{Intent, IntentRegistry, VerificationError};
 }
 
 /// Schema types for protocol encoding
@@ -109,6 +110,7 @@ pub mod Schema {
 pub mod Method {
     #[cfg(feature = "tempo")]
     pub use crate::protocol::methods::tempo;
+    pub use crate::protocol::traits::Method;
 }
 
 // ==================== Alloy Re-exports (batteries included) ====================
