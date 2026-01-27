@@ -15,12 +15,6 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install changelogs CLI
-        run: cargo install changelogs
-
       - name: Install Claude CLI
         run: npm install -g @anthropic-ai/claude-code
 
