@@ -24,9 +24,9 @@ All methods implementing the same intent use the same request type. This ensures
 The `ChargeMethod` trait verifies payment credentials against a typed `ChargeRequest`:
 
 ```rust
-use mpay::Method::{ChargeMethod, VerificationError};
+use mpay::server::{ChargeMethod, VerificationError};
 use mpay::Intent::ChargeRequest;
-use mpay::Receipt::PaymentReceipt;
+use mpay::Receipt::Receipt;
 use mpay::Credential::PaymentCredential;
 use std::future::Future;
 
@@ -39,16 +39,16 @@ pub trait ChargeMethod: Clone + Send + Sync {
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
-    ) -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send;
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send;
 }
 ```
 
 ## Example: Stripe ChargeMethod
 
 ```rust
-use mpay::Method::{ChargeMethod, VerificationError};
+use mpay::server::{ChargeMethod, VerificationError};
 use mpay::Intent::ChargeRequest;
-use mpay::Receipt::PaymentReceipt;
+use mpay::Receipt::Receipt;
 use mpay::Credential::PaymentCredential;
 
 #[derive(Clone)]
@@ -71,7 +71,7 @@ impl ChargeMethod for StripeChargeMethod {
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
-    ) -> impl std::future::Future<Output = Result<PaymentReceipt, VerificationError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Receipt, VerificationError>> + Send {
         let api_key = self.api_key.clone();
         let credential = credential.clone();
         let request = request.clone();
@@ -124,7 +124,7 @@ impl ChargeMethod for StripeChargeMethod {
                 )));
             }
 
-            Ok(PaymentReceipt::success("stripe", &payment_intent_id))
+            Ok(Receipt::success("stripe", &payment_intent_id))
         }
     }
 }
@@ -135,9 +135,9 @@ impl ChargeMethod for StripeChargeMethod {
 Support multiple EVM chains with a single method:
 
 ```rust
-use mpay::Method::{ChargeMethod, VerificationError};
+use mpay::server::{ChargeMethod, VerificationError};
 use mpay::Intent::ChargeRequest;
-use mpay::Receipt::PaymentReceipt;
+use mpay::Receipt::Receipt;
 use mpay::Credential::PaymentCredential;
 use std::collections::HashMap;
 
@@ -179,7 +179,7 @@ impl ChargeMethod for MultiChainChargeMethod {
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
-    ) -> impl std::future::Future<Output = Result<PaymentReceipt, VerificationError>> + Send {
+    ) -> impl std::future::Future<Output = Result<Receipt, VerificationError>> + Send {
         let this = self.clone();
         let credential = credential.clone();
         let request = request.clone();
@@ -200,7 +200,7 @@ impl ChargeMethod for MultiChainChargeMethod {
             // Verify transaction on chain using request.amount, request.currency, request.recipient
             // (implementation similar to TempoChargeMethod)
 
-            Ok(PaymentReceipt::success(format!("evm:{}", chain_id), &tx_hash))
+            Ok(Receipt::success(format!("evm:{}", chain_id), &tx_hash))
         }
     }
 }
@@ -211,7 +211,7 @@ impl ChargeMethod for MultiChainChargeMethod {
 The `PaymentProvider` trait creates credentials for payment challenges:
 
 ```rust
-use mpay::Provider::PaymentProvider;
+use mpay::client::PaymentProvider;
 use mpay::Challenge::PaymentChallenge;
 use mpay::Credential::PaymentCredential;
 use mpay::MppError;
@@ -234,7 +234,7 @@ With Stripe, the server creates a PaymentIntent and includes its ID in the chall
 `method_details`. The client confirms the payment and returns the ID as the credential:
 
 ```rust
-use mpay::Provider::PaymentProvider;
+use mpay::client::PaymentProvider;
 use mpay::Challenge::PaymentChallenge;
 use mpay::Credential::{PaymentCredential, PaymentPayload};
 use mpay::MppError;
@@ -297,8 +297,8 @@ use mpay::{
     Challenge::PaymentChallenge,
     Credential::PaymentCredential,
     Intent::ChargeRequest,
-    Method::{ChargeMethod, VerificationError},
-    Receipt::{format_receipt, PaymentReceipt},
+    server::{ChargeMethod, VerificationError},
+    Receipt::{format_receipt, Receipt},
     Schema::Base64UrlJson,
 };
 
@@ -312,7 +312,7 @@ async fn verify_or_challenge<M: ChargeMethod>(
     method: &M,
     request: &ChargeRequest,
     realm: &str,
-) -> Result<(PaymentCredential, PaymentReceipt), Response> {
+) -> Result<(PaymentCredential, Receipt), Response> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok());
@@ -393,7 +393,7 @@ async fn paid_resource<M: ChargeMethod>(
 mpay-rs includes `tempo::ChargeMethod` for Tempo blockchain verification:
 
 ```rust
-use mpay::Method::tempo::ChargeMethod;
+use mpay::server::tempo::ChargeMethod;
 use mpay::Intent::ChargeRequest;
 
 let method = ChargeMethod::new("https://rpc.moderato.tempo.xyz")

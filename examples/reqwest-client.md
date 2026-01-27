@@ -11,13 +11,13 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-## Using PaymentExt (Recommended)
+## Using Fetch (Recommended)
 
-The `PaymentExt` trait provides a `.send_with_payment()` method for opt-in
+The `Fetch` trait provides a `.send_with_payment()` method for opt-in
 per-request payment handling. This is the most idiomatic Rust approach.
 
 ```rust
-use mpay::http::{PaymentExt, TempoProvider};
+use mpay::client::{Fetch, tempo};
 use mpay::PrivateKeySigner;
 use reqwest::Client;
 
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signer = PrivateKeySigner::random();
     
     // Create a Tempo payment provider
-    let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+    let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
     
     // Use standard reqwest client
     let client = Client::new();
@@ -138,7 +138,7 @@ async fn fetch_with_receipt(
 Implement `PaymentProvider` for custom payment methods:
 
 ```rust
-use mpay::http::PaymentProvider;
+use mpay::client::PaymentProvider;
 use mpay::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
 use mpay::MppError;
 
