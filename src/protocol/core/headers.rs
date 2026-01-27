@@ -191,7 +191,6 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         method,
         intent,
         request,
-        digest: params.get("digest").cloned(),
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
     })
@@ -245,7 +244,6 @@ pub fn parse_www_authenticate_all<'a>(
 ///     method: "tempo".into(),
 ///     intent: "charge".into(),
 ///     request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
-///     digest: None,
 ///     expires: None,
 ///     description: None,
 /// };
@@ -270,10 +268,6 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
             escape_quoted_value(challenge.request.raw())?
         ),
     ];
-
-    if let Some(ref digest) = challenge.digest {
-        parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
-    }
 
     if let Some(ref expires) = challenge.expires {
         parts.push(format!("expires=\"{}\"", escape_quoted_value(expires)?));
@@ -305,7 +299,6 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
 ///     method: "tempo".into(),
 ///     intent: "charge".into(),
 ///     request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
-///     digest: None,
 ///     expires: None,
 ///     description: None,
 /// };
@@ -413,7 +406,6 @@ mod tests {
                 "currency": "0x123"
             }))
             .unwrap(),
-            digest: None,
             expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
         }
@@ -455,18 +447,6 @@ mod tests {
             r#"  Payment id="test", realm="api", method="tempo", intent="charge", request="e30""#;
         let parsed = parse_www_authenticate(header).unwrap();
         assert_eq!(parsed.id, "test");
-    }
-
-    #[test]
-    fn test_parse_www_authenticate_with_digest() {
-        let mut challenge = test_challenge();
-        challenge.digest = Some("sha-256=:abc123:".to_string());
-        let header = format_www_authenticate(&challenge).unwrap();
-
-        assert!(header.contains("digest=\"sha-256=:abc123:\""));
-
-        let parsed = parse_www_authenticate(&header).unwrap();
-        assert_eq!(parsed.digest, Some("sha-256=:abc123:".to_string()));
     }
 
     #[test]
@@ -518,7 +498,7 @@ mod tests {
         let challenge = test_challenge();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
-            "did:pkh:eip155:88153:0x123",
+            "did:pkh:eip155:42431:0x123",
             PaymentPayload::transaction("0xabc"),
         );
 
@@ -528,10 +508,10 @@ mod tests {
         assert_eq!(parsed.challenge.id, "abc123");
         assert_eq!(
             parsed.source,
-            Some("did:pkh:eip155:88153:0x123".to_string())
+            Some("did:pkh:eip155:42431:0x123".to_string())
         );
-        assert_eq!(parsed.payload.signature, "0xabc");
-        assert_eq!(parsed.payload.payload_type, Some(PayloadType::Transaction));
+        assert_eq!(parsed.payload.signature(), Some("0xabc"));
+        assert_eq!(parsed.payload.payload_type(), PayloadType::Transaction);
     }
 
     #[test]
@@ -541,8 +521,6 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc123".to_string(),
-            block_number: Some("12345".to_string()),
-            error: None,
         };
 
         let header = format_receipt(&receipt).unwrap();
@@ -551,7 +529,6 @@ mod tests {
         assert_eq!(parsed.status, ReceiptStatus::Success);
         assert_eq!(parsed.method.as_str(), "tempo");
         assert_eq!(parsed.reference, "0xabc123");
-        assert_eq!(parsed.block_number, Some("12345".to_string()));
     }
 
     #[test]

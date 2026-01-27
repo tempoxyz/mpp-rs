@@ -13,8 +13,8 @@ use crate::error::{MppError, Result};
 /// Payment method identifier (newtype over String).
 ///
 /// Represents a payment method like "tempo", "base", "stripe", etc.
-/// This is a simple string wrapper with no hardcoded variants - the method
-/// layer interprets specific values.
+/// Per IETF spec, method identifiers MUST be lowercase ASCII strings.
+/// This type validates and normalizes to lowercase on creation.
 ///
 /// # Examples
 ///
@@ -23,16 +23,19 @@ use crate::error::{MppError, Result};
 ///
 /// let method: MethodName = "tempo".into();
 /// assert_eq!(method.as_str(), "tempo");
-/// assert!(method.eq_ignore_ascii_case("TEMPO"));
+///
+/// // Uppercase input is normalized to lowercase
+/// let method2: MethodName = "TEMPO".into();
+/// assert_eq!(method2.as_str(), "tempo");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MethodName(String);
 
 impl MethodName {
-    /// Create a new method name.
+    /// Create a new method name, normalizing to lowercase per IETF spec.
     pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+        Self(name.into().to_ascii_lowercase())
     }
 
     /// Get the method name as a string slice.
@@ -43,6 +46,13 @@ impl MethodName {
     /// Check if this method name matches another (case-insensitive).
     pub fn eq_ignore_ascii_case(&self, other: &str) -> bool {
         self.0.eq_ignore_ascii_case(other)
+    }
+
+    /// Check if the method name contains only valid ASCII lowercase characters.
+    ///
+    /// Per IETF spec: `method-name = 1*LOWERALPHA` (a-z only).
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty() && self.0.chars().all(|c| c.is_ascii_lowercase())
     }
 }
 
@@ -62,13 +72,13 @@ impl fmt::Display for MethodName {
 
 impl From<&str> for MethodName {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self::new(s)
     }
 }
 
 impl From<String> for MethodName {
     fn from(s: String) -> Self {
-        Self(s)
+        Self::new(s)
     }
 }
 
@@ -306,16 +316,14 @@ impl fmt::Display for PaymentProtocol {
 
 /// Payment payload type.
 ///
-/// Indicates what kind of data is in the payload signature field.
+/// Indicates what kind of data is in the payload. Per IETF spec:
+/// - `transaction`: Signed blockchain transaction (to be broadcast by server)
+/// - `hash`: Transaction hash (already broadcast by client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Default)]
 pub enum PayloadType {
     /// Signed blockchain transaction (to be broadcast by server)
-    #[default]
     Transaction,
-    /// Key authorization signature (for authorize/subscription intents)
-    KeyAuthorization,
     /// Transaction hash (already broadcast by client)
     Hash,
 }
@@ -324,7 +332,6 @@ impl fmt::Display for PayloadType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => write!(f, "transaction"),
-            Self::KeyAuthorization => write!(f, "keyAuthorization"),
             Self::Hash => write!(f, "hash"),
         }
     }
@@ -359,6 +366,17 @@ mod tests {
         assert_eq!(method.as_str(), "tempo");
         assert!(method.eq_ignore_ascii_case("TEMPO"));
         assert_eq!(method.to_string(), "tempo");
+        assert!(method.is_valid());
+    }
+
+    #[test]
+    fn test_method_name_normalizes_to_lowercase() {
+        // Per IETF spec, method identifiers MUST be lowercase
+        let method: MethodName = "TEMPO".into();
+        assert_eq!(method.as_str(), "tempo");
+
+        let method2 = MethodName::new("TeMpO");
+        assert_eq!(method2.as_str(), "tempo");
     }
 
     #[test]
@@ -452,8 +470,8 @@ mod tests {
             "\"transaction\""
         );
         assert_eq!(
-            serde_json::to_string(&PayloadType::KeyAuthorization).unwrap(),
-            "\"keyAuthorization\""
+            serde_json::to_string(&PayloadType::Hash).unwrap(),
+            "\"hash\""
         );
     }
 

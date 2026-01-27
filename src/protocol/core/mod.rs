@@ -60,7 +60,7 @@
 //! // Create a credential and format it
 //! let credential = PaymentCredential::with_source(
 //!     challenge.to_echo(),
-//!     "did:pkh:eip155:88153:0x123",
+//!     "did:pkh:eip155:42431:0x123",
 //!     PaymentPayload::transaction("0xsigned_tx"),
 //! );
 //! let auth_header = format_authorization(&credential).unwrap();

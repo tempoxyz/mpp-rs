@@ -107,7 +107,7 @@ mod tests {
             description: None,
             external_id: None,
             method_details: Some(serde_json::json!({
-                "chainId": 88153,
+                "chainId": 42431,
                 "feePayer": true
             })),
         };
@@ -115,7 +115,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"amount\":\"10000\""));
         assert!(json.contains("\"methodDetails\""));
-        assert!(json.contains("\"chainId\":88153"));
+        assert!(json.contains("\"chainId\":42431"));
 
         let parsed: ChargeRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.amount, "10000");

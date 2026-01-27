@@ -87,7 +87,7 @@ async fn fetch_paid_resource(
         // Build credential
         let credential = Credential::PaymentCredential::with_source(
             challenge.to_echo(),
-            "did:pkh:eip155:88153:0xYourAddress",
+            "did:pkh:eip155:42431:0xYourAddress",
             Credential::PaymentPayload::hash(tx_hash),
         );
 
