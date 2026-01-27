@@ -60,26 +60,17 @@
 //! ```
 
 pub mod charge;
-#[cfg(feature = "http")]
-pub mod intent;
-#[cfg(feature = "http")]
 pub mod method;
 pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
-#[cfg(feature = "http")]
-#[deprecated(since = "0.2.0", note = "use tempo::ChargeMethod instead")]
-pub use intent::TempoChargeIntent;
-#[cfg(feature = "http")]
 pub use method::ChargeMethod;
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
 };
 pub use types::TempoMethodDetails;
-
-use alloy::primitives::b256;
 
 /// Tempo Moderato testnet chain ID.
 pub const CHAIN_ID: u64 = 42431;
@@ -89,11 +80,6 @@ pub const METHOD_NAME: &str = "tempo";
 
 /// Network name for Tempo Moderato.
 pub const NETWORK_NAME: &str = "tempo-moderato";
-
-/// ERC-20 Transfer(address,address,uint256) event signature.
-/// keccak256("Transfer(address,address,uint256)")
-pub(crate) const ERC20_TRANSFER_TOPIC: [u8; 32] =
-    b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").0;
 
 /// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
 pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {

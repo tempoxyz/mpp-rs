@@ -137,12 +137,19 @@ let request = ChargeRequest {
 
 ### Server-Side Traits
 
-Method traits verify payment credentials with typed schemas:
+Method traits verify payment credentials with typed schemas using alloy's Provider:
 
 ```rust
 use mpay::Method::tempo::ChargeMethod;
+use mpay::Method::ChargeMethod as ChargeMethodTrait;
+use alloy::providers::ProviderBuilder;
 
-let method = ChargeMethod::new("https://rpc.moderato.tempo.xyz");
+// Create an alloy provider
+let provider = ProviderBuilder::new()
+    .connect_http("https://rpc.moderato.tempo.xyz".parse()?);
+
+// Create the charge method with the provider
+let method = ChargeMethod::new(provider);
 
 // Verify a payment
 let receipt = method.verify(&credential, &request).await?;

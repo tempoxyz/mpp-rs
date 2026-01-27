@@ -116,7 +116,6 @@ pub mod Method {
 
     #[cfg(feature = "tempo")]
     pub mod tempo {
-        #[cfg(feature = "http")]
         pub use crate::protocol::methods::tempo::ChargeMethod;
         pub use crate::protocol::methods::tempo::{TempoChargeExt, TempoMethodDetails, CHAIN_ID};
     }

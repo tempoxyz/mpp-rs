@@ -1,34 +1,46 @@
 //! Tempo charge method for server-side payment verification.
 //!
 //! This module provides [`ChargeMethod`] which implements the [`ChargeMethod`]
-//! trait for Tempo blockchain payments.
+//! trait for Tempo blockchain payments using alloy's typed Provider.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use mpay::protocol::methods::tempo::ChargeMethod;
-//! use mpay::protocol::traits::ChargeMethod;
+//! use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
+//! use alloy::providers::ProviderBuilder;
 //!
-//! let method = ChargeMethod::new("https://rpc.moderato.tempo.xyz");
+//! let provider = ProviderBuilder::new().connect_http("https://rpc.moderato.tempo.xyz".parse()?);
+//! let method = ChargeMethod::new(provider);
 //!
 //! // In your server handler:
 //! let receipt = method.verify(&credential, &request).await?;
 //! assert!(receipt.is_success());
 //! ```
 
-use crate::evm::{parse_address, parse_amount, Address, U256};
+use alloy::consensus::Transaction;
+use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::providers::Provider;
+use alloy::rpc::types::Log;
+use std::future::Future;
+use std::sync::Arc;
+
+use crate::evm::{parse_address, parse_amount};
 use crate::protocol::core::{PaymentCredential, PaymentPayload, PaymentReceipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
-use std::future::Future;
 
-use super::{parse_iso8601_timestamp, ERC20_TRANSFER_TOPIC, TempoChargeExt, CHAIN_ID, METHOD_NAME};
+use super::{parse_iso8601_timestamp, TempoChargeExt, CHAIN_ID, METHOD_NAME};
+
+/// ERC-20 Transfer(address,address,uint256) event signature.
+const TRANSFER_TOPIC: B256 =
+    alloy::primitives::b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 
 /// Tempo charge method for one-time payment verification.
 ///
 /// Verifies that a payment transaction matches the requested parameters by:
 /// 1. Parsing the credential payload (hash or transaction)
-/// 2. Fetching the transaction receipt from Tempo RPC
+/// 2. Fetching the transaction receipt from Tempo RPC using alloy Provider
 /// 3. Verifying transfer amount, recipient, and currency match
 ///
 /// # Credential Types
@@ -40,9 +52,11 @@ use super::{parse_iso8601_timestamp, ERC20_TRANSFER_TOPIC, TempoChargeExt, CHAIN
 ///
 /// ```ignore
 /// use mpay::protocol::methods::tempo::ChargeMethod;
-/// use mpay::protocol::traits::ChargeMethod;
+/// use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
+/// use alloy::providers::ProviderBuilder;
 ///
-/// let method = ChargeMethod::new("https://rpc.moderato.tempo.xyz");
+/// let provider = ProviderBuilder::new().connect_http("https://rpc.moderato.tempo.xyz".parse()?);
+/// let method = ChargeMethod::new(provider);
 ///
 /// // Verify a payment
 /// let receipt = method.verify(&credential, &request).await?;
@@ -51,29 +65,24 @@ use super::{parse_iso8601_timestamp, ERC20_TRANSFER_TOPIC, TempoChargeExt, CHAIN
 /// }
 /// ```
 #[derive(Clone)]
-pub struct ChargeMethod {
-    rpc_url: String,
-    timeout_secs: u64,
+pub struct ChargeMethod<P> {
+    provider: Arc<P>,
 }
 
-impl ChargeMethod {
-    /// Create a new Tempo charge method with the given RPC URL.
-    pub fn new(rpc_url: impl Into<String>) -> Self {
+impl<P> ChargeMethod<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
+    /// Create a new Tempo charge method with the given alloy Provider.
+    pub fn new(provider: P) -> Self {
         Self {
-            rpc_url: rpc_url.into(),
-            timeout_secs: 30,
+            provider: Arc::new(provider),
         }
     }
 
-    /// Set the timeout for RPC requests.
-    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
-        self.timeout_secs = timeout_secs;
-        self
-    }
-
-    /// Get the RPC URL.
-    pub fn rpc_url(&self) -> &str {
-        &self.rpc_url
+    /// Get a reference to the underlying provider.
+    pub fn provider(&self) -> &P {
+        &self.provider
     }
 
     async fn verify_hash(
@@ -94,72 +103,43 @@ impl ChargeMethod {
         let expected_currency = parse_address(&charge.currency)
             .map_err(|e| VerificationError::new(format!("Invalid currency address: {}", e)))?;
 
+        let hash = tx_hash
+            .parse::<B256>()
+            .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
+
         let receipt = self
-            .fetch_transaction_receipt(tx_hash)
+            .provider
+            .get_transaction_receipt(hash)
             .await
-            .map_err(|e| VerificationError::new(format!("Failed to fetch receipt: {}", e)))?;
+            .map_err(|e| VerificationError::new(format!("Failed to fetch receipt: {}", e)))?
+            .ok_or_else(|| {
+                VerificationError::not_found(format!(
+                    "Transaction {} not found or not yet mined",
+                    tx_hash
+                ))
+            })?;
 
-        let receipt_json: serde_json::Value = serde_json::from_str(&receipt)
-            .map_err(|e| VerificationError::new(format!("Invalid receipt JSON: {}", e)))?;
-
-        let result = receipt_json.get("result").ok_or_else(|| {
-            VerificationError::not_found(format!("Transaction {} not found", tx_hash))
-        })?;
-
-        if result.is_null() {
-            return Err(VerificationError::not_found(format!(
-                "Transaction {} not found or not yet mined",
-                tx_hash
-            )));
-        }
-
-        let status = result
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("0x0");
-
-        if status != "0x1" {
+        if !receipt.status() {
             return Err(VerificationError::transaction_failed(format!(
                 "Transaction {} reverted",
                 tx_hash
             )));
         }
 
-        self.verify_transfer_logs(
-            result,
-            expected_recipient,
-            expected_amount,
-            expected_currency,
-        )?;
-
-        Ok(PaymentReceipt::success(METHOD_NAME, tx_hash))
-    }
-
-    fn verify_transfer_logs(
-        &self,
-        receipt: &serde_json::Value,
-        expected_recipient: Address,
-        expected_amount: U256,
-        expected_currency: Address,
-    ) -> Result<(), VerificationError> {
-        let logs = receipt
-            .get("logs")
-            .and_then(|l| l.as_array())
-            .ok_or_else(|| VerificationError::new("No logs in receipt"))?;
-
-        let transfer_topic = format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC));
-
         let is_native = expected_currency == Address::ZERO;
 
         if is_native {
-            let to = receipt.get("to").and_then(|t| t.as_str()).unwrap_or("");
-            let value_hex = receipt
-                .get("value")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0x0");
+            let tx = self
+                .provider
+                .get_transaction_by_hash(hash)
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to fetch transaction: {}", e)))?
+                .ok_or_else(|| {
+                    VerificationError::not_found(format!("Transaction {} not found", tx_hash))
+                })?;
 
-            let to_addr = parse_address(to).map_err(|_| {
-                VerificationError::invalid_recipient("Invalid 'to' address in transaction")
+            let to_addr = tx.inner.to().ok_or_else(|| {
+                VerificationError::invalid_recipient("Transaction has no recipient (contract creation)")
             })?;
 
             if to_addr != expected_recipient {
@@ -169,37 +149,39 @@ impl ChargeMethod {
                 )));
             }
 
-            let value = parse_hex_u256(value_hex)
-                .map_err(|_| VerificationError::new("Invalid value in transaction"))?;
-
+            let value = tx.inner.value();
             if value < expected_amount {
                 return Err(VerificationError::invalid_amount(format!(
                     "Amount mismatch: expected {}, got {}",
                     expected_amount, value
                 )));
             }
-
-            return Ok(());
+        } else {
+            self.verify_transfer_logs(
+                receipt.inner.logs(),
+                expected_recipient,
+                expected_amount,
+                expected_currency,
+            )?;
         }
 
-        for log in logs {
-            let topics = match log.get("topics").and_then(|t| t.as_array()) {
-                Some(t) if !t.is_empty() => t,
-                _ => continue,
-            };
+        Ok(PaymentReceipt::success(METHOD_NAME, tx_hash))
+    }
 
-            let topic0 = topics[0].as_str().unwrap_or("");
-            if topic0 != transfer_topic {
+    fn verify_transfer_logs(
+        &self,
+        logs: &[Log],
+        expected_recipient: Address,
+        expected_amount: U256,
+        expected_currency: Address,
+    ) -> Result<(), VerificationError> {
+        for log in logs {
+            let topics = log.topics();
+            if topics.is_empty() || topics[0] != TRANSFER_TOPIC {
                 continue;
             }
 
-            let log_address = log.get("address").and_then(|a| a.as_str()).unwrap_or("");
-            let log_currency = match parse_address(log_address) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-
-            if log_currency != expected_currency {
+            if log.address() != expected_currency {
                 continue;
             }
 
@@ -207,16 +189,22 @@ impl ChargeMethod {
                 continue;
             }
 
-            let to_topic = topics[2].as_str().unwrap_or("");
-            let to_addr = parse_topic_address(to_topic)?;
+            let to_addr = Address::from_slice(&topics[2].as_slice()[12..32]);
 
             if to_addr != expected_recipient {
                 continue;
             }
 
-            let data = log.get("data").and_then(|d| d.as_str()).unwrap_or("0x0");
-            let amount = parse_hex_u256(data)
-                .map_err(|_| VerificationError::new("Invalid amount in transfer log"))?;
+            let data = log.data().data.as_ref();
+            let amount = if data.len() >= 32 {
+                U256::from_be_slice(&data[..32])
+            } else if data.is_empty() {
+                U256::ZERO
+            } else {
+                let mut padded = [0u8; 32];
+                padded[32 - data.len()..].copy_from_slice(data);
+                U256::from_be_slice(&padded)
+            };
 
             if amount >= expected_amount {
                 return Ok(());
@@ -226,28 +214,6 @@ impl ChargeMethod {
         Err(VerificationError::not_found(
             "No matching transfer found in logs",
         ))
-    }
-
-    async fn fetch_transaction_receipt(&self, tx_hash: &str) -> Result<String, String> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_getTransactionReceipt",
-            "params": [tx_hash],
-            "id": 1
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&self.rpc_url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| format!("RPC request failed: {}", e))?;
-
-        resp.text()
-            .await
-            .map_err(|e| format!("Failed to read RPC response: {}", e))
     }
 
     fn check_expiration(&self, expires: &str) -> Result<(), VerificationError> {
@@ -271,108 +237,27 @@ impl ChargeMethod {
         Ok(())
     }
 
-    async fn fetch_chain_id(&self) -> Result<u64, VerificationError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_chainId",
-            "params": [],
-            "id": 1
-        });
+    async fn broadcast_transaction(&self, signed_tx: &str) -> Result<B256, VerificationError> {
+        let tx_bytes = signed_tx
+            .parse::<Bytes>()
+            .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {}", e)))?;
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&self.rpc_url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| VerificationError::new(format!("Failed to fetch chain ID: {}", e)))?;
-
-        let text = resp.text().await.map_err(|e| {
-            VerificationError::new(format!("Failed to read chain ID response: {}", e))
-        })?;
-
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| VerificationError::new(format!("Invalid chain ID response: {}", e)))?;
-
-        let result = json
-            .get("result")
-            .and_then(|r| r.as_str())
-            .ok_or_else(|| VerificationError::new("Missing chain ID in response"))?;
-
-        let chain_id = u64::from_str_radix(result.strip_prefix("0x").unwrap_or(result), 16)
-            .map_err(|e| VerificationError::new(format!("Invalid chain ID format: {}", e)))?;
-
-        Ok(chain_id)
-    }
-
-    async fn broadcast_transaction(&self, signed_tx: &str) -> Result<String, VerificationError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendRawTransaction",
-            "params": [signed_tx],
-            "id": 1
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(&self.rpc_url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+        let pending = self
+            .provider
+            .send_raw_transaction(&tx_bytes)
             .await
             .map_err(|e| {
                 VerificationError::transaction_failed(format!("Failed to broadcast: {}", e))
             })?;
 
-        let text = resp.text().await.map_err(|e| {
-            VerificationError::transaction_failed(format!(
-                "Failed to read broadcast response: {}",
-                e
-            ))
-        })?;
-
-        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            VerificationError::transaction_failed(format!("Invalid broadcast response: {}", e))
-        })?;
-
-        if let Some(error) = json.get("error") {
-            let message = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            return Err(VerificationError::transaction_failed(format!(
-                "Broadcast failed: {}",
-                message
-            )));
-        }
-
-        json.get("result")
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| VerificationError::transaction_failed("Missing tx hash in response"))
+        Ok(*pending.tx_hash())
     }
 }
 
-fn parse_hex_u256(hex: &str) -> Result<U256, ()> {
-    let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.is_empty() {
-        return Ok(U256::ZERO);
-    }
-    U256::from_str_radix(hex, 16).map_err(|_| ())
-}
-
-fn parse_topic_address(topic: &str) -> Result<Address, VerificationError> {
-    let topic = topic.strip_prefix("0x").unwrap_or(topic);
-    if topic.len() != 64 {
-        return Err(VerificationError::new("Invalid topic length for address"));
-    }
-    let addr_hex = &topic[24..];
-    parse_address(&format!("0x{}", addr_hex))
-        .map_err(|e| VerificationError::new(format!("Invalid address in topic: {}", e)))
-}
-
-impl ChargeMethodTrait for ChargeMethod {
+impl<P> ChargeMethodTrait for ChargeMethod<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
     fn method(&self) -> &str {
         METHOD_NAME
     }
@@ -384,28 +269,37 @@ impl ChargeMethodTrait for ChargeMethod {
     ) -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send {
         let credential = credential.clone();
         let request = request.clone();
-        let this = self.clone();
+        let provider = Arc::clone(&self.provider);
 
         async move {
+            let this = ChargeMethod { provider };
+
             if let Some(ref expires) = request.expires {
                 this.check_expiration(expires)?;
             }
 
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
-            let actual_chain_id = this.fetch_chain_id().await?;
+            let actual_chain_id = this
+                .provider
+                .get_chain_id()
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to fetch chain ID: {}", e)))?;
 
             if actual_chain_id != expected_chain_id {
-                return Err(VerificationError::new(format!(
-                    "Chain ID mismatch: expected {}, got {}",
-                    expected_chain_id, actual_chain_id
-                )));
+                return Err(VerificationError::with_code(
+                    format!(
+                        "Chain ID mismatch: expected {}, got {}",
+                        expected_chain_id, actual_chain_id
+                    ),
+                    super::super::super::traits::ErrorCode::NetworkError,
+                ));
             }
 
             match &credential.payload {
                 PaymentPayload::Hash { hash, .. } => this.verify_hash(hash, &request).await,
                 PaymentPayload::Transaction { signature, .. } => {
                     let tx_hash = this.broadcast_transaction(signature).await?;
-                    this.verify_hash(&tx_hash, &request).await
+                    this.verify_hash(&format!("{:#x}", tx_hash), &request).await
                 }
             }
         }
@@ -417,31 +311,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_hex_u256() {
-        assert_eq!(parse_hex_u256("0x0").unwrap(), U256::ZERO);
-        assert_eq!(parse_hex_u256("0x1").unwrap(), U256::from(1u64));
-        assert_eq!(parse_hex_u256("0x10").unwrap(), U256::from(16u64));
-        assert_eq!(parse_hex_u256("0x").unwrap(), U256::ZERO);
-    }
-
-    #[test]
-    fn test_parse_iso8601_timestamp() {
-        let ts = parse_iso8601_timestamp("2024-01-01T00:00:00Z");
-        assert!(ts.is_some());
-
-        let ts = parse_iso8601_timestamp("2024-06-15T12:30:45Z");
-        assert!(ts.is_some());
-    }
-
-    #[test]
-    fn test_tempo_charge_method_name() {
-        let method = ChargeMethod::new("https://rpc.example.com");
-        assert_eq!(method.method(), "tempo");
-    }
-
-    #[test]
-    fn test_tempo_charge_method_with_timeout() {
-        let method = ChargeMethod::new("https://rpc.example.com").with_timeout(60);
-        assert_eq!(method.timeout_secs, 60);
+    fn test_transfer_topic_constant() {
+        assert_eq!(
+            format!("{:#x}", TRANSFER_TOPIC),
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        );
     }
 }
