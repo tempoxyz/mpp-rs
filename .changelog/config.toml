@@ -5,7 +5,7 @@ dependent_bump = "patch"
 [changelog]
 # "per-crate" - CHANGELOG.md in each crate
 # "root" - Single CHANGELOG.md at workspace root
-format = "per-crate"
+format = "root"
 
 # Fixed groups: all crates always share the same version
 # [[fixed]]
