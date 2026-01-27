@@ -35,15 +35,13 @@
 //! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
 //! #     expires: None, description: None, external_id: None,
 //! #     method_details: Some(serde_json::json!({
-//! #         "feePayer": true,
-//! #         "feePayerUrl": "https://sponsor.moderato.tempo.xyz"
+//! #         "feePayer": true
 //! #     })),
 //! # };
 //! if req.fee_payer() {
 //!     // Client should build and sign a TempoTransaction (0x76),
 //!     // then return it as a "transaction" credential.
-//!     // The server will forward to fee_payer_url for broadcasting.
-//!     let fee_payer_url = req.fee_payer_url();
+//!     // The server will add fee payer signature and broadcast.
 //! }
 //! ```
 //!
@@ -57,7 +55,7 @@
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
 //! let req: ChargeRequest = challenge.request.decode().unwrap();
-//! let nonce_key = req.nonce_key();
+//! assert!(!req.fee_payer());
 //! assert_eq!(CHAIN_ID, 42431);
 //! ```
 
@@ -70,7 +68,7 @@ pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
 };
-pub use types::{TempoMethodDetails, DEFAULT_FEE_PAYER_URL};
+pub use types::TempoMethodDetails;
 
 /// Tempo Moderato testnet chain ID.
 pub const CHAIN_ID: u64 = 42431;

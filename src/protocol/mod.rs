@@ -78,7 +78,7 @@
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
 //! let req: ChargeRequest = challenge.request.decode().unwrap();
-//! let nonce_key = req.nonce_key();
+//! assert!(!req.fee_payer());
 //! ```
 
 pub mod core;
