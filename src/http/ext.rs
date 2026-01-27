@@ -17,10 +17,10 @@ use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHOR
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::http::{PaymentExt, TempoProvider};
+/// use mpay::client::{Fetch, tempo};
 /// use reqwest::Client;
 ///
-/// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+/// let provider = tempo::Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 /// let client = Client::new();
 ///
 /// let resp = client

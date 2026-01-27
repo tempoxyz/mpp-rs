@@ -17,7 +17,7 @@ use std::future::Future;
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::http::PaymentProvider;
+/// use mpay::client::PaymentProvider;
 /// use mpay::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
 /// use mpay::MppError;
 ///
@@ -85,11 +85,11 @@ pub trait PaymentProvider: Clone + Send + Sync {
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::http::TempoProvider;
+/// use mpay::client::tempo::Provider;
 /// use mpay::PrivateKeySigner;
 ///
 /// let signer = PrivateKeySigner::from_bytes(&key)?;
-/// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+/// let provider = Provider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 ///
 /// // Use with PaymentExt
 /// let resp = client

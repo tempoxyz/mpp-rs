@@ -17,7 +17,7 @@ Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Pa
 | `PaymentChallenge` | Server's payment request | `WWW-Authenticate: Payment ...` |
 | `ChargeRequest` | Typed request schema (inside challenge) | Base64 in `request=` param |
 | `PaymentCredential` | Client's payment proof | `Authorization: Payment ...` |
-| `PaymentReceipt` | Server's confirmation | `Payment-Receipt: ...` |
+| `Receipt` | Server's confirmation | `Payment-Receipt: ...` |
 
 ## Traits
 

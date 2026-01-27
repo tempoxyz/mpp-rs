@@ -115,7 +115,7 @@ async fn fetch_with_receipt(
     client: &Client,
     url: &str,
     auth_header: &str,
-) -> Result<(String, Option<Receipt::PaymentReceipt>), Box<dyn std::error::Error>> {
+) -> Result<(String, Option<Receipt::Receipt>), Box<dyn std::error::Error>> {
     let resp = client
         .get(url)
         .header("authorization", auth_header)
