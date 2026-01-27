@@ -24,7 +24,7 @@
 //!                              │
 //! ┌────────────────────────────▼────────────────────────────────────┐
 //! │                       Core Layer (always available)              │
-//! │  PaymentChallenge, PaymentCredential, PaymentReceipt            │
+//! │  PaymentChallenge, PaymentCredential, Receipt                   │
 //! │  MethodName, IntentName, Base64UrlJson (newtypes)              │
 //! │  Header parsing/formatting (no regex)                           │
 //! └─────────────────────────────────────────────────────────────────┘

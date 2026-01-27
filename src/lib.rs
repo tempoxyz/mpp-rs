@@ -22,7 +22,7 @@
 //! Following the mpay pattern, core types are exported as namespaced modules:
 //!
 //! ```no_run
-//! use mpay::{Challenge, Credential, Receipt, Intent, Method};
+//! use mpay::{Challenge, Credential, Receipt, Intent, server};
 //! # fn main() {}
 //! ```
 //!
@@ -58,6 +58,14 @@ pub mod evm;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "http")]
+pub mod client;
+
+pub mod server;
+
+#[cfg(feature = "tempo")]
+pub mod tempo;
+
 // ==================== Re-exports ====================
 
 // Error types
@@ -85,7 +93,7 @@ pub mod Credential {
 /// Receipt types for parsing Payment-Receipt headers
 #[allow(non_snake_case)]
 pub mod Receipt {
-    pub use crate::protocol::core::{format_receipt, parse_receipt, PaymentReceipt, ReceiptStatus};
+    pub use crate::protocol::core::{format_receipt, parse_receipt, Receipt, ReceiptStatus};
 }
 
 /// Intent request schemas (shared across methods)
@@ -105,30 +113,6 @@ pub mod Schema {
         PaymentProtocol, AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME,
         WWW_AUTHENTICATE_HEADER,
     };
-}
-
-/// Method traits for server-side verification
-///
-/// Methods implement intent-specific traits that enforce typed request schemas.
-#[allow(non_snake_case)]
-pub mod Method {
-    pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
-
-    #[cfg(feature = "tempo")]
-    pub mod tempo {
-        pub use crate::protocol::methods::tempo::ChargeMethod;
-        pub use crate::protocol::methods::tempo::{TempoChargeExt, TempoMethodDetails, CHAIN_ID};
-    }
-}
-
-/// Client-side payment provider trait
-#[allow(non_snake_case)]
-#[cfg(feature = "http")]
-pub mod Provider {
-    pub use crate::http::PaymentProvider;
-
-    #[cfg(feature = "tempo")]
-    pub use crate::http::TempoProvider;
 }
 
 // ==================== Alloy Re-exports (batteries included) ====================

@@ -26,7 +26,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::evm::{parse_address, parse_amount};
-use crate::protocol::core::{PaymentCredential, PaymentPayload, PaymentReceipt};
+use crate::protocol::core::{PaymentCredential, PaymentPayload, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 
@@ -89,7 +89,7 @@ where
         &self,
         tx_hash: &str,
         charge: &ChargeRequest,
-    ) -> Result<PaymentReceipt, VerificationError> {
+    ) -> Result<Receipt, VerificationError> {
         let expected_recipient = charge
             .recipient
             .as_ref()
@@ -167,7 +167,7 @@ where
             )?;
         }
 
-        Ok(PaymentReceipt::success(METHOD_NAME, tx_hash))
+        Ok(Receipt::success(METHOD_NAME, tx_hash))
     }
 
     fn verify_transfer_logs(
@@ -268,7 +268,7 @@ where
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
-    ) -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send {
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
         let credential = credential.clone();
         let request = request.clone();
         let provider = Arc::clone(&self.provider);

@@ -231,7 +231,7 @@ impl PaymentCredential {
 ///
 /// Per IETF spec, contains: status, method, timestamp, reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaymentReceipt {
+pub struct Receipt {
     /// Receipt status ("success" or "failed")
     pub status: ReceiptStatus,
 
@@ -253,7 +253,7 @@ pub struct PaymentReceipt {
     pub error: Option<String>,
 }
 
-impl PaymentReceipt {
+impl Receipt {
     /// Create a successful payment receipt.
     pub fn success(method: impl Into<MethodName>, reference: impl Into<String>) -> Self {
         Self {
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_payment_receipt_status() {
-        let success = PaymentReceipt {
+        let success = Receipt {
             status: ReceiptStatus::Success,
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
@@ -438,7 +438,7 @@ mod tests {
         assert!(success.is_success());
         assert!(!success.is_failed());
 
-        let failed = PaymentReceipt {
+        let failed = Receipt {
             status: ReceiptStatus::Failed,
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),

@@ -4,7 +4,7 @@
 //! ensuring consistent field names (amount, currency, recipient) across all
 //! payment methods.
 
-use crate::protocol::core::{PaymentCredential, PaymentReceipt};
+use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::VerificationError;
 use std::future::Future;
@@ -29,7 +29,7 @@ use std::future::Future;
 ///
 /// ```
 /// use mpay::protocol::traits::{ChargeMethod, VerificationError};
-/// use mpay::protocol::core::{PaymentCredential, PaymentReceipt};
+/// use mpay::protocol::core::{PaymentCredential, Receipt};
 /// use mpay::protocol::intents::ChargeRequest;
 /// use std::future::Future;
 ///
@@ -47,12 +47,12 @@ use std::future::Future;
 ///         &self,
 ///         credential: &PaymentCredential,
 ///         request: &ChargeRequest,
-///     ) -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send {
+///     ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
 ///         let credential = credential.clone();
 ///         let request = request.clone();
 ///         async move {
 ///             // Verify with Stripe API using request.amount, request.currency, etc.
-///             Ok(PaymentReceipt::success("stripe", "pi_xxx"))
+///             Ok(Receipt::success("stripe", "pi_xxx"))
 ///         }
 ///     }
 /// }
@@ -90,13 +90,13 @@ pub trait ChargeMethod: Clone + Send + Sync {
     ///
     /// # Returns
     ///
-    /// * `Ok(PaymentReceipt)` - Payment was verified successfully
+    /// * `Ok(Receipt)` - Payment was verified successfully
     /// * `Err(VerificationError)` - Verification failed
     fn verify(
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
-    ) -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send;
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send;
 }
 
 #[cfg(test)]
@@ -116,8 +116,8 @@ mod tests {
             &self,
             _credential: &PaymentCredential,
             _request: &ChargeRequest,
-        ) -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send {
-            async { Ok(PaymentReceipt::success("test", "test_ref")) }
+        ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+            async { Ok(Receipt::success("test", "test_ref")) }
         }
     }
 
