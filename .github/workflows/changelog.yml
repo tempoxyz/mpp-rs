@@ -15,13 +15,13 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
-      - name: Install Claude CLI
-        run: npm install -g @anthropic-ai/claude-code
+      - name: Install Amp CLI
+        run: npm install -g @anthropic-ai/amp
 
       - name: Generate changelog if missing
         uses: wevm/changelogs-rs/gen@master
         with:
-          ai: 'claude -p'
+          ai: 'amp'
           conventional-commit: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
