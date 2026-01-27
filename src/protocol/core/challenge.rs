@@ -112,37 +112,80 @@ pub struct ChallengeEcho {
 
 /// Payment payload in credential.
 ///
-/// Contains the signed transaction or authorization signature.
+/// Contains the signed transaction or transaction hash. Per the IETF spec,
+/// the field name depends on the payload type:
+/// - `type="transaction"`: uses `signature` field (hex-encoded signed transaction)
+/// - `type="hash"`: uses `hash` field (transaction hash, already broadcast)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaymentPayload {
-    /// Signature (hex-encoded signed transaction or authorization)
-    pub signature: String,
-
-    /// Payload type (defaults to "transaction" if not specified)
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub payload_type: Option<PayloadType>,
+#[serde(untagged)]
+pub enum PaymentPayload {
+    /// Signed transaction payload (to be broadcast by server)
+    Transaction {
+        /// Hex-encoded signed transaction
+        signature: String,
+        /// Payload type
+        #[serde(rename = "type")]
+        payload_type: PayloadType,
+    },
+    /// Transaction hash payload (already broadcast by client)
+    Hash {
+        /// Transaction hash with 0x prefix
+        hash: String,
+        /// Payload type
+        #[serde(rename = "type")]
+        payload_type: PayloadType,
+    },
 }
 
 impl PaymentPayload {
     /// Create a new transaction payload.
     pub fn transaction(signature: impl Into<String>) -> Self {
-        Self {
+        Self::Transaction {
             signature: signature.into(),
-            payload_type: Some(PayloadType::Transaction),
+            payload_type: PayloadType::Transaction,
         }
     }
 
     /// Create a new hash payload (already broadcast).
     pub fn hash(tx_hash: impl Into<String>) -> Self {
-        Self {
-            signature: tx_hash.into(),
-            payload_type: Some(PayloadType::Hash),
+        Self::Hash {
+            hash: tx_hash.into(),
+            payload_type: PayloadType::Hash,
         }
     }
 
-    /// Get the effective payload type.
-    pub fn effective_type(&self) -> PayloadType {
-        self.payload_type.clone().unwrap_or_default()
+    /// Get the payload type.
+    pub fn payload_type(&self) -> PayloadType {
+        match self {
+            Self::Transaction { payload_type, .. } => payload_type.clone(),
+            Self::Hash { payload_type, .. } => payload_type.clone(),
+        }
+    }
+
+    /// Get the signature (for transaction payloads).
+    pub fn signature(&self) -> Option<&str> {
+        match self {
+            Self::Transaction { signature, .. } => Some(signature),
+            Self::Hash { .. } => None,
+        }
+    }
+
+    /// Get the hash (for hash payloads).
+    pub fn tx_hash(&self) -> Option<&str> {
+        match self {
+            Self::Transaction { .. } => None,
+            Self::Hash { hash, .. } => Some(hash),
+        }
+    }
+
+    /// Check if this is a transaction payload.
+    pub fn is_transaction(&self) -> bool {
+        matches!(self, Self::Transaction { .. })
+    }
+
+    /// Check if this is a hash payload.
+    pub fn is_hash(&self) -> bool {
+        matches!(self, Self::Hash { .. })
     }
 }
 
@@ -265,10 +308,33 @@ mod tests {
     #[test]
     fn test_payment_payload_constructors() {
         let tx = PaymentPayload::transaction("0xabc");
-        assert_eq!(tx.effective_type(), PayloadType::Transaction);
+        assert_eq!(tx.payload_type(), PayloadType::Transaction);
+        assert!(tx.is_transaction());
+        assert_eq!(tx.signature(), Some("0xabc"));
+        assert_eq!(tx.tx_hash(), None);
 
         let hash = PaymentPayload::hash("0xdef");
-        assert_eq!(hash.effective_type(), PayloadType::Hash);
+        assert_eq!(hash.payload_type(), PayloadType::Hash);
+        assert!(hash.is_hash());
+        assert_eq!(hash.tx_hash(), Some("0xdef"));
+        assert_eq!(hash.signature(), None);
+    }
+
+    #[test]
+    fn test_payment_payload_serialization() {
+        // Transaction payload should serialize with "signature" field
+        let tx = PaymentPayload::transaction("0xabc");
+        let json = serde_json::to_string(&tx).unwrap();
+        assert!(json.contains("\"signature\":\"0xabc\""));
+        assert!(json.contains("\"type\":\"transaction\""));
+        assert!(!json.contains("\"hash\""));
+
+        // Hash payload should serialize with "hash" field (per IETF spec)
+        let hash = PaymentPayload::hash("0xdef");
+        let json = serde_json::to_string(&hash).unwrap();
+        assert!(json.contains("\"hash\":\"0xdef\""));
+        assert!(json.contains("\"type\":\"hash\""));
+        assert!(!json.contains("\"signature\""));
     }
 
     #[test]
@@ -276,20 +342,20 @@ mod tests {
         let challenge = test_challenge();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
-            "did:pkh:eip155:88153:0x123",
+            "did:pkh:eip155:42431:0x123",
             PaymentPayload::transaction("0xabc"),
         );
 
         let json = serde_json::to_string(&credential).unwrap();
         assert!(json.contains("\"id\":\"abc123\""));
-        assert!(json.contains("did:pkh:eip155:88153:0x123"));
+        assert!(json.contains("did:pkh:eip155:42431:0x123"));
         assert!(json.contains("\"type\":\"transaction\""));
     }
 
     #[test]
     fn test_evm_did() {
-        let did = PaymentCredential::evm_did(88153, "0x1234abcd");
-        assert_eq!(did, "did:pkh:eip155:88153:0x1234abcd");
+        let did = PaymentCredential::evm_did(42431, "0x1234abcd");
+        assert_eq!(did, "did:pkh:eip155:42431:0x1234abcd");
     }
 
     #[test]

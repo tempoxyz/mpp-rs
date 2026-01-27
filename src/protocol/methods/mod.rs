@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! methods/
-//! └── tempo/      # Tempo-specific (chain_id=88153, TIP-20, 2D nonces)
+//! └── tempo/      # Tempo-specific (chain_id=42431, TIP-20, 2D nonces)
 //!     ├── types.rs    # TempoMethodDetails
 //!     └── charge.rs   # TempoChargeExt trait
 //! ```

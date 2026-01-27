@@ -32,7 +32,7 @@ use crate::evm::U256;
 /// use mpay::protocol::methods::tempo::TempoMethodDetails;
 ///
 /// let details = TempoMethodDetails {
-///     chain_id: Some(88153),
+///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     fee_payer_url: Some("https://sponsor.moderato.tempo.xyz".to_string()),
 ///     nonce_key: None, // Uses default nonce stream
@@ -43,7 +43,7 @@ use crate::evm::U256;
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TempoMethodDetails {
-    /// Chain ID (should be 88153 for Tempo Moderato)
+    /// Chain ID (42431 for Tempo Moderato)
     #[serde(rename = "chainId", skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
 
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn test_tempo_method_details_serialization() {
         let details = TempoMethodDetails {
-            chain_id: Some(88153),
+            chain_id: Some(42431),
             fee_payer: Some(true),
             fee_payer_url: Some("https://custom.sponsor.xyz".to_string()),
             nonce_key: Some("1".to_string()),
@@ -134,7 +134,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&details).unwrap();
-        assert!(json.contains("\"chainId\":88153"));
+        assert!(json.contains("\"chainId\":42431"));
         assert!(json.contains("\"feePayer\":true"));
         assert!(json.contains("\"feePayerUrl\":\"https://custom.sponsor.xyz\""));
         assert!(json.contains("\"nonceKey\":\"1\""));
@@ -143,7 +143,7 @@ mod tests {
         assert!(!json.contains("validFrom"));
 
         let parsed: TempoMethodDetails = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.chain_id, Some(88153));
+        assert_eq!(parsed.chain_id, Some(42431));
         assert!(parsed.fee_payer());
         assert_eq!(parsed.fee_payer_url(), "https://custom.sponsor.xyz");
         assert!(parsed.is_tempo_moderato());
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn test_is_tempo_moderato() {
         let tempo = TempoMethodDetails {
-            chain_id: Some(88153),
+            chain_id: Some(42431),
             ..Default::default()
         };
         assert!(tempo.is_tempo_moderato());

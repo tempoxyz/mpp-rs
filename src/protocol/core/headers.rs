@@ -518,7 +518,7 @@ mod tests {
         let challenge = test_challenge();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
-            "did:pkh:eip155:88153:0x123",
+            "did:pkh:eip155:42431:0x123",
             PaymentPayload::transaction("0xabc"),
         );
 
@@ -528,10 +528,10 @@ mod tests {
         assert_eq!(parsed.challenge.id, "abc123");
         assert_eq!(
             parsed.source,
-            Some("did:pkh:eip155:88153:0x123".to_string())
+            Some("did:pkh:eip155:42431:0x123".to_string())
         );
-        assert_eq!(parsed.payload.signature, "0xabc");
-        assert_eq!(parsed.payload.payload_type, Some(PayloadType::Transaction));
+        assert_eq!(parsed.payload.signature(), Some("0xabc"));
+        assert_eq!(parsed.payload.payload_type(), PayloadType::Transaction);
     }
 
     #[test]

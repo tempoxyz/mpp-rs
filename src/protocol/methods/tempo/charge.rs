@@ -173,7 +173,7 @@ mod tests {
             description: None,
             external_id: None,
             method_details: Some(serde_json::json!({
-                "chainId": 88153,
+                "chainId": 42431,
                 "feePayer": true,
                 "feePayerUrl": "https://custom.sponsor.xyz",
                 "nonceKey": "42",
@@ -187,7 +187,7 @@ mod tests {
     fn test_tempo_method_details() {
         let req = test_charge_request();
         let details = req.tempo_method_details().unwrap();
-        assert_eq!(details.chain_id, Some(88153));
+        assert_eq!(details.chain_id, Some(42431));
         assert!(details.fee_payer());
         assert_eq!(details.nonce_key, Some("42".to_string()));
         assert_eq!(details.fee_token, Some("0xDEF".to_string()));
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(req.fee_token(), Some("0xDEF".to_string()));
 
         let req_no_fee_token = ChargeRequest {
-            method_details: Some(serde_json::json!({"chainId": 88153})),
+            method_details: Some(serde_json::json!({"chainId": 42431})),
             ..test_charge_request()
         };
         assert_eq!(req_no_fee_token.fee_token(), None);

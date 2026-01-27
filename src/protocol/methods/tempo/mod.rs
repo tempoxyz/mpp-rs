@@ -1,7 +1,7 @@
 //! Tempo-specific types and helpers for Web Payment Auth.
 //!
 //! This module provides Tempo blockchain-specific implementations.
-//! Tempo uses chain_id 88153 (tempo-moderato testnet) and supports TIP-20 tokens.
+//! Tempo uses chain_id 42431 (Moderato testnet, per IETF spec) and supports TIP-20 tokens.
 //!
 //! # Types
 //!
@@ -12,7 +12,7 @@
 //!
 //! # Constants
 //!
-//! - [`CHAIN_ID`]: Tempo Moderato chain ID (88153)
+//! - [`CHAIN_ID`]: Tempo Moderato chain ID (42431)
 //! - [`METHOD_NAME`]: Payment method name ("tempo")
 //!
 //! # Transaction Format
@@ -58,7 +58,7 @@
 //! let challenge = parse_www_authenticate(header).unwrap();
 //! let req: ChargeRequest = challenge.request.decode().unwrap();
 //! let nonce_key = req.nonce_key();
-//! assert_eq!(CHAIN_ID, 88153);
+//! assert_eq!(CHAIN_ID, 42431);
 //! ```
 
 pub mod charge;
@@ -73,7 +73,7 @@ pub use transaction::{
 pub use types::{TempoMethodDetails, DEFAULT_FEE_PAYER_URL};
 
 /// Tempo Moderato testnet chain ID.
-pub const CHAIN_ID: u64 = 88153;
+pub const CHAIN_ID: u64 = 42431;
 
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
