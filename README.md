@@ -170,6 +170,22 @@ assert!(provider.supports("tempo", "charge"));
 let credential = provider.pay(&challenge).await?;
 ```
 
+### Multiple Payment Methods
+
+Use `MultiProvider` to handle multiple payment methods:
+
+```rust
+use mpay::client::{MultiProvider, TempoProvider};
+
+let provider = MultiProvider::new()
+    .with(TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?);
+    // .with(StripeProvider::new(api_key))
+    // .with(OtherProvider::new(...))
+
+// Automatically picks the right provider based on challenge.method
+let resp = client.get(url).send_with_payment(&provider).await?;
+```
+
 ## Install
 
 ```toml

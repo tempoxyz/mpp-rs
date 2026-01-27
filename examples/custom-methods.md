@@ -9,7 +9,7 @@ mpay-rs uses intent-specific traits that enforce shared schemas:
 - **Intent** = Shared request schema (`ChargeRequest`, `AuthorizeRequest`)
 - **Method** = Your implementation of an intent-specific trait (`ChargeMethod`)
 
-All methods implementing the same intent use the same request type. This ensures consistent field names (amount, currency, recipient) across all payment networks.
+All methods implementing the same intent use the same request type. This ensures consistent shapes and field names across all payment networks.
 
 ### Core Traits
 
@@ -40,93 +40,6 @@ pub trait ChargeMethod: Clone + Send + Sync {
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send;
-}
-```
-
-## Example: Stripe ChargeMethod
-
-```rust
-use mpay::server::{ChargeMethod, VerificationError};
-use mpay::Intent::ChargeRequest;
-use mpay::Receipt::Receipt;
-use mpay::Credential::PaymentCredential;
-
-#[derive(Clone)]
-pub struct StripeChargeMethod {
-    api_key: String,
-}
-
-impl StripeChargeMethod {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self { api_key: api_key.into() }
-    }
-}
-
-impl ChargeMethod for StripeChargeMethod {
-    fn method(&self) -> &str {
-        "stripe"
-    }
-
-    fn verify(
-        &self,
-        credential: &PaymentCredential,
-        request: &ChargeRequest,
-    ) -> impl std::future::Future<Output = Result<Receipt, VerificationError>> + Send {
-        let api_key = self.api_key.clone();
-        let credential = credential.clone();
-        let request = request.clone();
-
-        async move {
-            // Extract payment intent ID from credential payload
-            let payment_intent_id = match &credential.payload {
-                mpay::Credential::PaymentPayload::Hash { hash, .. } => hash.clone(),
-                _ => return Err(VerificationError::new("Expected hash payload")),
-            };
-
-            // Verify with Stripe API
-            let client = reqwest::Client::new();
-            let resp = client
-                .get(format!(
-                    "https://api.stripe.com/v1/payment_intents/{}",
-                    payment_intent_id
-                ))
-                .bearer_auth(&api_key)
-                .send()
-                .await
-                .map_err(|e| VerificationError::new(format!("Stripe API error: {}", e)))?;
-
-            if !resp.status().is_success() {
-                return Err(VerificationError::not_found("Payment intent not found"));
-            }
-
-            let pi: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| VerificationError::new(format!("Invalid response: {}", e)))?;
-
-            // Verify status
-            let status = pi.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            if status != "succeeded" {
-                return Err(VerificationError::transaction_failed(format!(
-                    "Payment not completed: status={}",
-                    status
-                )));
-            }
-
-            // Verify amount using typed ChargeRequest
-            let expected_amount: i64 = request.amount.parse().unwrap_or(0);
-            let actual_amount = pi.get("amount").and_then(|a| a.as_i64()).unwrap_or(0);
-
-            if actual_amount < expected_amount {
-                return Err(VerificationError::invalid_amount(format!(
-                    "Amount mismatch: expected {}, got {}",
-                    expected_amount, actual_amount
-                )));
-            }
-
-            Ok(Receipt::success("stripe", &payment_intent_id))
-        }
-    }
 }
 ```
 
@@ -227,59 +140,6 @@ pub trait PaymentProvider: Clone + Send + Sync {
     ) -> impl std::future::Future<Output = Result<PaymentCredential, MppError>> + Send;
 }
 ```
-
-### Example: Stripe Provider
-
-With Stripe, the server creates a PaymentIntent and includes its ID in the challenge's
-`method_details`. The client confirms the payment and returns the ID as the credential:
-
-```rust
-use mpay::client::PaymentProvider;
-use mpay::Challenge::PaymentChallenge;
-use mpay::Credential::{PaymentCredential, PaymentPayload};
-use mpay::MppError;
-
-#[derive(Clone)]
-pub struct StripeProvider {
-    publishable_key: String,
-}
-
-impl StripeProvider {
-    pub fn new(publishable_key: impl Into<String>) -> Self {
-        Self { publishable_key: publishable_key.into() }
-    }
-}
-
-impl PaymentProvider for StripeProvider {
-    fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "stripe" && matches!(intent, "charge" | "authorize")
-    }
-
-    fn pay(
-        &self,
-        challenge: &PaymentChallenge,
-    ) -> impl std::future::Future<Output = Result<PaymentCredential, MppError>> + Send {
-        let challenge = challenge.clone();
-
-        async move {
-            // Server provides the PaymentIntent ID in method_details
-            let request: serde_json::Value = challenge.request.decode()?;
-            let pi_id = request
-                .get("method_details")
-                .and_then(|md| md.get("payment_intent_id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| MppError::Http("Missing payment_intent_id in challenge".into()))?;
-
-            // Client would confirm the PaymentIntent via Stripe.js in a real implementation.
-            // Here we just return the ID as proof of payment.
-
-            let echo = challenge.to_echo();
-            Ok(PaymentCredential::new(echo, PaymentPayload::hash(pi_id)))
-        }
-    }
-}
-```
-
 
 ## Using with Axum
 
@@ -417,6 +277,7 @@ if receipt.is_success() {
 ```
 
 Features:
+
 - Verifies `hash` (pre-broadcast) and `transaction` (server-broadcast) credentials
 - Validates ERC-20 transfer logs
 - Checks expiration timestamps
@@ -431,10 +292,12 @@ Features:
 | **Provider** | Client-side credential creation |
 
 This design ensures:
+
 - Consistent field names across all payment methods
 - Type safety for request parameters
 - Clear separation between schema (intent) and implementation (method)
 
 See also:
+
 - [axum-server.md](./axum-server.md) - Full Axum integration
 - [reqwest-client.md](./reqwest-client.md) - Client-side usage

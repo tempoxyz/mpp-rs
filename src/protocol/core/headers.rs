@@ -521,7 +521,6 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc123".to_string(),
-            block_number: None,
             error: None,
         };
 

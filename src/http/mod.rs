@@ -45,7 +45,7 @@ mod ext;
 mod middleware;
 
 pub use error::HttpError;
-pub use provider::PaymentProvider;
+pub use provider::{MultiProvider, PaymentProvider};
 
 #[cfg(feature = "http")]
 pub use ext::PaymentExt;

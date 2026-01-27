@@ -18,7 +18,7 @@
 //! ```
 
 #[cfg(feature = "http")]
-pub use crate::http::{HttpError, PaymentProvider};
+pub use crate::http::{HttpError, MultiProvider, PaymentProvider};
 
 #[cfg(feature = "http")]
 pub use crate::http::PaymentExt as Fetch;
