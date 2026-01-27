@@ -111,6 +111,10 @@ mod tests {
     struct MockProvider;
 
     impl PaymentProvider for MockProvider {
+        fn supports(&self, _method: &str, _intent: &str) -> bool {
+            true
+        }
+
         async fn pay(
             &self,
             _challenge: &crate::protocol::core::PaymentChallenge,

@@ -79,6 +79,8 @@ pub use transaction::{
 };
 pub use types::TempoMethodDetails;
 
+use alloy::primitives::b256;
+
 /// Tempo Moderato testnet chain ID.
 pub const CHAIN_ID: u64 = 42431;
 
@@ -87,3 +89,59 @@ pub const METHOD_NAME: &str = "tempo";
 
 /// Network name for Tempo Moderato.
 pub const NETWORK_NAME: &str = "tempo-moderato";
+
+/// ERC-20 Transfer(address,address,uint256) event signature.
+/// keccak256("Transfer(address,address,uint256)")
+pub(crate) const ERC20_TRANSFER_TOPIC: [u8; 32] =
+    b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").0;
+
+/// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
+pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.len() < 19 {
+        return None;
+    }
+
+    let year: i32 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    let minute: u32 = s.get(14..16)?.parse().ok()?;
+    let second: u32 = s.get(17..19)?.parse().ok()?;
+
+    let leap = is_leap_year(year);
+    let days_before = days_before_month(month, leap);
+
+    let mut total_days: i64 = 0;
+    for y in 1970..year {
+        total_days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    total_days += days_before as i64;
+    total_days += (day - 1) as i64;
+
+    Some(total_days as u64 * 86400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64)
+}
+
+/// Check if a year is a leap year.
+const fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Days before the given month (1-indexed) in a year.
+const fn days_before_month(month: u32, leap: bool) -> u32 {
+    match month {
+        1 => 0,
+        2 => 31,
+        3 => 59 + if leap { 1 } else { 0 },
+        4 => 90 + if leap { 1 } else { 0 },
+        5 => 120 + if leap { 1 } else { 0 },
+        6 => 151 + if leap { 1 } else { 0 },
+        7 => 181 + if leap { 1 } else { 0 },
+        8 => 212 + if leap { 1 } else { 0 },
+        9 => 243 + if leap { 1 } else { 0 },
+        10 => 273 + if leap { 1 } else { 0 },
+        11 => 304 + if leap { 1 } else { 0 },
+        12 => 334 + if leap { 1 } else { 0 },
+        _ => 0,
+    }
+}

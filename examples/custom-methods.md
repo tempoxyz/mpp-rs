@@ -43,14 +43,6 @@ pub trait ChargeMethod: Clone + Send + Sync {
 }
 ```
 
-### Key Difference from Old Design
-
-The old `Intent` trait took `request: &serde_json::Value`. The new `ChargeMethod` takes `request: &ChargeRequest`, enforcing:
-- `amount: String` - Payment amount in base units
-- `currency: String` - Currency identifier (ISO 4217, token address, or symbol)
-- `recipient: Option<String>` - Payment recipient
-- `method_details: Option<Value>` - Method-specific extensions
-
 ## Example: Stripe ChargeMethod
 
 ```rust
@@ -238,21 +230,23 @@ pub trait PaymentProvider: Clone + Send + Sync {
 
 ### Example: Stripe Provider
 
+With Stripe, the server creates a PaymentIntent and includes its ID in the challenge's
+`method_details`. The client confirms the payment and returns the ID as the credential:
+
 ```rust
 use mpay::Provider::PaymentProvider;
 use mpay::Challenge::PaymentChallenge;
 use mpay::Credential::{PaymentCredential, PaymentPayload};
-use mpay::Intent::ChargeRequest;
 use mpay::MppError;
 
 #[derive(Clone)]
 pub struct StripeProvider {
-    api_key: String,
+    publishable_key: String,
 }
 
 impl StripeProvider {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self { api_key: api_key.into() }
+    pub fn new(publishable_key: impl Into<String>) -> Self {
+        Self { publishable_key: publishable_key.into() }
     }
 }
 
@@ -265,36 +259,19 @@ impl PaymentProvider for StripeProvider {
         &self,
         challenge: &PaymentChallenge,
     ) -> impl std::future::Future<Output = Result<PaymentCredential, MppError>> + Send {
-        let api_key = self.api_key.clone();
         let challenge = challenge.clone();
 
         async move {
-            // Decode the typed request
-            let request: ChargeRequest = challenge.request.decode()?;
-
-            // Create a PaymentIntent with Stripe
-            let client = reqwest::Client::new();
-            let resp = client
-                .post("https://api.stripe.com/v1/payment_intents")
-                .bearer_auth(&api_key)
-                .form(&[
-                    ("amount", request.amount.clone()),
-                    ("currency", request.currency.clone()),
-                    ("confirm", "true".into()),
-                ])
-                .send()
-                .await
-                .map_err(|e| MppError::Http(format!("Stripe error: {}", e)))?;
-
-            let pi: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| MppError::Http(format!("Invalid response: {}", e)))?;
-
-            let pi_id = pi
-                .get("id")
+            // Server provides the PaymentIntent ID in method_details
+            let request: serde_json::Value = challenge.request.decode()?;
+            let pi_id = request
+                .get("method_details")
+                .and_then(|md| md.get("payment_intent_id"))
                 .and_then(|id| id.as_str())
-                .ok_or_else(|| MppError::Http("Missing payment intent ID".into()))?;
+                .ok_or_else(|| MppError::Http("Missing payment_intent_id in challenge".into()))?;
+
+            // Client would confirm the PaymentIntent via Stripe.js in a real implementation.
+            // Here we just return the ID as proof of payment.
 
             let echo = challenge.to_echo();
             Ok(PaymentCredential::new(echo, PaymentPayload::hash(pi_id)))
@@ -302,6 +279,7 @@ impl PaymentProvider for StripeProvider {
     }
 }
 ```
+
 
 ## Using with Axum
 
@@ -443,37 +421,6 @@ Features:
 - Validates ERC-20 transfer logs
 - Checks expiration timestamps
 - Confirms chain ID matches
-
-## Migration from Old Traits
-
-### Old Design (deprecated)
-
-```rust
-// Old: Generic Intent trait with untyped request
-impl Intent for MyIntent {
-    fn name(&self) -> &str { "charge" }
-    
-    fn verify(&self, credential: &PaymentCredential, request: &serde_json::Value) 
-        -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send;
-}
-```
-
-### New Design
-
-```rust
-// New: Intent-specific trait with typed request
-impl ChargeMethod for MyMethod {
-    fn method(&self) -> &str { "my_network" }
-    
-    fn verify(&self, credential: &PaymentCredential, request: &ChargeRequest)
-        -> impl Future<Output = Result<PaymentReceipt, VerificationError>> + Send;
-}
-```
-
-Key changes:
-1. `name()` → `method()` (returns method name, not intent name)
-2. `request: &Value` → `request: &ChargeRequest` (typed schema)
-3. Intent name is implicit from the trait (`ChargeMethod` = "charge" intent)
 
 ## Summary
 

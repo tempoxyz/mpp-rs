@@ -112,7 +112,7 @@ pub mod Schema {
 /// Methods implement intent-specific traits that enforce typed request schemas.
 #[allow(non_snake_case)]
 pub mod Method {
-    pub use crate::protocol::traits::{ChargeMethod, VerificationError};
+    pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
 
     #[cfg(feature = "tempo")]
     pub mod tempo {
@@ -126,10 +126,10 @@ pub mod Method {
 #[allow(non_snake_case)]
 #[cfg(feature = "http")]
 pub mod Provider {
-    pub use crate::http::provider::PaymentProvider;
+    pub use crate::http::PaymentProvider;
 
     #[cfg(feature = "tempo")]
-    pub use crate::http::provider::TempoProvider;
+    pub use crate::http::TempoProvider;
 }
 
 // ==================== Alloy Re-exports (batteries included) ====================

@@ -19,10 +19,10 @@
 use crate::evm::{parse_address, parse_amount, Address, U256};
 use crate::protocol::core::{PaymentCredential, PaymentPayload, PaymentReceipt};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::traits::{ChargeMethod, VerificationError};
+use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use std::future::Future;
 
-use super::{TempoChargeExt, CHAIN_ID, METHOD_NAME};
+use super::{parse_iso8601_timestamp, ERC20_TRANSFER_TOPIC, TempoChargeExt, CHAIN_ID, METHOD_NAME};
 
 /// Tempo charge method for one-time payment verification.
 ///
@@ -147,7 +147,7 @@ impl ChargeMethod {
             .and_then(|l| l.as_array())
             .ok_or_else(|| VerificationError::new("No logs in receipt"))?;
 
-        let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        let transfer_topic = format!("0x{}", hex::encode(ERC20_TRANSFER_TOPIC));
 
         let is_native = expected_currency == Address::ZERO;
 
@@ -372,55 +372,7 @@ fn parse_topic_address(topic: &str) -> Result<Address, VerificationError> {
         .map_err(|e| VerificationError::new(format!("Invalid address in topic: {}", e)))
 }
 
-fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if s.len() < 19 {
-        return None;
-    }
-
-    let year: i32 = s.get(0..4)?.parse().ok()?;
-    let month: u32 = s.get(5..7)?.parse().ok()?;
-    let day: u32 = s.get(8..10)?.parse().ok()?;
-    let hour: u32 = s.get(11..13)?.parse().ok()?;
-    let minute: u32 = s.get(14..16)?.parse().ok()?;
-    let second: u32 = s.get(17..19)?.parse().ok()?;
-
-    fn is_leap_year(year: i32) -> bool {
-        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-    }
-
-    let days_before_month = |y: i32, m: u32| -> u32 {
-        let leap = is_leap_year(y);
-        match m {
-            1 => 0,
-            2 => 31,
-            3 => 59 + u32::from(leap),
-            4 => 90 + u32::from(leap),
-            5 => 120 + u32::from(leap),
-            6 => 151 + u32::from(leap),
-            7 => 181 + u32::from(leap),
-            8 => 212 + u32::from(leap),
-            9 => 243 + u32::from(leap),
-            10 => 273 + u32::from(leap),
-            11 => 304 + u32::from(leap),
-            12 => 334 + u32::from(leap),
-            _ => 0,
-        }
-    };
-
-    let mut days: i64 = 0;
-    for y in 1970..year {
-        days += if is_leap_year(y) { 366 } else { 365 };
-    }
-    days += days_before_month(year, month) as i64;
-    days += (day - 1) as i64;
-
-    let timestamp = days as u64 * 86400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64;
-
-    Some(timestamp)
-}
-
-impl ChargeMethod for ChargeMethod {
+impl ChargeMethodTrait for ChargeMethod {
     fn method(&self) -> &str {
         METHOD_NAME
     }
@@ -443,13 +395,10 @@ impl ChargeMethod for ChargeMethod {
             let actual_chain_id = this.fetch_chain_id().await?;
 
             if actual_chain_id != expected_chain_id {
-                return Err(VerificationError::with_code(
-                    format!(
-                        "Chain ID mismatch: expected {}, got {}",
-                        expected_chain_id, actual_chain_id
-                    ),
-                    "chain_id_mismatch",
-                ));
+                return Err(VerificationError::new(format!(
+                    "Chain ID mismatch: expected {}, got {}",
+                    expected_chain_id, actual_chain_id
+                )));
             }
 
             match &credential.payload {
