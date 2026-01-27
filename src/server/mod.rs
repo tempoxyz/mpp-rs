@@ -7,7 +7,7 @@
 //! - [`ChargeMethod`]: Trait for verifying charge intent payments
 //! - [`VerificationError`]: Error type for verification failures
 //! - [`ErrorCode`]: Error codes for programmatic handling
-//! - [`tempo`]: Tempo-specific verification (feature-gated)
+//! - [`tempo`]: Tempo-specific verification (requires `tempo`)
 //!
 //! # Example
 //!

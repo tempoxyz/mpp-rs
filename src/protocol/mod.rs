@@ -83,5 +83,9 @@
 
 pub mod core;
 pub mod intents;
+
+#[cfg(any(feature = "server", feature = "tempo"))]
 pub mod methods;
+
+#[cfg(feature = "server")]
 pub mod traits;

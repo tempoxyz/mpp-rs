@@ -181,11 +181,28 @@ mpay = "0.1"
 
 | Feature | Description |
 |---------|-------------|
+| `client` | Client-side payment providers (`PaymentProvider` trait) |
+| `server` | Server-side payment verification (`ChargeMethod` trait) |
 | `tempo` | Tempo blockchain support (default, includes `evm`) |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
-| `utils` | Encoding utilities (hex, base64) |
-| `http` | HTTP client support with `Fetch` extension trait for reqwest |
-| `middleware` | reqwest-middleware support with `PaymentMiddleware` for automatic 402 handling |
+| `http` | HTTP client support with `Fetch` extension trait (implies `client`) |
+| `middleware` | reqwest-middleware support with `PaymentMiddleware` |
+
+### Common configurations
+
+```toml
+# Server app
+mpay = { version = "0.1", features = ["server", "tempo"] }
+
+# Client app  
+mpay = { version = "0.1", features = ["http", "tempo"] }
+
+# Both sides
+mpay = { version = "0.1", features = ["server", "http", "tempo"] }
+
+# Core only (parsing/formatting)
+mpay = { version = "0.1", default-features = false }
+```
 
 ## HTTP Client Support
 

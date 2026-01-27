@@ -22,7 +22,7 @@
 //! Following the mpay pattern, core types are exported as namespaced modules:
 //!
 //! ```no_run
-//! use mpay::{Challenge, Credential, Receipt, Intent, server};
+//! use mpay::{Challenge, Credential, Receipt, Intent};
 //! # fn main() {}
 //! ```
 //!
@@ -58,9 +58,10 @@ pub mod evm;
 #[cfg(feature = "http")]
 pub mod http;
 
-#[cfg(feature = "http")]
+#[cfg(feature = "client")]
 pub mod client;
 
+#[cfg(feature = "server")]
 pub mod server;
 
 #[cfg(feature = "tempo")]

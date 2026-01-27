@@ -11,8 +11,8 @@
 //!
 //! # Submodules
 //!
-//! - [`client`]: Client-side Tempo provider
-//! - [`server`]: Server-side Tempo verification
+//! - [`client`]: Client-side Tempo provider (requires `client` + `http`)
+//! - [`server`]: Server-side Tempo verification (requires `server`)
 //!
 //! # Example
 //!
@@ -32,13 +32,17 @@ pub use crate::protocol::methods::tempo::{
     TEMPO_TX_TYPE_ID,
 };
 
+#[cfg(feature = "server")]
+pub use crate::protocol::methods::tempo::ChargeMethod;
+
 /// Client-side Tempo provider.
-#[cfg(feature = "http")]
+#[cfg(all(feature = "client", feature = "http"))]
 pub mod client {
     pub use crate::http::TempoProvider as Provider;
 }
 
 /// Server-side Tempo verification.
+#[cfg(feature = "server")]
 pub mod server {
     pub use crate::protocol::methods::tempo::ChargeMethod;
 }
