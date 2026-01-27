@@ -44,10 +44,6 @@ pub struct PaymentChallenge {
     /// This is the source of truth - don't re-serialize.
     pub request: Base64UrlJson,
 
-    /// Content digest for body binding (RFC 9530)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
-
     /// Challenge expiration time (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
@@ -74,7 +70,6 @@ impl PaymentChallenge {
             method: self.method.clone(),
             intent: self.intent.clone(),
             request: self.request.raw().to_string(),
-            digest: self.digest.clone(),
             expires: self.expires.clone(),
         }
     }
@@ -100,10 +95,6 @@ pub struct ChallengeEcho {
 
     /// Base64url-encoded request (as received from server)
     pub request: String,
-
-    /// Content digest for body binding (RFC 9530)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
 
     /// Challenge expiration time (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,9 +228,11 @@ impl PaymentCredential {
 }
 
 /// Payment receipt from server (parsed from Payment-Receipt header).
+///
+/// Per IETF spec, contains: status, method, timestamp, reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentReceipt {
-    /// Receipt status
+    /// Receipt status ("success" or "failed")
     pub status: ReceiptStatus,
 
     /// Payment method used
@@ -250,14 +243,6 @@ pub struct PaymentReceipt {
 
     /// Transaction hash or reference
     pub reference: String,
-
-    /// Block number (optional)
-    #[serde(rename = "blockNumber", skip_serializing_if = "Option::is_none")]
-    pub block_number: Option<String>,
-
-    /// Error message if failed (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 impl PaymentReceipt {
@@ -287,7 +272,6 @@ mod tests {
                 "currency": "0x123"
             }))
             .unwrap(),
-            digest: None,
             expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
         }
@@ -365,8 +349,6 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc".to_string(),
-            block_number: Some("12345".to_string()),
-            error: None,
         };
         assert!(success.is_success());
         assert!(!success.is_failed());
@@ -376,8 +358,6 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "".to_string(),
-            block_number: None,
-            error: Some("Insufficient funds".to_string()),
         };
         assert!(!failed.is_success());
         assert!(failed.is_failed());
