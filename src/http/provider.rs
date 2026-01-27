@@ -66,9 +66,6 @@ pub trait PaymentProvider: Clone + Send + Sync {
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
 }
 
-#[allow(dead_code)]
-fn assert_payment_provider_is_object_safe<P: PaymentProvider>() {}
-
 /// Tempo payment provider using EVM signing.
 ///
 /// Executes payments on the Tempo blockchain by building and signing

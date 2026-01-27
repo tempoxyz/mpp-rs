@@ -78,9 +78,6 @@ pub const CHAIN_ID: u64 = 42431;
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
-/// Network name for Tempo Moderato.
-pub const NETWORK_NAME: &str = "tempo-moderato";
-
 /// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
 pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
     let s = s.trim();
