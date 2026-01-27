@@ -79,7 +79,8 @@ pub use error::{MppError, Result, ResultExt, SigningContext};
 #[allow(non_snake_case)]
 pub mod Challenge {
     pub use crate::protocol::core::{
-        parse_www_authenticate, parse_www_authenticate_all, PaymentChallenge,
+        format_www_authenticate, format_www_authenticate_many, parse_www_authenticate,
+        parse_www_authenticate_all, PaymentChallenge,
     };
 }
 
@@ -87,7 +88,7 @@ pub mod Challenge {
 #[allow(non_snake_case)]
 pub mod Credential {
     pub use crate::protocol::core::{
-        format_authorization, ChallengeEcho, PaymentCredential, PaymentPayload,
+        format_authorization, parse_authorization, ChallengeEcho, PaymentCredential, PaymentPayload,
     };
 }
 

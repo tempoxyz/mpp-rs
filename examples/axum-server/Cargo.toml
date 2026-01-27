@@ -1,0 +1,13 @@
+[package]
+name = "axum-server-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mpay = { path = "../.." }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
