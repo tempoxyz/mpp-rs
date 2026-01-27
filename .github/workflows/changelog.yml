@@ -15,11 +15,16 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
+      - name: Install changelogs
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/wevm/changelogs-rs/main/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: Install Amp CLI
         run: npm install -g @sourcegraph/amp
 
       - name: Generate changelog if missing
-        uses: wevm/changelogs-rs/gen@master
+        uses: wevm/changelogs-rs/gen@changelogs@0.4.0
         with:
           ai: 'amp -x'
           conventional-commit: true

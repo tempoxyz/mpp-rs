@@ -14,8 +14,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install changelogs
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/wevm/changelogs-rs/main/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: Changelogs
-        uses: wevm/changelogs-rs@master
+        uses: wevm/changelogs-rs@changelogs@0.4.0
         with:
           conventional-commit: true
         env:
