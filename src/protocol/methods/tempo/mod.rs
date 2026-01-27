@@ -62,12 +62,17 @@
 pub mod charge;
 #[cfg(feature = "http")]
 pub mod intent;
+#[cfg(feature = "http")]
+pub mod method;
 pub mod transaction;
 pub mod types;
 
 pub use charge::TempoChargeExt;
 #[cfg(feature = "http")]
+#[deprecated(since = "0.2.0", note = "use tempo::ChargeMethod instead")]
 pub use intent::TempoChargeIntent;
+#[cfg(feature = "http")]
+pub use method::ChargeMethod;
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,

@@ -11,6 +11,8 @@ use std::future::Future;
 /// Trait for payment providers that can execute payments for challenges.
 ///
 /// Implement this trait to add support for custom payment methods.
+/// PaymentProvider is the client-side counterpart to server-side method traits
+/// like [`ChargeMethod`](crate::protocol::traits::ChargeMethod).
 ///
 /// # Examples
 ///
@@ -23,6 +25,10 @@ use std::future::Future;
 /// struct MyProvider { /* ... */ }
 ///
 /// impl PaymentProvider for MyProvider {
+///     fn supports(&self, method: &str, intent: &str) -> bool {
+///         method == "my_network" && intent == "charge"
+///     }
+///
 ///     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
 ///         // 1. Parse the challenge request
 ///         // 2. Execute payment (sign tx, call API, etc.)
@@ -33,6 +39,21 @@ use std::future::Future;
 /// }
 /// ```
 pub trait PaymentProvider: Clone + Send + Sync {
+    /// Check if this provider supports the given method and intent combination.
+    ///
+    /// This allows clients to filter providers based on challenge requirements
+    /// before attempting payment.
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - Payment method name (e.g., "tempo", "stripe")
+    /// * `intent` - Payment intent name (e.g., "charge", "authorize")
+    ///
+    /// # Returns
+    ///
+    /// `true` if this provider can handle the combination.
+    fn supports(&self, method: &str, intent: &str) -> bool;
+
     /// Execute payment for the given challenge and return a credential.
     ///
     /// This method should:
@@ -120,6 +141,10 @@ impl TempoProvider {
 
 #[cfg(feature = "tempo")]
 impl PaymentProvider for TempoProvider {
+    fn supports(&self, method: &str, intent: &str) -> bool {
+        method == "tempo" && intent == "charge"
+    }
+
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;

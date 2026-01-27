@@ -8,7 +8,23 @@ Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Pa
 - **Zero-copy parsing** — Efficient header parsing without unnecessary allocations
 - **Pluggable methods** — Payment networks are feature-gated (Tempo included by default)
 - **Minimal dependencies** — Core has minimal deps; features add what you need
-- **Designed for extension** — `Method` and `Intent` are traits. Implement them for custom payment methods.
+- **Intent = Schema, Method = Implementation** — Intents define shared request schemas; methods implement verification
+
+## Core Types
+
+| Type | Role | HTTP Header |
+|------|------|-------------|
+| `PaymentChallenge` | Server's payment request | `WWW-Authenticate: Payment ...` |
+| `ChargeRequest` | Typed request schema (inside challenge) | Base64 in `request=` param |
+| `PaymentCredential` | Client's payment proof | `Authorization: Payment ...` |
+| `PaymentReceipt` | Server's confirmation | `Payment-Receipt: ...` |
+
+## Traits
+
+| Trait | Side | Purpose |
+|-------|------|---------|
+| `ChargeMethod` | Server | Verify credentials against `ChargeRequest` |
+| `PaymentProvider` | Client | Create credentials from challenges |
 
 ## Quick Start
 
@@ -62,7 +78,7 @@ let challenge = Challenge {
     id: "challenge-id".into(),
     method: "tempo".into(),
     intent: "charge".into(),
-    request: serde_json::json!({"amount": "1000000", "asset": "0x...", "destination": "0x..."}),
+    request: serde_json::json!({"amount": "1000000", "currency": "0x...", "recipient": "0x..."}),
 };
 
 let header = challenge.to_www_authenticate("api.example.com");
@@ -101,6 +117,51 @@ let receipt = Receipt {
 
 let header = receipt.to_payment_receipt();
 let parsed = Receipt::from_payment_receipt(&header)?;
+```
+
+### Intent Schemas
+
+Intent schemas define shared request fields per the IETF spec:
+
+```rust
+use mpay::Intent::ChargeRequest;
+
+let request = ChargeRequest {
+    amount: "1000000".into(),
+    currency: "0x20c0000000000000000000000000000000000001".into(),
+    recipient: Some("0x742d35Cc...".into()),
+    expires: Some("2025-01-15T12:00:00Z".into()),
+    ..Default::default()
+};
+```
+
+### Server-Side Traits
+
+Method traits verify payment credentials with typed schemas:
+
+```rust
+use mpay::Method::tempo::ChargeMethod;
+
+let method = ChargeMethod::new("https://rpc.moderato.tempo.xyz");
+
+// Verify a payment
+let receipt = method.verify(&credential, &request).await?;
+```
+
+### Client-Side Traits
+
+PaymentProvider creates credentials for challenges:
+
+```rust
+use mpay::Provider::{PaymentProvider, TempoProvider};
+
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+
+// Check support
+assert!(provider.supports("tempo", "charge"));
+
+// Create credential
+let credential = provider.pay(&challenge).await?;
 ```
 
 ## Install

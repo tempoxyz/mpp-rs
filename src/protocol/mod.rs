@@ -82,7 +82,13 @@
 //! ```
 
 pub mod core;
+#[deprecated(
+    since = "0.2.0",
+    note = "use protocol::traits::{ChargeMethod, VerificationError} instead"
+)]
 pub mod intent;
 pub mod intents;
+#[deprecated(since = "0.2.0", note = "use http::PaymentProvider instead")]
 pub mod method;
 pub mod methods;
+pub mod traits;
