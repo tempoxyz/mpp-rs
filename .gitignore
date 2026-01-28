@@ -14,4 +14,4 @@ Cargo.lock
 
 # Testing
 *.log
-examples/axum-server/target/
+examples/server/target/

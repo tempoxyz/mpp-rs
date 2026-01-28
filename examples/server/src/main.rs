@@ -14,7 +14,7 @@ use axum::{
     routing::get,
     Router,
 };
-use mpay::{Challenge, Credential, Receipt, Schema};
+use mpay::{Challenge, Credential, Intent, Receipt, Schema};
 use std::sync::LazyLock;
 
 const REALM: &str = "api.example.com";
@@ -65,17 +65,19 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
         }
     }
 
+    let charge_request = Intent::ChargeRequest {
+        amount: "1000000".to_string(),
+        currency: ALPHA_USD.to_string(),
+        recipient: Some(MERCHANT_ADDRESS.clone()),
+        ..Default::default()
+    };
+
     let challenge = Challenge::PaymentChallenge {
         id: uuid::Uuid::new_v4().to_string(),
         realm: REALM.to_string(),
         method: "tempo".into(),
         intent: "charge".into(),
-        request: Schema::Base64UrlJson::from_value(&serde_json::json!({
-            "amount": "1000000",
-            "currency": ALPHA_USD,
-            "recipient": &*MERCHANT_ADDRESS
-        }))
-        .unwrap(),
+        request: Schema::Base64UrlJson::from_typed(&charge_request).unwrap(),
         expires: None,
         description: None,
     };
