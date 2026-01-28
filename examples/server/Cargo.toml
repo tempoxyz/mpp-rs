@@ -1,0 +1,10 @@
+[package]
+name = "server-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mpay = { path = "../..", features = ["server"] }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }

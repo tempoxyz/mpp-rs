@@ -55,7 +55,6 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
             "currency": "0x...",
             "recipient": "0x..."
         })).unwrap(),
-        digest: None,
         expires: None,
         description: None,
     };
@@ -144,7 +143,6 @@ async fn dynamic_pricing(headers: HeaderMap, Path(resource_id): Path<String>) ->
             "recipient": MERCHANT_ADDRESS,
             "description": resource_id,
         })).unwrap(),
-        digest: None,
         expires: None,
         description: None,
     };
