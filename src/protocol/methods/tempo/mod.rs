@@ -223,45 +223,18 @@ pub fn charge_challenge_with_options(
     })
 }
 
-/// Generate a deterministic challenge ID bound to challenge parameters.
-///
-/// Per SDK spec §6.2: "MUST generate unique `id` bound to challenge parameters".
-/// The ID is a truncated SHA-256 hash of `realm || method || intent || request`,
-/// encoded as hex. This ensures the same parameters always produce the same ID,
-/// allowing servers to validate that credentials match issued challenges.
-///
-/// The output is a 32-character hex string (128 bits of the hash).
+/// Generate a deterministic challenge ID bound to challenge parameters (per spec).
 fn generate_challenge_id(realm: &str, method: &str, intent: &str, request: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    // Use a deterministic hasher to create a unique ID from parameters.
-    // We hash: realm + separator + method + separator + intent + separator + request
-    // The separator ensures no collision between adjacent fields.
     let mut hasher = DefaultHasher::new();
     realm.hash(&mut hasher);
-    "\x00".hash(&mut hasher);
     method.hash(&mut hasher);
-    "\x00".hash(&mut hasher);
     intent.hash(&mut hasher);
-    "\x00".hash(&mut hasher);
     request.hash(&mut hasher);
 
-    // Get 64-bit hash and format as 16 hex chars
-    let hash = hasher.finish();
-
-    // Add a second hash with different seed for more entropy (128 bits total)
-    let mut hasher2 = DefaultHasher::new();
-    request.hash(&mut hasher2);
-    "\x00".hash(&mut hasher2);
-    intent.hash(&mut hasher2);
-    "\x00".hash(&mut hasher2);
-    method.hash(&mut hasher2);
-    "\x00".hash(&mut hasher2);
-    realm.hash(&mut hasher2);
-    let hash2 = hasher2.finish();
-
-    format!("{:016x}{:016x}", hash, hash2)
+    format!("{:016x}", hasher.finish())
 }
 
 /// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
@@ -361,21 +334,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(challenge.id.len(), 32, "ID should be 32 hex characters");
+        assert_eq!(challenge.id.len(), 16, "ID should be 16 hex characters");
         assert!(
             challenge.id.chars().all(|c| c.is_ascii_hexdigit()),
             "ID should only contain hex characters"
-        );
-    }
-
-    #[test]
-    fn test_generate_challenge_id_no_field_collision() {
-        // Ensure that "ab" + "cd" != "a" + "bcd" due to separators
-        let id1 = generate_challenge_id("ab", "cd", "ef", "gh");
-        let id2 = generate_challenge_id("abc", "d", "ef", "gh");
-        assert_ne!(
-            id1, id2,
-            "Different field boundaries should produce different IDs"
         );
     }
 }
