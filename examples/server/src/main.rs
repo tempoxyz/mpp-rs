@@ -14,7 +14,8 @@ use axum::{
     routing::get,
     Router,
 };
-use mpay::{Challenge, Credential, Intent, Receipt, Schema};
+use mpay::protocol::methods::tempo;
+use mpay::{Challenge, Credential, Receipt};
 use std::sync::LazyLock;
 
 const REALM: &str = "api.example.com";
@@ -65,22 +66,8 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
         }
     }
 
-    let charge_request = Intent::ChargeRequest {
-        amount: "1000000".to_string(),
-        currency: ALPHA_USD.to_string(),
-        recipient: Some(MERCHANT_ADDRESS.clone()),
-        ..Default::default()
-    };
-
-    let challenge = Challenge::PaymentChallenge {
-        id: uuid::Uuid::new_v4().to_string(),
-        realm: REALM.to_string(),
-        method: "tempo".into(),
-        intent: "charge".into(),
-        request: Schema::Base64UrlJson::from_typed(&charge_request).unwrap(),
-        expires: None,
-        description: None,
-    };
+    let challenge = tempo::charge_challenge(REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS)
+        .expect("Failed to create challenge");
 
     match Challenge::format_www_authenticate(&challenge) {
         Ok(www_auth) => (
