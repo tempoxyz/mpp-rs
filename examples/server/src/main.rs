@@ -1,10 +1,48 @@
 //! axum server example demonstrating payment-gated endpoints with mpay.
 //!
-//! Run with: `MERCHANT_ADDRESS=0x... cargo run`
+//! # Running the server
 //!
-//! Then test:
-//! - GET http://localhost:3000/free → 200 OK (no payment)
-//! - GET http://localhost:3000/paid → 402 Payment Required (needs credential)
+//! ```bash
+//! MERCHANT_ADDRESS=0x... cargo run
+//! ```
+//!
+//! # Testing with curl
+//!
+//! ```bash
+//! # Free endpoint - no payment required
+//! curl http://localhost:3000/free
+//! # → "Free content - no payment required"
+//!
+//! # Paid endpoint without credentials - returns 402
+//! curl -i http://localhost:3000/paid
+//! # → HTTP/1.1 402 Payment Required
+//! # → WWW-Authenticate: Payment realm="api.example.com", ...
+//! ```
+//!
+//! # Testing with purl (automatic payment)
+//!
+//! [purl](https://github.com/tempoxyz/purl) handles 402 responses automatically,
+//! prompting for payment and retrying with credentials.
+//!
+//! ```bash
+//! # Free endpoint works normally
+//! purl http://localhost:3000/free
+//! # → "Free content - no payment required"
+//!
+//! # Paid endpoint - purl detects 402, pays, and retries automatically
+//! purl http://localhost:3000/paid
+//! # → Received 402 Payment Required
+//! # → Payment challenge: 1.00 αUSD to 0x...
+//! # → Confirm payment? [y/N]: y
+//! # → Payment sent: 0x...
+//! # → "Here's your paid content!"
+//!
+//! # Skip confirmation prompt with -y
+//! purl -y http://localhost:3000/paid
+//!
+//! # Verbose mode to see headers
+//! purl -vv http://localhost:3000/paid
+//! ```
 
 use axum::{
     extract::State,
