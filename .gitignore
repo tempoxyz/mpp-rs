@@ -14,4 +14,4 @@ Cargo.lock
 
 # Testing
 *.log
-examples/server/target/
+examples/*/target/
