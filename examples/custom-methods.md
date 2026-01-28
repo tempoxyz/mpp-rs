@@ -25,9 +25,7 @@ The `ChargeMethod` trait verifies payment credentials against a typed `ChargeReq
 
 ```rust
 use mpay::server::{ChargeMethod, VerificationError};
-use mpay::Intent::ChargeRequest;
-use mpay::Receipt::Receipt;
-use mpay::Credential::PaymentCredential;
+use mpay::{ChargeRequest, Receipt, PaymentCredential};
 use std::future::Future;
 
 pub trait ChargeMethod: Clone + Send + Sync {
@@ -49,9 +47,7 @@ Support multiple EVM chains with a single method:
 
 ```rust
 use mpay::server::{ChargeMethod, VerificationError};
-use mpay::Intent::ChargeRequest;
-use mpay::Receipt::Receipt;
-use mpay::Credential::PaymentCredential;
+use mpay::{ChargeRequest, Receipt, PaymentCredential, PaymentPayload};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -106,7 +102,7 @@ impl ChargeMethod for MultiChainChargeMethod {
                 .ok_or_else(|| VerificationError::new(format!("Unsupported chain: {}", chain_id)))?;
 
             let tx_hash = match &credential.payload {
-                mpay::Credential::PaymentPayload::Hash { hash, .. } => hash.clone(),
+                PaymentPayload::Hash { hash, .. } => hash.clone(),
                 _ => return Err(VerificationError::new("Expected hash payload")),
             };
 
@@ -125,9 +121,7 @@ The `PaymentProvider` trait creates credentials for payment challenges:
 
 ```rust
 use mpay::client::PaymentProvider;
-use mpay::Challenge::PaymentChallenge;
-use mpay::Credential::PaymentCredential;
-use mpay::MppError;
+use mpay::{PaymentChallenge, PaymentCredential, MppError};
 
 pub trait PaymentProvider: Clone + Send + Sync {
     /// Check if this provider supports the method+intent combination
@@ -154,13 +148,10 @@ use axum::{
     Router,
 };
 use mpay::{
-    Challenge::PaymentChallenge,
-    Credential::PaymentCredential,
-    Intent::ChargeRequest,
-    server::{ChargeMethod, VerificationError},
-    Receipt::{format_receipt, Receipt},
-    Schema::Base64UrlJson,
+    PaymentChallenge, PaymentCredential, ChargeRequest, Receipt,
+    format_receipt, Base64UrlJson,
 };
+use mpay::server::{ChargeMethod, VerificationError};
 
 #[derive(Clone)]
 struct AppState<M: ChargeMethod> {
@@ -179,8 +170,7 @@ async fn verify_or_challenge<M: ChargeMethod>(
 
     match auth_header {
         Some(auth) => {
-            let credential = mpay::Credential::format_authorization
-                .parse(auth)
+            let credential = mpay::parse_authorization(auth)
                 .map_err(|_| challenge_response(method, request, realm))?;
 
             let receipt = method
@@ -209,7 +199,7 @@ fn challenge_response<M: ChargeMethod>(
         description: None,
     };
 
-    let www_auth = mpay::protocol::core::format_www_authenticate(&challenge).unwrap();
+    let www_auth = mpay::format_www_authenticate(&challenge).unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -254,7 +244,7 @@ mpay-rs includes `TempoChargeMethod` for Tempo blockchain verification:
 
 ```rust
 use mpay::server::TempoChargeMethod;
-use mpay::Intent::ChargeRequest;
+use mpay::ChargeRequest;
 
 let method = TempoChargeMethod::new("https://rpc.moderato.tempo.xyz")
     .with_timeout(30);

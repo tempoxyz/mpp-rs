@@ -109,19 +109,6 @@ pub struct ChallengeEcho {
 /// Payment payload in credential.
 ///
 /// Contains the signed transaction or transaction hash.
-///
-/// # Wire Format Compatibility
-///
-/// The TypeScript SDK uses a single `signature` field for all payload types:
-/// - `type="transaction"`: `signature` contains hex-encoded signed transaction
-/// - `type="hash"`: `signature` contains the transaction hash
-///
-/// This Rust type accepts both formats for interoperability:
-/// - For `type="transaction"`: reads `signature` field
-/// - For `type="hash"`: reads `signature` field (TypeScript SDK format)
-///
-/// Note: An older Rust-only format used `hash` field for `type="hash"`, but this
-/// was never deployed and is not supported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentPayload {
     /// Payload type: "transaction" or "hash"
@@ -145,8 +132,6 @@ impl PaymentPayload {
     }
 
     /// Create a new hash payload (already broadcast).
-    ///
-    /// The `tx_hash` is stored in the `signature` field per TypeScript SDK wire format.
     pub fn hash(tx_hash: impl Into<String>) -> Self {
         Self {
             payload_type: PayloadType::Hash,
@@ -371,7 +356,7 @@ mod tests {
         assert_eq!(hash.payload_type(), PayloadType::Hash);
         assert!(hash.is_hash());
         assert_eq!(hash.tx_hash(), Some("0xdef"));
-        assert_eq!(hash.signature(), "0xdef"); // TypeScript SDK uses signature for both
+        assert_eq!(hash.signature(), "0xdef");
         assert_eq!(hash.signed_tx(), None);
     }
 
@@ -383,7 +368,7 @@ mod tests {
         assert!(json.contains("\"signature\":\"0xabc\""));
         assert!(json.contains("\"type\":\"transaction\""));
 
-        // Hash payload ALSO uses "signature" field (TypeScript SDK wire format)
+        // Hash payload also uses "signature" field
         let hash = PaymentPayload::hash("0xdef");
         let json = serde_json::to_string(&hash).unwrap();
         assert!(json.contains("\"signature\":\"0xdef\""));
@@ -391,16 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn test_payment_payload_deserialization_from_ts_sdk() {
-        // TypeScript SDK sends hash payloads with "signature" field
-        let ts_hash_json = r#"{"type":"hash","signature":"0xdef123"}"#;
-        let payload: PaymentPayload = serde_json::from_str(ts_hash_json).unwrap();
+    fn test_payment_payload_deserialization() {
+        // Hash payload deserialization
+        let hash_json = r#"{"type":"hash","signature":"0xdef123"}"#;
+        let payload: PaymentPayload = serde_json::from_str(hash_json).unwrap();
         assert!(payload.is_hash());
         assert_eq!(payload.tx_hash(), Some("0xdef123"));
 
-        // TypeScript SDK sends transaction payloads with "signature" field
-        let ts_tx_json = r#"{"type":"transaction","signature":"0xabc456"}"#;
-        let payload: PaymentPayload = serde_json::from_str(ts_tx_json).unwrap();
+        // Transaction payload deserialization
+        let tx_json = r#"{"type":"transaction","signature":"0xabc456"}"#;
+        let payload: PaymentPayload = serde_json::from_str(tx_json).unwrap();
         assert!(payload.is_transaction());
         assert_eq!(payload.signed_tx(), Some("0xabc456"));
     }

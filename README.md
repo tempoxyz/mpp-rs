@@ -31,10 +31,10 @@ Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Pa
 ### Parse a Challenge (Server → Client)
 
 ```rust
-use mpay::Challenge;
+use mpay::{parse_www_authenticate, PaymentChallenge};
 
 let header = r#"Payment realm="api.example.com", id="abc123", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIn0""#;
-let challenge = Challenge::from_www_authenticate(header)?;
+let challenge = parse_www_authenticate(header)?;
 
 println!("Method: {}", challenge.method);
 println!("Intent: {}", challenge.intent);
@@ -43,63 +43,66 @@ println!("Intent: {}", challenge.intent);
 ### Create a Credential (Client → Server)
 
 ```rust
-use mpay::Credential;
+use mpay::{PaymentCredential, PaymentPayload, ChallengeEcho, format_authorization};
 
-let credential = Credential {
-    id: challenge.id.clone(),
-    source: Some("did:pkh:eip155:8453:0x123...".into()),
-    payload: serde_json::json!({"hash": "0xabc..."}),
-};
+let credential = PaymentCredential::with_source(
+    ChallengeEcho::new("abc123"),
+    "did:pkh:eip155:8453:0x123...",
+    PaymentPayload::hash("0xabc..."),
+);
 
-let auth_header = credential.to_authorization();
+let auth_header = format_authorization(&credential)?;
 ```
 
 ### Parse a Receipt (Server → Client)
 
 ```rust
-use mpay::Receipt;
+use mpay::{parse_receipt, Receipt};
 
-let receipt = Receipt::from_payment_receipt(header)?;
-assert_eq!(receipt.status, "success");
+let receipt = parse_receipt(header)?;
+assert!(receipt.is_success());
 ```
 
 ## API Reference
 
 ### Core
 
-#### `Challenge`
+#### `PaymentChallenge`
 
 A parsed payment challenge from a `WWW-Authenticate` header.
 
 ```rust
-use mpay::Challenge;
+use mpay::{PaymentChallenge, Base64UrlJson, format_www_authenticate, parse_www_authenticate};
 
-let challenge = Challenge {
+let challenge = PaymentChallenge {
     id: "challenge-id".into(),
+    realm: "api.example.com".into(),
     method: "tempo".into(),
     intent: "charge".into(),
-    request: serde_json::json!({"amount": "1000000", "currency": "0x...", "recipient": "0x..."}),
+    request: Base64UrlJson::encode(&serde_json::json!({"amount": "1000000"}))?,
+    expires: None,
+    description: None,
 };
 
-let header = challenge.to_www_authenticate("api.example.com");
-let parsed = Challenge::from_www_authenticate(&header)?;
+let header = format_www_authenticate(&challenge)?;
+let parsed = parse_www_authenticate(&header)?;
 ```
 
-#### `Credential`
+#### `PaymentCredential`
 
 The credential sent in the `Authorization` header.
 
 ```rust
-use mpay::Credential;
+use mpay::{PaymentCredential, PaymentPayload, ChallengeEcho, format_authorization, parse_authorization};
 
-let credential = Credential {
-    id: "challenge-id".into(),
-    payload: serde_json::json!({"hash": "0x..."}),
-    source: Some("did:pkh:eip155:1:0x...".into()),
-};
+let credential = PaymentCredential::with_source(
+    ChallengeEcho::new("challenge-id"),
+    "did:pkh:eip155:1:0x...",
+    PaymentPayload::hash("0x..."),
+);
 
-let header = credential.to_authorization();
-let parsed = Credential::from_authorization(&header)?;
+let header = format_authorization(&credential)?;
+let parsed = parse_authorization(&header)?;
 ```
 
 #### `Receipt`
@@ -107,24 +110,20 @@ let parsed = Credential::from_authorization(&header)?;
 Payment receipt returned after successful verification.
 
 ```rust
-use mpay::Receipt;
+use mpay::{Receipt, format_receipt, parse_receipt};
 
-let receipt = Receipt {
-    status: "success".into(),
-    timestamp: Some("2024-01-20T12:00:00Z".into()),
-    reference: Some("0x...".into()),
-};
+let receipt = Receipt::success("tempo", "0x...");
 
-let header = receipt.to_payment_receipt();
-let parsed = Receipt::from_payment_receipt(&header)?;
+let header = format_receipt(&receipt)?;
+let parsed = parse_receipt(&header)?;
 ```
 
 ### Intent Schemas
 
-Intent schemas define shared request fields per the IETF spec:
+Intent schemas define shared request fields per spec:
 
 ```rust
-use mpay::Intent::ChargeRequest;
+use mpay::ChargeRequest;
 
 let request = ChargeRequest {
     amount: "1000000".into(),

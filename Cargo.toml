@@ -2,7 +2,7 @@
 name = "mpay"
 version = "0.1.0"
 edition = "2021"
-description = "Micropayments Protocol - Rust library for Web Payment Auth (IETF draft-ietf-httpauth-payment)"
+description = "Machine Payment Protocol - Rust library for Web Payment Auth"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tempoxyz/mpay-rs"
 homepage = "https://github.com/tempoxyz/mpay-rs"
@@ -14,8 +14,8 @@ categories = ["web-programming", "authentication", "cryptography"]
 [features]
 default = ["tempo"]
 
-# Side selection - pick one or both
-client = ["http"]
+# Side selection
+client = ["reqwest"]
 server = []
 
 # Method implementations
@@ -25,9 +25,8 @@ tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
 # Utilities
 utils = ["hex", "rand"]
 
-# HTTP client support (requires client)
-http = ["client", "reqwest"]
-middleware = ["http", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
+# Middleware support (requires client)
+middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
 
 [dependencies]
 # Core dependencies (always included)

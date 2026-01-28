@@ -8,7 +8,7 @@ use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
-use super::provider::PaymentProvider;
+use crate::client::provider::PaymentProvider;
 use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHORIZATION_HEADER};
 
 /// Middleware that automatically handles 402 Payment Required responses.

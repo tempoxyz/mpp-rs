@@ -34,5 +34,5 @@ pub use crate::protocol::methods::tempo::{
 #[cfg(feature = "server")]
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 
-#[cfg(all(feature = "client", feature = "http"))]
-pub use crate::http::TempoProvider;
+#[cfg(feature = "client")]
+pub use crate::client::TempoProvider;

@@ -61,7 +61,7 @@ When using `.send_with_payment()`:
 For full control, handle the 402 flow manually:
 
 ```rust
-use mpay::{Challenge, Credential};
+use mpay::{parse_www_authenticate, PaymentCredential, PaymentPayload, format_authorization};
 use reqwest::Client;
 
 async fn fetch_paid_resource(
@@ -79,20 +79,20 @@ async fn fetch_paid_resource(
             .ok_or("missing www-authenticate")?
             .to_str()?;
 
-        let challenge = Challenge::parse_www_authenticate(header)?;
+        let challenge = parse_www_authenticate(header)?;
 
         // Execute payment (your logic here)
         let tx_hash = execute_payment(&challenge).await?;
 
         // Build credential
-        let credential = Credential::PaymentCredential::with_source(
+        let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             "did:pkh:eip155:42431:0xYourAddress",
-            Credential::PaymentPayload::hash(&tx_hash),
+            PaymentPayload::hash(&tx_hash),
         );
 
         // Retry with payment credential
-        let auth_header = Credential::format_authorization(&credential)?;
+        let auth_header = format_authorization(&credential)?;
         let resp = client
             .get(url)
             .header("authorization", auth_header)
@@ -109,13 +109,13 @@ async fn fetch_paid_resource(
 ## With Receipt Parsing
 
 ```rust
-use mpay::Receipt;
+use mpay::{Receipt, parse_receipt};
 
 async fn fetch_with_receipt(
     client: &Client,
     url: &str,
     auth_header: &str,
-) -> Result<(String, Option<Receipt::Receipt>), Box<dyn std::error::Error>> {
+) -> Result<(String, Option<Receipt>), Box<dyn std::error::Error>> {
     let resp = client
         .get(url)
         .header("authorization", auth_header)
@@ -127,7 +127,7 @@ async fn fetch_with_receipt(
         .headers()
         .get("payment-receipt")
         .and_then(|h| h.to_str().ok())
-        .and_then(|h| Receipt::parse_receipt(h).ok());
+        .and_then(|h| parse_receipt(h).ok());
 
     Ok((resp.text().await?, receipt))
 }
@@ -139,8 +139,7 @@ Implement `PaymentProvider` for custom payment methods:
 
 ```rust
 use mpay::client::PaymentProvider;
-use mpay::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
-use mpay::MppError;
+use mpay::{PaymentChallenge, PaymentCredential, PaymentPayload, MppError};
 
 #[derive(Clone)]
 struct MyProvider {

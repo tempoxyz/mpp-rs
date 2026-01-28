@@ -17,6 +17,32 @@ use std::collections::HashMap;
 /// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
 const MAX_TOKEN_LEN: usize = 16 * 1024;
 
+/// Macro to extract a required parameter from the params map.
+macro_rules! require_param {
+    ($params:expr, $key:literal) => {
+        $params
+            .get($key)
+            .ok_or_else(|| MppError::InvalidChallenge(format!("Missing '{}' field", $key)))?
+    };
+}
+
+/// Strip the Payment scheme prefix (case-insensitive) from a header value.
+/// Returns the remainder of the header after the scheme, or None if not a Payment header.
+fn strip_payment_scheme(header: &str) -> Option<&str> {
+    let header = header.trim_start();
+    let scheme_len = PAYMENT_SCHEME.len();
+
+    if header.len() >= scheme_len
+        && header
+            .get(..scheme_len)
+            .is_some_and(|s| s.eq_ignore_ascii_case(PAYMENT_SCHEME))
+    {
+        header.get(scheme_len..)
+    } else {
+        None
+    }
+}
+
 /// Escape a string for use in a quoted-string header value.
 /// Rejects CRLF to prevent header injection attacks.
 fn escape_quoted_value(s: &str) -> Result<String> {
@@ -123,29 +149,9 @@ fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
 /// assert_eq!(challenge.id, "abc123");
 /// ```
 pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
-    // Trim leading whitespace (tolerate per RFC 7235)
-    let header = header.trim_start();
-
-    // Case-insensitive scheme matching using strip_prefix to avoid UTF-8 boundary panics
-    let rest = header
-        .strip_prefix("Payment")
-        .or_else(|| header.strip_prefix("payment"))
-        .or_else(|| header.strip_prefix("PAYMENT"))
-        .or_else(|| {
-            // Fallback for other case variations
-            if header.len() >= 7
-                && header
-                    .get(..7)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("Payment"))
-            {
-                header.get(7..)
-            } else {
-                None
-            }
-        })
+    let rest = strip_payment_scheme(header)
         .ok_or_else(|| MppError::InvalidChallenge("Expected 'Payment' scheme".to_string()))?;
 
-    // Check for whitespace after scheme
     let params_str = rest
         .strip_prefix(' ')
         .or_else(|| rest.strip_prefix('\t'))
@@ -155,33 +161,12 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         .trim_start();
     let params = parse_auth_params(params_str);
 
-    // Extract required fields
-    let id = params
-        .get("id")
-        .ok_or_else(|| MppError::InvalidChallenge("Missing 'id' field".to_string()))?
-        .clone();
+    let id = require_param!(params, "id").clone();
+    let realm = require_param!(params, "realm").clone();
+    let method = MethodName::new(require_param!(params, "method"));
+    let intent = IntentName::new(require_param!(params, "intent"));
+    let request_b64 = require_param!(params, "request").clone();
 
-    let realm = params
-        .get("realm")
-        .ok_or_else(|| MppError::InvalidChallenge("Missing 'realm' field".to_string()))?
-        .clone();
-
-    let method_str = params
-        .get("method")
-        .ok_or_else(|| MppError::InvalidChallenge("Missing 'method' field".to_string()))?;
-    let method = MethodName::new(method_str);
-
-    let intent_str = params
-        .get("intent")
-        .ok_or_else(|| MppError::InvalidChallenge("Missing 'intent' field".to_string()))?;
-    let intent = IntentName::new(intent_str);
-
-    let request_b64 = params
-        .get("request")
-        .ok_or_else(|| MppError::InvalidChallenge("Missing 'request' field".to_string()))?
-        .clone();
-
-    // Validate request is valid base64url JSON (but keep raw for echo)
     let _ = base64url_decode(&request_b64)?;
     let request = Base64UrlJson::from_raw(request_b64);
 
@@ -313,25 +298,7 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 ///
 /// Format: `Payment <base64url-json>`
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
-    let header = header.trim_start();
-
-    // Case-insensitive scheme matching using strip_prefix to avoid UTF-8 boundary panics
-    let rest = header
-        .strip_prefix("Payment")
-        .or_else(|| header.strip_prefix("payment"))
-        .or_else(|| header.strip_prefix("PAYMENT"))
-        .or_else(|| {
-            // Fallback for other case variations
-            if header.len() >= 7
-                && header
-                    .get(..7)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("Payment"))
-            {
-                header.get(7..)
-            } else {
-                None
-            }
-        })
+    let rest = strip_payment_scheme(header)
         .ok_or_else(|| MppError::InvalidChallenge("Expected 'Payment' scheme".to_string()))?;
 
     let token = rest.trim();

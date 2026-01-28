@@ -22,7 +22,7 @@ pub enum HttpError {
     Payment(MppError),
 
     /// HTTP request error
-    #[cfg(feature = "http")]
+    #[cfg(feature = "client")]
     Request(reqwest::Error),
 }
 
@@ -36,7 +36,7 @@ impl fmt::Display for HttpError {
             Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),
             Self::CloneFailed => write!(f, "request could not be cloned for retry"),
             Self::Payment(e) => write!(f, "payment failed: {}", e),
-            #[cfg(feature = "http")]
+            #[cfg(feature = "client")]
             Self::Request(e) => write!(f, "HTTP request failed: {}", e),
         }
     }
@@ -46,7 +46,7 @@ impl std::error::Error for HttpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Payment(e) => Some(e),
-            #[cfg(feature = "http")]
+            #[cfg(feature = "client")]
             Self::Request(e) => Some(e),
             _ => None,
         }
@@ -59,7 +59,7 @@ impl From<MppError> for HttpError {
     }
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "client")]
 impl From<reqwest::Error> for HttpError {
     fn from(e: reqwest::Error) -> Self {
         Self::Request(e)

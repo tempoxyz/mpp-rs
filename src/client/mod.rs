@@ -5,8 +5,8 @@
 //! # Exports
 //!
 //! - [`PaymentProvider`]: Trait for payment providers
-//! - [`Fetch`]: Extension trait for reqwest with `.send_with_payment()` method (requires `http`)
-//! - [`TempoProvider`]: Tempo blockchain provider (requires `tempo` + `http`)
+//! - [`Fetch`]: Extension trait for reqwest with `.send_with_payment()` method
+//! - [`TempoProvider`]: Tempo blockchain provider (requires `tempo`)
 //!
 //! # Example
 //!
@@ -17,14 +17,23 @@
 //! let resp = client.get(url).send_with_payment(&provider).await?;
 //! ```
 
-#[cfg(feature = "http")]
-pub use crate::http::{HttpError, MultiProvider, PaymentProvider};
+mod error;
+mod provider;
 
-#[cfg(feature = "http")]
-pub use crate::http::PaymentExt as Fetch;
+#[cfg(feature = "client")]
+mod fetch;
 
 #[cfg(feature = "middleware")]
-pub use crate::http::PaymentMiddleware;
+mod middleware;
 
-#[cfg(all(feature = "tempo", feature = "http"))]
-pub use crate::http::TempoProvider;
+pub use error::HttpError;
+pub use provider::{MultiProvider, PaymentProvider};
+
+#[cfg(feature = "client")]
+pub use fetch::PaymentExt as Fetch;
+
+#[cfg(feature = "middleware")]
+pub use middleware::PaymentMiddleware;
+
+#[cfg(feature = "tempo")]
+pub use provider::TempoProvider;
