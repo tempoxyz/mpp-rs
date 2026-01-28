@@ -13,10 +13,20 @@ categories = ["web-programming", "authentication", "cryptography"]
 
 [features]
 default = ["tempo"]
+
+# Side selection - pick one or both
+client = ["http"]
+server = []
+
+# Method implementations
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
 tempo = ["evm", "tempo-alloy", "tempo-primitives"]
+
+# Utilities
 utils = ["hex", "rand"]
-http = ["reqwest"]
+
+# HTTP client support (requires client)
+http = ["client", "reqwest"]
 middleware = ["http", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
 
 [dependencies]
@@ -24,6 +34,7 @@ middleware = ["http", "reqwest-middleware", "async-trait", "anyhow", "http-types
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 # Optional dependencies
 hex = { version = "0.4", optional = true }
@@ -44,5 +55,4 @@ anyhow = { version = "1", optional = true }
 http-types = { package = "http", version = "1", optional = true }
 
 [dev-dependencies]
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

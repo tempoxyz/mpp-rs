@@ -17,7 +17,7 @@ test-fast:
 
 check:
 	cargo fmt --check
-	cargo clippy -- -D warnings
+	cargo clippy --all-features -- -D warnings
 	cargo test -- --quiet
 	cargo build
 

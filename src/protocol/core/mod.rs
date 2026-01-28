@@ -24,7 +24,7 @@
 //! - [`Base64UrlJson`]: JSON encoded as base64url (preserves original encoding)
 //! - [`PaymentChallenge`]: Challenge from server (WWW-Authenticate header)
 //! - [`PaymentCredential`]: Credential from client (Authorization header)
-//! - [`PaymentReceipt`]: Receipt from server (Payment-Receipt header)
+//! - [`Receipt`]: Receipt from server (Payment-Receipt header)
 //!
 //! # Parsing
 //!
@@ -71,9 +71,7 @@ pub mod headers;
 pub mod types;
 
 // Re-export all public types
-pub use challenge::{
-    ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, PaymentReceipt,
-};
+pub use challenge::{ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt};
 pub use headers::{
     format_authorization, format_receipt, format_www_authenticate, format_www_authenticate_many,
     parse_authorization, parse_receipt, parse_www_authenticate, parse_www_authenticate_all,

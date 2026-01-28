@@ -8,7 +8,23 @@ Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Pa
 - **Zero-copy parsing** — Efficient header parsing without unnecessary allocations
 - **Pluggable methods** — Payment networks are feature-gated (Tempo included by default)
 - **Minimal dependencies** — Core has minimal deps; features add what you need
-- **Designed for extension** — `Method` and `Intent` are traits. Implement them for custom payment methods.
+- **Intent = Schema, Method = Implementation** — Intents define shared request schemas; methods implement verification
+
+## Core Types
+
+| Type | Role | HTTP Header |
+|------|------|-------------|
+| `PaymentChallenge` | Server's payment request | `WWW-Authenticate: Payment ...` |
+| `ChargeRequest` | Typed request schema (inside challenge) | Base64 in `request=` param |
+| `PaymentCredential` | Client's payment proof | `Authorization: Payment ...` |
+| `Receipt` | Server's confirmation | `Payment-Receipt: ...` |
+
+## Traits
+
+| Trait | Side | Purpose |
+|-------|------|---------|
+| `ChargeMethod` | Server | Verify credentials against `ChargeRequest` |
+| `PaymentProvider` | Client | Create credentials from challenges |
 
 ## Quick Start
 
@@ -62,7 +78,7 @@ let challenge = Challenge {
     id: "challenge-id".into(),
     method: "tempo".into(),
     intent: "charge".into(),
-    request: serde_json::json!({"amount": "1000000", "asset": "0x...", "destination": "0x..."}),
+    request: serde_json::json!({"amount": "1000000", "currency": "0x...", "recipient": "0x..."}),
 };
 
 let header = challenge.to_www_authenticate("api.example.com");
@@ -103,6 +119,73 @@ let header = receipt.to_payment_receipt();
 let parsed = Receipt::from_payment_receipt(&header)?;
 ```
 
+### Intent Schemas
+
+Intent schemas define shared request fields per the IETF spec:
+
+```rust
+use mpay::Intent::ChargeRequest;
+
+let request = ChargeRequest {
+    amount: "1000000".into(),
+    currency: "0x20c0000000000000000000000000000000000001".into(),
+    recipient: Some("0x742d35Cc...".into()),
+    expires: Some("2025-01-15T12:00:00Z".into()),
+    ..Default::default()
+};
+```
+
+### Server-Side Traits
+
+Method traits verify payment credentials with typed schemas using alloy's Provider:
+
+```rust
+use mpay::server::{ChargeMethod, TempoChargeMethod};
+use alloy::providers::ProviderBuilder;
+
+// Create an alloy provider
+let provider = ProviderBuilder::new()
+    .connect_http("https://rpc.moderato.tempo.xyz".parse()?);
+
+// Create the charge method with the provider
+let method = TempoChargeMethod::new(provider);
+
+// Verify a payment
+let receipt = method.verify(&credential, &request).await?;
+```
+
+### Client-Side Traits
+
+PaymentProvider creates credentials for challenges:
+
+```rust
+use mpay::client::{PaymentProvider, TempoProvider};
+
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
+
+// Check support
+assert!(provider.supports("tempo", "charge"));
+
+// Create credential
+let credential = provider.pay(&challenge).await?;
+```
+
+### Multiple Payment Methods
+
+Use `MultiProvider` to handle multiple payment methods:
+
+```rust
+use mpay::client::{MultiProvider, TempoProvider};
+
+let provider = MultiProvider::new()
+    .with(TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?);
+    // .with(StripeProvider::new(api_key))
+    // .with(OtherProvider::new(...))
+
+// Automatically picks the right provider based on challenge.method
+let resp = client.get(url).send_with_payment(&provider).await?;
+```
+
 ## Install
 
 ```toml
@@ -114,22 +197,39 @@ mpay = "0.1"
 
 | Feature | Description |
 |---------|-------------|
+| `client` | Client-side payment providers (`PaymentProvider` trait) |
+| `server` | Server-side payment verification (`ChargeMethod` trait) |
 | `tempo` | Tempo blockchain support (default, includes `evm`) |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
-| `utils` | Encoding utilities (hex, base64) |
-| `http` | HTTP client support with `PaymentExt` extension trait for reqwest |
-| `middleware` | reqwest-middleware support with `PaymentMiddleware` for automatic 402 handling |
+| `http` | HTTP client support with `Fetch` extension trait (implies `client`) |
+| `middleware` | reqwest-middleware support with `PaymentMiddleware` |
+
+### Common configurations
+
+```toml
+# Server app
+mpay = { version = "0.1", features = ["server", "tempo"] }
+
+# Client app  
+mpay = { version = "0.1", features = ["http", "tempo"] }
+
+# Both sides
+mpay = { version = "0.1", features = ["server", "http", "tempo"] }
+
+# Core only (parsing/formatting)
+mpay = { version = "0.1", default-features = false }
+```
 
 ## HTTP Client Support
 
 ### Extension Trait (recommended)
 
-Enable the `http` feature for the `PaymentExt` trait:
+Enable the `http` feature for the `Fetch` trait:
 
 ```rust
-use mpay::http::{PaymentExt, TempoProvider};
+use mpay::client::{Fetch, TempoProvider};
 
-let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 
 let resp = client
     .get("https://api.example.com/paid")
@@ -142,9 +242,10 @@ let resp = client
 Enable the `middleware` feature for automatic 402 handling:
 
 ```rust
-use mpay::http::{PaymentMiddleware, TempoProvider};
+use mpay::client::{PaymentMiddleware, TempoProvider};
 use reqwest_middleware::ClientBuilder;
 
+let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 let client = ClientBuilder::new(reqwest::Client::new())
     .with(PaymentMiddleware::new(provider))
     .build();

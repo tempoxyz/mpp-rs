@@ -9,7 +9,7 @@
 //!
 //! The parser is implemented without regex for minimal dependencies.
 
-use super::challenge::{PaymentChallenge, PaymentCredential, PaymentReceipt};
+use super::challenge::{PaymentChallenge, PaymentCredential, Receipt};
 use super::types::{base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName};
 use crate::error::{MppError, Result};
 use std::collections::HashMap;
@@ -360,10 +360,10 @@ pub fn format_authorization(credential: &PaymentCredential) -> Result<String> {
     Ok(format!("Payment {}", encoded))
 }
 
-/// Parse a Payment-Receipt header into a PaymentReceipt.
+/// Parse a Payment-Receipt header into a Receipt.
 ///
 /// Format: `<base64url-json>`
-pub fn parse_receipt(header: &str) -> Result<PaymentReceipt> {
+pub fn parse_receipt(header: &str) -> Result<Receipt> {
     let token = header.trim();
 
     // Enforce size limit to prevent memory exhaustion DoS
@@ -375,16 +375,16 @@ pub fn parse_receipt(header: &str) -> Result<PaymentReceipt> {
     }
 
     let decoded = base64url_decode(token)?;
-    let receipt: PaymentReceipt = serde_json::from_slice(&decoded)
+    let receipt: Receipt = serde_json::from_slice(&decoded)
         .map_err(|e| MppError::InvalidChallenge(format!("Invalid receipt JSON: {}", e)))?;
 
     Ok(receipt)
 }
 
-/// Format a PaymentReceipt as a Payment-Receipt header value.
+/// Format a Receipt as a Payment-Receipt header value.
 ///
 /// Format: `<base64url-json>`
-pub fn format_receipt(receipt: &PaymentReceipt) -> Result<String> {
+pub fn format_receipt(receipt: &Receipt) -> Result<String> {
     let json = serde_json::to_string(receipt)?;
     Ok(base64url_encode(json.as_bytes()))
 }
@@ -516,11 +516,12 @@ mod tests {
 
     #[test]
     fn test_parse_receipt() {
-        let receipt = PaymentReceipt {
+        let receipt = Receipt {
             status: ReceiptStatus::Success,
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc123".to_string(),
+            error: None,
         };
 
         let header = format_receipt(&receipt).unwrap();

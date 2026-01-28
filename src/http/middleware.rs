@@ -21,10 +21,10 @@ use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHOR
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::http::{PaymentMiddleware, TempoProvider};
+/// use mpay::client::{PaymentMiddleware, TempoProvider};
 /// use reqwest_middleware::ClientBuilder;
 ///
-/// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz");
+/// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 ///
 /// let client = ClientBuilder::new(reqwest::Client::new())
 ///     .with(PaymentMiddleware::new(provider))
@@ -111,6 +111,10 @@ mod tests {
     struct MockProvider;
 
     impl PaymentProvider for MockProvider {
+        fn supports(&self, _method: &str, _intent: &str) -> bool {
+            true
+        }
+
         async fn pay(
             &self,
             _challenge: &crate::protocol::core::PaymentChallenge,

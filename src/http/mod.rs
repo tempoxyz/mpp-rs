@@ -13,7 +13,7 @@
 //! `.send_with_payment()` method for opt-in per-request payment handling:
 //!
 //! ```ignore
-//! use mpay::http::PaymentExt;
+//! use mpay::client::Fetch;
 //!
 //! let resp = client
 //!     .get("https://api.example.com/paid")
@@ -27,7 +27,7 @@
 //! 402 handling on all requests:
 //!
 //! ```ignore
-//! use mpay::http::PaymentMiddleware;
+//! use mpay::client::PaymentMiddleware;
 //! use reqwest_middleware::ClientBuilder;
 //!
 //! let client = ClientBuilder::new(reqwest::Client::new())
@@ -45,7 +45,7 @@ mod ext;
 mod middleware;
 
 pub use error::HttpError;
-pub use provider::PaymentProvider;
+pub use provider::{MultiProvider, PaymentProvider};
 
 #[cfg(feature = "http")]
 pub use ext::PaymentExt;

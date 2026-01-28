@@ -20,26 +20,22 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use mpay::{Challenge, Credential, Receipt};
+use mpay::{Challenge, Credential, Receipt, Schema};
 
 async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
     // Check for payment credential
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
-            if let Ok(credential) = Credential::from_authorization(auth_str) {
+            if let Ok(credential) = Credential::parse_authorization(auth_str) {
                 // Verify the payment on-chain
                 if verify_payment(&credential).await.is_ok() {
-                    let receipt = Receipt {
-                        status: "success".into(),
-                        timestamp: Some(chrono::Utc::now().to_rfc3339()),
-                        reference: credential.payload.get("hash").map(|h| h.to_string()),
-                    };
+                    let receipt = Receipt::Receipt::success("tempo", "0x...");
 
                     return (
                         StatusCode::OK,
                         [(
                             header::HeaderName::from_static("payment-receipt"),
-                            receipt.to_payment_receipt(),
+                            Receipt::format_receipt(&receipt).unwrap(),
                         )],
                         "Here's your paid content!",
                     );
@@ -49,22 +45,26 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
     }
 
     // No valid payment - return 402 with challenge
-    let challenge = Challenge {
+    let challenge = Challenge::PaymentChallenge {
         id: uuid::Uuid::new_v4().to_string(),
+        realm: "api.example.com".into(),
         method: "tempo".into(),
         intent: "charge".into(),
-        request: serde_json::json!({
+        request: Schema::Base64UrlJson::from_value(&serde_json::json!({
             "amount": "1000000",
-            "asset": "0x...",
-            "destination": "0x..."
-        }),
+            "currency": "0x...",
+            "recipient": "0x..."
+        })).unwrap(),
+        digest: None,
+        expires: None,
+        description: None,
     };
 
     (
         StatusCode::PAYMENT_REQUIRED,
         [(
             header::WWW_AUTHENTICATE,
-            challenge.to_www_authenticate("api.example.com"),
+            Challenge::format_www_authenticate(&challenge).unwrap(),
         )],
         "Payment required",
     )
@@ -82,7 +82,7 @@ use axum::{
 use mpay::Credential;
 
 /// Extractor that requires a valid payment credential
-struct RequirePayment(Credential);
+struct RequirePayment(Credential::PaymentCredential);
 
 #[async_trait]
 impl<S> FromRequestParts<S> for RequirePayment
@@ -98,7 +98,7 @@ where
             .and_then(|h| h.to_str().ok())
             .ok_or((StatusCode::PAYMENT_REQUIRED, "missing authorization".into()))?;
 
-        let credential = Credential::from_authorization(auth)
+        let credential = Credential::parse_authorization(auth)
             .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
         // Verify payment here...
@@ -133,21 +133,25 @@ async fn dynamic_pricing(headers: HeaderMap, Path(resource_id): Path<String>) ->
     // Look up price for this resource
     let price = get_resource_price(&resource_id).await;
 
-    let challenge = Challenge {
+    let challenge = Challenge::PaymentChallenge {
         id: uuid::Uuid::new_v4().to_string(),
+        realm: "api.example.com".into(),
         method: "tempo".into(),
         intent: "charge".into(),
-        request: serde_json::json!({
+        request: Schema::Base64UrlJson::from_value(&serde_json::json!({
             "amount": price.to_string(),
-            "asset": USDC_ADDRESS,
-            "destination": MERCHANT_ADDRESS,
-            "memo": resource_id,
-        }),
+            "currency": USDC_ADDRESS,
+            "recipient": MERCHANT_ADDRESS,
+            "description": resource_id,
+        })).unwrap(),
+        digest: None,
+        expires: None,
+        description: None,
     };
 
     (
         StatusCode::PAYMENT_REQUIRED,
-        [(header::WWW_AUTHENTICATE, challenge.to_www_authenticate("api.example.com"))],
+        [(header::WWW_AUTHENTICATE, Challenge::format_www_authenticate(&challenge).unwrap())],
         "Payment required",
     )
 }

@@ -63,6 +63,9 @@ pub mod charge;
 pub mod transaction;
 pub mod types;
 
+#[cfg(feature = "server")]
+pub mod method;
+
 pub use charge::TempoChargeExt;
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
@@ -70,11 +73,22 @@ pub use transaction::{
 };
 pub use types::TempoMethodDetails;
 
+#[cfg(feature = "server")]
+pub use method::ChargeMethod;
+
 /// Tempo Moderato testnet chain ID.
 pub const CHAIN_ID: u64 = 42431;
 
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
-/// Network name for Tempo Moderato.
-pub const NETWORK_NAME: &str = "tempo-moderato";
+/// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
+#[cfg(feature = "server")]
+pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
+    use time::format_description::well_known::Iso8601;
+    use time::OffsetDateTime;
+
+    OffsetDateTime::parse(s.trim(), &Iso8601::DEFAULT)
+        .ok()
+        .map(|dt| dt.unix_timestamp() as u64)
+}

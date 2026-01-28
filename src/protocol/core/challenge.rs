@@ -231,7 +231,7 @@ impl PaymentCredential {
 ///
 /// Per IETF spec, contains: status, method, timestamp, reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaymentReceipt {
+pub struct Receipt {
     /// Receipt status ("success" or "failed")
     pub status: ReceiptStatus,
 
@@ -243,9 +243,35 @@ pub struct PaymentReceipt {
 
     /// Transaction hash or reference
     pub reference: String,
+
+    /// Error message (optional, for failed payments)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
-impl PaymentReceipt {
+impl Receipt {
+    /// Create a successful payment receipt.
+    pub fn success(method: impl Into<MethodName>, reference: impl Into<String>) -> Self {
+        Self {
+            status: ReceiptStatus::Success,
+            method: method.into(),
+            timestamp: now_iso8601(),
+            reference: reference.into(),
+            error: None,
+        }
+    }
+
+    /// Create a failed payment receipt.
+    pub fn failed(method: impl Into<MethodName>, error_msg: &str) -> Self {
+        Self {
+            status: ReceiptStatus::Failed,
+            method: method.into(),
+            timestamp: now_iso8601(),
+            reference: String::new(),
+            error: Some(error_msg.to_string()),
+        }
+    }
+
     /// Check if the payment was successful.
     pub fn is_success(&self) -> bool {
         self.status == ReceiptStatus::Success
@@ -255,6 +281,15 @@ impl PaymentReceipt {
     pub fn is_failed(&self) -> bool {
         self.status == ReceiptStatus::Failed
     }
+}
+
+fn now_iso8601() -> String {
+    use time::format_description::well_known::Iso8601;
+    use time::OffsetDateTime;
+
+    OffsetDateTime::now_utc()
+        .format(&Iso8601::DEFAULT)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 #[cfg(test)]
@@ -344,20 +379,22 @@ mod tests {
 
     #[test]
     fn test_payment_receipt_status() {
-        let success = PaymentReceipt {
+        let success = Receipt {
             status: ReceiptStatus::Success,
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc".to_string(),
+            error: None,
         };
         assert!(success.is_success());
         assert!(!success.is_failed());
 
-        let failed = PaymentReceipt {
+        let failed = Receipt {
             status: ReceiptStatus::Failed,
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "".to_string(),
+            error: Some("Payment failed".to_string()),
         };
         assert!(!failed.is_success());
         assert!(failed.is_failed());

@@ -22,7 +22,7 @@
 //! Following the mpay pattern, core types are exported as namespaced modules:
 //!
 //! ```no_run
-//! use mpay::{Challenge, Credential, Receipt, Intent, Method};
+//! use mpay::{Challenge, Credential, Receipt, Intent};
 //! # fn main() {}
 //! ```
 //!
@@ -58,6 +58,15 @@ pub mod evm;
 #[cfg(feature = "http")]
 pub mod http;
 
+#[cfg(feature = "client")]
+pub mod client;
+
+#[cfg(feature = "server")]
+pub mod server;
+
+#[cfg(feature = "tempo")]
+pub mod tempo;
+
 // ==================== Re-exports ====================
 
 // Error types
@@ -85,10 +94,13 @@ pub mod Credential {
 /// Receipt types for parsing Payment-Receipt headers
 #[allow(non_snake_case)]
 pub mod Receipt {
-    pub use crate::protocol::core::{format_receipt, parse_receipt, PaymentReceipt, ReceiptStatus};
+    pub use crate::protocol::core::{format_receipt, parse_receipt, Receipt, ReceiptStatus};
 }
 
-/// Intent types for payment requests
+/// Intent request schemas (shared across methods)
+///
+/// Intents define the shared request fields for payment operations.
+/// All methods implementing the same intent use the same request type.
 #[allow(non_snake_case)]
 pub mod Intent {
     pub use crate::protocol::intents::ChargeRequest;
@@ -102,13 +114,6 @@ pub mod Schema {
         PaymentProtocol, AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME,
         WWW_AUTHENTICATE_HEADER,
     };
-}
-
-/// Payment method implementations
-#[allow(non_snake_case)]
-pub mod Method {
-    #[cfg(feature = "tempo")]
-    pub use crate::protocol::methods::tempo;
 }
 
 // ==================== Alloy Re-exports (batteries included) ====================

@@ -36,21 +36,21 @@ async fn request_with_payment(
             .ok_or("missing challenge")?
             .to_str()?;
 
-        let challenge = Challenge::from_www_authenticate(header)?;
+        let challenge = Challenge::parse_www_authenticate(header)?;
 
         // Execute payment
         let tx_hash = pay(&challenge).await?;
 
         // Build credential
-        let credential = Credential {
-            id: challenge.id,
-            source: Some("did:pkh:eip155:8453:0x...".into()),
-            payload: serde_json::json!({ "hash": tx_hash }),
-        };
+        let credential = Credential::PaymentCredential::with_source(
+            challenge.to_echo(),
+            "did:pkh:eip155:8453:0x...",
+            Credential::PaymentPayload::hash(&tx_hash),
+        );
 
         // Retry with authorization
         let req = Request::get(uri)
-            .header("authorization", credential.to_authorization())
+            .header("authorization", Credential::format_authorization(&credential)?)
             .body(String::new())?;
 
         return Ok(client.request(req).await?);
@@ -64,7 +64,7 @@ async fn request_with_payment(
 
 ```rust
 use hyper::{body::Incoming, server::conn::http1, service::service_fn, Method, Request, Response};
-use mpay::{Challenge, Credential, Receipt};
+use mpay::{Challenge, Credential, Receipt, Schema};
 
 async fn handle_request(
     req: Request<Incoming>,
@@ -81,18 +81,14 @@ async fn handle_paid_request(
     // Check authorization header
     if let Some(auth) = req.headers().get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
-            if let Ok(credential) = Credential::from_authorization(auth_str) {
+            if let Ok(credential) = Credential::parse_authorization(auth_str) {
                 // Verify payment
                 if verify(&credential).await {
-                    let receipt = Receipt {
-                        status: "success".into(),
-                        timestamp: None,
-                        reference: None,
-                    };
+                    let receipt = Receipt::Receipt::success("tempo", "0x...");
 
                     let resp = Response::builder()
                         .status(200)
-                        .header("payment-receipt", receipt.to_payment_receipt())
+                        .header("payment-receipt", Receipt::format_receipt(&receipt).unwrap())
                         .body("Paid content".into())
                         .unwrap();
 
@@ -103,20 +99,24 @@ async fn handle_paid_request(
     }
 
     // Return 402 with challenge
-    let challenge = Challenge {
+    let challenge = Challenge::PaymentChallenge {
         id: uuid::Uuid::new_v4().to_string(),
+        realm: "api.example.com".into(),
         method: "tempo".into(),
         intent: "charge".into(),
-        request: serde_json::json!({
+        request: Schema::Base64UrlJson::from_value(&serde_json::json!({
             "amount": "1000000",
-            "asset": "0x...",
-            "destination": "0x...",
-        }),
+            "currency": "0x...",
+            "recipient": "0x...",
+        })).unwrap(),
+        digest: None,
+        expires: None,
+        description: None,
     };
 
     let resp = Response::builder()
         .status(402)
-        .header("www-authenticate", challenge.to_www_authenticate("api.example.com"))
+        .header("www-authenticate", Challenge::format_www_authenticate(&challenge).unwrap())
         .body("Payment required".into())
         .unwrap();
 
