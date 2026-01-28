@@ -46,7 +46,8 @@ pub fn tempo_provider(rpc_url: &str) -> TempoProvider {
     use alloy::providers::ProviderBuilder;
     use tempo_alloy::TempoNetwork;
 
-    ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc_url.parse().unwrap())
+    ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_http(rpc_url.parse().expect("invalid RPC URL"))
 }
 
 /// Type alias for the Tempo provider returned by [`tempo_provider`].
