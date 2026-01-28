@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-mpay = { path = "../.." }
+mpay = { path = "../..", features = ["server"] }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }

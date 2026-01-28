@@ -130,3 +130,7 @@ pub use alloy_signer_local::PrivateKeySigner;
 /// Re-export common alloy primitives
 #[cfg(feature = "evm")]
 pub use alloy::primitives::{Address, U256};
+
+/// Re-export alloy provider types for server use
+#[cfg(feature = "server")]
+pub use alloy::providers::{ProviderBuilder, RootProvider};
