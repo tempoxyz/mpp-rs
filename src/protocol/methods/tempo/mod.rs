@@ -114,6 +114,9 @@ pub const CHAIN_ID: u64 = 42431;
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
+/// Charge intent name.
+pub const INTENT_CHARGE: &str = "charge";
+
 /// Create a Tempo charge challenge with minimal parameters.
 ///
 /// This is the simplest way to create a payment challenge for the Tempo network.
@@ -207,7 +210,7 @@ pub fn charge_challenge_with_options(
         id: uuid::Uuid::new_v4().to_string(),
         realm: realm.to_string(),
         method: METHOD_NAME.into(),
-        intent: "charge".into(),
+        intent: INTENT_CHARGE.into(),
         request: Base64UrlJson::from_typed(request)?,
         expires: expires.map(|s| s.to_string()),
         description: description.map(|s| s.to_string()),

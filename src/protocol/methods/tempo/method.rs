@@ -35,14 +35,12 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 
-use super::{parse_iso8601_timestamp, TempoChargeExt, CHAIN_ID, METHOD_NAME};
+use super::{parse_iso8601_timestamp, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
 
-/// TIP-20/ERC-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
-/// TIP-20 extends ERC-20, so it uses the same Transfer event signature.
+/// TIP-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
+/// TIP-20 is Tempo's token standard (compatible with ERC-20 Transfer events).
 const TRANSFER_EVENT_TOPIC: B256 =
     alloy::primitives::b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
-
-const INTENT_CHARGE: &str = "charge";
 
 /// Tempo charge method for one-time payment verification.
 ///
@@ -143,46 +141,13 @@ where
             VerificationError::new(format!("Invalid currency address in request: {}", e))
         })?;
 
-        let is_native = currency == Address::ZERO;
-
-        if is_native {
-            let tx = self
-                .provider
-                .get_transaction_by_hash(hash)
-                .await
-                .map_err(|e| {
-                    VerificationError::network_error(format!("Failed to fetch transaction: {}", e))
-                })?
-                .ok_or_else(|| {
-                    VerificationError::new(format!("Transaction {} not found", tx_hash))
-                })?;
-
-            let tx_to = tx.to().ok_or_else(|| {
-                VerificationError::new("Native transfer must have a recipient".to_string())
-            })?;
-
-            if tx_to != expected_recipient {
-                return Err(VerificationError::new(format!(
-                    "Recipient mismatch: expected {}, got {}",
-                    expected_recipient, tx_to
-                )));
-            }
-
-            if tx.value() < expected_amount {
-                return Err(VerificationError::new(format!(
-                    "Amount mismatch: expected at least {}, got {}",
-                    expected_amount,
-                    tx.value()
-                )));
-            }
-        } else {
-            self.verify_erc20_transfer(&receipt, currency, expected_recipient, expected_amount)?;
-        }
+        // Tempo uses TIP-20 tokens exclusively (no native token transfers)
+        self.verify_tip20_transfer(&receipt, currency, expected_recipient, expected_amount)?;
 
         Ok(Receipt::success(METHOD_NAME, tx_hash))
     }
 
-    fn verify_erc20_transfer(
+    fn verify_tip20_transfer(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
         currency: Address,
