@@ -23,7 +23,6 @@
 //! assert!(receipt.is_success());
 //! ```
 
-use alloy::consensus::Transaction;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::Provider;
@@ -311,10 +310,13 @@ where
 
             if credential.payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
-                this.verify_hash(credential.payload.signature(), &request).await
+                this.verify_hash(credential.payload.signature(), &request)
+                    .await
             } else {
                 // Client sent signed transaction, we need to broadcast it
-                let tx_hash = this.broadcast_transaction(credential.payload.signature()).await?;
+                let tx_hash = this
+                    .broadcast_transaction(credential.payload.signature())
+                    .await?;
                 this.verify_hash(&format!("{:#x}", tx_hash), &request).await
             }
         }
