@@ -192,6 +192,33 @@ impl From<&str> for VerificationError {
     }
 }
 
+// ==================== Conversion to RFC 9457 Problem Details ====================
+
+use crate::error::{MppError, PaymentError, PaymentErrorDetails};
+
+impl From<VerificationError> for MppError {
+    fn from(err: VerificationError) -> Self {
+        match err.code {
+            Some(ErrorCode::Expired) => MppError::PaymentExpired(None),
+            Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
+            Some(ErrorCode::CredentialMismatch)
+            | Some(ErrorCode::InvalidAmount)
+            | Some(ErrorCode::InvalidRecipient)
+            | Some(ErrorCode::TransactionFailed)
+            | Some(ErrorCode::ChainIdMismatch)
+            | Some(ErrorCode::NotFound)
+            | Some(ErrorCode::NetworkError)
+            | None => MppError::VerificationFailed(Some(err.message)),
+        }
+    }
+}
+
+impl PaymentError for VerificationError {
+    fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
+        MppError::from(self.clone()).to_problem_details(challenge_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

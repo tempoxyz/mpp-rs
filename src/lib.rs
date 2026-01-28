@@ -45,6 +45,9 @@ pub mod tempo;
 // Error types
 pub use error::{MppError, Result, ResultExt, SigningContext};
 
+// RFC 9457 Problem Details
+pub use error::{PaymentError, PaymentErrorDetails, PROBLEM_TYPE_BASE};
+
 // Core protocol types
 pub use protocol::core::{
     ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt, ReceiptStatus,

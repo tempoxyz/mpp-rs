@@ -20,9 +20,9 @@ const MAX_TOKEN_LEN: usize = 16 * 1024;
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {
     ($params:expr, $key:literal) => {
-        $params
-            .get($key)
-            .ok_or_else(|| MppError::InvalidChallenge(format!("Missing '{}' field", $key)))?
+        $params.get($key).ok_or_else(|| {
+            MppError::invalid_challenge_reason(format!("Missing '{}' field", $key))
+        })?
     };
 }
 
@@ -47,8 +47,8 @@ fn strip_payment_scheme(header: &str) -> Option<&str> {
 /// Rejects CRLF to prevent header injection attacks.
 fn escape_quoted_value(s: &str) -> Result<String> {
     if s.contains('\r') || s.contains('\n') {
-        return Err(MppError::InvalidChallenge(
-            "Header value contains invalid CRLF characters".to_string(),
+        return Err(MppError::invalid_challenge_reason(
+            "Header value contains invalid CRLF characters",
         ));
     }
     Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -149,14 +149,15 @@ fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
 /// assert_eq!(challenge.id, "abc123");
 /// ```
 pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
-    let rest = strip_payment_scheme(header)
-        .ok_or_else(|| MppError::InvalidChallenge("Expected 'Payment' scheme".to_string()))?;
+    let rest = strip_payment_scheme(header).ok_or_else(|| {
+        MppError::invalid_challenge_reason("Expected 'Payment' scheme".to_string())
+    })?;
 
     let params_str = rest
         .strip_prefix(' ')
         .or_else(|| rest.strip_prefix('\t'))
         .ok_or_else(|| {
-            MppError::InvalidChallenge("Expected space after 'Payment' scheme".to_string())
+            MppError::invalid_challenge_reason("Expected space after 'Payment' scheme".to_string())
         })?
         .trim_start();
     let params = parse_auth_params(params_str);
@@ -305,22 +306,24 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 ///
 /// Format: `Payment <base64url-json>`
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
-    let rest = strip_payment_scheme(header)
-        .ok_or_else(|| MppError::InvalidChallenge("Expected 'Payment' scheme".to_string()))?;
+    let rest = strip_payment_scheme(header).ok_or_else(|| {
+        MppError::invalid_challenge_reason("Expected 'Payment' scheme".to_string())
+    })?;
 
     let token = rest.trim();
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::InvalidChallenge(format!(
+        return Err(MppError::invalid_challenge_reason(format!(
             "Token exceeds maximum length of {} bytes",
             MAX_TOKEN_LEN
         )));
     }
 
     let decoded = base64url_decode(token)?;
-    let credential: PaymentCredential = serde_json::from_slice(&decoded)
-        .map_err(|e| MppError::InvalidChallenge(format!("Invalid credential JSON: {}", e)))?;
+    let credential: PaymentCredential = serde_json::from_slice(&decoded).map_err(|e| {
+        MppError::invalid_challenge_reason(format!("Invalid credential JSON: {}", e))
+    })?;
 
     Ok(credential)
 }
@@ -342,7 +345,7 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::InvalidChallenge(format!(
+        return Err(MppError::invalid_challenge_reason(format!(
             "Receipt exceeds maximum length of {} bytes",
             MAX_TOKEN_LEN
         )));
@@ -350,7 +353,7 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
 
     let decoded = base64url_decode(token)?;
     let receipt: Receipt = serde_json::from_slice(&decoded)
-        .map_err(|e| MppError::InvalidChallenge(format!("Invalid receipt JSON: {}", e)))?;
+        .map_err(|e| MppError::invalid_challenge_reason(format!("Invalid receipt JSON: {}", e)))?;
 
     Ok(receipt)
 }

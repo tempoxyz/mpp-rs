@@ -50,10 +50,9 @@ impl TempoChargeExt for ChargeRequest {
     }
 
     fn recipient_address(&self) -> Result<Address> {
-        let recipient = self
-            .recipient
-            .as_ref()
-            .ok_or_else(|| MppError::InvalidChallenge("No recipient specified".to_string()))?;
+        let recipient = self.recipient.as_ref().ok_or_else(|| {
+            MppError::invalid_challenge_reason("No recipient specified".to_string())
+        })?;
         parse_address(recipient)
     }
 
@@ -71,7 +70,7 @@ impl TempoChargeExt for ChargeRequest {
     fn tempo_method_details(&self) -> Result<TempoMethodDetails> {
         match &self.method_details {
             Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
-                MppError::InvalidChallenge(format!("Invalid Tempo method details: {}", e))
+                MppError::invalid_challenge_reason(format!("Invalid Tempo method details: {}", e))
             }),
             None => Ok(TempoMethodDetails::default()),
         }
