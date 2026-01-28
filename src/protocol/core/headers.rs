@@ -510,7 +510,7 @@ mod tests {
             parsed.source,
             Some("did:pkh:eip155:42431:0x123".to_string())
         );
-        assert_eq!(parsed.payload.signature(), Some("0xabc"));
+        assert_eq!(parsed.payload.signature(), "0xabc");
         assert_eq!(parsed.payload.payload_type(), PayloadType::Transaction);
     }
 

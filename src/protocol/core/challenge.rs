@@ -108,90 +108,104 @@ pub struct ChallengeEcho {
 
 /// Payment payload in credential.
 ///
-/// Contains the signed transaction or transaction hash. Per the IETF spec,
-/// the field name depends on the payload type:
-/// - `type="transaction"`: uses `signature` field (hex-encoded signed transaction)
-/// - `type="hash"`: uses `hash` field (transaction hash, already broadcast)
+/// Contains the signed transaction or transaction hash.
+///
+/// # Wire Format Compatibility
+///
+/// The TypeScript SDK uses a single `signature` field for all payload types:
+/// - `type="transaction"`: `signature` contains hex-encoded signed transaction
+/// - `type="hash"`: `signature` contains the transaction hash
+///
+/// This Rust type accepts both formats for interoperability:
+/// - For `type="transaction"`: reads `signature` field
+/// - For `type="hash"`: reads `signature` field (TypeScript SDK format)
+///
+/// Note: An older Rust-only format used `hash` field for `type="hash"`, but this
+/// was never deployed and is not supported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum PaymentPayload {
-    /// Signed transaction payload (to be broadcast by server)
-    Transaction {
-        /// Hex-encoded signed transaction
-        signature: String,
-        /// Payload type
-        #[serde(rename = "type")]
-        payload_type: PayloadType,
-    },
-    /// Transaction hash payload (already broadcast by client)
-    Hash {
-        /// Transaction hash with 0x prefix
-        hash: String,
-        /// Payload type
-        #[serde(rename = "type")]
-        payload_type: PayloadType,
-    },
+pub struct PaymentPayload {
+    /// Payload type: "transaction" or "hash"
+    #[serde(rename = "type")]
+    pub payload_type: PayloadType,
+
+    /// Hex-encoded signed data.
+    ///
+    /// For `type="transaction"`: the RLP-encoded signed transaction to broadcast.
+    /// For `type="hash"`: the transaction hash (0x-prefixed) of an already-broadcast tx.
+    pub signature: String,
 }
 
 impl PaymentPayload {
     /// Create a new transaction payload.
     pub fn transaction(signature: impl Into<String>) -> Self {
-        Self::Transaction {
-            signature: signature.into(),
+        Self {
             payload_type: PayloadType::Transaction,
+            signature: signature.into(),
         }
     }
 
     /// Create a new hash payload (already broadcast).
+    ///
+    /// The `tx_hash` is stored in the `signature` field per TypeScript SDK wire format.
     pub fn hash(tx_hash: impl Into<String>) -> Self {
-        Self::Hash {
-            hash: tx_hash.into(),
+        Self {
             payload_type: PayloadType::Hash,
+            signature: tx_hash.into(),
         }
     }
 
     /// Get the payload type.
     pub fn payload_type(&self) -> PayloadType {
-        match self {
-            Self::Transaction { payload_type, .. } => payload_type.clone(),
-            Self::Hash { payload_type, .. } => payload_type.clone(),
-        }
+        self.payload_type.clone()
     }
 
-    /// Get the signature (for transaction payloads).
-    pub fn signature(&self) -> Option<&str> {
-        match self {
-            Self::Transaction { signature, .. } => Some(signature),
-            Self::Hash { .. } => None,
-        }
+    /// Get the signature data (works for both transaction and hash payloads).
+    ///
+    /// For transaction payloads, this is the signed transaction bytes.
+    /// For hash payloads, this is the transaction hash.
+    pub fn signature(&self) -> &str {
+        &self.signature
     }
 
     /// Get the hash (for hash payloads).
+    ///
+    /// Returns the transaction hash if this is a hash payload, None otherwise.
     pub fn tx_hash(&self) -> Option<&str> {
-        match self {
-            Self::Transaction { .. } => None,
-            Self::Hash { hash, .. } => Some(hash),
+        if self.payload_type == PayloadType::Hash {
+            Some(&self.signature)
+        } else {
+            None
+        }
+    }
+
+    /// Get the signed transaction (for transaction payloads).
+    ///
+    /// Returns the signed transaction if this is a transaction payload, None otherwise.
+    pub fn signed_tx(&self) -> Option<&str> {
+        if self.payload_type == PayloadType::Transaction {
+            Some(&self.signature)
+        } else {
+            None
         }
     }
 
     /// Check if this is a transaction payload.
     pub fn is_transaction(&self) -> bool {
-        matches!(self, Self::Transaction { .. })
+        self.payload_type == PayloadType::Transaction
     }
 
     /// Check if this is a hash payload.
     pub fn is_hash(&self) -> bool {
-        matches!(self, Self::Hash { .. })
+        self.payload_type == PayloadType::Hash
     }
 
     /// Get the transaction reference (hash or signature).
     ///
-    /// Returns the tx hash for hash payloads, or the signature for transaction payloads.
+    /// Returns the `signature` field value, which contains either:
+    /// - The transaction hash for hash payloads
+    /// - The signed transaction for transaction payloads
     pub fn reference(&self) -> &str {
-        match self {
-            Self::Hash { hash, .. } => hash,
-            Self::Transaction { signature, .. } => signature,
-        }
+        &self.signature
     }
 }
 
@@ -349,31 +363,46 @@ mod tests {
         let tx = PaymentPayload::transaction("0xabc");
         assert_eq!(tx.payload_type(), PayloadType::Transaction);
         assert!(tx.is_transaction());
-        assert_eq!(tx.signature(), Some("0xabc"));
+        assert_eq!(tx.signature(), "0xabc");
+        assert_eq!(tx.signed_tx(), Some("0xabc"));
         assert_eq!(tx.tx_hash(), None);
 
         let hash = PaymentPayload::hash("0xdef");
         assert_eq!(hash.payload_type(), PayloadType::Hash);
         assert!(hash.is_hash());
         assert_eq!(hash.tx_hash(), Some("0xdef"));
-        assert_eq!(hash.signature(), None);
+        assert_eq!(hash.signature(), "0xdef"); // TypeScript SDK uses signature for both
+        assert_eq!(hash.signed_tx(), None);
     }
 
     #[test]
     fn test_payment_payload_serialization() {
-        // Transaction payload should serialize with "signature" field
+        // Transaction payload serializes with "signature" field
         let tx = PaymentPayload::transaction("0xabc");
         let json = serde_json::to_string(&tx).unwrap();
         assert!(json.contains("\"signature\":\"0xabc\""));
         assert!(json.contains("\"type\":\"transaction\""));
-        assert!(!json.contains("\"hash\""));
 
-        // Hash payload should serialize with "hash" field (per IETF spec)
+        // Hash payload ALSO uses "signature" field (TypeScript SDK wire format)
         let hash = PaymentPayload::hash("0xdef");
         let json = serde_json::to_string(&hash).unwrap();
-        assert!(json.contains("\"hash\":\"0xdef\""));
+        assert!(json.contains("\"signature\":\"0xdef\""));
         assert!(json.contains("\"type\":\"hash\""));
-        assert!(!json.contains("\"signature\""));
+    }
+
+    #[test]
+    fn test_payment_payload_deserialization_from_ts_sdk() {
+        // TypeScript SDK sends hash payloads with "signature" field
+        let ts_hash_json = r#"{"type":"hash","signature":"0xdef123"}"#;
+        let payload: PaymentPayload = serde_json::from_str(ts_hash_json).unwrap();
+        assert!(payload.is_hash());
+        assert_eq!(payload.tx_hash(), Some("0xdef123"));
+
+        // TypeScript SDK sends transaction payloads with "signature" field
+        let ts_tx_json = r#"{"type":"transaction","signature":"0xabc456"}"#;
+        let payload: PaymentPayload = serde_json::from_str(ts_tx_json).unwrap();
+        assert!(payload.is_transaction());
+        assert_eq!(payload.signed_tx(), Some("0xabc456"));
     }
 
     #[test]

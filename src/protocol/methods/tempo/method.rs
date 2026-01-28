@@ -1,17 +1,22 @@
 //! Tempo charge method for server-side payment verification.
 //!
 //! This module provides [`ChargeMethod`] which implements the [`ChargeMethod`]
-//! trait for Tempo blockchain payments using alloy's typed Provider.
+//! trait for **Tempo blockchain** payments using alloy's typed Provider.
+//!
+//! # Tempo-Specific
+//!
+//! This verifier is designed specifically for the Tempo network (chain ID 42431).
+//! It uses Tempo-specific constants and expects a `TempoNetwork` provider.
+//! For other chains (Base, Ethereum mainnet, etc.), use separate method modules.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use mpay::protocol::methods::tempo::ChargeMethod;
+//! use mpay::server::{tempo_provider, TempoChargeMethod};
 //! use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
-//! use alloy::providers::ProviderBuilder;
 //!
-//! let provider = ProviderBuilder::new().connect_http("https://rpc.moderato.tempo.xyz".parse()?);
-//! let method = ChargeMethod::new(provider);
+//! let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
+//! let method = TempoChargeMethod::new(provider);
 //!
 //! // In your server handler:
 //! let receipt = method.verify(&credential, &request).await?;
@@ -19,14 +24,14 @@
 //! ```
 
 use alloy::consensus::Transaction;
-use alloy::network::{Network, ReceiptResponse, TransactionResponse};
+use alloy::network::ReceiptResponse;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::Provider;
 use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
 
-use crate::protocol::core::{PaymentCredential, PaymentPayload, Receipt};
+use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 
@@ -41,10 +46,18 @@ const INTENT_CHARGE: &str = "charge";
 
 /// Tempo charge method for one-time payment verification.
 ///
-/// Verifies that a payment transaction matches the requested parameters by:
-/// 1. Parsing the credential payload (hash or transaction)
-/// 2. Fetching the transaction receipt from Tempo RPC using alloy Provider
-/// 3. Verifying transfer amount, recipient, and currency match
+/// This is a **Tempo-specific** payment verifier. It expects:
+/// - `method="tempo"` in the credential
+/// - Chain ID 42431 (Tempo Moderato) by default
+/// - A provider configured for `TempoNetwork`
+///
+/// For other chains (Base, Ethereum), use or create separate method modules.
+///
+/// # Verification Flow
+///
+/// 1. Parse the credential payload (hash or signed transaction)
+/// 2. Fetch the transaction receipt from Tempo RPC
+/// 3. Verify transfer amount, recipient, and currency match
 ///
 /// # Credential Types
 ///
@@ -54,12 +67,11 @@ const INTENT_CHARGE: &str = "charge";
 /// # Example
 ///
 /// ```ignore
-/// use mpay::protocol::methods::tempo::ChargeMethod;
+/// use mpay::server::{tempo_provider, TempoChargeMethod};
 /// use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
-/// use alloy::providers::ProviderBuilder;
 ///
-/// let provider = ProviderBuilder::new().connect_http("https://rpc.moderato.tempo.xyz".parse()?);
-/// let method = ChargeMethod::new(provider);
+/// let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
+/// let method = TempoChargeMethod::new(provider);
 ///
 /// // Verify a payment
 /// let receipt = method.verify(&credential, &request).await?;
@@ -68,23 +80,21 @@ const INTENT_CHARGE: &str = "charge";
 /// }
 /// ```
 #[derive(Clone)]
-pub struct ChargeMethod<P, N: Network = TempoNetwork> {
+pub struct ChargeMethod<P> {
     provider: Arc<P>,
-    _network: std::marker::PhantomData<N>,
 }
 
-impl<P, N> ChargeMethod<P, N>
+impl<P> ChargeMethod<P>
 where
-    P: Provider<N> + Clone + Send + Sync + 'static,
-    N: Network,
-    N::ReceiptResponse: serde::Serialize,
-    N::TransactionResponse: TransactionResponse,
+    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
     /// Create a new Tempo charge method with the given alloy Provider.
+    ///
+    /// The provider must be configured for `TempoNetwork`. Use
+    /// [`tempo_provider`](crate::server::tempo_provider) to create one.
     pub fn new(provider: P) -> Self {
         Self {
             provider: Arc::new(provider),
-            _network: std::marker::PhantomData,
         }
     }
 
@@ -174,7 +184,7 @@ where
 
     fn verify_erc20_transfer(
         &self,
-        receipt: &N::ReceiptResponse,
+        receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
         currency: Address,
         expected_recipient: Address,
         expected_amount: U256,
@@ -285,12 +295,9 @@ where
     }
 }
 
-impl<P, N> ChargeMethodTrait for ChargeMethod<P, N>
+impl<P> ChargeMethodTrait for ChargeMethod<P>
 where
-    P: Provider<N> + Clone + Send + Sync + 'static,
-    N: Network,
-    N::ReceiptResponse: serde::Serialize,
-    N::TransactionResponse: TransactionResponse,
+    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
     fn method(&self) -> &str {
         METHOD_NAME
@@ -306,10 +313,7 @@ where
         let provider = Arc::clone(&self.provider);
 
         async move {
-            let this: ChargeMethod<P, N> = ChargeMethod {
-                provider,
-                _network: std::marker::PhantomData,
-            };
+            let this = ChargeMethod { provider };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(
@@ -340,12 +344,13 @@ where
                 )));
             }
 
-            match &credential.payload {
-                PaymentPayload::Hash { hash, .. } => this.verify_hash(hash, &request).await,
-                PaymentPayload::Transaction { signature, .. } => {
-                    let tx_hash = this.broadcast_transaction(signature).await?;
-                    this.verify_hash(&format!("{:#x}", tx_hash), &request).await
-                }
+            if credential.payload.is_hash() {
+                // Client already broadcast the transaction, verify by hash
+                this.verify_hash(credential.payload.signature(), &request).await
+            } else {
+                // Client sent signed transaction, we need to broadcast it
+                let tx_hash = this.broadcast_transaction(credential.payload.signature()).await?;
+                this.verify_hash(&format!("{:#x}", tx_hash), &request).await
             }
         }
     }
