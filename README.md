@@ -114,7 +114,12 @@ use mpay::{Receipt, format_receipt, parse_receipt};
 
 let receipt = Receipt::success("tempo", "0x...");
 
+// Format using standalone function
 let header = format_receipt(&receipt)?;
+
+// Or use the method directly
+let header = receipt.to_header()?;
+
 let parsed = parse_receipt(&header)?;
 ```
 
@@ -136,15 +141,13 @@ let request = ChargeRequest {
 
 ### Server-Side Traits
 
-Method traits verify payment credentials with typed schemas using alloy's Provider:
+Method traits verify payment credentials with typed schemas:
 
 ```rust
-use mpay::server::{ChargeMethod, TempoChargeMethod};
-use alloy::providers::ProviderBuilder;
+use mpay::server::{tempo_provider, ChargeMethod, TempoChargeMethod};
 
-// Create an alloy provider
-let provider = ProviderBuilder::new()
-    .connect_http("https://rpc.moderato.tempo.xyz".parse()?);
+// Create a Tempo provider (handles Tempo's custom transaction types)
+let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
 
 // Create the charge method with the provider
 let method = TempoChargeMethod::new(provider);
@@ -200,8 +203,9 @@ mpay = "0.1"
 | `server` | Server-side payment verification (`ChargeMethod` trait) |
 | `tempo` | Tempo blockchain support (default, includes `evm`) |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
-| `http` | HTTP client support with `Fetch` extension trait (implies `client`) |
+| `http` | HTTP client support with `Fetch` extension trait (implies `client`). For Tempo payments, combine with `tempo`: `features = ["http", "tempo"]` |
 | `middleware` | reqwest-middleware support with `PaymentMiddleware` |
+| `utils` | Hex/random utilities for development and testing |
 
 ### Common configurations
 

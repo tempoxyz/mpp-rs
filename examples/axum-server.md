@@ -48,19 +48,29 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
     }
 
     // No valid payment - return 402 with challenge
-    let challenge = PaymentChallenge {
-        id: uuid::Uuid::new_v4().to_string(),
-        realm: "api.example.com".into(),
-        method: "tempo".into(),
-        intent: "charge".into(),
-        request: Base64UrlJson::encode(&serde_json::json!({
-            "amount": "1000000",
-            "currency": "0x...",
-            "recipient": "0x..."
-        })).unwrap(),
-        expires: None,
-        description: None,
-    };
+    // Option 1: Use the tempo::charge_challenge helper (recommended)
+    use mpay::protocol::methods::tempo;
+    let challenge = tempo::charge_challenge(
+        "api.example.com",
+        "1000000",
+        "0x...", // currency address
+        "0x...", // recipient address
+    ).unwrap();
+    
+    // Option 2: Manual construction with PaymentChallenge
+    // let challenge = PaymentChallenge {
+    //     id: uuid::Uuid::new_v4().to_string(),
+    //     realm: "api.example.com".into(),
+    //     method: "tempo".into(),
+    //     intent: "charge".into(),
+    //     request: Base64UrlJson::encode(&serde_json::json!({
+    //         "amount": "1000000",
+    //         "currency": "0x...",
+    //         "recipient": "0x..."
+    //     })).unwrap(),
+    //     expires: None,
+    //     description: None,
+    // };
 
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -131,24 +141,19 @@ fn app() -> Router {
 ## Dynamic Pricing
 
 ```rust
+use mpay::protocol::methods::tempo;
+
 async fn dynamic_pricing(headers: HeaderMap, Path(resource_id): Path<String>) -> impl IntoResponse {
     // Look up price for this resource
     let price = get_resource_price(&resource_id).await;
 
-    let challenge = PaymentChallenge {
-        id: uuid::Uuid::new_v4().to_string(),
-        realm: "api.example.com".into(),
-        method: "tempo".into(),
-        intent: "charge".into(),
-        request: Base64UrlJson::encode(&serde_json::json!({
-            "amount": price.to_string(),
-            "currency": USDC_ADDRESS,
-            "recipient": MERCHANT_ADDRESS,
-            "description": resource_id,
-        })).unwrap(),
-        expires: None,
-        description: None,
-    };
+    // Use the charge_challenge helper for cleaner code
+    let challenge = tempo::charge_challenge(
+        "api.example.com",
+        &price.to_string(),
+        USDC_ADDRESS,
+        MERCHANT_ADDRESS,
+    ).unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,

@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use mpay::client::{PaymentMiddleware, TempoProvider};
-use mpay::PrivateKeySigner;
+use mpay::PrivateKeySigner;  // Requires `evm` or `tempo` feature
 use reqwest_middleware::ClientBuilder;
 
 #[tokio::main]
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Approach | Pros | Cons |
 |----------|------|------|
 | `PaymentMiddleware` | Automatic for all requests | Less control per-request |
-| `PaymentExt` trait | Opt-in per request | Must call `.send_with_payment()` |
+| `Fetch` trait | Opt-in per request | Must call `.send_with_payment()` |
 
 Use **middleware** when you want all requests to automatically pay.
 Use **extension trait** when you want explicit control over which requests pay.
