@@ -38,16 +38,22 @@ pub use crate::protocol::methods::tempo::{
 /// ```ignore
 /// use mpay::server::{tempo_provider, TempoChargeMethod};
 ///
-/// let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
+/// let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 /// let method = TempoChargeMethod::new(provider);
 /// ```
+///
+/// # Errors
+///
+/// Returns an error if the RPC URL is invalid.
 #[cfg(feature = "tempo")]
-pub fn tempo_provider(rpc_url: &str) -> TempoProvider {
+pub fn tempo_provider(rpc_url: &str) -> crate::error::Result<TempoProvider> {
     use alloy::providers::ProviderBuilder;
     use tempo_alloy::TempoNetwork;
 
-    ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(rpc_url.parse().expect("invalid RPC URL"))
+    let url = rpc_url
+        .parse()
+        .map_err(|e| crate::error::MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?;
+    Ok(ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(url))
 }
 
 /// Type alias for the Tempo provider returned by [`tempo_provider`].

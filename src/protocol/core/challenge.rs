@@ -329,6 +329,7 @@ pub struct Receipt {
 
 impl Receipt {
     /// Create a successful payment receipt.
+    #[must_use]
     pub fn success(method: impl Into<MethodName>, reference: impl Into<String>) -> Self {
         Self {
             status: ReceiptStatus::Success,
