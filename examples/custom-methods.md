@@ -99,11 +99,11 @@ impl ChargeMethod for MultiChainChargeMethod {
             let _rpc_url = this
                 .rpc_urls
                 .get(&chain_id)
-                .ok_or_else(|| VerificationError::new(format!("Unsupported chain: {}", chain_id)))?;
+                .ok_or_else(|| VerificationError::from(format!("Unsupported chain: {}", chain_id)))?;
 
             let tx_hash = match &credential.payload {
                 PaymentPayload::Hash { hash, .. } => hash.clone(),
-                _ => return Err(VerificationError::new("Expected hash payload")),
+                _ => return Err(VerificationError::from("Expected hash payload")),
             };
 
             // Verify transaction on chain using request.amount, request.currency, request.recipient
@@ -243,11 +243,12 @@ async fn paid_resource<M: ChargeMethod>(
 mpay-rs includes `TempoChargeMethod` for Tempo blockchain verification:
 
 ```rust
-use mpay::server::TempoChargeMethod;
+use mpay::server::{tempo_provider, TempoChargeMethod, ChargeMethod};
 use mpay::ChargeRequest;
 
-let method = TempoChargeMethod::new("https://rpc.moderato.tempo.xyz")
-    .with_timeout(30);
+// Create provider and method
+let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
+let method = TempoChargeMethod::new(provider);
 
 // The method name
 assert_eq!(method.method(), "tempo");

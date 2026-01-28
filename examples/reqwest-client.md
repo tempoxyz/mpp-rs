@@ -18,7 +18,7 @@ per-request payment handling. This is the most idiomatic Rust approach.
 
 ```rust
 use mpay::client::{Fetch, TempoProvider};
-use mpay::PrivateKeySigner;
+use mpay::PrivateKeySigner;  // Requires `evm` or `tempo` feature
 use reqwest::Client;
 
 #[tokio::main]
