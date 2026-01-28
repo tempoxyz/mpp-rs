@@ -91,9 +91,9 @@ where
         tx_hash: &str,
         charge: &ChargeRequest,
     ) -> Result<Receipt, VerificationError> {
-        let expected_recipient = charge
-            .recipient_address()
-            .map_err(|e| VerificationError::invalid_recipient(format!("Invalid recipient: {}", e)))?;
+        let expected_recipient = charge.recipient_address().map_err(|e| {
+            VerificationError::invalid_recipient(format!("Invalid recipient: {}", e))
+        })?;
 
         let expected_amount = charge
             .amount_u256()
@@ -111,7 +111,9 @@ where
             .provider
             .get_transaction_receipt(hash)
             .await
-            .map_err(|e| VerificationError::network_error(format!("Failed to fetch receipt: {}", e)))?
+            .map_err(|e| {
+                VerificationError::network_error(format!("Failed to fetch receipt: {}", e))
+            })?
             .ok_or_else(|| {
                 VerificationError::pending(format!(
                     "Transaction {} not found or not yet mined",
@@ -133,7 +135,9 @@ where
                 .provider
                 .get_transaction_by_hash(hash)
                 .await
-                .map_err(|e| VerificationError::network_error(format!("Failed to fetch transaction: {}", e)))?
+                .map_err(|e| {
+                    VerificationError::network_error(format!("Failed to fetch transaction: {}", e))
+                })?
                 .ok_or_else(|| {
                     VerificationError::pending(format!("Transaction {} not found", tx_hash))
                 })?;
@@ -248,9 +252,7 @@ where
             .provider
             .send_raw_transaction(&tx_bytes)
             .await
-            .map_err(|e| {
-                VerificationError::network_error(format!("Failed to broadcast: {}", e))
-            })?;
+            .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
 
         Ok(*pending.tx_hash())
     }
@@ -280,15 +282,13 @@ where
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(
                     "Method mismatch: expected {}, got {}",
-                    METHOD_NAME,
-                    credential.challenge.method
+                    METHOD_NAME, credential.challenge.method
                 )));
             }
             if credential.challenge.intent.as_str() != INTENT_CHARGE {
                 return Err(VerificationError::credential_mismatch(format!(
                     "Intent mismatch: expected {}, got {}",
-                    INTENT_CHARGE,
-                    credential.challenge.intent
+                    INTENT_CHARGE, credential.challenge.intent
                 )));
             }
 
@@ -297,10 +297,9 @@ where
             }
 
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
-            let actual_chain_id =
-                this.provider.get_chain_id().await.map_err(|e| {
-                    VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
-                })?;
+            let actual_chain_id = this.provider.get_chain_id().await.map_err(|e| {
+                VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
+            })?;
 
             if actual_chain_id != expected_chain_id {
                 return Err(VerificationError::chain_id_mismatch(format!(
