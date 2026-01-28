@@ -310,12 +310,12 @@ where
 
             if credential.payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
-                this.verify_hash(credential.payload.signature(), &request)
+                this.verify_hash(credential.payload.tx_hash().unwrap(), &request)
                     .await
             } else {
                 // Client sent signed transaction, we need to broadcast it
                 let tx_hash = this
-                    .broadcast_transaction(credential.payload.signature())
+                    .broadcast_transaction(credential.payload.signed_tx().unwrap())
                     .await?;
                 this.verify_hash(&format!("{:#x}", tx_hash), &request).await
             }

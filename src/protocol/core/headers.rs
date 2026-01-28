@@ -178,6 +178,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         request,
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
+        digest: params.get("digest").cloned(),
     })
 }
 
@@ -231,6 +232,7 @@ pub fn parse_www_authenticate_all<'a>(
 ///     request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
 ///     expires: None,
 ///     description: None,
+///     digest: None,
 /// };
 /// let header = format_www_authenticate(&challenge).unwrap();
 /// assert!(header.starts_with("Payment id=\"abc123\""));
@@ -265,6 +267,10 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
         ));
     }
 
+    if let Some(ref digest) = challenge.digest {
+        parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
+    }
+
     Ok(format!("Payment {}", parts.join(", ")))
 }
 
@@ -286,6 +292,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
 ///     request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
 ///     expires: None,
 ///     description: None,
+///     digest: None,
 /// };
 /// let headers = format_www_authenticate_many(&[challenge]).unwrap();
 /// assert_eq!(headers.len(), 1);
@@ -375,6 +382,7 @@ mod tests {
             .unwrap(),
             expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
+            digest: None,
         }
     }
 
@@ -477,7 +485,7 @@ mod tests {
             parsed.source,
             Some("did:pkh:eip155:42431:0x123".to_string())
         );
-        assert_eq!(parsed.payload.signature(), "0xabc");
+        assert_eq!(parsed.payload.signed_tx(), Some("0xabc"));
         assert_eq!(parsed.payload.payload_type(), PayloadType::Transaction);
     }
 

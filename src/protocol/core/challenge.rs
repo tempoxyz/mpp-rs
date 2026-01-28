@@ -51,6 +51,10 @@ pub struct PaymentChallenge {
     /// Human-readable description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Request body digest for body binding (RFC 9530 Content-Digest)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 impl PaymentChallenge {
@@ -71,6 +75,7 @@ impl PaymentChallenge {
             intent: self.intent.clone(),
             request: self.request.raw().to_string(),
             expires: self.expires.clone(),
+            digest: self.digest.clone(),
         }
     }
 
@@ -104,22 +109,79 @@ pub struct ChallengeEcho {
     /// Challenge expiration time (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+
+    /// Request body digest for body binding (RFC 9530 Content-Digest)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 /// Payment payload in credential.
 ///
 /// Contains the signed transaction or transaction hash.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Per IETF spec (Tempo §5.1-5.2):
+/// - `type="transaction"` uses field `signature` containing the signed transaction
+/// - `type="hash"` uses field `hash` containing the transaction hash
+#[derive(Debug, Clone)]
 pub struct PaymentPayload {
     /// Payload type: "transaction" or "hash"
-    #[serde(rename = "type")]
     pub payload_type: PayloadType,
 
     /// Hex-encoded signed data.
     ///
     /// For `type="transaction"`: the RLP-encoded signed transaction to broadcast.
     /// For `type="hash"`: the transaction hash (0x-prefixed) of an already-broadcast tx.
-    pub signature: String,
+    data: String,
+}
+
+impl serde::Serialize for PaymentPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("PaymentPayload", 2)?;
+        state.serialize_field("type", &self.payload_type)?;
+
+        match self.payload_type {
+            PayloadType::Transaction => state.serialize_field("signature", &self.data)?,
+            PayloadType::Hash => state.serialize_field("hash", &self.data)?,
+        }
+
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PaymentPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawPayload {
+            #[serde(rename = "type")]
+            payload_type: PayloadType,
+            signature: Option<String>,
+            hash: Option<String>,
+        }
+
+        let raw = RawPayload::deserialize(deserializer)?;
+
+        let data = match raw.payload_type {
+            PayloadType::Transaction => raw.signature.ok_or_else(|| {
+                serde::de::Error::custom("transaction payload requires 'signature' field")
+            })?,
+            PayloadType::Hash => raw
+                .hash
+                .ok_or_else(|| serde::de::Error::custom("hash payload requires 'hash' field"))?,
+        };
+
+        Ok(PaymentPayload {
+            payload_type: raw.payload_type,
+            data,
+        })
+    }
 }
 
 impl PaymentPayload {
@@ -127,7 +189,7 @@ impl PaymentPayload {
     pub fn transaction(signature: impl Into<String>) -> Self {
         Self {
             payload_type: PayloadType::Transaction,
-            signature: signature.into(),
+            data: signature.into(),
         }
     }
 
@@ -135,7 +197,7 @@ impl PaymentPayload {
     pub fn hash(tx_hash: impl Into<String>) -> Self {
         Self {
             payload_type: PayloadType::Hash,
-            signature: tx_hash.into(),
+            data: tx_hash.into(),
         }
     }
 
@@ -144,12 +206,14 @@ impl PaymentPayload {
         self.payload_type.clone()
     }
 
-    /// Get the signature data (works for both transaction and hash payloads).
+    /// Get the underlying data (works for both transaction and hash payloads).
     ///
     /// For transaction payloads, this is the signed transaction bytes.
     /// For hash payloads, this is the transaction hash.
-    pub fn signature(&self) -> &str {
-        &self.signature
+    ///
+    /// Prefer using `tx_hash()` or `signed_tx()` for type-safe access.
+    pub fn data(&self) -> &str {
+        &self.data
     }
 
     /// Get the hash (for hash payloads).
@@ -157,7 +221,7 @@ impl PaymentPayload {
     /// Returns the transaction hash if this is a hash payload, None otherwise.
     pub fn tx_hash(&self) -> Option<&str> {
         if self.payload_type == PayloadType::Hash {
-            Some(&self.signature)
+            Some(&self.data)
         } else {
             None
         }
@@ -168,7 +232,7 @@ impl PaymentPayload {
     /// Returns the signed transaction if this is a transaction payload, None otherwise.
     pub fn signed_tx(&self) -> Option<&str> {
         if self.payload_type == PayloadType::Transaction {
-            Some(&self.signature)
+            Some(&self.data)
         } else {
             None
         }
@@ -184,13 +248,13 @@ impl PaymentPayload {
         self.payload_type == PayloadType::Hash
     }
 
-    /// Get the transaction reference (hash or signature).
+    /// Get the transaction reference (hash or signature data).
     ///
-    /// Returns the `signature` field value, which contains either:
+    /// Returns the underlying data, which contains either:
     /// - The transaction hash for hash payloads
     /// - The signed transaction for transaction payloads
     pub fn reference(&self) -> &str {
-        &self.signature
+        &self.data
     }
 }
 
@@ -328,6 +392,7 @@ mod tests {
             .unwrap(),
             expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
+            digest: None,
         }
     }
 
@@ -348,7 +413,7 @@ mod tests {
         let tx = PaymentPayload::transaction("0xabc");
         assert_eq!(tx.payload_type(), PayloadType::Transaction);
         assert!(tx.is_transaction());
-        assert_eq!(tx.signature(), "0xabc");
+        assert_eq!(tx.data(), "0xabc");
         assert_eq!(tx.signed_tx(), Some("0xabc"));
         assert_eq!(tx.tx_hash(), None);
 
@@ -356,38 +421,55 @@ mod tests {
         assert_eq!(hash.payload_type(), PayloadType::Hash);
         assert!(hash.is_hash());
         assert_eq!(hash.tx_hash(), Some("0xdef"));
-        assert_eq!(hash.signature(), "0xdef");
+        assert_eq!(hash.data(), "0xdef");
         assert_eq!(hash.signed_tx(), None);
     }
 
     #[test]
     fn test_payment_payload_serialization() {
-        // Transaction payload serializes with "signature" field
+        // Transaction payload serializes with "signature" field per spec
         let tx = PaymentPayload::transaction("0xabc");
         let json = serde_json::to_string(&tx).unwrap();
         assert!(json.contains("\"signature\":\"0xabc\""));
         assert!(json.contains("\"type\":\"transaction\""));
+        assert!(!json.contains("\"hash\""));
 
-        // Hash payload also uses "signature" field
+        // Hash payload serializes with "hash" field per spec
         let hash = PaymentPayload::hash("0xdef");
         let json = serde_json::to_string(&hash).unwrap();
-        assert!(json.contains("\"signature\":\"0xdef\""));
+        assert!(json.contains("\"hash\":\"0xdef\""));
         assert!(json.contains("\"type\":\"hash\""));
+        assert!(!json.contains("\"signature\""));
     }
 
     #[test]
     fn test_payment_payload_deserialization() {
-        // Hash payload deserialization
-        let hash_json = r#"{"type":"hash","signature":"0xdef123"}"#;
+        // Hash payload requires "hash" field per IETF spec
+        let hash_json = r#"{"type":"hash","hash":"0xdef123"}"#;
         let payload: PaymentPayload = serde_json::from_str(hash_json).unwrap();
         assert!(payload.is_hash());
         assert_eq!(payload.tx_hash(), Some("0xdef123"));
 
-        // Transaction payload deserialization
+        // Transaction payload requires "signature" field per IETF spec
         let tx_json = r#"{"type":"transaction","signature":"0xabc456"}"#;
         let payload: PaymentPayload = serde_json::from_str(tx_json).unwrap();
         assert!(payload.is_transaction());
         assert_eq!(payload.signed_tx(), Some("0xabc456"));
+    }
+
+    #[test]
+    fn test_payment_payload_strict_field_enforcement() {
+        // hash payload with "signature" field should fail
+        let bad_hash = r#"{"type":"hash","signature":"0xdef123"}"#;
+        let result: Result<PaymentPayload, _> = serde_json::from_str(bad_hash);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hash"));
+
+        // transaction payload with "hash" field should fail
+        let bad_tx = r#"{"type":"transaction","hash":"0xabc456"}"#;
+        let result: Result<PaymentPayload, _> = serde_json::from_str(bad_tx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("signature"));
     }
 
     #[test]
