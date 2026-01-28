@@ -7,9 +7,7 @@
 //! - GET http://localhost:3000/paid → 402 Payment Required (needs credential)
 
 use axum::{
-    async_trait,
-    extract::FromRequestParts,
-    http::{header, request::Parts, HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -22,8 +20,7 @@ const REALM: &str = "api.example.com";
 const ALPHA_USD: &str = "0x20c0000000000000000000000000000000000001";
 
 static MERCHANT_ADDRESS: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("MERCHANT_ADDRESS")
-        .expect("MERCHANT_ADDRESS environment variable must be set")
+    std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set")
 });
 
 #[tokio::main]
@@ -39,75 +36,46 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn free_endpoint() -> impl IntoResponse {
+async fn free_endpoint() -> &'static str {
     "Free content - no payment required"
 }
 
 async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
-    if let Some(auth) = headers.get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Ok(credential) = Credential::parse_authorization(auth_str) {
-                if verify_payment(&credential).await.is_ok() {
-                    let receipt = Receipt::Receipt::success("tempo", "0x...");
-
-                    if let Ok(receipt_header) = Receipt::format_receipt(&receipt) {
-                        return (
-                            StatusCode::OK,
-                            [(
-                                header::HeaderName::from_static("payment-receipt"),
-                                receipt_header,
-                            )],
-                            "Here's your paid content!",
-                        )
-                            .into_response();
-                    }
-                }
-            }
+    // Check for payment credential
+    if let Some(credential) = parse_credential(&headers) {
+        if verify_payment(&credential).await.is_ok() {
+            let receipt = Receipt::Receipt::success("tempo", "0x...");
+            let header = Receipt::format_receipt(&receipt).unwrap();
+            return (
+                StatusCode::OK,
+                [("payment-receipt", header)],
+                "Here's your paid content!",
+            )
+                .into_response();
         }
     }
 
-    let challenge = tempo::charge_challenge(REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS)
-        .expect("Failed to create challenge");
+    // Return 402 with payment challenge
+    let challenge =
+        tempo::charge_challenge(REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS).unwrap();
+    let www_auth = Challenge::format_www_authenticate(&challenge).unwrap();
 
-    match Challenge::format_www_authenticate(&challenge) {
-        Ok(www_auth) => (
-            StatusCode::PAYMENT_REQUIRED,
-            [(header::WWW_AUTHENTICATE, www_auth)],
-            "Payment required",
-        )
-            .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        [(header::WWW_AUTHENTICATE, www_auth)],
+        "Payment required",
+    )
+        .into_response()
 }
 
-struct RequirePayment(Credential::PaymentCredential);
-
-#[async_trait]
-impl<S> FromRequestParts<S> for RequirePayment
-where
-    S: Send + Sync,
-{
-    type Rejection = (StatusCode, String);
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let auth = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .ok_or((StatusCode::PAYMENT_REQUIRED, "Missing authorization".into()))?;
-
-        let credential = Credential::parse_authorization(auth)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-        Ok(RequirePayment(credential))
-    }
-}
-
-#[allow(dead_code)]
-async fn handler_with_extractor(RequirePayment(credential): RequirePayment) -> impl IntoResponse {
-    format!("Paid by: {:?}", credential.source)
+fn parse_credential(headers: &HeaderMap) -> Option<Credential::PaymentCredential> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| Credential::parse_authorization(s).ok())
 }
 
 async fn verify_payment(_credential: &Credential::PaymentCredential) -> Result<(), ()> {
+    // TODO: Verify the payment credential (check signature, submit tx, etc.)
     Ok(())
 }
