@@ -143,7 +143,7 @@ impl PaymentProvider for TempoProvider {
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
         use alloy::network::{EthereumWallet, TransactionBuilder};
         use alloy::providers::{Provider, ProviderBuilder};
-        use alloy::sol;
+        use tempo_alloy::contracts::precompiles::tip20::ITIP20;
         use tempo_alloy::TempoNetwork;
 
         let charge: ChargeRequest = challenge.request.decode()?;
@@ -171,14 +171,10 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        sol! {
-            #[sol(rpc)]
-            interface IERC20 {
-                function transfer(address to, uint256 amount) external returns (bool);
-            }
-        }
-
-        let token = IERC20::new(currency, &provider);
+        // Use TIP-20 interface for proper Tempo token transfers.
+        // For pure transfer calls, Tempo infers the fee token from the token being transferred,
+        // enabling fee sponsorship when the server broadcasts the signed transaction.
+        let token = ITIP20::new(currency, &provider);
         let call = token.transfer(recipient, amount);
 
         let tx = call
