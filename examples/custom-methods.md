@@ -279,7 +279,6 @@ if receipt.is_success() {
 Features:
 
 - Verifies `hash` (pre-broadcast) and `transaction` (server-broadcast) credentials
-- Validates ERC-20 transfer logs
 - Checks expiration timestamps
 - Confirms chain ID matches
 

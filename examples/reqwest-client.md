@@ -88,7 +88,7 @@ async fn fetch_paid_resource(
         let credential = Credential::PaymentCredential::with_source(
             challenge.to_echo(),
             "did:pkh:eip155:42431:0xYourAddress",
-            Credential::PaymentPayload::hash(tx_hash),
+            Credential::PaymentPayload::hash(&tx_hash),
         );
 
         // Retry with payment credential
@@ -109,7 +109,7 @@ async fn fetch_paid_resource(
 ## With Receipt Parsing
 
 ```rust
-use mpay::{Challenge, Credential, Receipt};
+use mpay::Receipt;
 
 async fn fetch_with_receipt(
     client: &Client,

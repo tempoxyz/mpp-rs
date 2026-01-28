@@ -122,6 +122,7 @@ impl<S> Layer<S> for PaymentLayer {
 
 ```rust
 use http::{Request, Response, StatusCode};
+use mpay::{Challenge, Credential, Schema};
 
 #[derive(Clone)]
 pub struct PaymentService<S> {
@@ -159,7 +160,7 @@ where
         let challenge = self.create_challenge();
         let response = Response::builder()
             .status(StatusCode::PAYMENT_REQUIRED)
-            .header("www-authenticate", challenge.to_www_authenticate(&self.config.realm))
+            .header("www-authenticate", Challenge::format_www_authenticate(&challenge).unwrap())
             .body(ResBody::default())
             .unwrap();
 
@@ -174,7 +175,7 @@ impl<S> PaymentService<S> {
             realm: self.config.realm.clone(),
             method: self.config.method.clone().into(),
             intent: "charge".into(),
-            request: mpay::Schema::Base64UrlJson::from_value(&serde_json::json!({
+            request: Schema::Base64UrlJson::from_value(&serde_json::json!({
                 "amount": self.config.amount,
                 "currency": self.config.asset,
                 "recipient": self.config.destination,
