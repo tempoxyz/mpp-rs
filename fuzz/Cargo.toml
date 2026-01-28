@@ -1,0 +1,50 @@
+[package]
+name = "mpay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mpay]
+path = ".."
+default-features = false
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_www_authenticate"
+path = "fuzz_targets/fuzz_www_authenticate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_authorization"
+path = "fuzz_targets/fuzz_authorization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_receipt"
+path = "fuzz_targets/fuzz_receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_base64url_json"
+path = "fuzz_targets/fuzz_base64url_json.rs"
+test = false
+doc = false
+bench = false
