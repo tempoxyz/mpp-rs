@@ -21,7 +21,6 @@
 use alloy::consensus::Transaction;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::Log;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -32,10 +31,6 @@ use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationErr
 use super::{parse_iso8601_timestamp, TempoChargeExt, CHAIN_ID, METHOD_NAME};
 
 const INTENT_CHARGE: &str = "charge";
-
-/// ERC-20 Transfer(address,address,uint256) event signature.
-const TRANSFER_TOPIC: B256 =
-    alloy::primitives::b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 
 /// Tempo charge method for one-time payment verification.
 ///
@@ -128,98 +123,37 @@ where
             )));
         }
 
-        let is_native = expected_currency == Address::ZERO;
-
-        if is_native {
-            let tx = self
-                .provider
-                .get_transaction_by_hash(hash)
-                .await
-                .map_err(|e| {
-                    VerificationError::network_error(format!("Failed to fetch transaction: {}", e))
-                })?
-                .ok_or_else(|| {
-                    VerificationError::pending(format!("Transaction {} not found", tx_hash))
-                })?;
-
-            let to_addr = tx.inner.to().ok_or_else(|| {
-                VerificationError::invalid_recipient(
-                    "Transaction has no recipient (contract creation)",
-                )
+        let tx = self
+            .provider
+            .get_transaction_by_hash(hash)
+            .await
+            .map_err(|e| {
+                VerificationError::network_error(format!("Failed to fetch transaction: {}", e))
+            })?
+            .ok_or_else(|| {
+                VerificationError::pending(format!("Transaction {} not found", tx_hash))
             })?;
 
-            if to_addr != expected_recipient {
-                return Err(VerificationError::invalid_recipient(format!(
-                    "Recipient mismatch: expected {}, got {}",
-                    expected_recipient, to_addr
-                )));
-            }
+        let to_addr = tx.inner.to().ok_or_else(|| {
+            VerificationError::invalid_recipient("Transaction has no recipient (contract creation)")
+        })?;
 
-            let value = tx.inner.value();
-            if value < expected_amount {
-                return Err(VerificationError::invalid_amount(format!(
-                    "Amount mismatch: expected {}, got {}",
-                    expected_amount, value
-                )));
-            }
-        } else {
-            self.verify_transfer_logs(
-                receipt.inner.logs(),
-                expected_recipient,
-                expected_amount,
-                expected_currency,
-            )?;
+        if to_addr != expected_recipient {
+            return Err(VerificationError::invalid_recipient(format!(
+                "Recipient mismatch: expected {}, got {}",
+                expected_recipient, to_addr
+            )));
+        }
+
+        let value = tx.inner.value();
+        if value < expected_amount {
+            return Err(VerificationError::invalid_amount(format!(
+                "Amount mismatch: expected {}, got {}",
+                expected_amount, value
+            )));
         }
 
         Ok(Receipt::success(METHOD_NAME, tx_hash))
-    }
-
-    fn verify_transfer_logs(
-        &self,
-        logs: &[Log],
-        expected_recipient: Address,
-        expected_amount: U256,
-        expected_currency: Address,
-    ) -> Result<(), VerificationError> {
-        for log in logs {
-            let topics = log.topics();
-            if topics.is_empty() || topics[0] != TRANSFER_TOPIC {
-                continue;
-            }
-
-            if log.address() != expected_currency {
-                continue;
-            }
-
-            if topics.len() < 3 {
-                continue;
-            }
-
-            let to_addr = Address::from_slice(&topics[2].as_slice()[12..32]);
-
-            if to_addr != expected_recipient {
-                continue;
-            }
-
-            let data = log.data().data.as_ref();
-            let amount = if data.len() >= 32 {
-                U256::from_be_slice(&data[..32])
-            } else if data.is_empty() {
-                U256::ZERO
-            } else {
-                let mut padded = [0u8; 32];
-                padded[32 - data.len()..].copy_from_slice(data);
-                U256::from_be_slice(&padded)
-            };
-
-            if amount >= expected_amount {
-                return Ok(());
-            }
-        }
-
-        Err(VerificationError::not_found(
-            "No matching transfer found in logs",
-        ))
     }
 
     fn check_expiration(&self, expires: &str) -> Result<(), VerificationError> {
@@ -278,7 +212,6 @@ where
         async move {
             let this = ChargeMethod { provider };
 
-            // Issue #1: Validate credential matches expected method and intent
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(
                     "Method mismatch: expected {}, got {}",
@@ -319,15 +252,4 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_transfer_topic_constant() {
-        assert_eq!(
-            format!("{:#x}", TRANSFER_TOPIC),
-            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-        );
-    }
-}

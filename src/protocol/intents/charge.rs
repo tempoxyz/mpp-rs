@@ -33,13 +33,9 @@ use crate::error::{MppError, Result};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChargeRequest {
     /// Amount in base units (e.g., wei, satoshi, cents)
-    /// Accepts both "amount" and "price" for compatibility
-    #[serde(alias = "price", default)]
     pub amount: String,
 
     /// Currency/asset identifier (token address, ISO 4217 code, or symbol)
-    /// Optional for backward compatibility with servers that omit it
-    #[serde(default)]
     pub currency: String,
 
     /// Recipient address (optional, server may be recipient)
