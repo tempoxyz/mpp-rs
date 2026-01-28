@@ -175,7 +175,7 @@ impl<S> PaymentService<S> {
             realm: self.config.realm.clone(),
             method: self.config.method.clone().into(),
             intent: "charge".into(),
-            request: Base64UrlJson::encode(&serde_json::json!({
+            request: Base64UrlJson::from_value(&serde_json::json!({
                 "amount": self.config.amount,
                 "currency": self.config.asset,
                 "recipient": self.config.destination,

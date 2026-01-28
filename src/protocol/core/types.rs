@@ -102,9 +102,9 @@ impl From<String> for MethodName {
 pub struct IntentName(String);
 
 impl IntentName {
-    /// Create a new intent name.
+    /// Create a new intent name, normalizing to lowercase per spec.
     pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
+        Self(name.into().to_ascii_lowercase())
     }
 
     /// Get the intent name as a string slice.
@@ -144,13 +144,13 @@ impl fmt::Display for IntentName {
 
 impl From<&str> for IntentName {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self::new(s)
     }
 }
 
 impl From<String> for IntentName {
     fn from(s: String) -> Self {
-        Self(s)
+        Self::new(s)
     }
 }
 
@@ -192,6 +192,7 @@ impl Base64UrlJson {
     }
 
     /// Create from a JSON Value by encoding it.
+    #[must_use = "this returns a new Base64UrlJson and does not modify the input"]
     pub fn from_value(value: &serde_json::Value) -> Result<Self> {
         let json = serde_json::to_string(value)?;
         let raw = base64url_encode(json.as_bytes());
@@ -397,6 +398,16 @@ mod tests {
 
         let intent2 = IntentName::new("AUTHORIZE");
         assert!(intent2.is_authorize());
+        assert_eq!(intent2.as_str(), "authorize");
+    }
+
+    #[test]
+    fn test_intent_name_normalizes_to_lowercase() {
+        let intent: IntentName = "CHARGE".into();
+        assert_eq!(intent.as_str(), "charge");
+
+        let intent2 = IntentName::new("SuBsCrIpTiOn");
+        assert_eq!(intent2.as_str(), "subscription");
     }
 
     #[test]

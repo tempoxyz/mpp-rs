@@ -43,10 +43,11 @@ println!("Intent: {}", challenge.intent);
 ### Create a Credential (Client → Server)
 
 ```rust
-use mpay::{PaymentCredential, PaymentPayload, ChallengeEcho, format_authorization};
+use mpay::{PaymentCredential, PaymentPayload, format_authorization};
 
+// After parsing a challenge, create a credential with the echo
 let credential = PaymentCredential::with_source(
-    ChallengeEcho::new("abc123"),
+    challenge.to_echo(),  // Echo the challenge parameters
     "did:pkh:eip155:8453:0x123...",
     PaymentPayload::hash("0xabc..."),
 );
@@ -79,7 +80,7 @@ let challenge = PaymentChallenge {
     realm: "api.example.com".into(),
     method: "tempo".into(),
     intent: "charge".into(),
-    request: Base64UrlJson::encode(&serde_json::json!({"amount": "1000000"}))?,
+    request: Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"}))?,
     expires: None,
     description: None,
 };
@@ -93,10 +94,11 @@ let parsed = parse_www_authenticate(&header)?;
 The credential sent in the `Authorization` header.
 
 ```rust
-use mpay::{PaymentCredential, PaymentPayload, ChallengeEcho, format_authorization, parse_authorization};
+use mpay::{PaymentCredential, PaymentPayload, format_authorization, parse_authorization};
 
+// After parsing a challenge, create the credential
 let credential = PaymentCredential::with_source(
-    ChallengeEcho::new("challenge-id"),
+    challenge.to_echo(),  // Echo the parsed challenge
     "did:pkh:eip155:1:0x...",
     PaymentPayload::hash("0x..."),
 );
@@ -199,12 +201,12 @@ mpay = "0.1"
 
 | Feature | Description |
 |---------|-------------|
-| `client` | Client-side payment providers (`PaymentProvider` trait) |
+| `client` | Client-side payment providers (`PaymentProvider` trait, `Fetch` extension) |
 | `server` | Server-side payment verification (`ChargeMethod` trait) |
 | `tempo` | Tempo blockchain support (default, includes `evm`) |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
 | `http` | HTTP client support with `Fetch` extension trait (implies `client`). For Tempo payments, combine with `tempo`: `features = ["http", "tempo"]` |
-| `middleware` | reqwest-middleware support with `PaymentMiddleware` |
+| `middleware` | reqwest-middleware support with `PaymentMiddleware` (implies `client`) |
 | `utils` | Hex/random utilities for development and testing |
 
 ### Common configurations
@@ -214,10 +216,10 @@ mpay = "0.1"
 mpay = { version = "0.1", features = ["server", "tempo"] }
 
 # Client app  
-mpay = { version = "0.1", features = ["http", "tempo"] }
+mpay = { version = "0.1", features = ["client", "tempo"] }
 
 # Both sides
-mpay = { version = "0.1", features = ["server", "http", "tempo"] }
+mpay = { version = "0.1", features = ["server", "client", "tempo"] }
 
 # Core only (parsing/formatting)
 mpay = { version = "0.1", default-features = false }
@@ -227,7 +229,7 @@ mpay = { version = "0.1", default-features = false }
 
 ### Extension Trait (recommended)
 
-Enable the `http` feature for the `Fetch` trait:
+Enable the `client` feature for the `Fetch` trait:
 
 ```rust
 use mpay::client::{Fetch, TempoProvider};

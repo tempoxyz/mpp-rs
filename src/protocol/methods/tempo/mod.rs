@@ -145,6 +145,7 @@ pub const INTENT_CHARGE: &str = "charge";
 /// assert_eq!(challenge.method.as_str(), "tempo");
 /// assert_eq!(challenge.intent.as_str(), "charge");
 /// ```
+#[must_use = "this returns a new PaymentChallenge and does not have side effects"]
 pub fn charge_challenge(
     realm: &str,
     amount: &str,

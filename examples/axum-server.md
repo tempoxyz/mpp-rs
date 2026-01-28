@@ -63,7 +63,7 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
     //     realm: "api.example.com".into(),
     //     method: "tempo".into(),
     //     intent: "charge".into(),
-    //     request: Base64UrlJson::encode(&serde_json::json!({
+    //     request: Base64UrlJson::from_value(&serde_json::json!({
     //         "amount": "1000000",
     //         "currency": "0x...",
     //         "recipient": "0x..."
