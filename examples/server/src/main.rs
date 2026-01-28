@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use mpay::protocol::methods::tempo;
-use mpay::{Challenge, Credential, Receipt};
+use mpay::{Credential, Receipt};
 use std::sync::LazyLock;
 
 const REALM: &str = "api.example.com";
@@ -41,28 +41,30 @@ async fn free_endpoint() -> &'static str {
 }
 
 async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
-    // Check for payment credential
     if let Some(credential) = parse_credential(&headers) {
-        if verify_payment(&credential).await.is_ok() {
-            let receipt = Receipt::Receipt::success("tempo", "0x...");
-            let header = Receipt::format_receipt(&receipt).unwrap();
-            return (
-                StatusCode::OK,
-                [("payment-receipt", header)],
-                "Here's your paid content!",
-            )
-                .into_response();
-        }
+        // TODO: Verify the credential and submit the transaction
+        // For real verification, use mpay::server::TempoChargeMethod which
+        // broadcasts the tx and returns a receipt with the real tx hash.
+        let tx_ref = credential
+            .payload
+            .tx_hash()
+            .unwrap_or("pending")
+            .to_string();
+        let receipt = Receipt::Receipt::success("tempo", tx_ref);
+        return (
+            StatusCode::OK,
+            [("payment-receipt", receipt.to_header().unwrap())],
+            "Here's your paid content!",
+        )
+            .into_response();
     }
 
-    // Return 402 with payment challenge
     let challenge =
         tempo::charge_challenge(REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS).unwrap();
-    let www_auth = Challenge::format_www_authenticate(&challenge).unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
-        [(header::WWW_AUTHENTICATE, www_auth)],
+        [(header::WWW_AUTHENTICATE, challenge.to_header().unwrap())],
         "Payment required",
     )
         .into_response()
@@ -73,9 +75,4 @@ fn parse_credential(headers: &HeaderMap) -> Option<Credential::PaymentCredential
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|s| Credential::parse_authorization(s).ok())
-}
-
-async fn verify_payment(_credential: &Credential::PaymentCredential) -> Result<(), ()> {
-    // TODO: Verify the payment credential (check signature, submit tx, etc.)
-    Ok(())
 }

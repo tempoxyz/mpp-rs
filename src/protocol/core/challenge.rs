@@ -73,6 +73,11 @@ impl PaymentChallenge {
             expires: self.expires.clone(),
         }
     }
+
+    /// Format as WWW-Authenticate header value.
+    pub fn to_header(&self) -> crate::error::Result<String> {
+        super::format_www_authenticate(self)
+    }
 }
 
 /// Challenge echo in credential (echoes server challenge parameters).
@@ -178,6 +183,16 @@ impl PaymentPayload {
     pub fn is_hash(&self) -> bool {
         matches!(self, Self::Hash { .. })
     }
+
+    /// Get the transaction reference (hash or signature).
+    ///
+    /// Returns the tx hash for hash payloads, or the signature for transaction payloads.
+    pub fn reference(&self) -> &str {
+        match self {
+            Self::Hash { hash, .. } => hash,
+            Self::Transaction { signature, .. } => signature,
+        }
+    }
 }
 
 /// Payment credential from client (sent in Authorization header).
@@ -280,6 +295,11 @@ impl Receipt {
     /// Check if the payment failed.
     pub fn is_failed(&self) -> bool {
         self.status == ReceiptStatus::Failed
+    }
+
+    /// Format as Payment-Receipt header value.
+    pub fn to_header(&self) -> crate::error::Result<String> {
+        super::format_receipt(self)
     }
 }
 
