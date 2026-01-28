@@ -31,6 +31,10 @@ pub enum ErrorCode {
     InvalidCredential,
     /// Network or RPC error.
     NetworkError,
+    /// Chain ID mismatch between request and provider.
+    ChainIdMismatch,
+    /// Credential does not match the expected challenge.
+    CredentialMismatch,
 }
 
 impl ErrorCode {
@@ -44,6 +48,8 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::InvalidCredential => "invalid_credential",
             Self::NetworkError => "network_error",
+            Self::ChainIdMismatch => "chain_id_mismatch",
+            Self::CredentialMismatch => "credential_mismatch",
         }
     }
 }
@@ -116,6 +122,26 @@ impl VerificationError {
     /// Create a "not_found" verification error.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::NotFound)
+    }
+
+    /// Create a "chain_id_mismatch" verification error.
+    pub fn chain_id_mismatch(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::ChainIdMismatch)
+    }
+
+    /// Create a "credential_mismatch" verification error.
+    pub fn credential_mismatch(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::CredentialMismatch)
+    }
+
+    /// Create a retryable network error.
+    pub fn network_error(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::NetworkError).retryable()
+    }
+
+    /// Create a retryable "not found" error (e.g., tx not yet mined).
+    pub fn pending(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::NotFound).retryable()
     }
 }
 

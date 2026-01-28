@@ -25,12 +25,13 @@ use alloy::rpc::types::Log;
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::evm::{parse_address, parse_amount};
 use crate::protocol::core::{PaymentCredential, PaymentPayload, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 
 use super::{parse_iso8601_timestamp, TempoChargeExt, CHAIN_ID, METHOD_NAME};
+
+const INTENT_CHARGE: &str = "charge";
 
 /// ERC-20 Transfer(address,address,uint256) event signature.
 const TRANSFER_TOPIC: B256 =
@@ -91,16 +92,15 @@ where
         charge: &ChargeRequest,
     ) -> Result<Receipt, VerificationError> {
         let expected_recipient = charge
-            .recipient
-            .as_ref()
-            .ok_or_else(|| VerificationError::new("No recipient in request"))?;
-        let expected_recipient = parse_address(expected_recipient)
-            .map_err(|e| VerificationError::new(format!("Invalid recipient address: {}", e)))?;
+            .recipient_address()
+            .map_err(|e| VerificationError::invalid_recipient(format!("Invalid recipient: {}", e)))?;
 
-        let expected_amount = parse_amount(&charge.amount)
-            .map_err(|e| VerificationError::new(format!("Invalid amount: {}", e)))?;
+        let expected_amount = charge
+            .amount_u256()
+            .map_err(|e| VerificationError::invalid_amount(format!("Invalid amount: {}", e)))?;
 
-        let expected_currency = parse_address(&charge.currency)
+        let expected_currency = charge
+            .currency_address()
             .map_err(|e| VerificationError::new(format!("Invalid currency address: {}", e)))?;
 
         let hash = tx_hash
@@ -111,9 +111,9 @@ where
             .provider
             .get_transaction_receipt(hash)
             .await
-            .map_err(|e| VerificationError::new(format!("Failed to fetch receipt: {}", e)))?
+            .map_err(|e| VerificationError::network_error(format!("Failed to fetch receipt: {}", e)))?
             .ok_or_else(|| {
-                VerificationError::not_found(format!(
+                VerificationError::pending(format!(
                     "Transaction {} not found or not yet mined",
                     tx_hash
                 ))
@@ -133,9 +133,9 @@ where
                 .provider
                 .get_transaction_by_hash(hash)
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to fetch transaction: {}", e)))?
+                .map_err(|e| VerificationError::network_error(format!("Failed to fetch transaction: {}", e)))?
                 .ok_or_else(|| {
-                    VerificationError::not_found(format!("Transaction {} not found", tx_hash))
+                    VerificationError::pending(format!("Transaction {} not found", tx_hash))
                 })?;
 
             let to_addr = tx.inner.to().ok_or_else(|| {
@@ -249,7 +249,7 @@ where
             .send_raw_transaction(&tx_bytes)
             .await
             .map_err(|e| {
-                VerificationError::transaction_failed(format!("Failed to broadcast: {}", e))
+                VerificationError::network_error(format!("Failed to broadcast: {}", e))
             })?;
 
         Ok(*pending.tx_hash())
@@ -276,6 +276,22 @@ where
         async move {
             let this = ChargeMethod { provider };
 
+            // Issue #1: Validate credential matches expected method and intent
+            if credential.challenge.method.as_str() != METHOD_NAME {
+                return Err(VerificationError::credential_mismatch(format!(
+                    "Method mismatch: expected {}, got {}",
+                    METHOD_NAME,
+                    credential.challenge.method
+                )));
+            }
+            if credential.challenge.intent.as_str() != INTENT_CHARGE {
+                return Err(VerificationError::credential_mismatch(format!(
+                    "Intent mismatch: expected {}, got {}",
+                    INTENT_CHARGE,
+                    credential.challenge.intent
+                )));
+            }
+
             if let Some(ref expires) = request.expires {
                 this.check_expiration(expires)?;
             }
@@ -283,17 +299,14 @@ where
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
             let actual_chain_id =
                 this.provider.get_chain_id().await.map_err(|e| {
-                    VerificationError::new(format!("Failed to fetch chain ID: {}", e))
+                    VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
                 })?;
 
             if actual_chain_id != expected_chain_id {
-                return Err(VerificationError::with_code(
-                    format!(
-                        "Chain ID mismatch: expected {}, got {}",
-                        expected_chain_id, actual_chain_id
-                    ),
-                    super::super::super::traits::ErrorCode::NetworkError,
-                ));
+                return Err(VerificationError::chain_id_mismatch(format!(
+                    "Chain ID mismatch: expected {}, got {}",
+                    expected_chain_id, actual_chain_id
+                )));
             }
 
             match &credential.payload {

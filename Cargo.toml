@@ -15,7 +15,7 @@ categories = ["web-programming", "authentication", "cryptography"]
 default = ["tempo"]
 
 # Side selection - pick one or both
-client = []
+client = ["http"]
 server = []
 
 # Method implementations
