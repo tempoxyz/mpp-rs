@@ -80,7 +80,7 @@ axum = "0.7"
 ### Payment Layer
 
 ```rust
-use mpay::{Challenge, Credential};
+use mpay::{PaymentChallenge, PaymentCredential, parse_authorization};
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
@@ -122,7 +122,7 @@ impl<S> Layer<S> for PaymentLayer {
 
 ```rust
 use http::{Request, Response, StatusCode};
-use mpay::{Challenge, Credential, Schema};
+use mpay::{PaymentChallenge, PaymentCredential, Base64UrlJson, parse_authorization, format_www_authenticate};
 
 #[derive(Clone)]
 pub struct PaymentService<S> {
@@ -147,7 +147,7 @@ where
         // Check for valid payment credential
         if let Some(auth) = req.headers().get("authorization") {
             if let Ok(auth_str) = auth.to_str() {
-                if let Ok(credential) = Credential::parse_authorization(auth_str) {
+                if let Ok(credential) = parse_authorization(auth_str) {
                     if self.verify_payment(&credential) {
                         // Payment valid - proceed to inner service
                         return PaymentFuture::Authorized(self.inner.call(req));
@@ -160,7 +160,7 @@ where
         let challenge = self.create_challenge();
         let response = Response::builder()
             .status(StatusCode::PAYMENT_REQUIRED)
-            .header("www-authenticate", Challenge::format_www_authenticate(&challenge).unwrap())
+            .header("www-authenticate", format_www_authenticate(&challenge).unwrap())
             .body(ResBody::default())
             .unwrap();
 
@@ -169,24 +169,23 @@ where
 }
 
 impl<S> PaymentService<S> {
-    fn create_challenge(&self) -> Challenge::PaymentChallenge {
-        Challenge::PaymentChallenge {
+    fn create_challenge(&self) -> PaymentChallenge {
+        PaymentChallenge {
             id: uuid::Uuid::new_v4().to_string(),
             realm: self.config.realm.clone(),
             method: self.config.method.clone().into(),
             intent: "charge".into(),
-            request: Schema::Base64UrlJson::from_value(&serde_json::json!({
+            request: Base64UrlJson::encode(&serde_json::json!({
                 "amount": self.config.amount,
                 "currency": self.config.asset,
                 "recipient": self.config.destination,
             })).unwrap(),
-            digest: None,
             expires: None,
             description: None,
         }
     }
 
-    fn verify_payment(&self, credential: &Credential::PaymentCredential) -> bool {
+    fn verify_payment(&self, credential: &PaymentCredential) -> bool {
         // Implement your verification logic:
         // 1. Check transaction hash on-chain
         // 2. Verify amount matches

@@ -13,10 +13,9 @@ use axum::{
     routing::get,
     Router,
 };
-use mpay::protocol::intents::ChargeRequest;
+use mpay::{ChargeRequest, PaymentCredential, parse_authorization};
 use mpay::protocol::methods::tempo;
 use mpay::server::{tempo_provider, ChargeMethod, TempoChargeMethod};
-use mpay::Credential;
 use std::sync::{Arc, LazyLock};
 
 const REALM: &str = "api.example.com";
@@ -86,9 +85,9 @@ async fn paid_endpoint<M: ChargeMethod>(
         .into_response()
 }
 
-fn parse_credential(headers: &HeaderMap) -> Option<Credential::PaymentCredential> {
+fn parse_credential(headers: &HeaderMap) -> Option<PaymentCredential> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| Credential::parse_authorization(s).ok())
+        .and_then(|s| parse_authorization(s).ok())
 }

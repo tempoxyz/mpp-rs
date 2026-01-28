@@ -199,7 +199,7 @@ fn challenge_response<M: ChargeMethod>(
         description: None,
     };
 
-    let www_auth = mpay::protocol::core::format_www_authenticate(&challenge).unwrap();
+    let www_auth = mpay::format_www_authenticate(&challenge).unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
