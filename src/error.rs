@@ -2,8 +2,8 @@
 //!
 //! This module provides:
 //! - [`MppError`]: The main error enum for all mpp operations
-//! - [`ProblemDetails`]: RFC 9457 Problem Details format for HTTP error responses
-//! - [`PaymentProblem`]: Trait for converting errors to Problem Details
+//! - [`PaymentErrorDetails`]: RFC 9457 Problem Details format for HTTP error responses
+//! - [`PaymentError`]: Trait for converting errors to Problem Details
 
 use std::error::Error as StdError;
 use thiserror::Error;
@@ -24,9 +24,9 @@ pub const PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems";
 /// # Example
 ///
 /// ```
-/// use mpay::error::ProblemDetails;
+/// use mpay::error::PaymentErrorDetails;
 ///
-/// let problem = ProblemDetails::new("verification-failed")
+/// let problem = PaymentErrorDetails::new("verification-failed")
 ///     .with_title("VerificationFailedError")
 ///     .with_status(402)
 ///     .with_detail("Payment verification failed: insufficient amount.");
@@ -35,7 +35,7 @@ pub const PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems";
 /// let json = serde_json::to_string(&problem).unwrap();
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProblemDetails {
+pub struct PaymentErrorDetails {
     /// A URI reference that identifies the problem type.
     #[serde(rename = "type")]
     pub problem_type: String,
@@ -54,8 +54,8 @@ pub struct ProblemDetails {
     pub challenge_id: Option<String>,
 }
 
-impl ProblemDetails {
-    /// Create a new ProblemDetails with the given problem type suffix.
+impl PaymentErrorDetails {
+    /// Create a new PaymentErrorDetails with the given problem type suffix.
     ///
     /// The full type URI will be constructed as `{PROBLEM_TYPE_BASE}/{suffix}`.
     pub fn new(type_suffix: impl Into<String>) -> Self {
@@ -102,28 +102,28 @@ impl ProblemDetails {
 /// # Example
 ///
 /// ```
-/// use mpay::error::{PaymentProblem, ProblemDetails};
+/// use mpay::error::{PaymentError, PaymentErrorDetails};
 ///
 /// struct MyError {
 ///     reason: String,
 /// }
 ///
-/// impl PaymentProblem for MyError {
-///     fn to_problem_details(&self, challenge_id: Option<&str>) -> ProblemDetails {
-///         ProblemDetails::new("my-error")
+/// impl PaymentError for MyError {
+///     fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
+///         PaymentErrorDetails::new("my-error")
 ///             .with_title("MyError")
 ///             .with_status(402)
 ///             .with_detail(&self.reason)
 ///     }
 /// }
 /// ```
-pub trait PaymentProblem {
+pub trait PaymentError {
     /// Convert this error to RFC 9457 Problem Details format.
     ///
     /// # Arguments
     ///
     /// * `challenge_id` - Optional challenge ID to include in the response
-    fn to_problem_details(&self, challenge_id: Option<&str>) -> ProblemDetails;
+    fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails;
 }
 
 /// Context for signing errors
@@ -548,8 +548,8 @@ impl MppError {
     }
 }
 
-impl PaymentProblem for MppError {
-    fn to_problem_details(&self, challenge_id: Option<&str>) -> ProblemDetails {
+impl PaymentError for MppError {
+    fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
         let (suffix, title) = match self {
             Self::MalformedCredential(_) => ("malformed-credential", "MalformedCredentialError"),
             Self::InvalidChallenge { .. } => ("invalid-challenge", "InvalidChallengeError"),
@@ -561,7 +561,7 @@ impl PaymentProblem for MppError {
             _ => ("internal-error", "InternalError"),
         };
 
-        let mut problem = ProblemDetails::new(suffix)
+        let mut problem = PaymentErrorDetails::new(suffix)
             .with_title(title)
             .with_status(402)
             .with_detail(self.to_string());
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_problem_details_new() {
-        let problem = ProblemDetails::new("test-error")
+        let problem = PaymentErrorDetails::new("test-error")
             .with_title("TestError")
             .with_status(400)
             .with_detail("Something went wrong");
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_problem_details_with_challenge_id() {
-        let problem = ProblemDetails::new("test-error")
+        let problem = PaymentErrorDetails::new("test-error")
             .with_title("TestError")
             .with_challenge_id("abc123");
 
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_problem_details_serialize() {
-        let problem = ProblemDetails::new("verification-failed")
+        let problem = PaymentErrorDetails::new("verification-failed")
             .with_title("VerificationFailedError")
             .with_status(402)
             .with_detail("Payment verification failed.")

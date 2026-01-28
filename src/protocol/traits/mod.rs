@@ -171,7 +171,7 @@ impl From<&str> for VerificationError {
 
 // ==================== Conversion to RFC 9457 Problem Details ====================
 
-use crate::error::{MppError, PaymentProblem, ProblemDetails};
+use crate::error::{MppError, PaymentError, PaymentErrorDetails};
 
 impl From<VerificationError> for MppError {
     fn from(err: VerificationError) -> Self {
@@ -190,8 +190,8 @@ impl From<VerificationError> for MppError {
     }
 }
 
-impl PaymentProblem for VerificationError {
-    fn to_problem_details(&self, challenge_id: Option<&str>) -> ProblemDetails {
+impl PaymentError for VerificationError {
+    fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
         MppError::from(self.clone()).to_problem_details(challenge_id)
     }
 }
