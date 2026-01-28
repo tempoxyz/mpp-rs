@@ -213,15 +213,16 @@ impl Base64UrlJson {
     /// Decode to a JSON Value.
     pub fn decode_value(&self) -> Result<serde_json::Value> {
         let bytes = base64url_decode(&self.raw)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| MppError::InvalidChallenge(format!("Invalid JSON in base64url: {}", e)))
+        serde_json::from_slice(&bytes).map_err(|e| {
+            MppError::invalid_challenge_reason(format!("Invalid JSON in base64url: {}", e))
+        })
     }
 
     /// Decode to a typed struct.
     pub fn decode<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
         let bytes = base64url_decode(&self.raw)?;
         serde_json::from_slice(&bytes).map_err(|e| {
-            MppError::InvalidChallenge(format!("Failed to decode base64url JSON: {}", e))
+            MppError::invalid_challenge_reason(format!("Failed to decode base64url JSON: {}", e))
         })
     }
 
