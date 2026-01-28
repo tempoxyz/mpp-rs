@@ -15,3 +15,8 @@ Cargo.lock
 # Testing
 *.log
 examples/*/target/
+
+# Fuzz testing artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

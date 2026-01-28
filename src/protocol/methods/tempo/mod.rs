@@ -207,16 +207,36 @@ pub fn charge_challenge_with_options(
 ) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
 
+    let encoded_request = Base64UrlJson::from_typed(request)?;
+
+    // Per spec: challenge ID MUST be bound to challenge parameters.
+    // We generate a deterministic ID by hashing: realm || method || intent || request
+    let id = generate_challenge_id(realm, METHOD_NAME, INTENT_CHARGE, encoded_request.raw());
+
     Ok(PaymentChallenge {
-        id: uuid::Uuid::new_v4().to_string(),
+        id,
         realm: realm.to_string(),
         method: METHOD_NAME.into(),
         intent: INTENT_CHARGE.into(),
-        request: Base64UrlJson::from_typed(request)?,
+        request: encoded_request,
         expires: expires.map(|s| s.to_string()),
         description: description.map(|s| s.to_string()),
         digest: None,
     })
+}
+
+/// Generate a deterministic challenge ID bound to challenge parameters (per spec).
+fn generate_challenge_id(realm: &str, method: &str, intent: &str, request: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    realm.hash(&mut hasher);
+    method.hash(&mut hasher);
+    intent.hash(&mut hasher);
+    request.hash(&mut hasher);
+
+    format!("{:016x}", hasher.finish())
 }
 
 /// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
@@ -228,4 +248,98 @@ pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
     OffsetDateTime::parse(s.trim(), &Iso8601::DEFAULT)
         .ok()
         .map(|dt| dt.unix_timestamp() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_challenge_id_is_deterministic() {
+        let challenge1 = charge_challenge(
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        let challenge2 = charge_challenge(
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert_eq!(
+            challenge1.id, challenge2.id,
+            "Same parameters should produce same challenge ID"
+        );
+    }
+
+    #[test]
+    fn test_challenge_id_differs_for_different_params() {
+        let challenge1 = charge_challenge(
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        let challenge2 = charge_challenge(
+            "api.example.com",
+            "2000000", // Different amount
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert_ne!(
+            challenge1.id, challenge2.id,
+            "Different parameters should produce different challenge IDs"
+        );
+    }
+
+    #[test]
+    fn test_challenge_id_differs_for_different_realm() {
+        let challenge1 = charge_challenge(
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        let challenge2 = charge_challenge(
+            "api.other.com", // Different realm
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert_ne!(
+            challenge1.id, challenge2.id,
+            "Different realms should produce different challenge IDs"
+        );
+    }
+
+    #[test]
+    fn test_challenge_id_format() {
+        let challenge = charge_challenge(
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert_eq!(challenge.id.len(), 16, "ID should be 16 hex characters");
+        assert!(
+            challenge.id.chars().all(|c| c.is_ascii_hexdigit()),
+            "ID should only contain hex characters"
+        );
+    }
 }
