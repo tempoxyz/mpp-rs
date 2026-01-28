@@ -52,6 +52,29 @@ impl ErrorCode {
             Self::CredentialMismatch => "credential_mismatch",
         }
     }
+
+    /// Returns the IETF spec-compliant error code string (§7.2).
+    ///
+    /// These codes are intended for JSON error responses per the spec:
+    /// - `payment_required` - Payment is required
+    /// - `payment_insufficient` - Payment amount was insufficient
+    /// - `payment_expired` - Payment or challenge has expired
+    /// - `payment_verification_failed` - Payment verification failed
+    /// - `payment_method_unsupported` - Payment method not supported
+    /// - `malformed_proof` - Credential format is invalid
+    pub fn spec_code(&self) -> &'static str {
+        match self {
+            Self::Expired => "payment_expired",
+            Self::InvalidAmount => "payment_insufficient",
+            Self::InvalidRecipient => "payment_verification_failed",
+            Self::TransactionFailed => "payment_verification_failed",
+            Self::NotFound => "payment_verification_failed",
+            Self::InvalidCredential => "malformed_proof",
+            Self::NetworkError => "payment_verification_failed",
+            Self::ChainIdMismatch => "payment_method_unsupported",
+            Self::CredentialMismatch => "malformed_proof",
+        }
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -191,5 +214,21 @@ mod tests {
         let err = VerificationError::invalid_amount("Amount mismatch").retryable();
         assert_eq!(err.code, Some(ErrorCode::InvalidAmount));
         assert!(err.retryable);
+    }
+
+    #[test]
+    fn test_error_code_spec_codes() {
+        // Verify IETF spec-compliant error codes (§7.2)
+        assert_eq!(ErrorCode::Expired.spec_code(), "payment_expired");
+        assert_eq!(ErrorCode::InvalidAmount.spec_code(), "payment_insufficient");
+        assert_eq!(ErrorCode::InvalidCredential.spec_code(), "malformed_proof");
+        assert_eq!(
+            ErrorCode::ChainIdMismatch.spec_code(),
+            "payment_method_unsupported"
+        );
+        assert_eq!(
+            ErrorCode::TransactionFailed.spec_code(),
+            "payment_verification_failed"
+        );
     }
 }

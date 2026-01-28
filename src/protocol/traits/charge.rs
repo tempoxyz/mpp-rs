@@ -137,6 +137,7 @@ mod tests {
             intent: "charge".into(),
             request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
             expires: None,
+            digest: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
         let request = ChargeRequest {

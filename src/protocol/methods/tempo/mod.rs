@@ -214,6 +214,7 @@ pub fn charge_challenge_with_options(
         request: Base64UrlJson::from_typed(request)?,
         expires: expires.map(|s| s.to_string()),
         description: description.map(|s| s.to_string()),
+        digest: None,
     })
 }
 
