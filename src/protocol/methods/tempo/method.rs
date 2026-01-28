@@ -19,7 +19,7 @@
 //! ```
 
 use alloy::consensus::Transaction;
-use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{Bytes, B256};
 use alloy::providers::Provider;
 use std::future::Future;
 use std::sync::Arc;
@@ -93,10 +93,6 @@ where
         let expected_amount = charge
             .amount_u256()
             .map_err(|e| VerificationError::invalid_amount(format!("Invalid amount: {}", e)))?;
-
-        let expected_currency = charge
-            .currency_address()
-            .map_err(|e| VerificationError::new(format!("Invalid currency address: {}", e)))?;
 
         let hash = tx_hash
             .parse::<B256>()
