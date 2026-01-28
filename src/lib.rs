@@ -1,25 +1,18 @@
-//! mpay - Micropayments Protocol for Rust
+//! mpay - Machine Payment Protocol for Rust
 //!
-//! A Rust library for implementing the Web Payment Auth protocol
-//! (IETF draft-ietf-httpauth-payment).
+//! A Rust library for implementing the Web Payment Auth protocol.
 //!
 //! # Architecture
 //!
-//! mpay provides a thin protocol layer matching the TypeScript mpay library:
+//! mpay provides a thin protocol layer:
 //!
 //! - **Protocol Layer**: Core types for challenges, credentials, and receipts
-//! - **Methods Layer**: Payment method implementations (tempo, evm, stripe)
+//! - **Methods Layer**: Payment method implementations (tempo, evm)
 //! - **Intents Layer**: Payment intent types (charge)
-//!
-//! # Feature Flags
-//!
-//! - `evm`: EVM blockchain support (Ethereum, Base, Polygon, etc.)
-//! - `tempo`: Tempo blockchain support (includes `evm`)
-//! - `stripe`: Stripe payment method support
 //!
 //! # Exports
 //!
-//! Following the mpay pattern, core types are exported as namespaced modules:
+//! Core types are exported as namespaced modules:
 //!
 //! ```no_run
 //! use mpay::{Challenge, Credential, Receipt, Intent};
@@ -50,13 +43,7 @@ pub mod utils;
 // ==================== Feature-gated Modules ====================
 
 #[cfg(feature = "evm")]
-pub mod crypto;
-
-#[cfg(feature = "evm")]
 pub mod evm;
-
-#[cfg(feature = "http")]
-pub mod http;
 
 #[cfg(feature = "client")]
 pub mod client;
@@ -73,7 +60,6 @@ pub mod tempo;
 pub use error::{MppError, Result, ResultExt, SigningContext};
 
 // ==================== Protocol Namespace Exports (mpay style) ====================
-// Following mpay's export pattern with PascalCase module names
 
 /// Challenge types for parsing WWW-Authenticate headers
 #[allow(non_snake_case)]

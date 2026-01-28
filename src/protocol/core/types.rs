@@ -13,7 +13,7 @@ use crate::error::{MppError, Result};
 /// Payment method identifier (newtype over String).
 ///
 /// Represents a payment method like "tempo", "base", "stripe", etc.
-/// Per IETF spec, method identifiers MUST be lowercase ASCII strings.
+/// Per spec, method identifiers MUST be lowercase ASCII strings.
 /// This type validates and normalizes to lowercase on creation.
 ///
 /// # Examples
@@ -33,7 +33,7 @@ use crate::error::{MppError, Result};
 pub struct MethodName(String);
 
 impl MethodName {
-    /// Create a new method name, normalizing to lowercase per IETF spec.
+    /// Create a new method name, normalizing to lowercase per spec.
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into().to_ascii_lowercase())
     }
@@ -50,7 +50,7 @@ impl MethodName {
 
     /// Check if the method name contains only valid ASCII lowercase characters.
     ///
-    /// Per IETF spec: `method-name = 1*LOWERALPHA` (a-z only).
+    /// Per spec: `method-name = 1*LOWERALPHA` (a-z only).
     pub fn is_valid(&self) -> bool {
         !self.0.is_empty() && self.0.chars().all(|c| c.is_ascii_lowercase())
     }
@@ -260,7 +260,7 @@ pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
 /// Used to determine how to handle a payment-required response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentProtocol {
-    /// Web Payment Auth (IETF draft) - uses WWW-Authenticate/Authorization headers
+    /// Web Payment Auth protocol - uses WWW-Authenticate/Authorization headers
     WebPaymentAuth,
 }
 
@@ -316,7 +316,7 @@ impl fmt::Display for PaymentProtocol {
 
 /// Payment payload type.
 ///
-/// Indicates what kind of data is in the payload. Per IETF spec:
+/// Indicates what kind of data is in the payload. Per spec:
 /// - `transaction`: Signed blockchain transaction (to be broadcast by server)
 /// - `hash`: Transaction hash (already broadcast by client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn test_method_name_normalizes_to_lowercase() {
-        // Per IETF spec, method identifiers MUST be lowercase
+        // Per spec, method identifiers MUST be lowercase
         let method: MethodName = "TEMPO".into();
         assert_eq!(method.as_str(), "tempo");
 

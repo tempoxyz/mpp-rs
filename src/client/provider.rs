@@ -68,19 +68,14 @@ pub trait PaymentProvider: Clone + Send + Sync {
 
 /// Tempo payment provider using EVM signing.
 ///
-/// Executes payments on the Tempo blockchain by building and signing
-/// TempoTransactions (type 0x76) for charge requests.
+/// Signs TIP-20 token transfer transactions for charge requests. The signed
+/// transaction is returned in the credential for the server to broadcast,
+/// enabling fee sponsorship.
 ///
 /// This provider:
 /// 1. Parses the charge request from the challenge
-/// 2. Builds and signs a TempoTransaction using the provided signer
-/// 3. Submits it via the Tempo RPC endpoint
-/// 4. Returns a credential with the transaction hash
-///
-/// # Features
-///
-/// - **ERC-20 Transfers**: Handles both native transfers and ERC-20 token transfers
-/// - **Fee Sponsorship**: Supports server-paid fees when `feePayer: true`
+/// 2. Builds and signs a TIP-20 transfer transaction
+/// 3. Returns a credential with the signed transaction (server broadcasts)
 ///
 /// # Examples
 ///
@@ -91,7 +86,7 @@ pub trait PaymentProvider: Clone + Send + Sync {
 /// let signer = PrivateKeySigner::from_bytes(&key)?;
 /// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 ///
-/// // Use with PaymentExt
+/// // Use with Fetch trait
 /// let resp = client
 ///     .get("https://api.example.com/paid")
 ///     .send_with_payment(&provider)
@@ -145,9 +140,10 @@ impl PaymentProvider for TempoProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
-        use crate::protocol::methods::tempo::{TempoChargeExt, TempoTransactionRequest, CHAIN_ID};
-        use alloy::network::{EthereumWallet, ReceiptResponse, TransactionBuilder};
+        use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
+        use alloy::network::{EthereumWallet, TransactionBuilder};
         use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::sol;
         use tempo_alloy::TempoNetwork;
 
         let charge: ChargeRequest = challenge.request.decode()?;
@@ -156,7 +152,7 @@ impl PaymentProvider for TempoProvider {
 
         let wallet = EthereumWallet::from(self.signer.clone());
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .wallet(wallet)
+            .wallet(wallet.clone())
             .connect_http(self.rpc_url.clone());
 
         let actual_chain_id: u64 = provider
@@ -175,72 +171,35 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        let tx_hash = if currency == alloy::primitives::Address::ZERO {
-            let mut tx = TempoTransactionRequest::default();
-            tx.set_to(recipient);
-            tx.set_value(amount);
-
-            let pending = provider
-                .send_transaction(tx)
-                .await
-                .map_err(|e| MppError::Http(format!("transaction send failed: {}", e)))?;
-
-            let tx_hash = *pending.tx_hash();
-
-            let receipt = pending
-                .get_receipt()
-                .await
-                .map_err(|e| MppError::Http(format!("failed to get receipt: {}", e)))?;
-
-            if !receipt.status() {
-                return Err(MppError::TransactionReverted(format!(
-                    "transaction {:#x} reverted",
-                    tx_hash
-                )));
+        sol! {
+            #[sol(rpc)]
+            interface IERC20 {
+                function transfer(address to, uint256 amount) external returns (bool);
             }
+        }
 
-            tx_hash
-        } else {
-            use alloy::sol;
+        let token = IERC20::new(currency, &provider);
+        let call = token.transfer(recipient, amount);
 
-            sol! {
-                #[sol(rpc)]
-                interface IERC20 {
-                    function transfer(address to, uint256 amount) external returns (bool);
-                }
-            }
+        let tx = call
+            .into_transaction_request()
+            .with_from(address)
+            .with_chain_id(expected_chain_id);
 
-            let token = IERC20::new(currency, &provider);
-            let call = token.transfer(recipient, amount);
+        let tx_envelope = tx
+            .build(&wallet)
+            .await
+            .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-            let pending = call
-                .send()
-                .await
-                .map_err(|e| MppError::Http(format!("token transfer send failed: {}", e)))?;
-
-            let tx_hash = *pending.tx_hash();
-
-            let receipt = pending
-                .get_receipt()
-                .await
-                .map_err(|e| MppError::Http(format!("failed to get receipt: {}", e)))?;
-
-            if !receipt.status() {
-                return Err(MppError::TransactionReverted(format!(
-                    "token transfer {:#x} reverted",
-                    tx_hash
-                )));
-            }
-
-            tx_hash
-        };
+        let signed_tx_bytes = alloy::rlp::encode(&tx_envelope);
+        let signed_tx_hex = format!("0x{}", hex::encode(&signed_tx_bytes));
 
         let echo = challenge.to_echo();
 
         Ok(PaymentCredential::with_source(
             echo,
             format!("did:pkh:eip155:{}:{}", expected_chain_id, address),
-            PaymentPayload::hash(format!("{:#x}", tx_hash)),
+            PaymentPayload::transaction(signed_tx_hex),
         ))
     }
 }
