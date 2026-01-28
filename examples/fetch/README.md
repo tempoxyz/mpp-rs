@@ -2,27 +2,20 @@
 
 CLI tool for fetching URLs with automatic payment handling.
 
-## Build
-
-```bash
-cd examples/fetch
-cargo build --release
-```
-
 ## Usage
 
 ```bash
 # GET request
-fetch https://api.example.com/resource
+cargo run -p fetch -- https://api.example.com/resource
 
 # POST with body
-fetch -X POST -d '{"query": "test"}' https://api.example.com/search
+cargo run -p fetch -- -X POST -d '{"query": "test"}' https://api.example.com/search
 
 # PUT request
-fetch -X PUT -d '{"name": "updated"}' https://api.example.com/resource/123
+cargo run -p fetch -- -X PUT -d '{"name": "updated"}' https://api.example.com/resource/123
 
 # DELETE request
-fetch -X DELETE https://api.example.com/resource/123
+cargo run -p fetch -- -X DELETE https://api.example.com/resource/123
 ```
 
 ## Credentials
@@ -30,7 +23,7 @@ fetch -X DELETE https://api.example.com/resource/123
 Provide credentials via flags:
 
 ```bash
-fetch --key 0x... --rpc-url https://rpc.testnet.tempo.xyz/ https://api.example.com
+cargo run -p fetch -- --key 0x... --rpc-url https://rpc.testnet.tempo.xyz/ https://api.example.com
 ```
 
 Or via environment variables:
@@ -38,7 +31,7 @@ Or via environment variables:
 ```bash
 export TEMPO_PRIVATE_KEY=0x...
 export TEMPO_RPC_URL=https://rpc.testnet.tempo.xyz/  # optional, this is the default
-fetch https://api.example.com/resource
+cargo run -p fetch -- https://api.example.com/resource
 ```
 
 ## How It Works
@@ -55,8 +48,7 @@ This happens automatically via the mpay `Fetch` extension trait.
 
 1. Start the server:
    ```bash
-   cd ../server
-   MERCHANT_ADDRESS=0x... cargo run --release
+   MERCHANT_ADDRESS=0x... cargo run -p server
    ```
 
 2. Test the free endpoint:
@@ -66,5 +58,5 @@ This happens automatically via the mpay `Fetch` extension trait.
 
 3. Test the paid endpoint with fetch:
    ```bash
-   TEMPO_PRIVATE_KEY=0x... ./target/release/fetch http://localhost:3000/paid
+   TEMPO_PRIVATE_KEY=0x... cargo run -p fetch -- http://localhost:3000/paid
    ```
