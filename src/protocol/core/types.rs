@@ -251,9 +251,22 @@ pub fn base64url_encode(data: &[u8]) -> String {
 }
 
 /// Decode a base64url string (no padding) to bytes.
+///
+/// This implementation is lenient to match TypeScript behavior for interoperability:
+/// 1. Strip all non-base64url characters [^A-Za-z0-9_-] from input
+/// 2. Compute padding based on the cleaned string length
+/// 3. Decode the cleaned+padded string
+///
+/// This ensures cross-SDK compatibility when inputs contain unexpected characters.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
+    // Strip non-base64url characters first (matches TS lenient behavior)
+    let cleaned: String = input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+
     URL_SAFE_NO_PAD
-        .decode(input)
+        .decode(&cleaned)
         .map_err(|e| MppError::InvalidBase64Url(format!("Invalid base64url: {}", e)))
 }
 
@@ -321,6 +334,7 @@ impl fmt::Display for PaymentProtocol {
 /// Indicates what kind of data is in the payload. Per spec:
 /// - `transaction`: Signed blockchain transaction (to be broadcast by server)
 /// - `hash`: Transaction hash (already broadcast by client)
+/// - `keyAuthorization`: Access Key delegation signature (for authorize/subscription intents)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PayloadType {
@@ -328,6 +342,8 @@ pub enum PayloadType {
     Transaction,
     /// Transaction hash (already broadcast by client)
     Hash,
+    /// Access Key delegation signature (for authorize/subscription intents)
+    KeyAuthorization,
 }
 
 impl fmt::Display for PayloadType {
@@ -335,6 +351,7 @@ impl fmt::Display for PayloadType {
         match self {
             Self::Transaction => write!(f, "transaction"),
             Self::Hash => write!(f, "hash"),
+            Self::KeyAuthorization => write!(f, "keyAuthorization"),
         }
     }
 }

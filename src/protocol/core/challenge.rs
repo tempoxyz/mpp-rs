@@ -117,20 +117,22 @@ pub struct ChallengeEcho {
 
 /// Payment payload in credential.
 ///
-/// Contains the signed transaction or transaction hash.
+/// Contains the signed transaction, transaction hash, or key authorization signature.
 ///
 /// Per IETF spec (Tempo §5.1-5.2):
 /// - `type="transaction"` uses field `signature` containing the signed transaction
 /// - `type="hash"` uses field `hash` containing the transaction hash
+/// - `type="keyAuthorization"` uses field `signature` containing the Access Key delegation signature
 #[derive(Debug, Clone)]
 pub struct PaymentPayload {
-    /// Payload type: "transaction" or "hash"
+    /// Payload type: "transaction", "hash", or "keyAuthorization"
     pub payload_type: PayloadType,
 
     /// Hex-encoded signed data.
     ///
     /// For `type="transaction"`: the RLP-encoded signed transaction to broadcast.
     /// For `type="hash"`: the transaction hash (0x-prefixed) of an already-broadcast tx.
+    /// For `type="keyAuthorization"`: the Access Key delegation signature.
     data: String,
 }
 
@@ -145,7 +147,9 @@ impl serde::Serialize for PaymentPayload {
         state.serialize_field("type", &self.payload_type)?;
 
         match self.payload_type {
-            PayloadType::Transaction => state.serialize_field("signature", &self.data)?,
+            PayloadType::Transaction | PayloadType::KeyAuthorization => {
+                state.serialize_field("signature", &self.data)?
+            }
             PayloadType::Hash => state.serialize_field("hash", &self.data)?,
         }
 
@@ -175,6 +179,9 @@ impl<'de> serde::Deserialize<'de> for PaymentPayload {
             PayloadType::Hash => raw
                 .hash
                 .ok_or_else(|| serde::de::Error::custom("hash payload requires 'hash' field"))?,
+            PayloadType::KeyAuthorization => raw.signature.ok_or_else(|| {
+                serde::de::Error::custom("keyAuthorization payload requires 'signature' field")
+            })?,
         };
 
         Ok(PaymentPayload {
@@ -198,6 +205,14 @@ impl PaymentPayload {
         Self {
             payload_type: PayloadType::Hash,
             data: tx_hash.into(),
+        }
+    }
+
+    /// Create a new key authorization payload (for authorize/subscription intents).
+    pub fn key_authorization(signature: impl Into<String>) -> Self {
+        Self {
+            payload_type: PayloadType::KeyAuthorization,
+            data: signature.into(),
         }
     }
 
@@ -246,6 +261,22 @@ impl PaymentPayload {
     /// Check if this is a hash payload.
     pub fn is_hash(&self) -> bool {
         self.payload_type == PayloadType::Hash
+    }
+
+    /// Check if this is a key authorization payload.
+    pub fn is_key_authorization(&self) -> bool {
+        self.payload_type == PayloadType::KeyAuthorization
+    }
+
+    /// Get the signature (for key authorization payloads).
+    ///
+    /// Returns the signature if this is a key authorization payload, None otherwise.
+    pub fn key_authorization_signature(&self) -> Option<&str> {
+        if self.payload_type == PayloadType::KeyAuthorization {
+            Some(&self.data)
+        } else {
+            None
+        }
     }
 
     /// Get the transaction reference (hash or signature data).
