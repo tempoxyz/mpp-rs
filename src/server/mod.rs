@@ -30,8 +30,8 @@
 
 mod mpay;
 
-pub use mpay::Mpay;
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
+pub use mpay::Mpay;
 
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
