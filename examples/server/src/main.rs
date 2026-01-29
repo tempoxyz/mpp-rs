@@ -51,8 +51,8 @@ use axum::{
     routing::get,
     Router,
 };
-use mpay::{ChargeRequest, PaymentCredential, parse_authorization};
-use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+use mpay::server::{tempo_provider, Mpay, TempoChargeMethod};
+use mpay::{parse_authorization, ChargeRequest, PaymentCredential};
 use std::sync::{Arc, LazyLock};
 
 const REALM: &str = "api.example.com";
@@ -60,9 +60,8 @@ const ALPHA_USD: &str = "0x20c0000000000000000000000000000000000001";
 const RPC_URL: &str = "https://rpc.moderato.tempo.xyz";
 const SECRET_KEY: &str = "example-server-secret-key";
 
-static MERCHANT_ADDRESS: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set")
-});
+static MERCHANT_ADDRESS: LazyLock<String> =
+    LazyLock::new(|| std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set"));
 
 type PaymentHandler = Mpay<TempoChargeMethod<mpay::server::TempoProvider>>;
 
