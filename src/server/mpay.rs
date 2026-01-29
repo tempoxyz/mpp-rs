@@ -28,7 +28,7 @@ use crate::protocol::traits::{ChargeMethod, VerificationError};
 /// Server-side payment handler.
 ///
 /// Binds a payment method with realm and secret_key for stateless
-/// challenge verification. Matches TypeScript's `Mpay.create()` pattern.
+/// challenge verification.
 ///
 /// # Type Parameters
 ///

@@ -143,7 +143,7 @@ let request = ChargeRequest {
 
 ### Server-Side Handler
 
-Use `Mpay` to bind method, realm, and secret_key once (matches TypeScript pattern):
+Use `Mpay` to bind method, realm, and secret_key once:
 
 ```rust
 use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
