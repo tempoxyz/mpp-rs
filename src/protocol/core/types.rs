@@ -251,9 +251,21 @@ pub fn base64url_encode(data: &[u8]) -> String {
 }
 
 /// Decode a base64url string (no padding) to bytes.
+///
+/// This implementation is lenient to match TypeScript SDK behavior for interoperability:
+/// 1. Strip all non-base64url characters [^A-Za-z0-9_-] from input
+/// 2. Decode the cleaned string
+///
+/// This ensures cross-SDK compatibility when inputs contain unexpected characters.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
+    // Strip non-base64url characters first (matches TS lenient behavior)
+    let cleaned: String = input
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+
     URL_SAFE_NO_PAD
-        .decode(input)
+        .decode(&cleaned)
         .map_err(|e| MppError::InvalidBase64Url(format!("Invalid base64url: {}", e)))
 }
 
