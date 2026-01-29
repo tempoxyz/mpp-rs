@@ -275,13 +275,33 @@ mod tests {
         }
     }
 
-    fn test_credential() -> PaymentCredential {
+    fn test_credential(secret_key: &str) -> PaymentCredential {
+        let request = "eyJ0ZXN0IjoidmFsdWUifQ";
+        let id = {
+            #[cfg(feature = "tempo")]
+            {
+                crate::protocol::methods::tempo::generate_challenge_id(
+                    secret_key,
+                    "api.example.com",
+                    "mock",
+                    "charge",
+                    request,
+                    None,
+                    None,
+                )
+            }
+            #[cfg(not(feature = "tempo"))]
+            {
+                "test-id".to_string()
+            }
+        };
+
         let echo = ChallengeEcho {
-            id: "test-id".into(),
+            id,
             realm: "api.example.com".into(),
             method: "mock".into(),
             intent: "charge".into(),
-            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            request: request.into(),
             expires: None,
             digest: None,
         };
@@ -329,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_returns_error_for_failed_receipt() {
         let payment = Mpay::new(FailedReceiptMethod, "api.example.com", "secret");
-        let credential = test_credential();
+        let credential = test_credential("secret");
         let request = test_request();
 
         let result = payment.verify(&credential, &request).await;
@@ -347,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_returns_receipt_for_success() {
         let payment = Mpay::new(SuccessReceiptMethod, "api.example.com", "secret");
-        let credential = test_credential();
+        let credential = test_credential("secret");
         let request = test_request();
 
         let result = payment.verify(&credential, &request).await;
