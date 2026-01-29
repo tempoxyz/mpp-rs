@@ -59,6 +59,7 @@ use std::sync::{Arc, LazyLock};
 const REALM: &str = "api.example.com";
 const ALPHA_USD: &str = "0x20c0000000000000000000000000000000000001";
 const RPC_URL: &str = "https://rpc.moderato.tempo.xyz";
+const SECRET_KEY: &str = "example-server-secret-key";
 
 static MERCHANT_ADDRESS: LazyLock<String> = LazyLock::new(|| {
     std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set")
@@ -68,7 +69,7 @@ static MERCHANT_ADDRESS: LazyLock<String> = LazyLock::new(|| {
 async fn main() {
     LazyLock::force(&MERCHANT_ADDRESS);
 
-    let provider = tempo_provider(RPC_URL);
+    let provider = tempo_provider(RPC_URL).expect("failed to create provider");
     let charge_method = TempoChargeMethod::new(provider);
 
     let app = Router::new()
@@ -113,7 +114,8 @@ async fn paid_endpoint<M: ChargeMethod>(
     }
 
     let challenge =
-        tempo::charge_challenge(REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS).unwrap();
+        tempo::charge_challenge(SECRET_KEY, REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS)
+            .unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,

@@ -51,6 +51,7 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
     // Option 1: Use the tempo::charge_challenge helper (recommended)
     use mpay::protocol::methods::tempo;
     let challenge = tempo::charge_challenge(
+        "my-server-secret", // HMAC secret for stateless verification
         "api.example.com",
         "1000000",
         "0x...", // currency address
@@ -149,6 +150,7 @@ async fn dynamic_pricing(headers: HeaderMap, Path(resource_id): Path<String>) ->
 
     // Use the charge_challenge helper for cleaner code
     let challenge = tempo::charge_challenge(
+        "my-server-secret",
         "api.example.com",
         &price.to_string(),
         USDC_ADDRESS,

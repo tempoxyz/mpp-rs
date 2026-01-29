@@ -22,7 +22,7 @@
 //! ```
 //! use mpay::protocol::methods::tempo;
 //!
-//! // Simple charge challenge (secret_key required for HMAC-bound ID)
+//! // Simple charge challenge with HMAC-bound ID
 //! let challenge = tempo::charge_challenge(
 //!     "my-server-secret",
 //!     "api.example.com",
@@ -127,7 +127,8 @@ pub const INTENT_CHARGE: &str = "charge";
 ///
 /// # Arguments
 ///
-/// * `secret_key` - Server secret key for HMAC-bound challenge ID
+/// * `secret_key` - Server secret key for HMAC-bound challenge ID.
+///   Enables stateless verification of payment credentials.
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
 /// * `amount` - Amount in atomic units (e.g., "1000000" for 1 USDC)
 /// * `currency` - Token address (e.g., alphaUSD address)
@@ -176,7 +177,8 @@ pub fn charge_challenge(
 ///
 /// # Arguments
 ///
-/// * `secret_key` - Server secret key for HMAC-bound challenge ID
+/// * `secret_key` - Server secret key for HMAC-bound challenge ID.
+///   Enables stateless verification of payment credentials.
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
 /// * `request` - A fully configured [`ChargeRequest`](crate::protocol::intents::ChargeRequest)
 /// * `expires` - Optional challenge expiration (ISO 8601)
@@ -217,7 +219,6 @@ pub fn charge_challenge_with_options(
 
     let encoded_request = Base64UrlJson::from_typed(request)?;
 
-    // Per spec: challenge ID MUST be bound to challenge parameters via HMAC-SHA256.
     let id = generate_challenge_id(
         secret_key,
         realm,
@@ -477,7 +478,7 @@ mod tests {
         assert_eq!(
             challenge.id.len(),
             43,
-            "ID should be 43 base64url characters"
+            "HMAC ID should be 43 base64url characters"
         );
         assert!(
             challenge
