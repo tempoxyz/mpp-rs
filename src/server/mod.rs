@@ -4,6 +4,7 @@
 //!
 //! # Exports
 //!
+//! - [`Mpay`]: Payment handler that binds method, realm, and secret_key
 //! - [`ChargeMethod`]: Trait for verifying charge intent payments
 //! - [`VerificationError`]: Error type for verification failures
 //! - [`ErrorCode`]: Error codes for programmatic handling
@@ -12,12 +13,24 @@
 //! # Example
 //!
 //! ```ignore
-//! use mpay::server::{ChargeMethod, TempoChargeMethod};
+//! use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
 //!
+//! let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 //! let method = TempoChargeMethod::new(provider);
-//! let receipt = method.verify(&credential, &request).await?;
+//!
+//! // Create payment handler with bound secret_key
+//! let payment = Mpay::new(method, "api.example.com", "my-server-secret");
+//!
+//! // Generate challenge (secretKey already bound)
+//! let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
+//!
+//! // Verify credential
+//! let receipt = payment.verify(&credential, &request).await?;
 //! ```
 
+mod mpay;
+
+pub use mpay::Mpay;
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
 
 #[cfg(feature = "tempo")]
