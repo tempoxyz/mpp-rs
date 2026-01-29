@@ -22,8 +22,9 @@
 //! ```
 //! use mpay::protocol::methods::tempo;
 //!
-//! // Simple charge challenge
+//! // Simple charge challenge (secret_key required for HMAC-bound ID)
 //! let challenge = tempo::charge_challenge(
+//!     "my-server-secret",
 //!     "api.example.com",
 //!     "1000000",
 //!     "0x20c0000000000000000000000000000000000001",
@@ -40,6 +41,7 @@
 //!     ..Default::default()
 //! };
 //! let challenge = tempo::charge_challenge_with_options(
+//!     "my-server-secret",
 //!     "api.example.com",
 //!     &request,
 //!     None,
@@ -125,6 +127,7 @@ pub const INTENT_CHARGE: &str = "charge";
 ///
 /// # Arguments
 ///
+/// * `secret_key` - Server secret key for HMAC-bound challenge ID
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
 /// * `amount` - Amount in atomic units (e.g., "1000000" for 1 USDC)
 /// * `currency` - Token address (e.g., alphaUSD address)
@@ -136,6 +139,7 @@ pub const INTENT_CHARGE: &str = "charge";
 /// use mpay::protocol::methods::tempo;
 ///
 /// let challenge = tempo::charge_challenge(
+///     "my-server-secret",
 ///     "api.example.com",
 ///     "1000000",
 ///     "0x20c0000000000000000000000000000000000001",
@@ -147,6 +151,7 @@ pub const INTENT_CHARGE: &str = "charge";
 /// ```
 #[must_use = "this returns a new PaymentChallenge and does not have side effects"]
 pub fn charge_challenge(
+    secret_key: &str,
     realm: &str,
     amount: &str,
     currency: &str,
@@ -159,7 +164,7 @@ pub fn charge_challenge(
         ..Default::default()
     };
 
-    charge_challenge_with_options(realm, &request, None, None)
+    charge_challenge_with_options(secret_key, realm, &request, None, None)
 }
 
 /// Create a Tempo charge challenge with full options.
@@ -171,6 +176,7 @@ pub fn charge_challenge(
 ///
 /// # Arguments
 ///
+/// * `secret_key` - Server secret key for HMAC-bound challenge ID
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
 /// * `request` - A fully configured [`ChargeRequest`](crate::protocol::intents::ChargeRequest)
 /// * `expires` - Optional challenge expiration (ISO 8601)
@@ -191,6 +197,7 @@ pub fn charge_challenge(
 /// };
 ///
 /// let challenge = tempo::charge_challenge_with_options(
+///     "my-server-secret",
 ///     "api.example.com",
 ///     &request,
 ///     None,
@@ -200,6 +207,7 @@ pub fn charge_challenge(
 /// assert_eq!(challenge.description, Some("API access fee".to_string()));
 /// ```
 pub fn charge_challenge_with_options(
+    secret_key: &str,
     realm: &str,
     request: &crate::protocol::intents::ChargeRequest,
     expires: Option<&str>,
@@ -209,10 +217,9 @@ pub fn charge_challenge_with_options(
 
     let encoded_request = Base64UrlJson::from_typed(request)?;
 
-    // Per spec: challenge ID MUST be bound to challenge parameters.
-    // We generate a deterministic ID using HMAC-SHA256 with an empty key for internal use.
-    // For production with secret key binding, use generate_challenge_id() directly.
-    let id = generate_challenge_id_internal(
+    // Per spec: challenge ID MUST be bound to challenge parameters via HMAC-SHA256.
+    let id = generate_challenge_id(
+        secret_key,
         realm,
         METHOD_NAME,
         INTENT_CHARGE,
@@ -360,22 +367,6 @@ pub fn generate_challenge_id_from_request(
     ))
 }
 
-/// Generate a deterministic challenge ID without a secret key (internal use only).
-///
-/// This uses HMAC-SHA256 with an empty secret key for deterministic ID generation
-/// when no secret key is provided. For production use with secret key binding,
-/// use [`generate_challenge_id`] instead.
-fn generate_challenge_id_internal(
-    realm: &str,
-    method: &str,
-    intent: &str,
-    request: &str,
-    expires: Option<&str>,
-    digest: Option<&str>,
-) -> String {
-    generate_challenge_id("", realm, method, intent, request, expires, digest)
-}
-
 /// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
 #[cfg(feature = "server")]
 pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
@@ -391,9 +382,12 @@ pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    const TEST_SECRET: &str = "test-secret-key";
+
     #[test]
     fn test_challenge_id_is_deterministic() {
         let challenge1 = charge_challenge(
+            TEST_SECRET,
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000001",
@@ -402,6 +396,7 @@ mod tests {
         .unwrap();
 
         let challenge2 = charge_challenge(
+            TEST_SECRET,
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000001",
@@ -418,6 +413,7 @@ mod tests {
     #[test]
     fn test_challenge_id_differs_for_different_params() {
         let challenge1 = charge_challenge(
+            TEST_SECRET,
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000001",
@@ -426,6 +422,7 @@ mod tests {
         .unwrap();
 
         let challenge2 = charge_challenge(
+            TEST_SECRET,
             "api.example.com",
             "2000000", // Different amount
             "0x20c0000000000000000000000000000000000001",
@@ -442,6 +439,7 @@ mod tests {
     #[test]
     fn test_challenge_id_differs_for_different_realm() {
         let challenge1 = charge_challenge(
+            TEST_SECRET,
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000001",
@@ -450,6 +448,7 @@ mod tests {
         .unwrap();
 
         let challenge2 = charge_challenge(
+            TEST_SECRET,
             "api.other.com", // Different realm
             "1000000",
             "0x20c0000000000000000000000000000000000001",
@@ -466,6 +465,7 @@ mod tests {
     #[test]
     fn test_challenge_id_format() {
         let challenge = charge_challenge(
+            TEST_SECRET,
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000001",
@@ -485,6 +485,32 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "ID should only contain base64url characters"
+        );
+    }
+
+    #[test]
+    fn test_challenge_id_differs_for_different_secret() {
+        let challenge1 = charge_challenge(
+            "secret-one",
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        let challenge2 = charge_challenge(
+            "secret-two", // Different secret
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert_ne!(
+            challenge1.id, challenge2.id,
+            "Different secrets should produce different challenge IDs"
         );
     }
 
