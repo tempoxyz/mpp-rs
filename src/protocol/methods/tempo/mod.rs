@@ -651,7 +651,7 @@ mod tests {
                     "amount": "100",
                     "currency": "EUR",
                     "recipient": "0x1111111111111111111111111111111111111111",
-                    "description": "Payment for café ☕"
+                    "description": "Payment for caf\u{00e9} \u{2615}"
                 }),
                 None,
                 None,
