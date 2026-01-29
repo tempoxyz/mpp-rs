@@ -17,29 +17,39 @@ uuid = { version = "1", features = ["v4"] }
 
 ```rust
 use axum::{
+    extract::State,
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use mpay::{
-    PaymentChallenge, PaymentCredential, Receipt, Base64UrlJson,
-    parse_authorization, format_www_authenticate, format_receipt,
-};
+use mpay::{ChargeRequest, parse_authorization};
+use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+use std::sync::Arc;
 
-async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
+// Create payment handler at startup
+let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
+let method = TempoChargeMethod::new(provider);
+let payment = Arc::new(Mpay::new(method, "api.example.com", "my-server-secret"));
+
+async fn paid_endpoint(
+    State(payment): State<Arc<Mpay<TempoChargeMethod<_>>>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let request = ChargeRequest {
+        amount: "1000000".into(),
+        currency: "0x...".into(),
+        recipient: Some("0x...".into()),
+        ..Default::default()
+    };
+
     // Check for payment credential
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Ok(credential) = parse_authorization(auth_str) {
-                // Verify the payment on-chain
-                if verify_payment(&credential).await.is_ok() {
-                    let receipt = Receipt::success("tempo", "0x...");
-
+                // Verify the payment
+                if let Ok(receipt) = payment.verify(&credential, &request).await {
                     return (
                         StatusCode::OK,
-                        [(
-                            header::HeaderName::from_static("payment-receipt"),
-                            format_receipt(&receipt).unwrap(),
-                        )],
+                        [("payment-receipt", receipt.to_header().unwrap())],
                         "Here's your paid content!",
                     );
                 }
@@ -48,37 +58,11 @@ async fn paid_endpoint(headers: HeaderMap) -> impl IntoResponse {
     }
 
     // No valid payment - return 402 with challenge
-    // Option 1: Use the tempo::charge_challenge helper (recommended)
-    use mpay::protocol::methods::tempo;
-    let challenge = tempo::charge_challenge(
-        "my-server-secret", // HMAC secret for stateless verification
-        "api.example.com",
-        "1000000",
-        "0x...", // currency address
-        "0x...", // recipient address
-    ).unwrap();
-    
-    // Option 2: Manual construction with PaymentChallenge
-    // let challenge = PaymentChallenge {
-    //     id: uuid::Uuid::new_v4().to_string(),
-    //     realm: "api.example.com".into(),
-    //     method: "tempo".into(),
-    //     intent: "charge".into(),
-    //     request: Base64UrlJson::from_value(&serde_json::json!({
-    //         "amount": "1000000",
-    //         "currency": "0x...",
-    //         "recipient": "0x..."
-    //     })).unwrap(),
-    //     expires: None,
-    //     description: None,
-    // };
+    let challenge = payment.charge_challenge("1000000", "0x...", "0x...").unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
-        [(
-            header::WWW_AUTHENTICATE,
-            format_www_authenticate(&challenge).unwrap(),
-        )],
+        [(header::WWW_AUTHENTICATE, challenge.to_header().unwrap())],
         "Payment required",
     )
 }
@@ -142,24 +126,21 @@ fn app() -> Router {
 ## Dynamic Pricing
 
 ```rust
-use mpay::protocol::methods::tempo;
-
-async fn dynamic_pricing(headers: HeaderMap, Path(resource_id): Path<String>) -> impl IntoResponse {
+async fn dynamic_pricing(
+    State(payment): State<Arc<PaymentHandler>>,
+    Path(resource_id): Path<String>,
+) -> impl IntoResponse {
     // Look up price for this resource
     let price = get_resource_price(&resource_id).await;
 
-    // Use the charge_challenge helper for cleaner code
-    let challenge = tempo::charge_challenge(
-        "my-server-secret",
-        "api.example.com",
-        &price.to_string(),
-        USDC_ADDRESS,
-        MERCHANT_ADDRESS,
-    ).unwrap();
+    // Generate challenge with dynamic pricing (secret_key already bound)
+    let challenge = payment
+        .charge_challenge(&price.to_string(), USDC_ADDRESS, MERCHANT_ADDRESS)
+        .unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
-        [(header::WWW_AUTHENTICATE, format_www_authenticate(&challenge).unwrap())],
+        [(header::WWW_AUTHENTICATE, challenge.to_header().unwrap())],
         "Payment required",
     )
 }
