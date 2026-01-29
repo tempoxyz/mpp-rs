@@ -6,7 +6,7 @@ Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Pa
 
 - **Protocol-first** — Core types (`Challenge`, `Credential`, `Receipt`) map directly to HTTP headers
 - **Zero-copy parsing** — Efficient header parsing without unnecessary allocations
-- **Pluggable methods** — Payment networks are feature-gated (Tempo included by default)
+- **Pluggable methods** — Payment networks are feature-gated
 - **Minimal dependencies** — Core has minimal deps; features add what you need
 - **Intent = Schema, Method = Implementation** — Intents define shared request schemas; methods implement verification
 
@@ -198,7 +198,7 @@ let resp = client.get(url).send_with_payment(&provider).await?;
 
 ```toml
 [dependencies]
-mpay = "0.1"
+mpay = "0.2"
 ```
 
 ## Feature Flags
@@ -207,7 +207,7 @@ mpay = "0.1"
 |---------|-------------|
 | `client` | Client-side payment providers (`PaymentProvider` trait, `Fetch` extension) |
 | `server` | Server-side payment verification (`ChargeMethod` trait) |
-| `tempo` | Tempo blockchain support (default, includes `evm`) |
+| `tempo` | Tempo blockchain support (includes `evm`) - requires git patch (see below) |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
 | `http` | HTTP client support with `Fetch` extension trait (implies `client`). For Tempo payments, combine with `tempo`: `features = ["http", "tempo"]` |
 | `middleware` | reqwest-middleware support with `PaymentMiddleware` (implies `client`) |
@@ -216,17 +216,28 @@ mpay = "0.1"
 ### Common configurations
 
 ```toml
-# Server app
-mpay = { version = "0.1", features = ["server", "tempo"] }
+# Core only (parsing/formatting) - works out of the box
+mpay = "0.2"
 
-# Client app  
-mpay = { version = "0.1", features = ["client", "tempo"] }
+# With Tempo support (requires git patch)
+mpay = { version = "0.2", features = ["tempo"] }
 
-# Both sides
-mpay = { version = "0.1", features = ["server", "client", "tempo"] }
+# Server app with Tempo
+mpay = { version = "0.2", features = ["server", "tempo"] }
 
-# Core only (parsing/formatting)
-mpay = { version = "0.1", default-features = false }
+# Client app with Tempo
+mpay = { version = "0.2", features = ["client", "tempo"] }
+```
+
+### Using the `tempo` feature
+
+The `tempo` feature requires Tempo's internal crates which are not published to crates.io.
+Add this patch to your `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
 ```
 
 ## HTTP Client Support
