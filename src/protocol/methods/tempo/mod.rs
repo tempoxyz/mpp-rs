@@ -210,8 +210,16 @@ pub fn charge_challenge_with_options(
     let encoded_request = Base64UrlJson::from_typed(request)?;
 
     // Per spec: challenge ID MUST be bound to challenge parameters.
-    // We generate a deterministic ID by hashing: realm || method || intent || request
-    let id = generate_challenge_id(realm, METHOD_NAME, INTENT_CHARGE, encoded_request.raw());
+    // We generate a deterministic ID using HMAC-SHA256 with an empty key for internal use.
+    // For production with secret key binding, use generate_challenge_id() directly.
+    let id = generate_challenge_id_internal(
+        realm,
+        METHOD_NAME,
+        INTENT_CHARGE,
+        encoded_request.raw(),
+        expires,
+        None,
+    );
 
     Ok(PaymentChallenge {
         id,
@@ -225,18 +233,147 @@ pub fn charge_challenge_with_options(
     })
 }
 
-/// Generate a deterministic challenge ID bound to challenge parameters (per spec).
-fn generate_challenge_id(realm: &str, method: &str, intent: &str, request: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Generate a challenge ID using HMAC-SHA256 (cross-SDK compatible).
+///
+/// This function generates challenge IDs that are compatible with TypeScript and Python SDKs.
+/// The algorithm uses HMAC-SHA256 with a pipe-delimited input format.
+///
+/// # Arguments
+///
+/// * `secret_key` - Server secret key for HMAC
+/// * `realm` - Protection space / realm
+/// * `method` - Payment method name
+/// * `intent` - Intent name
+/// * `request` - Base64url-encoded request JSON
+/// * `expires` - Optional expiration timestamp
+/// * `digest` - Optional request body digest
+///
+/// # Returns
+///
+/// Base64url-encoded HMAC-SHA256 hash (no padding)
+///
+/// # Example
+///
+/// ```
+/// use mpay::protocol::methods::tempo::generate_challenge_id;
+///
+/// let id = generate_challenge_id(
+///     "my-secret-key",
+///     "api.example.com",
+///     "tempo",
+///     "charge",
+///     "eyJhbW91bnQiOiIxMDAwMDAwIn0",
+///     None,
+///     None,
+/// );
+/// ```
+pub fn generate_challenge_id(
+    secret_key: &str,
+    realm: &str,
+    method: &str,
+    intent: &str,
+    request: &str,
+    expires: Option<&str>,
+    digest: Option<&str>,
+) -> String {
+    use crate::protocol::core::base64url_encode;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
-    let mut hasher = DefaultHasher::new();
-    realm.hash(&mut hasher);
-    method.hash(&mut hasher);
-    intent.hash(&mut hasher);
-    request.hash(&mut hasher);
+    type HmacSha256 = Hmac<Sha256>;
 
-    format!("{:016x}", hasher.finish())
+    let hmac_input = format!(
+        "{}|{}|{}|{}|{}|{}",
+        realm,
+        method,
+        intent,
+        request,
+        expires.unwrap_or(""),
+        digest.unwrap_or("")
+    );
+
+    let mut mac =
+        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
+    mac.update(hmac_input.as_bytes());
+    let result = mac.finalize();
+
+    base64url_encode(&result.into_bytes())
+}
+
+/// Generate a challenge ID from a JSON request value using HMAC-SHA256.
+///
+/// This is a convenience function that serializes the request to compact JSON,
+/// base64url encodes it, and generates the challenge ID.
+///
+/// # Arguments
+///
+/// * `secret_key` - Server secret key for HMAC
+/// * `realm` - Protection space / realm
+/// * `method` - Payment method name
+/// * `intent` - Intent name
+/// * `request` - Request as a serde_json::Value
+/// * `expires` - Optional expiration timestamp
+/// * `digest` - Optional request body digest
+///
+/// # Example
+///
+/// ```
+/// use mpay::protocol::methods::tempo::generate_challenge_id_from_request;
+/// use serde_json::json;
+///
+/// let id = generate_challenge_id_from_request(
+///     "my-secret-key",
+///     "api.example.com",
+///     "tempo",
+///     "charge",
+///     &json!({
+///         "amount": "1000000",
+///         "currency": "0x20c0000000000000000000000000000000000001",
+///         "recipient": "0x1234567890abcdef1234567890abcdef12345678"
+///     }),
+///     None,
+///     None,
+/// ).unwrap();
+/// ```
+pub fn generate_challenge_id_from_request(
+    secret_key: &str,
+    realm: &str,
+    method: &str,
+    intent: &str,
+    request: &serde_json::Value,
+    expires: Option<&str>,
+    digest: Option<&str>,
+) -> crate::error::Result<String> {
+    use crate::protocol::core::base64url_encode;
+
+    let request_json = serde_json::to_string(request)?;
+    let request_b64 = base64url_encode(request_json.as_bytes());
+
+    Ok(generate_challenge_id(
+        secret_key,
+        realm,
+        method,
+        intent,
+        &request_b64,
+        expires,
+        digest,
+    ))
+}
+
+/// Generate a deterministic challenge ID without a secret key (internal use only).
+///
+/// This uses HMAC-SHA256 with an empty secret key for deterministic ID generation
+/// when no secret key is provided. For production use with secret key binding,
+/// use [`generate_challenge_id`] instead.
+fn generate_challenge_id_internal(
+    realm: &str,
+    method: &str,
+    intent: &str,
+    request: &str,
+    expires: Option<&str>,
+    digest: Option<&str>,
+) -> String {
+    generate_challenge_id("", realm, method, intent, request, expires, digest)
 }
 
 /// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
@@ -336,10 +473,189 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(challenge.id.len(), 16, "ID should be 16 hex characters");
-        assert!(
-            challenge.id.chars().all(|c| c.is_ascii_hexdigit()),
-            "ID should only contain hex characters"
+        // Base64url-encoded SHA256 hash is 43 characters (256 bits / 6 bits per char, no padding)
+        assert_eq!(
+            challenge.id.len(),
+            43,
+            "ID should be 43 base64url characters"
         );
+        assert!(
+            challenge
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "ID should only contain base64url characters"
+        );
+    }
+
+    /// Cross-SDK compatibility tests using conformance test vectors.
+    /// These test cases are from mpay-sdks/conformance/vectors/challenge-id.json
+    /// and verify that Rust produces the same challenge IDs as TypeScript and Python.
+    mod cross_sdk_compatibility {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn test_basic_charge() {
+            let id = generate_challenge_id_from_request(
+                "test-secret-key-12345",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "1000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "recipient": "0x1234567890abcdef1234567890abcdef12345678"
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(id, "4Y_7cCtNrnPq0ujXFLOPsk4DRMctIFYxijKxrY5uob0");
+        }
+
+        #[test]
+        fn test_with_expires() {
+            let id = generate_challenge_id_from_request(
+                "test-secret-key-12345",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "5000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "recipient": "0xabcdef1234567890abcdef1234567890abcdef12"
+                }),
+                Some("2026-01-29T12:00:00Z"),
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(id, "02h24ab0XjVsKFwbyhz8HU9FacoT-21zV4FokI2U4YI");
+        }
+
+        #[test]
+        fn test_with_digest() {
+            let id = generate_challenge_id_from_request(
+                "my-server-secret",
+                "payments.example.org",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "250000",
+                    "currency": "USD",
+                    "recipient": "0x9999999999999999999999999999999999999999"
+                }),
+                None,
+                Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="),
+            )
+            .unwrap();
+
+            assert_eq!(id, "EAX2sqwdeg8Km8LIKRBFhM5xDQvEgIlbTif9FKBsOiU");
+        }
+
+        #[test]
+        fn test_full_challenge() {
+            let id = generate_challenge_id_from_request(
+                "production-secret-abc123",
+                "api.tempo.xyz",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "10000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                    "description": "API access fee",
+                    "externalId": "order-12345"
+                }),
+                Some("2026-02-01T00:00:00Z"),
+                Some("sha-256=abc123def456"),
+            )
+            .unwrap();
+
+            assert_eq!(id, "9uqa-bDFwDBiMIgJF-hytstRW_YgjpBUDCo5_SMSqG4");
+        }
+
+        #[test]
+        fn test_different_secret_different_id() {
+            let id = generate_challenge_id_from_request(
+                "different-secret-key",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "1000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "recipient": "0x1234567890abcdef1234567890abcdef12345678"
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(id, "GaC7Gn_Fbbq98Tw-Eb7z4FadriU7GzNrAyC7ZcY3VRI");
+        }
+
+        #[test]
+        fn test_empty_request() {
+            let id = generate_challenge_id_from_request(
+                "test-key",
+                "test.example.com",
+                "tempo",
+                "authorize",
+                &json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(id, "jUTqTVe3kCv5rVizv1XBCs9qKCLg4AZLwBUnk4N3MR8");
+        }
+
+        #[test]
+        fn test_unicode_in_description() {
+            let id = generate_challenge_id_from_request(
+                "unicode-test-key",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "100",
+                    "currency": "EUR",
+                    "recipient": "0x1111111111111111111111111111111111111111",
+                    "description": "Payment for café ☕"
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(id, "76lyru2p7i7Xw6fGTJtWzd9c7Z6mt33LIW7968Mlkz8");
+        }
+
+        #[test]
+        fn test_nested_method_details() {
+            let id = generate_challenge_id_from_request(
+                "nested-test-key",
+                "api.tempo.xyz",
+                "tempo",
+                "charge",
+                &json!({
+                    "amount": "5000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "recipient": "0x2222222222222222222222222222222222222222",
+                    "methodDetails": {
+                        "chainId": 42431,
+                        "feePayer": true
+                    }
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(id, "dyItTtUU31Gp2ckWrYXoeB2wZtS1OTVpXw81D_blwuk");
+        }
     }
 }
