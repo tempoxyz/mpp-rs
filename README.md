@@ -141,21 +141,25 @@ let request = ChargeRequest {
 };
 ```
 
-### Server-Side Traits
+### Server-Side Handler
 
-Method traits verify payment credentials with typed schemas:
+Use `Mpay` to bind method, realm, and secret_key once:
 
 ```rust
-use mpay::server::{tempo_provider, ChargeMethod, TempoChargeMethod};
+use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
 
-// Create a Tempo provider (handles Tempo's custom transaction types)
-let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
-
-// Create the charge method with the provider
+// Create provider and method
+let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 let method = TempoChargeMethod::new(provider);
 
+// Create handler with bound secret_key
+let payment = Mpay::new(method, "api.example.com", "my-server-secret");
+
+// Generate challenge (secretKey already bound)
+let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
+
 // Verify a payment
-let receipt = method.verify(&credential, &request).await?;
+let receipt = payment.verify(&credential, &request).await?;
 ```
 
 ### Client-Side Traits

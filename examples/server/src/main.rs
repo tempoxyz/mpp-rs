@@ -51,30 +51,34 @@ use axum::{
     routing::get,
     Router,
 };
-use mpay::{ChargeRequest, PaymentCredential, parse_authorization};
-use mpay::protocol::methods::tempo;
-use mpay::server::{tempo_provider, ChargeMethod, TempoChargeMethod};
+use mpay::server::{tempo_provider, Mpay, TempoChargeMethod};
+use mpay::{parse_authorization, ChargeRequest, PaymentCredential};
 use std::sync::{Arc, LazyLock};
 
 const REALM: &str = "api.example.com";
 const ALPHA_USD: &str = "0x20c0000000000000000000000000000000000001";
 const RPC_URL: &str = "https://rpc.moderato.tempo.xyz";
+const SECRET_KEY: &str = "example-server-secret-key";
 
-static MERCHANT_ADDRESS: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set")
-});
+static MERCHANT_ADDRESS: LazyLock<String> =
+    LazyLock::new(|| std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set"));
+
+type PaymentHandler = Mpay<TempoChargeMethod<mpay::server::TempoProvider>>;
 
 #[tokio::main]
 async fn main() {
     LazyLock::force(&MERCHANT_ADDRESS);
 
-    let provider = tempo_provider(RPC_URL);
-    let charge_method = TempoChargeMethod::new(provider);
+    let provider = tempo_provider(RPC_URL).expect("failed to create provider");
+    let method = TempoChargeMethod::new(provider);
+
+    // Create payment handler with bound secret_key
+    let payment = Mpay::new(method, REALM, SECRET_KEY);
 
     let app = Router::new()
         .route("/free", get(free_endpoint))
         .route("/paid", get(paid_endpoint))
-        .with_state(Arc::new(charge_method));
+        .with_state(Arc::new(payment));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Listening on http://localhost:3000");
@@ -85,8 +89,8 @@ async fn free_endpoint() -> &'static str {
     "Free content - no payment required"
 }
 
-async fn paid_endpoint<M: ChargeMethod>(
-    State(method): State<Arc<M>>,
+async fn paid_endpoint(
+    State(payment): State<Arc<PaymentHandler>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let request = ChargeRequest {
@@ -97,7 +101,7 @@ async fn paid_endpoint<M: ChargeMethod>(
     };
 
     if let Some(credential) = parse_credential(&headers) {
-        match method.verify(&credential, &request).await {
+        match payment.verify(&credential, &request).await {
             Ok(receipt) => {
                 return (
                     StatusCode::OK,
@@ -112,8 +116,10 @@ async fn paid_endpoint<M: ChargeMethod>(
         }
     }
 
-    let challenge =
-        tempo::charge_challenge(REALM, "1000000", ALPHA_USD, &MERCHANT_ADDRESS).unwrap();
+    // Generate challenge (secret_key already bound to payment handler)
+    let challenge = payment
+        .charge_challenge("1000000", ALPHA_USD, &MERCHANT_ADDRESS)
+        .unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,

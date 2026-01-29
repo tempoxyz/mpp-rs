@@ -31,9 +31,11 @@ middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-typ
 [dependencies]
 # Core dependencies (always included)
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+hmac = "0.12"
+sha2 = "0.10"
 
 # Optional dependencies
 hex = { version = "0.4", optional = true }
