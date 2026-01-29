@@ -20,8 +20,11 @@
 //! let receipt = payment.verify(&credential, &request).await?;
 //! ```
 
+#[cfg(feature = "tempo")]
 use crate::error::Result;
-use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+#[cfg(feature = "tempo")]
+use crate::protocol::core::PaymentChallenge;
+use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, VerificationError};
 
@@ -166,6 +169,13 @@ where
     ///
     /// * `Ok(Receipt)` - Payment was verified successfully
     /// * `Err(VerificationError)` - Verification failed
+    ///
+    /// # Note
+    ///
+    /// Per the IETF Payment Auth spec, synchronous flows MUST NOT return
+    /// a successful response with a failed receipt. If the underlying method
+    /// returns a receipt with `status: "failed"`, this function converts it
+    /// to a `VerificationError` with the transaction reference.
     pub async fn verify(
         &self,
         credential: &PaymentCredential,
@@ -191,13 +201,25 @@ where
             }
         }
 
-        self.method.verify(credential, request).await
+        let receipt = self.method.verify(credential, request).await?;
+
+        // Per spec, synchronous flows MUST NOT return 200 with a failed receipt.
+        // Convert failed receipts to VerificationError.
+        if receipt.is_failed() {
+            return Err(VerificationError::transaction_failed(format!(
+                "payment failed: {}",
+                receipt.reference
+            )));
+        }
+
+        Ok(receipt)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::core::{ChallengeEcho, PaymentPayload};
     use std::future::Future;
 
     #[derive(Clone)]
@@ -214,6 +236,64 @@ mod tests {
             _request: &ChargeRequest,
         ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
             async { Ok(Receipt::success("mock", "mock_ref")) }
+        }
+    }
+
+    /// Mock method that returns a failed receipt
+    #[derive(Clone)]
+    struct FailedReceiptMethod;
+
+    impl ChargeMethod for FailedReceiptMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            async { Ok(Receipt::failed("mock", "tx reverted on-chain")) }
+        }
+    }
+
+    /// Mock method that returns a successful receipt
+    #[derive(Clone)]
+    struct SuccessReceiptMethod;
+
+    impl ChargeMethod for SuccessReceiptMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            async { Ok(Receipt::success("mock", "0xabc123")) }
+        }
+    }
+
+    fn test_credential() -> PaymentCredential {
+        let echo = ChallengeEcho {
+            id: "test-id".into(),
+            realm: "api.example.com".into(),
+            method: "mock".into(),
+            intent: "charge".into(),
+            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            expires: None,
+            digest: None,
+        };
+        PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
+    }
+
+    fn test_request() -> ChargeRequest {
+        ChargeRequest {
+            amount: "1000".into(),
+            currency: "0x123".into(),
+            recipient: Some("0x456".into()),
+            ..Default::default()
         }
     }
 
@@ -241,5 +321,40 @@ mod tests {
         assert_eq!(challenge.intent.as_str(), "charge");
         // ID should be 43 chars (base64url SHA256)
         assert_eq!(challenge.id.len(), 43);
+    }
+
+    /// Per IETF spec, synchronous flows MUST NOT return 200 with a failed receipt.
+    /// When verify() returns a receipt with status: "failed", Mpay::verify should
+    /// convert it to a VerificationError.
+    #[tokio::test]
+    async fn test_verify_returns_error_for_failed_receipt() {
+        let payment = Mpay::new(FailedReceiptMethod, "api.example.com", "secret");
+        let credential = test_credential();
+        let request = test_request();
+
+        let result = payment.verify(&credential, &request).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("payment failed"));
+        assert_eq!(
+            err.code,
+            Some(crate::protocol::traits::ErrorCode::TransactionFailed)
+        );
+    }
+
+    /// Verify that successful receipts are returned normally.
+    #[tokio::test]
+    async fn test_verify_returns_receipt_for_success() {
+        let payment = Mpay::new(SuccessReceiptMethod, "api.example.com", "secret");
+        let credential = test_credential();
+        let request = test_request();
+
+        let result = payment.verify(&credential, &request).await;
+
+        assert!(result.is_ok());
+        let receipt = result.unwrap();
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "0xabc123");
     }
 }
