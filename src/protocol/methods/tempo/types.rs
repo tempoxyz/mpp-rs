@@ -25,6 +25,7 @@ use super::CHAIN_ID;
 /// let details = TempoMethodDetails {
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
+///     memo: None,
 /// };
 /// assert!(details.fee_payer());
 /// ```
@@ -75,6 +76,7 @@ mod tests {
         let details = TempoMethodDetails {
             chain_id: Some(42431),
             fee_payer: Some(true),
+            memo: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();

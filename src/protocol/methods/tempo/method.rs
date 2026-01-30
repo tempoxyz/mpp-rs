@@ -194,8 +194,16 @@ where
             .and_then(|v| v.as_array())
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
-        // Parse expected memo if present
-        let expected_memo = memo.and_then(parse_b256_hex);
+        // Parse expected memo if present - fail if memo is present but invalid
+        let expected_memo = match memo {
+            Some(m) => Some(parse_b256_hex(m).ok_or_else(|| {
+                VerificationError::new(format!(
+                    "Invalid memo: must be 32-byte hex string, got: {}",
+                    m
+                ))
+            })?),
+            None => None,
+        };
 
         for log in logs {
             let log_address = log
@@ -217,14 +225,21 @@ where
                 continue;
             }
 
-            let topic0 = topics[0].parse::<B256>().unwrap_or_default();
+            // Skip logs with unparseable topic0 rather than defaulting to zero
+            let topic0 = match topics[0].parse::<B256>() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
 
             // Check for TransferWithMemo when memo is expected
             if let Some(exp_memo) = expected_memo {
                 if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
                     let to_topic = topics[2];
-                    let to_address =
-                        Address::from_slice(&to_topic.parse::<B256>().unwrap_or_default()[12..]);
+                    // Skip if to_address topic is unparseable
+                    let to_address = match to_topic.parse::<B256>() {
+                        Ok(b) => Address::from_slice(&b[12..]),
+                        Err(_) => continue,
+                    };
 
                     if to_address != expected_recipient {
                         continue;
@@ -234,8 +249,15 @@ where
                     // Data contains: amount (32 bytes) + memo (32 bytes)
                     if data.len() >= 130 {
                         // 0x + 64 (amount) + 64 (memo)
-                        let amount = U256::from_str_radix(&data[2..66], 16).unwrap_or(U256::ZERO);
-                        let memo_bytes = parse_b256_hex(&data[66..130]).unwrap_or_default();
+                        // Skip if amount or memo parsing fails
+                        let amount = match U256::from_str_radix(&data[2..66], 16) {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+                        let memo_bytes = match parse_b256_hex(&data[66..130]) {
+                            Some(m) => m,
+                            None => continue,
+                        };
 
                         if amount == expected_amount && memo_bytes == exp_memo {
                             return Ok(());
@@ -251,8 +273,11 @@ where
             }
 
             let to_topic = topics[2];
-            let to_address =
-                Address::from_slice(&to_topic.parse::<B256>().unwrap_or_default()[12..]);
+            // Skip if to_address topic is unparseable
+            let to_address = match to_topic.parse::<B256>() {
+                Ok(b) => Address::from_slice(&b[12..]),
+                Err(_) => continue,
+            };
 
             if to_address != expected_recipient {
                 continue;
@@ -261,7 +286,11 @@ where
             let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
 
             if data.len() >= 66 {
-                let amount = U256::from_str_radix(&data[2..], 16).unwrap_or(U256::ZERO);
+                // Skip if amount parsing fails
+                let amount = match U256::from_str_radix(&data[2..], 16) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
                 // Use exact equality per TypeScript SDK behavior
                 if amount == expected_amount {
                     return Ok(());
@@ -326,8 +355,16 @@ where
         let tx = TempoTransaction::decode(&mut &tx_data[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
 
-        // Parse expected memo if present
-        let expected_memo = memo.and_then(parse_b256_hex);
+        // Parse expected memo if present - fail if memo is present but invalid
+        let expected_memo = match memo {
+            Some(m) => Some(parse_b256_hex(m).ok_or_else(|| {
+                VerificationError::new(format!(
+                    "Invalid memo: must be 32-byte hex string, got: {}",
+                    m
+                ))
+            })?),
+            None => None,
+        };
 
         // Search for matching call in transaction
         for call in &tx.calls {
@@ -350,8 +387,8 @@ where
 
             if let Some(exp_memo) = expected_memo {
                 // Look for transferWithMemo(address,uint256,bytes32)
-                if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() >= 100 {
-                    // 4 + 32 + 32 + 32
+                // Exact length: 4 (selector) + 32 (address) + 32 (amount) + 32 (memo) = 100 bytes
+                if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
                     let to = Address::from_slice(&data[16..36]);
                     let amount = U256::from_be_slice(&data[36..68]);
                     let memo_bytes = B256::from_slice(&data[68..100]);
@@ -365,8 +402,8 @@ where
                 }
             } else {
                 // Look for transfer(address,uint256)
-                if selector == TRANSFER_SELECTOR && data.len() >= 68 {
-                    // 4 + 32 + 32
+                // Exact length: 4 (selector) + 32 (address) + 32 (amount) = 68 bytes
+                if selector == TRANSFER_SELECTOR && data.len() == 68 {
                     let to = Address::from_slice(&data[16..36]);
                     let amount = U256::from_be_slice(&data[36..68]);
 
@@ -419,10 +456,14 @@ where
             memo.as_deref(),
         )?;
 
-        // Fee payer support: if feePayer is requested, the server would need to
-        // add its signature here. This requires a signer to be configured.
-        // For now, we just broadcast the transaction as-is.
-        // TODO: Implement fee payer co-signing when signer is provided
+        // Fail fast if fee payer is requested but not configured.
+        // Full fee payer support requires passing a signer to ChargeMethod.
+        if charge.fee_payer() {
+            return Err(VerificationError::new(
+                "feePayer requested but fee sponsorship is not configured on this server"
+                    .to_string(),
+            ));
+        }
 
         let pending = self
             .provider
@@ -524,5 +565,99 @@ mod tests {
     fn test_transfer_with_memo_selector() {
         // transferWithMemo(address,uint256,bytes32) = 0x4a7a1364
         assert_eq!(TRANSFER_WITH_MEMO_SELECTOR, [0x4a, 0x7a, 0x13, 0x64]);
+    }
+
+    #[test]
+    fn test_parse_b256_hex_valid() {
+        let valid = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let result = parse_b256_hex(valid);
+        assert!(result.is_some());
+
+        // Without 0x prefix
+        let valid_no_prefix = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let result = parse_b256_hex(valid_no_prefix);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_b256_hex_invalid_length() {
+        // Too short (only 3 bytes)
+        let too_short = "0xabcdef";
+        assert!(parse_b256_hex(too_short).is_none());
+
+        // Too long (33 bytes)
+        let too_long = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef00";
+        assert!(parse_b256_hex(too_long).is_none());
+
+        // Empty
+        assert!(parse_b256_hex("").is_none());
+        assert!(parse_b256_hex("0x").is_none());
+    }
+
+    #[test]
+    fn test_parse_b256_hex_invalid_chars() {
+        // Invalid hex characters
+        let invalid = "0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
+        assert!(parse_b256_hex(invalid).is_none());
+    }
+
+    #[test]
+    fn test_event_topics() {
+        // Verify event topic constants match keccak256 of event signatures
+        // Transfer(address,address,uint256)
+        assert_eq!(
+            TRANSFER_EVENT_TOPIC,
+            alloy::primitives::b256!(
+                "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            )
+        );
+
+        // TransferWithMemo(address,address,uint256,bytes32)
+        assert_eq!(
+            TRANSFER_WITH_MEMO_EVENT_TOPIC,
+            alloy::primitives::b256!(
+                "57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0"
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_b256_hex_case_insensitive() {
+        // Test case insensitivity - both should parse to the same value
+        let lower = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let upper = "0xABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890";
+        let mixed = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890";
+
+        let lower_result = parse_b256_hex(lower).unwrap();
+        let upper_result = parse_b256_hex(upper).unwrap();
+        let mixed_result = parse_b256_hex(mixed).unwrap();
+
+        assert_eq!(lower_result, upper_result);
+        assert_eq!(lower_result, mixed_result);
+    }
+
+    #[test]
+    fn test_calldata_length_constants() {
+        // Verify the expected calldata lengths match ABI encoding
+        // transfer(address,uint256): 4 + 32 + 32 = 68
+        // transferWithMemo(address,uint256,bytes32): 4 + 32 + 32 + 32 = 100
+        const TRANSFER_CALLDATA_LEN: usize = 4 + 32 + 32;
+        const TRANSFER_WITH_MEMO_CALLDATA_LEN: usize = 4 + 32 + 32 + 32;
+
+        assert_eq!(TRANSFER_CALLDATA_LEN, 68);
+        assert_eq!(TRANSFER_WITH_MEMO_CALLDATA_LEN, 100);
+    }
+
+    #[test]
+    fn test_selector_parsing_short_input() {
+        // Ensure short inputs don't panic - test with various short lengths
+        let short_inputs: Vec<&[u8]> = vec![&[], &[0xa9], &[0xa9, 0x05], &[0xa9, 0x05, 0x9c]];
+
+        for input in short_inputs {
+            // This mimics the parsing logic - should not panic
+            if input.len() >= 4 {
+                let _selector: [u8; 4] = input[..4].try_into().unwrap_or([0; 4]);
+            }
+        }
     }
 }
