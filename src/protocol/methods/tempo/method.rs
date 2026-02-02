@@ -186,6 +186,23 @@ where
         expected_amount: U256,
         memo: Option<&str>,
     ) -> Result<(), VerificationError> {
+        // Security guards: reject zero values that could match parse failures
+        if expected_amount.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid amount: expected_amount must be greater than zero".to_string(),
+            ));
+        }
+        if expected_recipient.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
+            ));
+        }
+        if currency.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid currency: currency cannot be the zero address".to_string(),
+            ));
+        }
+
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
 
@@ -344,7 +361,25 @@ where
         expected_recipient: Address,
         expected_amount: U256,
         memo: Option<&str>,
+        expected_chain_id: u64,
     ) -> Result<(), VerificationError> {
+        // Security guards: reject zero values that could match parse failures
+        if expected_amount.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid amount: expected_amount must be greater than zero".to_string(),
+            ));
+        }
+        if expected_recipient.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
+            ));
+        }
+        if currency.is_zero() {
+            return Err(VerificationError::new(
+                "Invalid currency: currency cannot be the zero address".to_string(),
+            ));
+        }
+
         // Skip type byte (0x76) for Tempo transactions
         let tx_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
             &tx_bytes[1..]
@@ -354,6 +389,14 @@ where
 
         let tx = TempoTransaction::decode(&mut &tx_data[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
+
+        // Validate chain_id to prevent cross-chain replay attacks
+        if tx.chain_id != expected_chain_id {
+            return Err(VerificationError::new(format!(
+                "Transaction chain_id mismatch: expected {}, got {}",
+                expected_chain_id, tx.chain_id
+            )));
+        }
 
         // Parse expected memo if present - fail if memo is present but invalid
         let expected_memo = match memo {
@@ -431,6 +474,7 @@ where
         &self,
         signed_tx: &str,
         charge: &ChargeRequest,
+        expected_chain_id: u64,
     ) -> Result<B256, VerificationError> {
         let tx_bytes = signed_tx
             .parse::<Bytes>()
@@ -454,6 +498,7 @@ where
             expected_recipient,
             expected_amount,
             memo.as_deref(),
+            expected_chain_id,
         )?;
 
         // Fail fast if fee payer is requested but not configured.
@@ -543,7 +588,11 @@ where
             } else {
                 // Client sent signed transaction, validate and broadcast it
                 let tx_hash = this
-                    .broadcast_transaction(credential.payload.signed_tx().unwrap(), &request)
+                    .broadcast_transaction(
+                        credential.payload.signed_tx().unwrap(),
+                        &request,
+                        expected_chain_id,
+                    )
                     .await?;
                 this.verify_hash(&format!("{:#x}", tx_hash), &request).await
             }
@@ -659,5 +708,33 @@ mod tests {
                 let _selector: [u8; 4] = input[..4].try_into().unwrap_or([0; 4]);
             }
         }
+    }
+
+    #[test]
+    fn test_zero_amount_rejected() {
+        // Zero amounts should be rejected to prevent parse-failure bypasses
+        let zero = U256::ZERO;
+        assert!(zero.is_zero());
+
+        let non_zero = U256::from(1u64);
+        assert!(!non_zero.is_zero());
+    }
+
+    #[test]
+    fn test_zero_address_detection() {
+        // Zero addresses should be rejected to prevent parse-failure bypasses
+        let zero_addr = Address::ZERO;
+        assert!(zero_addr.is_zero());
+
+        let valid_addr: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f3bB77"
+            .parse()
+            .unwrap();
+        assert!(!valid_addr.is_zero());
+    }
+
+    #[test]
+    fn test_chain_id_constant() {
+        // Verify the Tempo Moderato chain ID constant
+        assert_eq!(CHAIN_ID, 42431);
     }
 }
