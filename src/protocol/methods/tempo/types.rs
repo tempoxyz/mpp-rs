@@ -25,6 +25,7 @@ use super::CHAIN_ID;
 /// let details = TempoMethodDetails {
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
+///     memo: None,
 /// };
 /// assert!(details.fee_payer());
 /// ```
@@ -40,6 +41,13 @@ pub struct TempoMethodDetails {
     /// The server adds its fee payer signature before broadcasting.
     #[serde(rename = "feePayer", skip_serializing_if = "Option::is_none")]
     pub fee_payer: Option<bool>,
+
+    /// Optional memo for `transferWithMemo` calls.
+    ///
+    /// When present, the server verifies `TransferWithMemo` logs instead of `Transfer`.
+    /// Must be a 32-byte hex string (with or without 0x prefix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 
 impl TempoMethodDetails {
@@ -52,6 +60,11 @@ impl TempoMethodDetails {
     pub fn is_tempo_moderato(&self) -> bool {
         self.chain_id == Some(CHAIN_ID)
     }
+
+    /// Get the memo as a reference, if present.
+    pub fn memo(&self) -> Option<&str> {
+        self.memo.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -63,6 +76,7 @@ mod tests {
         let details = TempoMethodDetails {
             chain_id: Some(42431),
             fee_payer: Some(true),
+            memo: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
@@ -94,5 +108,37 @@ mod tests {
             ..Default::default()
         };
         assert!(!other.is_tempo_moderato());
+    }
+
+    #[test]
+    fn test_memo() {
+        let details = TempoMethodDetails::default();
+        assert!(details.memo().is_none());
+
+        let details_with_memo = TempoMethodDetails {
+            memo: Some(
+                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            details_with_memo.memo(),
+            Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
+        );
+    }
+
+    #[test]
+    fn test_serialization_with_memo() {
+        let details = TempoMethodDetails {
+            chain_id: Some(42431),
+            fee_payer: Some(true),
+            memo: Some("0xabcdef".to_string()),
+        };
+
+        let json = serde_json::to_string(&details).unwrap();
+        assert!(json.contains("\"memo\":\"0xabcdef\""));
+
+        let parsed: TempoMethodDetails = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.memo(), Some("0xabcdef"));
     }
 }
