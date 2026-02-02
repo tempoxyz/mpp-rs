@@ -40,7 +40,7 @@ sha2 = "0.10"
 # Optional dependencies
 hex = { version = "0.4", optional = true }
 base64 = "0.22"
-rand = { version = "0.8", optional = true }
+rand = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 alloy = { version = "1.2", features = ["full"], optional = true }
 alloy-signer-local = { version = "1.2", optional = true }
