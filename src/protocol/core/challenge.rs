@@ -340,25 +340,9 @@ impl Receipt {
         }
     }
 
-    /// Create a failed payment receipt.
-    pub fn failed(method: impl Into<MethodName>, error_msg: &str) -> Self {
-        Self {
-            status: ReceiptStatus::Failed,
-            method: method.into(),
-            timestamp: now_iso8601(),
-            reference: String::new(),
-            error: Some(error_msg.to_string()),
-        }
-    }
-
     /// Check if the payment was successful.
     pub fn is_success(&self) -> bool {
         self.status == ReceiptStatus::Success
-    }
-
-    /// Check if the payment failed.
-    pub fn is_failed(&self) -> bool {
-        self.status == ReceiptStatus::Failed
     }
 
     /// Format as Payment-Receipt header value.
@@ -504,16 +488,5 @@ mod tests {
             error: None,
         };
         assert!(success.is_success());
-        assert!(!success.is_failed());
-
-        let failed = Receipt {
-            status: ReceiptStatus::Failed,
-            method: "tempo".into(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            reference: "".to_string(),
-            error: Some("Payment failed".to_string()),
-        };
-        assert!(!failed.is_success());
-        assert!(failed.is_failed());
     }
 }

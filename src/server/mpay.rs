@@ -203,15 +203,6 @@ where
 
         let receipt = self.method.verify(credential, request).await?;
 
-        // Per spec, synchronous flows MUST NOT return 200 with a failed receipt.
-        // Convert failed receipts to VerificationError.
-        if receipt.is_failed() {
-            return Err(VerificationError::transaction_failed(format!(
-                "payment failed: {}",
-                receipt.reference
-            )));
-        }
-
         Ok(receipt)
     }
 }
@@ -239,24 +230,6 @@ mod tests {
         }
     }
 
-    /// Mock method that returns a failed receipt
-    #[derive(Clone)]
-    struct FailedReceiptMethod;
-
-    impl ChargeMethod for FailedReceiptMethod {
-        fn method(&self) -> &str {
-            "mock"
-        }
-
-        fn verify(
-            &self,
-            _credential: &PaymentCredential,
-            _request: &ChargeRequest,
-        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
-            async { Ok(Receipt::failed("mock", "tx reverted on-chain")) }
-        }
-    }
-
     /// Mock method that returns a successful receipt
     #[derive(Clone)]
     struct SuccessReceiptMethod;
@@ -272,6 +245,28 @@ mod tests {
             _request: &ChargeRequest,
         ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
             async { Ok(Receipt::success("mock", "0xabc123")) }
+        }
+    }
+
+    /// Mock method that returns a transaction_failed error (simulates reverted tx)
+    #[derive(Clone)]
+    struct FailedTransactionMethod;
+
+    impl ChargeMethod for FailedTransactionMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            async {
+                Err(VerificationError::transaction_failed(
+                    "Transaction reverted on-chain",
+                ))
+            }
         }
     }
 
@@ -343,26 +338,6 @@ mod tests {
         assert_eq!(challenge.id.len(), 43);
     }
 
-    /// Per IETF spec, synchronous flows MUST NOT return 200 with a failed receipt.
-    /// When verify() returns a receipt with status: "failed", Mpay::verify should
-    /// convert it to a VerificationError.
-    #[tokio::test]
-    async fn test_verify_returns_error_for_failed_receipt() {
-        let payment = Mpay::new(FailedReceiptMethod, "api.example.com", "secret");
-        let credential = test_credential("secret");
-        let request = test_request();
-
-        let result = payment.verify(&credential, &request).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("payment failed"));
-        assert_eq!(
-            err.code,
-            Some(crate::protocol::traits::ErrorCode::TransactionFailed)
-        );
-    }
-
     /// Verify that successful receipts are returned normally.
     #[tokio::test]
     async fn test_verify_returns_receipt_for_success() {
@@ -376,5 +351,28 @@ mod tests {
         let receipt = result.unwrap();
         assert!(receipt.is_success());
         assert_eq!(receipt.reference, "0xabc123");
+    }
+
+    /// Verify that transaction failures return VerificationError (which becomes 402).
+    #[tokio::test]
+    async fn test_verify_returns_error_for_failed_transaction() {
+        use crate::error::{MppError, PaymentError};
+        use crate::protocol::traits::ErrorCode;
+
+        let payment = Mpay::new(FailedTransactionMethod, "api.example.com", "secret");
+        let credential = test_credential("secret");
+        let request = test_request();
+
+        let result = payment.verify(&credential, &request).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::TransactionFailed));
+        assert!(err.message.contains("reverted"));
+
+        // Verify it converts to MppError with 402 status
+        let mpp_err: MppError = err.into();
+        let problem = mpp_err.to_problem_details(None);
+        assert_eq!(problem.status, 402);
     }
 }
