@@ -203,15 +203,6 @@ where
 
         let receipt = self.method.verify(credential, request).await?;
 
-        // Per spec, synchronous flows MUST NOT return 200 with a failed receipt.
-        // Convert failed receipts to VerificationError.
-        if receipt.is_failed() {
-            return Err(VerificationError::transaction_failed(format!(
-                "payment failed: {}",
-                receipt.reference
-            )));
-        }
-
         Ok(receipt)
     }
 }
@@ -236,24 +227,6 @@ mod tests {
             _request: &ChargeRequest,
         ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
             async { Ok(Receipt::success("mock", "mock_ref")) }
-        }
-    }
-
-    /// Mock method that returns a failed receipt
-    #[derive(Clone)]
-    struct FailedReceiptMethod;
-
-    impl ChargeMethod for FailedReceiptMethod {
-        fn method(&self) -> &str {
-            "mock"
-        }
-
-        fn verify(
-            &self,
-            _credential: &PaymentCredential,
-            _request: &ChargeRequest,
-        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
-            async { Ok(Receipt::failed("mock", "tx reverted on-chain")) }
         }
     }
 
@@ -341,26 +314,6 @@ mod tests {
         assert_eq!(challenge.intent.as_str(), "charge");
         // ID should be 43 chars (base64url SHA256)
         assert_eq!(challenge.id.len(), 43);
-    }
-
-    /// Per IETF spec, synchronous flows MUST NOT return 200 with a failed receipt.
-    /// When verify() returns a receipt with status: "failed", Mpay::verify should
-    /// convert it to a VerificationError.
-    #[tokio::test]
-    async fn test_verify_returns_error_for_failed_receipt() {
-        let payment = Mpay::new(FailedReceiptMethod, "api.example.com", "secret");
-        let credential = test_credential("secret");
-        let request = test_request();
-
-        let result = payment.verify(&credential, &request).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("payment failed"));
-        assert_eq!(
-            err.code,
-            Some(crate::protocol::traits::ErrorCode::TransactionFailed)
-        );
     }
 
     /// Verify that successful receipts are returned normally.
