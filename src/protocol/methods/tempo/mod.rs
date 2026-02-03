@@ -113,6 +113,15 @@ pub use method::ChargeMethod;
 /// Tempo Moderato testnet chain ID.
 pub const CHAIN_ID: u64 = 42431;
 
+/// Tempo mainnet chain ID.
+pub const MAINNET_CHAIN_ID: u64 = 4217;
+
+/// Default RPC URL for Tempo mainnet.
+pub const DEFAULT_RPC_URL: &str = "https://rpc.tempo.xyz";
+
+/// Default challenge expiration in minutes.
+pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;
+
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
@@ -216,8 +225,22 @@ pub fn charge_challenge_with_options(
     description: Option<&str>,
 ) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+    use time::{Duration, OffsetDateTime};
 
     let encoded_request = Base64UrlJson::from_typed(request)?;
+
+    let default_expires;
+    let expires = match expires {
+        Some(e) => Some(e),
+        None => {
+            let expiry_time =
+                OffsetDateTime::now_utc() + Duration::minutes(DEFAULT_EXPIRES_MINUTES as i64);
+            default_expires = expiry_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| expiry_time.to_string());
+            Some(default_expires.as_str())
+        }
+    };
 
     let id = generate_challenge_id(
         secret_key,
@@ -387,27 +410,53 @@ mod tests {
 
     #[test]
     fn test_challenge_id_is_deterministic() {
-        let challenge1 = charge_challenge(
+        use crate::protocol::intents::ChargeRequest;
+
+        let request = ChargeRequest {
+            amount: "1000000".into(),
+            currency: "0x20c0000000000000000000000000000000000001".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+
+        let challenge1 = charge_challenge_with_options(
             TEST_SECRET,
             "api.example.com",
-            "1000000",
-            "0x20c0000000000000000000000000000000000001",
-            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            &request,
+            Some("2026-01-01T00:00:00Z"),
+            None,
         )
         .unwrap();
 
-        let challenge2 = charge_challenge(
+        let challenge2 = charge_challenge_with_options(
             TEST_SECRET,
             "api.example.com",
-            "1000000",
-            "0x20c0000000000000000000000000000000000001",
-            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            &request,
+            Some("2026-01-01T00:00:00Z"),
+            None,
         )
         .unwrap();
 
         assert_eq!(
             challenge1.id, challenge2.id,
             "Same parameters should produce same challenge ID"
+        );
+    }
+
+    #[test]
+    fn test_challenge_default_expires() {
+        let challenge = charge_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert!(
+            challenge.expires.is_some(),
+            "Challenge should have default expires"
         );
     }
 

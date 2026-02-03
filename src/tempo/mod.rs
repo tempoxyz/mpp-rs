@@ -27,8 +27,8 @@
 pub use crate::protocol::intents::ChargeRequest;
 pub use crate::protocol::methods::tempo::{
     Call, SignatureType, TempoChargeExt, TempoMethodDetails, TempoTransaction,
-    TempoTransactionRequest, CHAIN_ID, METHOD_NAME, TEMPO_SEND_TRANSACTION_METHOD,
-    TEMPO_TX_TYPE_ID,
+    TempoTransactionRequest, CHAIN_ID, DEFAULT_EXPIRES_MINUTES, DEFAULT_RPC_URL, MAINNET_CHAIN_ID,
+    METHOD_NAME, TEMPO_SEND_TRANSACTION_METHOD, TEMPO_TX_TYPE_ID,
 };
 
 #[cfg(feature = "server")]

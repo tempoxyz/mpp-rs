@@ -81,6 +81,51 @@ pub trait ChargeMethod: Clone + Send + Sync {
     /// This should match the `method` field in payment challenges.
     fn method(&self) -> &str;
 
+    /// Transform a charge request before challenge creation.
+    ///
+    /// This hook allows methods to modify the request based on:
+    /// - Method defaults (e.g., default currency, recipient)
+    /// - Credential presence (e.g., `feePayer: true` vs actual account)
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The charge request to transform
+    /// * `credential` - Optional credential (None for initial challenge, Some for verification)
+    ///
+    /// # Returns
+    ///
+    /// The transformed request. Default implementation returns the request unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn prepare_request(
+    ///     &self,
+    ///     request: ChargeRequest,
+    ///     credential: Option<&PaymentCredential>,
+    /// ) -> ChargeRequest {
+    ///     let mut req = request;
+    ///     // Apply defaults
+    ///     if req.currency.is_empty() {
+    ///         req.currency = self.default_currency.clone();
+    ///     }
+    ///     // Conditional feePayer based on credential presence
+    ///     if credential.is_some() {
+    ///         // Use actual fee payer account for verification
+    ///     } else {
+    ///         // Signal fee payer availability in challenge
+    ///     }
+    ///     req
+    /// }
+    /// ```
+    fn prepare_request(
+        &self,
+        request: ChargeRequest,
+        _credential: Option<&PaymentCredential>,
+    ) -> ChargeRequest {
+        request
+    }
+
     /// Verify a charge credential against the typed request.
     ///
     /// # Arguments
