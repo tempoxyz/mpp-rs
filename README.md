@@ -284,21 +284,6 @@ make check      # Format check, clippy, test, and build
 make fix        # Auto-fix formatting and clippy warnings
 ```
 
-### AI-Generated Changelogs
-
-PRs automatically generate changelog entries using [wevm/changelogs-rs](https://github.com/wevm/changelogs-rs). The `ai` parameter accepts any CLI that reads from stdin and outputs text:
-
-| Provider | Command | Required Secret |
-|----------|---------|-----------------|
-| Amp | `amp -x` | `AMP_API_KEY` |
-| Claude | `claude -p` | `ANTHROPIC_API_KEY` |
-| OpenAI | `openai api chat.completions` | `OPENAI_API_KEY` |
-| Gemini | `gemini` | `GOOGLE_API_KEY` |
-| Ollama | `ollama run llama3` | (none, runs locally) |
-| Custom | any CLI that reads stdin | (varies) |
-
-To switch providers, update `.github/workflows/changelog.yml`.
-
 ## License
 
 MIT OR Apache-2.0

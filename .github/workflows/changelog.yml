@@ -3,23 +3,6 @@ on:
   pull_request:
     types: [opened, synchronize]
 
-# AI-Generated Changelogs
-#
-# This workflow uses wevm/changelogs-rs to auto-generate changelog entries.
-# The `ai` parameter accepts any CLI that reads from stdin and outputs text.
-#
-# Supported AI Providers:
-# ┌──────────────┬─────────────────────────────┬─────────────────────────────────┐
-# │ Provider     │ Command                     │ Required Secret                 │
-# ├──────────────┼─────────────────────────────┼─────────────────────────────────┤
-# │ Amp          │ amp -x                      │ AMP_API_KEY                     │
-# │ Claude       │ claude -p                   │ ANTHROPIC_API_KEY               │
-# │ OpenAI       │ openai api chat.completions │ OPENAI_API_KEY                  │
-# │ Gemini       │ gemini                      │ GOOGLE_API_KEY                  │
-# │ Ollama       │ ollama run llama3           │ (none, runs locally)            │
-# │ Custom       │ any-cli-that-reads-stdin    │ (varies)                        │
-# └──────────────┴─────────────────────────────┴─────────────────────────────────┘
-
 jobs:
   check-changelog:
     runs-on: ubuntu-latest
