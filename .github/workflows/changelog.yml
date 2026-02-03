@@ -1,10 +1,11 @@
 name: Changelog
+
 on:
   pull_request:
     types: [opened, synchronize]
 
 jobs:
-  check-changelog:
+  changelog:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -12,16 +13,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
           fetch-depth: 0
-
-      - name: Install Amp CLI
-        run: npm install -g @sourcegraph/amp
-
-      - name: Generate changelog if missing
-        uses: wevm/changelogs-rs/gen@changelogs@0.4.0
-        with:
-          ai: 'amp -x'
-          conventional-commit: true
+      - name: Install changelogs
+        run: curl -sSL https://changelogs.sh | sh
+      - name: Generate changelog
         env:
-          AMP_API_KEY: ${{ secrets.AMP_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Skip if only infra/config files changed (no code changes requiring changelog)
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          CODE_CHANGES=$(echo "$CHANGED" | grep -vE '^(\.changelog/|\.github/|\.gitignore|README\.md|AGENTS\.md)' || true)
+          if [ -z "$CODE_CHANGES" ]; then
+            echo "No code changes requiring changelog, skipping"
+            exit 0
+          fi
+          ~/.local/bin/changelogs add --ecosystem rust --ai "claude" --ref origin/${{ github.base_ref }}
+      - name: Commit changelog
+        run: |
+          if [ -n "$(git status --porcelain .changelog/)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .changelog/
+            git commit -m "chore: add changelog"
+            git push
+          fi
