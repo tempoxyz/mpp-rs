@@ -16,18 +16,20 @@ jobs:
           fetch-depth: 0
       - name: Install changelogs
         run: curl -sSL https://changelogs.sh | sh
+      - name: Install Claude CLI
+        run: npm install -g @anthropic-ai/claude-code
       - name: Generate changelog
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           # Skip if only infra/config files changed (no code changes requiring changelog)
           CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
-          CODE_CHANGES=$(echo "$CHANGED" | grep -vE '^(\.changelog/|\.github/|\.gitignore|README\.md|AGENTS\.md)' || true)
+          CODE_CHANGES=$(echo "$CHANGED" | grep -vE '^(\.changelog/|\.github/|\.gitignore|README\.md|AGENTS\.md|RELEASE\.md)' || true)
           if [ -z "$CODE_CHANGES" ]; then
             echo "No code changes requiring changelog, skipping"
             exit 0
           fi
-          ~/.local/bin/changelogs add --ecosystem rust --ai "claude" --ref origin/${{ github.base_ref }}
+          ~/.local/bin/changelogs add --ecosystem rust --ai "claude -p" --ref origin/${{ github.base_ref }}
       - name: Commit changelog
         run: |
           if [ -n "$(git status --porcelain .changelog/)" ]; then
