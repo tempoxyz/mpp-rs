@@ -7,7 +7,7 @@
 //! - Intent schemas: [`ChargeRequest`]
 //! - Method details: [`TempoMethodDetails`], [`TempoChargeExt`]
 //! - Transaction types: [`TempoTransaction`], [`TempoTransactionRequest`]
-//! - Constants: [`CHAIN_ID`], [`METHOD_NAME`]
+//! - Constants: [`CHAIN_ID`], [`MODERATO_CHAIN_ID`], [`METHOD_NAME`]
 //!
 //! For client/server specific types, use:
 //! - `mpay::client::TempoProvider` (requires `client` + `http`)
@@ -27,8 +27,8 @@
 pub use crate::protocol::intents::ChargeRequest;
 pub use crate::protocol::methods::tempo::{
     Call, SignatureType, TempoChargeExt, TempoMethodDetails, TempoTransaction,
-    TempoTransactionRequest, CHAIN_ID, DEFAULT_EXPIRES_MINUTES, DEFAULT_RPC_URL, MAINNET_CHAIN_ID,
-    METHOD_NAME, TEMPO_SEND_TRANSACTION_METHOD, TEMPO_TX_TYPE_ID,
+    TempoTransactionRequest, CHAIN_ID, DEFAULT_EXPIRES_MINUTES, DEFAULT_RPC_URL, METHOD_NAME,
+    MODERATO_CHAIN_ID, TEMPO_SEND_TRANSACTION_METHOD, TEMPO_TX_TYPE_ID,
 };
 
 #[cfg(feature = "server")]

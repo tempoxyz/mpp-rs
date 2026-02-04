@@ -96,7 +96,7 @@ impl TempoChargeExt for ChargeRequest {
     }
 
     fn is_tempo_moderato(&self) -> bool {
-        self.chain_id() == Some(super::CHAIN_ID)
+        self.chain_id() == Some(super::MODERATO_CHAIN_ID)
     }
 }
 

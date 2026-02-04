@@ -1,7 +1,7 @@
 //! Tempo-specific types and helpers for Web Payment Auth.
 //!
 //! This module provides Tempo blockchain-specific implementations.
-//! Tempo uses chain_id 42431 (Moderato testnet, per IETF spec) and supports TIP-20 tokens.
+//! Tempo mainnet uses chain_id 4217; Moderato testnet uses 42431. Both support TIP-20 tokens.
 //!
 //! # Types
 //!
@@ -12,7 +12,8 @@
 //!
 //! # Constants
 //!
-//! - [`CHAIN_ID`]: Tempo Moderato chain ID (42431)
+//! - [`CHAIN_ID`]: Tempo mainnet chain ID (4217)
+//! - [`MODERATO_CHAIN_ID`]: Tempo Moderato testnet chain ID (42431)
 //! - [`METHOD_NAME`]: Payment method name ("tempo")
 //!
 //! # Challenge Helpers
@@ -84,13 +85,14 @@
 //! ```
 //! use mpay::protocol::core::parse_www_authenticate;
 //! use mpay::protocol::intents::ChargeRequest;
-//! use mpay::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
+//! use mpay::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID, MODERATO_CHAIN_ID};
 //!
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
 //! let req: ChargeRequest = challenge.request.decode().unwrap();
 //! assert!(!req.fee_payer());
-//! assert_eq!(CHAIN_ID, 42431);
+//! assert_eq!(CHAIN_ID, 4217);
+//! assert_eq!(MODERATO_CHAIN_ID, 42431);
 //! ```
 
 pub mod charge;
@@ -110,11 +112,11 @@ pub use types::TempoMethodDetails;
 #[cfg(feature = "server")]
 pub use method::ChargeMethod;
 
-/// Tempo Moderato testnet chain ID.
-pub const CHAIN_ID: u64 = 42431;
-
 /// Tempo mainnet chain ID.
-pub const MAINNET_CHAIN_ID: u64 = 4217;
+pub const CHAIN_ID: u64 = 4217;
+
+/// Tempo Moderato testnet chain ID.
+pub const MODERATO_CHAIN_ID: u64 = 42431;
 
 /// Default RPC URL for Tempo mainnet.
 pub const DEFAULT_RPC_URL: &str = "https://rpc.tempo.xyz";
