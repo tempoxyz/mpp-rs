@@ -1,0 +1,23 @@
+# How to bump packages that depend on changed packages
+# "patch" | "minor" | "none"
+dependent_bump = "patch"
+
+[changelog]
+# "per-crate" - CHANGELOG.md in each crate
+# "root" - Single CHANGELOG.md at workspace root
+format = "root"
+
+# Fixed groups: all crates always share the same version
+# [[fixed]]
+# members = ["crate-a", "crate-b"]
+
+# Linked groups: versions sync when released together
+# [[linked]]
+# members = ["sdk-core", "sdk-macros"]
+
+# Packages to ignore
+ignore = []
+
+# AI-assisted changelog generation
+# [ai]
+# command = "amp ask"  # or "gh copilot suggest -t shell"
