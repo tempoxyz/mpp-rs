@@ -81,6 +81,52 @@ pub trait ChargeMethod: Clone + Send + Sync {
     /// This should match the `method` field in payment challenges.
     fn method(&self) -> &str;
 
+    /// Transform a charge request before challenge creation.
+    ///
+    /// This hook is called during **challenge creation only** (when `credential` is `None`).
+    /// It allows methods to apply defaults and normalize the request before it gets
+    /// encoded into the challenge. The credential parameter is provided for future
+    /// extensibility but should typically be `None` at call sites.
+    ///
+    /// **Important**: This must be a fast, synchronous, deterministic operation.
+    /// Do not perform network I/O here. Any async operations should happen in
+    /// the method constructor or in `verify()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The charge request to transform
+    /// * `credential` - Always `None` during challenge creation
+    ///
+    /// # Returns
+    ///
+    /// The transformed request. Default implementation returns the request unchanged.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn prepare_request(
+    ///     &self,
+    ///     request: ChargeRequest,
+    ///     _credential: Option<&PaymentCredential>,
+    /// ) -> ChargeRequest {
+    ///     let mut req = request;
+    ///     if req.currency.is_empty() {
+    ///         req.currency = self.default_currency.clone();
+    ///     }
+    ///     if req.recipient.is_none() {
+    ///         req.recipient = Some(self.default_recipient.clone());
+    ///     }
+    ///     req
+    /// }
+    /// ```
+    fn prepare_request(
+        &self,
+        request: ChargeRequest,
+        _credential: Option<&PaymentCredential>,
+    ) -> ChargeRequest {
+        request
+    }
+
     /// Verify a charge credential against the typed request.
     ///
     /// # Arguments

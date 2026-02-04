@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::CHAIN_ID;
+use super::MODERATO_CHAIN_ID;
 
 /// Tempo method-specific details in payment requests.
 ///
@@ -58,7 +58,7 @@ impl TempoMethodDetails {
 
     /// Check if this is for the Tempo Moderato network.
     pub fn is_tempo_moderato(&self) -> bool {
-        self.chain_id == Some(CHAIN_ID)
+        self.chain_id == Some(MODERATO_CHAIN_ID)
     }
 
     /// Get the memo as a reference, if present.

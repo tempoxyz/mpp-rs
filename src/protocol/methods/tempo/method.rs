@@ -602,7 +602,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::MODERATO_CHAIN_ID, *};
 
     #[test]
     fn test_transfer_selector() {
@@ -734,7 +734,9 @@ mod tests {
 
     #[test]
     fn test_chain_id_constant() {
-        // Verify the Tempo Moderato chain ID constant
-        assert_eq!(CHAIN_ID, 42431);
+        // Verify the Tempo mainnet chain ID constant
+        assert_eq!(CHAIN_ID, 4217);
+        // Verify the Tempo Moderato testnet chain ID constant
+        assert_eq!(MODERATO_CHAIN_ID, 42431);
     }
 }
