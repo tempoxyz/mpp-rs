@@ -237,7 +237,9 @@ pub fn charge_challenge_with_options(
                 OffsetDateTime::now_utc() + Duration::minutes(DEFAULT_EXPIRES_MINUTES as i64);
             default_expires = expiry_time
                 .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|_| expiry_time.to_string());
+                .map_err(|e| {
+                    crate::error::MppError::InvalidConfig(format!("failed to format expires: {e}"))
+                })?;
             Some(default_expires.as_str())
         }
     };

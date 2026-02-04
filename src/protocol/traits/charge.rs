@@ -83,14 +83,19 @@ pub trait ChargeMethod: Clone + Send + Sync {
 
     /// Transform a charge request before challenge creation.
     ///
-    /// This hook allows methods to modify the request based on:
-    /// - Method defaults (e.g., default currency, recipient)
-    /// - Credential presence (e.g., `feePayer: true` vs actual account)
+    /// This hook is called during **challenge creation only** (when `credential` is `None`).
+    /// It allows methods to apply defaults and normalize the request before it gets
+    /// encoded into the challenge. The credential parameter is provided for future
+    /// extensibility but should typically be `None` at call sites.
+    ///
+    /// **Important**: This must be a fast, synchronous, deterministic operation.
+    /// Do not perform network I/O here. Any async operations should happen in
+    /// the method constructor or in `verify()`.
     ///
     /// # Arguments
     ///
     /// * `request` - The charge request to transform
-    /// * `credential` - Optional credential (None for initial challenge, Some for verification)
+    /// * `credential` - Always `None` during challenge creation
     ///
     /// # Returns
     ///
@@ -102,18 +107,14 @@ pub trait ChargeMethod: Clone + Send + Sync {
     /// fn prepare_request(
     ///     &self,
     ///     request: ChargeRequest,
-    ///     credential: Option<&PaymentCredential>,
+    ///     _credential: Option<&PaymentCredential>,
     /// ) -> ChargeRequest {
     ///     let mut req = request;
-    ///     // Apply defaults
     ///     if req.currency.is_empty() {
     ///         req.currency = self.default_currency.clone();
     ///     }
-    ///     // Conditional feePayer based on credential presence
-    ///     if credential.is_some() {
-    ///         // Use actual fee payer account for verification
-    ///     } else {
-    ///         // Signal fee payer availability in challenge
+    ///     if req.recipient.is_none() {
+    ///         req.recipient = Some(self.default_recipient.clone());
     ///     }
     ///     req
     /// }
