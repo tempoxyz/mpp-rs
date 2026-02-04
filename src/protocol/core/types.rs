@@ -357,15 +357,12 @@ impl fmt::Display for PayloadType {
 pub enum ReceiptStatus {
     /// Payment succeeded
     Success,
-    /// Payment failed
-    Failed,
 }
 
 impl fmt::Display for ReceiptStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Success => write!(f, "success"),
-            Self::Failed => write!(f, "failed"),
         }
     }
 }
@@ -504,10 +501,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ReceiptStatus::Success).unwrap(),
             "\"success\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ReceiptStatus::Failed).unwrap(),
-            "\"failed\""
         );
     }
 }
