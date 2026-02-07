@@ -6,7 +6,7 @@ Using `mpay` with [axum](https://docs.rs/axum) for server-side payment gating.
 
 ```toml
 [dependencies]
-mpay = "0.1"
+mpay = "0.2"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
@@ -21,32 +21,31 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use mpay::{ChargeRequest, parse_authorization};
-use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+use mpay::parse_authorization;
+use mpay::server::{Mpay, tempo, TempoConfig, TempoChargeMethod, TempoProvider};
 use std::sync::Arc;
 
 // Create payment handler at startup
-let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
-let method = TempoChargeMethod::new(provider);
-let payment = Arc::new(Mpay::new(method, "api.example.com", "my-server-secret"));
+let mpay = Arc::new(Mpay::create(
+    tempo(TempoConfig {
+        currency: "0x20c0000000000000000000000000000000000001",
+        recipient: "0xabc...123",
+    })
+    .rpc_url("https://rpc.moderato.tempo.xyz")
+    .realm("api.example.com")
+    .secret_key("my-server-secret"),
+).unwrap());
 
 async fn paid_endpoint(
-    State(payment): State<Arc<Mpay<TempoChargeMethod<_>>>>,
+    State(mpay): State<Arc<Mpay<TempoChargeMethod<TempoProvider>>>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let request = ChargeRequest {
-        amount: "1000000".into(),
-        currency: "0x...".into(),
-        recipient: Some("0x...".into()),
-        ..Default::default()
-    };
-
     // Check for payment credential
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Ok(credential) = parse_authorization(auth_str) {
                 // Verify the payment
-                if let Ok(receipt) = payment.verify(&credential, &request).await {
+                if let Ok(receipt) = mpay.verify_credential(&credential).await {
                     return (
                         StatusCode::OK,
                         [("payment-receipt", receipt.to_header().unwrap())],
@@ -58,7 +57,7 @@ async fn paid_endpoint(
     }
 
     // No valid payment - return 402 with challenge
-    let challenge = payment.charge_challenge("1000000", "0x...", "0x...").unwrap();
+    let challenge = mpay.charge("0.10").unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -127,15 +126,15 @@ fn app() -> Router {
 
 ```rust
 async fn dynamic_pricing(
-    State(payment): State<Arc<PaymentHandler>>,
+    State(mpay): State<Arc<Mpay<TempoChargeMethod<TempoProvider>>>>,
     Path(resource_id): Path<String>,
 ) -> impl IntoResponse {
     // Look up price for this resource
     let price = get_resource_price(&resource_id).await;
 
-    // Generate challenge with dynamic pricing (secret_key already bound)
-    let challenge = payment
-        .charge_challenge(&price.to_string(), USDC_ADDRESS, MERCHANT_ADDRESS)
+    // Generate challenge with dynamic pricing (amount in base units, e.g. "1000000" = 1 pathUSD)
+    let challenge = mpay
+        .charge_challenge(&price.to_string(), PATH_USD, MERCHANT_ADDRESS)
         .unwrap();
 
     (
