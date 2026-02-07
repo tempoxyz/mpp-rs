@@ -12,6 +12,7 @@ pub enum AmountError {
     InvalidFormat(String),
     TooManyDecimals { given: usize, max: u32 },
     ZeroOrNegative,
+    Overflow,
 }
 
 impl fmt::Display for AmountError {
@@ -27,6 +28,7 @@ impl fmt::Display for AmountError {
                 )
             }
             AmountError::ZeroOrNegative => write!(f, "amount must be greater than zero"),
+            AmountError::Overflow => write!(f, "amount too large"),
         }
     }
 }
@@ -121,13 +123,17 @@ pub fn parse_dollar_amount(
             .map_err(|_| AmountError::InvalidFormat(amount.to_string()))?
     };
 
+    if decimals > 38 {
+        return Err(AmountError::Overflow);
+    }
+
     let scale: u128 = 10u128.pow(decimals);
     let frac_scale: u128 = 10u128.pow(decimals - frac_len as u32);
 
     let base_units = int_val
         .checked_mul(scale)
         .and_then(|v| v.checked_add(frac_val.checked_mul(frac_scale)?))
-        .ok_or_else(|| AmountError::InvalidFormat("amount overflow".to_string()))?;
+        .ok_or(AmountError::Overflow)?;
 
     if base_units == 0 {
         return Err(AmountError::ZeroOrNegative);
@@ -231,5 +237,23 @@ mod tests {
         assert_eq!(parse_dollar_amount(".5", 6).unwrap(), "500000");
         assert_eq!(parse_dollar_amount(".123456", 6).unwrap(), "123456");
         assert_eq!(parse_dollar_amount(".000001", 6).unwrap(), "1");
+    }
+
+    #[test]
+    fn test_overflow_large_amount() {
+        let err = parse_dollar_amount("999999999999999999999999999999999", 6).unwrap_err();
+        assert!(matches!(err, AmountError::Overflow));
+    }
+
+    #[test]
+    fn test_overflow_large_decimals() {
+        let err = parse_dollar_amount("1", 39).unwrap_err();
+        assert!(matches!(err, AmountError::Overflow));
+    }
+
+    #[test]
+    fn test_decimals_boundary() {
+        assert!(parse_dollar_amount("1", 38).is_ok());
+        assert!(parse_dollar_amount("1", 39).is_err());
     }
 }
