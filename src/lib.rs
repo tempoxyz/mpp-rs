@@ -68,6 +68,11 @@ pub use protocol::core::{
 
 // Intent types
 pub use protocol::intents::ChargeRequest;
+pub use protocol::intents::StreamRequest;
+
+// Stream types (requires tempo feature for alloy types)
+#[cfg(feature = "tempo")]
+pub use protocol::methods::tempo::stream::StreamCredential;
 
 // ==================== Alloy Re-exports ====================
 

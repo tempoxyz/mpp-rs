@@ -96,6 +96,7 @@
 //! ```
 
 pub mod charge;
+pub mod stream;
 pub mod transaction;
 pub mod types;
 
@@ -129,6 +130,12 @@ pub const METHOD_NAME: &str = "tempo";
 
 /// Charge intent name.
 pub const INTENT_CHARGE: &str = "charge";
+
+/// Stream intent name.
+pub const INTENT_STREAM: &str = "stream";
+
+// Re-export stream types at the tempo level for convenience.
+pub use stream::{StreamCredential, StreamCredentialPayload};
 
 /// Create a Tempo charge challenge with minimal parameters.
 ///
@@ -261,6 +268,153 @@ pub fn charge_challenge_with_options(
         realm: realm.to_string(),
         method: METHOD_NAME.into(),
         intent: INTENT_CHARGE.into(),
+        request: encoded_request,
+        expires: expires.map(|s| s.to_string()),
+        description: description.map(|s| s.to_string()),
+        digest: None,
+    })
+}
+
+/// Create a Tempo stream challenge with minimal parameters.
+///
+/// This creates a payment challenge for streaming (pay-as-you-go) payments
+/// using cumulative vouchers over a payment channel.
+///
+/// # Arguments
+///
+/// * `secret_key` - Server secret key for HMAC-bound challenge ID
+/// * `realm` - Protection space / realm (e.g., "api.example.com")
+/// * `currency` - Token address (e.g., pathUSD address)
+/// * `recipient` - Recipient/payee address
+/// * `escrow_contract` - Address of the on-chain escrow contract
+///
+/// # Examples
+///
+/// ```
+/// use mpay::protocol::methods::tempo;
+///
+/// let challenge = tempo::stream_challenge(
+///     "my-server-secret",
+///     "api.example.com",
+///     "0x20c0000000000000000000000000000000000001",
+///     "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+///     "0xescrow",
+/// ).unwrap();
+///
+/// assert_eq!(challenge.method.as_str(), "tempo");
+/// assert_eq!(challenge.intent.as_str(), "stream");
+/// ```
+#[must_use = "this returns a new PaymentChallenge and does not have side effects"]
+pub fn stream_challenge(
+    secret_key: &str,
+    realm: &str,
+    currency: &str,
+    recipient: &str,
+    escrow_contract: &str,
+) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
+    let request = crate::protocol::intents::StreamRequest {
+        currency: currency.to_string(),
+        recipient: recipient.to_string(),
+        method_details: Some(crate::protocol::intents::StreamMethodDetails {
+            escrow_contract: escrow_contract.to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    stream_challenge_with_options(secret_key, realm, &request, None, None)
+}
+
+/// Create a Tempo stream challenge with full options.
+///
+/// Use this when you need more control over the challenge, such as:
+/// - Per-unit cost amount
+/// - Suggested deposit for auto-managed clients
+/// - Custom expiration times
+/// - Minimum voucher delta
+/// - Chain ID specification
+///
+/// # Arguments
+///
+/// * `secret_key` - Server secret key for HMAC-bound challenge ID
+/// * `realm` - Protection space / realm (e.g., "api.example.com")
+/// * `request` - A fully configured [`StreamRequest`](crate::protocol::intents::StreamRequest)
+/// * `expires` - Optional challenge expiration (ISO 8601)
+/// * `description` - Optional human-readable description
+///
+/// # Examples
+///
+/// ```
+/// use mpay::protocol::intents::{StreamRequest, StreamMethodDetails};
+/// use mpay::protocol::methods::tempo;
+///
+/// let request = StreamRequest {
+///     amount: Some("75".into()),
+///     currency: "0x20c0000000000000000000000000000000000001".into(),
+///     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into(),
+///     decimals: Some(6),
+///     suggested_deposit: Some("10000000".into()),
+///     method_details: Some(StreamMethodDetails {
+///         escrow_contract: "0xescrow".into(),
+///         min_voucher_delta: Some("100000".into()),
+///         chain_id: Some(42431),
+///         ..Default::default()
+///     }),
+///     ..Default::default()
+/// };
+///
+/// let challenge = tempo::stream_challenge_with_options(
+///     "my-server-secret",
+///     "api.example.com",
+///     &request,
+///     None,
+///     Some("Metered API access"),
+/// ).unwrap();
+///
+/// assert_eq!(challenge.description, Some("Metered API access".to_string()));
+/// ```
+pub fn stream_challenge_with_options(
+    secret_key: &str,
+    realm: &str,
+    request: &crate::protocol::intents::StreamRequest,
+    expires: Option<&str>,
+    description: Option<&str>,
+) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
+    use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+    use time::{Duration, OffsetDateTime};
+
+    let encoded_request = Base64UrlJson::from_typed(request)?;
+
+    let default_expires;
+    let expires = match expires {
+        Some(e) => Some(e),
+        None => {
+            let expiry_time =
+                OffsetDateTime::now_utc() + Duration::minutes(DEFAULT_EXPIRES_MINUTES as i64);
+            default_expires = expiry_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| {
+                    crate::error::MppError::InvalidConfig(format!("failed to format expires: {e}"))
+                })?;
+            Some(default_expires.as_str())
+        }
+    };
+
+    let id = generate_challenge_id(
+        secret_key,
+        realm,
+        METHOD_NAME,
+        INTENT_STREAM,
+        encoded_request.raw(),
+        expires,
+        None,
+    );
+
+    Ok(PaymentChallenge {
+        id,
+        realm: realm.to_string(),
+        method: METHOD_NAME.into(),
+        intent: INTENT_STREAM.into(),
         request: encoded_request,
         expires: expires.map(|s| s.to_string()),
         description: description.map(|s| s.to_string()),
@@ -566,6 +720,144 @@ mod tests {
             challenge1.id, challenge2.id,
             "Different secrets should produce different challenge IDs"
         );
+    }
+
+    // ==================== Stream Challenge Tests ====================
+
+    #[test]
+    fn test_stream_challenge_basic() {
+        let challenge = stream_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "0xescrow",
+        )
+        .unwrap();
+
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "stream");
+        assert!(challenge.expires.is_some());
+
+        // Decode the request and verify
+        let req: crate::protocol::intents::StreamRequest =
+            challenge.request.decode().unwrap();
+        assert_eq!(req.currency, "0x20c0000000000000000000000000000000000001");
+        assert_eq!(req.recipient, "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2");
+        assert_eq!(
+            req.method_details.as_ref().unwrap().escrow_contract,
+            "0xescrow"
+        );
+    }
+
+    #[test]
+    fn test_stream_challenge_with_options() {
+        use crate::protocol::intents::{StreamMethodDetails, StreamRequest};
+
+        let request = StreamRequest {
+            amount: Some("75".into()),
+            currency: "0x20c0000000000000000000000000000000000001".into(),
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into(),
+            decimals: Some(6),
+            suggested_deposit: Some("10000000".into()),
+            method_details: Some(StreamMethodDetails {
+                escrow_contract: "0xescrow".into(),
+                min_voucher_delta: Some("100000".into()),
+                chain_id: Some(42431),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let challenge = stream_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-06-01T00:00:00Z"),
+            Some("Metered API access"),
+        )
+        .unwrap();
+
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "stream");
+        assert_eq!(
+            challenge.expires,
+            Some("2026-06-01T00:00:00Z".to_string())
+        );
+        assert_eq!(
+            challenge.description,
+            Some("Metered API access".to_string())
+        );
+
+        let req: StreamRequest = challenge.request.decode().unwrap();
+        assert_eq!(req.amount, Some("75".to_string()));
+        assert_eq!(req.decimals, Some(6));
+        assert_eq!(req.suggested_deposit, Some("10000000".to_string()));
+        assert_eq!(
+            req.method_details.as_ref().unwrap().min_voucher_delta,
+            Some("100000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stream_challenge_deterministic() {
+        use crate::protocol::intents::{StreamMethodDetails, StreamRequest};
+
+        let request = StreamRequest {
+            currency: "0x20c0000000000000000000000000000000000001".into(),
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into(),
+            method_details: Some(StreamMethodDetails {
+                escrow_contract: "0xescrow".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let c1 = stream_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-06-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+
+        let c2 = stream_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-06-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(c1.id, c2.id, "Same parameters should produce same ID");
+    }
+
+    #[test]
+    fn test_stream_vs_charge_different_ids() {
+        // Stream and charge challenges for the same realm should produce different IDs
+        let stream = stream_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "0xescrow",
+        )
+        .unwrap();
+
+        let charge = charge_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "1000000",
+            "0x20c0000000000000000000000000000000000001",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        assert_ne!(stream.id, charge.id);
+        assert_eq!(stream.intent.as_str(), "stream");
+        assert_eq!(charge.intent.as_str(), "charge");
     }
 
     /// Cross-SDK compatibility tests using conformance test vectors.

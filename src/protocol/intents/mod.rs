@@ -26,5 +26,7 @@
 //! ```
 
 pub mod charge;
+pub mod stream;
 
 pub use charge::ChargeRequest;
+pub use stream::{StreamMethodDetails, StreamRequest};
