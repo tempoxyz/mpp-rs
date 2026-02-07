@@ -43,7 +43,7 @@ pub mod tempo;
 // ==================== Flat Re-exports ====================
 
 // Error types
-pub use error::{MppError, Result, ResultExt, SigningContext};
+pub use error::{MppError, Result};
 
 // RFC 9457 Problem Details
 pub use error::{PaymentError, PaymentErrorDetails, PROBLEM_TYPE_BASE};

@@ -38,7 +38,7 @@ pub use alloy::primitives::{Address, U256};
 /// ```
 pub fn parse_address(s: &str) -> Result<Address> {
     Address::from_str(s)
-        .map_err(|e| MppError::invalid_address(format!("Invalid EVM address '{}': {}", s, e)))
+        .map_err(|e| MppError::InvalidConfig(format!("Invalid EVM address '{}': {}", s, e)))
 }
 
 /// Parse a U256 amount from a string.
