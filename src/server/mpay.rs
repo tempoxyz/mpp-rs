@@ -557,8 +557,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded =
-            crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
         let raw = encoded.raw().to_string();
 
         let secret = "test-secret";
