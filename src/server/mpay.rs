@@ -110,6 +110,21 @@ where
         self.decimals
     }
 
+    #[cfg(feature = "tempo")]
+    fn require_bound_config(&self) -> Result<(&str, &str)> {
+        let currency = self.currency.as_deref().ok_or_else(|| {
+            crate::error::MppError::InvalidConfig(
+                "currency not configured — use Mpay::create() or set currency".into(),
+            )
+        })?;
+        let recipient = self.recipient.as_deref().ok_or_else(|| {
+            crate::error::MppError::InvalidConfig(
+                "recipient not configured — use Mpay::create() or set recipient".into(),
+            )
+        })?;
+        Ok((currency, recipient))
+    }
+
     /// Generate a charge challenge for a dollar amount.
     ///
     /// Requires currency and recipient to be bound (via [`Mpay::create()`]).
@@ -127,24 +142,7 @@ where
     /// ```
     #[cfg(feature = "tempo")]
     pub fn charge(&self, amount: &str) -> Result<PaymentChallenge> {
-        let currency = self.currency.as_deref().ok_or_else(|| {
-            crate::error::MppError::InvalidConfig(
-                "currency not configured — use Mpay::create() or set currency".into(),
-            )
-        })?;
-        let recipient = self.recipient.as_deref().ok_or_else(|| {
-            crate::error::MppError::InvalidConfig(
-                "recipient not configured — use Mpay::create() or set recipient".into(),
-            )
-        })?;
-        let base_units = super::parse_dollar_amount(amount, self.decimals)?;
-        crate::protocol::methods::tempo::charge_challenge(
-            &self.secret_key,
-            &self.realm,
-            &base_units,
-            currency,
-            recipient,
-        )
+        self.charge_with_options(amount, super::ChargeOptions::default())
     }
 
     /// Generate a charge challenge with a dollar amount and additional options.
@@ -156,12 +154,7 @@ where
         amount: &str,
         options: super::ChargeOptions<'_>,
     ) -> Result<PaymentChallenge> {
-        let currency = self.currency.as_deref().ok_or_else(|| {
-            crate::error::MppError::InvalidConfig("currency not configured".into())
-        })?;
-        let recipient = self.recipient.as_deref().ok_or_else(|| {
-            crate::error::MppError::InvalidConfig("recipient not configured".into())
-        })?;
+        let (currency, recipient) = self.require_bound_config()?;
         let base_units = super::parse_dollar_amount(amount, self.decimals)?;
         let mut request = ChargeRequest {
             amount: base_units,
@@ -187,7 +180,7 @@ where
     ///
     /// Use this when you want to specify amount, currency, and recipient
     /// per-call instead of using bound defaults. Amount is in base units
-    /// (e.g., `"1000000"` for 1 USDC).
+    /// (e.g., `"1000000"` for 1 pathUSD).
     #[cfg(feature = "tempo")]
     pub fn charge_challenge(
         &self,

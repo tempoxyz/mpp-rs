@@ -141,8 +141,8 @@ pub const INTENT_CHARGE: &str = "charge";
 /// * `secret_key` - Server secret key for HMAC-bound challenge ID.
 ///   Enables stateless verification of payment credentials.
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
-/// * `amount` - Amount in atomic units (e.g., "1000000" for 1 USDC)
-/// * `currency` - Token address (e.g., alphaUSD address)
+/// * `amount` - Amount in atomic units (e.g., "1000000" for 1 pathUSD)
+/// * `currency` - Token address (e.g., pathUSD address)
 /// * `recipient` - Recipient address for the payment
 ///
 /// # Examples

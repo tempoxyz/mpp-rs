@@ -31,6 +31,7 @@ let mpay = Arc::new(Mpay::create(
         currency: "0x20c0000000000000000000000000000000000001",
         recipient: "0xabc...123",
     })
+    .rpc_url("https://rpc.moderato.tempo.xyz")
     .realm("api.example.com")
     .secret_key("my-server-secret"),
 ).unwrap());
@@ -131,9 +132,9 @@ async fn dynamic_pricing(
     // Look up price for this resource
     let price = get_resource_price(&resource_id).await;
 
-    // Generate challenge with dynamic pricing (amount in base units, e.g. "1000000" = 1 USDC)
+    // Generate challenge with dynamic pricing (amount in base units, e.g. "1000000" = 1 pathUSD)
     let challenge = mpay
-        .charge_challenge(&price.to_string(), USDC_ADDRESS, MERCHANT_ADDRESS)
+        .charge_challenge(&price.to_string(), PATH_USD, MERCHANT_ADDRESS)
         .unwrap();
 
     (

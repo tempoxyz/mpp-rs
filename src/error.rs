@@ -679,12 +679,12 @@ mod tests {
     #[test]
     fn test_token_config_not_found_display() {
         let err = MppError::TokenConfigNotFound {
-            asset: "USDC".to_string(),
+            asset: "pathUSD".to_string(),
             network: "ethereum".to_string(),
         };
         let display = err.to_string();
         assert!(
-            display.contains("Token configuration not found for asset USDC on network ethereum")
+            display.contains("Token configuration not found for asset pathUSD on network ethereum")
         );
     }
 

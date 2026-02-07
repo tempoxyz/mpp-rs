@@ -49,7 +49,7 @@ pub use crate::protocol::methods::tempo::{
 /// Only `currency` and `recipient` are required. Everything else has smart defaults.
 #[cfg(feature = "tempo")]
 pub struct TempoConfig<'a> {
-    /// Token address (e.g., αUSD).
+    /// Token address (e.g., pathUSD).
     pub currency: &'a str,
     /// Recipient address for payments.
     pub recipient: &'a str,
@@ -118,7 +118,7 @@ pub struct ChargeOptions<'a> {
 /// - **rpc_url**: `https://rpc.tempo.xyz`
 /// - **realm**: `"MPP Payment"`
 /// - **secret_key**: reads `MPAY_SECRET_KEY` env var, or generates a random UUID
-/// - **decimals**: `6` (for αUSD / standard stablecoins)
+/// - **decimals**: `6` (for pathUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example

@@ -434,12 +434,12 @@ mod tests {
 
     #[test]
     fn test_base64url_json() {
-        let value = serde_json::json!({"amount": "1000", "currency": "USDC"});
+        let value = serde_json::json!({"amount": "1000", "currency": "pathUSD"});
         let b64 = Base64UrlJson::from_value(&value).unwrap();
 
         let decoded = b64.decode_value().unwrap();
         assert_eq!(decoded["amount"], "1000");
-        assert_eq!(decoded["currency"], "USDC");
+        assert_eq!(decoded["currency"], "pathUSD");
 
         // Can also decode to typed
         #[derive(Deserialize)]

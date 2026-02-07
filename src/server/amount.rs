@@ -51,7 +51,7 @@ impl From<AmountError> for crate::error::MppError {
 /// # Arguments
 ///
 /// * `amount` - Dollar amount string (e.g., `"0.10"`, `"1"`, `"100.50"`)
-/// * `decimals` - Number of decimal places for the token (e.g., 6 for USDC)
+/// * `decimals` - Number of decimal places for the token (e.g., 6 for pathUSD)
 ///
 /// # Examples
 ///
