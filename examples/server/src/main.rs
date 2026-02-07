@@ -51,29 +51,31 @@ use axum::{
     routing::get,
     Router,
 };
-use mpay::server::{tempo_provider, Mpay, TempoChargeMethod};
-use mpay::{parse_authorization, ChargeRequest, PaymentCredential};
-use std::sync::{Arc, LazyLock};
+use mpay::server::{Mpay, tempo, TempoChargeMethod, TempoConfig};
+use mpay::{parse_authorization, PaymentCredential};
+use std::sync::Arc;
 
 const REALM: &str = "api.example.com";
-const ALPHA_USD: &str = "0x20c0000000000000000000000000000000000001";
 const RPC_URL: &str = "https://rpc.moderato.tempo.xyz";
 const SECRET_KEY: &str = "example-server-secret-key";
-
-static MERCHANT_ADDRESS: LazyLock<String> =
-    LazyLock::new(|| std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set"));
 
 type PaymentHandler = Mpay<TempoChargeMethod<mpay::server::TempoProvider>>;
 
 #[tokio::main]
 async fn main() {
-    LazyLock::force(&MERCHANT_ADDRESS);
+    let merchant_address =
+        std::env::var("MERCHANT_ADDRESS").expect("MERCHANT_ADDRESS must be set");
 
-    let provider = tempo_provider(RPC_URL).expect("failed to create provider");
-    let method = TempoChargeMethod::new(provider);
-
-    // Create payment handler with bound secret_key
-    let payment = Mpay::new(method, REALM, SECRET_KEY);
+    let payment = Mpay::create(
+        tempo(TempoConfig {
+            currency: "0x20c0000000000000000000000000000000000001",
+            recipient: &merchant_address,
+        })
+        .rpc_url(RPC_URL)
+        .realm(REALM)
+        .secret_key(SECRET_KEY),
+    )
+    .expect("failed to create payment handler");
 
     let app = Router::new()
         .route("/free", get(free_endpoint))
@@ -93,15 +95,8 @@ async fn paid_endpoint(
     State(payment): State<Arc<PaymentHandler>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let request = ChargeRequest {
-        amount: "1000000".into(),
-        currency: ALPHA_USD.into(),
-        recipient: Some(MERCHANT_ADDRESS.clone()),
-        ..Default::default()
-    };
-
     if let Some(credential) = parse_credential(&headers) {
-        match payment.verify(&credential, &request).await {
+        match payment.verify_credential(&credential).await {
             Ok(receipt) => {
                 return (
                     StatusCode::OK,
@@ -116,10 +111,7 @@ async fn paid_endpoint(
         }
     }
 
-    // Generate challenge (secret_key already bound to payment handler)
-    let challenge = payment
-        .charge_challenge("1000000", ALPHA_USD, &MERCHANT_ADDRESS)
-        .unwrap();
+    let challenge = payment.charge("1.00").unwrap();
 
     (
         StatusCode::PAYMENT_REQUIRED,
