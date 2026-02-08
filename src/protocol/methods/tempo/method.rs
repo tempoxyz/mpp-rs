@@ -27,6 +27,7 @@ use alloy::network::ReceiptResponse;
 use alloy::primitives::{hex, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use alloy::rlp::Decodable as _;
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
@@ -148,6 +149,15 @@ where
                 ))
             })?;
 
+        self.verify_receipt(&receipt, tx_hash, charge)
+    }
+
+    fn verify_receipt(
+        &self,
+        receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
+        tx_hash: &str,
+        charge: &ChargeRequest,
+    ) -> Result<Receipt, VerificationError> {
         if !receipt.status() {
             return Err(VerificationError::transaction_failed(format!(
                 "Transaction {} reverted",
@@ -166,9 +176,8 @@ where
         })?;
         let memo = charge.memo();
 
-        // Tempo uses TIP-20 tokens exclusively (no native token transfers)
         self.verify_tip20_transfer(
-            &receipt,
+            receipt,
             currency,
             expected_recipient,
             expected_amount,
@@ -475,7 +484,7 @@ where
         signed_tx: &str,
         charge: &ChargeRequest,
         expected_chain_id: u64,
-    ) -> Result<B256, VerificationError> {
+    ) -> Result<Receipt, VerificationError> {
         let tx_bytes = signed_tx
             .parse::<Bytes>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {}", e)))?;
@@ -510,25 +519,15 @@ where
             ));
         }
 
-        let pending = self
+        let canonical_tx = format!("0x{}", hex::encode(&tx_bytes));
+        let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
             .provider
-            .send_raw_transaction(&tx_bytes)
+            .raw_request(Cow::Borrowed("eth_sendRawTransactionSync"), (canonical_tx,))
             .await
             .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
 
-        // Wait for transaction to be mined
-        let receipt = pending.get_receipt().await.map_err(|e| {
-            VerificationError::network_error(format!("Failed to get receipt: {}", e))
-        })?;
-
-        if !receipt.status() {
-            return Err(VerificationError::transaction_failed(format!(
-                "Transaction {} reverted",
-                receipt.transaction_hash()
-            )));
-        }
-
-        Ok(receipt.transaction_hash())
+        let tx_hash = format!("{:#x}", receipt.transaction_hash());
+        self.verify_receipt(&receipt, &tx_hash, charge)
     }
 }
 
@@ -586,15 +585,14 @@ where
                 this.verify_hash(credential.payload.tx_hash().unwrap(), &request)
                     .await
             } else {
-                // Client sent signed transaction, validate and broadcast it
-                let tx_hash = this
-                    .broadcast_transaction(
-                        credential.payload.signed_tx().unwrap(),
-                        &request,
-                        expected_chain_id,
-                    )
-                    .await?;
-                this.verify_hash(&format!("{:#x}", tx_hash), &request).await
+                // Client sent signed transaction, broadcast via eth_sendRawTransactionSync
+                // which returns the receipt directly, avoiding extra RPC round-trips
+                this.broadcast_transaction(
+                    credential.payload.signed_tx().unwrap(),
+                    &request,
+                    expected_chain_id,
+                )
+                .await
             }
         }
     }
