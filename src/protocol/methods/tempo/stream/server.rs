@@ -136,14 +136,11 @@ impl<S: ChannelStorage> StreamServer<S> {
 
         // Verify signature before entering the atomic update. This is pure
         // crypto (no state dependency) so it's safe to do outside the callback.
-        let recovered = voucher::verify_voucher(
-            &signed,
-            self.config.chain_id,
-            self.config.escrow_contract,
-        )
-        .map_err(|e| StreamError::InvalidSignature {
-            reason: format!("Voucher signature verification failed: {e}"),
-        })?;
+        let recovered =
+            voucher::verify_voucher(&signed, self.config.chain_id, self.config.escrow_contract)
+                .map_err(|e| StreamError::InvalidSignature {
+                    reason: format!("Voucher signature verification failed: {e}"),
+                })?;
 
         if recovered == Address::ZERO {
             return Err(StreamError::InvalidSignature {
@@ -332,13 +329,11 @@ impl<S: ChannelStorage> StreamServer<S> {
         channel_id: FixedBytes<32>,
         cost: u128,
     ) -> Result<StreamReceipt, StreamError> {
-        let channel = self
-            .storage
-            .get_channel(channel_id)
-            .await
-            .ok_or_else(|| StreamError::ChannelNotFound {
+        let channel = self.storage.get_channel(channel_id).await.ok_or_else(|| {
+            StreamError::ChannelNotFound {
                 reason: format!("Channel {} not found", channel_id),
-            })?;
+            }
+        })?;
 
         let challenge_id =
             channel
@@ -399,13 +394,11 @@ impl<S: ChannelStorage> StreamServer<S> {
         &self,
         channel_id: FixedBytes<32>,
     ) -> Result<(u128, SessionState), StreamError> {
-        let channel = self
-            .storage
-            .get_channel(channel_id)
-            .await
-            .ok_or_else(|| StreamError::ChannelNotFound {
+        let channel = self.storage.get_channel(channel_id).await.ok_or_else(|| {
+            StreamError::ChannelNotFound {
                 reason: format!("Channel {} not found", channel_id),
-            })?;
+            }
+        })?;
 
         let challenge_id =
             channel
@@ -429,10 +422,10 @@ impl<S: ChannelStorage> StreamServer<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::storage::{ChannelState, MemoryStorage};
     use super::super::types::{SignedVoucher, Voucher as VoucherType};
     use super::super::voucher::sign_voucher;
+    use super::*;
     use alloy::primitives::hex;
     use alloy_signer_local::PrivateKeySigner;
 
@@ -444,8 +437,8 @@ mod tests {
 
     fn test_channel_id() -> FixedBytes<32> {
         FixedBytes::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
         ])
     }
 
@@ -482,9 +475,7 @@ mod tests {
             .await;
     }
 
-    fn make_voucher_payload(
-        signed: &SignedVoucher,
-    ) -> StreamCredentialPayload {
+    fn make_voucher_payload(signed: &SignedVoucher) -> StreamCredentialPayload {
         StreamCredentialPayload::Voucher {
             channel_id: signed.channel_id.to_string(),
             cumulative_amount: signed.cumulative_amount.to_string(),

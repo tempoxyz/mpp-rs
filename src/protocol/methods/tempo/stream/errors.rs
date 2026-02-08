@@ -98,6 +98,7 @@ impl std::error::Error for StreamError {}
 
 // ==================== Conversions ====================
 
+#[cfg(feature = "server")]
 impl From<StreamError> for crate::protocol::traits::VerificationError {
     fn from(err: StreamError) -> Self {
         use crate::protocol::traits::ErrorCode;
@@ -240,43 +241,29 @@ mod tests {
     #[test]
     fn test_problem_type_suffix() {
         assert_eq!(
-            StreamError::ChannelNotFound {
-                reason: "".into()
-            }
-            .problem_type_suffix(),
+            StreamError::ChannelNotFound { reason: "".into() }.problem_type_suffix(),
             "channel-not-found"
         );
         assert_eq!(
-            StreamError::ChannelClosed {
-                reason: "".into()
-            }
-            .problem_type_suffix(),
+            StreamError::ChannelClosed { reason: "".into() }.problem_type_suffix(),
             "channel-finalized"
         );
         assert_eq!(
-            StreamError::ChallengeNotFound {
-                reason: "".into()
-            }
-            .problem_type_suffix(),
+            StreamError::ChallengeNotFound { reason: "".into() }.problem_type_suffix(),
             "challenge-not-found"
         );
         assert_eq!(
-            StreamError::InvalidSignature {
-                reason: "".into()
-            }
-            .problem_type_suffix(),
+            StreamError::InvalidSignature { reason: "".into() }.problem_type_suffix(),
             "invalid-signature"
         );
         assert_eq!(
-            StreamError::SignerMismatch {
-                reason: "".into()
-            }
-            .problem_type_suffix(),
+            StreamError::SignerMismatch { reason: "".into() }.problem_type_suffix(),
             "signer-mismatch"
         );
     }
 
     #[test]
+    #[cfg(feature = "server")]
     fn test_conversion_to_verification_error() {
         use crate::protocol::traits::ErrorCode;
 
@@ -313,9 +300,6 @@ mod tests {
             reason: "wrong".into(),
         };
         let mpp: crate::error::MppError = err.into();
-        assert!(matches!(
-            mpp,
-            crate::error::MppError::VerificationFailed(_)
-        ));
+        assert!(matches!(mpp, crate::error::MppError::VerificationFailed(_)));
     }
 }

@@ -41,9 +41,7 @@ pub fn serialize_stream_receipt(receipt: &StreamReceipt) -> String {
 }
 
 /// Deserialize a Payment-Receipt header value to a stream receipt.
-pub fn deserialize_stream_receipt(
-    encoded: &str,
-) -> Result<StreamReceipt, crate::error::MppError> {
+pub fn deserialize_stream_receipt(encoded: &str) -> Result<StreamReceipt, crate::error::MppError> {
     let bytes = crate::protocol::core::base64url_decode(encoded)?;
     let json = String::from_utf8(bytes)?;
     let receipt: StreamReceipt = serde_json::from_str(&json)?;
@@ -56,8 +54,8 @@ mod tests {
 
     fn test_channel_id() -> FixedBytes<32> {
         FixedBytes::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
         ])
     }
 

@@ -740,8 +740,7 @@ mod tests {
         assert!(challenge.expires.is_some());
 
         // Decode the request and verify
-        let req: crate::protocol::intents::StreamRequest =
-            challenge.request.decode().unwrap();
+        let req: crate::protocol::intents::StreamRequest = challenge.request.decode().unwrap();
         assert_eq!(req.currency, "0x20c0000000000000000000000000000000000001");
         assert_eq!(req.recipient, "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2");
         assert_eq!(
@@ -780,10 +779,7 @@ mod tests {
 
         assert_eq!(challenge.method.as_str(), "tempo");
         assert_eq!(challenge.intent.as_str(), "stream");
-        assert_eq!(
-            challenge.expires,
-            Some("2026-06-01T00:00:00Z".to_string())
-        );
+        assert_eq!(challenge.expires, Some("2026-06-01T00:00:00Z".to_string()));
         assert_eq!(
             challenge.description,
             Some("Metered API access".to_string())

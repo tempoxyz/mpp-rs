@@ -80,10 +80,7 @@ pub trait ChannelStorage: Send + Sync {
     ) -> impl Future<Output = Option<ChannelState>> + Send;
 
     /// Get the current state of a session.
-    fn get_session(
-        &self,
-        challenge_id: &str,
-    ) -> impl Future<Output = Option<SessionState>> + Send;
+    fn get_session(&self, challenge_id: &str) -> impl Future<Output = Option<SessionState>> + Send;
 
     /// Atomic read-modify-write for channel state.
     ///
@@ -137,25 +134,12 @@ impl ChannelStorage for MemoryStorage {
         &self,
         channel_id: FixedBytes<32>,
     ) -> impl Future<Output = Option<ChannelState>> + Send {
-        let result = self
-            .channels
-            .lock()
-            .unwrap()
-            .get(&channel_id)
-            .cloned();
+        let result = self.channels.lock().unwrap().get(&channel_id).cloned();
         async move { result }
     }
 
-    fn get_session(
-        &self,
-        challenge_id: &str,
-    ) -> impl Future<Output = Option<SessionState>> + Send {
-        let result = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(challenge_id)
-            .cloned();
+    fn get_session(&self, challenge_id: &str) -> impl Future<Output = Option<SessionState>> + Send {
+        let result = self.sessions.lock().unwrap().get(challenge_id).cloned();
         async move { result }
     }
 
@@ -204,8 +188,8 @@ mod tests {
 
     fn test_channel_id() -> FixedBytes<32> {
         FixedBytes::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
         ])
     }
 
@@ -256,9 +240,7 @@ mod tests {
             .await;
         assert_eq!(updated.unwrap().deposit, 20_000_000);
 
-        let deleted = storage
-            .update_channel(id, Box::new(|_| None))
-            .await;
+        let deleted = storage.update_channel(id, Box::new(|_| None)).await;
         assert!(deleted.is_none());
         assert!(storage.get_channel(id).await.is_none());
     }

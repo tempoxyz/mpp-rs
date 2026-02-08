@@ -50,10 +50,7 @@ pub enum StreamCredentialPayload {
         /// EIP-712 voucher signature.
         signature: String,
         /// Optional authorized signer address (defaults to payer if zero).
-        #[serde(
-            rename = "authorizedSigner",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(rename = "authorizedSigner", skip_serializing_if = "Option::is_none")]
         authorized_signer: Option<String>,
         /// Initial cumulative amount.
         #[serde(rename = "cumulativeAmount")]
@@ -454,10 +451,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            cred.source,
-            Some("did:pkh:eip155:42431:0x1234".to_string())
-        );
+        assert_eq!(cred.source, Some("did:pkh:eip155:42431:0x1234".to_string()));
     }
 
     #[test]

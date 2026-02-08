@@ -155,8 +155,8 @@ mod tests {
 
     fn test_channel_id() -> FixedBytes<32> {
         FixedBytes::from([
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 1,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
         ])
     }
 
@@ -264,8 +264,7 @@ mod tests {
 
     #[test]
     fn test_parse_voucher_from_payload() {
-        let channel_id =
-            "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let channel_id = "0x0000000000000000000000000000000000000000000000000000000000000001";
         let cumulative_amount = "5000000";
         // 65 zero bytes as hex
         let signature = format!("0x{}", "00".repeat(65));
@@ -284,16 +283,16 @@ mod tests {
             &format!("0x{}", "00".repeat(65)),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cumulative_amount"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cumulative_amount"));
     }
 
     #[test]
     fn test_parse_voucher_invalid_channel_id() {
-        let result = parse_voucher_from_payload(
-            "not_a_hex",
-            "5000000",
-            &format!("0x{}", "00".repeat(65)),
-        );
+        let result =
+            parse_voucher_from_payload("not_a_hex", "5000000", &format!("0x{}", "00".repeat(65)));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("channel_id"));
     }
