@@ -601,6 +601,235 @@ where
 #[cfg(test)]
 mod tests {
     use super::{super::MODERATO_CHAIN_ID, *};
+    use tempo_alloy::rpc::TempoTransactionReceipt;
+
+    const CURRENCY: &str = "0x20c0000000000000000000000000000000000001";
+    const RECIPIENT: &str = "0x742d35Cc6634C0532925a3b844Bc9e7595f3bB77";
+    const TX_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn test_charge(amount: &str) -> ChargeRequest {
+        ChargeRequest {
+            amount: amount.to_string(),
+            currency: CURRENCY.to_string(),
+            recipient: Some(RECIPIENT.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn test_charge_with_memo(amount: &str, memo: &str) -> ChargeRequest {
+        ChargeRequest {
+            amount: amount.to_string(),
+            currency: CURRENCY.to_string(),
+            recipient: Some(RECIPIENT.to_string()),
+            method_details: Some(serde_json::json!({ "memo": memo })),
+            ..Default::default()
+        }
+    }
+
+    fn make_receipt(status: bool, logs: serde_json::Value) -> TempoTransactionReceipt {
+        let receipt_json = serde_json::json!({
+            "transactionHash": TX_HASH,
+            "transactionIndex": "0x0",
+            "blockHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "blockNumber": "0x1",
+            "from": "0x0000000000000000000000000000000000000001",
+            "to": CURRENCY,
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x3b9aca00",
+            "logs": logs,
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "status": if status { "0x1" } else { "0x0" },
+            "type": "0x76",
+            "feePayer": "0x0000000000000000000000000000000000000001"
+        });
+        serde_json::from_value(receipt_json).expect("valid receipt JSON")
+    }
+
+    fn transfer_log(currency: &str, from: &str, to: &str, amount_hex: &str) -> serde_json::Value {
+        let from_topic = format!("0x000000000000000000000000{}", &from[2..]);
+        let to_topic = format!("0x000000000000000000000000{}", &to[2..]);
+        serde_json::json!({
+            "address": currency,
+            "topics": [
+                format!("0x{}", hex::encode(TRANSFER_EVENT_TOPIC)),
+                from_topic,
+                to_topic
+            ],
+            "data": format!("0x{}", amount_hex),
+            "blockNumber": "0x1",
+            "transactionHash": TX_HASH,
+            "transactionIndex": "0x0",
+            "blockHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "logIndex": "0x0",
+            "removed": false
+        })
+    }
+
+    fn transfer_with_memo_log(
+        currency: &str,
+        from: &str,
+        to: &str,
+        amount_hex: &str,
+        memo_hex: &str,
+    ) -> serde_json::Value {
+        let from_topic = format!("0x000000000000000000000000{}", &from[2..]);
+        let to_topic = format!("0x000000000000000000000000{}", &to[2..]);
+        serde_json::json!({
+            "address": currency,
+            "topics": [
+                format!("0x{}", hex::encode(TRANSFER_WITH_MEMO_EVENT_TOPIC)),
+                from_topic,
+                to_topic
+            ],
+            "data": format!("0x{}{}", amount_hex, memo_hex),
+            "blockNumber": "0x1",
+            "transactionHash": TX_HASH,
+            "transactionIndex": "0x0",
+            "blockHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "logIndex": "0x0",
+            "removed": false
+        })
+    }
+
+    fn dummy_charge_method() -> ChargeMethod<crate::server::TempoProvider> {
+        let provider = crate::server::tempo_provider("http://localhost:1234").unwrap();
+        ChargeMethod::new(provider)
+    }
+
+    #[test]
+    fn test_verify_receipt_success() {
+        let method = dummy_charge_method();
+        let amount_hex = "00000000000000000000000000000000000000000000000000000000000f4240"; // 1000000
+        let log = transfer_log(
+            CURRENCY,
+            "0x0000000000000000000000000000000000000001",
+            RECIPIENT,
+            amount_hex,
+        );
+        let receipt = make_receipt(true, serde_json::json!([log]));
+        let charge = test_charge("1000000");
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert!(r.is_success());
+        assert_eq!(r.reference, TX_HASH);
+    }
+
+    #[test]
+    fn test_verify_receipt_reverted() {
+        let method = dummy_charge_method();
+        let receipt = make_receipt(false, serde_json::json!([]));
+        let charge = test_charge("1000000");
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("reverted"));
+    }
+
+    #[test]
+    fn test_verify_receipt_no_matching_transfer() {
+        let method = dummy_charge_method();
+        let receipt = make_receipt(true, serde_json::json!([]));
+        let charge = test_charge("1000000");
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No matching Transfer"));
+    }
+
+    #[test]
+    fn test_verify_receipt_wrong_amount() {
+        let method = dummy_charge_method();
+        let amount_hex = "0000000000000000000000000000000000000000000000000000000000000001"; // 1 (wrong)
+        let log = transfer_log(
+            CURRENCY,
+            "0x0000000000000000000000000000000000000001",
+            RECIPIENT,
+            amount_hex,
+        );
+        let receipt = make_receipt(true, serde_json::json!([log]));
+        let charge = test_charge("1000000");
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_receipt_wrong_recipient() {
+        let method = dummy_charge_method();
+        let amount_hex = "00000000000000000000000000000000000000000000000000000000000f4240";
+        let log = transfer_log(
+            CURRENCY,
+            "0x0000000000000000000000000000000000000001",
+            "0x0000000000000000000000000000000000000099", // wrong recipient
+            amount_hex,
+        );
+        let receipt = make_receipt(true, serde_json::json!([log]));
+        let charge = test_charge("1000000");
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_receipt_wrong_currency() {
+        let method = dummy_charge_method();
+        let amount_hex = "00000000000000000000000000000000000000000000000000000000000f4240";
+        let log = transfer_log(
+            "0x0000000000000000000000000000000000000099", // wrong currency
+            "0x0000000000000000000000000000000000000001",
+            RECIPIENT,
+            amount_hex,
+        );
+        let receipt = make_receipt(true, serde_json::json!([log]));
+        let charge = test_charge("1000000");
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_receipt_with_memo_success() {
+        let method = dummy_charge_method();
+        let memo_hex = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let amount_hex = "00000000000000000000000000000000000000000000000000000000000f4240";
+        let log = transfer_with_memo_log(
+            CURRENCY,
+            "0x0000000000000000000000000000000000000001",
+            RECIPIENT,
+            amount_hex,
+            memo_hex,
+        );
+        let receipt = make_receipt(true, serde_json::json!([log]));
+        let charge = test_charge_with_memo("1000000", &format!("0x{}", memo_hex));
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_receipt_with_memo_wrong_memo() {
+        let method = dummy_charge_method();
+        let memo_hex = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let wrong_memo = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let amount_hex = "00000000000000000000000000000000000000000000000000000000000f4240";
+        let log = transfer_with_memo_log(
+            CURRENCY,
+            "0x0000000000000000000000000000000000000001",
+            RECIPIENT,
+            amount_hex,
+            wrong_memo,
+        );
+        let receipt = make_receipt(true, serde_json::json!([log]));
+        let charge = test_charge_with_memo("1000000", &format!("0x{}", memo_hex));
+
+        let result = method.verify_receipt(&receipt, TX_HASH, &charge);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_transfer_selector() {
