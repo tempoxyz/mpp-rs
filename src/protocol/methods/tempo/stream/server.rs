@@ -218,18 +218,26 @@ impl<S: ChannelStorage> StreamServer<S> {
                         }
                     }
 
-                    if ch.authorized_signer == Address::ZERO {
-                        *error_slot.lock().unwrap() = Some(StreamError::InvalidSignature {
-                            reason: "Channel has zero address as authorized signer".into(),
+                    // Spec: recovered address must match authorizedSigner or payer.
+                    // If authorizedSigner is zero/unset, fall back to payer.
+                    let expected_signer = if ch.authorized_signer == Address::ZERO {
+                        ch.payer
+                    } else {
+                        ch.authorized_signer
+                    };
+
+                    if expected_signer == Address::ZERO {
+                        *error_slot.lock().unwrap() = Some(StreamError::SignerMismatch {
+                            reason: "Channel has no valid signer (both authorizedSigner and payer are zero)".into(),
                         });
                         return Some(ch);
                     }
 
-                    if recovered_signer != ch.authorized_signer {
-                        *error_slot.lock().unwrap() = Some(StreamError::InvalidSignature {
+                    if recovered_signer != expected_signer && recovered_signer != ch.payer {
+                        *error_slot.lock().unwrap() = Some(StreamError::SignerMismatch {
                             reason: format!(
-                                "Voucher signed by {}, expected {}",
-                                recovered_signer, ch.authorized_signer
+                                "Voucher signed by {}, expected {} or payer {}",
+                                recovered_signer, expected_signer, ch.payer
                             ),
                         });
                         return Some(ch);
@@ -641,7 +649,107 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, StreamError::InvalidSignature { .. }));
+        assert!(matches!(err, StreamError::SignerMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_voucher_payer_fallback_when_authorized_signer_zero() {
+        // When authorizedSigner is zero, the payer's address should be accepted
+        let signer = PrivateKeySigner::random();
+        let signer_address = signer.address();
+        let storage = MemoryStorage::new();
+        let id = test_channel_id();
+
+        // Create channel with authorizedSigner = ZERO but payer = signer's address
+        storage
+            .update_channel(
+                id,
+                Box::new(move |_| {
+                    Some(ChannelState {
+                        channel_id: id,
+                        payer: signer_address,
+                        payee: Address::ZERO,
+                        token: Address::ZERO,
+                        authorized_signer: Address::ZERO,
+                        deposit: 10_000_000,
+                        settled_on_chain: 0,
+                        highest_voucher_amount: 0,
+                        highest_voucher: None,
+                        active_session_id: None,
+                        finalized: false,
+                        created_at: SystemTime::now(),
+                    })
+                }),
+            )
+            .await;
+
+        let server = StreamServer::new(storage, test_config());
+        let cfg = test_config();
+
+        let voucher = VoucherType {
+            channel_id: id,
+            cumulative_amount: 5_000_000,
+        };
+        let signed = sign_voucher(&signer, &voucher, cfg.chain_id, cfg.escrow_contract)
+            .await
+            .unwrap();
+        let result = server
+            .verify(&make_voucher_payload(&signed), "challenge-1")
+            .await;
+
+        // Should succeed — payer fallback accepted
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().accepted_cumulative, "5000000");
+    }
+
+    #[tokio::test]
+    async fn test_voucher_payer_accepted_even_with_authorized_signer_set() {
+        // Spec: recovered address must match authorizedSigner OR payer
+        let payer_signer = PrivateKeySigner::random();
+        let payer_address = payer_signer.address();
+        let authorized = PrivateKeySigner::random();
+        let authorized_address = authorized.address();
+        let storage = MemoryStorage::new();
+        let id = test_channel_id();
+
+        storage
+            .update_channel(
+                id,
+                Box::new(move |_| {
+                    Some(ChannelState {
+                        channel_id: id,
+                        payer: payer_address,
+                        payee: Address::ZERO,
+                        token: Address::ZERO,
+                        authorized_signer: authorized_address,
+                        deposit: 10_000_000,
+                        settled_on_chain: 0,
+                        highest_voucher_amount: 0,
+                        highest_voucher: None,
+                        active_session_id: None,
+                        finalized: false,
+                        created_at: SystemTime::now(),
+                    })
+                }),
+            )
+            .await;
+
+        let server = StreamServer::new(storage, test_config());
+        let cfg = test_config();
+
+        // Sign with payer (not authorized_signer) — should still work per spec
+        let voucher = VoucherType {
+            channel_id: id,
+            cumulative_amount: 5_000_000,
+        };
+        let signed = sign_voucher(&payer_signer, &voucher, cfg.chain_id, cfg.escrow_contract)
+            .await
+            .unwrap();
+        let result = server
+            .verify(&make_voucher_payload(&signed), "challenge-1")
+            .await;
+
+        assert!(result.is_ok());
     }
 
     #[tokio::test]

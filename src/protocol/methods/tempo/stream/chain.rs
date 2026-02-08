@@ -30,16 +30,19 @@ alloy::sol! {
             address authorizedSigner,
             uint128 deposit,
             uint128 settledAmount,
+            uint256 closeRequestedAt,
             bool finalized
         );
 
         /// Compute channel ID deterministically from the channel parameters.
         ///
-        /// The channel ID is keccak256(abi.encode(payer, payee, token, authorizedSigner)).
+        /// The channel ID is keccak256(abi.encode(payer, payee, token, deposit, salt, authorizedSigner)).
         function computeChannelId(
             address payer,
             address payee,
             address token,
+            uint128 deposit,
+            bytes32 salt,
             address authorizedSigner
         ) external pure returns (bytes32);
 
@@ -47,16 +50,17 @@ alloy::sol! {
         ///
         /// The caller must have approved the escrow contract for the token amount.
         function open(
-            address token,
             address payee,
-            address authorizedSigner,
-            uint128 amount
+            address token,
+            uint128 deposit,
+            bytes32 salt,
+            address authorizedSigner
         ) external returns (bytes32);
 
         /// Add funds to an existing channel.
         ///
         /// The caller must have approved the escrow contract for the additional amount.
-        function topUp(bytes32 channelId, uint128 amount) external;
+        function topUp(bytes32 channelId, uint128 additionalDeposit) external;
 
         /// Settle a partial amount using a signed voucher.
         ///
@@ -75,6 +79,16 @@ alloy::sol! {
             uint128 cumulativeAmount,
             bytes signature
         ) external;
+
+        /// Request channel closure (payer-initiated).
+        ///
+        /// Starts a grace period after which the payer can withdraw remaining funds.
+        function requestClose(bytes32 channelId) external;
+
+        /// Withdraw remaining funds after grace period expires (payer-initiated).
+        ///
+        /// Can only be called after requestClose and the grace period has elapsed.
+        function withdraw(bytes32 channelId) external;
     }
 }
 
@@ -92,5 +106,7 @@ mod tests {
         let _ = std::mem::size_of::<ITempoStreamChannel::topUpCall>();
         let _ = std::mem::size_of::<ITempoStreamChannel::settleCall>();
         let _ = std::mem::size_of::<ITempoStreamChannel::closeCall>();
+        let _ = std::mem::size_of::<ITempoStreamChannel::requestCloseCall>();
+        let _ = std::mem::size_of::<ITempoStreamChannel::withdrawCall>();
     }
 }

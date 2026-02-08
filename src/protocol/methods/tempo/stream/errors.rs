@@ -21,10 +21,14 @@ pub enum StreamError {
     InsufficientBalance { reason: String },
     /// Invalid voucher signature (HTTP 402 Payment Required).
     InvalidSignature { reason: String },
+    /// Recovered signer is not authorized for this channel (HTTP 402 Payment Required).
+    SignerMismatch { reason: String },
     /// Voucher amount exceeds channel deposit (HTTP 402 Payment Required).
     AmountExceedsDeposit { reason: String },
     /// Voucher delta is below minimum threshold (HTTP 402 Payment Required).
     DeltaTooSmall { reason: String },
+    /// Challenge ID is unknown or expired (HTTP 410 Gone).
+    ChallengeNotFound { reason: String },
     /// General verification failure (HTTP 402 Payment Required).
     VerificationFailed { reason: String },
     /// Malformed request (HTTP 400 Bad Request).
@@ -37,9 +41,11 @@ impl StreamError {
         match self {
             Self::ChannelNotFound { .. } => 410,
             Self::ChannelClosed { .. } => 410,
+            Self::ChallengeNotFound { .. } => 410,
             Self::ChannelConflict { .. } => 409,
             Self::InsufficientBalance { .. } => 402,
             Self::InvalidSignature { .. } => 402,
+            Self::SignerMismatch { .. } => 402,
             Self::AmountExceedsDeposit { .. } => 402,
             Self::DeltaTooSmall { .. } => 402,
             Self::VerificationFailed { .. } => 402,
@@ -52,9 +58,11 @@ impl StreamError {
         match self {
             Self::ChannelNotFound { reason }
             | Self::ChannelClosed { reason }
+            | Self::ChallengeNotFound { reason }
             | Self::ChannelConflict { reason }
             | Self::InsufficientBalance { reason }
             | Self::InvalidSignature { reason }
+            | Self::SignerMismatch { reason }
             | Self::AmountExceedsDeposit { reason }
             | Self::DeltaTooSmall { reason }
             | Self::VerificationFailed { reason }
@@ -66,10 +74,12 @@ impl StreamError {
     pub fn problem_type_suffix(&self) -> &'static str {
         match self {
             Self::ChannelNotFound { .. } => "channel-not-found",
-            Self::ChannelClosed { .. } => "channel-closed",
+            Self::ChannelClosed { .. } => "channel-finalized",
+            Self::ChallengeNotFound { .. } => "challenge-not-found",
             Self::ChannelConflict { .. } => "channel-conflict",
             Self::InsufficientBalance { .. } => "insufficient-balance",
             Self::InvalidSignature { .. } => "invalid-signature",
+            Self::SignerMismatch { .. } => "signer-mismatch",
             Self::AmountExceedsDeposit { .. } => "amount-exceeds-deposit",
             Self::DeltaTooSmall { .. } => "delta-too-small",
             Self::VerificationFailed { .. } => "verification-failed",
@@ -95,9 +105,11 @@ impl From<StreamError> for crate::protocol::traits::VerificationError {
         let code = match &err {
             StreamError::ChannelNotFound { .. } => Some(ErrorCode::NotFound),
             StreamError::ChannelClosed { .. } => Some(ErrorCode::NotFound),
+            StreamError::ChallengeNotFound { .. } => Some(ErrorCode::NotFound),
             StreamError::ChannelConflict { .. } => None,
             StreamError::InsufficientBalance { .. } => Some(ErrorCode::InvalidAmount),
             StreamError::InvalidSignature { .. } => Some(ErrorCode::InvalidCredential),
+            StreamError::SignerMismatch { .. } => Some(ErrorCode::InvalidCredential),
             StreamError::AmountExceedsDeposit { .. } => Some(ErrorCode::InvalidAmount),
             StreamError::DeltaTooSmall { .. } => Some(ErrorCode::InvalidAmount),
             StreamError::VerificationFailed { .. } => None,
@@ -113,13 +125,15 @@ impl From<StreamError> for crate::protocol::traits::VerificationError {
 impl From<StreamError> for crate::error::MppError {
     fn from(err: StreamError) -> Self {
         match &err {
-            StreamError::ChannelNotFound { .. } | StreamError::ChannelClosed { .. } => {
+            StreamError::ChannelNotFound { .. }
+            | StreamError::ChannelClosed { .. }
+            | StreamError::ChallengeNotFound { .. } => {
                 crate::error::MppError::VerificationFailed(Some(err.to_string()))
             }
             StreamError::ChannelConflict { .. } => {
                 crate::error::MppError::VerificationFailed(Some(err.to_string()))
             }
-            StreamError::InvalidSignature { .. } => {
+            StreamError::InvalidSignature { .. } | StreamError::SignerMismatch { .. } => {
                 crate::error::MppError::VerificationFailed(Some(err.to_string()))
             }
             StreamError::BadRequest { .. } => {
@@ -151,6 +165,13 @@ mod tests {
             410
         );
         assert_eq!(
+            StreamError::ChallengeNotFound {
+                reason: "expired".into()
+            }
+            .status(),
+            410
+        );
+        assert_eq!(
             StreamError::ChannelConflict {
                 reason: "conflict".into()
             }
@@ -167,6 +188,13 @@ mod tests {
         assert_eq!(
             StreamError::InvalidSignature {
                 reason: "bad sig".into()
+            }
+            .status(),
+            402
+        );
+        assert_eq!(
+            StreamError::SignerMismatch {
+                reason: "wrong signer".into()
             }
             .status(),
             402
@@ -219,11 +247,32 @@ mod tests {
             "channel-not-found"
         );
         assert_eq!(
+            StreamError::ChannelClosed {
+                reason: "".into()
+            }
+            .problem_type_suffix(),
+            "channel-finalized"
+        );
+        assert_eq!(
+            StreamError::ChallengeNotFound {
+                reason: "".into()
+            }
+            .problem_type_suffix(),
+            "challenge-not-found"
+        );
+        assert_eq!(
             StreamError::InvalidSignature {
                 reason: "".into()
             }
             .problem_type_suffix(),
             "invalid-signature"
+        );
+        assert_eq!(
+            StreamError::SignerMismatch {
+                reason: "".into()
+            }
+            .problem_type_suffix(),
+            "signer-mismatch"
         );
     }
 
@@ -237,6 +286,19 @@ mod tests {
         let ve: crate::protocol::traits::VerificationError = err.into();
         assert_eq!(ve.code, Some(ErrorCode::InvalidCredential));
         assert!(ve.message.contains("invalid voucher signature"));
+
+        let err = StreamError::SignerMismatch {
+            reason: "wrong signer".into(),
+        };
+        let ve: crate::protocol::traits::VerificationError = err.into();
+        assert_eq!(ve.code, Some(ErrorCode::InvalidCredential));
+        assert!(ve.message.contains("wrong signer"));
+
+        let err = StreamError::ChallengeNotFound {
+            reason: "expired".into(),
+        };
+        let ve: crate::protocol::traits::VerificationError = err.into();
+        assert_eq!(ve.code, Some(ErrorCode::NotFound));
     }
 
     #[test]
@@ -246,5 +308,14 @@ mod tests {
         };
         let mpp: crate::error::MppError = err.into();
         assert!(matches!(mpp, crate::error::MppError::InvalidPayload(_)));
+
+        let err = StreamError::SignerMismatch {
+            reason: "wrong".into(),
+        };
+        let mpp: crate::error::MppError = err.into();
+        assert!(matches!(
+            mpp,
+            crate::error::MppError::VerificationFailed(_)
+        ));
     }
 }
