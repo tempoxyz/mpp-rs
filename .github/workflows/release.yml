@@ -1,3 +1,13 @@
+# This crate is distributed via GitHub Releases rather than crates.io because
+# it depends on tempo-alloy and tempo-primitives, which are not published to
+# crates.io (they live in the tempoxyz/tempo repo as git dependencies).
+#
+# GitHub Releases are created automatically by changelogs-rs when a "Version
+# Packages" PR is merged.
+#
+# Users consume this crate via git dependency in their Cargo.toml:
+#   mpay = { git = "https://github.com/tempoxyz/mpay-rs", tag = "v0.2.1", features = ["tempo", "client"] }
+
 name: Release
 on:
   push:
