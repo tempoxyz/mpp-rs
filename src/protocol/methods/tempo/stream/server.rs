@@ -3,6 +3,13 @@
 //! Provides [`StreamServer`] for verifying stream payment credentials,
 //! managing session accounting, and charging against session balances.
 //!
+//! # Architecture
+//!
+//! - [`StreamServer`] handles voucher verification, session accounting, and charging.
+//!   It does **not** require an on-chain provider and works with any [`ChannelStorage`].
+//! - [`OnChainStreamServer`] wraps a `StreamServer` and adds on-chain operations
+//!   (open, topUp, close) via an Alloy [`Provider`].
+//!
 //! # Verification Flow
 //!
 //! 1. Client sends a `StreamCredentialPayload` (voucher, open, topUp, or close action)
@@ -26,6 +33,8 @@
 //!     chain_id: 42431,
 //!     escrow_contract: "0x...".parse().unwrap(),
 //!     min_delta: 0,
+//!     recipient: None,
+//!     currency: None,
 //! });
 //!
 //! // Verify a voucher credential
@@ -38,11 +47,14 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, Bytes, FixedBytes};
+use alloy::providers::Provider;
+use tempo_alloy::TempoNetwork;
 
+use super::chain::{self, decode_tempo_transaction, find_open_call, find_top_up_call};
 use super::errors::StreamError;
 use super::receipt::{create_stream_receipt, CreateStreamReceiptParams};
-use super::storage::{ChannelStorage, SessionState};
+use super::storage::{ChannelState, ChannelStorage, SessionState};
 use super::types::{StreamCredentialPayload, StreamReceipt};
 use super::voucher;
 
@@ -55,6 +67,12 @@ pub struct StreamConfig {
     pub escrow_contract: Address,
     /// Minimum voucher delta the server will accept (0 = no minimum).
     pub min_delta: u128,
+    /// Server's payee address (recipient of payments).
+    /// Required for on-chain operations (open/topUp/close).
+    pub recipient: Option<Address>,
+    /// Expected token address for payments.
+    /// Required for on-chain operations (open/topUp/close).
+    pub currency: Option<Address>,
 }
 
 /// Server-side stream payment verifier.
@@ -62,16 +80,17 @@ pub struct StreamConfig {
 /// Handles voucher verification, session accounting, and charging.
 /// Generic over [`ChannelStorage`] for pluggable persistence backends.
 ///
-/// For on-chain operations (open, topUp, close with settlement),
-/// a provider will be needed — these operations will be supported
-/// in a future update.
+/// For on-chain operations (open, topUp, close), use [`OnChainStreamServer`].
 pub struct StreamServer<S> {
     storage: Arc<S>,
     config: StreamConfig,
 }
 
 impl<S: ChannelStorage> StreamServer<S> {
-    /// Create a new stream server.
+    /// Create a new stream server (voucher-only mode).
+    ///
+    /// On-chain operations (open, topUp, close) will return errors.
+    /// Use [`OnChainStreamServer::new`] for full on-chain support.
     pub fn new(storage: S, config: StreamConfig) -> Self {
         Self {
             storage: Arc::new(storage),
@@ -91,7 +110,8 @@ impl<S: ChannelStorage> StreamServer<S> {
 
     /// Verify a stream credential and return a receipt.
     ///
-    /// Dispatches to the appropriate handler based on the credential's `action` field.
+    /// Only voucher actions are supported. On-chain operations (open, topUp, close)
+    /// require [`OnChainStreamServer`].
     pub async fn verify(
         &self,
         payload: &StreamCredentialPayload,
@@ -106,14 +126,10 @@ impl<S: ChannelStorage> StreamServer<S> {
                 self.handle_voucher(channel_id, cumulative_amount, signature, challenge_id)
                     .await
             }
-            StreamCredentialPayload::Open { .. } => Err(StreamError::BadRequest {
-                reason: "open action requires on-chain provider (not yet supported)".into(),
-            }),
-            StreamCredentialPayload::TopUp { .. } => Err(StreamError::BadRequest {
-                reason: "topUp action requires on-chain provider (not yet supported)".into(),
-            }),
-            StreamCredentialPayload::Close { .. } => Err(StreamError::BadRequest {
-                reason: "close action requires on-chain provider (not yet supported)".into(),
+            StreamCredentialPayload::Open { .. }
+            | StreamCredentialPayload::TopUp { .. }
+            | StreamCredentialPayload::Close { .. } => Err(StreamError::BadRequest {
+                reason: "on-chain actions (open/topUp/close) require OnChainStreamServer".into(),
             }),
         }
     }
@@ -122,44 +138,49 @@ impl<S: ChannelStorage> StreamServer<S> {
     ///
     /// Verifies the voucher signature, checks monotonicity and deposit limits,
     /// and atomically updates channel and session state.
-    async fn handle_voucher(
-        &self,
-        channel_id: &str,
-        cumulative_amount: &str,
-        signature: &str,
-        challenge_id: &str,
-    ) -> Result<StreamReceipt, StreamError> {
-        let signed = voucher::parse_voucher_from_payload(channel_id, cumulative_amount, signature)
-            .map_err(|e| StreamError::BadRequest {
-                reason: e.to_string(),
-            })?;
+    fn handle_voucher<'a>(
+        &'a self,
+        channel_id: &'a str,
+        cumulative_amount: &'a str,
+        signature: &'a str,
+        challenge_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<StreamReceipt, StreamError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let signed =
+                voucher::parse_voucher_from_payload(channel_id, cumulative_amount, signature)
+                    .map_err(|e| StreamError::BadRequest {
+                        reason: e.to_string(),
+                    })?;
 
-        // Verify signature before entering the atomic update. This is pure
-        // crypto (no state dependency) so it's safe to do outside the callback.
-        let recovered =
-            voucher::verify_voucher(&signed, self.config.chain_id, self.config.escrow_contract)
-                .map_err(|e| StreamError::InvalidSignature {
-                    reason: format!("Voucher signature verification failed: {e}"),
-                })?;
+            // Verify signature before entering the atomic update. This is pure
+            // crypto (no state dependency) so it's safe to do outside the callback.
+            let recovered =
+                voucher::verify_voucher(&signed, self.config.chain_id, self.config.escrow_contract)
+                    .map_err(|e| StreamError::InvalidSignature {
+                        reason: format!("Voucher signature verification failed: {e}"),
+                    })?;
 
-        if recovered == Address::ZERO {
-            return Err(StreamError::InvalidSignature {
-                reason: "Recovered zero address from voucher signature".into(),
-            });
-        }
+            if recovered == Address::ZERO {
+                return Err(StreamError::InvalidSignature {
+                    reason: "Recovered zero address from voucher signature".into(),
+                });
+            }
 
-        let session = self
-            .verify_and_accept_voucher(&signed, recovered, challenge_id)
-            .await?;
+            let session = self
+                .verify_and_accept_voucher(&signed, recovered, challenge_id)
+                .await?;
 
-        Ok(create_stream_receipt(CreateStreamReceiptParams {
-            challenge_id: challenge_id.to_string(),
-            channel_id: signed.channel_id,
-            accepted_cumulative: session.accepted_cumulative,
-            spent: session.spent,
-            units: Some(session.units),
-            tx_hash: None,
-        }))
+            Ok(create_stream_receipt(CreateStreamReceiptParams {
+                challenge_id: challenge_id.to_string(),
+                channel_id: signed.channel_id,
+                accepted_cumulative: session.accepted_cumulative,
+                spent: session.spent,
+                units: Some(session.units),
+                tx_hash: None,
+            }))
+        })
     }
 
     /// Atomically verify and accept a voucher.
@@ -215,8 +236,9 @@ impl<S: ChannelStorage> StreamServer<S> {
                         }
                     }
 
-                    // Spec: recovered address must match authorizedSigner or payer.
-                    // If authorizedSigner is zero/unset, fall back to payer.
+                    // Spec §10.3: recovered address must match expected signer
+                    // from on-chain state. Expected signer is authorizedSigner
+                    // if non-zero, otherwise payer.
                     let expected_signer = if ch.authorized_signer == Address::ZERO {
                         ch.payer
                     } else {
@@ -230,23 +252,21 @@ impl<S: ChannelStorage> StreamServer<S> {
                         return Some(ch);
                     }
 
-                    if recovered_signer != expected_signer && recovered_signer != ch.payer {
+                    if recovered_signer != expected_signer {
                         *error_slot.lock().unwrap() = Some(StreamError::SignerMismatch {
                             reason: format!(
-                                "Voucher signed by {}, expected {} or payer {}",
-                                recovered_signer, expected_signer, ch.payer
+                                "Voucher signed by {}, expected {}",
+                                recovered_signer, expected_signer
                             ),
                         });
                         return Some(ch);
                     }
 
-                    if signed_clone.cumulative_amount < ch.highest_voucher_amount {
-                        *error_slot.lock().unwrap() = Some(StreamError::DeltaTooSmall {
-                            reason: format!(
-                                "Cumulative amount {} is less than current highest {}",
-                                signed_clone.cumulative_amount, ch.highest_voucher_amount
-                            ),
-                        });
+                    // Spec §10.4 Idempotency: vouchers with cumulativeAmount <=
+                    // highest accepted are no-ops. Return the channel unchanged
+                    // and let the session update return current state.
+                    if signed_clone.cumulative_amount <= ch.highest_voucher_amount {
+                        ch.active_session_id = Some(challenge_id_owned);
                         return Some(ch);
                     }
 
@@ -260,10 +280,11 @@ impl<S: ChannelStorage> StreamServer<S> {
                         return Some(ch);
                     }
 
+                    // min_delta only applies to advancing vouchers (not replays).
                     if min_delta > 0 {
                         let delta =
                             signed_clone.cumulative_amount - ch.highest_voucher_amount;
-                        if delta > 0 && delta < min_delta {
+                        if delta < min_delta {
                             *error_slot.lock().unwrap() = Some(StreamError::DeltaTooSmall {
                                 reason: format!(
                                     "Voucher delta {} is below minimum {}",
@@ -305,7 +326,9 @@ impl<S: ChannelStorage> StreamServer<S> {
                         units: 0,
                         created_at: SystemTime::now(),
                     });
-                    session.accepted_cumulative = new_cumulative;
+                    if new_cumulative > session.accepted_cumulative {
+                        session.accepted_cumulative = new_cumulative;
+                    }
                     Some(session)
                 }),
             )
@@ -420,6 +443,699 @@ impl<S: ChannelStorage> StreamServer<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OnChainStreamServer — wraps StreamServer and adds on-chain operations
+// ---------------------------------------------------------------------------
+
+/// Stream server with on-chain support for open, topUp, and close operations.
+///
+/// Wraps a [`StreamServer`] and adds the ability to broadcast transactions
+/// and read on-chain state via an Alloy [`Provider`].
+pub struct OnChainStreamServer<S, P> {
+    inner: StreamServer<S>,
+    provider: Arc<P>,
+}
+
+impl<S: ChannelStorage, P: Provider<TempoNetwork> + Send + Sync + 'static>
+    OnChainStreamServer<S, P>
+{
+    /// Create a new on-chain stream server.
+    pub fn new(storage: S, config: StreamConfig, provider: P) -> Self {
+        Self {
+            inner: StreamServer::new(storage, config),
+            provider: Arc::new(provider),
+        }
+    }
+
+    /// Get a reference to the storage backend.
+    pub fn storage(&self) -> &S {
+        self.inner.storage()
+    }
+
+    /// Get a reference to the server configuration.
+    pub fn config(&self) -> &StreamConfig {
+        self.inner.config()
+    }
+
+    /// Get a reference to the inner [`StreamServer`].
+    pub fn inner(&self) -> &StreamServer<S> {
+        &self.inner
+    }
+
+    /// Verify a stream credential and return a receipt.
+    ///
+    /// Dispatches to the appropriate handler based on the credential's `action` field.
+    /// Supports all actions including on-chain operations (open, topUp, close).
+    pub async fn verify(
+        &self,
+        payload: &StreamCredentialPayload,
+        challenge_id: &str,
+    ) -> Result<StreamReceipt, StreamError> {
+        match payload {
+            StreamCredentialPayload::Voucher {
+                channel_id,
+                cumulative_amount,
+                signature,
+            } => {
+                self.inner
+                    .handle_voucher(channel_id, cumulative_amount, signature, challenge_id)
+                    .await
+            }
+            StreamCredentialPayload::Open {
+                channel_id,
+                transaction,
+                signature,
+                cumulative_amount,
+                ..
+            } => {
+                self.handle_open(
+                    channel_id,
+                    transaction,
+                    signature,
+                    cumulative_amount,
+                    challenge_id,
+                )
+                .await
+            }
+            StreamCredentialPayload::TopUp {
+                channel_id,
+                transaction,
+                additional_deposit,
+                ..
+            } => {
+                self.handle_top_up(channel_id, transaction, additional_deposit, challenge_id)
+                    .await
+            }
+            StreamCredentialPayload::Close {
+                channel_id,
+                cumulative_amount,
+                signature,
+            } => {
+                self.handle_close(channel_id, cumulative_amount, signature, challenge_id)
+                    .await
+            }
+        }
+    }
+
+    /// Charge against a session's balance (delegates to inner server).
+    pub async fn charge(
+        &self,
+        channel_id: FixedBytes<32>,
+        cost: u128,
+    ) -> Result<StreamReceipt, StreamError> {
+        self.inner.charge(channel_id, cost).await
+    }
+
+    /// Get the remaining balance for a channel's active session (delegates to inner server).
+    pub async fn balance(
+        &self,
+        channel_id: FixedBytes<32>,
+    ) -> Result<(u128, SessionState), StreamError> {
+        self.inner.balance(channel_id).await
+    }
+
+    /// Handle the open action: broadcast open tx, verify on-chain state, accept voucher.
+    async fn handle_open(
+        &self,
+        channel_id_str: &str,
+        transaction: &str,
+        signature: &str,
+        cumulative_amount_str: &str,
+        challenge_id: &str,
+    ) -> Result<StreamReceipt, StreamError> {
+        let recipient = self.inner.config.recipient.ok_or(StreamError::BadRequest {
+            reason: "server config missing recipient address for on-chain operations".into(),
+        })?;
+        let currency = self.inner.config.currency.ok_or(StreamError::BadRequest {
+            reason: "server config missing currency address for on-chain operations".into(),
+        })?;
+
+        // Decode and validate the transaction
+        let tx = decode_tempo_transaction(transaction)?;
+
+        if tx.chain_id != self.inner.config.chain_id {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "Transaction chain_id mismatch: expected {}, got {}",
+                    self.inner.config.chain_id, tx.chain_id
+                ),
+            });
+        }
+
+        // Find and validate the open call
+        let open_params = find_open_call(&tx, self.inner.config.escrow_contract)?;
+
+        if open_params.payee != recipient {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "Open call payee {} does not match expected recipient {}",
+                    open_params.payee, recipient
+                ),
+            });
+        }
+
+        if open_params.token != currency {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "Open call token {} does not match expected currency {}",
+                    open_params.token, currency
+                ),
+            });
+        }
+
+        // Broadcast the transaction
+        let tx_bytes: Bytes = transaction.parse().map_err(|e| StreamError::BadRequest {
+            reason: format!("Invalid transaction hex: {e}"),
+        })?;
+
+        let pending = self
+            .provider
+            .send_raw_transaction(&tx_bytes)
+            .await
+            .map_err(|e| StreamError::NetworkError {
+                reason: format!("Failed to broadcast open transaction: {e}"),
+            })?;
+
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| StreamError::NetworkError {
+                reason: format!("Failed to get transaction receipt: {e}"),
+            })?;
+
+        use alloy::network::ReceiptResponse;
+        if !receipt.status() {
+            return Err(StreamError::TransactionFailed {
+                reason: format!("Open transaction {} reverted", receipt.transaction_hash()),
+            });
+        }
+
+        let tx_hash = receipt.transaction_hash();
+
+        // Read on-chain channel state
+        let channel_id: FixedBytes<32> =
+            channel_id_str
+                .parse()
+                .map_err(|e| StreamError::BadRequest {
+                    reason: format!("Invalid channel_id: {e}"),
+                })?;
+
+        let on_chain = chain::get_on_chain_channel(
+            self.provider.as_ref(),
+            self.inner.config.escrow_contract,
+            channel_id,
+        )
+        .await?;
+
+        // Validate on-chain state
+        if on_chain.deposit == 0 {
+            return Err(StreamError::BadRequest {
+                reason: "On-chain channel has zero deposit".into(),
+            });
+        }
+
+        if on_chain.finalized {
+            return Err(StreamError::ChannelClosed {
+                reason: "On-chain channel is already finalized".into(),
+            });
+        }
+
+        if on_chain.payee != recipient {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "On-chain payee {} does not match expected recipient {}",
+                    on_chain.payee, recipient
+                ),
+            });
+        }
+
+        if on_chain.token != currency {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "On-chain token {} does not match expected currency {}",
+                    on_chain.token, currency
+                ),
+            });
+        }
+
+        // Parse and verify the voucher
+        let signed =
+            voucher::parse_voucher_from_payload(channel_id_str, cumulative_amount_str, signature)
+                .map_err(|e| StreamError::BadRequest {
+                reason: e.to_string(),
+            })?;
+
+        // Verify signature using on-chain authorized signer (or payer fallback)
+        let recovered = voucher::verify_voucher(
+            &signed,
+            self.inner.config.chain_id,
+            self.inner.config.escrow_contract,
+        )
+        .map_err(|e| StreamError::InvalidSignature {
+            reason: format!("Voucher signature verification failed: {e}"),
+        })?;
+
+        if recovered == Address::ZERO {
+            return Err(StreamError::InvalidSignature {
+                reason: "Recovered zero address from voucher signature".into(),
+            });
+        }
+
+        let expected_signer = if on_chain.authorized_signer == Address::ZERO {
+            on_chain.payer
+        } else {
+            on_chain.authorized_signer
+        };
+
+        if recovered != expected_signer && recovered != on_chain.payer {
+            return Err(StreamError::SignerMismatch {
+                reason: format!(
+                    "Voucher signed by {}, expected {} or payer {}",
+                    recovered, expected_signer, on_chain.payer
+                ),
+            });
+        }
+
+        // Validate voucher amounts against on-chain state
+        let cumulative_amount: u128 =
+            cumulative_amount_str
+                .parse()
+                .map_err(|e| StreamError::BadRequest {
+                    reason: format!("Invalid cumulative_amount: {e}"),
+                })?;
+
+        if cumulative_amount > on_chain.deposit {
+            return Err(StreamError::AmountExceedsDeposit {
+                reason: format!(
+                    "Cumulative amount {} exceeds on-chain deposit {}",
+                    cumulative_amount, on_chain.deposit
+                ),
+            });
+        }
+
+        if cumulative_amount < on_chain.settled_amount {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "Cumulative amount {} is less than on-chain settled amount {}",
+                    cumulative_amount, on_chain.settled_amount
+                ),
+            });
+        }
+
+        // Atomically create/update channel state and session
+        let signed_clone = signed.clone();
+        let on_chain_clone = on_chain;
+        let challenge_id_owned = challenge_id.to_string();
+
+        self.inner
+            .storage
+            .update_channel(
+                channel_id,
+                Box::new(move |_current| {
+                    Some(ChannelState {
+                        channel_id,
+                        payer: on_chain_clone.payer,
+                        payee: on_chain_clone.payee,
+                        token: on_chain_clone.token,
+                        authorized_signer: on_chain_clone.authorized_signer,
+                        deposit: on_chain_clone.deposit,
+                        settled_on_chain: on_chain_clone.settled_amount,
+                        highest_voucher_amount: signed_clone.cumulative_amount,
+                        highest_voucher: Some(signed_clone),
+                        active_session_id: Some(challenge_id_owned),
+                        finalized: false,
+                        created_at: SystemTime::now(),
+                    })
+                }),
+            )
+            .await;
+
+        let challenge_for_session = challenge_id.to_string();
+        let session = self
+            .inner
+            .storage
+            .update_session(
+                challenge_id,
+                Box::new(move |_current| {
+                    Some(SessionState {
+                        challenge_id: challenge_for_session,
+                        channel_id,
+                        accepted_cumulative: cumulative_amount,
+                        spent: 0,
+                        units: 0,
+                        created_at: SystemTime::now(),
+                    })
+                }),
+            )
+            .await
+            .expect("update_session callback always returns Some");
+
+        Ok(create_stream_receipt(CreateStreamReceiptParams {
+            challenge_id: challenge_id.to_string(),
+            channel_id,
+            accepted_cumulative: session.accepted_cumulative,
+            spent: session.spent,
+            units: Some(session.units),
+            tx_hash: Some(format!("{tx_hash:#x}")),
+        }))
+    }
+
+    /// Handle the topUp action: broadcast topUp tx, verify deposit increased.
+    async fn handle_top_up(
+        &self,
+        channel_id_str: &str,
+        transaction: &str,
+        additional_deposit_str: &str,
+        challenge_id: &str,
+    ) -> Result<StreamReceipt, StreamError> {
+        let channel_id: FixedBytes<32> =
+            channel_id_str
+                .parse()
+                .map_err(|e| StreamError::BadRequest {
+                    reason: format!("Invalid channel_id: {e}"),
+                })?;
+
+        // Get existing channel from storage
+        let existing = self
+            .inner
+            .storage
+            .get_channel(channel_id)
+            .await
+            .ok_or_else(|| StreamError::ChannelNotFound {
+                reason: format!("Channel {} not found", channel_id),
+            })?;
+
+        let previous_deposit = existing.deposit;
+
+        // Decode and validate the transaction
+        let tx = decode_tempo_transaction(transaction)?;
+
+        if tx.chain_id != self.inner.config.chain_id {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "Transaction chain_id mismatch: expected {}, got {}",
+                    self.inner.config.chain_id, tx.chain_id
+                ),
+            });
+        }
+
+        let top_up_params = find_top_up_call(&tx, self.inner.config.escrow_contract)?;
+
+        if top_up_params.channel_id != channel_id {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "TopUp call channel_id {} does not match expected {}",
+                    top_up_params.channel_id, channel_id
+                ),
+            });
+        }
+
+        let additional_deposit: u128 =
+            additional_deposit_str
+                .parse()
+                .map_err(|e| StreamError::BadRequest {
+                    reason: format!("Invalid additional_deposit: {e}"),
+                })?;
+
+        if top_up_params.additional_deposit != additional_deposit {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "TopUp call amount {} does not match payload {}",
+                    top_up_params.additional_deposit, additional_deposit
+                ),
+            });
+        }
+
+        // Broadcast the transaction
+        let tx_bytes: Bytes = transaction.parse().map_err(|e| StreamError::BadRequest {
+            reason: format!("Invalid transaction hex: {e}"),
+        })?;
+
+        let pending = self
+            .provider
+            .send_raw_transaction(&tx_bytes)
+            .await
+            .map_err(|e| StreamError::NetworkError {
+                reason: format!("Failed to broadcast topUp transaction: {e}"),
+            })?;
+
+        let receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| StreamError::NetworkError {
+                reason: format!("Failed to get transaction receipt: {e}"),
+            })?;
+
+        use alloy::network::ReceiptResponse;
+        if !receipt.status() {
+            return Err(StreamError::TransactionFailed {
+                reason: format!("TopUp transaction {} reverted", receipt.transaction_hash()),
+            });
+        }
+
+        let tx_hash = receipt.transaction_hash();
+
+        // Read on-chain channel state
+        let on_chain = chain::get_on_chain_channel(
+            self.provider.as_ref(),
+            self.inner.config.escrow_contract,
+            channel_id,
+        )
+        .await?;
+
+        // Validate deposit increased
+        if on_chain.deposit <= previous_deposit {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "On-chain deposit {} did not increase from previous {}",
+                    on_chain.deposit, previous_deposit
+                ),
+            });
+        }
+
+        // Atomically update channel deposit
+        let new_deposit = on_chain.deposit;
+        self.inner
+            .storage
+            .update_channel(
+                channel_id,
+                Box::new(move |current| {
+                    current.map(|mut ch| {
+                        ch.deposit = new_deposit;
+                        ch
+                    })
+                }),
+            )
+            .await;
+
+        // Return receipt (no session creation — client sends separate voucher)
+        let channel = self
+            .inner
+            .storage
+            .get_channel(channel_id)
+            .await
+            .ok_or_else(|| StreamError::ChannelNotFound {
+                reason: format!("Channel {} not found after topUp", channel_id),
+            })?;
+
+        Ok(create_stream_receipt(CreateStreamReceiptParams {
+            challenge_id: challenge_id.to_string(),
+            channel_id,
+            accepted_cumulative: channel.highest_voucher_amount,
+            spent: 0,
+            units: None,
+            tx_hash: Some(format!("{tx_hash:#x}")),
+        }))
+    }
+
+    /// Handle the close action: verify voucher, submit close tx on-chain, finalize.
+    async fn handle_close(
+        &self,
+        channel_id_str: &str,
+        cumulative_amount_str: &str,
+        signature: &str,
+        challenge_id: &str,
+    ) -> Result<StreamReceipt, StreamError> {
+        let channel_id: FixedBytes<32> =
+            channel_id_str
+                .parse()
+                .map_err(|e| StreamError::BadRequest {
+                    reason: format!("Invalid channel_id: {e}"),
+                })?;
+
+        // Get existing channel from storage
+        let existing = self
+            .inner
+            .storage
+            .get_channel(channel_id)
+            .await
+            .ok_or_else(|| StreamError::ChannelNotFound {
+                reason: format!("Channel {} not found", channel_id),
+            })?;
+
+        if existing.finalized {
+            return Err(StreamError::ChannelClosed {
+                reason: format!("Channel {} is already finalized", channel_id),
+            });
+        }
+
+        // Parse and verify the voucher
+        let signed =
+            voucher::parse_voucher_from_payload(channel_id_str, cumulative_amount_str, signature)
+                .map_err(|e| StreamError::BadRequest {
+                reason: e.to_string(),
+            })?;
+
+        let cumulative_amount: u128 =
+            cumulative_amount_str
+                .parse()
+                .map_err(|e| StreamError::BadRequest {
+                    reason: format!("Invalid cumulative_amount: {e}"),
+                })?;
+
+        // Close voucher must be >= highest accepted voucher
+        if cumulative_amount < existing.highest_voucher_amount {
+            return Err(StreamError::DeltaTooSmall {
+                reason: format!(
+                    "Close voucher amount {} is less than highest accepted {}",
+                    cumulative_amount, existing.highest_voucher_amount
+                ),
+            });
+        }
+
+        // Read on-chain channel state
+        let on_chain = chain::get_on_chain_channel(
+            self.provider.as_ref(),
+            self.inner.config.escrow_contract,
+            channel_id,
+        )
+        .await?;
+
+        if on_chain.finalized {
+            return Err(StreamError::ChannelClosed {
+                reason: "On-chain channel is already finalized".into(),
+            });
+        }
+
+        // Validate voucher amounts against on-chain state
+        if cumulative_amount > on_chain.deposit {
+            return Err(StreamError::AmountExceedsDeposit {
+                reason: format!(
+                    "Close voucher amount {} exceeds on-chain deposit {}",
+                    cumulative_amount, on_chain.deposit
+                ),
+            });
+        }
+
+        if cumulative_amount < on_chain.settled_amount {
+            return Err(StreamError::BadRequest {
+                reason: format!(
+                    "Close voucher amount {} is less than on-chain settled amount {}",
+                    cumulative_amount, on_chain.settled_amount
+                ),
+            });
+        }
+
+        // Verify signature
+        let recovered = voucher::verify_voucher(
+            &signed,
+            self.inner.config.chain_id,
+            self.inner.config.escrow_contract,
+        )
+        .map_err(|e| StreamError::InvalidSignature {
+            reason: format!("Voucher signature verification failed: {e}"),
+        })?;
+
+        if recovered == Address::ZERO {
+            return Err(StreamError::InvalidSignature {
+                reason: "Recovered zero address from voucher signature".into(),
+            });
+        }
+
+        let expected_signer = if on_chain.authorized_signer == Address::ZERO {
+            on_chain.payer
+        } else {
+            on_chain.authorized_signer
+        };
+
+        if recovered != expected_signer && recovered != on_chain.payer {
+            return Err(StreamError::SignerMismatch {
+                reason: format!(
+                    "Voucher signed by {}, expected {} or payer {}",
+                    recovered, expected_signer, on_chain.payer
+                ),
+            });
+        }
+
+        // Submit close on-chain
+        let sig_bytes = signed.signature.clone();
+        let contract = super::chain::ITempoStreamChannel::new(
+            self.inner.config.escrow_contract,
+            self.provider.as_ref(),
+        );
+        let close_tx = contract
+            .close(channel_id, cumulative_amount, sig_bytes)
+            .send()
+            .await
+            .map_err(|e| StreamError::NetworkError {
+                reason: format!("Failed to send close transaction: {e}"),
+            })?;
+
+        let receipt = close_tx
+            .get_receipt()
+            .await
+            .map_err(|e| StreamError::NetworkError {
+                reason: format!("Failed to get close transaction receipt: {e}"),
+            })?;
+
+        use alloy::network::ReceiptResponse;
+        if !receipt.status() {
+            return Err(StreamError::TransactionFailed {
+                reason: format!("Close transaction {} reverted", receipt.transaction_hash()),
+            });
+        }
+
+        let tx_hash = receipt.transaction_hash();
+
+        // Atomically update channel: finalized, clear session, update highest voucher
+        let signed_clone = signed.clone();
+        self.inner
+            .storage
+            .update_channel(
+                channel_id,
+                Box::new(move |current| {
+                    current.map(|mut ch| {
+                        ch.finalized = true;
+                        ch.active_session_id = None;
+                        if signed_clone.cumulative_amount > ch.highest_voucher_amount {
+                            ch.highest_voucher_amount = signed_clone.cumulative_amount;
+                            ch.highest_voucher = Some(signed_clone);
+                        }
+                        ch
+                    })
+                }),
+            )
+            .await;
+
+        // Delete session from storage
+        if let Some(ref session_id) = existing.active_session_id {
+            self.inner
+                .storage
+                .update_session(session_id, Box::new(|_| None))
+                .await;
+        }
+
+        Ok(create_stream_receipt(CreateStreamReceiptParams {
+            challenge_id: challenge_id.to_string(),
+            channel_id,
+            accepted_cumulative: cumulative_amount,
+            spent: 0,
+            units: None,
+            tx_hash: Some(format!("{tx_hash:#x}")),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::storage::{ChannelState, MemoryStorage};
@@ -447,6 +1163,8 @@ mod tests {
             chain_id: 42431,
             escrow_contract: test_escrow_address(),
             min_delta: 0,
+            recipient: None,
+            currency: None,
         }
     }
 
@@ -552,7 +1270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_voucher_monotonic_rejection() {
+    async fn test_voucher_idempotent_same_amount() {
         let signer = PrivateKeySigner::random();
         let storage = MemoryStorage::new();
         setup_channel(&storage, signer.address()).await;
@@ -573,7 +1291,38 @@ mod tests {
             .await
             .unwrap();
 
-        // Second voucher: 3M (lower — should fail)
+        // Resubmit same voucher: 5M (same — spec §10.4: MUST return 200 OK)
+        let result = server
+            .verify(&make_voucher_payload(&s1), "challenge-1")
+            .await;
+        assert!(result.is_ok());
+        let receipt = result.unwrap();
+        assert_eq!(receipt.accepted_cumulative, "5000000");
+    }
+
+    #[tokio::test]
+    async fn test_voucher_idempotent_lower_amount() {
+        let signer = PrivateKeySigner::random();
+        let storage = MemoryStorage::new();
+        setup_channel(&storage, signer.address()).await;
+
+        let server = StreamServer::new(storage, test_config());
+        let cfg = test_config();
+
+        // First voucher: 5M
+        let v1 = VoucherType {
+            channel_id: test_channel_id(),
+            cumulative_amount: 5_000_000,
+        };
+        let s1 = sign_voucher(&signer, &v1, cfg.chain_id, cfg.escrow_contract)
+            .await
+            .unwrap();
+        server
+            .verify(&make_voucher_payload(&s1), "challenge-1")
+            .await
+            .unwrap();
+
+        // Lower voucher: 3M (spec §10.4: MUST return 200 OK with current highest)
         let v2 = VoucherType {
             channel_id: test_channel_id(),
             cumulative_amount: 3_000_000,
@@ -585,9 +1334,45 @@ mod tests {
             .verify(&make_voucher_payload(&s2), "challenge-1")
             .await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, StreamError::DeltaTooSmall { .. }));
+        assert!(result.is_ok());
+        let receipt = result.unwrap();
+        assert_eq!(receipt.accepted_cumulative, "5000000");
+    }
+
+    #[tokio::test]
+    async fn test_voucher_idempotent_with_min_delta() {
+        let signer = PrivateKeySigner::random();
+        let storage = MemoryStorage::new();
+        setup_channel(&storage, signer.address()).await;
+
+        let config = StreamConfig {
+            chain_id: 42431,
+            escrow_contract: test_escrow_address(),
+            min_delta: 1_000_000,
+            recipient: None,
+            currency: None,
+        };
+        let server = StreamServer::new(storage, config);
+
+        // First voucher: 5M
+        let v1 = VoucherType {
+            channel_id: test_channel_id(),
+            cumulative_amount: 5_000_000,
+        };
+        let s1 = sign_voucher(&signer, &v1, 42431, test_escrow_address())
+            .await
+            .unwrap();
+        server
+            .verify(&make_voucher_payload(&s1), "challenge-1")
+            .await
+            .unwrap();
+
+        // Replay same amount — must succeed even with min_delta > 0
+        let result = server
+            .verify(&make_voucher_payload(&s1), "challenge-1")
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().accepted_cumulative, "5000000");
     }
 
     #[tokio::test]
@@ -694,8 +1479,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_voucher_payer_accepted_even_with_authorized_signer_set() {
-        // Spec: recovered address must match authorizedSigner OR payer
+    async fn test_voucher_payer_rejected_when_authorized_signer_set() {
+        // Spec §10.3: when authorizedSigner is set (non-zero), only
+        // authorizedSigner is accepted. Payer signing is not sufficient.
         let payer_signer = PrivateKeySigner::random();
         let payer_address = payer_signer.address();
         let authorized = PrivateKeySigner::random();
@@ -728,7 +1514,7 @@ mod tests {
         let server = StreamServer::new(storage, test_config());
         let cfg = test_config();
 
-        // Sign with payer (not authorized_signer) — should still work per spec
+        // Sign with payer (not authorized_signer) — should be rejected
         let voucher = VoucherType {
             channel_id: id,
             cumulative_amount: 5_000_000,
@@ -740,7 +1526,59 @@ mod tests {
             .verify(&make_voucher_payload(&signed), "challenge-1")
             .await;
 
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StreamError::SignerMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_voucher_authorized_signer_accepted_when_set() {
+        // Spec §10.3: when authorizedSigner is set, it is the expected signer
+        let payer_signer = PrivateKeySigner::random();
+        let payer_address = payer_signer.address();
+        let authorized = PrivateKeySigner::random();
+        let authorized_address = authorized.address();
+        let storage = MemoryStorage::new();
+        let id = test_channel_id();
+
+        storage
+            .update_channel(
+                id,
+                Box::new(move |_| {
+                    Some(ChannelState {
+                        channel_id: id,
+                        payer: payer_address,
+                        payee: Address::ZERO,
+                        token: Address::ZERO,
+                        authorized_signer: authorized_address,
+                        deposit: 10_000_000,
+                        settled_on_chain: 0,
+                        highest_voucher_amount: 0,
+                        highest_voucher: None,
+                        active_session_id: None,
+                        finalized: false,
+                        created_at: SystemTime::now(),
+                    })
+                }),
+            )
+            .await;
+
+        let server = StreamServer::new(storage, test_config());
+        let cfg = test_config();
+
+        // Sign with authorized signer — should succeed
+        let voucher = VoucherType {
+            channel_id: id,
+            cumulative_amount: 5_000_000,
+        };
+        let signed = sign_voucher(&authorized, &voucher, cfg.chain_id, cfg.escrow_contract)
+            .await
+            .unwrap();
+        let result = server
+            .verify(&make_voucher_payload(&signed), "challenge-1")
+            .await;
+
         assert!(result.is_ok());
+        assert_eq!(result.unwrap().accepted_cumulative, "5000000");
     }
 
     #[tokio::test]
@@ -1011,6 +1849,8 @@ mod tests {
             chain_id: 42431,
             escrow_contract: test_escrow_address(),
             min_delta: 1_000_000, // Minimum 1M delta
+            recipient: None,
+            currency: None,
         };
         let server = StreamServer::new(storage, config);
 
