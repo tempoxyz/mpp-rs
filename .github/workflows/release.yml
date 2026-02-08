@@ -1,14 +1,23 @@
+# This crate is distributed via GitHub Releases rather than crates.io because
+# it depends on tempo-alloy and tempo-primitives, which are not published to
+# crates.io (they live in the tempoxyz/tempo repo as git dependencies).
+#
+# Users consume this crate via git dependency in their Cargo.toml:
+#   mpay = { git = "https://github.com/tempoxyz/mpay-rs", tag = "v0.2.1", features = ["tempo", "client"] }
+
 name: Release
 on:
   push:
+    tags: ["v*"]
     branches:
       - main
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
-  release:
-    name: Version
+  changelog:
+    name: Changelog
+    if: github.ref_type == 'branch'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,5 +27,29 @@ jobs:
         uses: wevm/changelogs-rs@changelogs@0.6.0
         with:
           conventional-commit: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --all-features
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
