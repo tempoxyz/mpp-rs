@@ -68,7 +68,7 @@ async fn main() {
 
     let payment = Mpay::create(
         tempo(TempoConfig {
-            currency: "0x20c0000000000000000000000000000000000001",
+            currency: "0x20c0000000000000000000000000000000000000",
             recipient: &merchant_address,
         })
         .rpc_url(RPC_URL)

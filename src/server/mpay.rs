@@ -9,7 +9,7 @@
 //! use mpay::server::{Mpay, tempo};
 //!
 //! let mpay = Mpay::create(tempo(mpay::server::TempoConfig {
-//!     currency: "0x20c0000000000000000000000000000000000001",
+//!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 //! }))?;
 //!
@@ -38,7 +38,7 @@ const DEFAULT_DECIMALS: u32 = 6;
 /// use mpay::server::{Mpay, tempo, TempoConfig};
 ///
 /// let mpay = Mpay::create(tempo(TempoConfig {
-///     currency: "0x20c0000000000000000000000000000000000001",
+///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
 /// }))?;
 ///
@@ -275,7 +275,7 @@ impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
     /// use mpay::server::{Mpay, tempo, TempoConfig};
     ///
     /// let mpay = Mpay::create(tempo(TempoConfig {
-    ///     currency: "0x20c0000000000000000000000000000000000001",
+    ///     currency: "0x20c0000000000000000000000000000000000000",
     ///     recipient: "0xabc...123",
     /// }))?;
     ///
@@ -421,7 +421,7 @@ mod tests {
         let challenge = payment
             .charge_challenge(
                 "1000000",
-                "0x20c0000000000000000000000000000000000001",
+                "0x20c0000000000000000000000000000000000000",
                 "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
             )
             .unwrap();
@@ -471,7 +471,7 @@ mod tests {
     fn create_test_mpay() -> Mpay<crate::server::TempoChargeMethod<crate::server::TempoProvider>> {
         Mpay::create(
             tempo(TempoConfig {
-                currency: "0x20c0000000000000000000000000000000000001",
+                currency: "0x20c0000000000000000000000000000000000000",
                 recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
             })
             .secret_key("test-secret"),
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(mpay.realm(), "MPP Payment");
         assert_eq!(
             mpay.currency(),
-            Some("0x20c0000000000000000000000000000000000001")
+            Some("0x20c0000000000000000000000000000000000000")
         );
         assert_eq!(
             mpay.recipient(),
@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(request.amount, "100000");
         assert_eq!(
             request.currency,
-            "0x20c0000000000000000000000000000000000001"
+            "0x20c0000000000000000000000000000000000000"
         );
         assert_eq!(
             request.recipient,
@@ -546,7 +546,7 @@ mod tests {
     async fn test_verify_credential_decodes_request() {
         let request = ChargeRequest {
             amount: "500000".into(),
-            currency: "0x20c0000000000000000000000000000000000001".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };

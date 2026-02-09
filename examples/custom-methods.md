@@ -256,7 +256,7 @@ assert_eq!(method.method(), "tempo");
 // In your server handler:
 let request = ChargeRequest {
     amount: "1000000".into(),
-    currency: "0x20c0000000000000000000000000000000000001".into(),
+    currency: "0x20c0000000000000000000000000000000000000".into(),
     recipient: Some("0x742d35Cc...".into()),
     ..Default::default()
 };
