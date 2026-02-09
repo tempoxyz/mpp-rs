@@ -28,7 +28,7 @@
 //!     "my-server-secret",
 //!     "api.example.com",
 //!     "1000000",
-//!     "0x20c0000000000000000000000000000000000001",
+//!     "0x20c0000000000000000000000000000000000000",
 //!     "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 //! ).unwrap();
 //!
@@ -36,7 +36,7 @@
 //! use mpay::protocol::intents::ChargeRequest;
 //! let request = ChargeRequest {
 //!     amount: "1000000".into(),
-//!     currency: "0x20c0000000000000000000000000000000000001".into(),
+//!     currency: "0x20c0000000000000000000000000000000000000".into(),
 //!     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
 //!     method_details: Some(serde_json::json!({"feePayer": true})),
 //!     ..Default::default()
@@ -154,7 +154,7 @@ pub const INTENT_CHARGE: &str = "charge";
 ///     "my-server-secret",
 ///     "api.example.com",
 ///     "1000000",
-///     "0x20c0000000000000000000000000000000000001",
+///     "0x20c0000000000000000000000000000000000000",
 ///     "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 /// ).unwrap();
 ///
@@ -203,7 +203,7 @@ pub fn charge_challenge(
 ///
 /// let request = ChargeRequest {
 ///     amount: "1000000".into(),
-///     currency: "0x20c0000000000000000000000000000000000001".into(),
+///     currency: "0x20c0000000000000000000000000000000000000".into(),
 ///     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
 ///     method_details: Some(serde_json::json!({"feePayer": true})),
 ///     ..Default::default()
@@ -363,7 +363,7 @@ pub fn generate_challenge_id(
 ///     "charge",
 ///     &json!({
 ///         "amount": "1000000",
-///         "currency": "0x20c0000000000000000000000000000000000001",
+///         "currency": "0x20c0000000000000000000000000000000000000",
 ///         "recipient": "0x1234567890abcdef1234567890abcdef12345678"
 ///     }),
 ///     None,
@@ -418,7 +418,7 @@ mod tests {
 
         let request = ChargeRequest {
             amount: "1000000".into(),
-            currency: "0x20c0000000000000000000000000000000000001".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
@@ -453,7 +453,7 @@ mod tests {
             TEST_SECRET,
             "api.example.com",
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -470,7 +470,7 @@ mod tests {
             TEST_SECRET,
             "api.example.com",
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -479,7 +479,7 @@ mod tests {
             TEST_SECRET,
             "api.example.com",
             "2000000", // Different amount
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -496,7 +496,7 @@ mod tests {
             TEST_SECRET,
             "api.example.com",
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -505,7 +505,7 @@ mod tests {
             TEST_SECRET,
             "api.other.com", // Different realm
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -522,7 +522,7 @@ mod tests {
             TEST_SECRET,
             "api.example.com",
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -548,7 +548,7 @@ mod tests {
             "secret-one",
             "api.example.com",
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -557,7 +557,7 @@ mod tests {
             "secret-two", // Different secret
             "api.example.com",
             "1000000",
-            "0x20c0000000000000000000000000000000000001",
+            "0x20c0000000000000000000000000000000000000",
             "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         )
         .unwrap();
@@ -584,7 +584,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "1000000",
-                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "currency": "0x20c0000000000000000000000000000000000000",
                     "recipient": "0x1234567890abcdef1234567890abcdef12345678"
                 }),
                 None,
@@ -604,7 +604,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "5000000",
-                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "currency": "0x20c0000000000000000000000000000000000000",
                     "recipient": "0xabcdef1234567890abcdef1234567890abcdef12"
                 }),
                 Some("2026-01-29T12:00:00Z"),
@@ -644,7 +644,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "10000000",
-                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "currency": "0x20c0000000000000000000000000000000000000",
                     "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
                     "description": "API access fee",
                     "externalId": "order-12345"
@@ -666,7 +666,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "1000000",
-                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "currency": "0x20c0000000000000000000000000000000000000",
                     "recipient": "0x1234567890abcdef1234567890abcdef12345678"
                 }),
                 None,
@@ -723,7 +723,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "5000000",
-                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "currency": "0x20c0000000000000000000000000000000000000",
                     "recipient": "0x2222222222222222222222222222222222222222",
                     "methodDetails": {
                         "chainId": 42431,

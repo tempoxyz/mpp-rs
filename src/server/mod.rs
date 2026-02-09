@@ -6,7 +6,7 @@
 //! use mpay::server::{Mpay, tempo, TempoConfig};
 //!
 //! let mpay = Mpay::create(tempo(TempoConfig {
-//!     currency: "0x20c0000000000000000000000000000000000001",
+//!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0xabc...123",
 //! }))?;
 //!
@@ -128,14 +128,14 @@ pub struct ChargeOptions<'a> {
 ///
 /// // Minimal
 /// let mpay = Mpay::create(tempo(TempoConfig {
-///     currency: "0x20c0000000000000000000000000000000000001",
+///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
 /// }))?;
 ///
 /// // With overrides
 /// let mpay = Mpay::create(
 ///     tempo(TempoConfig {
-///         currency: "0x20c0000000000000000000000000000000000001",
+///         currency: "0x20c0000000000000000000000000000000000000",
 ///         recipient: "0xabc...123",
 ///     })
 ///     .rpc_url("https://rpc.moderato.tempo.xyz")
