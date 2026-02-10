@@ -47,6 +47,36 @@ impl TempoStreamMethodDetails {
     }
 }
 
+/// Voucher signature, supporting both raw and keychain envelope formats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VoucherSignature {
+    Envelope {
+        #[serde(rename = "userAddress")]
+        user_address: String,
+        signature: String,
+    },
+    Raw(String),
+}
+
+impl VoucherSignature {
+    /// Get the raw signature hex string regardless of format.
+    pub fn signature(&self) -> &str {
+        match self {
+            Self::Raw(sig) => sig,
+            Self::Envelope { signature, .. } => signature,
+        }
+    }
+
+    /// Get the user address if this is an envelope (keychain mode).
+    pub fn user_address(&self) -> Option<&str> {
+        match self {
+            Self::Envelope { user_address, .. } => Some(user_address),
+            Self::Raw(_) => None,
+        }
+    }
+}
+
 /// Stream credential payload (discriminated by `action`).
 ///
 /// Represents the different actions a client can take in a streaming payment channel.
@@ -63,8 +93,8 @@ pub enum StreamCredentialPayload {
         channel_id: String,
         /// Signed transaction hex
         transaction: String,
-        /// Signature hex
-        signature: String,
+        /// Voucher signature (raw hex or keychain envelope)
+        signature: VoucherSignature,
         /// Optional authorized signer address
         #[serde(rename = "authorizedSigner", skip_serializing_if = "Option::is_none")]
         authorized_signer: Option<String>,
@@ -94,8 +124,8 @@ pub enum StreamCredentialPayload {
         /// Cumulative amount paid through the channel
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
-        /// Signature hex
-        signature: String,
+        /// Voucher signature (raw hex or keychain envelope)
+        signature: VoucherSignature,
     },
     /// Close a payment channel
     Close {
@@ -105,8 +135,8 @@ pub enum StreamCredentialPayload {
         /// Cumulative amount paid through the channel
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
-        /// Signature hex
-        signature: String,
+        /// Voucher signature (raw hex or keychain envelope)
+        signature: VoucherSignature,
     },
 }
 
@@ -312,7 +342,7 @@ mod tests {
             payload_type: "transaction".to_string(),
             channel_id: "0xabc".to_string(),
             transaction: "0xdef".to_string(),
-            signature: "0x123".to_string(),
+            signature: VoucherSignature::Raw("0x123".to_string()),
             authorized_signer: Some("0x456".to_string()),
             cumulative_amount: "5000".to_string(),
         };
@@ -337,7 +367,7 @@ mod tests {
         let payload = StreamCredentialPayload::Voucher {
             channel_id: "0xabc".to_string(),
             cumulative_amount: "10000".to_string(),
-            signature: "0xsig".to_string(),
+            signature: VoucherSignature::Raw("0xsig".to_string()),
         };
 
         let json = serde_json::to_string(&payload).unwrap();
@@ -374,11 +404,27 @@ mod tests {
         let payload = StreamCredentialPayload::Close {
             channel_id: "0xabc".to_string(),
             cumulative_amount: "99000".to_string(),
-            signature: "0xsig".to_string(),
+            signature: VoucherSignature::Raw("0xsig".to_string()),
         };
 
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"action\":\"close\""));
+    }
+
+    #[test]
+    fn test_voucher_signature_raw_deserialization() {
+        let json = r#""0xabcdef""#;
+        let sig: VoucherSignature = serde_json::from_str(json).unwrap();
+        assert_eq!(sig.signature(), "0xabcdef");
+        assert!(sig.user_address().is_none());
+    }
+
+    #[test]
+    fn test_voucher_signature_envelope_deserialization() {
+        let json = r#"{"userAddress":"0x1234","signature":"0xabcdef"}"#;
+        let sig: VoucherSignature = serde_json::from_str(json).unwrap();
+        assert_eq!(sig.signature(), "0xabcdef");
+        assert_eq!(sig.user_address(), Some("0x1234"));
     }
 
     #[test]

@@ -104,9 +104,16 @@ pub mod types;
 pub mod method;
 #[cfg(feature = "server")]
 pub mod stream_method;
+#[cfg(feature = "server")]
+pub mod stream_storage;
+#[cfg(feature = "server")]
+pub mod stream_verify;
 
 pub use charge::TempoChargeExt;
-pub use stream::{StreamCredentialPayload, StreamReceipt, TempoStreamExt, TempoStreamMethodDetails};
+pub use stream::{
+    StreamCredentialPayload, StreamReceipt, TempoStreamExt, TempoStreamMethodDetails,
+    VoucherSignature,
+};
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
@@ -117,6 +124,12 @@ pub use types::TempoMethodDetails;
 pub use method::ChargeMethod;
 #[cfg(feature = "server")]
 pub use stream_method::StreamMethod;
+#[cfg(feature = "server")]
+pub use stream_storage::{
+    ChannelState, ChannelStatus, ChannelStorage, InMemoryChannelStorage, SessionState, StorageError,
+};
+#[cfg(feature = "server")]
+pub use stream_verify::{recover_voucher_signer, verify_voucher_signature};
 
 /// Tempo mainnet chain ID.
 pub const CHAIN_ID: u64 = 4217;
@@ -669,8 +682,7 @@ mod tests {
         assert!(challenge.expires.is_some());
         assert_eq!(challenge.id.len(), 43);
 
-        let request: crate::protocol::intents::StreamRequest =
-            challenge.request.decode().unwrap();
+        let request: crate::protocol::intents::StreamRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "1000");
         assert_eq!(request.unit_type, "llm_token");
         assert_eq!(

@@ -652,8 +652,10 @@ mod tests {
         }"#;
         let credential: PaymentCredential = serde_json::from_str(json).unwrap();
 
-        assert!(!credential.payload.is_transaction(), 
-            "Stream payload with action field should not parse as charge transaction");
+        assert!(
+            !credential.payload.is_transaction(),
+            "Stream payload with action field should not parse as charge transaction"
+        );
         assert_eq!(credential.payload.data(), "");
         assert!(credential.raw_payload().is_some());
         assert_eq!(credential.raw_payload().unwrap()["action"], "open");

@@ -50,6 +50,14 @@ pub use crate::protocol::methods::tempo::stream::{
     StreamCredentialPayload, StreamReceipt, TempoStreamExt, TempoStreamMethodDetails,
 };
 
+#[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::{
+    ChannelState, ChannelStatus, ChannelStorage, InMemoryChannelStorage, SessionState, StorageError,
+};
+
+#[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::{recover_voucher_signer, verify_voucher_signature};
+
 // ==================== Simple API ====================
 
 /// Configuration for the Tempo payment method.

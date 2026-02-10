@@ -16,7 +16,7 @@ default = []
 
 # Side selection
 client = ["reqwest"]
-server = []
+server = ["tokio"]
 
 # Method implementations
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
@@ -52,6 +52,9 @@ alloy-signer-local = { version = "1.2", optional = true }
 #   tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
 tempo-alloy = { version = "1", optional = true }
 tempo-primitives = { version = "1", optional = true }
+
+# Server dependencies (optional)
+tokio = { version = "1", features = ["sync"], optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.12", features = ["json"], optional = true }
