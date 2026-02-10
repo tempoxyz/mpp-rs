@@ -134,7 +134,7 @@ impl TempoProvider {
 #[cfg(feature = "tempo")]
 impl PaymentProvider for TempoProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "tempo" && intent == "charge"
+        method == "tempo" && (intent == "charge" || intent == "stream")
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -145,6 +145,12 @@ impl PaymentProvider for TempoProvider {
         use alloy::providers::{Provider, ProviderBuilder};
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
         use tempo_alloy::TempoNetwork;
+
+        if challenge.intent.is_stream() {
+            return Err(MppError::UnsupportedPaymentMethod(
+                "stream payments require manual credential construction via PaymentCredential::with_raw_payload() — automatic pay() is not supported for the stream intent".to_string(),
+            ));
+        }
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);

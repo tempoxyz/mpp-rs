@@ -25,10 +25,14 @@
 //! ```
 
 pub use crate::protocol::intents::ChargeRequest;
+pub use crate::protocol::intents::StreamRequest;
 pub use crate::protocol::methods::tempo::{
     Call, SignatureType, TempoChargeExt, TempoMethodDetails, TempoTransaction,
     TempoTransactionRequest, CHAIN_ID, DEFAULT_EXPIRES_MINUTES, DEFAULT_RPC_URL, METHOD_NAME,
     MODERATO_CHAIN_ID, TEMPO_SEND_TRANSACTION_METHOD, TEMPO_TX_TYPE_ID,
+};
+pub use crate::protocol::methods::tempo::stream::{
+    StreamCredentialPayload, StreamReceipt, TempoStreamExt, TempoStreamMethodDetails,
 };
 
 #[cfg(feature = "server")]

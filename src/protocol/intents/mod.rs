@@ -3,6 +3,7 @@
 //! This module provides typed request structures for payment intents:
 //!
 //! - [`ChargeRequest`]: One-time payment (charge intent)
+//! - [`StreamRequest`]: Streaming/metered payment (stream intent)
 //!
 //! **Zero heavy dependencies** - only serde and serde_json. No alloy, no blockchain types.
 //!
@@ -26,5 +27,7 @@
 //! ```
 
 pub mod charge;
+pub mod stream;
 
 pub use charge::ChargeRequest;
+pub use stream::StreamRequest;

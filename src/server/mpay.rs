@@ -67,10 +67,7 @@ pub struct Mpay<M> {
     decimals: u32,
 }
 
-impl<M> Mpay<M>
-where
-    M: ChargeMethod,
-{
+impl<M> Mpay<M> {
     /// Create a new payment handler (advanced API).
     ///
     /// For a simpler API, use [`Mpay::create()`] with [`tempo()`](super::tempo).
@@ -90,11 +87,6 @@ where
         &self.realm
     }
 
-    /// Get the method name.
-    pub fn method_name(&self) -> &str {
-        self.method.method()
-    }
-
     /// Get the bound currency, if configured.
     pub fn currency(&self) -> Option<&str> {
         self.currency.as_deref()
@@ -108,6 +100,16 @@ where
     /// Get the configured decimals.
     pub fn decimals(&self) -> u32 {
         self.decimals
+    }
+}
+
+impl<M> Mpay<M>
+where
+    M: ChargeMethod,
+{
+    /// Get the method name.
+    pub fn method_name(&self) -> &str {
+        self.method.method()
     }
 
     #[cfg(feature = "tempo")]
@@ -257,6 +259,116 @@ where
         let receipt = self.method.verify(credential, request).await?;
 
         Ok(receipt)
+    }
+}
+
+impl<M> Mpay<M>
+where
+    M: crate::protocol::traits::StreamMethod,
+{
+    /// Generate a stream challenge for a dollar amount per unit.
+    #[cfg(feature = "tempo")]
+    pub fn stream(
+        &self,
+        amount: &str,
+        unit_type: &str,
+        escrow_contract: &str,
+    ) -> Result<PaymentChallenge> {
+        let (currency, recipient) = self.require_bound_config_stream()?;
+        let base_units = super::parse_dollar_amount(amount, self.decimals)?;
+        let request = crate::protocol::intents::StreamRequest {
+            amount: base_units,
+            unit_type: unit_type.to_string(),
+            currency: currency.to_string(),
+            recipient: Some(recipient.to_string()),
+            method_details: Some(serde_json::json!({
+                "escrowContract": escrow_contract
+            })),
+            ..Default::default()
+        };
+        crate::protocol::methods::tempo::stream_challenge_with_options(
+            &self.secret_key,
+            &self.realm,
+            &request,
+            None,
+            None,
+        )
+    }
+
+    /// Generate a stream challenge with explicit parameters (base units).
+    #[cfg(feature = "tempo")]
+    pub fn stream_challenge(
+        &self,
+        amount: &str,
+        unit_type: &str,
+        currency: &str,
+        recipient: &str,
+        escrow_contract: &str,
+    ) -> Result<PaymentChallenge> {
+        crate::protocol::methods::tempo::stream_challenge(
+            &self.secret_key,
+            &self.realm,
+            amount,
+            unit_type,
+            currency,
+            recipient,
+            escrow_contract,
+        )
+    }
+
+    /// Verify a stream payment credential.
+    pub async fn verify_stream_credential(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request: crate::protocol::intents::StreamRequest =
+            crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
+                .decode()
+                .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+        self.verify_stream(credential, &request).await
+    }
+
+    /// Verify a stream credential with an explicit request.
+    pub async fn verify_stream(
+        &self,
+        credential: &PaymentCredential,
+        request: &crate::protocol::intents::StreamRequest,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        #[cfg(feature = "tempo")]
+        {
+            let expected_id = crate::protocol::methods::tempo::generate_challenge_id(
+                &self.secret_key,
+                &self.realm,
+                credential.challenge.method.as_str(),
+                credential.challenge.intent.as_str(),
+                &credential.challenge.request,
+                credential.challenge.expires.as_deref(),
+                credential.challenge.digest.as_deref(),
+            );
+
+            if credential.challenge.id != expected_id {
+                return Err(VerificationError::credential_mismatch(
+                    "Challenge ID mismatch: credential was not issued by this server",
+                ));
+            }
+        }
+
+        self.method.verify(credential, request).await
+    }
+
+    #[cfg(feature = "tempo")]
+    fn require_bound_config_stream(&self) -> Result<(&str, &str)> {
+        let currency = self.currency.as_deref().ok_or_else(|| {
+            crate::error::MppError::InvalidConfig(
+                "currency not configured — use Mpay::create() or set currency".into(),
+            )
+        })?;
+        let recipient = self.recipient.as_deref().ok_or_else(|| {
+            crate::error::MppError::InvalidConfig(
+                "recipient not configured — use Mpay::create() or set recipient".into(),
+            )
+        })?;
+        Ok((currency, recipient))
     }
 }
 
@@ -607,5 +719,95 @@ mod tests {
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "5500000");
         assert_eq!(challenge.description, Some("API access fee".to_string()));
+    }
+
+    #[derive(Clone)]
+    struct MockStreamMethod;
+
+    impl crate::protocol::traits::StreamMethod for MockStreamMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &crate::protocol::intents::StreamRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            async { Ok(Receipt::success("mock", "stream_ref")) }
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_stream_challenge_generation() {
+        let payment = Mpay::new(MockStreamMethod, "api.example.com", "test-secret");
+        let challenge = payment
+            .stream_challenge(
+                "1000",
+                "llm_token",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                "0x1234567890abcdef1234567890abcdef12345678",
+            )
+            .unwrap();
+
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "stream");
+        assert_eq!(challenge.realm, "api.example.com");
+        assert_eq!(challenge.id.len(), 43);
+    }
+
+    #[tokio::test]
+    async fn test_verify_stream_returns_receipt() {
+        let payment = Mpay::new(MockStreamMethod, "api.example.com", "secret");
+        let request = crate::protocol::intents::StreamRequest {
+            amount: "1000".into(),
+            unit_type: "llm_token".into(),
+            currency: "0x123".into(),
+            ..Default::default()
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let raw = encoded.raw().to_string();
+
+        let id = {
+            #[cfg(feature = "tempo")]
+            {
+                crate::protocol::methods::tempo::generate_challenge_id(
+                    "secret",
+                    "api.example.com",
+                    "mock",
+                    "stream",
+                    &raw,
+                    None,
+                    None,
+                )
+            }
+            #[cfg(not(feature = "tempo"))]
+            {
+                "test-id".to_string()
+            }
+        };
+
+        let echo = ChallengeEcho {
+            id,
+            realm: "api.example.com".into(),
+            method: "mock".into(),
+            intent: "stream".into(),
+            request: raw,
+            expires: None,
+            digest: None,
+        };
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
+
+        let receipt = payment.verify_stream(&credential, &request).await.unwrap();
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "stream_ref");
+    }
+
+    #[test]
+    fn test_mpay_new_works_with_stream_only_method() {
+        let payment = Mpay::new(MockStreamMethod, "api.example.com", "secret");
+        assert_eq!(payment.realm(), "api.example.com");
     }
 }

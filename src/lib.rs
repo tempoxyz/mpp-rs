@@ -68,6 +68,7 @@ pub use protocol::core::{
 
 // Intent types
 pub use protocol::intents::ChargeRequest;
+pub use protocol::intents::StreamRequest;
 
 // ==================== Alloy Re-exports ====================
 

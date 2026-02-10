@@ -126,6 +126,11 @@ impl IntentName {
     pub fn is_subscription(&self) -> bool {
         self.0.eq_ignore_ascii_case("subscription")
     }
+
+    /// Check if this is the "stream" intent.
+    pub fn is_stream(&self) -> bool {
+        self.0.eq_ignore_ascii_case("stream")
+    }
 }
 
 impl Deref for IntentName {
@@ -333,6 +338,7 @@ impl fmt::Display for PaymentProtocol {
 /// Indicates what kind of data is in the payload. Per spec:
 /// - `transaction`: Signed blockchain transaction (to be broadcast by server)
 /// - `hash`: Transaction hash (already broadcast by client)
+/// - `json`: Arbitrary JSON payload (for stream credentials and other intents)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PayloadType {
@@ -340,6 +346,8 @@ pub enum PayloadType {
     Transaction,
     /// Transaction hash (already broadcast by client)
     Hash,
+    /// Arbitrary JSON payload (for stream credentials)
+    Json,
 }
 
 impl fmt::Display for PayloadType {
@@ -347,6 +355,7 @@ impl fmt::Display for PayloadType {
         match self {
             Self::Transaction => write!(f, "transaction"),
             Self::Hash => write!(f, "hash"),
+            Self::Json => write!(f, "json"),
         }
     }
 }
@@ -405,10 +414,19 @@ mod tests {
         let intent: IntentName = "charge".into();
         assert!(intent.is_charge());
         assert!(!intent.is_authorize());
+        assert!(!intent.is_stream());
 
         let intent2 = IntentName::new("AUTHORIZE");
         assert!(intent2.is_authorize());
         assert_eq!(intent2.as_str(), "authorize");
+
+        let intent3: IntentName = "stream".into();
+        assert!(intent3.is_stream());
+        assert!(!intent3.is_charge());
+
+        let intent4 = IntentName::new("STREAM");
+        assert!(intent4.is_stream());
+        assert_eq!(intent4.as_str(), "stream");
     }
 
     #[test]

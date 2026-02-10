@@ -96,13 +96,17 @@
 //! ```
 
 pub mod charge;
+pub mod stream;
 pub mod transaction;
 pub mod types;
 
 #[cfg(feature = "server")]
 pub mod method;
+#[cfg(feature = "server")]
+pub mod stream_method;
 
 pub use charge::TempoChargeExt;
+pub use stream::{StreamCredentialPayload, StreamReceipt, TempoStreamExt, TempoStreamMethodDetails};
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
@@ -111,6 +115,8 @@ pub use types::TempoMethodDetails;
 
 #[cfg(feature = "server")]
 pub use method::ChargeMethod;
+#[cfg(feature = "server")]
+pub use stream_method::StreamMethod;
 
 /// Tempo mainnet chain ID.
 pub const CHAIN_ID: u64 = 4217;
@@ -129,6 +135,9 @@ pub const METHOD_NAME: &str = "tempo";
 
 /// Charge intent name.
 pub const INTENT_CHARGE: &str = "charge";
+
+/// Stream intent name.
+pub const INTENT_STREAM: &str = "stream";
 
 /// Create a Tempo charge challenge with minimal parameters.
 ///
@@ -264,6 +273,79 @@ pub fn charge_challenge_with_options(
         request: encoded_request,
         expires: expires.map(|s| s.to_string()),
         description: description.map(|s| s.to_string()),
+        digest: None,
+    })
+}
+
+/// Create a Tempo stream challenge with minimal parameters.
+pub fn stream_challenge(
+    secret_key: &str,
+    realm: &str,
+    amount: &str,
+    unit_type: &str,
+    currency: &str,
+    recipient: &str,
+    escrow_contract: &str,
+) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
+    let request = crate::protocol::intents::StreamRequest {
+        amount: amount.to_string(),
+        unit_type: unit_type.to_string(),
+        currency: currency.to_string(),
+        recipient: Some(recipient.to_string()),
+        method_details: Some(serde_json::json!({
+            "escrowContract": escrow_contract
+        })),
+        ..Default::default()
+    };
+    stream_challenge_with_options(secret_key, realm, &request, None, None)
+}
+
+/// Create a Tempo stream challenge with full options.
+pub fn stream_challenge_with_options(
+    secret_key: &str,
+    realm: &str,
+    request: &crate::protocol::intents::StreamRequest,
+    expires: Option<&str>,
+    description: Option<&str>,
+) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
+    use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+    use time::{Duration, OffsetDateTime};
+
+    let encoded_request = Base64UrlJson::from_typed(request)?;
+
+    let default_expires;
+    let expires = match expires {
+        Some(e) => Some(e),
+        None => {
+            let expiry_time =
+                OffsetDateTime::now_utc() + Duration::minutes(DEFAULT_EXPIRES_MINUTES as i64);
+            default_expires = expiry_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| {
+                    crate::error::MppError::InvalidConfig(format!("failed to format expires: {e}"))
+                })?;
+            Some(default_expires.as_str())
+        }
+    };
+
+    let id = generate_challenge_id(
+        secret_key,
+        realm,
+        METHOD_NAME,
+        INTENT_STREAM,
+        encoded_request.raw(),
+        expires,
+        None,
+    );
+
+    Ok(PaymentChallenge {
+        id,
+        realm: realm.to_string(),
+        method: METHOD_NAME.into(),
+        intent: INTENT_STREAM.into(),
+        request: encoded_request,
+        expires: expires.map(|e| e.to_string()),
+        description: description.map(|d| d.to_string()),
         digest: None,
     })
 }
@@ -568,6 +650,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_stream_challenge_fields() {
+        let challenge = stream_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "1000",
+            "llm_token",
+            "0x20c0000000000000000000000000000000000000",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "0x1234567890abcdef1234567890abcdef12345678",
+        )
+        .unwrap();
+
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "stream");
+        assert_eq!(challenge.realm, "api.example.com");
+        assert!(challenge.expires.is_some());
+        assert_eq!(challenge.id.len(), 43);
+
+        let request: crate::protocol::intents::StreamRequest =
+            challenge.request.decode().unwrap();
+        assert_eq!(request.amount, "1000");
+        assert_eq!(request.unit_type, "llm_token");
+        assert_eq!(
+            request.recipient,
+            Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stream_challenge_id_is_deterministic() {
+        use crate::protocol::intents::StreamRequest;
+
+        let request = StreamRequest {
+            amount: "1000".into(),
+            unit_type: "llm_token".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            method_details: Some(serde_json::json!({"escrowContract": "0x123"})),
+            ..Default::default()
+        };
+
+        let c1 = stream_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+
+        let c2 = stream_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(c1.id, c2.id);
+    }
+
+    #[test]
+    fn test_stream_and_charge_challenge_ids_differ() {
+        let charge = charge_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "1000",
+            "0x20c0000000000000000000000000000000000000",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+
+        let stream = stream_challenge(
+            TEST_SECRET,
+            "api.example.com",
+            "1000",
+            "llm_token",
+            "0x20c0000000000000000000000000000000000000",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "0x1234567890abcdef1234567890abcdef12345678",
+        )
+        .unwrap();
+
+        assert_ne!(charge.id, stream.id);
+    }
+
     /// Cross-SDK compatibility tests using conformance test vectors.
     /// These test cases are from mpay-sdks/conformance/vectors/challenge-id.json
     /// and verify that Rust produces the same challenge IDs as TypeScript and Python.
@@ -584,7 +754,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "1000000",
-                    "currency": "0x20c0000000000000000000000000000000000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
                     "recipient": "0x1234567890abcdef1234567890abcdef12345678"
                 }),
                 None,
@@ -604,7 +774,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "5000000",
-                    "currency": "0x20c0000000000000000000000000000000000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
                     "recipient": "0xabcdef1234567890abcdef1234567890abcdef12"
                 }),
                 Some("2026-01-29T12:00:00Z"),
@@ -644,7 +814,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "10000000",
-                    "currency": "0x20c0000000000000000000000000000000000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
                     "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
                     "description": "API access fee",
                     "externalId": "order-12345"
@@ -666,7 +836,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "1000000",
-                    "currency": "0x20c0000000000000000000000000000000000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
                     "recipient": "0x1234567890abcdef1234567890abcdef12345678"
                 }),
                 None,
@@ -723,7 +893,7 @@ mod tests {
                 "charge",
                 &json!({
                     "amount": "5000000",
-                    "currency": "0x20c0000000000000000000000000000000000000",
+                    "currency": "0x20c0000000000000000000000000000000000001",
                     "recipient": "0x2222222222222222222222222222222222222222",
                     "methodDetails": {
                         "chainId": 42431,

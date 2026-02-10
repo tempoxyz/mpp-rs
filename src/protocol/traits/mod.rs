@@ -3,14 +3,17 @@
 //! This module provides traits for payment methods organized by intent:
 //!
 //! - [`ChargeMethod`]: One-time payment verification
+//! - [`StreamMethod`]: Streaming payment channel verification
 //! - [`AuthorizeMethod`]: Payment authorization with capture (stub)
 //!
 //! Each trait enforces a typed request schema, ensuring consistent
 //! field names across all implementations.
 
 mod charge;
+mod stream;
 
 pub use charge::ChargeMethod;
+pub use stream::StreamMethod;
 
 use std::fmt;
 

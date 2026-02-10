@@ -30,7 +30,7 @@
 mod amount;
 mod mpay;
 
-pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
+pub use crate::protocol::traits::{ChargeMethod, ErrorCode, StreamMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};
 pub use mpay::Mpay;
 
@@ -38,8 +38,16 @@ pub use mpay::Mpay;
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 
 #[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::StreamMethod as TempoStreamMethod;
+
+#[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::{
     TempoChargeExt, TempoMethodDetails, CHAIN_ID, METHOD_NAME,
+};
+
+#[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::stream::{
+    StreamCredentialPayload, StreamReceipt, TempoStreamExt, TempoStreamMethodDetails,
 };
 
 // ==================== Simple API ====================

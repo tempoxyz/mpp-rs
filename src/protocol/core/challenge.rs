@@ -147,6 +147,7 @@ impl serde::Serialize for PaymentPayload {
         match self.payload_type {
             PayloadType::Transaction => state.serialize_field("signature", &self.data)?,
             PayloadType::Hash => state.serialize_field("hash", &self.data)?,
+            PayloadType::Json => state.serialize_field("data", &self.data)?,
         }
 
         state.end()
@@ -164,6 +165,7 @@ impl<'de> serde::Deserialize<'de> for PaymentPayload {
             payload_type: PayloadType,
             signature: Option<String>,
             hash: Option<String>,
+            data: Option<String>,
         }
 
         let raw = RawPayload::deserialize(deserializer)?;
@@ -175,6 +177,9 @@ impl<'de> serde::Deserialize<'de> for PaymentPayload {
             PayloadType::Hash => raw
                 .hash
                 .ok_or_else(|| serde::de::Error::custom("hash payload requires 'hash' field"))?,
+            PayloadType::Json => raw
+                .data
+                .ok_or_else(|| serde::de::Error::custom("json payload requires 'data' field"))?,
         };
 
         Ok(PaymentPayload {
@@ -261,17 +266,80 @@ impl PaymentPayload {
 /// Payment credential from client (sent in Authorization header).
 ///
 /// Contains the challenge echo and the payment proof.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// For charge credentials, `payload` contains the parsed transaction/hash data.
+/// For stream credentials, `raw_payload` contains the arbitrary JSON payload
+/// (e.g., `{action: "open", channelId: "..."}`) and `payload` is a placeholder.
+#[derive(Debug, Clone)]
 pub struct PaymentCredential {
     /// Echo of challenge parameters from server
     pub challenge: ChallengeEcho,
 
     /// Payer identifier (DID format: did:pkh:eip155:chainId:address)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 
-    /// Payment payload
+    /// Payment payload (parsed for charge credentials)
     pub payload: PaymentPayload,
+
+    /// Raw JSON of the payload field, available for intent-specific parsing.
+    /// Populated during deserialization; when present, used for serialization
+    /// instead of `payload`.
+    pub raw_payload: Option<serde_json::Value>,
+}
+
+impl serde::Serialize for PaymentCredential {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let field_count = 2 + self.source.is_some() as usize;
+        let mut state = serializer.serialize_struct("PaymentCredential", field_count)?;
+        state.serialize_field("challenge", &self.challenge)?;
+        if let Some(ref source) = self.source {
+            state.serialize_field("source", source)?;
+        }
+        if let Some(ref raw) = self.raw_payload {
+            state.serialize_field("payload", raw)?;
+        } else {
+            state.serialize_field("payload", &self.payload)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PaymentCredential {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            challenge: ChallengeEcho,
+            source: Option<String>,
+            payload: serde_json::Value,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let is_stream_payload = raw
+            .payload
+            .as_object()
+            .and_then(|o| o.get("action"))
+            .is_some();
+        let payload = if is_stream_payload {
+            PaymentPayload::hash("")
+        } else {
+            serde_json::from_value::<PaymentPayload>(raw.payload.clone())
+                .unwrap_or_else(|_| PaymentPayload::hash(""))
+        };
+
+        Ok(PaymentCredential {
+            challenge: raw.challenge,
+            source: raw.source,
+            payload,
+            raw_payload: Some(raw.payload),
+        })
+    }
 }
 
 impl PaymentCredential {
@@ -281,6 +349,7 @@ impl PaymentCredential {
             challenge,
             source: None,
             payload,
+            raw_payload: None,
         }
     }
 
@@ -294,7 +363,27 @@ impl PaymentCredential {
             challenge,
             source: Some(source.into()),
             payload,
+            raw_payload: None,
         }
+    }
+
+    /// Create a new payment credential with a raw JSON payload (for stream credentials).
+    pub fn with_raw_payload(
+        challenge: ChallengeEcho,
+        source: impl Into<String>,
+        raw_payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            challenge,
+            source: Some(source.into()),
+            payload: PaymentPayload::hash(""),
+            raw_payload: Some(raw_payload),
+        }
+    }
+
+    /// Get the raw JSON payload, if available.
+    pub fn raw_payload(&self) -> Option<&serde_json::Value> {
+        self.raw_payload.as_ref()
     }
 
     /// Create a DID for an EVM address.
@@ -488,5 +577,105 @@ mod tests {
             error: None,
         };
         assert!(success.is_success());
+    }
+
+    #[test]
+    fn test_credential_with_raw_payload_serializes_raw() {
+        let echo = ChallengeEcho {
+            id: "test".into(),
+            realm: "test.com".into(),
+            method: "tempo".into(),
+            intent: "stream".into(),
+            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            expires: None,
+            digest: None,
+        };
+        let raw = serde_json::json!({
+            "action": "open",
+            "type": "transaction",
+            "channelId": "0xabc",
+            "transaction": "0xdef",
+            "signature": "0x123",
+            "cumulativeAmount": "5000"
+        });
+        let credential = PaymentCredential::with_raw_payload(echo, "did:test", raw.clone());
+
+        let json = serde_json::to_string(&credential).unwrap();
+        assert!(json.contains("\"action\":\"open\""));
+        assert!(json.contains("\"channelId\":\"0xabc\""));
+        assert!(!json.contains("\"hash\":\"\""));
+    }
+
+    #[test]
+    fn test_credential_stream_payload_roundtrip() {
+        let echo = ChallengeEcho {
+            id: "test".into(),
+            realm: "test.com".into(),
+            method: "tempo".into(),
+            intent: "stream".into(),
+            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            expires: None,
+            digest: None,
+        };
+        let raw = serde_json::json!({
+            "action": "voucher",
+            "channelId": "0xabc",
+            "cumulativeAmount": "10000",
+            "signature": "0xsig"
+        });
+        let credential = PaymentCredential::with_raw_payload(echo, "did:test", raw.clone());
+
+        let json = serde_json::to_string(&credential).unwrap();
+        let parsed: PaymentCredential = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.raw_payload().unwrap()["action"], "voucher");
+        assert_eq!(parsed.raw_payload().unwrap()["channelId"], "0xabc");
+        assert_eq!(parsed.raw_payload().unwrap()["cumulativeAmount"], "10000");
+    }
+
+    #[test]
+    fn test_credential_stream_payload_does_not_misparse_as_charge() {
+        let json = r#"{
+            "challenge": {
+                "id": "test", "realm": "test.com", "method": "tempo",
+                "intent": "stream", "request": "eyJ0ZXN0IjoidmFsdWUifQ"
+            },
+            "source": "did:test",
+            "payload": {
+                "action": "open",
+                "type": "transaction",
+                "channelId": "0xabc",
+                "transaction": "0xdef",
+                "signature": "0x123",
+                "cumulativeAmount": "5000"
+            }
+        }"#;
+        let credential: PaymentCredential = serde_json::from_str(json).unwrap();
+
+        assert!(!credential.payload.is_transaction(), 
+            "Stream payload with action field should not parse as charge transaction");
+        assert_eq!(credential.payload.data(), "");
+        assert!(credential.raw_payload().is_some());
+        assert_eq!(credential.raw_payload().unwrap()["action"], "open");
+    }
+
+    #[test]
+    fn test_credential_charge_payload_still_works() {
+        let json = r#"{
+            "challenge": {
+                "id": "test", "realm": "test.com", "method": "tempo",
+                "intent": "charge", "request": "eyJ0ZXN0IjoidmFsdWUifQ"
+            },
+            "source": "did:test",
+            "payload": {
+                "type": "transaction",
+                "signature": "0xabc456"
+            }
+        }"#;
+        let credential: PaymentCredential = serde_json::from_str(json).unwrap();
+
+        assert!(credential.payload.is_transaction());
+        assert_eq!(credential.payload.signed_tx(), Some("0xabc456"));
+        assert!(credential.raw_payload().is_some());
     }
 }
