@@ -42,37 +42,37 @@ impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Expired => "expired",
-            Self::InvalidAmount => "invalid_amount",
-            Self::InvalidRecipient => "invalid_recipient",
-            Self::TransactionFailed => "transaction_failed",
-            Self::NotFound => "not_found",
-            Self::InvalidCredential => "invalid_credential",
-            Self::NetworkError => "network_error",
-            Self::ChainIdMismatch => "chain_id_mismatch",
-            Self::CredentialMismatch => "credential_mismatch",
+            Self::InvalidAmount => "invalid-amount",
+            Self::InvalidRecipient => "invalid-recipient",
+            Self::TransactionFailed => "transaction-failed",
+            Self::NotFound => "not-found",
+            Self::InvalidCredential => "invalid-credential",
+            Self::NetworkError => "network-error",
+            Self::ChainIdMismatch => "chain-id-mismatch",
+            Self::CredentialMismatch => "credential-mismatch",
         }
     }
 
-    /// Returns the IETF spec-compliant error code string (§7.2).
+    /// Returns the IETF spec-compliant error code string (§8.2).
     ///
     /// These codes are intended for JSON error responses per the spec:
-    /// - `payment_required` - Payment is required
-    /// - `payment_insufficient` - Payment amount was insufficient
-    /// - `payment_expired` - Payment or challenge has expired
-    /// - `payment_verification_failed` - Payment verification failed
-    /// - `payment_method_unsupported` - Payment method not supported
-    /// - `malformed_proof` - Credential format is invalid
+    /// - `payment-required` - Payment is required
+    /// - `payment-insufficient` - Payment amount was insufficient
+    /// - `payment-expired` - Payment or challenge has expired
+    /// - `verification-failed` - Payment verification failed
+    /// - `method-unsupported` - Payment method not supported
+    /// - `malformed-credential` - Credential format is invalid
     pub fn spec_code(&self) -> &'static str {
         match self {
-            Self::Expired => "payment_expired",
-            Self::InvalidAmount => "payment_insufficient",
-            Self::InvalidRecipient => "payment_verification_failed",
-            Self::TransactionFailed => "payment_verification_failed",
-            Self::NotFound => "payment_verification_failed",
-            Self::InvalidCredential => "malformed_proof",
-            Self::NetworkError => "payment_verification_failed",
-            Self::ChainIdMismatch => "payment_method_unsupported",
-            Self::CredentialMismatch => "malformed_proof",
+            Self::Expired => "payment-expired",
+            Self::InvalidAmount => "payment-insufficient",
+            Self::InvalidRecipient => "verification-failed",
+            Self::TransactionFailed => "verification-failed",
+            Self::NotFound => "verification-failed",
+            Self::InvalidCredential => "malformed-credential",
+            Self::NetworkError => "verification-failed",
+            Self::ChainIdMismatch => "method-unsupported",
+            Self::CredentialMismatch => "malformed-credential",
         }
     }
 }
@@ -127,32 +127,32 @@ impl VerificationError {
         Self::with_code(message, ErrorCode::Expired)
     }
 
-    /// Create an "invalid_amount" verification error.
+    /// Create an "invalid-amount" verification error.
     pub fn invalid_amount(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::InvalidAmount)
     }
 
-    /// Create an "invalid_recipient" verification error.
+    /// Create an "invalid-recipient" verification error.
     pub fn invalid_recipient(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::InvalidRecipient)
     }
 
-    /// Create a "transaction_failed" verification error.
+    /// Create a "transaction-failed" verification error.
     pub fn transaction_failed(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::TransactionFailed)
     }
 
-    /// Create a "not_found" verification error.
+    /// Create a "not-found" verification error.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::NotFound)
     }
 
-    /// Create a "chain_id_mismatch" verification error.
+    /// Create a "chain-id-mismatch" verification error.
     pub fn chain_id_mismatch(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::ChainIdMismatch)
     }
 
-    /// Create a "credential_mismatch" verification error.
+    /// Create a "credential-mismatch" verification error.
     pub fn credential_mismatch(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::CredentialMismatch)
     }
@@ -245,17 +245,17 @@ mod tests {
 
     #[test]
     fn test_error_code_spec_codes() {
-        // Verify IETF spec-compliant error codes (§7.2)
-        assert_eq!(ErrorCode::Expired.spec_code(), "payment_expired");
-        assert_eq!(ErrorCode::InvalidAmount.spec_code(), "payment_insufficient");
-        assert_eq!(ErrorCode::InvalidCredential.spec_code(), "malformed_proof");
+        // Verify IETF spec-compliant error codes (§8.2)
+        assert_eq!(ErrorCode::Expired.spec_code(), "payment-expired");
+        assert_eq!(ErrorCode::InvalidAmount.spec_code(), "payment-insufficient");
+        assert_eq!(ErrorCode::InvalidCredential.spec_code(), "malformed-credential");
         assert_eq!(
             ErrorCode::ChainIdMismatch.spec_code(),
-            "payment_method_unsupported"
+            "method-unsupported"
         );
         assert_eq!(
             ErrorCode::TransactionFailed.spec_code(),
-            "payment_verification_failed"
+            "verification-failed"
         );
     }
 }
