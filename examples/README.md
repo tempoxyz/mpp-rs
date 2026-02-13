@@ -1,11 +1,20 @@
 # Examples
 
-Integration examples for using `mpay` with common Rust HTTP libraries.
+## Inline Examples
+
+Run directly from the crate root:
+
+| Example | Description | Command |
+|---------|-------------|---------|
+| `parse_headers` | Core protocol parsing & formatting round-trip | `cargo run --example parse_headers` |
+| `basic_server` | Payment-gated fortune teller (server flow) | `MERCHANT_ADDRESS=0x... cargo run --example basic_server --features "tempo,server"` |
+| `fetch_client` | Fetch a URL with automatic 402 payment | `TEMPO_PRIVATE_KEY=0x... cargo run --example fetch_client --features "tempo,client" -- <URL>` |
+
+## Standalone Examples
+
+These are separate crates with their own dependencies (e.g., axum, clap):
 
 | Example | Description |
 |---------|-------------|
-| [axum-server](./axum-server.md) | Server-side payment gating with axum |
-| [reqwest-client](./reqwest-client.md) | Client-side 402 handling with reqwest |
-| [custom-methods](./custom-methods.md) | Implement custom payment methods |
-| [tower-middleware](./tower-middleware.md) | Reusable middleware with tower |
-| [hyper-low-level](./hyper-low-level.md) | Low-level integration with hyper |
+| [server/](./server/) | Full axum server with payment-gated endpoints |
+| [fetch/](./fetch/) | Full CLI tool for fetching URLs with payment handling |
