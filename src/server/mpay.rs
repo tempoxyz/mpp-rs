@@ -76,6 +76,7 @@ pub struct Mpay<M, S = ()> {
     currency: Option<String>,
     recipient: Option<String>,
     decimals: u32,
+    fee_payer: bool,
 }
 
 impl<M> Mpay<M, ()>
@@ -94,6 +95,7 @@ where
             currency: None,
             recipient: None,
             decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
         }
     }
 }
@@ -112,6 +114,7 @@ where
             currency: self.currency,
             recipient: self.recipient,
             decimals: self.decimals,
+            fee_payer: self.fee_payer,
         }
     }
 
@@ -194,7 +197,7 @@ where
             external_id: options.external_id.map(|s| s.to_string()),
             ..Default::default()
         };
-        if options.fee_payer {
+        if options.fee_payer || self.fee_payer {
             request.method_details = Some(serde_json::json!({"feePayer": true}));
         }
         crate::protocol::methods::tempo::charge_challenge_with_options(
@@ -374,7 +377,7 @@ where
 
         let mut method_details = session.and_then(|s| s.challenge_method_details());
 
-        if options.fee_payer {
+        if options.fee_payer || self.fee_payer {
             let details = method_details.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = details.as_object_mut() {
                 obj.insert("feePayer".to_string(), serde_json::json!(true));
@@ -502,6 +505,7 @@ impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
             currency: Some(builder.currency),
             recipient: Some(builder.recipient),
             decimals: builder.decimals,
+            fee_payer: builder.fee_payer,
         })
     }
 }

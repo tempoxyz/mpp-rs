@@ -74,6 +74,7 @@ pub struct TempoBuilder {
     pub(crate) realm: String,
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
+    pub(crate) fee_payer: bool,
 }
 
 #[cfg(feature = "tempo")]
@@ -99,6 +100,15 @@ impl TempoBuilder {
     /// Override the token decimals (default: `6`).
     pub fn decimals(mut self, d: u32) -> Self {
         self.decimals = d;
+        self
+    }
+
+    /// Enable fee sponsorship for all challenges (default: `false`).
+    ///
+    /// When enabled, all charge and session challenges will include
+    /// `feePayer: true` in their `methodDetails`.
+    pub fn fee_payer(mut self, enabled: bool) -> Self {
+        self.fee_payer = enabled;
         self
     }
 }
@@ -174,6 +184,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         realm: "MPP Payment".to_string(),
         secret_key: None,
         decimals: 6,
+        fee_payer: false,
     }
 }
 

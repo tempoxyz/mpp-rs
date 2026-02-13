@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, B256};
 
 use super::channel_ops::{
-    ChannelEntry, OpenPayloadOptions, build_credential, create_open_payload,
+    ChannelEntry, OpenPayloadOptions, build_credential, create_close_payload, create_open_payload,
     create_voucher_payload, resolve_chain_id, resolve_escrow, try_recover_channel,
 };
 use super::provider::PaymentProvider;
 use crate::error::MppError;
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::session::TempoSessionExt;
 
@@ -59,6 +59,8 @@ pub struct TempoSessionProvider {
     channel_id_to_key: Arc<Mutex<HashMap<String, String>>>,
     /// Optional callback for channel state changes.
     on_channel_update: Option<Arc<dyn Fn(&ChannelEntry) + Send + Sync>>,
+    /// Last challenge received from the server, used for `close()`.
+    last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
 }
 
 impl TempoSessionProvider {
@@ -85,6 +87,7 @@ impl TempoSessionProvider {
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
+            last_challenge: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -151,6 +154,89 @@ impl TempoSessionProvider {
         )
     }
 
+    /// Get the cumulative voucher amount for the first active channel.
+    ///
+    /// Returns the total cumulative amount across all vouchers sent for the
+    /// channel, or 0 if no channel is open.
+    pub fn cumulative(&self) -> u128 {
+        self.channels
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.opened)
+            .map(|e| e.cumulative_amount)
+            .next()
+            .unwrap_or(0)
+    }
+
+    /// Close the payment channel and settle on-chain.
+    ///
+    /// Sends a close credential to the server, which triggers on-chain settlement.
+    /// The server will submit the highest cumulative voucher to the escrow contract,
+    /// transferring the owed amount to the server and refunding the remainder.
+    ///
+    /// Mirrors the TypeScript SDK's `session.close()` method.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - An HTTP client to send the close request
+    /// * `url` - The server endpoint URL (same endpoint used for payments)
+    ///
+    /// # Returns
+    ///
+    /// The payment receipt from the server, if available.
+    pub async fn close(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<Option<Receipt>, MppError> {
+        let challenge = self.last_challenge.lock().unwrap().clone();
+        let challenge = match challenge {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let entry = {
+            let channels = self.channels.lock().unwrap();
+            channels.values().find(|e| e.opened).cloned()
+        };
+
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let payer = self.signer.address();
+
+        let payload = create_close_payload(
+            &self.signer,
+            entry.channel_id,
+            entry.cumulative_amount,
+            entry.escrow_contract,
+            entry.chain_id,
+        )
+        .await?;
+
+        let credential = build_credential(&challenge, payload, entry.chain_id, payer);
+
+        let auth_header = crate::protocol::core::format_authorization(&credential)?;
+
+        let resp = client
+            .post(url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .map_err(|e| MppError::Http(format!("close request failed: {}", e)))?;
+
+        let receipt = resp
+            .headers()
+            .get("payment-receipt")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| crate::protocol::core::parse_receipt(s).ok());
+
+        Ok(receipt)
+    }
+
     fn resolve_deposit(
         &self,
         suggested_deposit: Option<&str>,
@@ -182,6 +268,8 @@ impl PaymentProvider for TempoSessionProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         use alloy::providers::ProviderBuilder;
         use tempo_alloy::TempoNetwork;
+
+        *self.last_challenge.lock().unwrap() = Some(challenge.clone());
 
         let chain_id = resolve_chain_id(challenge);
         let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;

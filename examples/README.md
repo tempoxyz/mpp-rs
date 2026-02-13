@@ -1,20 +1,32 @@
-# Examples
+# mpay Examples
 
-## Inline Examples
+Standalone, runnable examples demonstrating the mpay HTTP 402 payment flow.
 
-Run directly from the crate root:
-
-| Example | Description | Command |
-|---------|-------------|---------|
-| `parse_headers` | Core protocol parsing & formatting round-trip | `cargo run --example parse_headers` |
-| `basic_server` | Payment-gated fortune teller (server flow) | `MERCHANT_ADDRESS=0x... cargo run --example basic_server --features "tempo,server"` |
-| `fetch_client` | Fetch a URL with automatic 402 payment | `TEMPO_PRIVATE_KEY=0x... cargo run --example fetch_client --features "tempo,client" -- <URL>` |
-
-## Standalone Examples
-
-These are separate crates with their own dependencies (e.g., axum, clap):
+## Examples
 
 | Example | Description |
 |---------|-------------|
-| [server/](./server/) | Full axum server with payment-gated endpoints |
-| [fetch/](./fetch/) | Full CLI tool for fetching URLs with payment handling |
+| [basic](./basic/) | Payment-gated Fortune Teller API |
+| [session/multi-fetch](./session/multi-fetch/) | Multiple paid requests over a single payment channel |
+| [session/sse](./session/sse/) | Pay-per-token LLM streaming with SSE |
+
+## Running Examples
+
+Each example is a standalone Cargo crate with a server and client binary.
+
+```bash
+# Basic example
+cd examples/basic
+cargo run --bin basic-server   # Terminal 1
+cargo run --bin basic-client   # Terminal 2
+
+# Session multi-fetch
+cd examples/session/multi-fetch
+cargo run --bin session-server   # Terminal 1
+cargo run --bin session-client   # Terminal 2
+
+# Session SSE streaming
+cd examples/session/sse
+cargo run --bin sse-server   # Terminal 1
+cargo run --bin sse-client   # Terminal 2
+```
