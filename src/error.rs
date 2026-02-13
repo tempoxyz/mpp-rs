@@ -228,32 +228,32 @@ pub enum MppError {
 
     // ==================== Session/Channel Errors ====================
     /// Insufficient balance in payment channel.
-    #[error("Insufficient balance in channel: {0}")]
-    InsufficientBalance(String),
+    #[error("{}", format_insufficient_balance(.0))]
+    InsufficientBalance(Option<String>),
 
     /// Invalid cryptographic signature.
-    #[error("Invalid signature: {0}")]
-    InvalidSignature(String),
+    #[error("{}", format_invalid_signature(.0))]
+    InvalidSignature(Option<String>),
 
     /// Signer does not match expected address.
-    #[error("Signer mismatch: {0}")]
-    SignerMismatch(String),
+    #[error("{}", format_signer_mismatch(.0))]
+    SignerMismatch(Option<String>),
 
     /// Voucher amount exceeds channel deposit.
-    #[error("Amount exceeds deposit: {0}")]
-    AmountExceedsDeposit(String),
+    #[error("{}", format_amount_exceeds_deposit(.0))]
+    AmountExceedsDeposit(Option<String>),
 
     /// Voucher delta is below the minimum threshold.
-    #[error("Delta too small: {0}")]
-    DeltaTooSmall(String),
+    #[error("{}", format_delta_too_small(.0))]
+    DeltaTooSmall(Option<String>),
 
     /// Payment channel not found.
-    #[error("Channel not found: {0}")]
-    ChannelNotFound(String),
+    #[error("{}", format_channel_not_found(.0))]
+    ChannelNotFound(Option<String>),
 
     /// Payment channel has been closed.
-    #[error("Channel closed: {0}")]
-    ChannelClosed(String),
+    #[error("{}", format_channel_closed(.0))]
+    ChannelClosed(Option<String>),
 
     // ==================== External Library Errors ====================
     /// IO error
@@ -327,6 +327,55 @@ fn format_bad_request(reason: &Option<String>) -> String {
     match reason {
         Some(r) => format!("Bad request: {}.", r),
         None => "Bad request.".to_string(),
+    }
+}
+
+fn format_insufficient_balance(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Insufficient balance: {}.", r),
+        None => "Insufficient balance.".to_string(),
+    }
+}
+
+fn format_invalid_signature(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Invalid signature: {}.", r),
+        None => "Invalid signature.".to_string(),
+    }
+}
+
+fn format_signer_mismatch(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Signer mismatch: {}.", r),
+        None => "Signer is not authorized for this channel.".to_string(),
+    }
+}
+
+fn format_amount_exceeds_deposit(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Amount exceeds deposit: {}.", r),
+        None => "Voucher amount exceeds channel deposit.".to_string(),
+    }
+}
+
+fn format_delta_too_small(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Delta too small: {}.", r),
+        None => "Amount increase below minimum voucher delta.".to_string(),
+    }
+}
+
+fn format_channel_not_found(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Channel not found: {}.", r),
+        None => "No channel with this ID exists.".to_string(),
+    }
+}
+
+fn format_channel_closed(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Channel closed: {}.", r),
+        None => "Channel is closed.".to_string(),
     }
 }
 
@@ -800,6 +849,106 @@ mod tests {
         );
         assert_eq!(problem.title, "BadRequestError");
         assert_eq!(problem.status, 400);
+    }
+
+    #[test]
+    fn test_insufficient_balance_problem_details() {
+        let err = MppError::InsufficientBalance(Some("requested 500, available 100".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "Insufficient balance: requested 500, available 100."
+        );
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/insufficient-balance");
+        assert_eq!(problem.title, "InsufficientBalanceError");
+        assert_eq!(problem.status, 402);
+
+        let err = MppError::InsufficientBalance(None);
+        assert_eq!(err.to_string(), "Insufficient balance.");
+    }
+
+    #[test]
+    fn test_invalid_signature_problem_details() {
+        let err = MppError::InvalidSignature(Some("ECDSA recovery failed".to_string()));
+        assert_eq!(err.to_string(), "Invalid signature: ECDSA recovery failed.");
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/invalid-signature");
+        assert_eq!(problem.title, "InvalidSignatureError");
+        assert_eq!(problem.status, 402);
+
+        let err = MppError::InvalidSignature(None);
+        assert_eq!(err.to_string(), "Invalid signature.");
+    }
+
+    #[test]
+    fn test_signer_mismatch_problem_details() {
+        let err = MppError::SignerMismatch(Some("expected 0x123, got 0x456".to_string()));
+        assert_eq!(err.to_string(), "Signer mismatch: expected 0x123, got 0x456.");
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/signer-mismatch");
+        assert_eq!(problem.title, "SignerMismatchError");
+        assert_eq!(problem.status, 402);
+
+        let err = MppError::SignerMismatch(None);
+        assert_eq!(err.to_string(), "Signer is not authorized for this channel.");
+    }
+
+    #[test]
+    fn test_amount_exceeds_deposit_problem_details() {
+        let err = MppError::AmountExceedsDeposit(Some("voucher exceeds deposit".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "Amount exceeds deposit: voucher exceeds deposit."
+        );
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/amount-exceeds-deposit");
+        assert_eq!(problem.title, "AmountExceedsDepositError");
+        assert_eq!(problem.status, 402);
+
+        let err = MppError::AmountExceedsDeposit(None);
+        assert_eq!(err.to_string(), "Voucher amount exceeds channel deposit.");
+    }
+
+    #[test]
+    fn test_delta_too_small_problem_details() {
+        let err = MppError::DeltaTooSmall(Some("increase below minimum".to_string()));
+        assert_eq!(err.to_string(), "Delta too small: increase below minimum.");
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/delta-too-small");
+        assert_eq!(problem.title, "DeltaTooSmallError");
+        assert_eq!(problem.status, 402);
+
+        let err = MppError::DeltaTooSmall(None);
+        assert_eq!(err.to_string(), "Amount increase below minimum voucher delta.");
+    }
+
+    #[test]
+    fn test_channel_not_found_problem_details() {
+        let err = MppError::ChannelNotFound(Some("no such channel".to_string()));
+        assert_eq!(err.to_string(), "Channel not found: no such channel.");
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/channel-not-found");
+        assert_eq!(problem.title, "ChannelNotFoundError");
+        assert_eq!(problem.status, 410);
+
+        let err = MppError::ChannelNotFound(None);
+        assert_eq!(err.to_string(), "No channel with this ID exists.");
+    }
+
+    #[test]
+    fn test_channel_closed_problem_details() {
+        let err = MppError::ChannelClosed(Some("channel is finalized on-chain".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "Channel closed: channel is finalized on-chain."
+        );
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/channel-finalized");
+        assert_eq!(problem.title, "ChannelClosedError");
+        assert_eq!(problem.status, 410);
+
+        let err = MppError::ChannelClosed(None);
+        assert_eq!(err.to_string(), "Channel is closed.");
     }
 
     #[test]

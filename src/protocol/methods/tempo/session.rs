@@ -6,6 +6,21 @@ use crate::error::{MppError, Result};
 use crate::protocol::intents::SessionRequest;
 use serde::{Deserialize, Serialize};
 
+/// Custom deserializer that only accepts the literal string "transaction".
+fn deserialize_transaction_literal<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s != "transaction" {
+        return Err(serde::de::Error::custom(format!(
+            "expected \"transaction\", got \"{}\"",
+            s
+        )));
+    }
+    Ok(s)
+}
+
 /// Tempo session-specific method details.
 ///
 /// Extension fields for the `methodDetails` in a session challenge.
@@ -64,7 +79,7 @@ pub struct TempoSessionMethodDetails {
 pub enum SessionCredentialPayload {
     #[serde(rename = "open")]
     Open {
-        #[serde(rename = "type")]
+        #[serde(rename = "type", deserialize_with = "deserialize_transaction_literal")]
         payload_type: String,
         #[serde(rename = "channelId")]
         channel_id: String,
@@ -77,7 +92,7 @@ pub enum SessionCredentialPayload {
     },
     #[serde(rename = "topUp")]
     TopUp {
-        #[serde(rename = "type")]
+        #[serde(rename = "type", deserialize_with = "deserialize_transaction_literal")]
         payload_type: String,
         #[serde(rename = "channelId")]
         channel_id: String,
@@ -551,5 +566,23 @@ mod tests {
             ..test_session_request()
         };
         assert!(req.tempo_session_details().is_err());
+    }
+
+    #[test]
+    fn test_open_payload_rejects_non_transaction_type() {
+        let json = r#"{"action":"open","type":"hash","channelId":"0xabc","transaction":"0xtx","cumulativeAmount":"100","signature":"0xsig"}"#;
+        let result = serde_json::from_str::<SessionCredentialPayload>(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("expected \"transaction\""), "error was: {err}");
+    }
+
+    #[test]
+    fn test_topup_payload_rejects_non_transaction_type() {
+        let json = r#"{"action":"topUp","type":"hash","channelId":"0xabc","transaction":"0xtx","additionalDeposit":"200"}"#;
+        let result = serde_json::from_str::<SessionCredentialPayload>(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("expected \"transaction\""), "error was: {err}");
     }
 }

@@ -33,7 +33,7 @@ pub mod sse;
 
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};
-pub use mpay::Mpay;
+pub use mpay::{Mpay, SessionVerifyResult};
 
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;

@@ -266,13 +266,13 @@ impl From<VerificationError> for MppError {
         match err.code {
             Some(ErrorCode::Expired) => MppError::PaymentExpired(None),
             Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
-            Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(err.message),
-            Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(err.message),
-            Some(ErrorCode::InsufficientBalance) => MppError::InsufficientBalance(err.message),
+            Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(Some(err.message)),
+            Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(Some(err.message)),
+            Some(ErrorCode::InsufficientBalance) => MppError::InsufficientBalance(Some(err.message)),
             Some(ErrorCode::InvalidPayload) => MppError::InvalidPayload(Some(err.message)),
-            Some(ErrorCode::InvalidSignature) => MppError::InvalidSignature(err.message),
-            Some(ErrorCode::AmountExceedsDeposit) => MppError::AmountExceedsDeposit(err.message),
-            Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(err.message),
+            Some(ErrorCode::InvalidSignature) => MppError::InvalidSignature(Some(err.message)),
+            Some(ErrorCode::AmountExceedsDeposit) => MppError::AmountExceedsDeposit(Some(err.message)),
+            Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(Some(err.message)),
             Some(ErrorCode::CredentialMismatch)
             | Some(ErrorCode::InvalidAmount)
             | Some(ErrorCode::InvalidRecipient)

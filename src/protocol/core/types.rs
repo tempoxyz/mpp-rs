@@ -256,21 +256,9 @@ pub fn base64url_encode(data: &[u8]) -> String {
 }
 
 /// Decode a base64url string (no padding) to bytes.
-///
-/// This implementation is lenient to match TypeScript SDK behavior for interoperability:
-/// 1. Strip all non-base64url characters [^A-Za-z0-9_-] from input
-/// 2. Decode the cleaned string
-///
-/// This ensures cross-SDK compatibility when inputs contain unexpected characters.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
-    // Strip non-base64url characters first (matches TS lenient behavior)
-    let cleaned: String = input
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-
     URL_SAFE_NO_PAD
-        .decode(&cleaned)
+        .decode(input)
         .map_err(|e| MppError::InvalidBase64Url(format!("Invalid base64url: {}", e)))
 }
 
@@ -438,6 +426,12 @@ mod tests {
     }
 
     #[test]
+    fn test_base64url_decode_rejects_invalid_characters() {
+        let noisy = "YW!JjZA";
+        assert!(base64url_decode(noisy).is_err());
+    }
+
+    #[test]
     fn test_base64url_json() {
         let value = serde_json::json!({"amount": "1000", "currency": "pathUSD"});
         let b64 = Base64UrlJson::from_value(&value).unwrap();
@@ -499,6 +493,18 @@ mod tests {
             serde_json::to_string(&PayloadType::Hash).unwrap(),
             "\"hash\""
         );
+    }
+
+    #[test]
+    fn test_base64url_json_special_characters() {
+        let value = serde_json::json!({
+            "text": "quotes \" and backslashes \\",
+            "unicode": "€ 漢字",
+            "url": "https://example.com/path?a=1&b=2"
+        });
+        let encoded = Base64UrlJson::from_value(&value).unwrap();
+        let decoded: serde_json::Value = encoded.decode_value().unwrap();
+        assert_eq!(decoded, value);
     }
 
     #[test]

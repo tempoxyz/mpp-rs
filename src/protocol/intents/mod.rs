@@ -26,7 +26,17 @@
 //! ```
 
 pub mod charge;
+pub mod payment_request;
 pub mod session;
 
 pub use charge::ChargeRequest;
+pub use payment_request::{
+    deserialize as deserialize_request,
+    deserialize_typed as deserialize_request_typed,
+    from as from_request,
+    from_challenge as request_from_challenge,
+    from_challenge_typed as request_from_challenge_typed,
+    serialize as serialize_request,
+    Request,
+};
 pub use session::SessionRequest;

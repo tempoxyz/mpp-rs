@@ -104,6 +104,7 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 #[derive(Clone)]
 pub struct ChargeMethod<P> {
     provider: Arc<P>,
+    fee_payer_signer: Option<Arc<alloy_signer_local::PrivateKeySigner>>,
 }
 
 impl<P> ChargeMethod<P>
@@ -117,7 +118,17 @@ where
     pub fn new(provider: P) -> Self {
         Self {
             provider: Arc::new(provider),
+            fee_payer_signer: None,
         }
+    }
+
+    /// Configure a fee payer signer for sponsoring transaction fees.
+    ///
+    /// When set, requests with `feePayer: true` will be accepted and
+    /// broadcast. Without a fee payer signer, such requests are rejected.
+    pub fn with_fee_payer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+        self.fee_payer_signer = Some(Arc::new(signer));
+        self
     }
 
     /// Get a reference to the underlying provider.
@@ -501,9 +512,8 @@ where
             expected_chain_id,
         )?;
 
-        // Fail fast if fee payer is requested but not configured.
-        // Full fee payer support requires passing a signer to ChargeMethod.
-        if charge.fee_payer() {
+        // Fail fast if fee payer is requested but no signer is configured.
+        if charge.fee_payer() && self.fee_payer_signer.is_none() {
             return Err(VerificationError::new(
                 "feePayer requested but fee sponsorship is not configured on this server"
                     .to_string(),
@@ -569,9 +579,13 @@ where
         let credential = credential.clone();
         let request = request.clone();
         let provider = Arc::clone(&self.provider);
+        let fee_payer_signer = self.fee_payer_signer.clone();
 
         async move {
-            let this = ChargeMethod { provider };
+            let this = ChargeMethod {
+                provider,
+                fee_payer_signer,
+            };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(
@@ -766,5 +780,15 @@ mod tests {
         assert_eq!(CHAIN_ID, 4217);
         // Verify the Tempo Moderato testnet chain ID constant
         assert_eq!(MODERATO_CHAIN_ID, 42431);
+    }
+
+    #[test]
+    fn test_fee_payer_not_configured() {
+        // When fee_payer_signer is None, the error message should indicate
+        // that fee sponsorship is not configured.
+        let error = VerificationError::new(
+            "feePayer requested but fee sponsorship is not configured on this server",
+        );
+        assert!(error.to_string().contains("fee sponsorship is not configured"));
     }
 }

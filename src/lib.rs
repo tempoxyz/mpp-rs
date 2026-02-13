@@ -71,7 +71,17 @@ pub use protocol::core::{
 };
 
 // Intent types
-pub use protocol::intents::{ChargeRequest, SessionRequest};
+pub use protocol::intents::{
+    deserialize_request,
+    deserialize_request_typed,
+    from_request,
+    request_from_challenge,
+    request_from_challenge_typed,
+    serialize_request,
+    ChargeRequest,
+    Request as PaymentRequest,
+    SessionRequest,
+};
 
 // ==================== Alloy Re-exports ====================
 

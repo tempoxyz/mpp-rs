@@ -27,6 +27,16 @@ use crate::protocol::traits::{ChargeMethod, VerificationError};
 const SECRET_KEY_ENV_VAR: &str = "MPAY_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;
 
+/// Result of session verification, including optional management response.
+pub struct SessionVerifyResult {
+    /// The payment receipt.
+    pub receipt: Receipt,
+    /// Optional management response body (for channel open/close/topUp).
+    /// When `Some`, the caller should return this as the response body
+    /// instead of proceeding with normal request handling.
+    pub management_response: Option<serde_json::Value>,
+}
+
 /// Server-side payment handler.
 ///
 /// Binds a payment method with realm, secret_key, and optionally
@@ -407,7 +417,7 @@ where
     pub async fn verify_session(
         &self,
         credential: &PaymentCredential,
-    ) -> std::result::Result<Receipt, crate::protocol::traits::VerificationError> {
+    ) -> std::result::Result<SessionVerifyResult, crate::protocol::traits::VerificationError> {
         let session = self.session_method.as_ref().ok_or_else(|| {
             crate::protocol::traits::VerificationError::new("No session method configured")
         })?;
@@ -442,7 +452,16 @@ where
                     ))
                 })?;
 
-        session.verify_session(credential, &request).await
+        let receipt = session.verify_session(credential, &request).await?;
+
+        // Call respond hook — management actions (open, topUp, close) may
+        // return a response body that short-circuits normal request handling.
+        let management_response = session.respond(credential, &receipt);
+
+        Ok(SessionVerifyResult {
+            receipt,
+            management_response,
+        })
     }
 }
 

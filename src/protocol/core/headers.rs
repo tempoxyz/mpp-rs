@@ -43,6 +43,39 @@ fn strip_payment_scheme(header: &str) -> Option<&str> {
     }
 }
 
+/// Extract the `Payment` scheme from an Authorization header that may contain
+/// multiple comma-separated schemes (per RFC 9110).
+///
+/// Returns the `Payment ...` scheme string, or `None` if not found.
+/// This matches the TypeScript SDK's `Credential.extractPaymentScheme`.
+///
+/// # Examples
+///
+/// ```
+/// use mpay::protocol::core::extract_payment_scheme;
+///
+/// // Single Payment scheme
+/// assert!(extract_payment_scheme("Payment eyJhYmMi...").is_some());
+///
+/// // Mixed schemes (comma-separated per RFC 9110)
+/// let header = "Bearer token123, Payment eyJhYmMi...";
+/// let payment = extract_payment_scheme(header).unwrap();
+/// assert!(payment.starts_with("Payment "));
+///
+/// // No Payment scheme
+/// assert!(extract_payment_scheme("Bearer token123").is_none());
+/// ```
+pub fn extract_payment_scheme(header: &str) -> Option<&str> {
+    header
+        .split(',')
+        .map(|s| s.trim())
+        .find(|s| {
+            s.len() >= 8
+                && s.get(..8)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("payment "))
+        })
+}
+
 /// Escape a string for use in a quoted-string header value.
 /// Rejects CRLF to prevent header injection attacks.
 fn escape_quoted_value(s: &str) -> Result<String> {
@@ -133,6 +166,13 @@ fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
     params
 }
 
+/// Validate digest format.
+///
+/// Matches TypeScript SDK behavior: digest must start with `sha-256=`.
+fn is_valid_digest_format(d: &str) -> bool {
+    d.starts_with("sha-256=")
+}
+
 /// Parse a single WWW-Authenticate header into a PaymentChallenge.
 ///
 /// Format: `Payment id="<id>", realm="<realm>", method="<method>", intent="<intent>", request="<base64url-json>"`
@@ -168,8 +208,19 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     let intent = IntentName::new(require_param!(params, "intent"));
     let request_b64 = require_param!(params, "request").clone();
 
-    let _ = base64url_decode(&request_b64)?;
+    let request_bytes = base64url_decode(&request_b64)?;
+    // Validate that the decoded bytes are valid JSON (matches TS SDK behavior)
+    let _ = serde_json::from_slice::<serde_json::Value>(&request_bytes).map_err(|e| {
+        MppError::invalid_challenge_reason(format!("Invalid JSON in request field: {}", e))
+    })?;
     let request = Base64UrlJson::from_raw(request_b64);
+
+    let digest = params.get("digest").cloned();
+    if let Some(ref d) = digest {
+        if !is_valid_digest_format(d) {
+            return Err(MppError::invalid_challenge_reason("Invalid digest format"));
+        }
+    }
 
     Ok(PaymentChallenge {
         id,
@@ -179,7 +230,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         request,
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
-        digest: params.get("digest").cloned(),
+        digest,
     })
 }
 
@@ -306,11 +357,15 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 ///
 /// Format: `Payment <base64url-json>`
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
-    let rest = strip_payment_scheme(header).ok_or_else(|| {
+    let payment_part = extract_payment_scheme(header).ok_or_else(|| {
         MppError::invalid_challenge_reason("Expected 'Payment' scheme".to_string())
     })?;
 
-    let token = rest.trim();
+    // Strip "Payment " prefix to get the token
+    let token = payment_part
+        .get(8..)
+        .unwrap_or("")
+        .trim();
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
@@ -324,6 +379,12 @@ pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
     let credential: PaymentCredential = serde_json::from_slice(&decoded).map_err(|e| {
         MppError::invalid_challenge_reason(format!("Invalid credential JSON: {}", e))
     })?;
+
+    if let Some(ref d) = credential.challenge.digest {
+        if !is_valid_digest_format(d) {
+            return Err(MppError::invalid_challenge_reason("Invalid digest format"));
+        }
+    }
 
     Ok(credential)
 }
@@ -523,6 +584,137 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_authorization_missing_payment_scheme() {
+        let result = parse_authorization("Bearer abc123");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_authorization_invalid_base64url() {
+        let result = parse_authorization("Payment !");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_authorization_invalid_json() {
+        let token = base64url_encode(b"not valid json");
+        let result = parse_authorization(&format!("Payment {}", token));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_authorization_missing_challenge_fields() {
+        let json = r#"{"challenge":{"id":"abc"},"payload":{}}"#;
+        let token = base64url_encode(json.as_bytes());
+        let result = parse_authorization(&format!("Payment {}", token));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_credential_roundtrip_with_optional_fields() {
+        let mut challenge = test_challenge();
+        challenge.expires = Some("2025-06-01T00:00:00Z".to_string());
+        challenge.digest = Some("sha-256=abc123".to_string());
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            "did:pkh:eip155:42431:0x123",
+            PaymentPayload::transaction("0xabc"),
+        );
+
+        let header = format_authorization(&credential).unwrap();
+        let parsed = parse_authorization(&header).unwrap();
+
+        assert_eq!(
+            parsed.challenge.expires,
+            Some("2025-06-01T00:00:00Z".to_string())
+        );
+        assert_eq!(
+            parsed.challenge.digest,
+            Some("sha-256=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_credential_roundtrip_without_source() {
+        let challenge = test_challenge();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        );
+
+        let header = format_authorization(&credential).unwrap();
+        let parsed = parse_authorization(&header).unwrap();
+
+        assert!(parsed.source.is_none());
+    }
+
+    #[test]
+    fn test_parse_receipt_invalid_status() {
+        let json = r#"{"status":"failed","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc"}"#;
+        let token = base64url_encode(json.as_bytes());
+        let result = parse_receipt(&token);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_authorization_invalid_digest_format() {
+        let mut challenge = test_challenge();
+        challenge.digest = Some("invalid-digest-format".to_string());
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            "did:pkh:eip155:42431:0x123",
+            PaymentPayload::transaction("0xabc"),
+        );
+
+        // Manually serialize with the invalid digest intact
+        let json = serde_json::to_string(&credential).unwrap();
+        let token = base64url_encode(json.as_bytes());
+        let result = parse_authorization(&format!("Payment {}", token));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_authorization_rejects_non_sha256_digest() {
+        let mut challenge = test_challenge();
+        challenge.digest = Some("sha-512=abc123".to_string());
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            "did:pkh:eip155:42431:0x123",
+            PaymentPayload::transaction("0xabc"),
+        );
+
+        let json = serde_json::to_string(&credential).unwrap();
+        let token = base64url_encode(json.as_bytes());
+        let result = parse_authorization(&format!("Payment {}", token));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_invalid_digest_format() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", digest="invalid-digest-format""#;
+        let result = parse_www_authenticate(header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_non_sha256_digest() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", digest="sha-512=abc""#;
+        let result = parse_www_authenticate(header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_invalid_request_json() {
+        // "not json" base64url-encoded is "bm90IGpzb24"
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="bm90IGpzb24""#;
+        let result = parse_www_authenticate(header);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_roundtrip_preserves_request() {
         let original_request = serde_json::json!({
             "amount": "5000",
@@ -541,5 +733,50 @@ mod tests {
         // And should decode to the same value
         let decoded: serde_json::Value = parsed.request.decode_value().unwrap();
         assert_eq!(decoded, original_request);
+    }
+
+    #[test]
+    fn test_extract_payment_scheme_single() {
+        let header = "Payment eyJhYmMi";
+        let result = extract_payment_scheme(header);
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with("Payment "));
+    }
+
+    #[test]
+    fn test_extract_payment_scheme_mixed() {
+        let header = "Bearer token123, Payment eyJhYmMi";
+        let result = extract_payment_scheme(header);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "Payment eyJhYmMi");
+    }
+
+    #[test]
+    fn test_extract_payment_scheme_not_found() {
+        assert!(extract_payment_scheme("Bearer token123").is_none());
+        assert!(extract_payment_scheme("Basic abc123").is_none());
+    }
+
+    #[test]
+    fn test_extract_payment_scheme_case_insensitive() {
+        let header = "Bearer xxx, payment eyJhYmMi";
+        let result = extract_payment_scheme(header);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_parse_authorization_mixed_schemes() {
+        let challenge = test_challenge();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            "did:pkh:eip155:42431:0x123",
+            PaymentPayload::transaction("0xabc"),
+        );
+        let formatted = format_authorization(&credential).unwrap();
+
+        // Prepend a Bearer scheme to simulate mixed Authorization
+        let mixed = format!("Bearer some-token, {}", formatted);
+        let parsed = parse_authorization(&mixed).unwrap();
+        assert_eq!(parsed.challenge.id, "abc123");
     }
 }

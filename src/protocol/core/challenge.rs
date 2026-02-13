@@ -58,6 +58,161 @@ pub struct PaymentChallenge {
 }
 
 impl PaymentChallenge {
+    /// Create a new payment challenge with an explicit ID.
+    ///
+    /// For HMAC-bound IDs (recommended for servers), use [`PaymentChallenge::with_secret_key`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mpay::PaymentChallenge;
+    /// use mpay::protocol::core::Base64UrlJson;
+    ///
+    /// let challenge = PaymentChallenge::new(
+    ///     "explicit-id-123",
+    ///     "api.example.com",
+    ///     "tempo",
+    ///     "charge",
+    ///     Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+    /// );
+    /// assert_eq!(challenge.id, "explicit-id-123");
+    /// assert_eq!(challenge.method.as_str(), "tempo");
+    /// ```
+    pub fn new(
+        id: impl Into<String>,
+        realm: impl Into<String>,
+        method: impl Into<MethodName>,
+        intent: impl Into<IntentName>,
+        request: Base64UrlJson,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            realm: realm.into(),
+            method: method.into(),
+            intent: intent.into(),
+            request,
+            expires: None,
+            description: None,
+            digest: None,
+        }
+    }
+
+    /// Create a new payment challenge with an HMAC-bound ID.
+    ///
+    /// The challenge ID is computed as HMAC-SHA256 over the challenge parameters,
+    /// cryptographically binding the ID to its contents. This enables stateless
+    /// verification without storing challenge state.
+    ///
+    /// This is the Rust equivalent of `Challenge.from({ secretKey, ... })` in the TS SDK.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mpay::PaymentChallenge;
+    /// use mpay::protocol::core::Base64UrlJson;
+    ///
+    /// let challenge = PaymentChallenge::with_secret_key(
+    ///     "my-server-secret",
+    ///     "api.example.com",
+    ///     "tempo",
+    ///     "charge",
+    ///     Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+    /// );
+    ///
+    /// // ID is HMAC-bound — can be verified later
+    /// assert!(challenge.verify("my-server-secret"));
+    /// ```
+    pub fn with_secret_key(
+        secret_key: &str,
+        realm: impl Into<String>,
+        method: impl Into<MethodName>,
+        intent: impl Into<IntentName>,
+        request: Base64UrlJson,
+    ) -> Self {
+        let realm = realm.into();
+        let method = method.into();
+        let intent = intent.into();
+        let id = compute_challenge_id(
+            secret_key,
+            &realm,
+            method.as_str(),
+            intent.as_str(),
+            request.raw(),
+            None,
+            None,
+        );
+        Self {
+            id,
+            realm,
+            method,
+            intent,
+            request,
+            expires: None,
+            description: None,
+            digest: None,
+        }
+    }
+
+    /// Create a new payment challenge with HMAC-bound ID including all optional fields.
+    ///
+    /// Unlike [`with_secret_key`], this includes `expires` and `digest` in the HMAC
+    /// computation, matching the full TS SDK `Challenge.from()` behavior.
+    pub fn with_secret_key_full(
+        secret_key: &str,
+        realm: impl Into<String>,
+        method: impl Into<MethodName>,
+        intent: impl Into<IntentName>,
+        request: Base64UrlJson,
+        expires: Option<&str>,
+        digest: Option<&str>,
+        description: Option<&str>,
+    ) -> Self {
+        let realm = realm.into();
+        let method = method.into();
+        let intent = intent.into();
+        let id = compute_challenge_id(
+            secret_key,
+            &realm,
+            method.as_str(),
+            intent.as_str(),
+            request.raw(),
+            expires,
+            digest,
+        );
+        Self {
+            id,
+            realm,
+            method,
+            intent,
+            request,
+            expires: expires.map(String::from),
+            description: description.map(String::from),
+            digest: digest.map(String::from),
+        }
+    }
+
+    /// Set the expiration time (ISO 8601).
+    ///
+    /// Note: When using `with_secret_key`, set expires BEFORE creating the challenge
+    /// since it affects the HMAC. For post-creation use, the HMAC won't include the
+    /// expires. Use [`with_secret_key_full`] instead if expires is needed in the HMAC.
+    pub fn with_expires(mut self, expires: impl Into<String>) -> Self {
+        self.expires = Some(expires.into());
+        self
+    }
+
+    /// Set the description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set the digest.
+    pub fn with_digest(mut self, digest: impl Into<String>) -> Self {
+        self.digest = Some(digest.into());
+        self
+    }
+
     /// Get the effective expiration time for this payment challenge.
     ///
     /// Returns `challenge.expires` if set. Callers should also check
@@ -874,5 +1029,149 @@ mod tests {
             None,
         );
         assert_eq!(id, "2zBPShTPApayQwXeT8WydrfbsHFLWIC8cosfBzK3UUs");
+    }
+
+    #[test]
+    fn test_challenge_serialize_includes_digest() {
+        let mut challenge = test_challenge();
+        challenge.digest = Some("sha-256=abc".to_string());
+
+        let header = challenge.to_header().unwrap();
+        assert!(header.contains(r#"digest="sha-256=abc""#));
+        assert!(header.contains("expires="));
+    }
+
+    #[test]
+    fn test_challenge_roundtrip_with_digest() {
+        let mut challenge = test_challenge();
+        challenge.digest = Some("sha-256=abc".to_string());
+
+        let header = challenge.to_header().unwrap();
+        let parsed = PaymentChallenge::from_header(&header).unwrap();
+
+        assert_eq!(parsed.digest.as_deref(), Some("sha-256=abc"));
+        assert_eq!(parsed.expires, challenge.expires);
+    }
+
+    #[test]
+    fn test_challenge_from_response_402() {
+        let challenge = test_challenge();
+        let header = challenge.to_header().unwrap();
+
+        let parsed = PaymentChallenge::from_response(402, &header).unwrap();
+        assert_eq!(parsed.id, challenge.id);
+        assert_eq!(parsed.realm, challenge.realm);
+        assert_eq!(parsed.method.as_str(), challenge.method.as_str());
+        assert_eq!(parsed.intent.as_str(), challenge.intent.as_str());
+    }
+
+    #[test]
+    fn test_challenge_from_response_non_402() {
+        let challenge = test_challenge();
+        let header = challenge.to_header().unwrap();
+
+        let result = PaymentChallenge::from_response(401, &header);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compute_challenge_id_deterministic() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+
+        let id1 = compute_challenge_id("secret", "api", "tempo", "charge", request.raw(), None, None);
+        let id2 = compute_challenge_id("secret", "api", "tempo", "charge", request.raw(), None, None);
+
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_compute_challenge_id_different_secrets() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+
+        let id1 = compute_challenge_id("secret-a", "api", "tempo", "charge", request.raw(), None, None);
+        let id2 = compute_challenge_id("secret-b", "api", "tempo", "charge", request.raw(), None, None);
+
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_challenge_verify_tampered_request() {
+        let secret = "test-secret";
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+
+        let id = compute_challenge_id(secret, "api", "tempo", "charge", request.raw(), None, None);
+
+        // Build challenge with the valid HMAC ID but tampered request data
+        let tampered_request = Base64UrlJson::from_value(&serde_json::json!({"amount": "9999"})).unwrap();
+        let challenge = PaymentChallenge {
+            id,
+            realm: "api".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: tampered_request,
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        assert!(!challenge.verify(secret));
+    }
+
+    #[test]
+    fn test_challenge_new() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("my-id", "api.example.com", "tempo", "charge", request);
+        assert_eq!(challenge.id, "my-id");
+        assert_eq!(challenge.realm, "api.example.com");
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "charge");
+        assert!(challenge.expires.is_none());
+        assert!(challenge.description.is_none());
+        assert!(challenge.digest.is_none());
+    }
+
+    #[test]
+    fn test_challenge_with_secret_key() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::with_secret_key(
+            "my-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        );
+        assert!(challenge.verify("my-secret"));
+        assert!(!challenge.verify("wrong-secret"));
+    }
+
+    #[test]
+    fn test_challenge_with_secret_key_full() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::with_secret_key_full(
+            "my-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            Some("2026-01-01T00:00:00Z"),
+            Some("sha-256=abc"),
+            Some("test payment"),
+        );
+        assert!(challenge.verify("my-secret"));
+        assert_eq!(challenge.expires.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(challenge.digest.as_deref(), Some("sha-256=abc"));
+        assert_eq!(challenge.description.as_deref(), Some("test payment"));
+    }
+
+    #[test]
+    fn test_challenge_builder_methods() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2026-01-01T00:00:00Z")
+            .with_description("test")
+            .with_digest("sha-256=abc");
+        assert_eq!(challenge.expires.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(challenge.description.as_deref(), Some("test"));
+        assert_eq!(challenge.digest.as_deref(), Some("sha-256=abc"));
     }
 }

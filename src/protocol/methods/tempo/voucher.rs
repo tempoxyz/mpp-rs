@@ -75,7 +75,7 @@ pub async fn sign_voucher(
 
     let signing_hash = voucher.eip712_signing_hash(&domain);
     let signature = signer.sign_hash(&signing_hash).await.map_err(|e| {
-        crate::error::MppError::InvalidSignature(format!("failed to sign voucher: {}", e))
+        crate::error::MppError::InvalidSignature(Some(format!("failed to sign voucher: {}", e)))
     })?;
 
     Ok(alloy::primitives::Bytes::from(
