@@ -58,8 +58,9 @@ const DEFAULT_DECIMALS: u32 = 6;
 /// let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
 /// ```
 #[derive(Clone)]
-pub struct Mpay<M> {
+pub struct Mpay<M, S = ()> {
     method: M,
+    session_method: Option<S>,
     realm: String,
     secret_key: String,
     currency: Option<String>,
@@ -67,21 +68,40 @@ pub struct Mpay<M> {
     decimals: u32,
 }
 
-impl<M> Mpay<M>
+impl<M> Mpay<M, ()>
 where
     M: ChargeMethod,
 {
     /// Create a new payment handler (advanced API).
     ///
     /// For a simpler API, use [`Mpay::create()`] with [`tempo()`](super::tempo).
-    pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Self {
-        Self {
+    pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpay<M, ()> {
+        Mpay {
             method,
+            session_method: None,
             realm: realm.into(),
             secret_key: secret_key.into(),
             currency: None,
             recipient: None,
             decimals: DEFAULT_DECIMALS,
+        }
+    }
+}
+
+impl<M, S> Mpay<M, S>
+where
+    M: ChargeMethod,
+{
+    /// Add a session method to this payment handler.
+    pub fn with_session_method<S2>(self, session_method: S2) -> Mpay<M, S2> {
+        Mpay {
+            method: self.method,
+            session_method: Some(session_method),
+            realm: self.realm,
+            secret_key: self.secret_key,
+            currency: self.currency,
+            recipient: self.recipient,
+            decimals: self.decimals,
         }
     }
 
@@ -260,6 +280,172 @@ where
     }
 }
 
+impl<M, S> Mpay<M, S>
+where
+    M: ChargeMethod,
+    S: crate::protocol::traits::SessionMethod,
+{
+    /// Generate a session challenge.
+    #[cfg(feature = "tempo")]
+    pub fn session_challenge(
+        &self,
+        amount: &str,
+        unit_type: &str,
+        currency: &str,
+        recipient: &str,
+    ) -> crate::error::Result<PaymentChallenge> {
+        use crate::protocol::intents::SessionRequest;
+
+        let request = SessionRequest {
+            amount: amount.to_string(),
+            unit_type: unit_type.to_string(),
+            currency: currency.to_string(),
+            recipient: Some(recipient.to_string()),
+            ..Default::default()
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
+
+        let id = crate::protocol::methods::tempo::generate_challenge_id(
+            &self.secret_key,
+            &self.realm,
+            "tempo",
+            "session",
+            encoded.raw(),
+            None,
+            None,
+        );
+
+        Ok(PaymentChallenge {
+            id,
+            realm: self.realm.clone(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: encoded,
+            expires: None,
+            description: None,
+            digest: None,
+        })
+    }
+
+    /// Generate a session challenge with method details populated from the session method.
+    ///
+    /// When a session method is configured (e.g., Tempo's `SessionMethod`), this
+    /// automatically populates `methodDetails` with fields like `escrowContract`,
+    /// `chainId`, and `minVoucherDelta`. Additional options like `suggestedDeposit`,
+    /// `feePayer`, `description`, and `expires` can be set via [`SessionChallengeOptions`](super::SessionChallengeOptions).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let challenge = mpay.session_challenge_with_details(
+    ///     "1000",
+    ///     "second",
+    ///     "0x20c0...",
+    ///     "0x742d...",
+    ///     SessionChallengeOptions {
+    ///         suggested_deposit: Some("60000"),
+    ///         fee_payer: true,
+    ///         ..Default::default()
+    ///     },
+    /// )?;
+    /// ```
+    #[cfg(feature = "tempo")]
+    pub fn session_challenge_with_details(
+        &self,
+        amount: &str,
+        unit_type: &str,
+        currency: &str,
+        recipient: &str,
+        options: super::SessionChallengeOptions<'_>,
+    ) -> crate::error::Result<PaymentChallenge> {
+        use crate::protocol::intents::SessionRequest;
+
+        let session = self.session_method.as_ref();
+
+        let mut method_details = session.and_then(|s| s.challenge_method_details());
+
+        if options.fee_payer {
+            let details = method_details.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("feePayer".to_string(), serde_json::json!(true));
+            }
+        }
+
+        let request = SessionRequest {
+            amount: amount.to_string(),
+            unit_type: unit_type.to_string(),
+            currency: currency.to_string(),
+            recipient: Some(recipient.to_string()),
+            suggested_deposit: options.suggested_deposit.map(|s| s.to_string()),
+            method_details,
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
+
+        let id = crate::protocol::methods::tempo::generate_challenge_id(
+            &self.secret_key,
+            &self.realm,
+            "tempo",
+            "session",
+            encoded.raw(),
+            options.expires,
+            None,
+        );
+
+        Ok(PaymentChallenge {
+            id,
+            realm: self.realm.clone(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: encoded,
+            expires: options.expires.map(|s| s.to_string()),
+            description: options.description.map(|s| s.to_string()),
+            digest: None,
+        })
+    }
+
+    /// Verify a session credential.
+    pub async fn verify_session(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<Receipt, crate::protocol::traits::VerificationError> {
+        let session = self.session_method.as_ref().ok_or_else(|| {
+            crate::protocol::traits::VerificationError::new("No session method configured")
+        })?;
+
+        // Verify HMAC
+        #[cfg(feature = "tempo")]
+        {
+            let expected_id = crate::protocol::methods::tempo::generate_challenge_id(
+                &self.secret_key,
+                &self.realm,
+                credential.challenge.method.as_str(),
+                credential.challenge.intent.as_str(),
+                &credential.challenge.request,
+                credential.challenge.expires.as_deref(),
+                credential.challenge.digest.as_deref(),
+            );
+            if credential.challenge.id != expected_id {
+                return Err(crate::protocol::traits::VerificationError::with_code(
+                    "Challenge ID mismatch",
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        let request: crate::protocol::intents::SessionRequest =
+            crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
+                .decode()
+                .map_err(|e| {
+                    crate::protocol::traits::VerificationError::new(format!(
+                        "Failed to decode session request: {}",
+                        e
+                    ))
+                })?;
+
+        session.verify_session(credential, &request).await
+    }
+}
+
 /// Tempo-specific `create` constructor for [`Mpay`].
 #[cfg(feature = "tempo")]
 impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
@@ -291,6 +477,7 @@ impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
 
         Ok(Self {
             method,
+            session_method: None,
             realm: builder.realm,
             secret_key,
             currency: Some(builder.currency),

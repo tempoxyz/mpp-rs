@@ -96,21 +96,32 @@
 //! ```
 
 pub mod charge;
+pub mod session;
 pub mod transaction;
 pub mod types;
+pub mod voucher;
+pub mod stream_receipt;
 
 #[cfg(feature = "server")]
 pub mod method;
+#[cfg(feature = "server")]
+pub mod session_method;
 
 pub use charge::TempoChargeExt;
+pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
 };
 pub use types::TempoMethodDetails;
+pub use stream_receipt::StreamReceipt;
+#[cfg(feature = "evm")]
+pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
 #[cfg(feature = "server")]
 pub use method::ChargeMethod;
+#[cfg(feature = "server")]
+pub use session_method::{SessionMethod, SessionMethodConfig, InMemoryChannelStore};
 
 /// Tempo mainnet chain ID.
 pub const CHAIN_ID: u64 = 4217;
@@ -129,6 +140,9 @@ pub const METHOD_NAME: &str = "tempo";
 
 /// Charge intent name.
 pub const INTENT_CHARGE: &str = "charge";
+
+/// Session intent name.
+pub const INTENT_SESSION: &str = "session";
 
 /// Create a Tempo charge challenge with minimal parameters.
 ///
@@ -311,28 +325,7 @@ pub fn generate_challenge_id(
     expires: Option<&str>,
     digest: Option<&str>,
 ) -> String {
-    use crate::protocol::core::base64url_encode;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    let hmac_input = format!(
-        "{}|{}|{}|{}|{}|{}",
-        realm,
-        method,
-        intent,
-        request,
-        expires.unwrap_or(""),
-        digest.unwrap_or("")
-    );
-
-    let mut mac =
-        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(hmac_input.as_bytes());
-    let result = mac.finalize();
-
-    base64url_encode(&result.into_bytes())
+    crate::protocol::core::compute_challenge_id(secret_key, realm, method, intent, request, expires, digest)
 }
 
 /// Generate a challenge ID from a JSON request value using HMAC-SHA256.
@@ -592,7 +585,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "4Y_7cCtNrnPq0ujXFLOPsk4DRMctIFYxijKxrY5uob0");
+            assert_eq!(id, "2zBPShTPApayQwXeT8WydrfbsHFLWIC8cosfBzK3UUs");
         }
 
         #[test]
@@ -612,7 +605,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "02h24ab0XjVsKFwbyhz8HU9FacoT-21zV4FokI2U4YI");
+            assert_eq!(id, "HQEKiVUplCDQ6AIff8eN55Q3BpRmg2RqU0DOl3R8QIA");
         }
 
         #[test]
@@ -632,7 +625,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "EAX2sqwdeg8Km8LIKRBFhM5xDQvEgIlbTif9FKBsOiU");
+            assert_eq!(id, "WglnB-3knPMLPOVEdA8P81UXpy8oFVfBx31ntDh-VPk");
         }
 
         #[test]
@@ -654,7 +647,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "9uqa-bDFwDBiMIgJF-hytstRW_YgjpBUDCo5_SMSqG4");
+            assert_eq!(id, "96xfZu2wzXD-f-l-hClS9OgODVgIoPWSCWhUw6a4I1Q");
         }
 
         #[test]
@@ -674,7 +667,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "GaC7Gn_Fbbq98Tw-Eb7z4FadriU7GzNrAyC7ZcY3VRI");
+            assert_eq!(id, "mi0krYRZpfDxn0DFDHeXOIYdU_SEcJQfURKGTN26Ehg");
         }
 
         #[test]
@@ -690,7 +683,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "jUTqTVe3kCv5rVizv1XBCs9qKCLg4AZLwBUnk4N3MR8");
+            assert_eq!(id, "yXILRwEbyiy4F2pCUoxcKbvYHy4ZyXtLxnzMZTi3qDs");
         }
 
         #[test]
@@ -711,7 +704,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "76lyru2p7i7Xw6fGTJtWzd9c7Z6mt33LIW7968Mlkz8");
+            assert_eq!(id, "stLlKuOMkHscBIqCE78v48-CY-I0JIQkm1rjotcb-rQ");
         }
 
         #[test]
@@ -735,7 +728,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "dyItTtUU31Gp2ckWrYXoeB2wZtS1OTVpXw81D_blwuk");
+            assert_eq!(id, "AbaOnesHVxXeDbG9eStLZOlBwTI87_8g7skZwL9tOvA");
         }
     }
 }

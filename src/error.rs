@@ -12,8 +12,12 @@ pub type Result<T> = std::result::Result<T, MppError>;
 
 // ==================== RFC 9457 Problem Details ====================
 
-/// Base URI for payment-related problem types.
-pub const PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems";
+/// Base URI for core payment-auth problem types.
+pub const CORE_PROBLEM_TYPE_BASE: &str =
+    "https://tempoxyz.github.io/payment-auth-spec/problems";
+
+/// Base URI for stream/channel problem types.
+pub const STREAM_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/stream";
 
 /// RFC 9457 Problem Details structure for payment errors.
 ///
@@ -25,7 +29,7 @@ pub const PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems";
 /// ```
 /// use mpay::error::PaymentErrorDetails;
 ///
-/// let problem = PaymentErrorDetails::new("verification-failed")
+/// let problem = PaymentErrorDetails::core("verification-failed")
 ///     .with_title("VerificationFailedError")
 ///     .with_status(402)
 ///     .with_detail("Payment verification failed: insufficient amount.");
@@ -54,18 +58,29 @@ pub struct PaymentErrorDetails {
 }
 
 impl PaymentErrorDetails {
-    /// Create a new PaymentErrorDetails with the given problem type suffix.
-    ///
-    /// The full type URI will be constructed as `{PROBLEM_TYPE_BASE}/{suffix}`.
-    pub fn new(type_suffix: impl Into<String>) -> Self {
-        let suffix = type_suffix.into();
+    /// Create a new PaymentErrorDetails with a full problem type URI.
+    pub fn new(type_uri: impl Into<String>) -> Self {
         Self {
-            problem_type: format!("{}/{}", PROBLEM_TYPE_BASE, suffix),
+            problem_type: type_uri.into(),
             title: String::new(),
             status: 402,
             detail: String::new(),
             challenge_id: None,
         }
+    }
+
+    /// Create a PaymentErrorDetails for a core payment-auth problem.
+    ///
+    /// The full type URI will be `{CORE_PROBLEM_TYPE_BASE}/{suffix}`.
+    pub fn core(suffix: impl std::fmt::Display) -> Self {
+        Self::new(format!("{}/{}", CORE_PROBLEM_TYPE_BASE, suffix))
+    }
+
+    /// Create a PaymentErrorDetails for a stream/channel problem.
+    ///
+    /// The full type URI will be `{STREAM_PROBLEM_TYPE_BASE}/{suffix}`.
+    pub fn stream(suffix: impl std::fmt::Display) -> Self {
+        Self::new(format!("{}/{}", STREAM_PROBLEM_TYPE_BASE, suffix))
     }
 
     /// Set the title.
@@ -109,7 +124,7 @@ impl PaymentErrorDetails {
 ///
 /// impl PaymentError for MyError {
 ///     fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
-///         PaymentErrorDetails::new("my-error")
+///         PaymentErrorDetails::core("my-error")
 ///             .with_title("MyError")
 ///             .with_status(402)
 ///             .with_detail(&self.reason)
@@ -207,6 +222,39 @@ pub enum MppError {
     #[error("{}", format_invalid_payload(.0))]
     InvalidPayload(Option<String>),
 
+    /// Request is malformed or contains invalid parameters.
+    #[error("{}", format_bad_request(.0))]
+    BadRequest(Option<String>),
+
+    // ==================== Session/Channel Errors ====================
+    /// Insufficient balance in payment channel.
+    #[error("Insufficient balance in channel: {0}")]
+    InsufficientBalance(String),
+
+    /// Invalid cryptographic signature.
+    #[error("Invalid signature: {0}")]
+    InvalidSignature(String),
+
+    /// Signer does not match expected address.
+    #[error("Signer mismatch: {0}")]
+    SignerMismatch(String),
+
+    /// Voucher amount exceeds channel deposit.
+    #[error("Amount exceeds deposit: {0}")]
+    AmountExceedsDeposit(String),
+
+    /// Voucher delta is below the minimum threshold.
+    #[error("Delta too small: {0}")]
+    DeltaTooSmall(String),
+
+    /// Payment channel not found.
+    #[error("Channel not found: {0}")]
+    ChannelNotFound(String),
+
+    /// Payment channel has been closed.
+    #[error("Channel closed: {0}")]
+    ChannelClosed(String),
+
     // ==================== External Library Errors ====================
     /// IO error
     #[error("IO error: {0}")]
@@ -272,6 +320,13 @@ fn format_invalid_payload(reason: &Option<String>) -> String {
     match reason {
         Some(r) => format!("Credential payload is invalid: {}.", r),
         None => "Credential payload is invalid.".to_string(),
+    }
+}
+
+fn format_bad_request(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Bad request: {}.", r),
+        None => "Bad request.".to_string(),
     }
 }
 
@@ -387,6 +442,16 @@ impl MppError {
         Self::InvalidPayload(None)
     }
 
+    /// Create a bad request error.
+    pub fn bad_request(reason: impl Into<String>) -> Self {
+        Self::BadRequest(Some(reason.into()))
+    }
+
+    /// Create a bad request error without a reason.
+    pub fn bad_request_default() -> Self {
+        Self::BadRequest(None)
+    }
+
     /// Returns the RFC 9457 problem type suffix if this is a payment problem.
     pub fn problem_type_suffix(&self) -> Option<&'static str> {
         match self {
@@ -396,6 +461,14 @@ impl MppError {
             Self::PaymentExpired(_) => Some("payment-expired"),
             Self::PaymentRequired { .. } => Some("payment-required"),
             Self::InvalidPayload(_) => Some("invalid-payload"),
+            Self::BadRequest(_) => Some("bad-request"),
+            Self::InsufficientBalance(_) => Some("stream/insufficient-balance"),
+            Self::InvalidSignature(_) => Some("stream/invalid-signature"),
+            Self::SignerMismatch(_) => Some("stream/signer-mismatch"),
+            Self::AmountExceedsDeposit(_) => Some("stream/amount-exceeds-deposit"),
+            Self::DeltaTooSmall(_) => Some("stream/delta-too-small"),
+            Self::ChannelNotFound(_) => Some("stream/channel-not-found"),
+            Self::ChannelClosed(_) => Some("stream/channel-finalized"),
             _ => None,
         }
     }
@@ -408,21 +481,57 @@ impl MppError {
 
 impl PaymentError for MppError {
     fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
-        let (suffix, title) = match self {
-            Self::MalformedCredential(_) => ("malformed-credential", "MalformedCredentialError"),
-            Self::InvalidChallenge { .. } => ("invalid-challenge", "InvalidChallengeError"),
-            Self::VerificationFailed(_) => ("verification-failed", "VerificationFailedError"),
-            Self::PaymentExpired(_) => ("payment-expired", "PaymentExpiredError"),
-            Self::PaymentRequired { .. } => ("payment-required", "PaymentRequiredError"),
-            Self::InvalidPayload(_) => ("invalid-payload", "InvalidPayloadError"),
+        let mut problem = match self {
+            // Core payment-auth errors
+            Self::MalformedCredential(_) => PaymentErrorDetails::core("malformed-credential")
+                .with_title("MalformedCredentialError")
+                .with_status(402),
+            Self::InvalidChallenge { .. } => PaymentErrorDetails::core("invalid-challenge")
+                .with_title("InvalidChallengeError")
+                .with_status(402),
+            Self::VerificationFailed(_) => PaymentErrorDetails::core("verification-failed")
+                .with_title("VerificationFailedError")
+                .with_status(402),
+            Self::PaymentExpired(_) => PaymentErrorDetails::core("payment-expired")
+                .with_title("PaymentExpiredError")
+                .with_status(402),
+            Self::PaymentRequired { .. } => PaymentErrorDetails::core("payment-required")
+                .with_title("PaymentRequiredError")
+                .with_status(402),
+            Self::InvalidPayload(_) => PaymentErrorDetails::core("invalid-payload")
+                .with_title("InvalidPayloadError")
+                .with_status(402),
+            Self::BadRequest(_) => PaymentErrorDetails::core("bad-request")
+                .with_title("BadRequestError")
+                .with_status(400),
+            // Stream/channel errors
+            Self::InsufficientBalance(_) => PaymentErrorDetails::stream("insufficient-balance")
+                .with_title("InsufficientBalanceError")
+                .with_status(402),
+            Self::InvalidSignature(_) => PaymentErrorDetails::stream("invalid-signature")
+                .with_title("InvalidSignatureError")
+                .with_status(402),
+            Self::SignerMismatch(_) => PaymentErrorDetails::stream("signer-mismatch")
+                .with_title("SignerMismatchError")
+                .with_status(402),
+            Self::AmountExceedsDeposit(_) => PaymentErrorDetails::stream("amount-exceeds-deposit")
+                .with_title("AmountExceedsDepositError")
+                .with_status(402),
+            Self::DeltaTooSmall(_) => PaymentErrorDetails::stream("delta-too-small")
+                .with_title("DeltaTooSmallError")
+                .with_status(402),
+            Self::ChannelNotFound(_) => PaymentErrorDetails::stream("channel-not-found")
+                .with_title("ChannelNotFoundError")
+                .with_status(410),
+            Self::ChannelClosed(_) => PaymentErrorDetails::stream("channel-finalized")
+                .with_title("ChannelClosedError")
+                .with_status(410),
             // Non-payment-problem errors get a generic problem type
-            _ => ("internal-error", "InternalError"),
-        };
-
-        let mut problem = PaymentErrorDetails::new(suffix)
-            .with_title(title)
-            .with_status(402)
-            .with_detail(self.to_string());
+            _ => PaymentErrorDetails::core("internal-error")
+                .with_title("InternalError")
+                .with_status(402),
+        }
+        .with_detail(self.to_string());
 
         // Use embedded challenge ID from InvalidChallenge, or the provided one
         let embedded_id = match self {
@@ -512,15 +621,15 @@ mod tests {
     // ==================== RFC 9457 Problem Details Tests ====================
 
     #[test]
-    fn test_problem_details_new() {
-        let problem = PaymentErrorDetails::new("test-error")
+    fn test_problem_details_core() {
+        let problem = PaymentErrorDetails::core("test-error")
             .with_title("TestError")
             .with_status(400)
             .with_detail("Something went wrong");
 
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/test-error"
+            "https://tempoxyz.github.io/payment-auth-spec/problems/test-error"
         );
         assert_eq!(problem.title, "TestError");
         assert_eq!(problem.status, 400);
@@ -529,8 +638,23 @@ mod tests {
     }
 
     #[test]
+    fn test_problem_details_stream() {
+        let problem = PaymentErrorDetails::stream("insufficient-balance")
+            .with_title("InsufficientBalanceError")
+            .with_status(402)
+            .with_detail("Insufficient balance.");
+
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/insufficient-balance"
+        );
+        assert_eq!(problem.title, "InsufficientBalanceError");
+        assert_eq!(problem.status, 402);
+    }
+
+    #[test]
     fn test_problem_details_with_challenge_id() {
-        let problem = PaymentErrorDetails::new("test-error")
+        let problem = PaymentErrorDetails::core("test-error")
             .with_title("TestError")
             .with_challenge_id("abc123");
 
@@ -539,7 +663,7 @@ mod tests {
 
     #[test]
     fn test_problem_details_serialize() {
-        let problem = PaymentErrorDetails::new("verification-failed")
+        let problem = PaymentErrorDetails::core("verification-failed")
             .with_title("VerificationFailedError")
             .with_status(402)
             .with_detail("Payment verification failed.")
@@ -563,7 +687,10 @@ mod tests {
         );
 
         let problem = err.to_problem_details(Some("test-id"));
-        assert!(problem.problem_type.contains("malformed-credential"));
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/malformed-credential"
+        );
         assert_eq!(problem.title, "MalformedCredentialError");
         assert_eq!(problem.challenge_id, Some("test-id".to_string()));
     }
@@ -586,7 +713,10 @@ mod tests {
         );
 
         let problem = err.to_problem_details(None);
-        assert!(problem.problem_type.contains("invalid-challenge"));
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/invalid-challenge"
+        );
         assert_eq!(problem.challenge_id, Some("abc123".to_string()));
     }
 
@@ -602,7 +732,10 @@ mod tests {
         );
 
         let problem = err.to_problem_details(None);
-        assert!(problem.problem_type.contains("verification-failed"));
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/verification-failed"
+        );
         assert_eq!(problem.title, "VerificationFailedError");
     }
 
@@ -615,7 +748,10 @@ mod tests {
         assert_eq!(err.to_string(), "Payment expired at 2025-01-15T12:00:00Z.");
 
         let problem = err.to_problem_details(None);
-        assert!(problem.problem_type.contains("payment-expired"));
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/payment-expired"
+        );
     }
 
     #[test]
@@ -642,8 +778,28 @@ mod tests {
         );
 
         let problem = err.to_problem_details(Some("chal-id"));
-        assert!(problem.problem_type.contains("payment-required"));
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/payment-required"
+        );
         assert_eq!(problem.challenge_id, Some("chal-id".to_string()));
+    }
+
+    #[test]
+    fn test_bad_request_error() {
+        let err = MppError::bad_request_default();
+        assert_eq!(err.to_string(), "Bad request.");
+
+        let err = MppError::bad_request("invalid parameters");
+        assert_eq!(err.to_string(), "Bad request: invalid parameters.");
+
+        let problem = err.to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/bad-request"
+        );
+        assert_eq!(problem.title, "BadRequestError");
+        assert_eq!(problem.status, 400);
     }
 
     #[test]
@@ -658,7 +814,10 @@ mod tests {
         );
 
         let problem = err.to_problem_details(None);
-        assert!(problem.problem_type.contains("invalid-payload"));
+        assert_eq!(
+            problem.problem_type,
+            "https://tempoxyz.github.io/payment-auth-spec/problems/invalid-payload"
+        );
         assert_eq!(problem.title, "InvalidPayloadError");
     }
 }

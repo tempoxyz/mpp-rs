@@ -1,0 +1,1119 @@
+//! Server-side session payment verification for Tempo.
+//!
+//! Implements the `SessionMethod` trait for Tempo streaming payments (pay-as-you-go).
+//! Handles four channel lifecycle actions: open, topUp, voucher, close.
+//!
+//! Ported from the TypeScript SDK's `Session.ts`.
+
+use alloy::primitives::{Address, B256};
+use std::future::Future;
+use std::sync::Arc;
+
+use alloy::providers::Provider;
+use tempo_alloy::TempoNetwork;
+
+use super::session::{SessionCredentialPayload, TempoSessionMethodDetails};
+use super::voucher::verify_voucher;
+use super::{INTENT_SESSION, METHOD_NAME};
+use crate::protocol::core::{PaymentCredential, Receipt};
+use crate::protocol::intents::SessionRequest;
+use crate::protocol::traits::{SessionMethod as SessionMethodTrait, VerificationError};
+
+// ==================== ChannelStore ====================
+
+/// State for an on-chain payment channel, including per-session accounting.
+///
+/// Tracks the channel's identity, on-chain balance, the highest voucher
+/// the server has accepted, and the current session's spend counters.
+///
+/// Mirrors the TypeScript `ChannelStore.State` interface.
+#[derive(Debug, Clone)]
+pub struct ChannelState {
+    pub channel_id: String,
+    pub chain_id: u64,
+    pub escrow_contract: Address,
+    pub payer: Address,
+    pub payee: Address,
+    pub token: Address,
+    pub authorized_signer: Address,
+    pub deposit: u128,
+    pub settled_on_chain: u128,
+    pub highest_voucher_amount: u128,
+    /// Serialized signature bytes of the highest voucher (hex-encoded).
+    pub highest_voucher_signature: Option<Vec<u8>>,
+    pub spent: u128,
+    pub units: u64,
+    pub finalized: bool,
+    pub created_at: String,
+}
+
+/// Trait for channel state persistence.
+///
+/// Implementations must provide atomic read-modify-write semantics for
+/// `update_channel`. The callback receives the current state (or `None`)
+/// and returns the next state (or `None` to delete).
+///
+/// Object-safe so it can be used as `Arc<dyn ChannelStore>`.
+///
+/// # Note
+///
+/// This is a minimal trait defined inline. It should be consolidated with
+/// a shared store abstraction in a future refactor.
+pub trait ChannelStore: Send + Sync {
+    fn get_channel(
+        &self,
+        channel_id: &str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    >;
+
+    fn update_channel(
+        &self,
+        channel_id: &str,
+        updater: Box<
+            dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                + Send,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    >;
+
+    /// Wait for the next update to a channel.
+    /// Default implementation returns immediately (poll-based fallback).
+    fn wait_for_update(
+        &self,
+        _channel_id: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+/// Atomically deduct `amount` from a channel's available balance.
+///
+/// Returns `Ok(state)` on success, `Err` if insufficient balance or channel not found.
+pub async fn deduct_from_channel(
+    store: &dyn ChannelStore,
+    channel_id: &str,
+    amount: u128,
+) -> Result<ChannelState, VerificationError> {
+    let result = store
+        .update_channel(
+            channel_id,
+            Box::new(move |current| {
+                let state = current
+                    .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                let available = state.highest_voucher_amount.saturating_sub(state.spent);
+                if available >= amount {
+                    Ok(Some(ChannelState {
+                        spent: state.spent + amount,
+                        units: state.units + 1,
+                        ..state
+                    }))
+                } else {
+                    Err(VerificationError::insufficient_balance(format!(
+                        "requested {}, available {}",
+                        amount, available
+                    )))
+                }
+            }),
+        )
+        .await?;
+
+    result.ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+}
+
+// ==================== On-chain channel reading ====================
+
+/// On-chain channel state from the escrow contract.
+#[derive(Debug, Clone)]
+pub struct OnChainChannel {
+    pub payer: Address,
+    pub payee: Address,
+    pub token: Address,
+    pub deposit: u128,
+    pub settled: u128,
+    pub finalized: bool,
+    pub authorized_signer: Address,
+    pub close_requested_at: u128,
+}
+
+/// Read channel state from the escrow contract.
+///
+/// Uses the `getChannel` view function on the escrow contract.
+async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
+    provider: &P,
+    escrow_contract: Address,
+    channel_id: B256,
+) -> Result<OnChainChannel, VerificationError> {
+    use alloy::sol;
+
+    sol! {
+        #[sol(rpc)]
+        interface IEscrow {
+            function getChannel(bytes32 channelId) external view returns (
+                address payer,
+                address payee,
+                address token,
+                uint128 deposit,
+                uint128 settled,
+                bool finalized,
+                address authorizedSigner,
+                uint128 closeRequestedAt
+            );
+        }
+    }
+
+    let escrow = IEscrow::new(escrow_contract, provider);
+    let result = escrow
+        .getChannel(channel_id.into())
+        .call()
+        .await
+        .map_err(|e| {
+            VerificationError::network_error(format!("Failed to read on-chain channel: {}", e))
+        })?;
+
+    Ok(OnChainChannel {
+        payer: result.payer,
+        payee: result.payee,
+        token: result.token,
+        deposit: result.deposit,
+        settled: result.settled,
+        finalized: result.finalized,
+        authorized_signer: result.authorizedSigner,
+        close_requested_at: result.closeRequestedAt,
+    })
+}
+
+// ==================== TempoSessionMethod ====================
+
+/// Configuration for the Tempo session method.
+#[derive(Debug, Clone)]
+pub struct SessionMethodConfig {
+    /// Default escrow contract address.
+    pub escrow_contract: Address,
+    /// Default chain ID.
+    pub chain_id: u64,
+    /// Minimum voucher delta to accept (in base units). Default: 0.
+    pub min_voucher_delta: u128,
+}
+
+/// Tempo session method for server-side streaming payment verification.
+///
+/// Handles four channel lifecycle actions:
+/// - `open`: broadcast open tx, verify initial voucher, create channel in store
+/// - `topUp`: broadcast topUp tx, update deposit in store
+/// - `voucher`: verify voucher signature, check monotonicity/bounds/delta, update store
+/// - `close`: verify final voucher, close on-chain, finalize in store
+#[derive(Clone)]
+pub struct SessionMethod<P> {
+    provider: Arc<P>,
+    store: Arc<dyn ChannelStore>,
+    config: SessionMethodConfig,
+}
+
+impl<P> SessionMethod<P> {
+    /// Parse a hex channel ID string to B256.
+    fn parse_channel_id(channel_id: &str) -> Result<B256, VerificationError> {
+        channel_id.parse::<B256>().map_err(|e| {
+            VerificationError::invalid_payload(format!("Invalid channel ID: {}", e))
+        })
+    }
+
+    /// Parse a hex signature string to bytes.
+    fn parse_signature(signature: &str) -> Result<Vec<u8>, VerificationError> {
+        let s = signature.strip_prefix("0x").unwrap_or(signature);
+        hex::decode(s).map_err(|e| {
+            VerificationError::invalid_payload(format!("Invalid signature hex: {}", e))
+        })
+    }
+
+    /// Parse an address string.
+    fn parse_address(addr: &str) -> Result<Address, VerificationError> {
+        addr.parse::<Address>().map_err(|e| {
+            VerificationError::invalid_payload(format!("Invalid address: {}", e))
+        })
+    }
+}
+
+impl<P> SessionMethod<P>
+where
+    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
+{
+    /// Create a new Tempo session method.
+    pub fn new(
+        provider: P,
+        store: Arc<dyn ChannelStore>,
+        config: SessionMethodConfig,
+    ) -> Self {
+        Self {
+            provider: Arc::new(provider),
+            store,
+            config,
+        }
+    }
+
+    /// Get the session method configuration.
+    pub fn config(&self) -> &SessionMethodConfig {
+        &self.config
+    }
+
+    /// Get the method details from the session request, with fallbacks to config.
+    fn resolve_method_details(
+        &self,
+        request: &SessionRequest,
+    ) -> Result<TempoSessionMethodDetails, VerificationError> {
+        use super::session::TempoSessionExt;
+
+        match request.tempo_session_details() {
+            Ok(details) => Ok(details),
+            Err(_) => Ok(TempoSessionMethodDetails {
+                escrow_contract: format!("{:#x}", self.config.escrow_contract),
+                chain_id: Some(self.config.chain_id),
+                channel_id: None,
+                min_voucher_delta: None,
+                fee_payer: None,
+            }),
+        }
+    }
+
+    /// Resolve the escrow contract address from method details or config.
+    fn resolve_escrow(&self, details: &TempoSessionMethodDetails) -> Result<Address, VerificationError> {
+        Self::parse_address(&details.escrow_contract)
+    }
+
+    /// Resolve the chain ID from method details or config.
+    fn resolve_chain_id(&self, details: &TempoSessionMethodDetails) -> u64 {
+        details.chain_id.unwrap_or(self.config.chain_id)
+    }
+
+    /// Resolve the effective minimum voucher delta.
+    fn resolve_min_delta(&self, details: &TempoSessionMethodDetails) -> u128 {
+        details
+            .min_voucher_delta
+            .as_ref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(self.config.min_voucher_delta)
+    }
+
+    /// Handle 'open' action.
+    async fn handle_open(
+        &self,
+        _credential: &PaymentCredential,
+        payload: &SessionCredentialPayload,
+        details: &TempoSessionMethodDetails,
+    ) -> Result<Receipt, VerificationError> {
+        let (channel_id_str, cumulative_amount_str, signature_str, _authorized_signer_str) =
+            match payload {
+                SessionCredentialPayload::Open {
+                    channel_id,
+                    cumulative_amount,
+                    signature,
+                    authorized_signer,
+                    ..
+                } => (channel_id, cumulative_amount, signature, authorized_signer),
+                _ => unreachable!(),
+            };
+
+        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+        let escrow = self.resolve_escrow(details)?;
+        let chain_id = self.resolve_chain_id(details);
+
+        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+
+        // Validate on-chain state.
+        if on_chain.deposit == 0 {
+            return Err(VerificationError::channel_not_found(
+                "channel not funded on-chain",
+            ));
+        }
+        if on_chain.finalized {
+            return Err(VerificationError::channel_closed(
+                "channel is finalized on-chain",
+            ));
+        }
+        if on_chain.close_requested_at != 0 {
+            return Err(VerificationError::channel_closed(
+                "channel has a pending close request",
+            ));
+        }
+
+        let authorized_signer = if on_chain.authorized_signer == Address::ZERO {
+            on_chain.payer
+        } else {
+            on_chain.authorized_signer
+        };
+
+        let cumulative_amount: u128 = cumulative_amount_str.parse().map_err(|_| {
+            VerificationError::invalid_payload("invalid cumulativeAmount")
+        })?;
+
+        if cumulative_amount > on_chain.deposit {
+            return Err(VerificationError::amount_exceeds_deposit(
+                "voucher amount exceeds on-chain deposit",
+            ));
+        }
+        if cumulative_amount < on_chain.settled {
+            return Err(VerificationError::new(
+                "voucher cumulativeAmount is below on-chain settled amount",
+            ));
+        }
+
+        let sig_bytes = Self::parse_signature(signature_str)?;
+        let is_valid = verify_voucher(
+            escrow,
+            chain_id,
+            channel_id_b256,
+            cumulative_amount,
+            &sig_bytes,
+            authorized_signer,
+        );
+
+        if !is_valid {
+            return Err(VerificationError::invalid_signature(
+                "invalid voucher signature",
+            ));
+        }
+
+        // Create or update channel in store.
+        let channel_id_for_key = channel_id_str.clone();
+        let channel_id_for_state = channel_id_str.clone();
+        let updated = self
+            .store
+            .update_channel(
+                &channel_id_for_key,
+                Box::new(move |existing| {
+                    if let Some(existing) = existing {
+                        // Channel already exists — update if higher.
+                        if cumulative_amount > existing.highest_voucher_amount {
+                            Ok(Some(ChannelState {
+                                deposit: on_chain.deposit,
+                                highest_voucher_amount: cumulative_amount,
+                                highest_voucher_signature: Some(sig_bytes),
+                                authorized_signer,
+                                ..existing
+                            }))
+                        } else {
+                            Ok(Some(ChannelState {
+                                deposit: on_chain.deposit,
+                                authorized_signer,
+                                ..existing
+                            }))
+                        }
+                    } else {
+                        // New channel.
+                        Ok(Some(ChannelState {
+                            channel_id: channel_id_for_state,
+                            chain_id,
+                            escrow_contract: escrow,
+                            payer: on_chain.payer,
+                            payee: on_chain.payee,
+                            token: on_chain.token,
+                            authorized_signer,
+                            deposit: on_chain.deposit,
+                            settled_on_chain: 0,
+                            highest_voucher_amount: cumulative_amount,
+                            highest_voucher_signature: Some(sig_bytes),
+                            spent: 0,
+                            units: 0,
+                            finalized: false,
+                            created_at: now_iso8601(),
+                        }))
+                    }
+                }),
+            )
+            .await?;
+
+        let state = updated
+            .ok_or_else(|| VerificationError::new("failed to create channel"))?;
+
+        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+    }
+
+    /// Handle 'topUp' action.
+    async fn handle_top_up(
+        &self,
+        _credential: &PaymentCredential,
+        payload: &SessionCredentialPayload,
+        details: &TempoSessionMethodDetails,
+    ) -> Result<Receipt, VerificationError> {
+        let (channel_id_str, _additional_deposit_str) = match payload {
+            SessionCredentialPayload::TopUp {
+                channel_id,
+                additional_deposit,
+                ..
+            } => (channel_id, additional_deposit),
+            _ => unreachable!(),
+        };
+
+        let channel = self
+            .store
+            .get_channel(channel_id_str)
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
+        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+        let escrow = self.resolve_escrow(details)?;
+
+        // Re-read on-chain state after topUp tx is broadcast.
+        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+
+        if on_chain.deposit <= channel.deposit {
+            return Err(VerificationError::new(
+                "channel deposit did not increase after topUp",
+            ));
+        }
+
+        // Update deposit in store.
+        let new_deposit = on_chain.deposit;
+        let channel_id_owned = channel_id_str.clone();
+        let updated = self
+            .store
+            .update_channel(
+                &channel_id_owned,
+                Box::new(move |current| {
+                    let state = current.ok_or_else(|| {
+                        VerificationError::channel_not_found("channel not found")
+                    })?;
+                    Ok(Some(ChannelState {
+                        deposit: new_deposit,
+                        ..state
+                    }))
+                }),
+            )
+            .await?;
+
+        let state = updated.unwrap_or(channel);
+        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+    }
+
+    /// Handle 'voucher' action.
+    async fn handle_voucher(
+        &self,
+        _credential: &PaymentCredential,
+        payload: &SessionCredentialPayload,
+        details: &TempoSessionMethodDetails,
+    ) -> Result<Receipt, VerificationError> {
+        let (channel_id_str, cumulative_amount_str, signature_str) = match payload {
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                cumulative_amount,
+                signature,
+            } => (channel_id, cumulative_amount, signature),
+            _ => unreachable!(),
+        };
+
+        let channel = self
+            .store
+            .get_channel(channel_id_str)
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
+        if channel.finalized {
+            return Err(VerificationError::channel_closed("channel is finalized"));
+        }
+
+        let cumulative_amount: u128 = cumulative_amount_str.parse().map_err(|_| {
+            VerificationError::invalid_payload("invalid cumulativeAmount")
+        })?;
+
+        let escrow = self.resolve_escrow(details)?;
+        let chain_id = self.resolve_chain_id(details);
+        let min_delta = self.resolve_min_delta(details);
+
+        // Use cached channel state (verified during open/topUp) instead of
+        // reading on-chain for every voucher. This avoids an RPC round-trip
+        // per voucher, critical for high-frequency streaming.
+        self.verify_and_accept_voucher(
+            channel_id_str,
+            &channel,
+            cumulative_amount,
+            signature_str,
+            escrow,
+            chain_id,
+            min_delta,
+            channel.deposit,
+            channel.settled_on_chain,
+            false, // not finalized (checked above)
+            0,     // no close request
+        )
+        .await
+    }
+
+    /// Handle 'close' action.
+    async fn handle_close(
+        &self,
+        _credential: &PaymentCredential,
+        payload: &SessionCredentialPayload,
+        details: &TempoSessionMethodDetails,
+    ) -> Result<Receipt, VerificationError> {
+        let (channel_id_str, cumulative_amount_str, signature_str) = match payload {
+            SessionCredentialPayload::Close {
+                channel_id,
+                cumulative_amount,
+                signature,
+            } => (channel_id, cumulative_amount, signature),
+            _ => unreachable!(),
+        };
+
+        let channel = self
+            .store
+            .get_channel(channel_id_str)
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
+        if channel.finalized {
+            return Err(VerificationError::channel_closed(
+                "channel is already finalized",
+            ));
+        }
+
+        let cumulative_amount: u128 = cumulative_amount_str.parse().map_err(|_| {
+            VerificationError::invalid_payload("invalid cumulativeAmount")
+        })?;
+
+        if cumulative_amount < channel.highest_voucher_amount {
+            return Err(VerificationError::new(
+                "close voucher amount must be >= highest accepted voucher",
+            ));
+        }
+
+        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+        let escrow = self.resolve_escrow(details)?;
+        let chain_id = self.resolve_chain_id(details);
+
+        // For close, always re-read on-chain state.
+        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+
+        if on_chain.finalized {
+            return Err(VerificationError::channel_closed(
+                "channel is finalized on-chain",
+            ));
+        }
+        if cumulative_amount < on_chain.settled {
+            return Err(VerificationError::new(
+                "close voucher cumulativeAmount is below on-chain settled amount",
+            ));
+        }
+        if cumulative_amount > on_chain.deposit {
+            return Err(VerificationError::amount_exceeds_deposit(
+                "close voucher amount exceeds on-chain deposit",
+            ));
+        }
+
+        let sig_bytes = Self::parse_signature(signature_str)?;
+        let is_valid = verify_voucher(
+            escrow,
+            chain_id,
+            channel_id_b256,
+            cumulative_amount,
+            &sig_bytes,
+            channel.authorized_signer,
+        );
+
+        if !is_valid {
+            return Err(VerificationError::invalid_signature(
+                "invalid voucher signature",
+            ));
+        }
+
+        // Finalize in store.
+        let channel_id_owned = channel_id_str.clone();
+        let updated = self
+            .store
+            .update_channel(
+                &channel_id_owned,
+                Box::new(move |current| {
+                    let state = match current {
+                        Some(s) => s,
+                        None => return Ok(None),
+                    };
+                    Ok(Some(ChannelState {
+                        deposit: on_chain.deposit,
+                        highest_voucher_amount: cumulative_amount,
+                        highest_voucher_signature: Some(sig_bytes),
+                        finalized: true,
+                        ..state
+                    }))
+                }),
+            )
+            .await?;
+
+        let state = updated.unwrap_or(channel);
+        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+    }
+
+    /// Shared logic for verifying an incremental voucher and updating channel state.
+    async fn verify_and_accept_voucher(
+        &self,
+        channel_id_str: &str,
+        channel: &ChannelState,
+        cumulative_amount: u128,
+        signature_str: &str,
+        escrow: Address,
+        chain_id: u64,
+        min_delta: u128,
+        deposit: u128,
+        settled: u128,
+        finalized: bool,
+        close_requested_at: u128,
+    ) -> Result<Receipt, VerificationError> {
+        if finalized {
+            return Err(VerificationError::channel_closed(
+                "channel is finalized on-chain",
+            ));
+        }
+        if close_requested_at != 0 {
+            return Err(VerificationError::channel_closed(
+                "channel has a pending close request",
+            ));
+        }
+        if cumulative_amount < settled {
+            return Err(VerificationError::new(
+                "voucher cumulativeAmount is below on-chain settled amount",
+            ));
+        }
+        if cumulative_amount > deposit {
+            return Err(VerificationError::amount_exceeds_deposit(
+                "voucher amount exceeds on-chain deposit",
+            ));
+        }
+
+        // If voucher is not higher than what we already have, accept idempotently.
+        if cumulative_amount <= channel.highest_voucher_amount {
+            return Ok(Receipt::success(METHOD_NAME, &channel.channel_id));
+        }
+
+        let delta = cumulative_amount - channel.highest_voucher_amount;
+        if delta < min_delta {
+            return Err(VerificationError::delta_too_small(format!(
+                "voucher delta {} below minimum {}",
+                delta, min_delta
+            )));
+        }
+
+        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+        let sig_bytes = Self::parse_signature(signature_str)?;
+
+        let is_valid = verify_voucher(
+            escrow,
+            chain_id,
+            channel_id_b256,
+            cumulative_amount,
+            &sig_bytes,
+            channel.authorized_signer,
+        );
+
+        if !is_valid {
+            return Err(VerificationError::invalid_signature(
+                "invalid voucher signature",
+            ));
+        }
+
+        // Update store with new highest voucher.
+        let channel_id_owned = channel_id_str.to_string();
+        let updated = self
+            .store
+            .update_channel(
+                &channel_id_owned,
+                Box::new(move |current| {
+                    let state = current.ok_or_else(|| {
+                        VerificationError::channel_not_found("channel not found")
+                    })?;
+                    if cumulative_amount > state.highest_voucher_amount {
+                        Ok(Some(ChannelState {
+                            highest_voucher_amount: cumulative_amount,
+                            highest_voucher_signature: Some(sig_bytes),
+                            deposit,
+                            ..state
+                        }))
+                    } else {
+                        Ok(Some(state))
+                    }
+                }),
+            )
+            .await?;
+
+        let state =
+            updated.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+    }
+}
+
+impl<P> SessionMethodTrait for SessionMethod<P>
+where
+    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
+{
+    fn method(&self) -> &str {
+        METHOD_NAME
+    }
+
+    fn challenge_method_details(&self) -> Option<serde_json::Value> {
+        let details = super::session::TempoSessionMethodDetails {
+            escrow_contract: format!("{:#x}", self.config.escrow_contract),
+            chain_id: Some(self.config.chain_id),
+            min_voucher_delta: Some(self.config.min_voucher_delta.to_string()),
+            channel_id: None,
+            fee_payer: None,
+        };
+        serde_json::to_value(details).ok()
+    }
+
+    fn verify_session(
+        &self,
+        credential: &PaymentCredential,
+        request: &SessionRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        let credential = credential.clone();
+        let request = request.clone();
+        let provider = Arc::clone(&self.provider);
+        let store = Arc::clone(&self.store);
+        let config = self.config.clone();
+
+        async move {
+            let this = SessionMethod {
+                provider,
+                store,
+                config,
+            };
+
+            if credential.challenge.method.as_str() != METHOD_NAME {
+                return Err(VerificationError::credential_mismatch(format!(
+                    "Method mismatch: expected {}, got {}",
+                    METHOD_NAME,
+                    credential.challenge.method
+                )));
+            }
+            if credential.challenge.intent.as_str() != INTENT_SESSION {
+                return Err(VerificationError::credential_mismatch(format!(
+                    "Intent mismatch: expected {}, got {}",
+                    INTENT_SESSION,
+                    credential.challenge.intent
+                )));
+            }
+
+            let details = this.resolve_method_details(&request)?;
+
+            let payload: SessionCredentialPayload =
+                credential.payload_as().map_err(|e| {
+                    VerificationError::invalid_payload(format!(
+                        "Expected session payload: {}",
+                        e
+                    ))
+                })?;
+
+            match &payload {
+                SessionCredentialPayload::Open { .. } => {
+                    this.handle_open(&credential, &payload, &details).await
+                }
+                SessionCredentialPayload::TopUp { .. } => {
+                    this.handle_top_up(&credential, &payload, &details).await
+                }
+                SessionCredentialPayload::Voucher { .. } => {
+                    this.handle_voucher(&credential, &payload, &details).await
+                }
+                SessionCredentialPayload::Close { .. } => {
+                    this.handle_close(&credential, &payload, &details).await
+                }
+            }
+        }
+    }
+}
+
+fn now_iso8601() -> String {
+    use time::format_description::well_known::Iso8601;
+    use time::OffsetDateTime;
+
+    OffsetDateTime::now_utc()
+        .format(&Iso8601::DEFAULT)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+// ==================== In-memory store for testing ====================
+
+/// In-memory channel store for testing.
+///
+/// Uses a `Mutex<HashMap>` for thread-safe access.
+pub struct InMemoryChannelStore {
+    channels: std::sync::Mutex<std::collections::HashMap<String, ChannelState>>,
+    notifiers:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+}
+
+impl Default for InMemoryChannelStore {
+    fn default() -> Self {
+        Self {
+            channels: std::sync::Mutex::new(std::collections::HashMap::new()),
+            notifiers: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl InMemoryChannelStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get a snapshot of a channel (for test assertions).
+    pub fn get_channel_sync(&self, channel_id: &str) -> Option<ChannelState> {
+        self.channels.lock().unwrap().get(channel_id).cloned()
+    }
+}
+
+impl InMemoryChannelStore {
+    /// Insert a channel directly (for test setup).
+    pub fn insert(&self, channel_id: &str, state: ChannelState) {
+        self.channels
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), state);
+    }
+}
+
+impl ChannelStore for InMemoryChannelStore {
+    fn get_channel(
+        &self,
+        channel_id: &str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    > {
+        let result = self.channels.lock().unwrap().get(channel_id).cloned();
+        Box::pin(async move { Ok(result) })
+    }
+
+    fn update_channel(
+        &self,
+        channel_id: &str,
+        updater: Box<
+            dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                + Send,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    > {
+        let mut map = self.channels.lock().unwrap();
+        let current = map.get(channel_id).cloned();
+        let result = updater(current);
+        let channel_id = channel_id.to_string();
+        match result {
+            Ok(Some(state)) => {
+                map.insert(channel_id.clone(), state.clone());
+                // Notify waiters that the channel was updated
+                if let Some(notify) = self.notifiers.lock().unwrap().get(&channel_id) {
+                    notify.notify_waiters();
+                }
+                Box::pin(async move { Ok(Some(state)) })
+            }
+            Ok(None) => {
+                map.remove(&channel_id);
+                Box::pin(async { Ok(None) })
+            }
+            Err(e) => Box::pin(async { Err(e) }),
+        }
+    }
+
+    fn wait_for_update(
+        &self,
+        channel_id: &str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let notify = self
+            .notifiers
+            .lock()
+            .unwrap()
+            .entry(channel_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        Box::pin(async move {
+            notify.notified().await;
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::traits::ErrorCode;
+
+    fn test_channel_state(channel_id: &str) -> ChannelState {
+        ChannelState {
+            channel_id: channel_id.to_string(),
+            chain_id: 42431,
+            escrow_contract: "0x5555555555555555555555555555555555555555"
+                .parse()
+                .unwrap(),
+            payer: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            payee: "0x2222222222222222222222222222222222222222"
+                .parse()
+                .unwrap(),
+            token: "0x3333333333333333333333333333333333333333"
+                .parse()
+                .unwrap(),
+            authorized_signer: "0x4444444444444444444444444444444444444444"
+                .parse()
+                .unwrap(),
+            deposit: 100_000,
+            settled_on_chain: 0,
+            highest_voucher_amount: 0,
+            highest_voucher_signature: None,
+            spent: 0,
+            units: 0,
+            finalized: false,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_in_memory_store_insert_and_get() {
+        let store = InMemoryChannelStore::new();
+        let state = test_channel_state("0xchannel1");
+        store.insert("0xchannel1", state.clone());
+
+        let retrieved = store.get_channel_sync("0xchannel1");
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().deposit, 100_000);
+
+        assert!(store.get_channel_sync("0xnonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_update() {
+        let store = InMemoryChannelStore::new();
+        let state = test_channel_state("0xchannel1");
+        store.insert("0xchannel1", state);
+
+        let updated = store
+            .update_channel(
+                "0xchannel1",
+                Box::new(|current| {
+                    let mut s = current.unwrap();
+                    s.highest_voucher_amount = 5000;
+                    Ok(Some(s))
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.unwrap().highest_voucher_amount, 5000);
+        assert_eq!(
+            store.get_channel_sync("0xchannel1").unwrap().highest_voucher_amount,
+            5000
+        );
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_update_nonexistent() {
+        let store = InMemoryChannelStore::new();
+
+        let result = store
+            .update_channel(
+                "0xmissing",
+                Box::new(|current| {
+                    assert!(current.is_none());
+                    Ok(None)
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_deduct_from_channel_success() {
+        let store = InMemoryChannelStore::new();
+        let mut state = test_channel_state("0xchannel1");
+        state.highest_voucher_amount = 10_000;
+        state.spent = 0;
+        store.insert("0xchannel1", state);
+
+        let result = deduct_from_channel(&store, "0xchannel1", 3_000).await;
+        assert!(result.is_ok());
+        let updated = result.unwrap();
+        assert_eq!(updated.spent, 3_000);
+        assert_eq!(updated.units, 1);
+    }
+
+    #[tokio::test]
+    async fn test_deduct_from_channel_insufficient() {
+        let store = InMemoryChannelStore::new();
+        let mut state = test_channel_state("0xchannel1");
+        state.highest_voucher_amount = 10_000;
+        state.spent = 9_000;
+        store.insert("0xchannel1", state);
+
+        let result = deduct_from_channel(&store, "0xchannel1", 5_000).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InsufficientBalance));
+    }
+
+    #[tokio::test]
+    async fn test_deduct_from_channel_not_found() {
+        let store = InMemoryChannelStore::new();
+        let result = deduct_from_channel(&store, "0xmissing", 1_000).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::ChannelNotFound));
+    }
+
+    #[test]
+    fn test_parse_channel_id_valid() {
+        let id = "0xabababababababababababababababababababababababababababababababab";
+        // 32 bytes = 64 hex chars + 0x prefix
+        let padded = format!(
+            "0x{}",
+            "ab".repeat(32)
+        );
+        let result = SessionMethod::<()>::parse_channel_id(&padded);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_channel_id_invalid() {
+        let result = SessionMethod::<()>::parse_channel_id("not-a-hex");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_signature_valid() {
+        let sig_hex = format!("0x{}", "ab".repeat(65));
+        let result = SessionMethod::<()>::parse_signature(&sig_hex);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 65);
+    }
+
+    #[test]
+    fn test_parse_signature_no_prefix() {
+        let sig_hex = "ab".repeat(65);
+        let result = SessionMethod::<()>::parse_signature(&sig_hex);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_signature_invalid() {
+        let result = SessionMethod::<()>::parse_signature("not-hex!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_channel_state_clone() {
+        let state = test_channel_state("0xchannel1");
+        let cloned = state.clone();
+        assert_eq!(cloned.channel_id, "0xchannel1");
+        assert_eq!(cloned.deposit, 100_000);
+    }
+
+    #[test]
+    fn test_session_method_config() {
+        let config = SessionMethodConfig {
+            escrow_contract: "0x5555555555555555555555555555555555555555"
+                .parse()
+                .unwrap(),
+            chain_id: 42431,
+            min_voucher_delta: 100,
+        };
+        assert_eq!(config.chain_id, 42431);
+        assert_eq!(config.min_voucher_delta, 100);
+    }
+}

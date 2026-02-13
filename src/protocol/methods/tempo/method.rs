@@ -532,6 +532,27 @@ where
     }
 }
 
+impl<P> crate::protocol::traits::SessionMethod for ChargeMethod<P>
+where
+    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
+{
+    fn method(&self) -> &str {
+        METHOD_NAME
+    }
+
+    fn verify_session(
+        &self,
+        _credential: &PaymentCredential,
+        _request: &crate::protocol::intents::SessionRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        async {
+            Err(VerificationError::new(
+                "Session verification not yet implemented — requires on-chain channel state lookup",
+            ))
+        }
+    }
+}
+
 impl<P> ChargeMethodTrait for ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
@@ -581,15 +602,22 @@ where
                 )));
             }
 
-            if credential.payload.is_hash() {
+            let charge_payload = credential.charge_payload().map_err(|e| {
+                VerificationError::with_code(
+                    format!("Expected charge payload: {}", e),
+                    crate::protocol::traits::ErrorCode::InvalidCredential,
+                )
+            })?;
+
+            if charge_payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
-                this.verify_hash(credential.payload.tx_hash().unwrap(), &request)
+                this.verify_hash(charge_payload.tx_hash().unwrap(), &request)
                     .await
             } else {
                 // Client sent signed transaction, validate and broadcast it
                 let tx_hash = this
                     .broadcast_transaction(
-                        credential.payload.signed_tx().unwrap(),
+                        charge_payload.signed_tx().unwrap(),
                         &request,
                         expected_chain_id,
                     )

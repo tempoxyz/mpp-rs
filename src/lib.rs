@@ -27,6 +27,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod error;
 pub mod protocol;
 pub mod utils;
+pub mod expires;
 
 #[cfg(feature = "evm")]
 pub mod evm;
@@ -46,11 +47,14 @@ pub mod tempo;
 pub use error::{MppError, Result};
 
 // RFC 9457 Problem Details
-pub use error::{PaymentError, PaymentErrorDetails, PROBLEM_TYPE_BASE};
+pub use error::{
+    PaymentError, PaymentErrorDetails, CORE_PROBLEM_TYPE_BASE, STREAM_PROBLEM_TYPE_BASE,
+};
 
 // Core protocol types
 pub use protocol::core::{
-    ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt, ReceiptStatus,
+    compute_challenge_id, ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload,
+    Receipt, ReceiptStatus,
 };
 
 // Header parsing/formatting
@@ -67,7 +71,7 @@ pub use protocol::core::{
 };
 
 // Intent types
-pub use protocol::intents::ChargeRequest;
+pub use protocol::intents::{ChargeRequest, SessionRequest};
 
 // ==================== Alloy Re-exports ====================
 

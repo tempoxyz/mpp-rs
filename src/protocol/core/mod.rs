@@ -71,7 +71,10 @@ pub mod headers;
 pub mod types;
 
 // Re-export all public types
-pub use challenge::{ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt};
+pub use challenge::{
+    compute_challenge_id, ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload,
+    Receipt,
+};
 pub use headers::{
     format_authorization, format_receipt, format_www_authenticate, format_www_authenticate_many,
     parse_authorization, parse_receipt, parse_www_authenticate, parse_www_authenticate_all,

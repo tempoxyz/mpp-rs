@@ -488,8 +488,9 @@ mod tests {
             parsed.source,
             Some("did:pkh:eip155:42431:0x123".to_string())
         );
-        assert_eq!(parsed.payload.signed_tx(), Some("0xabc"));
-        assert_eq!(parsed.payload.payload_type(), PayloadType::Transaction);
+        let charge_payload: PaymentPayload = parsed.charge_payload().unwrap();
+        assert_eq!(charge_payload.signed_tx(), Some("0xabc"));
+        assert_eq!(charge_payload.payload_type(), PayloadType::Transaction);
     }
 
     #[test]
@@ -499,7 +500,6 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc123".to_string(),
-            error: None,
         };
 
         let header = format_receipt(&receipt).unwrap();

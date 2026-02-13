@@ -1,0 +1,507 @@
+//! Tempo session payment provider.
+//!
+//! Implements `PaymentProvider` for the session intent, providing automatic
+//! channel lifecycle management: open on first request, voucher on subsequent
+//! requests, cumulative amount tracking, and channel recovery from on-chain state.
+//!
+//! Ported from the TypeScript SDK's `Session.ts`.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use alloy::primitives::{Address, B256};
+
+use super::channel_ops::{
+    ChannelEntry, OpenPayloadOptions, build_credential, create_open_payload,
+    create_voucher_payload, resolve_chain_id, resolve_escrow, try_recover_channel,
+};
+use super::provider::PaymentProvider;
+use crate::error::MppError;
+use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::intents::SessionRequest;
+use crate::protocol::methods::tempo::session::TempoSessionExt;
+
+/// Tempo session provider with automatic channel management.
+///
+/// Manages the full channel lifecycle (open, voucher, close) automatically.
+/// Channels are tracked in an internal registry keyed by `payee:currency:escrow`.
+///
+/// # Examples
+///
+/// ```ignore
+/// use mpay::client::TempoSessionProvider;
+/// use mpay::PrivateKeySigner;
+///
+/// let signer = PrivateKeySigner::random();
+/// let provider = TempoSessionProvider::new(
+///     signer,
+///     "https://rpc.moderato.tempo.xyz",
+/// )?;
+///
+/// // First call opens a channel, subsequent calls send vouchers
+/// let credential = provider.pay(&challenge).await?;
+/// ```
+#[derive(Clone)]
+pub struct TempoSessionProvider {
+    signer: alloy_signer_local::PrivateKeySigner,
+    rpc_url: reqwest::Url,
+    /// Escrow contract address override. If None, resolved from challenge or defaults.
+    escrow_contract: Option<Address>,
+    /// Address authorized to sign vouchers. Defaults to signer address.
+    authorized_signer: Option<Address>,
+    /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`.
+    max_deposit: Option<u128>,
+    /// Default deposit in atomic units when no suggestedDeposit is available.
+    default_deposit: Option<u128>,
+    /// Channel registry: key is `payee:currency:escrow` (lowercase).
+    channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
+    /// Maps channel ID hex → channel key for reverse lookup.
+    channel_id_to_key: Arc<Mutex<HashMap<String, String>>>,
+    /// Optional callback for channel state changes.
+    on_channel_update: Option<Arc<dyn Fn(&ChannelEntry) + Send + Sync>>,
+}
+
+impl TempoSessionProvider {
+    /// Create a new Tempo session provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC URL is invalid.
+    pub fn new(
+        signer: alloy_signer_local::PrivateKeySigner,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
+        let url = rpc_url
+            .as_ref()
+            .parse()
+            .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?;
+        Ok(Self {
+            signer,
+            rpc_url: url,
+            escrow_contract: None,
+            authorized_signer: None,
+            max_deposit: None,
+            default_deposit: None,
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
+            on_channel_update: None,
+        })
+    }
+
+    /// Set the escrow contract address override.
+    pub fn with_escrow_contract(mut self, addr: Address) -> Self {
+        self.escrow_contract = Some(addr);
+        self
+    }
+
+    /// Set the authorized signer address (for delegated voucher signing).
+    pub fn with_authorized_signer(mut self, addr: Address) -> Self {
+        self.authorized_signer = Some(addr);
+        self
+    }
+
+    /// Set the maximum deposit in atomic units.
+    pub fn with_max_deposit(mut self, amount: u128) -> Self {
+        self.max_deposit = Some(amount);
+        self
+    }
+
+    /// Set the default deposit in atomic units.
+    pub fn with_default_deposit(mut self, amount: u128) -> Self {
+        self.default_deposit = Some(amount);
+        self
+    }
+
+    /// Set a callback for channel state changes.
+    pub fn with_on_channel_update(
+        mut self,
+        callback: impl Fn(&ChannelEntry) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_channel_update = Some(Arc::new(callback));
+        self
+    }
+
+    /// Get a reference to the signer.
+    pub fn signer(&self) -> &alloy_signer_local::PrivateKeySigner {
+        &self.signer
+    }
+
+    /// Get the RPC URL.
+    pub fn rpc_url(&self) -> &reqwest::Url {
+        &self.rpc_url
+    }
+
+    /// Get a snapshot of the current channel registry.
+    pub fn channels(&self) -> HashMap<String, ChannelEntry> {
+        self.channels.lock().unwrap().clone()
+    }
+
+    fn notify_update(&self, entry: &ChannelEntry) {
+        if let Some(ref cb) = self.on_channel_update {
+            cb(entry);
+        }
+    }
+
+    fn channel_key(payee: &Address, currency: &Address, escrow: &Address) -> String {
+        format!(
+            "{}:{}:{}",
+            format!("{}", payee).to_lowercase(),
+            format!("{}", currency).to_lowercase(),
+            format!("{}", escrow).to_lowercase()
+        )
+    }
+
+    fn resolve_deposit(
+        &self,
+        suggested_deposit: Option<&str>,
+    ) -> Result<u128, MppError> {
+        let suggested = suggested_deposit.and_then(|s| s.parse::<u128>().ok());
+
+        match (suggested, self.max_deposit, self.default_deposit) {
+            // Both suggested and max: use the smaller
+            (Some(s), Some(max), _) => Ok(s.min(max)),
+            // Only suggested
+            (Some(s), None, _) => Ok(s),
+            // Only max
+            (None, Some(max), _) => Ok(max),
+            // Only default
+            (None, None, Some(def)) => Ok(def),
+            // Nothing
+            (None, None, None) => Err(MppError::InvalidConfig(
+                "No deposit amount available. Set `default_deposit`, `max_deposit`, or ensure the server challenge includes `suggestedDeposit`.".to_string(),
+            )),
+        }
+    }
+}
+
+impl PaymentProvider for TempoSessionProvider {
+    fn supports(&self, method: &str, intent: &str) -> bool {
+        method == "tempo" && intent == "session"
+    }
+
+    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        use alloy::providers::ProviderBuilder;
+        use tempo_alloy::TempoNetwork;
+
+        let chain_id = resolve_chain_id(challenge);
+        let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;
+
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .map_err(|e| MppError::InvalidConfig(format!("failed to decode session request: {}", e)))?;
+
+        let payee: Address = session_req
+            .recipient
+            .as_deref()
+            .ok_or_else(|| MppError::InvalidConfig("session challenge missing recipient".to_string()))?
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid recipient address".to_string()))?;
+
+        let currency: Address = session_req
+            .currency
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
+
+        let amount: u128 = session_req.parse_amount()?;
+        let payer = self.signer.address();
+        let key = Self::channel_key(&payee, &currency, &escrow_contract);
+
+        // Check if we already have a channel
+        let existing = self.channels.lock().unwrap().get(&key).cloned();
+
+        if let Some(mut entry) = existing {
+            if entry.opened {
+                // Increment cumulative and sign a voucher
+                entry.cumulative_amount += amount;
+
+                let payload = create_voucher_payload(
+                    &self.signer,
+                    entry.channel_id,
+                    entry.cumulative_amount,
+                    escrow_contract,
+                    chain_id,
+                )
+                .await?;
+
+                // Update the registry
+                self.channels.lock().unwrap().insert(key, entry.clone());
+                self.notify_update(&entry);
+
+                return Ok(build_credential(challenge, payload, chain_id, payer));
+            }
+        }
+
+        // Try to recover a channel from on-chain state if suggested
+        let suggested_channel_id = session_req.channel_id();
+        if let Some(ref cid_str) = suggested_channel_id {
+            if let Ok(cid) = cid_str.parse::<B256>() {
+                let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+                    .connect_http(self.rpc_url.clone());
+
+                if let Some(mut recovered) = try_recover_channel(
+                    &provider,
+                    escrow_contract,
+                    cid,
+                    chain_id,
+                )
+                .await
+                {
+                    // Start from recovered settled amount + request amount
+                    recovered.cumulative_amount += amount;
+
+                    let payload = create_voucher_payload(
+                        &self.signer,
+                        recovered.channel_id,
+                        recovered.cumulative_amount,
+                        escrow_contract,
+                        chain_id,
+                    )
+                    .await?;
+
+                    self.channel_id_to_key
+                        .lock()
+                        .unwrap()
+                        .insert(format!("{}", recovered.channel_id), key.clone());
+                    self.channels.lock().unwrap().insert(key, recovered.clone());
+                    self.notify_update(&recovered);
+
+                    return Ok(build_credential(challenge, payload, chain_id, payer));
+                }
+            }
+        }
+
+        // No existing channel — open a new one
+        let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
+
+        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_http(self.rpc_url.clone());
+
+        let (entry, payload) = create_open_payload(
+            &provider,
+            &self.signer,
+            payer,
+            OpenPayloadOptions {
+                authorized_signer: self.authorized_signer,
+                escrow_contract,
+                payee,
+                currency,
+                deposit,
+                initial_amount: amount,
+                chain_id,
+                fee_payer: session_req.fee_payer(),
+            },
+        )
+        .await?;
+
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(format!("{}", entry.channel_id), key.clone());
+        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.notify_update(&entry);
+
+        Ok(build_credential(challenge, payload, chain_id, payer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_signer_local::PrivateKeySigner;
+
+    #[test]
+    fn test_session_provider_new() {
+        let signer = PrivateKeySigner::random();
+        let provider =
+            TempoSessionProvider::new(signer.clone(), "https://rpc.moderato.tempo.xyz").unwrap();
+
+        assert_eq!(
+            provider.rpc_url().as_str(),
+            "https://rpc.moderato.tempo.xyz/"
+        );
+        assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn test_session_provider_invalid_url() {
+        let signer = PrivateKeySigner::random();
+        let result = TempoSessionProvider::new(signer, "not a url");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_session_provider_supports() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert!(provider.supports("tempo", "session"));
+        assert!(!provider.supports("tempo", "charge"));
+        assert!(!provider.supports("stripe", "session"));
+    }
+
+    #[test]
+    fn test_session_provider_builder() {
+        let signer = PrivateKeySigner::random();
+        let escrow: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let auth_signer: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
+
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_escrow_contract(escrow)
+            .with_authorized_signer(auth_signer)
+            .with_max_deposit(1_000_000)
+            .with_default_deposit(500_000);
+
+        assert_eq!(provider.escrow_contract, Some(escrow));
+        assert_eq!(provider.authorized_signer, Some(auth_signer));
+        assert_eq!(provider.max_deposit, Some(1_000_000));
+        assert_eq!(provider.default_deposit, Some(500_000));
+    }
+
+    #[test]
+    fn test_resolve_deposit_suggested_and_max() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_max_deposit(5000);
+
+        // suggested < max → use suggested
+        assert_eq!(provider.resolve_deposit(Some("3000")).unwrap(), 3000);
+        // suggested > max → use max
+        assert_eq!(provider.resolve_deposit(Some("8000")).unwrap(), 5000);
+    }
+
+    #[test]
+    fn test_resolve_deposit_suggested_only() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert_eq!(provider.resolve_deposit(Some("3000")).unwrap(), 3000);
+    }
+
+    #[test]
+    fn test_resolve_deposit_max_only() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_max_deposit(5000);
+
+        assert_eq!(provider.resolve_deposit(None).unwrap(), 5000);
+    }
+
+    #[test]
+    fn test_resolve_deposit_default_only() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_default_deposit(2000);
+
+        assert_eq!(provider.resolve_deposit(None).unwrap(), 2000);
+    }
+
+    #[test]
+    fn test_resolve_deposit_none() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert!(provider.resolve_deposit(None).is_err());
+    }
+
+    #[test]
+    fn test_channel_key_format() {
+        let payee: Address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
+        let currency: Address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".parse().unwrap();
+        let escrow: Address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".parse().unwrap();
+
+        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow);
+        // Should be lowercase
+        assert_eq!(key, key.to_lowercase());
+        // Should contain all three addresses separated by colons
+        assert_eq!(key.matches(':').count(), 2);
+    }
+
+    #[test]
+    fn test_channels_snapshot() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        // Initially empty
+        assert!(provider.channels().is_empty());
+
+        // Insert a channel
+        let entry = ChannelEntry {
+            channel_id: B256::repeat_byte(0xAB),
+            salt: B256::ZERO,
+            cumulative_amount: 1000,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("test-key".to_string(), entry);
+
+        assert_eq!(provider.channels().len(), 1);
+    }
+
+    #[test]
+    fn test_on_channel_update_callback() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let signer = PrivateKeySigner::random();
+        let counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_on_channel_update(move |_entry| {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+
+        let entry = ChannelEntry {
+            channel_id: B256::ZERO,
+            salt: B256::ZERO,
+            cumulative_amount: 0,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+
+        provider.notify_update(&entry);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        provider.notify_update(&entry);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_session_provider_clone() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_max_deposit(5000);
+
+        let cloned = provider.clone();
+        assert!(cloned.supports("tempo", "session"));
+        assert_eq!(cloned.max_deposit, Some(5000));
+
+        // Cloned provider shares the same channel registry (Arc)
+        let entry = ChannelEntry {
+            channel_id: B256::ZERO,
+            salt: B256::ZERO,
+            cumulative_amount: 0,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("key".to_string(), entry);
+        assert_eq!(cloned.channels().len(), 1);
+    }
+}

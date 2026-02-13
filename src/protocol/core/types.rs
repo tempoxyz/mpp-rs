@@ -122,6 +122,11 @@ impl IntentName {
         self.0.eq_ignore_ascii_case("authorize")
     }
 
+    /// Check if this is the "session" intent.
+    pub fn is_session(&self) -> bool {
+        self.0.eq_ignore_ascii_case("session")
+    }
+
     /// Check if this is the "subscription" intent.
     pub fn is_subscription(&self) -> bool {
         self.0.eq_ignore_ascii_case("subscription")

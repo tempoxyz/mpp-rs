@@ -29,8 +29,9 @@
 
 mod amount;
 mod mpay;
+pub mod sse;
 
-pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
+pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};
 pub use mpay::Mpay;
 
@@ -40,6 +41,13 @@ pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::{
     TempoChargeExt, TempoMethodDetails, CHAIN_ID, METHOD_NAME,
+};
+
+#[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::session_method::{
+    SessionMethod as TempoSessionMethod,
+    SessionMethodConfig,
+    InMemoryChannelStore as SessionChannelStore,
 };
 
 // ==================== Simple API ====================
@@ -93,6 +101,19 @@ impl TempoBuilder {
         self.decimals = d;
         self
     }
+}
+
+/// Options for [`Mpay::session_challenge_with_details()`].
+#[derive(Debug, Default)]
+pub struct SessionChallengeOptions<'a> {
+    /// Suggested deposit amount in base units.
+    pub suggested_deposit: Option<&'a str>,
+    /// Enable fee sponsorship.
+    pub fee_payer: bool,
+    /// Human-readable description.
+    pub description: Option<&'a str>,
+    /// Custom expiration (ISO 8601). Default: none.
+    pub expires: Option<&'a str>,
 }
 
 /// Options for [`Mpay::charge_with_options()`].

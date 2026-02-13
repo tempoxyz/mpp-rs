@@ -24,15 +24,31 @@
 //! }
 //! ```
 
-pub use crate::protocol::intents::ChargeRequest;
+pub use crate::protocol::intents::{ChargeRequest, SessionRequest};
 pub use crate::protocol::methods::tempo::{
-    Call, SignatureType, TempoChargeExt, TempoMethodDetails, TempoTransaction,
-    TempoTransactionRequest, CHAIN_ID, DEFAULT_EXPIRES_MINUTES, DEFAULT_RPC_URL, METHOD_NAME,
-    MODERATO_CHAIN_ID, TEMPO_SEND_TRANSACTION_METHOD, TEMPO_TX_TYPE_ID,
+    Call, SessionCredentialPayload, SignatureType, TempoChargeExt, TempoMethodDetails,
+    TempoSessionExt, TempoSessionMethodDetails, TempoTransaction, TempoTransactionRequest,
+    CHAIN_ID, DEFAULT_EXPIRES_MINUTES, DEFAULT_RPC_URL, METHOD_NAME, MODERATO_CHAIN_ID,
+    TEMPO_SEND_TRANSACTION_METHOD, TEMPO_TX_TYPE_ID,
+};
+
+#[cfg(feature = "evm")]
+pub use crate::protocol::methods::tempo::{
+    compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION,
 };
 
 #[cfg(feature = "server")]
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 
+#[cfg(feature = "server")]
+pub use crate::protocol::methods::tempo::session_method::{
+    SessionMethod as TempoSessionMethod,
+    SessionMethodConfig,
+    InMemoryChannelStore as SessionChannelStore,
+};
+
 #[cfg(feature = "client")]
 pub use crate::client::TempoProvider;
+
+#[cfg(feature = "client")]
+pub use crate::client::{ChannelEntry, TempoSessionProvider};

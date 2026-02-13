@@ -26,5 +26,7 @@
 //! ```
 
 pub mod charge;
+pub mod session;
 
 pub use charge::ChargeRequest;
+pub use session::SessionRequest;
