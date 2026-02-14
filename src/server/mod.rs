@@ -29,6 +29,7 @@
 
 mod amount;
 mod mpp;
+#[cfg(feature = "tempo")]
 pub mod sse;
 
 #[cfg(feature = "tower")]
