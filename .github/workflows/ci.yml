@@ -39,12 +39,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-hack
       - run: cargo test --all-features
-      - run: cargo test --no-default-features
-      - run: cargo test --features client
-      - run: cargo test --features server
-      - run: cargo test --features evm
-      - run: cargo test --features tempo
-      - run: cargo test --features utils
-      - run: cargo test --features middleware
-      - run: cargo test --features tower
+      - run: cargo hack check --each-feature --no-dev-deps
