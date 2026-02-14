@@ -98,5 +98,5 @@ pub use alloy_signer_local::PrivateKeySigner;
 #[cfg(feature = "evm")]
 pub use alloy::primitives::{Address, U256};
 
-#[cfg(feature = "server")]
+#[cfg(feature = "tempo")]
 pub use alloy::providers::{ProviderBuilder, RootProvider};

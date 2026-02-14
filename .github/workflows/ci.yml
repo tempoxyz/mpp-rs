@@ -33,26 +33,18 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-features --verbose
-      - run: cargo test --all-features --verbose
-
-  test-features:
-    name: Test Feature Combinations
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-default-features --verbose
-      - run: cargo test --features evm --verbose
-      - run: cargo test --features tempo --verbose
-      - run: cargo test --features utils --verbose
+      - run: cargo test --all-features
+      - run: cargo test --no-default-features
+      - run: cargo test --features client
+      - run: cargo test --features server
+      - run: cargo test --features evm
+      - run: cargo test --features tempo
+      - run: cargo test --features utils
+      - run: cargo test --features middleware
+      - run: cargo test --features tower
