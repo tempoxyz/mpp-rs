@@ -209,9 +209,7 @@ pub fn parse_event(raw: &str) -> Option<SseEvent> {
 /// assert!(!is_event_stream("application/json"));
 /// ```
 pub fn is_event_stream(content_type: &str) -> bool {
-    content_type
-        .to_lowercase()
-        .starts_with("text/event-stream")
+    content_type.to_lowercase().starts_with("text/event-stream")
 }
 
 // ---------------------------------------------------------------------------
@@ -374,13 +372,8 @@ mod tests {
 
     #[test]
     fn test_format_receipt_event() {
-        let mut receipt = StreamReceipt::new(
-            "2025-01-01T00:00:00Z",
-            "ch-1",
-            "0xabc",
-            "1000000",
-            "500000",
-        );
+        let mut receipt =
+            StreamReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         let event = format_receipt_event(&receipt);
         assert!(event.starts_with("event: payment-receipt\ndata: "));
@@ -478,10 +471,7 @@ mod tests {
     #[test]
     fn test_parse_event_unknown_type() {
         let raw = "event: custom-type\ndata: fallback\n\n";
-        assert_eq!(
-            parse_event(raw),
-            Some(SseEvent::Message("fallback".into()))
-        );
+        assert_eq!(parse_event(raw), Some(SseEvent::Message("fallback".into())));
     }
 
     #[test]
@@ -510,13 +500,8 @@ mod tests {
 
     #[test]
     fn test_stream_receipt_new() {
-        let mut receipt = StreamReceipt::new(
-            "2025-01-01T00:00:00Z",
-            "ch-1",
-            "0xabc",
-            "1000000",
-            "500000",
-        );
+        let mut receipt =
+            StreamReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         receipt.tx_hash = Some("0xtx".into());
         assert_eq!(receipt.method, "tempo");
@@ -532,13 +517,8 @@ mod tests {
 
     #[test]
     fn test_stream_receipt_serialization() {
-        let mut receipt = StreamReceipt::new(
-            "2025-01-01T00:00:00Z",
-            "ch-1",
-            "0xabc",
-            "1000000",
-            "500000",
-        );
+        let mut receipt =
+            StreamReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         let json = serde_json::to_string(&receipt).unwrap();
         assert!(json.contains("\"challengeId\":\"ch-1\""));

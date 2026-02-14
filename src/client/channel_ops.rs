@@ -22,8 +22,16 @@ use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
 /// Default escrow contract addresses per chain ID.
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
     match chain_id {
-        4217 => Some("0x0901aED692C755b870F9605E56BAA66c35BEfF69".parse().unwrap()),
-        42431 => Some("0x542831e3E4Ace07559b7C8787395f4Fb99F70787".parse().unwrap()),
+        4217 => Some(
+            "0x0901aED692C755b870F9605E56BAA66c35BEfF69"
+                .parse()
+                .unwrap(),
+        ),
+        42431 => Some(
+            "0x542831e3E4Ace07559b7C8787395f4Fb99F70787"
+                .parse()
+                .unwrap(),
+        ),
         _ => None,
     }
 }
@@ -102,7 +110,14 @@ pub async fn create_voucher_payload(
     escrow_contract: Address,
     chain_id: u64,
 ) -> Result<SessionCredentialPayload, MppError> {
-    let sig = sign_voucher(signer, channel_id, cumulative_amount, escrow_contract, chain_id).await?;
+    let sig = sign_voucher(
+        signer,
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )
+    .await?;
 
     Ok(SessionCredentialPayload::Voucher {
         channel_id: format!("{}", channel_id),
@@ -119,7 +134,14 @@ pub async fn create_close_payload(
     escrow_contract: Address,
     chain_id: u64,
 ) -> Result<SessionCredentialPayload, MppError> {
-    let sig = sign_voucher(signer, channel_id, cumulative_amount, escrow_contract, chain_id).await?;
+    let sig = sign_voucher(
+        signer,
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )
+    .await?;
 
     Ok(SessionCredentialPayload::Close {
         channel_id: format!("{}", channel_id),
@@ -159,8 +181,8 @@ where
     S: Signer + Clone,
 {
     use alloy::sol;
-    use tempo_primitives::TempoTransaction;
     use tempo_primitives::transaction::Call;
+    use tempo_primitives::TempoTransaction;
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
@@ -246,9 +268,10 @@ where
 
     // Sign the transaction
     let sig_hash = tempo_tx.signature_hash();
-    let signature = signer.sign_hash(&sig_hash).await.map_err(|e| {
-        MppError::Http(format!("failed to sign open transaction: {}", e))
-    })?;
+    let signature = signer
+        .sign_hash(&sig_hash)
+        .await
+        .map_err(|e| MppError::Http(format!("failed to sign open transaction: {}", e)))?;
 
     let signed_tx = tempo_tx.into_signed(signature.into());
 
@@ -329,22 +352,22 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     use tempo_alloy::rpc::TempoTransactionRequest;
 
     let mut tx_req = TempoTransactionRequest::default();
-    tx_req.inner = tx_req
-        .inner
-        .to(escrow_contract)
-        .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
-            call_data,
-        )));
+    tx_req.inner =
+        tx_req
+            .inner
+            .to(escrow_contract)
+            .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
+                call_data,
+            )));
 
     let result = provider
         .call(tx_req)
         .await
         .map_err(|e| MppError::Http(format!("failed to read channel: {}", e)))?;
 
-    let decoded = <(Address, Address, Address, Address, u128, u128, u64, bool)>::abi_decode(
-        &result,
-    )
-    .map_err(|e| MppError::Http(format!("failed to decode channel data: {}", e)))?;
+    let decoded =
+        <(Address, Address, Address, Address, u128, u128, u64, bool)>::abi_decode(&result)
+            .map_err(|e| MppError::Http(format!("failed to decode channel data: {}", e)))?;
 
     Ok(OnChainChannel {
         payer: decoded.0,
@@ -436,7 +459,9 @@ mod tests {
             digest: None,
         };
 
-        let override_addr: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let override_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
         let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();
         assert_eq!(result, override_addr);
     }
@@ -543,7 +568,9 @@ mod tests {
             signature: "0xdef".to_string(),
         };
 
-        let addr: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
         let cred = build_credential(&challenge, payload, 42431, addr);
         assert!(cred.source.is_some());
         assert!(cred.source.unwrap().contains("42431"));
@@ -556,7 +583,9 @@ mod tests {
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xAB);
-        let escrow: Address = "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
 
         let payload = create_voucher_payload(&signer, channel_id, 1000, escrow, 42431)
             .await
@@ -583,7 +612,9 @@ mod tests {
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xCD);
-        let escrow: Address = "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
 
         let payload = create_close_payload(&signer, channel_id, 2000, escrow, 42431)
             .await

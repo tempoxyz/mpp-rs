@@ -23,10 +23,7 @@ use base64::Engine;
 ///
 /// assert_eq!(svc.id, "stripe");
 /// ```
-pub fn service(
-    api_key: &str,
-    configure: impl FnOnce(ServiceBuilder) -> ServiceBuilder,
-) -> Service {
+pub fn service(api_key: &str, configure: impl FnOnce(ServiceBuilder) -> ServiceBuilder) -> Service {
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{api_key}:"));
     configure(
         Service::new("stripe", "https://api.stripe.com")

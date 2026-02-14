@@ -9,6 +9,4 @@
 pub mod service;
 pub mod services;
 
-pub use service::{
-    Endpoint, PaidEndpoint, ProxyConfig, Route, Service, ServiceBuilder,
-};
+pub use service::{Endpoint, PaidEndpoint, ProxyConfig, Route, Service, ServiceBuilder};

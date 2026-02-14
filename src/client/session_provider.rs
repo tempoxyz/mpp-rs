@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, B256};
 
 use super::channel_ops::{
-    ChannelEntry, OpenPayloadOptions, build_credential, create_close_payload, create_open_payload,
-    create_voucher_payload, resolve_chain_id, resolve_escrow, try_recover_channel,
+    build_credential, create_close_payload, create_open_payload, create_voucher_payload,
+    resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry, OpenPayloadOptions,
 };
 use super::provider::PaymentProvider;
 use crate::error::MppError;
@@ -183,22 +183,25 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         required_cumulative: u128,
     ) -> Result<(), MppError> {
-        let challenge = self.last_challenge.lock().unwrap().clone()
-            .ok_or_else(|| MppError::InvalidConfig("no challenge available for voucher".into()))?;
+        let challenge =
+            self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
+                MppError::InvalidConfig("no challenge available for voucher".into())
+            })?;
 
         // Find the channel entry by channel ID
         let key = {
             let id_map = self.channel_id_to_key.lock().unwrap();
             id_map.get(channel_id_hex).cloned()
         };
-        let key = key.ok_or_else(|| MppError::InvalidConfig(
-            format!("no channel found for id {}", channel_id_hex),
-        ))?;
+        let key = key.ok_or_else(|| {
+            MppError::InvalidConfig(format!("no channel found for id {}", channel_id_hex))
+        })?;
 
         let mut entry = {
             let channels = self.channels.lock().unwrap();
             channels.get(&key).cloned()
-        }.ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        }
+        .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
 
         // Update cumulative to at least the required amount
         if required_cumulative > entry.cumulative_amount {
@@ -218,7 +221,8 @@ impl TempoSessionProvider {
         self.channels.lock().unwrap().insert(key, entry.clone());
         self.notify_update(&entry);
 
-        let credential = build_credential(&challenge, payload, entry.chain_id, self.signer.address());
+        let credential =
+            build_credential(&challenge, payload, entry.chain_id, self.signer.address());
         let auth_header = crate::protocol::core::format_authorization(&credential)?;
 
         let resp = client
@@ -319,10 +323,7 @@ impl TempoSessionProvider {
         Ok(receipt)
     }
 
-    fn resolve_deposit(
-        &self,
-        suggested_deposit: Option<&str>,
-    ) -> Result<u128, MppError> {
+    fn resolve_deposit(&self, suggested_deposit: Option<&str>) -> Result<u128, MppError> {
         let suggested = suggested_deposit.and_then(|s| s.parse::<u128>().ok());
 
         match (suggested, self.max_deposit, self.default_deposit) {
@@ -356,15 +357,16 @@ impl PaymentProvider for TempoSessionProvider {
         let chain_id = resolve_chain_id(challenge);
         let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;
 
-        let session_req: SessionRequest = challenge
-            .request
-            .decode()
-            .map_err(|e| MppError::InvalidConfig(format!("failed to decode session request: {}", e)))?;
+        let session_req: SessionRequest = challenge.request.decode().map_err(|e| {
+            MppError::InvalidConfig(format!("failed to decode session request: {}", e))
+        })?;
 
         let payee: Address = session_req
             .recipient
             .as_deref()
-            .ok_or_else(|| MppError::InvalidConfig("session challenge missing recipient".to_string()))?
+            .ok_or_else(|| {
+                MppError::InvalidConfig("session challenge missing recipient".to_string())
+            })?
             .parse()
             .map_err(|_| MppError::InvalidConfig("invalid recipient address".to_string()))?;
 
@@ -409,13 +411,8 @@ impl PaymentProvider for TempoSessionProvider {
                 let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
                     .connect_http(self.rpc_url.clone());
 
-                if let Some(mut recovered) = try_recover_channel(
-                    &provider,
-                    escrow_contract,
-                    cid,
-                    chain_id,
-                )
-                .await
+                if let Some(mut recovered) =
+                    try_recover_channel(&provider, escrow_contract, cid, chain_id).await
                 {
                     // Start from recovered settled amount + request amount
                     recovered.cumulative_amount += amount;
@@ -444,8 +441,8 @@ impl PaymentProvider for TempoSessionProvider {
         // No existing channel — open a new one
         let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
 
-        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_http(self.rpc_url.clone());
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
 
         let (entry, payload) = create_open_payload(
             &provider,
@@ -513,8 +510,12 @@ mod tests {
     #[test]
     fn test_session_provider_builder() {
         let signer = PrivateKeySigner::random();
-        let escrow: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
-        let auth_signer: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
+        let escrow: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let auth_signer: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
 
         let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
             .unwrap()
@@ -580,9 +581,15 @@ mod tests {
 
     #[test]
     fn test_channel_key_format() {
-        let payee: Address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".parse().unwrap();
-        let currency: Address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".parse().unwrap();
-        let escrow: Address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".parse().unwrap();
+        let payee: Address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap();
+        let currency: Address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            .parse()
+            .unwrap();
+        let escrow: Address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+            .parse()
+            .unwrap();
 
         let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow);
         // Should be lowercase

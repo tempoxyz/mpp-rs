@@ -88,6 +88,9 @@ pub struct McpPaymentErrorData {
     #[serde(rename = "httpStatus")]
     pub http_status: u16,
     pub challenges: Vec<PaymentChallenge>,
+    /// RFC 9457 Problem Details for rich error context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<crate::error::PaymentErrorDetails>,
 }
 
 // ==================== Server-side helpers ====================
@@ -109,6 +112,7 @@ pub fn payment_required_error(challenge: &PaymentChallenge) -> McpPaymentError {
         data: Some(McpPaymentErrorData {
             http_status: 402,
             challenges: vec![challenge.clone()],
+            problem: None,
         }),
     }
 }
@@ -255,7 +259,10 @@ mod tests {
         });
         let extracted = extract_credential(&meta).unwrap();
         assert_eq!(extracted.challenge.id, "ch_test_123");
-        assert_eq!(extracted.source.as_deref(), Some("did:pkh:eip155:42161:0xabc"));
+        assert_eq!(
+            extracted.source.as_deref(),
+            Some("did:pkh:eip155:42161:0xabc")
+        );
     }
 
     #[test]

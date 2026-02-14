@@ -264,9 +264,10 @@ impl PaymentChallenge {
     /// * `www_authenticate` - The WWW-Authenticate header value
     pub fn from_response(status_code: u16, www_authenticate: &str) -> crate::error::Result<Self> {
         if status_code != 402 {
-            return Err(crate::error::MppError::invalid_challenge_reason(
-                format!("Expected 402 status, got {}", status_code),
-            ));
+            return Err(crate::error::MppError::invalid_challenge_reason(format!(
+                "Expected 402 status, got {}",
+                status_code
+            )));
         }
         Self::from_header(www_authenticate)
     }
@@ -602,8 +603,9 @@ impl PaymentCredential {
     ///
     /// Returns `Ok` if the payload has the expected `type`/`signature`/`hash` structure.
     pub fn charge_payload(&self) -> crate::error::Result<PaymentPayload> {
-        serde_json::from_value(self.payload.clone())
-            .map_err(|e| crate::error::MppError::invalid_payload(format!("not a charge payload: {}", e)))
+        serde_json::from_value(self.payload.clone()).map_err(|e| {
+            crate::error::MppError::invalid_payload(format!("not a charge payload: {}", e))
+        })
     }
 
     /// Parse a PaymentCredential from an Authorization header value.
@@ -617,8 +619,12 @@ impl PaymentCredential {
     ///
     /// This is a generic accessor for method/intent-specific payload types.
     pub fn payload_as<T: serde::de::DeserializeOwned>(&self) -> crate::error::Result<T> {
-        serde_json::from_value(self.payload.clone())
-            .map_err(|e| crate::error::MppError::invalid_payload(format!("payload deserialization failed: {}", e)))
+        serde_json::from_value(self.payload.clone()).map_err(|e| {
+            crate::error::MppError::invalid_payload(format!(
+                "payload deserialization failed: {}",
+                e
+            ))
+        })
     }
 
     /// Create a DID for an EVM address.
@@ -812,10 +818,7 @@ mod tests {
     #[test]
     fn test_payment_credential_charge_payload() {
         let challenge = test_challenge();
-        let credential = PaymentCredential::new(
-            challenge.to_echo(),
-            PaymentPayload::hash("0xdef"),
-        );
+        let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdef"));
 
         let payload = credential.charge_payload().unwrap();
         assert!(payload.is_hash());
@@ -831,10 +834,7 @@ mod tests {
             "cumulativeAmount": "5000",
             "signature": "0xdef"
         });
-        let credential = PaymentCredential::new(
-            challenge.to_echo(),
-            payload_json.clone(),
-        );
+        let credential = PaymentCredential::new(challenge.to_echo(), payload_json.clone());
 
         assert_eq!(credential.payload, payload_json);
 
@@ -845,10 +845,8 @@ mod tests {
     #[test]
     fn test_payment_credential_payload_as() {
         let challenge = test_challenge();
-        let credential = PaymentCredential::new(
-            challenge.to_echo(),
-            PaymentPayload::transaction("0xabc"),
-        );
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
 
         let payload: PaymentPayload = credential.payload_as().unwrap();
         assert!(payload.is_transaction());
@@ -949,7 +947,15 @@ mod tests {
     #[test]
     fn test_challenge_verify_wrong_secret() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-        let id = compute_challenge_id("correct-secret", "api", "tempo", "charge", request.raw(), None, None);
+        let id = compute_challenge_id(
+            "correct-secret",
+            "api",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+        );
 
         let challenge = PaymentChallenge {
             id,
@@ -1078,8 +1084,24 @@ mod tests {
     fn test_compute_challenge_id_deterministic() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
 
-        let id1 = compute_challenge_id("secret", "api", "tempo", "charge", request.raw(), None, None);
-        let id2 = compute_challenge_id("secret", "api", "tempo", "charge", request.raw(), None, None);
+        let id1 = compute_challenge_id(
+            "secret",
+            "api",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+        );
+        let id2 = compute_challenge_id(
+            "secret",
+            "api",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+        );
 
         assert_eq!(id1, id2);
     }
@@ -1088,8 +1110,24 @@ mod tests {
     fn test_compute_challenge_id_different_secrets() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
 
-        let id1 = compute_challenge_id("secret-a", "api", "tempo", "charge", request.raw(), None, None);
-        let id2 = compute_challenge_id("secret-b", "api", "tempo", "charge", request.raw(), None, None);
+        let id1 = compute_challenge_id(
+            "secret-a",
+            "api",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+        );
+        let id2 = compute_challenge_id(
+            "secret-b",
+            "api",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+        );
 
         assert_ne!(id1, id2);
     }
@@ -1102,7 +1140,8 @@ mod tests {
         let id = compute_challenge_id(secret, "api", "tempo", "charge", request.raw(), None, None);
 
         // Build challenge with the valid HMAC ID but tampered request data
-        let tampered_request = Base64UrlJson::from_value(&serde_json::json!({"amount": "9999"})).unwrap();
+        let tampered_request =
+            Base64UrlJson::from_value(&serde_json::json!({"amount": "9999"})).unwrap();
         let challenge = PaymentChallenge {
             id,
             realm: "api".to_string(),
@@ -1120,7 +1159,8 @@ mod tests {
     #[test]
     fn test_challenge_new() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-        let challenge = PaymentChallenge::new("my-id", "api.example.com", "tempo", "charge", request);
+        let challenge =
+            PaymentChallenge::new("my-id", "api.example.com", "tempo", "charge", request);
         assert_eq!(challenge.id, "my-id");
         assert_eq!(challenge.realm, "api.example.com");
         assert_eq!(challenge.method.as_str(), "tempo");

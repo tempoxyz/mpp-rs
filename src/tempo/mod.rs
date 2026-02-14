@@ -45,10 +45,8 @@ pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 
 #[cfg(feature = "server")]
 pub use crate::protocol::methods::tempo::session_method::{
-    SessionMethod as TempoSessionMethod,
-    SessionMethodConfig,
-    InMemoryChannelStore as SessionChannelStore,
-    ChannelStore, ChannelState,
+    ChannelState, ChannelStore, InMemoryChannelStore as SessionChannelStore,
+    SessionMethod as TempoSessionMethod, SessionMethodConfig,
 };
 
 #[cfg(feature = "client")]

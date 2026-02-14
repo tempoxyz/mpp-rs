@@ -453,13 +453,11 @@ mod tests {
         let parsed: SessionCredentialPayload = serde_json::from_str(topup_json).unwrap();
         assert!(matches!(parsed, SessionCredentialPayload::TopUp { .. }));
 
-        let voucher_json =
-            r#"{"action":"voucher","channelId":"0xabc","cumulativeAmount":"300","signature":"0xsig"}"#;
+        let voucher_json = r#"{"action":"voucher","channelId":"0xabc","cumulativeAmount":"300","signature":"0xsig"}"#;
         let parsed: SessionCredentialPayload = serde_json::from_str(voucher_json).unwrap();
         assert!(matches!(parsed, SessionCredentialPayload::Voucher { .. }));
 
-        let close_json =
-            r#"{"action":"close","channelId":"0xabc","cumulativeAmount":"400","signature":"0xsig"}"#;
+        let close_json = r#"{"action":"close","channelId":"0xabc","cumulativeAmount":"400","signature":"0xsig"}"#;
         let parsed: SessionCredentialPayload = serde_json::from_str(close_json).unwrap();
         assert!(matches!(parsed, SessionCredentialPayload::Close { .. }));
     }

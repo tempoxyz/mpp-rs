@@ -147,15 +147,15 @@ impl PaymentProvider for TempoProvider {
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
         use tempo_alloy::TempoNetwork;
-        use tempo_primitives::TempoTransaction;
         use tempo_primitives::transaction::Call;
+        use tempo_primitives::TempoTransaction;
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
         let address = self.signer.address();
 
-        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .connect_http(self.rpc_url.clone());
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
 
         let actual_chain_id: u64 = provider
             .get_chain_id()
@@ -203,7 +203,9 @@ impl PaymentProvider for TempoProvider {
 
         use alloy::signers::SignerSync;
         let sig_hash = tempo_tx.signature_hash();
-        let signature = self.signer.sign_hash_sync(&sig_hash)
+        let signature = self
+            .signer
+            .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
         let signed_tx = tempo_tx.into_signed(signature.into());

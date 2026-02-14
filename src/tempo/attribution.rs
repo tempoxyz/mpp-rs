@@ -169,10 +169,7 @@ mod tests {
         let decoded = decode(&memo).unwrap();
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.server_fingerprint, fingerprint("api.example.com"));
-        assert_eq!(
-            decoded.client_fingerprint,
-            Some(fingerprint("my-app"))
-        );
+        assert_eq!(decoded.client_fingerprint, Some(fingerprint("my-app")));
     }
 
     #[test]

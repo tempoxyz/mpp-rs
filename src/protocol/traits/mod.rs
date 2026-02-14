@@ -268,10 +268,14 @@ impl From<VerificationError> for MppError {
             Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
             Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(Some(err.message)),
             Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(Some(err.message)),
-            Some(ErrorCode::InsufficientBalance) => MppError::InsufficientBalance(Some(err.message)),
+            Some(ErrorCode::InsufficientBalance) => {
+                MppError::InsufficientBalance(Some(err.message))
+            }
             Some(ErrorCode::InvalidPayload) => MppError::InvalidPayload(Some(err.message)),
             Some(ErrorCode::InvalidSignature) => MppError::InvalidSignature(Some(err.message)),
-            Some(ErrorCode::AmountExceedsDeposit) => MppError::AmountExceedsDeposit(Some(err.message)),
+            Some(ErrorCode::AmountExceedsDeposit) => {
+                MppError::AmountExceedsDeposit(Some(err.message))
+            }
             Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(Some(err.message)),
             Some(ErrorCode::CredentialMismatch)
             | Some(ErrorCode::InvalidAmount)
@@ -320,11 +324,11 @@ mod tests {
         // Verify IETF spec-compliant error codes (§8.2)
         assert_eq!(ErrorCode::Expired.spec_code(), "payment-expired");
         assert_eq!(ErrorCode::InvalidAmount.spec_code(), "payment-insufficient");
-        assert_eq!(ErrorCode::InvalidCredential.spec_code(), "malformed-credential");
         assert_eq!(
-            ErrorCode::ChainIdMismatch.spec_code(),
-            "method-unsupported"
+            ErrorCode::InvalidCredential.spec_code(),
+            "malformed-credential"
         );
+        assert_eq!(ErrorCode::ChainIdMismatch.spec_code(), "method-unsupported");
         assert_eq!(
             ErrorCode::TransactionFailed.spec_code(),
             "verification-failed"

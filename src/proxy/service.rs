@@ -73,8 +73,10 @@ pub struct ServiceBuilder {
 impl ServiceBuilder {
     /// Inject an `Authorization: Bearer {token}` header on upstream requests.
     pub fn bearer(mut self, token: impl Into<String>) -> Self {
-        self.headers
-            .insert("Authorization".to_string(), format!("Bearer {}", token.into()));
+        self.headers.insert(
+            "Authorization".to_string(),
+            format!("Bearer {}", token.into()),
+        );
         self
     }
 
@@ -117,10 +119,7 @@ const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD",
 fn parse_route_pattern(pattern: &str) -> (Option<String>, String) {
     let tokens: Vec<&str> = pattern.trim().split_whitespace().collect();
     if tokens.len() >= 2 && HTTP_METHODS.contains(&tokens[0].to_uppercase().as_str()) {
-        (
-            Some(tokens[0].to_uppercase()),
-            tokens[1..].join(" "),
-        )
+        (Some(tokens[0].to_uppercase()), tokens[1..].join(" "))
     } else {
         (None, pattern.trim().to_string())
     }
@@ -333,7 +332,8 @@ pub fn to_llms_txt(services: &[Service]) -> String {
     let mut lines = vec![
         "# API Proxy".to_string(),
         String::new(),
-        "> Paid API proxy powered by [Machine Payments Protocol](https://mpp.tempo.xyz).".to_string(),
+        "> Paid API proxy powered by [Machine Payments Protocol](https://mpp.tempo.xyz)."
+            .to_string(),
         String::new(),
         "For machine-readable service data, use `GET /services` (JSON).".to_string(),
         String::new(),
@@ -346,7 +346,11 @@ pub fn to_llms_txt(services: &[Service]) -> String {
     lines.push("## Services".to_string());
     lines.push(String::new());
     for s in services {
-        let free = s.routes.iter().filter(|r| matches!(r.endpoint, Endpoint::Free)).count();
+        let free = s
+            .routes
+            .iter()
+            .filter(|r| matches!(r.endpoint, Endpoint::Free))
+            .count();
         let paid = s.routes.len() - free;
         let mut parts = Vec::new();
         if paid > 0 {
@@ -355,7 +359,12 @@ pub fn to_llms_txt(services: &[Service]) -> String {
         if free > 0 {
             parts.push(format!("{free} free"));
         }
-        lines.push(format!("- [{}]({}): {}", s.id, s.base_url, parts.join(", ")));
+        lines.push(format!(
+            "- [{}]({}): {}",
+            s.id,
+            s.base_url,
+            parts.join(", ")
+        ));
     }
 
     for s in services {
@@ -427,7 +436,10 @@ mod tests {
         assert!(path_matches("/v1/chat/completions", "/v1/chat/completions"));
         assert!(!path_matches("/v1/chat/completions", "/v1/models"));
         assert!(path_matches("/v1/customers/:id", "/v1/customers/cus_123"));
-        assert!(!path_matches("/v1/customers/:id", "/v1/customers/cus_123/charges"));
+        assert!(!path_matches(
+            "/v1/customers/:id",
+            "/v1/customers/cus_123/charges"
+        ));
     }
 
     #[test]
@@ -536,7 +548,9 @@ mod tests {
             assert_eq!(v["id"], "openai");
         }
 
-        assert!(config.handle_discovery("GET", "/services/unknown").is_none());
+        assert!(config
+            .handle_discovery("GET", "/services/unknown")
+            .is_none());
     }
 
     #[test]
@@ -623,7 +637,9 @@ mod tests {
             services: vec![test_service()],
         };
 
-        assert!(config.handle_discovery("GET", "/api/proxy/services").is_some());
+        assert!(config
+            .handle_discovery("GET", "/api/proxy/services")
+            .is_some());
         assert!(config.handle_discovery("GET", "/services").is_none());
     }
 }

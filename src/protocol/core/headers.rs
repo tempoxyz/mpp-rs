@@ -66,14 +66,11 @@ fn strip_payment_scheme(header: &str) -> Option<&str> {
 /// assert!(extract_payment_scheme("Bearer token123").is_none());
 /// ```
 pub fn extract_payment_scheme(header: &str) -> Option<&str> {
-    header
-        .split(',')
-        .map(|s| s.trim())
-        .find(|s| {
-            s.len() >= 8
-                && s.get(..8)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("payment "))
-        })
+    header.split(',').map(|s| s.trim()).find(|s| {
+        s.len() >= 8
+            && s.get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("payment "))
+    })
 }
 
 /// Escape a string for use in a quoted-string header value.
@@ -362,10 +359,7 @@ pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
     })?;
 
     // Strip "Payment " prefix to get the token
-    let token = payment_part
-        .get(8..)
-        .unwrap_or("")
-        .trim();
+    let token = payment_part.get(8..).unwrap_or("").trim();
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
@@ -629,19 +623,14 @@ mod tests {
             parsed.challenge.expires,
             Some("2025-06-01T00:00:00Z".to_string())
         );
-        assert_eq!(
-            parsed.challenge.digest,
-            Some("sha-256=abc123".to_string())
-        );
+        assert_eq!(parsed.challenge.digest, Some("sha-256=abc123".to_string()));
     }
 
     #[test]
     fn test_credential_roundtrip_without_source() {
         let challenge = test_challenge();
-        let credential = PaymentCredential::new(
-            challenge.to_echo(),
-            PaymentPayload::transaction("0xabc"),
-        );
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
 
         let header = format_authorization(&credential).unwrap();
         let parsed = parse_authorization(&header).unwrap();

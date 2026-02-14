@@ -23,7 +23,7 @@ pub fn compute_channel_id(
     escrow_contract: alloy::primitives::Address,
     chain_id: u64,
 ) -> alloy::primitives::B256 {
-    use alloy::primitives::{U256, keccak256};
+    use alloy::primitives::{keccak256, U256};
     use alloy::sol_types::SolValue;
 
     let encoded = (
@@ -59,7 +59,7 @@ pub async fn sign_voucher(
     escrow_contract: alloy::primitives::Address,
     chain_id: u64,
 ) -> crate::error::Result<alloy::primitives::Bytes> {
-    use alloy::sol_types::{SolStruct, eip712_domain};
+    use alloy::sol_types::{eip712_domain, SolStruct};
 
     let domain = eip712_domain! {
         name: DOMAIN_NAME,
@@ -142,7 +142,14 @@ pub fn verify_voucher(
     }
 
     // Fall through to raw ECDSA signature recovery.
-    verify_voucher_ecdsa(escrow_contract, chain_id, channel_id, cumulative_amount, sig, expected_signer)
+    verify_voucher_ecdsa(
+        escrow_contract,
+        chain_id,
+        channel_id,
+        cumulative_amount,
+        sig,
+        expected_signer,
+    )
 }
 
 /// Verify a raw ECDSA voucher signature via EIP-712 recovery.
@@ -155,7 +162,7 @@ fn verify_voucher_ecdsa(
     signature_bytes: &[u8],
     expected_signer: alloy::primitives::Address,
 ) -> bool {
-    use alloy::sol_types::{SolStruct, eip712_domain};
+    use alloy::sol_types::{eip712_domain, SolStruct};
 
     let domain = eip712_domain! {
         name: DOMAIN_NAME,
@@ -191,14 +198,22 @@ mod tests {
     fn test_compute_channel_id_deterministic() {
         use alloy::primitives::{Address, B256};
 
-        let payer: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
-        let payee: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
-        let token: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
         let salt = B256::ZERO;
-        let authorized_signer: Address =
-            "0x4444444444444444444444444444444444444444".parse().unwrap();
-        let escrow_contract: Address =
-            "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let authorized_signer: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
         let chain_id = 42431u64;
 
         let id1 = compute_channel_id(
@@ -220,7 +235,10 @@ mod tests {
             chain_id,
         );
 
-        assert_eq!(id1, id2, "Same parameters should produce the same channel ID");
+        assert_eq!(
+            id1, id2,
+            "Same parameters should produce the same channel ID"
+        );
         assert_ne!(id1, B256::ZERO, "Channel ID should not be zero");
     }
 
@@ -229,14 +247,22 @@ mod tests {
     fn test_compute_channel_id_differs_for_different_params() {
         use alloy::primitives::{Address, B256};
 
-        let payer: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
-        let payee: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
-        let token: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
         let salt = B256::ZERO;
-        let authorized_signer: Address =
-            "0x4444444444444444444444444444444444444444".parse().unwrap();
-        let escrow_contract: Address =
-            "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let authorized_signer: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
 
         let id1 = compute_channel_id(
             payer,
@@ -257,7 +283,10 @@ mod tests {
             4217, // Different chain ID
         );
 
-        assert_ne!(id1, id2, "Different chain IDs should produce different channel IDs");
+        assert_ne!(
+            id1, id2,
+            "Different chain IDs should produce different channel IDs"
+        );
     }
 
     #[cfg(feature = "evm")]
@@ -270,8 +299,9 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xAB);
         let cumulative_amount = 1000u128;
-        let escrow_contract: Address =
-            "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
         let chain_id = 42431u64;
 
         let sig_bytes = sign_voucher(
@@ -309,7 +339,11 @@ mod tests {
             .recover_address_from_prehash(&signing_hash)
             .expect("should recover address");
 
-        assert_eq!(recovered, signer.address(), "Recovered address should match signer");
+        assert_eq!(
+            recovered,
+            signer.address(),
+            "Recovered address should match signer"
+        );
     }
 
     #[cfg(feature = "evm")]
@@ -322,8 +356,9 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xCD);
         let cumulative_amount = 5000u128;
-        let escrow_contract: Address =
-            "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
         let chain_id = 42431u64;
 
         let sig_bytes = sign_voucher(
@@ -399,7 +434,9 @@ mod tests {
     fn test_parse_keychain_user_address() {
         use alloy::primitives::Address;
 
-        let addr: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01".parse().unwrap();
+        let addr: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+            .parse()
+            .unwrap();
 
         // Valid keychain envelope: 0x03 + 20-byte address + 65-byte inner sig
         let mut envelope = vec![KEYCHAIN_TYPE_PREFIX];
@@ -419,13 +456,16 @@ mod tests {
         assert_eq!(parse_keychain_user_address(&wrong_prefix), None);
 
         // Too short to contain address
-        assert_eq!(parse_keychain_user_address(&[KEYCHAIN_TYPE_PREFIX; 10]), None);
+        assert_eq!(
+            parse_keychain_user_address(&[KEYCHAIN_TYPE_PREFIX; 10]),
+            None
+        );
 
         // A 65-byte signature starting with 0x03 is still treated as raw ECDSA
         // by verify_voucher (matching TS SDK behavior where size === 65 is checked first).
         let raw_65 = vec![0x03; 65];
         assert!(parse_keychain_user_address(&raw_65).is_some()); // parse_keychain alone would match
-        // But verify_voucher skips keychain parsing for exactly 65 bytes.
+                                                                 // But verify_voucher skips keychain parsing for exactly 65 bytes.
     }
 
     #[cfg(feature = "evm")]
@@ -433,8 +473,12 @@ mod tests {
     fn test_verify_voucher_keychain_envelope() {
         use alloy::primitives::{Address, B256};
 
-        let user_address: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01".parse().unwrap();
-        let escrow_contract: Address = "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let user_address: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+            .parse()
+            .unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
         let channel_id = B256::repeat_byte(0xCD);
         let cumulative_amount = 5000u128;
         let chain_id = 42431u64;
@@ -455,7 +499,9 @@ mod tests {
         ));
 
         // Should fail for a different expected signer
-        let other: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let other: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
         assert!(!verify_voucher(
             escrow_contract,
             chain_id,
@@ -471,8 +517,12 @@ mod tests {
     fn test_verify_voucher_keychain_with_magic_trailer() {
         use alloy::primitives::{Address, B256};
 
-        let user_address: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01".parse().unwrap();
-        let escrow_contract: Address = "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let user_address: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
+            .parse()
+            .unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
         let channel_id = B256::repeat_byte(0xCD);
         let cumulative_amount = 5000u128;
         let chain_id = 42431u64;
@@ -503,8 +553,9 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xEE);
         let cumulative_amount = 42u128;
-        let escrow_contract: Address =
-            "0x5555555555555555555555555555555555555555".parse().unwrap();
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
         let chain_id = 42431u64;
 
         let sig_bytes = sign_voucher(
@@ -528,7 +579,9 @@ mod tests {
         ));
 
         // Wrong signer should still fail
-        let wrong: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let wrong: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
         assert!(!verify_voucher(
             escrow_contract,
             chain_id,

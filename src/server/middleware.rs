@@ -56,8 +56,11 @@ pub trait PaymentVerifier: Send + Sync + 'static {
 /// A [`PaymentVerifier`] built from closures.
 pub struct FnVerifier {
     challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
-    verify_fn:
-        Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>,
+    verify_fn: Box<
+        dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+            + Send
+            + Sync,
+    >,
 }
 
 impl PaymentVerifier for FnVerifier {
@@ -131,10 +134,12 @@ pub struct PaymentService<S, V> {
     verifier: Arc<V>,
 }
 
-impl<S, V, ReqBody, ResBody> tower_service::Service<Request<ReqBody>>
-    for PaymentService<S, V>
+impl<S, V, ReqBody, ResBody> tower_service::Service<Request<ReqBody>> for PaymentService<S, V>
 where
-    S: tower_service::Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: tower_service::Service<Request<ReqBody>, Response = Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send,
     S::Error: Send,
     V: PaymentVerifier,
@@ -182,9 +187,8 @@ where
                     *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
                     resp.headers_mut().insert(
                         WWW_AUTHENTICATE_HEADER,
-                        HeaderValue::from_str(&challenge).unwrap_or_else(|_| {
-                            HeaderValue::from_static("Payment")
-                        }),
+                        HeaderValue::from_str(&challenge)
+                            .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
                     );
                     return Ok(resp);
                 }
@@ -230,8 +234,11 @@ struct ChargeVerifier {
     /// Pre-formatted `WWW-Authenticate` header value.
     challenge_header: String,
     /// Shared mpp instance for verification (type-erased).
-    verify_fn:
-        Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>,
+    verify_fn: Box<
+        dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+            + Send
+            + Sync,
+    >,
 }
 
 impl PaymentVerifier for ChargeVerifier {
@@ -267,13 +274,9 @@ impl PaymentLayer<ChargeVerifier> {
         S: Clone + Send + Sync + 'static,
     {
         let challenge = mpp.charge(amount)?;
-        let challenge_header =
-            format_www_authenticate(&challenge).map_err(|e| {
-                crate::error::MppError::InvalidConfig(format!(
-                    "Failed to format challenge: {}",
-                    e
-                ))
-            })?;
+        let challenge_header = format_www_authenticate(&challenge).map_err(|e| {
+            crate::error::MppError::InvalidConfig(format!("Failed to format challenge: {}", e))
+        })?;
 
         let mpp = mpp.clone();
         let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
@@ -405,15 +408,10 @@ mod tests {
             }
         }
 
-        let mut svc = <PaymentLayer<MockVerifier> as tower_layer::Layer<OkService>>::layer(
-            &layer,
-            OkService,
-        );
+        let mut svc =
+            <PaymentLayer<MockVerifier> as tower_layer::Layer<OkService>>::layer(&layer, OkService);
 
-        let req = Request::builder()
-            .uri("/premium")
-            .body(())
-            .unwrap();
+        let req = Request::builder().uri("/premium").body(()).unwrap();
 
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -447,10 +445,8 @@ mod tests {
             }
         }
 
-        let mut svc = <PaymentLayer<MockVerifier> as tower_layer::Layer<OkService>>::layer(
-            &layer,
-            OkService,
-        );
+        let mut svc =
+            <PaymentLayer<MockVerifier> as tower_layer::Layer<OkService>>::layer(&layer, OkService);
 
         let req = Request::builder()
             .uri("/premium")
@@ -493,10 +489,8 @@ mod tests {
             }
         }
 
-        let mut svc = <PaymentLayer<MockVerifier> as tower_layer::Layer<OkService>>::layer(
-            &layer,
-            OkService,
-        );
+        let mut svc =
+            <PaymentLayer<MockVerifier> as tower_layer::Layer<OkService>>::layer(&layer, OkService);
 
         let req = Request::builder()
             .uri("/premium")

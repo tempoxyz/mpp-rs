@@ -129,7 +129,13 @@ impl FileStore {
         // Sanitize key: replace path separators and special chars
         let safe_key: String = key
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.dir.join(format!("{}.json", safe_key))
     }
@@ -164,8 +170,7 @@ impl Store for FileStore {
         Box::pin(async move {
             let serialized = serde_json::to_string_pretty(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            std::fs::write(&path, serialized)
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            std::fs::write(&path, serialized).map_err(|e| StoreError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -345,14 +350,8 @@ mod tests {
     #[tokio::test]
     async fn memory_store_overwrite() {
         let store = MemoryStore::new();
-        store
-            .put("k", serde_json::json!("first"))
-            .await
-            .unwrap();
-        store
-            .put("k", serde_json::json!("second"))
-            .await
-            .unwrap();
+        store.put("k", serde_json::json!("first")).await.unwrap();
+        store.put("k", serde_json::json!("second")).await.unwrap();
         assert_eq!(
             store.get("k").await.unwrap(),
             Some(serde_json::json!("second"))
@@ -393,14 +392,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let store = FileStore::new(&tmp).unwrap();
 
-        store
-            .put("k", serde_json::json!("first"))
-            .await
-            .unwrap();
-        store
-            .put("k", serde_json::json!("second"))
-            .await
-            .unwrap();
+        store.put("k", serde_json::json!("first")).await.unwrap();
+        store.put("k", serde_json::json!("second")).await.unwrap();
         assert_eq!(
             store.get("k").await.unwrap(),
             Some(serde_json::json!("second"))
@@ -448,10 +441,7 @@ mod adapter_tests {
         // Update (insert) a channel
         let state = test_channel_state("ch1");
         let result = adapter
-            .update_channel(
-                "ch1",
-                Box::new(move |_current| Ok(Some(state))),
-            )
+            .update_channel("ch1", Box::new(move |_current| Ok(Some(state))))
             .await
             .unwrap();
         assert!(result.is_some());

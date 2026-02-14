@@ -71,11 +71,9 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(
-            serialized
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        );
+        assert!(serialized
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert!(!serialized.contains('='));
     }
 

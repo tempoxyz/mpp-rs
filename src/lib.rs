@@ -26,12 +26,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod body_digest;
 pub mod error;
+pub mod expires;
 pub mod mcp;
 pub mod protocol;
 pub mod proxy;
 pub mod store;
 pub mod utils;
-pub mod expires;
 
 #[cfg(feature = "evm")]
 pub mod evm;
@@ -82,16 +82,9 @@ pub use store::ChannelStoreAdapter;
 
 // Intent types
 pub use protocol::intents::{
-    deserialize_request,
-    deserialize_request_typed,
-    from_request,
-    parse_units,
-    request_from_challenge,
-    request_from_challenge_typed,
-    serialize_request,
-    ChargeRequest,
-    Request as PaymentRequest,
-    SessionRequest,
+    deserialize_request, deserialize_request_typed, from_request, parse_units,
+    request_from_challenge, request_from_challenge_typed, serialize_request, ChargeRequest,
+    Request as PaymentRequest, SessionRequest,
 };
 
 // ==================== Alloy Re-exports ====================

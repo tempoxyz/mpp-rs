@@ -217,9 +217,9 @@ pub struct SessionMethod<P> {
 impl<P> SessionMethod<P> {
     /// Parse a hex channel ID string to B256.
     fn parse_channel_id(channel_id: &str) -> Result<B256, VerificationError> {
-        channel_id.parse::<B256>().map_err(|e| {
-            VerificationError::invalid_payload(format!("Invalid channel ID: {}", e))
-        })
+        channel_id
+            .parse::<B256>()
+            .map_err(|e| VerificationError::invalid_payload(format!("Invalid channel ID: {}", e)))
     }
 
     /// Parse a hex signature string to bytes.
@@ -232,9 +232,8 @@ impl<P> SessionMethod<P> {
 
     /// Parse an address string.
     fn parse_address(addr: &str) -> Result<Address, VerificationError> {
-        addr.parse::<Address>().map_err(|e| {
-            VerificationError::invalid_payload(format!("Invalid address: {}", e))
-        })
+        addr.parse::<Address>()
+            .map_err(|e| VerificationError::invalid_payload(format!("Invalid address: {}", e)))
     }
 }
 
@@ -243,11 +242,7 @@ where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
     /// Create a new Tempo session method.
-    pub fn new(
-        provider: P,
-        store: Arc<dyn ChannelStore>,
-        config: SessionMethodConfig,
-    ) -> Self {
+    pub fn new(provider: P, store: Arc<dyn ChannelStore>, config: SessionMethodConfig) -> Self {
         Self {
             provider: Arc::new(provider),
             store,
@@ -287,7 +282,10 @@ where
     }
 
     /// Resolve the escrow contract address from method details or config.
-    fn resolve_escrow(&self, details: &TempoSessionMethodDetails) -> Result<Address, VerificationError> {
+    fn resolve_escrow(
+        &self,
+        details: &TempoSessionMethodDetails,
+    ) -> Result<Address, VerificationError> {
         Self::parse_address(&details.escrow_contract)
     }
 
@@ -312,32 +310,45 @@ where
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, cumulative_amount_str, signature_str, _authorized_signer_str, transaction_str) =
-            match payload {
-                SessionCredentialPayload::Open {
-                    channel_id,
-                    cumulative_amount,
-                    signature,
-                    authorized_signer,
-                    transaction,
-                    ..
-                } => (channel_id, cumulative_amount, signature, authorized_signer, transaction),
-                _ => unreachable!(),
-            };
+        let (
+            channel_id_str,
+            cumulative_amount_str,
+            signature_str,
+            _authorized_signer_str,
+            transaction_str,
+        ) = match payload {
+            SessionCredentialPayload::Open {
+                channel_id,
+                cumulative_amount,
+                signature,
+                authorized_signer,
+                transaction,
+                ..
+            } => (
+                channel_id,
+                cumulative_amount,
+                signature,
+                authorized_signer,
+                transaction,
+            ),
+            _ => unreachable!(),
+        };
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
 
         // Broadcast the client's signed open transaction (approve + escrow.open).
-        let tx_bytes: Bytes = transaction_str
-            .parse()
-            .map_err(|e| VerificationError::invalid_payload(format!("invalid open transaction hex: {}", e)))?;
+        let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
+            VerificationError::invalid_payload(format!("invalid open transaction hex: {}", e))
+        })?;
         let pending = self
             .provider
             .send_raw_transaction(&tx_bytes)
             .await
-            .map_err(|e| VerificationError::network_error(format!("failed to broadcast open tx: {}", e)))?;
+            .map_err(|e| {
+                VerificationError::network_error(format!("failed to broadcast open tx: {}", e))
+            })?;
         let tx_receipt = pending
             .get_receipt()
             .await
@@ -375,9 +386,9 @@ where
             on_chain.authorized_signer
         };
 
-        let cumulative_amount: u128 = cumulative_amount_str.parse().map_err(|_| {
-            VerificationError::invalid_payload("invalid cumulativeAmount")
-        })?;
+        let cumulative_amount: u128 = cumulative_amount_str
+            .parse()
+            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
 
         if cumulative_amount > on_chain.deposit {
             return Err(VerificationError::amount_exceeds_deposit(
@@ -455,8 +466,7 @@ where
             )
             .await?;
 
-        let _state = updated
-            .ok_or_else(|| VerificationError::new("failed to create channel"))?;
+        let _state = updated.ok_or_else(|| VerificationError::new("failed to create channel"))?;
 
         Ok(Receipt::success(METHOD_NAME, &open_tx_hash))
     }
@@ -488,20 +498,24 @@ where
         let escrow = self.resolve_escrow(details)?;
 
         // Broadcast the client's signed topUp transaction.
-        let tx_bytes: Bytes = transaction_str
-            .parse()
-            .map_err(|e| VerificationError::invalid_payload(format!("invalid topUp transaction hex: {}", e)))?;
+        let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
+            VerificationError::invalid_payload(format!("invalid topUp transaction hex: {}", e))
+        })?;
         let pending = self
             .provider
             .send_raw_transaction(&tx_bytes)
             .await
-            .map_err(|e| VerificationError::network_error(format!("failed to broadcast topUp tx: {}", e)))?;
+            .map_err(|e| {
+                VerificationError::network_error(format!("failed to broadcast topUp tx: {}", e))
+            })?;
         let tx_receipt = pending
             .get_receipt()
             .await
             .map_err(|e| VerificationError::network_error(format!("topUp tx failed: {}", e)))?;
         if !tx_receipt.status() {
-            return Err(VerificationError::transaction_failed("topUp transaction reverted"));
+            return Err(VerificationError::transaction_failed(
+                "topUp transaction reverted",
+            ));
         }
 
         // Re-read on-chain state after topUp tx is broadcast.
@@ -521,9 +535,8 @@ where
             .update_channel(
                 &channel_id_owned,
                 Box::new(move |current| {
-                    let state = current.ok_or_else(|| {
-                        VerificationError::channel_not_found("channel not found")
-                    })?;
+                    let state = current
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
                     Ok(Some(ChannelState {
                         deposit: new_deposit,
                         ..state
@@ -562,9 +575,9 @@ where
             return Err(VerificationError::channel_closed("channel is finalized"));
         }
 
-        let cumulative_amount: u128 = cumulative_amount_str.parse().map_err(|_| {
-            VerificationError::invalid_payload("invalid cumulativeAmount")
-        })?;
+        let cumulative_amount: u128 = cumulative_amount_str
+            .parse()
+            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
 
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
@@ -617,9 +630,9 @@ where
             ));
         }
 
-        let cumulative_amount: u128 = cumulative_amount_str.parse().map_err(|_| {
-            VerificationError::invalid_payload("invalid cumulativeAmount")
-        })?;
+        let cumulative_amount: u128 = cumulative_amount_str
+            .parse()
+            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
 
         if cumulative_amount < channel.highest_voucher_amount {
             return Err(VerificationError::new(
@@ -672,8 +685,8 @@ where
             use alloy::primitives::Bytes;
             use alloy::signers::SignerSync;
             use alloy::sol_types::SolCall;
-            use tempo_primitives::TempoTransaction;
             use tempo_primitives::transaction::Call;
+            use tempo_primitives::TempoTransaction;
 
             alloy::sol! {
                 interface IEscrowClose {
@@ -688,14 +701,16 @@ where
             ))
             .abi_encode();
 
-            let nonce = self.provider
+            let nonce = self
+                .provider
                 .get_transaction_count(signer.address())
                 .await
-                .map_err(|e| VerificationError::network_error(format!("failed to get nonce: {}", e)))?;
-            let gas_price = self.provider
-                .get_gas_price()
-                .await
-                .map_err(|e| VerificationError::network_error(format!("failed to get gas price: {}", e)))?;
+                .map_err(|e| {
+                    VerificationError::network_error(format!("failed to get nonce: {}", e))
+                })?;
+            let gas_price = self.provider.get_gas_price().await.map_err(|e| {
+                VerificationError::network_error(format!("failed to get gas price: {}", e))
+            })?;
 
             let tempo_tx = TempoTransaction {
                 chain_id,
@@ -712,15 +727,19 @@ where
             };
 
             let sig_hash = tempo_tx.signature_hash();
-            let signature = signer.sign_hash_sync(&sig_hash)
-                .map_err(|e| VerificationError::network_error(format!("failed to sign close tx: {}", e)))?;
+            let signature = signer.sign_hash_sync(&sig_hash).map_err(|e| {
+                VerificationError::network_error(format!("failed to sign close tx: {}", e))
+            })?;
             let signed_tx = tempo_tx.into_signed(signature.into());
             let tx_bytes = Bytes::from(signed_tx.encoded_2718());
 
-            let pending = self.provider
+            let pending = self
+                .provider
                 .send_raw_transaction(&tx_bytes)
                 .await
-                .map_err(|e| VerificationError::network_error(format!("failed to send close tx: {}", e)))?;
+                .map_err(|e| {
+                    VerificationError::network_error(format!("failed to send close tx: {}", e))
+                })?;
             let receipt = pending
                 .get_receipt()
                 .await
@@ -753,8 +772,11 @@ where
             )
             .await?;
 
-        let reference = close_tx_hash
-            .unwrap_or_else(|| updated.map(|s| s.channel_id).unwrap_or_else(|| channel.channel_id.clone()));
+        let reference = close_tx_hash.unwrap_or_else(|| {
+            updated
+                .map(|s| s.channel_id)
+                .unwrap_or_else(|| channel.channel_id.clone())
+        });
         Ok(Receipt::success(METHOD_NAME, &reference))
     }
 
@@ -832,9 +854,8 @@ where
             .update_channel(
                 &channel_id_owned,
                 Box::new(move |current| {
-                    let state = current.ok_or_else(|| {
-                        VerificationError::channel_not_found("channel not found")
-                    })?;
+                    let state = current
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
                     if cumulative_amount > state.highest_voucher_amount {
                         Ok(Some(ChannelState {
                             highest_voucher_amount: cumulative_amount,
@@ -911,27 +932,21 @@ where
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(
                     "Method mismatch: expected {}, got {}",
-                    METHOD_NAME,
-                    credential.challenge.method
+                    METHOD_NAME, credential.challenge.method
                 )));
             }
             if credential.challenge.intent.as_str() != INTENT_SESSION {
                 return Err(VerificationError::credential_mismatch(format!(
                     "Intent mismatch: expected {}, got {}",
-                    INTENT_SESSION,
-                    credential.challenge.intent
+                    INTENT_SESSION, credential.challenge.intent
                 )));
             }
 
             let details = this.resolve_method_details(&request)?;
 
-            let payload: SessionCredentialPayload =
-                credential.payload_as().map_err(|e| {
-                    VerificationError::invalid_payload(format!(
-                        "Expected session payload: {}",
-                        e
-                    ))
-                })?;
+            let payload: SessionCredentialPayload = credential.payload_as().map_err(|e| {
+                VerificationError::invalid_payload(format!("Expected session payload: {}", e))
+            })?;
 
             match &payload {
                 SessionCredentialPayload::Open { .. } => {
@@ -967,8 +982,7 @@ fn now_iso8601() -> String {
 /// Uses a `Mutex<HashMap>` for thread-safe access.
 pub struct InMemoryChannelStore {
     channels: std::sync::Mutex<std::collections::HashMap<String, ChannelState>>,
-    notifiers:
-        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    notifiers: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl Default for InMemoryChannelStore {
@@ -1128,7 +1142,10 @@ mod tests {
 
         assert_eq!(updated.unwrap().highest_voucher_amount, 5000);
         assert_eq!(
-            store.get_channel_sync("0xchannel1").unwrap().highest_voucher_amount,
+            store
+                .get_channel_sync("0xchannel1")
+                .unwrap()
+                .highest_voucher_amount,
             5000
         );
     }
@@ -1193,10 +1210,7 @@ mod tests {
     fn test_parse_channel_id_valid() {
         let id = "0xabababababababababababababababababababababababababababababababab";
         // 32 bytes = 64 hex chars + 0x prefix
-        let padded = format!(
-            "0x{}",
-            "ab".repeat(32)
-        );
+        let padded = format!("0x{}", "ab".repeat(32));
         let result = SessionMethod::<()>::parse_channel_id(&padded);
         assert!(result.is_ok());
     }

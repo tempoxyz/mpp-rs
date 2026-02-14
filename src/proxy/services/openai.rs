@@ -22,9 +22,6 @@ use crate::proxy::service::{Service, ServiceBuilder};
 ///
 /// assert_eq!(svc.id, "openai");
 /// ```
-pub fn service(
-    api_key: &str,
-    configure: impl FnOnce(ServiceBuilder) -> ServiceBuilder,
-) -> Service {
+pub fn service(api_key: &str, configure: impl FnOnce(ServiceBuilder) -> ServiceBuilder) -> Service {
     configure(Service::new("openai", "https://api.openai.com").bearer(api_key)).build()
 }

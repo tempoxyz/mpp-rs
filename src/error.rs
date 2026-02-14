@@ -13,8 +13,7 @@ pub type Result<T> = std::result::Result<T, MppError>;
 // ==================== RFC 9457 Problem Details ====================
 
 /// Base URI for core payment-auth problem types.
-pub const CORE_PROBLEM_TYPE_BASE: &str =
-    "https://tempoxyz.github.io/payment-auth-spec/problems";
+pub const CORE_PROBLEM_TYPE_BASE: &str = "https://tempoxyz.github.io/payment-auth-spec/problems";
 
 /// Base URI for stream/channel problem types.
 pub const STREAM_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/stream";
@@ -859,7 +858,10 @@ mod tests {
             "Insufficient balance: requested 500, available 100."
         );
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/insufficient-balance");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/insufficient-balance"
+        );
         assert_eq!(problem.title, "InsufficientBalanceError");
         assert_eq!(problem.status, 402);
 
@@ -872,7 +874,10 @@ mod tests {
         let err = MppError::InvalidSignature(Some("ECDSA recovery failed".to_string()));
         assert_eq!(err.to_string(), "Invalid signature: ECDSA recovery failed.");
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/invalid-signature");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/invalid-signature"
+        );
         assert_eq!(problem.title, "InvalidSignatureError");
         assert_eq!(problem.status, 402);
 
@@ -883,14 +888,23 @@ mod tests {
     #[test]
     fn test_signer_mismatch_problem_details() {
         let err = MppError::SignerMismatch(Some("expected 0x123, got 0x456".to_string()));
-        assert_eq!(err.to_string(), "Signer mismatch: expected 0x123, got 0x456.");
+        assert_eq!(
+            err.to_string(),
+            "Signer mismatch: expected 0x123, got 0x456."
+        );
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/signer-mismatch");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/signer-mismatch"
+        );
         assert_eq!(problem.title, "SignerMismatchError");
         assert_eq!(problem.status, 402);
 
         let err = MppError::SignerMismatch(None);
-        assert_eq!(err.to_string(), "Signer is not authorized for this channel.");
+        assert_eq!(
+            err.to_string(),
+            "Signer is not authorized for this channel."
+        );
     }
 
     #[test]
@@ -901,7 +915,10 @@ mod tests {
             "Amount exceeds deposit: voucher exceeds deposit."
         );
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/amount-exceeds-deposit");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/amount-exceeds-deposit"
+        );
         assert_eq!(problem.title, "AmountExceedsDepositError");
         assert_eq!(problem.status, 402);
 
@@ -914,12 +931,18 @@ mod tests {
         let err = MppError::DeltaTooSmall(Some("increase below minimum".to_string()));
         assert_eq!(err.to_string(), "Delta too small: increase below minimum.");
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/delta-too-small");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/delta-too-small"
+        );
         assert_eq!(problem.title, "DeltaTooSmallError");
         assert_eq!(problem.status, 402);
 
         let err = MppError::DeltaTooSmall(None);
-        assert_eq!(err.to_string(), "Amount increase below minimum voucher delta.");
+        assert_eq!(
+            err.to_string(),
+            "Amount increase below minimum voucher delta."
+        );
     }
 
     #[test]
@@ -927,7 +950,10 @@ mod tests {
         let err = MppError::ChannelNotFound(Some("no such channel".to_string()));
         assert_eq!(err.to_string(), "Channel not found: no such channel.");
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/channel-not-found");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/channel-not-found"
+        );
         assert_eq!(problem.title, "ChannelNotFoundError");
         assert_eq!(problem.status, 410);
 
@@ -943,7 +969,10 @@ mod tests {
             "Channel closed: channel is finalized on-chain."
         );
         let problem = err.to_problem_details(None);
-        assert_eq!(problem.problem_type, "https://paymentauth.org/problems/stream/channel-finalized");
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/stream/channel-finalized"
+        );
         assert_eq!(problem.title, "ChannelClosedError");
         assert_eq!(problem.status, 410);
 

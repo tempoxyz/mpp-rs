@@ -48,9 +48,8 @@ pub use crate::protocol::methods::tempo::{
 
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::session_method::{
-    SessionMethod as TempoSessionMethod,
+    InMemoryChannelStore as SessionChannelStore, SessionMethod as TempoSessionMethod,
     SessionMethodConfig,
-    InMemoryChannelStore as SessionChannelStore,
 };
 
 // ==================== Simple API ====================

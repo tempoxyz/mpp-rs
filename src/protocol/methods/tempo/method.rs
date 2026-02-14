@@ -789,6 +789,8 @@ mod tests {
         let error = VerificationError::new(
             "feePayer requested but fee sponsorship is not configured on this server",
         );
-        assert!(error.to_string().contains("fee sponsorship is not configured"));
+        assert!(error
+            .to_string()
+            .contains("fee sponsorship is not configured"));
     }
 }
