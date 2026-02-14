@@ -1,6 +1,6 @@
-# Fuzz Testing for mpay-rs
+# Fuzz Testing for mpp
 
-This directory contains fuzz testing harnesses for the mpay-rs library, targeting the header parsing functions which handle untrusted input.
+This directory contains fuzz testing harnesses for the mpp library, targeting the header parsing functions which handle untrusted input.
 
 ## Fuzz Targets
 

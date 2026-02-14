@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use mpay::client::{Fetch, TempoProvider};
+//! use mpp::client::{Fetch, TempoProvider};
 //!
 //! let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 //! let resp = client.get(url).send_with_payment(&provider).await?;
@@ -19,6 +19,12 @@
 
 mod error;
 mod provider;
+
+#[cfg(feature = "tempo")]
+pub mod channel_ops;
+
+#[cfg(feature = "tempo")]
+mod session_provider;
 
 #[cfg(feature = "client")]
 mod fetch;
@@ -37,3 +43,9 @@ pub use middleware::PaymentMiddleware;
 
 #[cfg(feature = "tempo")]
 pub use provider::TempoProvider;
+
+#[cfg(feature = "tempo")]
+pub use channel_ops::ChannelEntry;
+
+#[cfg(feature = "tempo")]
+pub use session_provider::TempoSessionProvider;

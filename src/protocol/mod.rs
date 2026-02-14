@@ -41,8 +41,8 @@
 //! ## Parse a challenge (core layer only)
 //!
 //! ```
-//! use mpay::protocol::core::*;
-//! use mpay::protocol::intents::ChargeRequest;
+//! use mpp::protocol::core::*;
+//! use mpp::protocol::intents::ChargeRequest;
 //!
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
@@ -56,10 +56,10 @@
 //!
 #![cfg_attr(feature = "tempo", doc = "```")]
 #![cfg_attr(not(feature = "tempo"), doc = "```ignore")]
-//! use mpay::protocol::core::parse_www_authenticate;
-//! use mpay::protocol::intents::ChargeRequest;
-//! use mpay::protocol::methods::tempo::TempoChargeExt;
-//! use mpay::evm::U256;
+//! use mpp::protocol::core::parse_www_authenticate;
+//! use mpp::protocol::intents::ChargeRequest;
+//! use mpp::protocol::methods::tempo::TempoChargeExt;
+//! use mpp::evm::U256;
 //!
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiIweDEyMyIsInJlY2lwaWVudCI6IjB4NDU2In0""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
@@ -71,9 +71,9 @@
 //!
 #![cfg_attr(feature = "tempo", doc = "```")]
 #![cfg_attr(not(feature = "tempo"), doc = "```ignore")]
-//! use mpay::protocol::core::parse_www_authenticate;
-//! use mpay::protocol::intents::ChargeRequest;
-//! use mpay::protocol::methods::tempo::TempoChargeExt;
+//! use mpp::protocol::core::parse_www_authenticate;
+//! use mpp::protocol::intents::ChargeRequest;
+//! use mpp::protocol::methods::tempo::TempoChargeExt;
 //!
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();

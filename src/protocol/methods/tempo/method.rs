@@ -12,8 +12,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use mpay::server::{tempo_provider, TempoChargeMethod};
-//! use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
+//! use mpp::server::{tempo_provider, TempoChargeMethod};
+//! use mpp::protocol::traits::ChargeMethod as ChargeMethodTrait;
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
 //! let method = TempoChargeMethod::new(provider);
@@ -26,11 +26,9 @@
 use alloy::network::ReceiptResponse;
 use alloy::primitives::{hex, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
-use alloy::rlp::Decodable as _;
 use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::TempoTransaction;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
@@ -89,8 +87,8 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 /// # Example
 ///
 /// ```ignore
-/// use mpay::server::{tempo_provider, TempoChargeMethod};
-/// use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
+/// use mpp::server::{tempo_provider, TempoChargeMethod};
+/// use mpp::protocol::traits::ChargeMethod as ChargeMethodTrait;
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
 /// let method = TempoChargeMethod::new(provider);
@@ -104,6 +102,7 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 #[derive(Clone)]
 pub struct ChargeMethod<P> {
     provider: Arc<P>,
+    fee_payer_signer: Option<Arc<alloy_signer_local::PrivateKeySigner>>,
 }
 
 impl<P> ChargeMethod<P>
@@ -117,7 +116,17 @@ where
     pub fn new(provider: P) -> Self {
         Self {
             provider: Arc::new(provider),
+            fee_payer_signer: None,
         }
+    }
+
+    /// Configure a fee payer signer for sponsoring transaction fees.
+    ///
+    /// When set, requests with `feePayer: true` will be accepted and
+    /// broadcast. Without a fee payer signer, such requests are rejected.
+    pub fn with_fee_payer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+        self.fee_payer_signer = Some(Arc::new(signer));
+        self
     }
 
     /// Get a reference to the underlying provider.
@@ -387,8 +396,10 @@ where
             tx_bytes
         };
 
-        let tx = TempoTransaction::decode(&mut &tx_data[..])
+        // Decode the signed Tempo transaction (AASigned = tx fields + signature).
+        let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
+        let tx = signed.tx();
 
         // Validate chain_id to prevent cross-chain replay attacks
         if tx.chain_id != expected_chain_id {
@@ -501,9 +512,8 @@ where
             expected_chain_id,
         )?;
 
-        // Fail fast if fee payer is requested but not configured.
-        // Full fee payer support requires passing a signer to ChargeMethod.
-        if charge.fee_payer() {
+        // Fail fast if fee payer is requested but no signer is configured.
+        if charge.fee_payer() && self.fee_payer_signer.is_none() {
             return Err(VerificationError::new(
                 "feePayer requested but fee sponsorship is not configured on this server"
                     .to_string(),
@@ -532,6 +542,28 @@ where
     }
 }
 
+#[allow(clippy::manual_async_fn)]
+impl<P> crate::protocol::traits::SessionMethod for ChargeMethod<P>
+where
+    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
+{
+    fn method(&self) -> &str {
+        METHOD_NAME
+    }
+
+    fn verify_session(
+        &self,
+        _credential: &PaymentCredential,
+        _request: &crate::protocol::intents::SessionRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        async {
+            Err(VerificationError::new(
+                "Session verification not yet implemented — requires on-chain channel state lookup",
+            ))
+        }
+    }
+}
+
 impl<P> ChargeMethodTrait for ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
@@ -548,9 +580,13 @@ where
         let credential = credential.clone();
         let request = request.clone();
         let provider = Arc::clone(&self.provider);
+        let fee_payer_signer = self.fee_payer_signer.clone();
 
         async move {
-            let this = ChargeMethod { provider };
+            let this = ChargeMethod {
+                provider,
+                fee_payer_signer,
+            };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(
@@ -581,15 +617,22 @@ where
                 )));
             }
 
-            if credential.payload.is_hash() {
+            let charge_payload = credential.charge_payload().map_err(|e| {
+                VerificationError::with_code(
+                    format!("Expected charge payload: {}", e),
+                    crate::protocol::traits::ErrorCode::InvalidCredential,
+                )
+            })?;
+
+            if charge_payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
-                this.verify_hash(credential.payload.tx_hash().unwrap(), &request)
+                this.verify_hash(charge_payload.tx_hash().unwrap(), &request)
                     .await
             } else {
                 // Client sent signed transaction, validate and broadcast it
                 let tx_hash = this
                     .broadcast_transaction(
-                        credential.payload.signed_tx().unwrap(),
+                        charge_payload.signed_tx().unwrap(),
                         &request,
                         expected_chain_id,
                     )
@@ -738,5 +781,17 @@ mod tests {
         assert_eq!(CHAIN_ID, 4217);
         // Verify the Tempo Moderato testnet chain ID constant
         assert_eq!(MODERATO_CHAIN_ID, 42431);
+    }
+
+    #[test]
+    fn test_fee_payer_not_configured() {
+        // When fee_payer_signer is None, the error message should indicate
+        // that fee sponsorship is not configured.
+        let error = VerificationError::new(
+            "feePayer requested but fee sponsorship is not configured on this server",
+        );
+        assert!(error
+            .to_string()
+            .contains("fee sponsorship is not configured"));
     }
 }

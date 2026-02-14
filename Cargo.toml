@@ -1,12 +1,12 @@
 [package]
-name = "mpay"
+name = "mpp"
 version = "0.2.1"
 edition = "2021"
 description = "Machine Payment Protocol - Rust library for Web Payment Auth"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tempoxyz/mpay-rs"
 homepage = "https://github.com/tempoxyz/mpay-rs"
-documentation = "https://docs.rs/mpay"
+documentation = "https://docs.rs/mpp"
 readme = "README.md"
 keywords = ["http", "payments", "402", "authentication", "web3"]
 categories = ["web-programming", "authentication", "cryptography"]
@@ -16,7 +16,7 @@ default = []
 
 # Side selection
 client = ["reqwest"]
-server = []
+server = ["tokio", "futures-core"]
 
 # Method implementations
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
@@ -27,6 +27,9 @@ utils = ["hex", "rand"]
 
 # Middleware support (requires client)
 middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
+
+# Tower middleware support (server-side)
+tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", "server"]
 
 [dependencies]
 # Core dependencies (always included)
@@ -42,6 +45,8 @@ hex = { version = "0.4", optional = true }
 base64 = "0.22"
 rand = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
+futures-core = { version = "0.3", optional = true }
 alloy = { version = "1.2", features = ["full"], optional = true }
 alloy-signer-local = { version = "1.2", optional = true }
 
@@ -59,6 +64,11 @@ reqwest-middleware = { version = "0.4", optional = true }
 async-trait = { version = "0.1", optional = true }
 anyhow = { version = "1", optional = true }
 http-types = { package = "http", version = "1", optional = true }
+
+# Tower middleware dependencies (optional)
+tower-layer = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }
+http-body = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

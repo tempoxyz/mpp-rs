@@ -21,7 +21,7 @@ use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHOR
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::client::{PaymentMiddleware, TempoProvider};
+/// use mpp::client::{PaymentMiddleware, TempoProvider};
 /// use reqwest_middleware::ClientBuilder;
 ///
 /// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;

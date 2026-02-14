@@ -21,7 +21,7 @@
 //! For server-side challenge creation, use the helper functions:
 //!
 //! ```
-//! use mpay::protocol::methods::tempo;
+//! use mpp::protocol::methods::tempo;
 //!
 //! // Simple charge challenge with HMAC-bound ID
 //! let challenge = tempo::charge_challenge(
@@ -33,7 +33,7 @@
 //! ).unwrap();
 //!
 //! // With full options (fee payer, description, etc.)
-//! use mpay::protocol::intents::ChargeRequest;
+//! use mpp::protocol::intents::ChargeRequest;
 //! let request = ChargeRequest {
 //!     amount: "1000000".into(),
 //!     currency: "0x20c0000000000000000000000000000000000000".into(),
@@ -63,12 +63,13 @@
 //! adds its signature and broadcasts.
 //!
 //! ```
-//! use mpay::protocol::intents::ChargeRequest;
-//! use mpay::protocol::methods::tempo::TempoChargeExt;
+//! use mpp::protocol::intents::ChargeRequest;
+//! use mpp::protocol::methods::tempo::TempoChargeExt;
 //!
 //! # let req = ChargeRequest {
 //! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
 //! #     expires: None, description: None, external_id: None,
+//! #     decimals: None,
 //! #     method_details: Some(serde_json::json!({
 //! #         "feePayer": true
 //! #     })),
@@ -83,9 +84,9 @@
 //! # Examples
 //!
 //! ```
-//! use mpay::protocol::core::parse_www_authenticate;
-//! use mpay::protocol::intents::ChargeRequest;
-//! use mpay::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID, MODERATO_CHAIN_ID};
+//! use mpp::protocol::core::parse_www_authenticate;
+//! use mpp::protocol::intents::ChargeRequest;
+//! use mpp::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID, MODERATO_CHAIN_ID};
 //!
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
@@ -96,21 +97,34 @@
 //! ```
 
 pub mod charge;
+pub mod session;
+pub mod stream_receipt;
 pub mod transaction;
 pub mod types;
+pub mod voucher;
 
 #[cfg(feature = "server")]
 pub mod method;
+#[cfg(feature = "server")]
+pub mod session_method;
 
 pub use charge::TempoChargeExt;
+pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};
+pub use stream_receipt::StreamReceipt;
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
 };
 pub use types::TempoMethodDetails;
+#[cfg(feature = "evm")]
+pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
 #[cfg(feature = "server")]
 pub use method::ChargeMethod;
+#[cfg(feature = "server")]
+pub use session_method::{
+    ChannelState, ChannelStore, InMemoryChannelStore, SessionMethod, SessionMethodConfig,
+};
 
 /// Tempo mainnet chain ID.
 pub const CHAIN_ID: u64 = 4217;
@@ -130,6 +144,9 @@ pub const METHOD_NAME: &str = "tempo";
 /// Charge intent name.
 pub const INTENT_CHARGE: &str = "charge";
 
+/// Session intent name.
+pub const INTENT_SESSION: &str = "session";
+
 /// Create a Tempo charge challenge with minimal parameters.
 ///
 /// This is the simplest way to create a payment challenge for the Tempo network.
@@ -148,7 +165,7 @@ pub const INTENT_CHARGE: &str = "charge";
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::methods::tempo;
+/// use mpp::protocol::methods::tempo;
 ///
 /// let challenge = tempo::charge_challenge(
 ///     "my-server-secret",
@@ -198,8 +215,8 @@ pub fn charge_challenge(
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::intents::ChargeRequest;
-/// use mpay::protocol::methods::tempo;
+/// use mpp::protocol::intents::ChargeRequest;
+/// use mpp::protocol::methods::tempo;
 ///
 /// let request = ChargeRequest {
 ///     amount: "1000000".into(),
@@ -229,7 +246,10 @@ pub fn charge_challenge_with_options(
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
     use time::{Duration, OffsetDateTime};
 
-    let encoded_request = Base64UrlJson::from_typed(request)?;
+    // Apply decimals transform if present (matches TS SDK's parseUnits behavior).
+    let request = request.clone().with_base_units()?;
+
+    let encoded_request = Base64UrlJson::from_typed(&request)?;
 
     let default_expires;
     let expires = match expires {
@@ -290,7 +310,7 @@ pub fn charge_challenge_with_options(
 /// # Example
 ///
 /// ```
-/// use mpay::protocol::methods::tempo::generate_challenge_id;
+/// use mpp::protocol::methods::tempo::generate_challenge_id;
 ///
 /// let id = generate_challenge_id(
 ///     "my-secret-key",
@@ -311,28 +331,9 @@ pub fn generate_challenge_id(
     expires: Option<&str>,
     digest: Option<&str>,
 ) -> String {
-    use crate::protocol::core::base64url_encode;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    let hmac_input = format!(
-        "{}|{}|{}|{}|{}|{}",
-        realm,
-        method,
-        intent,
-        request,
-        expires.unwrap_or(""),
-        digest.unwrap_or("")
-    );
-
-    let mut mac =
-        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(hmac_input.as_bytes());
-    let result = mac.finalize();
-
-    base64url_encode(&result.into_bytes())
+    crate::protocol::core::compute_challenge_id(
+        secret_key, realm, method, intent, request, expires, digest,
+    )
 }
 
 /// Generate a challenge ID from a JSON request value using HMAC-SHA256.
@@ -353,7 +354,7 @@ pub fn generate_challenge_id(
 /// # Example
 ///
 /// ```
-/// use mpay::protocol::methods::tempo::generate_challenge_id_from_request;
+/// use mpp::protocol::methods::tempo::generate_challenge_id_from_request;
 /// use serde_json::json;
 ///
 /// let id = generate_challenge_id_from_request(
@@ -569,7 +570,7 @@ mod tests {
     }
 
     /// Cross-SDK compatibility tests using conformance test vectors.
-    /// These test cases are from mpay-sdks/conformance/vectors/challenge-id.json
+    /// These test cases are from mpp-sdks/conformance/vectors/challenge-id.json
     /// and verify that Rust produces the same challenge IDs as TypeScript and Python.
     mod cross_sdk_compatibility {
         use super::*;
@@ -592,7 +593,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "4Y_7cCtNrnPq0ujXFLOPsk4DRMctIFYxijKxrY5uob0");
+            assert_eq!(id, "2zBPShTPApayQwXeT8WydrfbsHFLWIC8cosfBzK3UUs");
         }
 
         #[test]
@@ -612,7 +613,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "02h24ab0XjVsKFwbyhz8HU9FacoT-21zV4FokI2U4YI");
+            assert_eq!(id, "HQEKiVUplCDQ6AIff8eN55Q3BpRmg2RqU0DOl3R8QIA");
         }
 
         #[test]
@@ -632,7 +633,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "EAX2sqwdeg8Km8LIKRBFhM5xDQvEgIlbTif9FKBsOiU");
+            assert_eq!(id, "WglnB-3knPMLPOVEdA8P81UXpy8oFVfBx31ntDh-VPk");
         }
 
         #[test]
@@ -654,7 +655,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "9uqa-bDFwDBiMIgJF-hytstRW_YgjpBUDCo5_SMSqG4");
+            assert_eq!(id, "96xfZu2wzXD-f-l-hClS9OgODVgIoPWSCWhUw6a4I1Q");
         }
 
         #[test]
@@ -674,7 +675,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "GaC7Gn_Fbbq98Tw-Eb7z4FadriU7GzNrAyC7ZcY3VRI");
+            assert_eq!(id, "mi0krYRZpfDxn0DFDHeXOIYdU_SEcJQfURKGTN26Ehg");
         }
 
         #[test]
@@ -690,7 +691,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "jUTqTVe3kCv5rVizv1XBCs9qKCLg4AZLwBUnk4N3MR8");
+            assert_eq!(id, "yXILRwEbyiy4F2pCUoxcKbvYHy4ZyXtLxnzMZTi3qDs");
         }
 
         #[test]
@@ -711,7 +712,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "76lyru2p7i7Xw6fGTJtWzd9c7Z6mt33LIW7968Mlkz8");
+            assert_eq!(id, "stLlKuOMkHscBIqCE78v48-CY-I0JIQkm1rjotcb-rQ");
         }
 
         #[test]
@@ -735,7 +736,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(id, "dyItTtUU31Gp2ckWrYXoeB2wZtS1OTVpXw81D_blwuk");
+            assert_eq!(id, "AbaOnesHVxXeDbG9eStLZOlBwTI87_8g7skZwL9tOvA");
         }
     }
 }

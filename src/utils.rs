@@ -1,4 +1,4 @@
-//! Utility functions for mpay-rs library
+//! Utility functions for mpp library
 
 /// Format an Ethereum address with 0x prefix
 pub fn format_eth_address(addr: &str) -> String {
@@ -25,7 +25,7 @@ pub fn strip_0x_prefix(s: &str) -> &str {
 /// # Examples
 ///
 /// ```
-/// use mpay::utils::truncate_address;
+/// use mpp::utils::truncate_address;
 ///
 /// // Short addresses are unchanged
 /// assert_eq!(truncate_address("0x1234", 20), "0x1234");

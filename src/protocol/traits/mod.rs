@@ -9,8 +9,10 @@
 //! field names across all implementations.
 
 mod charge;
+mod session;
 
 pub use charge::ChargeMethod;
+pub use session::SessionMethod;
 
 use std::fmt;
 
@@ -35,6 +37,20 @@ pub enum ErrorCode {
     ChainIdMismatch,
     /// Credential does not match the expected challenge.
     CredentialMismatch,
+    /// Payment channel not found.
+    ChannelNotFound,
+    /// Payment channel has been closed.
+    ChannelClosed,
+    /// Insufficient balance in payment channel.
+    InsufficientBalance,
+    /// Invalid credential payload.
+    InvalidPayload,
+    /// Invalid cryptographic signature.
+    InvalidSignature,
+    /// Voucher amount exceeds channel deposit.
+    AmountExceedsDeposit,
+    /// Voucher delta is below the minimum threshold.
+    DeltaTooSmall,
 }
 
 impl ErrorCode {
@@ -50,6 +66,13 @@ impl ErrorCode {
             Self::NetworkError => "network-error",
             Self::ChainIdMismatch => "chain-id-mismatch",
             Self::CredentialMismatch => "credential-mismatch",
+            Self::ChannelNotFound => "channel-not-found",
+            Self::ChannelClosed => "channel-closed",
+            Self::InsufficientBalance => "insufficient-balance",
+            Self::InvalidPayload => "invalid-payload",
+            Self::InvalidSignature => "invalid-signature",
+            Self::AmountExceedsDeposit => "amount-exceeds-deposit",
+            Self::DeltaTooSmall => "delta-too-small",
         }
     }
 
@@ -73,6 +96,13 @@ impl ErrorCode {
             Self::NetworkError => "verification-failed",
             Self::ChainIdMismatch => "method-unsupported",
             Self::CredentialMismatch => "malformed-credential",
+            Self::ChannelNotFound => "verification-failed",
+            Self::ChannelClosed => "verification-failed",
+            Self::InsufficientBalance => "payment-insufficient",
+            Self::InvalidPayload => "malformed-credential",
+            Self::InvalidSignature => "verification-failed",
+            Self::AmountExceedsDeposit => "verification-failed",
+            Self::DeltaTooSmall => "verification-failed",
         }
     }
 }
@@ -166,6 +196,41 @@ impl VerificationError {
     pub fn pending(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::NotFound).retryable()
     }
+
+    /// Create a "channel-not-found" verification error.
+    pub fn channel_not_found(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::ChannelNotFound)
+    }
+
+    /// Create a "channel-closed" verification error.
+    pub fn channel_closed(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::ChannelClosed)
+    }
+
+    /// Create an "insufficient-balance" verification error.
+    pub fn insufficient_balance(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::InsufficientBalance)
+    }
+
+    /// Create an "invalid-payload" verification error.
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::InvalidPayload)
+    }
+
+    /// Create an "invalid-signature" verification error.
+    pub fn invalid_signature(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::InvalidSignature)
+    }
+
+    /// Create an "amount-exceeds-deposit" verification error.
+    pub fn amount_exceeds_deposit(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::AmountExceedsDeposit)
+    }
+
+    /// Create a "delta-too-small" verification error.
+    pub fn delta_too_small(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::DeltaTooSmall)
+    }
 }
 
 impl fmt::Display for VerificationError {
@@ -201,6 +266,17 @@ impl From<VerificationError> for MppError {
         match err.code {
             Some(ErrorCode::Expired) => MppError::PaymentExpired(None),
             Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
+            Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(Some(err.message)),
+            Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(Some(err.message)),
+            Some(ErrorCode::InsufficientBalance) => {
+                MppError::InsufficientBalance(Some(err.message))
+            }
+            Some(ErrorCode::InvalidPayload) => MppError::InvalidPayload(Some(err.message)),
+            Some(ErrorCode::InvalidSignature) => MppError::InvalidSignature(Some(err.message)),
+            Some(ErrorCode::AmountExceedsDeposit) => {
+                MppError::AmountExceedsDeposit(Some(err.message))
+            }
+            Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(Some(err.message)),
             Some(ErrorCode::CredentialMismatch)
             | Some(ErrorCode::InvalidAmount)
             | Some(ErrorCode::InvalidRecipient)
@@ -248,11 +324,11 @@ mod tests {
         // Verify IETF spec-compliant error codes (§8.2)
         assert_eq!(ErrorCode::Expired.spec_code(), "payment-expired");
         assert_eq!(ErrorCode::InvalidAmount.spec_code(), "payment-insufficient");
-        assert_eq!(ErrorCode::InvalidCredential.spec_code(), "malformed-credential");
         assert_eq!(
-            ErrorCode::ChainIdMismatch.spec_code(),
-            "method-unsupported"
+            ErrorCode::InvalidCredential.spec_code(),
+            "malformed-credential"
         );
+        assert_eq!(ErrorCode::ChainIdMismatch.spec_code(), "method-unsupported");
         assert_eq!(
             ErrorCode::TransactionFailed.spec_code(),
             "verification-failed"

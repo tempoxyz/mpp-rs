@@ -8,14 +8,14 @@
 //! For convenience, this module re-exports core alloy primitives:
 //!
 //! ```no_run
-//! use mpay::evm::{Address, U256};
+//! use mpp::evm::{Address, U256};
 //! # fn main() {}
 //! ```
 //!
 //! # Examples
 //!
 //! ```
-//! use mpay::evm::{parse_address, parse_amount};
+//! use mpp::evm::{parse_address, parse_amount};
 //!
 //! let addr = parse_address("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2").unwrap();
 //! let amount = parse_amount("1000000").unwrap();
@@ -32,7 +32,7 @@ pub use alloy::primitives::{Address, U256};
 /// # Examples
 ///
 /// ```
-/// use mpay::evm::parse_address;
+/// use mpp::evm::parse_address;
 ///
 /// let addr = parse_address("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2").unwrap();
 /// ```
@@ -46,7 +46,7 @@ pub fn parse_address(s: &str) -> Result<Address> {
 /// # Examples
 ///
 /// ```
-/// use mpay::evm::parse_amount;
+/// use mpp::evm::parse_amount;
 ///
 /// let amount = parse_amount("1000000").unwrap();
 /// assert_eq!(amount.to_string(), "1000000");

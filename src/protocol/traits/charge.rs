@@ -28,9 +28,9 @@ use std::future::Future;
 /// ## Implementing for a custom payment network
 ///
 /// ```
-/// use mpay::protocol::traits::{ChargeMethod, VerificationError};
-/// use mpay::protocol::core::{PaymentCredential, Receipt};
-/// use mpay::protocol::intents::ChargeRequest;
+/// use mpp::protocol::traits::{ChargeMethod, VerificationError};
+/// use mpp::protocol::core::{PaymentCredential, Receipt};
+/// use mpp::protocol::intents::ChargeRequest;
 /// use std::future::Future;
 ///
 /// #[derive(Clone)]
@@ -62,7 +62,7 @@ use std::future::Future;
 ///
 /// ```ignore
 /// use axum::{extract::State, response::IntoResponse};
-/// use mpay::protocol::traits::ChargeMethod;
+/// use mpp::protocol::traits::ChargeMethod;
 ///
 /// async fn verify_payment<M: ChargeMethod>(
 ///     State(method): State<M>,
@@ -153,6 +153,7 @@ mod tests {
     #[derive(Clone)]
     struct TestChargeMethod;
 
+    #[allow(clippy::manual_async_fn)]
     impl ChargeMethod for TestChargeMethod {
         fn method(&self) -> &str {
             "test"

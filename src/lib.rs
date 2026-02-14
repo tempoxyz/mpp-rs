@@ -1,12 +1,12 @@
-//! mpay - Machine Payment Protocol for Rust
+//! mpp - Machine Payment Protocol for Rust
 //!
 //! A Rust library implementing the Web Payment Auth protocol.
 //!
 //! # Quick Start
 //!
 //! ```no_run
-//! use mpay::{PaymentChallenge, PaymentCredential, Receipt, ChargeRequest};
-//! use mpay::{parse_www_authenticate, format_authorization};
+//! use mpp::{PaymentChallenge, PaymentCredential, Receipt, ChargeRequest};
+//! use mpp::{parse_www_authenticate, format_authorization};
 //! # fn main() {}
 //! ```
 //!
@@ -14,7 +14,7 @@
 //!
 #![cfg_attr(feature = "evm", doc = "```no_run")]
 #![cfg_attr(not(feature = "evm"), doc = "```ignore")]
-//! use mpay::{Signer, PrivateKeySigner};
+//! use mpp::{Signer, PrivateKeySigner};
 //! # fn main() {}
 //! ```
 //!
@@ -24,8 +24,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ==================== Internal Modules ====================
 
+pub mod body_digest;
 pub mod error;
+pub mod expires;
+pub mod mcp;
 pub mod protocol;
+pub mod proxy;
+pub mod store;
 pub mod utils;
 
 #[cfg(feature = "evm")]
@@ -46,11 +51,14 @@ pub mod tempo;
 pub use error::{MppError, Result};
 
 // RFC 9457 Problem Details
-pub use error::{PaymentError, PaymentErrorDetails, PROBLEM_TYPE_BASE};
+pub use error::{
+    PaymentError, PaymentErrorDetails, CORE_PROBLEM_TYPE_BASE, STREAM_PROBLEM_TYPE_BASE,
+};
 
 // Core protocol types
 pub use protocol::core::{
-    ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt, ReceiptStatus,
+    compute_challenge_id, ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload,
+    Receipt, ReceiptStatus,
 };
 
 // Header parsing/formatting
@@ -66,8 +74,18 @@ pub use protocol::core::{
     WWW_AUTHENTICATE_HEADER,
 };
 
+// Store types
+pub use store::{FileStore, MemoryStore, Store, StoreError};
+
+#[cfg(all(feature = "server", feature = "tempo"))]
+pub use store::ChannelStoreAdapter;
+
 // Intent types
-pub use protocol::intents::ChargeRequest;
+pub use protocol::intents::{
+    deserialize_request, deserialize_request_typed, from_request, parse_units,
+    request_from_challenge, request_from_challenge_typed, serialize_request, ChargeRequest,
+    Request as PaymentRequest, SessionRequest,
+};
 
 // ==================== Alloy Re-exports ====================
 

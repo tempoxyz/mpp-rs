@@ -17,9 +17,9 @@ use std::future::Future;
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::client::PaymentProvider;
-/// use mpay::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
-/// use mpay::MppError;
+/// use mpp::client::PaymentProvider;
+/// use mpp::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
+/// use mpp::MppError;
 ///
 /// #[derive(Clone)]
 /// struct MyProvider { /* ... */ }
@@ -80,8 +80,8 @@ pub trait PaymentProvider: Clone + Send + Sync {
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::client::TempoProvider;
-/// use mpay::PrivateKeySigner;
+/// use mpp::client::TempoProvider;
+/// use mpp::PrivateKeySigner;
 ///
 /// let signer = PrivateKeySigner::from_bytes(&key)?;
 /// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
@@ -141,19 +141,21 @@ impl PaymentProvider for TempoProvider {
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
-        use alloy::network::{EthereumWallet, TransactionBuilder};
+        use alloy::eips::Encodable2718;
+        use alloy::primitives::{Bytes, TxKind};
         use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
         use tempo_alloy::TempoNetwork;
+        use tempo_primitives::transaction::Call;
+        use tempo_primitives::TempoTransaction;
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
         let address = self.signer.address();
 
-        let wallet = EthereumWallet::from(self.signer.clone());
-        let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-            .wallet(wallet.clone())
-            .connect_http(self.rpc_url.clone());
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
 
         let actual_chain_id: u64 = provider
             .get_chain_id()
@@ -171,24 +173,44 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        // Use TIP-20 interface for proper Tempo token transfers.
-        // For pure transfer calls, Tempo infers the fee token from the token being transferred,
-        // enabling fee sponsorship when the server broadcasts the signed transaction.
-        let token = ITIP20::new(currency, &provider);
-        let call = token.transfer(recipient, amount);
+        // Build TIP-20 transfer calldata.
+        let transfer_data = ITIP20::transferCall::new((recipient, amount)).abi_encode();
 
-        let tx = call
-            .into_transaction_request()
-            .with_from(address)
-            .with_chain_id(expected_chain_id);
-
-        let tx_envelope = tx
-            .build(&wallet)
+        let nonce = provider
+            .get_transaction_count(address)
             .await
+            .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
+
+        let gas_price = provider
+            .get_gas_price()
+            .await
+            .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
+
+        // Build a Tempo transaction (type 0x76) for proper on-chain processing.
+        let tempo_tx = TempoTransaction {
+            chain_id: expected_chain_id,
+            nonce,
+            gas_limit: 1_000_000,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: gas_price,
+            calls: vec![Call {
+                to: TxKind::Call(currency),
+                value: alloy::primitives::U256::ZERO,
+                input: Bytes::from(transfer_data),
+            }],
+            ..Default::default()
+        };
+
+        use alloy::signers::SignerSync;
+        let sig_hash = tempo_tx.signature_hash();
+        let signature = self
+            .signer
+            .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-        let signed_tx_bytes = alloy::rlp::encode(&tx_envelope);
-        let signed_tx_hex = format!("0x{}", hex::encode(&signed_tx_bytes));
+        let signed_tx = tempo_tx.into_signed(signature.into());
+        let tx_bytes = signed_tx.encoded_2718();
+        let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
         let echo = challenge.to_echo();
 
@@ -208,7 +230,7 @@ impl PaymentProvider for TempoProvider {
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::client::{MultiProvider, TempoProvider};
+/// use mpp::client::{MultiProvider, TempoProvider};
 ///
 /// let provider = MultiProvider::new()
 ///     .with(TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?);

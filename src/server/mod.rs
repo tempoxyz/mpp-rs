@@ -3,36 +3,40 @@
 //! # Simple API
 //!
 //! ```ignore
-//! use mpay::server::{Mpay, tempo, TempoConfig};
+//! use mpp::server::{Mpp, tempo, TempoConfig};
 //!
-//! let mpay = Mpay::create(tempo(TempoConfig {
+//! let mpp = Mpp::create(tempo(TempoConfig {
 //!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0xabc...123",
 //! }))?;
 //!
 //! // Charge $0.10 — everything else has smart defaults
-//! let challenge = mpay.charge("0.10")?;
+//! let challenge = mpp.charge("0.10")?;
 //! ```
 //!
 //! # Advanced API
 //!
 //! ```ignore
-//! use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+//! use mpp::server::{Mpp, tempo_provider, TempoChargeMethod};
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 //! let method = TempoChargeMethod::new(provider);
-//! let payment = Mpay::new(method, "api.example.com", "my-server-secret");
+//! let payment = Mpp::new(method, "api.example.com", "my-server-secret");
 //!
 //! let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
 //! let receipt = payment.verify(&credential, &request).await?;
 //! ```
 
 mod amount;
-mod mpay;
+mod mpp;
+pub mod sse;
 
-pub use crate::protocol::traits::{ChargeMethod, ErrorCode, VerificationError};
+#[cfg(feature = "tower")]
+pub mod middleware;
+
+pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};
-pub use mpay::Mpay;
+pub use mpp::{Mpp, SessionVerifyResult};
 
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
@@ -40,6 +44,12 @@ pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::{
     TempoChargeExt, TempoMethodDetails, CHAIN_ID, METHOD_NAME,
+};
+
+#[cfg(feature = "tempo")]
+pub use crate::protocol::methods::tempo::session_method::{
+    InMemoryChannelStore as SessionChannelStore, SessionMethod as TempoSessionMethod,
+    SessionMethodConfig,
 };
 
 // ==================== Simple API ====================
@@ -66,13 +76,29 @@ pub struct TempoBuilder {
     pub(crate) realm: String,
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
+    pub(crate) fee_payer: bool,
+    pub(crate) chain_id: Option<u64>,
+    pub(crate) fee_payer_signer: Option<alloy_signer_local::PrivateKeySigner>,
 }
 
 #[cfg(feature = "tempo")]
 impl TempoBuilder {
     /// Override the RPC URL (default: `https://rpc.tempo.xyz`).
+    ///
+    /// Also auto-detects the chain ID from the URL if not explicitly set:
+    /// - URLs containing "moderato" → chain ID 42431 (Tempo Moderato testnet)
+    /// - Otherwise → chain ID 4217 (Tempo mainnet)
     pub fn rpc_url(mut self, url: &str) -> Self {
         self.rpc_url = url.to_string();
+        if self.chain_id.is_none() {
+            self.chain_id = Some(chain_id_from_rpc_url(url));
+        }
+        self
+    }
+
+    /// Explicitly set the chain ID for challenges.
+    pub fn chain_id(mut self, id: u64) -> Self {
+        self.chain_id = Some(id);
         self
     }
 
@@ -82,7 +108,7 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the secret key (default: reads `MPAY_SECRET_KEY` env var or generates UUID).
+    /// Override the secret key (default: reads `MPP_SECRET_KEY` env var or generates UUID).
     pub fn secret_key(mut self, key: &str) -> Self {
         self.secret_key = Some(key.to_string());
         self
@@ -93,9 +119,43 @@ impl TempoBuilder {
         self.decimals = d;
         self
     }
+
+    /// Enable fee sponsorship for all challenges (default: `false`).
+    ///
+    /// When enabled, all charge and session challenges will include
+    /// `feePayer: true` in their `methodDetails`. You should also call
+    /// [`fee_payer_signer`](Self::fee_payer_signer) to provide the signer
+    /// that will sponsor transaction fees.
+    pub fn fee_payer(mut self, enabled: bool) -> Self {
+        self.fee_payer = enabled;
+        self
+    }
+
+    /// Set the signer used for fee sponsorship.
+    ///
+    /// When clients send transactions with `feePayer: true`, the server
+    /// uses this signer to co-sign and sponsor the transaction gas fees.
+    /// The signer's account must have sufficient balance for gas.
+    pub fn fee_payer_signer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+        self.fee_payer_signer = Some(signer);
+        self
+    }
 }
 
-/// Options for [`Mpay::charge_with_options()`].
+/// Options for [`Mpp::session_challenge_with_details()`].
+#[derive(Debug, Default)]
+pub struct SessionChallengeOptions<'a> {
+    /// Suggested deposit amount in base units.
+    pub suggested_deposit: Option<&'a str>,
+    /// Enable fee sponsorship.
+    pub fee_payer: bool,
+    /// Human-readable description.
+    pub description: Option<&'a str>,
+    /// Custom expiration (ISO 8601). Default: none.
+    pub expires: Option<&'a str>,
+}
+
+/// Options for [`Mpp::charge_with_options()`].
 #[derive(Debug, Default)]
 pub struct ChargeOptions<'a> {
     /// Human-readable description.
@@ -111,29 +171,29 @@ pub struct ChargeOptions<'a> {
 /// Create a Tempo payment method configuration with smart defaults.
 ///
 /// Only `currency` and `recipient` are required. Returns a [`TempoBuilder`]
-/// that can be passed to [`Mpay::create()`].
+/// that can be passed to [`Mpp::create()`].
 ///
 /// # Defaults
 ///
 /// - **rpc_url**: `https://rpc.tempo.xyz`
 /// - **realm**: `"MPP Payment"`
-/// - **secret_key**: reads `MPAY_SECRET_KEY` env var, or generates a random UUID
+/// - **secret_key**: reads `MPP_SECRET_KEY` env var, or generates a random UUID
 /// - **decimals**: `6` (for pathUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example
 ///
 /// ```ignore
-/// use mpay::server::{Mpay, tempo, TempoConfig};
+/// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
 /// // Minimal
-/// let mpay = Mpay::create(tempo(TempoConfig {
+/// let mpp = Mpp::create(tempo(TempoConfig {
 ///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
 /// }))?;
 ///
 /// // With overrides
-/// let mpay = Mpay::create(
+/// let mpp = Mpp::create(
 ///     tempo(TempoConfig {
 ///         currency: "0x20c0000000000000000000000000000000000000",
 ///         recipient: "0xabc...123",
@@ -153,6 +213,22 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         realm: "MPP Payment".to_string(),
         secret_key: None,
         decimals: 6,
+        fee_payer: false,
+        chain_id: None,
+        fee_payer_signer: None,
+    }
+}
+
+/// Derive a chain ID from an RPC URL.
+///
+/// Returns `MODERATO_CHAIN_ID` (42431) for URLs containing "moderato",
+/// otherwise returns `CHAIN_ID` (4217).
+#[cfg(feature = "tempo")]
+fn chain_id_from_rpc_url(url: &str) -> u64 {
+    if url.contains("moderato") {
+        crate::protocol::methods::tempo::MODERATO_CHAIN_ID
+    } else {
+        crate::protocol::methods::tempo::CHAIN_ID
     }
 }
 
