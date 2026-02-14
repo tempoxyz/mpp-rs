@@ -169,6 +169,75 @@ impl TempoSessionProvider {
             .unwrap_or(0)
     }
 
+    /// Send a voucher for a need-voucher SSE event.
+    ///
+    /// Called during SSE streaming when the server emits a `payment-need-voucher`
+    /// event. Updates the internal cumulative amount and POSTs a signed voucher
+    /// credential to the server.
+    ///
+    /// Mirrors the TypeScript SDK's `SessionManager.sse` need-voucher handling.
+    pub async fn send_voucher(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        channel_id_hex: &str,
+        required_cumulative: u128,
+    ) -> Result<(), MppError> {
+        let challenge = self.last_challenge.lock().unwrap().clone()
+            .ok_or_else(|| MppError::InvalidConfig("no challenge available for voucher".into()))?;
+
+        // Find the channel entry by channel ID
+        let key = {
+            let id_map = self.channel_id_to_key.lock().unwrap();
+            id_map.get(channel_id_hex).cloned()
+        };
+        let key = key.ok_or_else(|| MppError::InvalidConfig(
+            format!("no channel found for id {}", channel_id_hex),
+        ))?;
+
+        let mut entry = {
+            let channels = self.channels.lock().unwrap();
+            channels.get(&key).cloned()
+        }.ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+
+        // Update cumulative to at least the required amount
+        if required_cumulative > entry.cumulative_amount {
+            entry.cumulative_amount = required_cumulative;
+        }
+
+        let payload = create_voucher_payload(
+            &self.signer,
+            entry.channel_id,
+            entry.cumulative_amount,
+            entry.escrow_contract,
+            entry.chain_id,
+        )
+        .await?;
+
+        // Update the registry
+        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.notify_update(&entry);
+
+        let credential = build_credential(&challenge, payload, entry.chain_id, self.signer.address());
+        let auth_header = crate::protocol::core::format_authorization(&credential)?;
+
+        let resp = client
+            .post(url)
+            .header("Authorization", auth_header)
+            .send()
+            .await
+            .map_err(|e| MppError::Http(format!("voucher POST failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(MppError::Http(format!(
+                "voucher POST returned status {}",
+                resp.status()
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Close the payment channel and settle on-chain.
     ///
     /// Sends a close credential to the server, which triggers on-chain settlement.
@@ -228,10 +297,23 @@ impl TempoSessionProvider {
             .await
             .map_err(|e| MppError::Http(format!("close request failed: {}", e)))?;
 
-        let receipt = resp
+        let status = resp.status();
+        let receipt_header = resp
             .headers()
             .get("payment-receipt")
             .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MppError::Http(format!(
+                "close request returned {}: {}",
+                status, body
+            )));
+        }
+
+        let receipt = receipt_header
+            .as_deref()
             .and_then(|s| crate::protocol::core::parse_receipt(s).ok());
 
         Ok(receipt)

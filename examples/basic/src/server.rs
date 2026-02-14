@@ -30,7 +30,7 @@ use tempo_alloy::TempoNetwork;
 
 type Payment = Mpay<TempoChargeMethod<mpay::server::TempoProvider>>;
 
-const ALPHA_USD: &str = "0x20c0000000000000000000000000000000000001";
+const PATH_USD: &str = "0x20c0000000000000000000000000000000000000";
 
 const FORTUNES: &[&str] = &[
     "A beautiful, smart, and loving person will come into your life.",
@@ -65,11 +65,12 @@ async fn main() {
 
     let payment = Mpay::create(
         tempo(TempoConfig {
-            currency: ALPHA_USD,
+            currency: PATH_USD,
             recipient: &recipient,
         })
         .rpc_url(&rpc_url)
-        .fee_payer(true),
+        .fee_payer(true)
+        .fee_payer_signer(signer),
     )
     .expect("failed to create payment handler");
 

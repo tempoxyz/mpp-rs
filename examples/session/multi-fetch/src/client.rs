@@ -14,7 +14,7 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
 use mpay::client::{Fetch, TempoSessionProvider};
-use mpay::PrivateKeySigner;
+use mpay::{parse_receipt, PrivateKeySigner};
 use reqwest::Client;
 use tempo_alloy::TempoNetwork;
 
@@ -60,7 +60,16 @@ async fn main() {
 
     let currency_addr: Address = CURRENCY.parse().unwrap();
     let erc20 = IERC20::new(currency_addr, &faucet_provider);
-    let balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
+
+    // Wait for faucet transactions to confirm.
+    let mut balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
+    for _ in 0..30 {
+        if balance_before.to::<u128>() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
+    }
     let balance_before_f64 = balance_before.to::<u128>() as f64 / 1e6;
     println!("Balance: {balance_before_f64} pathUSD");
 
@@ -96,6 +105,14 @@ async fn main() {
                     eprintln!("Error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
                     return;
                 }
+                if i == 1 {
+                    if let Some(r) = resp.headers().get("payment-receipt")
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|s| parse_receipt(s).ok())
+                    {
+                        println!("  Open channel tx: https://explore.moderato.tempo.xyz/tx/{}", r.reference);
+                    }
+                }
                 let _body: serde_json::Value = resp.json().await.unwrap_or_default();
                 let cumulative = session.cumulative() as f64 / 1e6;
                 println!("  {url} → OK (voucher cumulative: {cumulative:.2} pathUSD)");
@@ -117,8 +134,7 @@ async fn main() {
     let close_url = format!("{base_url}/api/scrape");
     match session.close(&client, &close_url).await {
         Ok(Some(receipt)) => {
-            println!("  Channel settled");
-            println!("  Reference: {}", receipt.reference);
+            println!("  Channel settled: https://explore.moderato.tempo.xyz/tx/{}", receipt.reference);
         }
         Ok(None) => {
             println!("  No active channel to close");

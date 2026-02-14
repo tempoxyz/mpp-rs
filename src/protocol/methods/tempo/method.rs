@@ -26,11 +26,9 @@
 use alloy::network::ReceiptResponse;
 use alloy::primitives::{hex, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
-use alloy::rlp::Decodable as _;
 use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::TempoTransaction;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
@@ -398,8 +396,10 @@ where
             tx_bytes
         };
 
-        let tx = TempoTransaction::decode(&mut &tx_data[..])
+        // Decode the signed Tempo transaction (AASigned = tx fields + signature).
+        let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
+        let tx = signed.tx();
 
         // Validate chain_id to prevent cross-chain replay attacks
         if tx.chain_id != expected_chain_id {

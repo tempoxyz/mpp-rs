@@ -5,7 +5,8 @@
 //!
 //! Ported from the TypeScript SDK's `Session.ts`.
 
-use alloy::primitives::{Address, B256};
+use alloy::network::ReceiptResponse;
+use alloy::primitives::{Address, Bytes, B256};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -130,11 +131,11 @@ pub struct OnChainChannel {
     pub payer: Address,
     pub payee: Address,
     pub token: Address,
+    pub authorized_signer: Address,
     pub deposit: u128,
     pub settled: u128,
+    pub close_requested_at: u64,
     pub finalized: bool,
-    pub authorized_signer: Address,
-    pub close_requested_at: u128,
 }
 
 /// Read channel state from the escrow contract.
@@ -154,11 +155,11 @@ async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
                 address payer,
                 address payee,
                 address token,
+                address authorizedSigner,
                 uint128 deposit,
                 uint128 settled,
-                bool finalized,
-                address authorizedSigner,
-                uint128 closeRequestedAt
+                uint64 closeRequestedAt,
+                bool finalized
             );
         }
     }
@@ -209,6 +210,8 @@ pub struct SessionMethod<P> {
     provider: Arc<P>,
     store: Arc<dyn ChannelStore>,
     config: SessionMethodConfig,
+    /// Optional signer for submitting on-chain close transactions.
+    close_signer: Option<Arc<alloy_signer_local::PrivateKeySigner>>,
 }
 
 impl<P> SessionMethod<P> {
@@ -249,7 +252,14 @@ where
             provider: Arc::new(provider),
             store,
             config,
+            close_signer: None,
         }
+    }
+
+    /// Set the signer used for submitting on-chain close transactions.
+    pub fn with_close_signer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+        self.close_signer = Some(Arc::new(signer));
+        self
     }
 
     /// Get the session method configuration.
@@ -302,21 +312,43 @@ where
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, cumulative_amount_str, signature_str, _authorized_signer_str) =
+        let (channel_id_str, cumulative_amount_str, signature_str, _authorized_signer_str, transaction_str) =
             match payload {
                 SessionCredentialPayload::Open {
                     channel_id,
                     cumulative_amount,
                     signature,
                     authorized_signer,
+                    transaction,
                     ..
-                } => (channel_id, cumulative_amount, signature, authorized_signer),
+                } => (channel_id, cumulative_amount, signature, authorized_signer, transaction),
                 _ => unreachable!(),
             };
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
+
+        // Broadcast the client's signed open transaction (approve + escrow.open).
+        let tx_bytes: Bytes = transaction_str
+            .parse()
+            .map_err(|e| VerificationError::invalid_payload(format!("invalid open transaction hex: {}", e)))?;
+        let pending = self
+            .provider
+            .send_raw_transaction(&tx_bytes)
+            .await
+            .map_err(|e| VerificationError::network_error(format!("failed to broadcast open tx: {}", e)))?;
+        let tx_receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| VerificationError::network_error(format!("open tx failed: {}", e)))?;
+        if !tx_receipt.status() {
+            return Err(VerificationError::transaction_failed(format!(
+                "open transaction reverted (tx: {})",
+                tx_receipt.transaction_hash()
+            )));
+        }
+        let open_tx_hash = format!("{}", tx_receipt.transaction_hash());
 
         let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
 
@@ -423,10 +455,10 @@ where
             )
             .await?;
 
-        let state = updated
+        let _state = updated
             .ok_or_else(|| VerificationError::new("failed to create channel"))?;
 
-        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+        Ok(Receipt::success(METHOD_NAME, &open_tx_hash))
     }
 
     /// Handle 'topUp' action.
@@ -436,12 +468,13 @@ where
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, _additional_deposit_str) = match payload {
+        let (channel_id_str, _additional_deposit_str, transaction_str) = match payload {
             SessionCredentialPayload::TopUp {
                 channel_id,
                 additional_deposit,
+                transaction,
                 ..
-            } => (channel_id, additional_deposit),
+            } => (channel_id, additional_deposit, transaction),
             _ => unreachable!(),
         };
 
@@ -453,6 +486,23 @@ where
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
+
+        // Broadcast the client's signed topUp transaction.
+        let tx_bytes: Bytes = transaction_str
+            .parse()
+            .map_err(|e| VerificationError::invalid_payload(format!("invalid topUp transaction hex: {}", e)))?;
+        let pending = self
+            .provider
+            .send_raw_transaction(&tx_bytes)
+            .await
+            .map_err(|e| VerificationError::network_error(format!("failed to broadcast topUp tx: {}", e)))?;
+        let tx_receipt = pending
+            .get_receipt()
+            .await
+            .map_err(|e| VerificationError::network_error(format!("topUp tx failed: {}", e)))?;
+        if !tx_receipt.status() {
+            return Err(VerificationError::transaction_failed("topUp transaction reverted"));
+        }
 
         // Re-read on-chain state after topUp tx is broadcast.
         let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
@@ -616,6 +666,71 @@ where
             ));
         }
 
+        // Submit close transaction on-chain if we have a signer.
+        let close_tx_hash = if let Some(ref signer) = self.close_signer {
+            use alloy::eips::Encodable2718;
+            use alloy::primitives::Bytes;
+            use alloy::signers::SignerSync;
+            use alloy::sol_types::SolCall;
+            use tempo_primitives::TempoTransaction;
+            use tempo_primitives::transaction::Call;
+
+            alloy::sol! {
+                interface IEscrowClose {
+                    function close(bytes32 channelId, uint128 cumulativeAmount, bytes calldata signature) external;
+                }
+            }
+
+            let close_data = IEscrowClose::closeCall::new((
+                channel_id_b256.into(),
+                cumulative_amount,
+                Bytes::from(sig_bytes.clone()),
+            ))
+            .abi_encode();
+
+            let nonce = self.provider
+                .get_transaction_count(signer.address())
+                .await
+                .map_err(|e| VerificationError::network_error(format!("failed to get nonce: {}", e)))?;
+            let gas_price = self.provider
+                .get_gas_price()
+                .await
+                .map_err(|e| VerificationError::network_error(format!("failed to get gas price: {}", e)))?;
+
+            let tempo_tx = TempoTransaction {
+                chain_id,
+                nonce,
+                gas_limit: 2_000_000,
+                max_fee_per_gas: gas_price,
+                max_priority_fee_per_gas: gas_price,
+                calls: vec![Call {
+                    to: alloy::primitives::TxKind::Call(escrow),
+                    value: alloy::primitives::U256::ZERO,
+                    input: Bytes::from(close_data),
+                }],
+                ..Default::default()
+            };
+
+            let sig_hash = tempo_tx.signature_hash();
+            let signature = signer.sign_hash_sync(&sig_hash)
+                .map_err(|e| VerificationError::network_error(format!("failed to sign close tx: {}", e)))?;
+            let signed_tx = tempo_tx.into_signed(signature.into());
+            let tx_bytes = Bytes::from(signed_tx.encoded_2718());
+
+            let pending = self.provider
+                .send_raw_transaction(&tx_bytes)
+                .await
+                .map_err(|e| VerificationError::network_error(format!("failed to send close tx: {}", e)))?;
+            let receipt = pending
+                .get_receipt()
+                .await
+                .map_err(|e| VerificationError::network_error(format!("close tx failed: {}", e)))?;
+
+            Some(format!("{}", receipt.transaction_hash))
+        } else {
+            None
+        };
+
         // Finalize in store.
         let channel_id_owned = channel_id_str.clone();
         let updated = self
@@ -638,8 +753,9 @@ where
             )
             .await?;
 
-        let state = updated.unwrap_or(channel);
-        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+        let reference = close_tx_hash
+            .unwrap_or_else(|| updated.map(|s| s.channel_id).unwrap_or_else(|| channel.channel_id.clone()));
+        Ok(Receipt::success(METHOD_NAME, &reference))
     }
 
     /// Shared logic for verifying an incremental voucher and updating channel state.
@@ -655,7 +771,7 @@ where
         deposit: u128,
         settled: u128,
         finalized: bool,
-        close_requested_at: u128,
+        close_requested_at: u64,
     ) -> Result<Receipt, VerificationError> {
         if finalized {
             return Err(VerificationError::channel_closed(
@@ -758,6 +874,20 @@ where
         serde_json::to_value(details).ok()
     }
 
+    fn respond(
+        &self,
+        credential: &PaymentCredential,
+        _receipt: &Receipt,
+    ) -> Option<serde_json::Value> {
+        // Management actions (open, topUp, close) short-circuit normal response handling.
+        // Only voucher actions proceed to content delivery.
+        let payload: SessionCredentialPayload = credential.payload_as().ok()?;
+        match payload {
+            SessionCredentialPayload::Voucher { .. } => None,
+            _ => Some(serde_json::json!({ "status": "ok" })),
+        }
+    }
+
     fn verify_session(
         &self,
         credential: &PaymentCredential,
@@ -768,12 +898,14 @@ where
         let provider = Arc::clone(&self.provider);
         let store = Arc::clone(&self.store);
         let config = self.config.clone();
+        let close_signer = self.close_signer.clone();
 
         async move {
             let this = SessionMethod {
                 provider,
                 store,
                 config,
+                close_signer,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {

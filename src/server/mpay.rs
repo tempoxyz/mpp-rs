@@ -77,6 +77,7 @@ pub struct Mpay<M, S = ()> {
     recipient: Option<String>,
     decimals: u32,
     fee_payer: bool,
+    chain_id: Option<u64>,
 }
 
 impl<M> Mpay<M, ()>
@@ -96,6 +97,7 @@ where
             recipient: None,
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            chain_id: None,
         }
     }
 }
@@ -115,6 +117,7 @@ where
             recipient: self.recipient,
             decimals: self.decimals,
             fee_payer: self.fee_payer,
+            chain_id: self.chain_id,
         }
     }
 
@@ -197,8 +200,17 @@ where
             external_id: options.external_id.map(|s| s.to_string()),
             ..Default::default()
         };
-        if options.fee_payer || self.fee_payer {
-            request.method_details = Some(serde_json::json!({"feePayer": true}));
+        {
+            let mut details = serde_json::Map::new();
+            if options.fee_payer || self.fee_payer {
+                details.insert("feePayer".into(), serde_json::json!(true));
+            }
+            if let Some(chain_id) = self.chain_id {
+                details.insert("chainId".into(), serde_json::json!(chain_id));
+            }
+            if !details.is_empty() {
+                request.method_details = Some(serde_json::Value::Object(details));
+            }
         }
         crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.secret_key,
@@ -495,7 +507,10 @@ impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
         });
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
-        let method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
+        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
+        if let Some(signer) = builder.fee_payer_signer {
+            method = method.with_fee_payer(signer);
+        }
 
         Ok(Self {
             method,
@@ -506,6 +521,7 @@ impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
             recipient: Some(builder.recipient),
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
+            chain_id: builder.chain_id,
         })
     }
 }

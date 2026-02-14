@@ -80,14 +80,15 @@ async fn main() {
             chain_id: CHAIN_ID,
             min_voucher_delta: 0,
         },
-    );
+    )
+    .with_close_signer(signer);
 
     // Add session method to the payment handler.
     let payment = base_payment.with_session_method(session_method);
 
     let app = Router::new()
         .route("/api/health", get(health))
-        .route("/api/scrape", get(scrape))
+        .route("/api/scrape", get(scrape).post(scrape))
         .with_state(Arc::new(payment));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -112,8 +113,15 @@ async fn scrape(
             Ok(result) => {
                 // If the session method returned a management response (open/close/topUp),
                 // return it directly instead of the scraped content.
+                // Include the payment-receipt header so the client can read tx hashes.
                 if let Some(mgmt) = result.management_response {
-                    return (StatusCode::OK, axum::Json(mgmt)).into_response();
+                    let receipt_header = result.receipt.to_header().unwrap_or_default();
+                    return (
+                        StatusCode::OK,
+                        [("payment-receipt", receipt_header)],
+                        axum::Json(mgmt),
+                    )
+                        .into_response();
                 }
 
                 // Payment verified — return the scraped content with a receipt.

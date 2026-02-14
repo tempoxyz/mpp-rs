@@ -96,7 +96,8 @@ async fn main() {
             chain_id,
             min_voucher_delta: 0,
         },
-    );
+    )
+    .with_close_signer(signer);
 
     let payment = base.with_session_method(session_method);
 

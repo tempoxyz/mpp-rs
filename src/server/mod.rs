@@ -75,13 +75,28 @@ pub struct TempoBuilder {
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
     pub(crate) fee_payer: bool,
+    pub(crate) chain_id: Option<u64>,
+    pub(crate) fee_payer_signer: Option<alloy_signer_local::PrivateKeySigner>,
 }
 
 #[cfg(feature = "tempo")]
 impl TempoBuilder {
     /// Override the RPC URL (default: `https://rpc.tempo.xyz`).
+    ///
+    /// Also auto-detects the chain ID from the URL if not explicitly set:
+    /// - URLs containing "moderato" → chain ID 42431 (Tempo Moderato testnet)
+    /// - Otherwise → chain ID 4217 (Tempo mainnet)
     pub fn rpc_url(mut self, url: &str) -> Self {
         self.rpc_url = url.to_string();
+        if self.chain_id.is_none() {
+            self.chain_id = Some(chain_id_from_rpc_url(url));
+        }
+        self
+    }
+
+    /// Explicitly set the chain ID for challenges.
+    pub fn chain_id(mut self, id: u64) -> Self {
+        self.chain_id = Some(id);
         self
     }
 
@@ -106,9 +121,21 @@ impl TempoBuilder {
     /// Enable fee sponsorship for all challenges (default: `false`).
     ///
     /// When enabled, all charge and session challenges will include
-    /// `feePayer: true` in their `methodDetails`.
+    /// `feePayer: true` in their `methodDetails`. You should also call
+    /// [`fee_payer_signer`](Self::fee_payer_signer) to provide the signer
+    /// that will sponsor transaction fees.
     pub fn fee_payer(mut self, enabled: bool) -> Self {
         self.fee_payer = enabled;
+        self
+    }
+
+    /// Set the signer used for fee sponsorship.
+    ///
+    /// When clients send transactions with `feePayer: true`, the server
+    /// uses this signer to co-sign and sponsor the transaction gas fees.
+    /// The signer's account must have sufficient balance for gas.
+    pub fn fee_payer_signer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+        self.fee_payer_signer = Some(signer);
         self
     }
 }
@@ -185,6 +212,21 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         secret_key: None,
         decimals: 6,
         fee_payer: false,
+        chain_id: None,
+        fee_payer_signer: None,
+    }
+}
+
+/// Derive a chain ID from an RPC URL.
+///
+/// Returns `MODERATO_CHAIN_ID` (42431) for URLs containing "moderato",
+/// otherwise returns `CHAIN_ID` (4217).
+#[cfg(feature = "tempo")]
+fn chain_id_from_rpc_url(url: &str) -> u64 {
+    if url.contains("moderato") {
+        crate::protocol::methods::tempo::MODERATO_CHAIN_ID
+    } else {
+        crate::protocol::methods::tempo::CHAIN_ID
     }
 }
 

@@ -20,7 +20,7 @@
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
 use mpay::client::{Fetch, TempoProvider};
-use mpay::PrivateKeySigner;
+use mpay::{parse_receipt, PrivateKeySigner};
 use reqwest::Client;
 use tempo_alloy::TempoNetwork;
 
@@ -50,6 +50,8 @@ async fn main() {
         .raw_request("tempo_fundAddress".into(), (signer.address(),))
         .await
         .expect("faucet funding failed");
+    // Wait briefly for faucet transactions to confirm.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let provider =
         TempoProvider::new(signer, &rpc_url).expect("failed to create payment provider");
@@ -67,6 +69,16 @@ async fn main() {
         .send_with_payment(&provider)
         .await
         .expect("request failed");
+
+    println!("Status: {}", resp.status());
+
+    if let Some(receipt_hdr) = resp.headers().get("payment-receipt") {
+        if let Ok(receipt_str) = receipt_hdr.to_str() {
+            if let Ok(receipt) = parse_receipt(receipt_str) {
+                println!("Payment tx: https://explore.moderato.tempo.xyz/tx/{}", receipt.reference);
+            }
+        }
+    }
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse response");
 

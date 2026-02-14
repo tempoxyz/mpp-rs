@@ -237,7 +237,7 @@ where
     let tempo_tx = TempoTransaction {
         chain_id: options.chain_id,
         nonce,
-        gas_limit: 205_000, // base estimate + 5k buffer, matching TS SDK
+        gas_limit: 2_000_000,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         calls,

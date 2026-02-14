@@ -16,7 +16,7 @@ use alloy::sol;
 use futures::StreamExt;
 use mpay::client::{Fetch, TempoSessionProvider};
 use mpay::server::sse::{parse_event, SseEvent};
-use mpay::PrivateKeySigner;
+use mpay::{parse_receipt, PrivateKeySigner};
 use reqwest::Client;
 use tempo_alloy::TempoNetwork;
 
@@ -57,7 +57,16 @@ async fn main() {
 
     let currency_addr: Address = CURRENCY.parse().unwrap();
     let erc20 = IERC20::new(currency_addr, &faucet_provider);
-    let balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
+
+    // Wait for faucet transactions to confirm.
+    let mut balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
+    for _ in 0..30 {
+        if balance_before.to::<u128>() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
+    }
     println!("Balance: {} pathUSD", balance_before.to::<u128>() as f64 / 1e6);
 
     // Create a session provider with max deposit of 1 pathUSD (1_000_000 base units).
@@ -84,12 +93,15 @@ async fn main() {
         base_url,
         urlencoding::encode(&prompt)
     );
+    let voucher_url = format!("{}/api/chat", base_url);
 
     println!("\n--- Streaming (prompt: \"{}\") ---", prompt);
 
     let client = Client::new();
 
-    let response = match client.get(&url).send_with_payment(&provider).await {
+    // Step 1: send_with_payment handles the 402 → open channel flow.
+    // The server returns a management JSON response (not SSE) for the channel open.
+    let open_resp = match client.get(&url).send_with_payment(&provider).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -97,10 +109,34 @@ async fn main() {
         }
     };
 
-    let status = response.status();
-    if !status.is_success() {
+    if let Some(r) = open_resp.headers().get("payment-receipt")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| parse_receipt(s).ok())
+    {
+        println!("Open channel tx: https://explore.moderato.tempo.xyz/tx/{}", r.reference);
+    }
+    let open_status = open_resp.status();
+    if !open_status.is_success() {
+        let body = open_resp.text().await.unwrap_or_default();
+        eprintln!("Server returned {}: {}", open_status, body);
+        std::process::exit(1);
+    }
+    // Consume the management response body.
+    let _ = open_resp.text().await;
+
+    // Step 2: Send a second request with a voucher to start the actual SSE stream.
+    let response = match client.get(&url).send_with_payment(&provider).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error starting stream: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let stream_status = response.status();
+    if !stream_status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        eprintln!("Server returned {}: {}", status, body);
+        eprintln!("Server returned {}: {}", stream_status, body);
         std::process::exit(1);
     }
 
@@ -142,10 +178,17 @@ async fn main() {
                         }
                     }
                     SseEvent::PaymentNeedVoucher(nv) => {
+                        let required: u128 = nv.required_cumulative.parse().unwrap_or(0);
                         eprintln!(
-                            "\n[need-voucher: channel={} required={}]",
-                            nv.channel_id, nv.required_cumulative
+                            "\n[voucher: channel={} required={}]",
+                            nv.channel_id, required
                         );
+                        if let Err(e) = provider
+                            .send_voucher(&client, &voucher_url, &nv.channel_id, required)
+                            .await
+                        {
+                            eprintln!("[voucher failed: {}]", e);
+                        }
                     }
                 }
             }
@@ -161,11 +204,10 @@ async fn main() {
     let close_url = format!("{}/api/chat", base_url);
     match provider.close(&client, &close_url).await {
         Ok(Some(receipt)) => {
-            println!("  Channel settled");
-            println!("  Reference: {}", receipt.reference);
+            println!("  Channel settled: https://explore.moderato.tempo.xyz/tx/{}", receipt.reference);
         }
         Ok(None) => {
-            println!("  No active channel to close");
+            println!("  Close sent (no receipt returned)");
         }
         Err(e) => {
             eprintln!("  Close failed: {e}");
