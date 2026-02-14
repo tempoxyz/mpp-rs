@@ -5,7 +5,7 @@ A barebones example demonstrating a payment-gated Fortune Teller API using the M
 The server exposes two endpoints:
 
 - `GET /api/health` — Free, returns `{"status": "ok"}`
-- `GET /api/fortune` — Costs $1.00 in alphaUSD, returns a random fortune with a payment receipt
+- `GET /api/fortune` — Costs $1.00 in pathUSD, returns a random fortune with a payment receipt
 
 ## Running
 
