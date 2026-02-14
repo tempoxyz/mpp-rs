@@ -83,7 +83,7 @@ async fn main() {
     let body: serde_json::Value = resp.json().await.expect("failed to parse response");
 
     if let Some(fortune) = body.get("fortune").and_then(|v| v.as_str()) {
-        println!("\n🔮 {fortune}");
+        println!("\nFortune: {fortune}");
     } else {
         println!("\nResponse: {body}");
     }
