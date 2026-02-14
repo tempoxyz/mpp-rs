@@ -51,6 +51,7 @@ pub struct PaidEndpoint {
 
 impl Service {
     /// Start building a new service.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(id: impl Into<String>, base_url: impl Into<String>) -> ServiceBuilder {
         ServiceBuilder {
             id: id.into(),
@@ -117,7 +118,7 @@ const HTTP_METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD",
 
 /// Parse a route pattern like `"POST /v1/chat/completions"` into (method, path).
 fn parse_route_pattern(pattern: &str) -> (Option<String>, String) {
-    let tokens: Vec<&str> = pattern.trim().split_whitespace().collect();
+    let tokens: Vec<&str> = pattern.split_whitespace().collect();
     if tokens.len() >= 2 && HTTP_METHODS.contains(&tokens[0].to_uppercase().as_str()) {
         (Some(tokens[0].to_uppercase()), tokens[1..].join(" "))
     } else {

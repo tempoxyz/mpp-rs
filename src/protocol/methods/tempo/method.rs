@@ -542,6 +542,7 @@ where
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl<P> crate::protocol::traits::SessionMethod for ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,

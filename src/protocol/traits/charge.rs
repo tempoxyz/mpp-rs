@@ -153,6 +153,7 @@ mod tests {
     #[derive(Clone)]
     struct TestChargeMethod;
 
+    #[allow(clippy::manual_async_fn)]
     impl ChargeMethod for TestChargeMethod {
         fn method(&self) -> &str {
             "test"

@@ -54,6 +54,7 @@ pub trait PaymentVerifier: Send + Sync + 'static {
 // ==================== FnVerifier ====================
 
 /// A [`PaymentVerifier`] built from closures.
+#[allow(clippy::type_complexity)]
 pub struct FnVerifier {
     challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
     verify_fn: Box<
@@ -230,6 +231,7 @@ fn error_response<B: Default>(status: StatusCode, _message: &str) -> Response<B>
 /// A [`PaymentVerifier`] backed by an `Mpp` instance's charge flow.
 ///
 /// Created via [`PaymentLayer::charge()`].
+#[allow(clippy::type_complexity)]
 struct ChargeVerifier {
     /// Pre-formatted `WWW-Authenticate` header value.
     challenge_header: String,

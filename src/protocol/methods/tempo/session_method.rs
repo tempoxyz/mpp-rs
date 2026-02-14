@@ -68,6 +68,7 @@ pub trait ChannelStore: Send + Sync {
         Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
     >;
 
+    #[allow(clippy::type_complexity)]
     fn update_channel(
         &self,
         channel_id: &str,
@@ -165,13 +166,9 @@ async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     }
 
     let escrow = IEscrow::new(escrow_contract, provider);
-    let result = escrow
-        .getChannel(channel_id.into())
-        .call()
-        .await
-        .map_err(|e| {
-            VerificationError::network_error(format!("Failed to read on-chain channel: {}", e))
-        })?;
+    let result = escrow.getChannel(channel_id).call().await.map_err(|e| {
+        VerificationError::network_error(format!("Failed to read on-chain channel: {}", e))
+    })?;
 
     Ok(OnChainChannel {
         payer: result.payer,
@@ -695,7 +692,7 @@ where
             }
 
             let close_data = IEscrowClose::closeCall::new((
-                channel_id_b256.into(),
+                channel_id_b256,
                 cumulative_amount,
                 Bytes::from(sig_bytes.clone()),
             ))
@@ -781,6 +778,7 @@ where
     }
 
     /// Shared logic for verifying an incremental voucher and updating channel state.
+    #[allow(clippy::too_many_arguments)]
     async fn verify_and_accept_voucher(
         &self,
         channel_id_str: &str,
@@ -1208,7 +1206,7 @@ mod tests {
 
     #[test]
     fn test_parse_channel_id_valid() {
-        let id = "0xabababababababababababababababababababababababababababababababab";
+        let _id = "0xabababababababababababababababababababababababababababababababab";
         // 32 bytes = 64 hex chars + 0x prefix
         let padded = format!("0x{}", "ab".repeat(32));
         let result = SessionMethod::<()>::parse_channel_id(&padded);

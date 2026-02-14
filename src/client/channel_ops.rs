@@ -227,7 +227,7 @@ where
         options.payee,
         options.currency,
         options.deposit,
-        salt.into(),
+        salt,
         authorized_signer,
     ))
     .abi_encode();
@@ -347,7 +347,7 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
         }
     }
 
-    let call_data = IEscrowRead::getChannelCall::new((channel_id.into(),)).abi_encode();
+    let call_data = IEscrowRead::getChannelCall::new((channel_id,)).abi_encode();
 
     use tempo_alloy::rpc::TempoTransactionRequest;
 

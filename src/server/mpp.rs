@@ -538,6 +538,7 @@ mod tests {
     #[derive(Clone)]
     struct MockMethod;
 
+    #[allow(clippy::manual_async_fn)]
     impl ChargeMethod for MockMethod {
         fn method(&self) -> &str {
             "mock"
@@ -555,6 +556,7 @@ mod tests {
     #[derive(Clone)]
     struct SuccessReceiptMethod;
 
+    #[allow(clippy::manual_async_fn)]
     impl ChargeMethod for SuccessReceiptMethod {
         fn method(&self) -> &str {
             "mock"
@@ -572,6 +574,7 @@ mod tests {
     #[derive(Clone)]
     struct FailedTransactionMethod;
 
+    #[allow(clippy::manual_async_fn)]
     impl ChargeMethod for FailedTransactionMethod {
         fn method(&self) -> &str {
             "mock"

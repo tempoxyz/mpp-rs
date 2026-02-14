@@ -42,6 +42,7 @@ use crate::protocol::methods::tempo::session::TempoSessionExt;
 /// let credential = provider.pay(&challenge).await?;
 /// ```
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 pub struct TempoSessionProvider {
     signer: alloy_signer_local::PrivateKeySigner,
     rpc_url: reqwest::Url,

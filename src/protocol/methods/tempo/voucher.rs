@@ -69,7 +69,7 @@ pub async fn sign_voucher(
     };
 
     let voucher = Voucher {
-        channelId: channel_id.into(),
+        channelId: channel_id,
         cumulativeAmount: cumulative_amount,
     };
 
@@ -172,7 +172,7 @@ fn verify_voucher_ecdsa(
     };
 
     let voucher = Voucher {
-        channelId: channel_id.into(),
+        channelId: channel_id,
         cumulativeAmount: cumulative_amount,
     };
 
@@ -293,7 +293,6 @@ mod tests {
     #[tokio::test]
     async fn test_sign_voucher_roundtrip() {
         use alloy::primitives::{Address, B256};
-        use alloy::signers::Signer as _;
         use alloy_signer_local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
@@ -327,7 +326,7 @@ mod tests {
         };
 
         let voucher = Voucher {
-            channelId: channel_id.into(),
+            channelId: channel_id,
             cumulativeAmount: cumulative_amount,
         };
 
@@ -350,7 +349,6 @@ mod tests {
     #[tokio::test]
     async fn test_verify_voucher_roundtrip() {
         use alloy::primitives::{Address, B256};
-        use alloy::signers::Signer as _;
         use alloy_signer_local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
@@ -547,7 +545,6 @@ mod tests {
     #[tokio::test]
     async fn test_verify_voucher_ecdsa_still_works() {
         use alloy::primitives::{Address, B256};
-        use alloy::signers::Signer as _;
         use alloy_signer_local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();

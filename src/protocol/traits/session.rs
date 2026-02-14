@@ -119,6 +119,7 @@ mod tests {
     #[derive(Clone)]
     struct TestSessionMethod;
 
+    #[allow(clippy::manual_async_fn)]
     impl SessionMethod for TestSessionMethod {
         fn method(&self) -> &str {
             "test"

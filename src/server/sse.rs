@@ -300,11 +300,11 @@ where
         // Emit final receipt
         if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
             let mut receipt = StreamReceipt::new(
-                &now_iso8601(),
+                now_iso8601(),
                 &challenge_id,
                 &channel_id,
-                &ch.highest_voucher_amount.to_string(),
-                &ch.spent.to_string(),
+                ch.highest_voucher_amount.to_string(),
+                ch.spent.to_string(),
             );
             receipt.units = Some(ch.units);
             let event = format_receipt_event(&receipt);

@@ -157,6 +157,7 @@ impl PaymentChallenge {
     ///
     /// Unlike [`with_secret_key`], this includes `expires` and `digest` in the HMAC
     /// computation, matching the full TS SDK `Challenge.from()` behavior.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_secret_key_full(
         secret_key: &str,
         realm: impl Into<String>,
