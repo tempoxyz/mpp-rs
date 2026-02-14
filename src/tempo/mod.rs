@@ -10,13 +10,13 @@
 //! - Constants: [`CHAIN_ID`], [`MODERATO_CHAIN_ID`], [`METHOD_NAME`]
 //!
 //! For client/server specific types, use:
-//! - `mpay::client::TempoProvider` (requires `client` + `http`)
-//! - `mpay::server::TempoChargeMethod` (requires `server`)
+//! - `mpp::client::TempoProvider` (requires `client` + `http`)
+//! - `mpp::server::TempoChargeMethod` (requires `server`)
 //!
 //! # Example
 //!
 //! ```ignore
-//! use mpay::tempo::{ChargeRequest, TempoChargeExt, CHAIN_ID};
+//! use mpp::tempo::{ChargeRequest, TempoChargeExt, CHAIN_ID};
 //!
 //! let req: ChargeRequest = challenge.request.decode()?;
 //! if req.fee_payer() {
@@ -33,6 +33,9 @@ pub use crate::protocol::methods::tempo::{
 };
 
 #[cfg(feature = "evm")]
+pub mod attribution;
+
+#[cfg(feature = "evm")]
 pub use crate::protocol::methods::tempo::{
     compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION,
 };
@@ -45,6 +48,7 @@ pub use crate::protocol::methods::tempo::session_method::{
     SessionMethod as TempoSessionMethod,
     SessionMethodConfig,
     InMemoryChannelStore as SessionChannelStore,
+    ChannelStore, ChannelState,
 };
 
 #[cfg(feature = "client")]

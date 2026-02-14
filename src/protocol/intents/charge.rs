@@ -16,7 +16,7 @@ use crate::error::{MppError, Result};
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::intents::ChargeRequest;
+/// use mpp::protocol::intents::ChargeRequest;
 ///
 /// let req = ChargeRequest {
 ///     amount: "1000000".to_string(),

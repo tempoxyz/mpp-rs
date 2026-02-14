@@ -55,14 +55,14 @@ Releases are **not scheduled** - they happen when you merge the RC PR:
 
 | Artifact | Location | When |
 |----------|----------|------|
-| Crate | [crates.io/crates/mpay](https://crates.io/crates/mpay) | RC PR merged |
+| Crate | [crates.io/crates/mpp](https://crates.io/crates/mpp) | RC PR merged |
 | GitHub Release | [Releases page](https://github.com/tempoxyz/mpay-rs/releases) | RC PR merged |
 | Changelog | `CHANGELOG.md` in repo | RC PR merged |
-| Git tag | `mpay@x.y.z` | RC PR merged |
+| Git tag | `mpp@x.y.z` | RC PR merged |
 
 ### Version Tags
 
-Tags follow the format `mpay@x.y.z` (e.g., `mpay@0.2.1`). For workspaces with multiple crates, each crate gets its own tag.
+Tags follow the format `mpp@x.y.z` (e.g., `mpp@0.2.1`). For workspaces with multiple crates, each crate gets its own tag.
 
 ## Manual Commands
 
@@ -92,7 +92,7 @@ Changelogs are markdown files in `.changelog/` with frontmatter specifying bump 
 
 ```markdown
 ---
-mpay: minor
+mpp: minor
 ---
 
 Added new payment provider support.

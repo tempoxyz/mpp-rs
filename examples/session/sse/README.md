@@ -1,8 +1,8 @@
 # Session SSE Example
 
-Pay-per-token LLM streaming using Server-Sent Events (SSE) with mpay session payments.
+Pay-per-token LLM streaming using Server-Sent Events (SSE) with mpp session payments.
 
-This mirrors the TypeScript `session/sse` example from the mpay SDK.
+This mirrors the TypeScript `session/sse` example from the mpp SDK.
 
 ## How it works
 
@@ -28,6 +28,6 @@ cargo run --bin sse-client -- "What is the meaning of life?"
 ## Architecture
 
 - **Server** (`src/server.rs`): Axum server with session payment verification
-  and metered SSE streaming via `mpay::server::sse::serve()`.
+  and metered SSE streaming via `mpp::server::sse::serve()`.
 - **Client** (`src/client.rs`): reqwest client with `TempoSessionProvider` for
   automatic channel lifecycle management and SSE event parsing.

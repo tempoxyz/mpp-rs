@@ -43,7 +43,7 @@
 //! # Examples
 //!
 //! ```
-//! use mpay::protocol::core::*;
+//! use mpp::protocol::core::*;
 //!
 //! // Parse a challenge
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
@@ -51,7 +51,7 @@
 //! println!("Method: {}, Intent: {}", challenge.method, challenge.intent);
 //!
 //! // Decode the request to a typed struct
-//! use mpay::protocol::intents::ChargeRequest;
+//! use mpp::protocol::intents::ChargeRequest;
 //! if challenge.intent.is_charge() {
 //!     let req: ChargeRequest = challenge.request.decode().unwrap();
 //!     println!("Amount: {}", req.amount);

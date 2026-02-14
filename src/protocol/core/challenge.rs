@@ -16,8 +16,8 @@ use super::types::{Base64UrlJson, IntentName, MethodName, PayloadType, ReceiptSt
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::core::{PaymentChallenge, parse_www_authenticate};
-/// use mpay::protocol::intents::ChargeRequest;
+/// use mpp::protocol::core::{PaymentChallenge, parse_www_authenticate};
+/// use mpp::protocol::intents::ChargeRequest;
 ///
 /// let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 /// let challenge = parse_www_authenticate(header).unwrap();
@@ -65,8 +65,8 @@ impl PaymentChallenge {
     /// # Examples
     ///
     /// ```
-    /// use mpay::PaymentChallenge;
-    /// use mpay::protocol::core::Base64UrlJson;
+    /// use mpp::PaymentChallenge;
+    /// use mpp::protocol::core::Base64UrlJson;
     ///
     /// let challenge = PaymentChallenge::new(
     ///     "explicit-id-123",
@@ -108,8 +108,8 @@ impl PaymentChallenge {
     /// # Examples
     ///
     /// ```
-    /// use mpay::PaymentChallenge;
-    /// use mpay::protocol::core::Base64UrlJson;
+    /// use mpp::PaymentChallenge;
+    /// use mpp::protocol::core::Base64UrlJson;
     ///
     /// let challenge = PaymentChallenge::with_secret_key(
     ///     "my-server-secret",
@@ -281,7 +281,7 @@ impl PaymentChallenge {
     /// # Examples
     ///
     /// ```
-    /// use mpay::PaymentChallenge;
+    /// use mpp::PaymentChallenge;
     ///
     /// # let challenge = PaymentChallenge::from_header(
     /// #     r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30""#
@@ -314,7 +314,7 @@ impl PaymentChallenge {
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::core::compute_challenge_id;
+/// use mpp::protocol::core::compute_challenge_id;
 ///
 /// let id = compute_challenge_id(
 ///     "my-secret-key",

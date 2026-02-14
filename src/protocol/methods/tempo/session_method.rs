@@ -28,7 +28,7 @@ use crate::protocol::traits::{SessionMethod as SessionMethodTrait, VerificationE
 /// the server has accepted, and the current session's spend counters.
 ///
 /// Mirrors the TypeScript `ChannelStore.State` interface.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChannelState {
     pub channel_id: String,
     pub chain_id: u64,

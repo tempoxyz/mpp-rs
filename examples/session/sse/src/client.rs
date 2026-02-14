@@ -14,9 +14,9 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
 use futures::StreamExt;
-use mpay::client::{Fetch, TempoSessionProvider};
-use mpay::server::sse::{parse_event, SseEvent};
-use mpay::{parse_receipt, PrivateKeySigner};
+use mpp::client::{Fetch, TempoSessionProvider};
+use mpp::server::sse::{parse_event, SseEvent};
+use mpp::{parse_receipt, PrivateKeySigner};
 use reqwest::Client;
 use tempo_alloy::TempoNetwork;
 

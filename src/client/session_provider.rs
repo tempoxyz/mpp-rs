@@ -29,8 +29,8 @@ use crate::protocol::methods::tempo::session::TempoSessionExt;
 /// # Examples
 ///
 /// ```ignore
-/// use mpay::client::TempoSessionProvider;
-/// use mpay::PrivateKeySigner;
+/// use mpp::client::TempoSessionProvider;
+/// use mpp::PrivateKeySigner;
 ///
 /// let signer = PrivateKeySigner::random();
 /// let provider = TempoSessionProvider::new(

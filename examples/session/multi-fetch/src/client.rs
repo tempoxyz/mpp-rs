@@ -13,8 +13,8 @@
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
-use mpay::client::{Fetch, TempoSessionProvider};
-use mpay::{parse_receipt, PrivateKeySigner};
+use mpp::client::{Fetch, TempoSessionProvider};
+use mpp::{parse_receipt, PrivateKeySigner};
 use reqwest::Client;
 use tempo_alloy::TempoNetwork;
 

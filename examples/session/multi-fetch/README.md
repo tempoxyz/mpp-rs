@@ -1,6 +1,6 @@
 # Session Multi-Fetch Example
 
-Demonstrates multiple paid requests over a single payment channel using the mpay Rust SDK.
+Demonstrates multiple paid requests over a single payment channel using the mpp Rust SDK.
 
 This is the Rust port of the TypeScript `session/multi-fetch` example.
 

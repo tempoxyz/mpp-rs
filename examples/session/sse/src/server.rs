@@ -1,7 +1,7 @@
 //! SSE streaming payment server example.
 //!
 //! Demonstrates pay-per-token LLM streaming using Server-Sent Events (SSE)
-//! with mpay's session payment flow.
+//! with mpp's session payment flow.
 //!
 //! # Running
 //!
@@ -18,14 +18,14 @@ use axum::{
     Router,
 };
 use futures::stream;
-use mpay::server::{
-    Mpay, SessionChannelStore, SessionChallengeOptions, TempoChargeMethod, TempoSessionMethod,
+use mpp::server::{
+    Mpp, SessionChannelStore, SessionChallengeOptions, TempoChargeMethod, TempoSessionMethod,
     tempo, TempoConfig, SessionMethodConfig,
 };
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
-use mpay::client::channel_ops::default_escrow_contract;
-use mpay::{parse_authorization, PaymentCredential, PrivateKeySigner};
+use mpp::client::channel_ops::default_escrow_contract;
+use mpp::{parse_authorization, PaymentCredential, PrivateKeySigner};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,9 +41,9 @@ const PRICE_PER_TOKEN: u128 = 75;
 /// Unit type for session challenges.
 const UNIT_TYPE: &str = "token";
 
-type PaymentHandler = Mpay<
-    TempoChargeMethod<mpay::server::TempoProvider>,
-    TempoSessionMethod<mpay::server::TempoProvider>,
+type PaymentHandler = Mpp<
+    TempoChargeMethod<mpp::server::TempoProvider>,
+    TempoSessionMethod<mpp::server::TempoProvider>,
 >;
 
 struct AppState {
@@ -75,7 +75,7 @@ async fn main() {
     let store = Arc::new(SessionChannelStore::new());
 
     // Create the base payment handler.
-    let base = Mpay::create(
+    let base = Mpp::create(
         tempo(TempoConfig {
             currency: CURRENCY,
             recipient: &recipient,
@@ -86,8 +86,8 @@ async fn main() {
     .expect("failed to create payment handler");
 
     // Create the session method with shared store.
-    let provider = mpay::server::tempo_provider(RPC_URL).expect("failed to create provider");
-    let chain_id = mpay::tempo::MODERATO_CHAIN_ID;
+    let provider = mpp::server::tempo_provider(RPC_URL).expect("failed to create provider");
+    let chain_id = mpp::tempo::MODERATO_CHAIN_ID;
     let session_method = TempoSessionMethod::new(
         provider,
         store.clone(),
@@ -188,9 +188,9 @@ async fn chat(
 
     let token_stream = generate_tokens(&prompt);
 
-    // Use mpay's sse::serve for metered streaming with automatic
+    // Use mpp's sse::serve for metered streaming with automatic
     // balance tracking, need-voucher events, and final receipt.
-    let mut rx = mpay::server::sse::serve(mpay::server::sse::ServeOptions {
+    let mut rx = mpp::server::sse::serve(mpp::server::sse::ServeOptions {
         store: state.store.clone(),
         channel_id,
         challenge_id,
@@ -205,7 +205,7 @@ async fn chat(
         }
     };
 
-    let headers = mpay::server::sse::sse_headers();
+    let headers = mpp::server::sse::sse_headers();
     let header_tuples: Vec<(String, String)> = headers
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))

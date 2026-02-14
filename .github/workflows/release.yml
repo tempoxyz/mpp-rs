@@ -6,7 +6,7 @@
 # Packages" PR is merged.
 #
 # Users consume this crate via git dependency in their Cargo.toml:
-#   mpay = { git = "https://github.com/tempoxyz/mpay-rs", tag = "v0.2.1", features = ["tempo", "client"] }
+#   mpp = { git = "https://github.com/tempoxyz/mpay-rs", tag = "v0.2.1", features = ["tempo", "client"] }
 
 name: Release
 on:

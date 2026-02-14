@@ -3,37 +3,40 @@
 //! # Simple API
 //!
 //! ```ignore
-//! use mpay::server::{Mpay, tempo, TempoConfig};
+//! use mpp::server::{Mpp, tempo, TempoConfig};
 //!
-//! let mpay = Mpay::create(tempo(TempoConfig {
+//! let mpp = Mpp::create(tempo(TempoConfig {
 //!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0xabc...123",
 //! }))?;
 //!
 //! // Charge $0.10 — everything else has smart defaults
-//! let challenge = mpay.charge("0.10")?;
+//! let challenge = mpp.charge("0.10")?;
 //! ```
 //!
 //! # Advanced API
 //!
 //! ```ignore
-//! use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+//! use mpp::server::{Mpp, tempo_provider, TempoChargeMethod};
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 //! let method = TempoChargeMethod::new(provider);
-//! let payment = Mpay::new(method, "api.example.com", "my-server-secret");
+//! let payment = Mpp::new(method, "api.example.com", "my-server-secret");
 //!
 //! let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
 //! let receipt = payment.verify(&credential, &request).await?;
 //! ```
 
 mod amount;
-mod mpay;
+mod mpp;
 pub mod sse;
+
+#[cfg(feature = "tower")]
+pub mod middleware;
 
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};
-pub use mpay::{Mpay, SessionVerifyResult};
+pub use mpp::{Mpp, SessionVerifyResult};
 
 #[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
@@ -106,7 +109,7 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the secret key (default: reads `MPAY_SECRET_KEY` env var or generates UUID).
+    /// Override the secret key (default: reads `MPP_SECRET_KEY` env var or generates UUID).
     pub fn secret_key(mut self, key: &str) -> Self {
         self.secret_key = Some(key.to_string());
         self
@@ -140,7 +143,7 @@ impl TempoBuilder {
     }
 }
 
-/// Options for [`Mpay::session_challenge_with_details()`].
+/// Options for [`Mpp::session_challenge_with_details()`].
 #[derive(Debug, Default)]
 pub struct SessionChallengeOptions<'a> {
     /// Suggested deposit amount in base units.
@@ -153,7 +156,7 @@ pub struct SessionChallengeOptions<'a> {
     pub expires: Option<&'a str>,
 }
 
-/// Options for [`Mpay::charge_with_options()`].
+/// Options for [`Mpp::charge_with_options()`].
 #[derive(Debug, Default)]
 pub struct ChargeOptions<'a> {
     /// Human-readable description.
@@ -169,29 +172,29 @@ pub struct ChargeOptions<'a> {
 /// Create a Tempo payment method configuration with smart defaults.
 ///
 /// Only `currency` and `recipient` are required. Returns a [`TempoBuilder`]
-/// that can be passed to [`Mpay::create()`].
+/// that can be passed to [`Mpp::create()`].
 ///
 /// # Defaults
 ///
 /// - **rpc_url**: `https://rpc.tempo.xyz`
 /// - **realm**: `"MPP Payment"`
-/// - **secret_key**: reads `MPAY_SECRET_KEY` env var, or generates a random UUID
+/// - **secret_key**: reads `MPP_SECRET_KEY` env var, or generates a random UUID
 /// - **decimals**: `6` (for pathUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example
 ///
 /// ```ignore
-/// use mpay::server::{Mpay, tempo, TempoConfig};
+/// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
 /// // Minimal
-/// let mpay = Mpay::create(tempo(TempoConfig {
+/// let mpp = Mpp::create(tempo(TempoConfig {
 ///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
 /// }))?;
 ///
 /// // With overrides
-/// let mpay = Mpay::create(
+/// let mpp = Mpp::create(
 ///     tempo(TempoConfig {
 ///         currency: "0x20c0000000000000000000000000000000000000",
 ///         recipient: "0xabc...123",

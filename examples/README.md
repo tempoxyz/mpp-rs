@@ -1,6 +1,6 @@
-# mpay Examples
+# mpp Examples
 
-Standalone, runnable examples demonstrating the mpay HTTP 402 payment flow.
+Standalone, runnable examples demonstrating the mpp HTTP 402 payment flow.
 
 ## Examples
 

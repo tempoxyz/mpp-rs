@@ -5,7 +5,7 @@
 //!
 //! # Event types
 //!
-//! Three SSE event types are used by mpay streaming:
+//! Three SSE event types are used by mpp streaming:
 //! - `message` — application data
 //! - `payment-need-voucher` — balance exhausted, client should send voucher
 //! - `payment-receipt` — final receipt
@@ -25,7 +25,7 @@ use crate::protocol::methods::tempo::stream_receipt::StreamReceipt;
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::NeedVoucherEvent;
+/// use mpp::server::sse::NeedVoucherEvent;
 ///
 /// let event = NeedVoucherEvent {
 ///     channel_id: "0xabc".into(),
@@ -58,7 +58,7 @@ impl PartialEq for NeedVoucherEvent {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::{parse_event, SseEvent};
+/// use mpp::server::sse::{parse_event, SseEvent};
 ///
 /// let raw = "event: message\ndata: hello\n\n";
 /// assert_eq!(parse_event(raw), Some(SseEvent::Message("hello".into())));
@@ -82,8 +82,8 @@ pub enum SseEvent {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::format_receipt_event;
-/// use mpay::protocol::methods::tempo::stream_receipt::StreamReceipt;
+/// use mpp::server::sse::format_receipt_event;
+/// use mpp::protocol::methods::tempo::stream_receipt::StreamReceipt;
 ///
 /// let receipt = StreamReceipt::new(
 ///     "2025-01-01T00:00:00Z",
@@ -110,7 +110,7 @@ pub fn format_receipt_event(receipt: &StreamReceipt) -> String {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::{format_need_voucher_event, NeedVoucherEvent};
+/// use mpp::server::sse::{format_need_voucher_event, NeedVoucherEvent};
 ///
 /// let event = format_need_voucher_event(&NeedVoucherEvent {
 ///     channel_id: "0xabc".into(),
@@ -132,7 +132,7 @@ pub fn format_need_voucher_event(event: &NeedVoucherEvent) -> String {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::format_message_event;
+/// use mpp::server::sse::format_message_event;
 ///
 /// assert_eq!(format_message_event("hello"), "event: message\ndata: hello\n\n");
 /// ```
@@ -146,7 +146,7 @@ pub fn format_message_event(data: &str) -> String {
 
 /// Parse a raw SSE event string into a typed event.
 ///
-/// Handles the three event types used by mpay streaming:
+/// Handles the three event types used by mpp streaming:
 /// - `message` (default / no event field) — application data
 /// - `payment-need-voucher` — balance exhausted
 /// - `payment-receipt` — final receipt
@@ -156,7 +156,7 @@ pub fn format_message_event(data: &str) -> String {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::{parse_event, SseEvent};
+/// use mpp::server::sse::{parse_event, SseEvent};
 ///
 /// let raw = "event: message\ndata: hello world\n\n";
 /// assert_eq!(parse_event(raw), Some(SseEvent::Message("hello world".into())));
@@ -202,7 +202,7 @@ pub fn parse_event(raw: &str) -> Option<SseEvent> {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::is_event_stream;
+/// use mpp::server::sse::is_event_stream;
 ///
 /// assert!(is_event_stream("text/event-stream"));
 /// assert!(is_event_stream("Text/Event-Stream; charset=utf-8"));
@@ -348,7 +348,7 @@ fn now_iso8601() -> String {
 /// # Example
 ///
 /// ```
-/// use mpay::server::sse::sse_headers;
+/// use mpp::server::sse::sse_headers;
 ///
 /// let headers = sse_headers();
 /// assert_eq!(headers.len(), 3);

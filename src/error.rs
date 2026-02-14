@@ -27,7 +27,7 @@ pub const STREAM_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/str
 /// # Example
 ///
 /// ```
-/// use mpay::error::PaymentErrorDetails;
+/// use mpp::error::PaymentErrorDetails;
 ///
 /// let problem = PaymentErrorDetails::core("verification-failed")
 ///     .with_title("VerificationFailedError")
@@ -116,7 +116,7 @@ impl PaymentErrorDetails {
 /// # Example
 ///
 /// ```
-/// use mpay::error::{PaymentError, PaymentErrorDetails};
+/// use mpp::error::{PaymentError, PaymentErrorDetails};
 ///
 /// struct MyError {
 ///     reason: String,

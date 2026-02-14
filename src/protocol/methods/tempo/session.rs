@@ -28,7 +28,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::methods::tempo::session::TempoSessionMethodDetails;
+/// use mpp::protocol::methods::tempo::session::TempoSessionMethodDetails;
 ///
 /// let details = TempoSessionMethodDetails {
 ///     escrow_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
@@ -68,7 +68,7 @@ pub struct TempoSessionMethodDetails {
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::methods::tempo::session::SessionCredentialPayload;
+/// use mpp::protocol::methods::tempo::session::SessionCredentialPayload;
 ///
 /// let json = r#"{"action":"voucher","channelId":"0xabc","cumulativeAmount":"5000","signature":"0xdef"}"#;
 /// let payload: SessionCredentialPayload = serde_json::from_str(json).unwrap();
@@ -123,8 +123,8 @@ pub enum SessionCredentialPayload {
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::intents::SessionRequest;
-/// use mpay::protocol::methods::tempo::session::TempoSessionExt;
+/// use mpp::protocol::intents::SessionRequest;
+/// use mpp::protocol::methods::tempo::session::TempoSessionExt;
 ///
 /// let req = SessionRequest {
 ///     amount: "1000".to_string(),

@@ -1,4 +1,4 @@
-# mpay
+# mpp
 
 Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ietf-httpauth-payment/).
 
@@ -31,7 +31,7 @@ Rust SDK for the Machine Payments Protocol (MPP) - an implementation of the ["Pa
 ### Parse a Challenge (Server → Client)
 
 ```rust
-use mpay::{parse_www_authenticate, PaymentChallenge};
+use mpp::{parse_www_authenticate, PaymentChallenge};
 
 let header = r#"Payment realm="api.example.com", id="abc123", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIn0""#;
 let challenge = parse_www_authenticate(header)?;
@@ -43,7 +43,7 @@ println!("Intent: {}", challenge.intent);
 ### Create a Credential (Client → Server)
 
 ```rust
-use mpay::{PaymentCredential, PaymentPayload, format_authorization};
+use mpp::{PaymentCredential, PaymentPayload, format_authorization};
 
 // After parsing a challenge, create a credential with the echo
 let credential = PaymentCredential::with_source(
@@ -58,7 +58,7 @@ let auth_header = format_authorization(&credential)?;
 ### Parse a Receipt (Server → Client)
 
 ```rust
-use mpay::{parse_receipt, Receipt};
+use mpp::{parse_receipt, Receipt};
 
 let receipt = parse_receipt(header)?;
 assert!(receipt.is_success());
@@ -73,7 +73,7 @@ assert!(receipt.is_success());
 A parsed payment challenge from a `WWW-Authenticate` header.
 
 ```rust
-use mpay::{PaymentChallenge, Base64UrlJson, format_www_authenticate, parse_www_authenticate};
+use mpp::{PaymentChallenge, Base64UrlJson, format_www_authenticate, parse_www_authenticate};
 
 let challenge = PaymentChallenge {
     id: "challenge-id".into(),
@@ -94,7 +94,7 @@ let parsed = parse_www_authenticate(&header)?;
 The credential sent in the `Authorization` header.
 
 ```rust
-use mpay::{PaymentCredential, PaymentPayload, format_authorization, parse_authorization};
+use mpp::{PaymentCredential, PaymentPayload, format_authorization, parse_authorization};
 
 // After parsing a challenge, create the credential
 let credential = PaymentCredential::with_source(
@@ -112,7 +112,7 @@ let parsed = parse_authorization(&header)?;
 Payment receipt returned after successful verification.
 
 ```rust
-use mpay::{Receipt, format_receipt, parse_receipt};
+use mpp::{Receipt, format_receipt, parse_receipt};
 
 let receipt = Receipt::success("tempo", "0x...");
 
@@ -130,7 +130,7 @@ let parsed = parse_receipt(&header)?;
 Intent schemas define shared request fields per spec:
 
 ```rust
-use mpay::ChargeRequest;
+use mpp::ChargeRequest;
 
 let request = ChargeRequest {
     amount: "1000000".into(),
@@ -143,17 +143,17 @@ let request = ChargeRequest {
 
 ### Server-Side Handler
 
-Use `Mpay` to bind method, realm, and secret_key once:
+Use `Mpp` to bind method, realm, and secret_key once:
 
 ```rust
-use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+use mpp::server::{Mpp, tempo_provider, TempoChargeMethod};
 
 // Create provider and method
 let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 let method = TempoChargeMethod::new(provider);
 
 // Create handler with bound secret_key
-let payment = Mpay::new(method, "api.example.com", "my-server-secret");
+let payment = Mpp::new(method, "api.example.com", "my-server-secret");
 
 // Generate challenge (secretKey already bound)
 let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
@@ -167,7 +167,7 @@ let receipt = payment.verify(&credential, &request).await?;
 PaymentProvider creates credentials for challenges:
 
 ```rust
-use mpay::client::{PaymentProvider, TempoProvider};
+use mpp::client::{PaymentProvider, TempoProvider};
 
 let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 
@@ -183,7 +183,7 @@ let credential = provider.pay(&challenge).await?;
 Use `MultiProvider` to handle multiple payment methods:
 
 ```rust
-use mpay::client::{MultiProvider, TempoProvider};
+use mpp::client::{MultiProvider, TempoProvider};
 
 let provider = MultiProvider::new()
     .with(TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?);
@@ -198,7 +198,7 @@ let resp = client.get(url).send_with_payment(&provider).await?;
 
 ```toml
 [dependencies]
-mpay = "0.2"
+mpp = "0.2"
 ```
 
 ## Feature Flags
@@ -217,16 +217,16 @@ mpay = "0.2"
 
 ```toml
 # Core only (parsing/formatting) - works out of the box
-mpay = "0.2"
+mpp = "0.2"
 
 # With Tempo support (requires git patch)
-mpay = { version = "0.2", features = ["tempo"] }
+mpp = { version = "0.2", features = ["tempo"] }
 
 # Server app with Tempo
-mpay = { version = "0.2", features = ["server", "tempo"] }
+mpp = { version = "0.2", features = ["server", "tempo"] }
 
 # Client app with Tempo
-mpay = { version = "0.2", features = ["client", "tempo"] }
+mpp = { version = "0.2", features = ["client", "tempo"] }
 ```
 
 ### Using the `tempo` feature
@@ -247,7 +247,7 @@ tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
 Enable the `client` feature for the `Fetch` trait:
 
 ```rust
-use mpay::client::{Fetch, TempoProvider};
+use mpp::client::{Fetch, TempoProvider};
 
 let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 
@@ -262,7 +262,7 @@ let resp = client
 Enable the `middleware` feature for automatic 402 handling:
 
 ```rust
-use mpay::client::{PaymentMiddleware, TempoProvider};
+use mpp::client::{PaymentMiddleware, TempoProvider};
 use reqwest_middleware::ClientBuilder;
 
 let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;

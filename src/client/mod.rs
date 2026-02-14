@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use mpay::client::{Fetch, TempoProvider};
+//! use mpp::client::{Fetch, TempoProvider};
 //!
 //! let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 //! let resp = client.get(url).send_with_payment(&provider).await?;

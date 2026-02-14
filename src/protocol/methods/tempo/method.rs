@@ -12,8 +12,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use mpay::server::{tempo_provider, TempoChargeMethod};
-//! use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
+//! use mpp::server::{tempo_provider, TempoChargeMethod};
+//! use mpp::protocol::traits::ChargeMethod as ChargeMethodTrait;
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
 //! let method = TempoChargeMethod::new(provider);
@@ -87,8 +87,8 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 /// # Example
 ///
 /// ```ignore
-/// use mpay::server::{tempo_provider, TempoChargeMethod};
-/// use mpay::protocol::traits::ChargeMethod as ChargeMethodTrait;
+/// use mpp::server::{tempo_provider, TempoChargeMethod};
+/// use mpp::protocol::traits::ChargeMethod as ChargeMethodTrait;
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
 /// let method = TempoChargeMethod::new(provider);

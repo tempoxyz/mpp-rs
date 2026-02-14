@@ -19,8 +19,8 @@
 
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
-use mpay::client::{Fetch, TempoProvider};
-use mpay::{parse_receipt, PrivateKeySigner};
+use mpp::client::{Fetch, TempoProvider};
+use mpp::{parse_receipt, PrivateKeySigner};
 use reqwest::Client;
 use tempo_alloy::TempoNetwork;
 

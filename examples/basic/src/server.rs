@@ -22,13 +22,13 @@ use axum::{
 };
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
-use mpay::server::{tempo, Mpay, TempoChargeMethod, TempoConfig};
-use mpay::{format_www_authenticate, parse_authorization, PrivateKeySigner};
+use mpp::server::{tempo, Mpp, TempoChargeMethod, TempoConfig};
+use mpp::{format_www_authenticate, parse_authorization, PrivateKeySigner};
 use rand::seq::IndexedRandom;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
 
-type Payment = Mpay<TempoChargeMethod<mpay::server::TempoProvider>>;
+type Payment = Mpp<TempoChargeMethod<mpp::server::TempoProvider>>;
 
 const PATH_USD: &str = "0x20c0000000000000000000000000000000000000";
 
@@ -63,7 +63,7 @@ async fn main() {
         .expect("faucet funding failed");
     println!("Server account funded");
 
-    let payment = Mpay::create(
+    let payment = Mpp::create(
         tempo(TempoConfig {
             currency: PATH_USD,
             recipient: &recipient,

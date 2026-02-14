@@ -3,6 +3,9 @@
 //! This module provides typed request structures for payment intents:
 //!
 //! - [`ChargeRequest`]: One-time payment (charge intent)
+//! - [`SessionRequest`]: Pay-as-you-go streaming payment (session intent)
+//! - [`AuthorizeRequest`]: Pre-authorization for later capture (authorize intent)
+//! - [`SubscriptionRequest`]: Recurring periodic payment (subscription intent)
 //!
 //! **Zero heavy dependencies** - only serde and serde_json. No alloy, no blockchain types.
 //!
@@ -14,8 +17,8 @@
 //! Use `PaymentChallenge.request.decode::<T>()` to decode the request to a typed struct:
 //!
 //! ```
-//! use mpay::protocol::core::parse_www_authenticate;
-//! use mpay::protocol::intents::ChargeRequest;
+//! use mpp::protocol::core::parse_www_authenticate;
+//! use mpp::protocol::intents::ChargeRequest;
 //!
 //! let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="eyJhbW91bnQiOiIxMDAwIiwiY3VycmVuY3kiOiJVU0QifQ""#;
 //! let challenge = parse_www_authenticate(header).unwrap();
@@ -25,10 +28,13 @@
 //! }
 //! ```
 
+pub mod authorize;
 pub mod charge;
 pub mod payment_request;
 pub mod session;
+pub mod subscription;
 
+pub use authorize::AuthorizeRequest;
 pub use charge::ChargeRequest;
 pub use payment_request::{
     deserialize as deserialize_request,
@@ -40,3 +46,4 @@ pub use payment_request::{
     Request,
 };
 pub use session::SessionRequest;
+pub use subscription::SubscriptionRequest;

@@ -18,12 +18,12 @@ use axum::{
 };
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
-use mpay::client::channel_ops::default_escrow_contract;
-use mpay::server::{
-    Mpay, SessionChallengeOptions, SessionChannelStore, SessionMethodConfig,
+use mpp::client::channel_ops::default_escrow_contract;
+use mpp::server::{
+    Mpp, SessionChallengeOptions, SessionChannelStore, SessionMethodConfig,
     TempoChargeMethod, TempoSessionMethod, tempo, TempoConfig,
 };
-use mpay::{parse_authorization, PaymentCredential, PrivateKeySigner};
+use mpp::{parse_authorization, PaymentCredential, PrivateKeySigner};
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
 
@@ -33,9 +33,9 @@ const CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
 /// 0.01 pathUSD in base units (6 decimals).
 const AMOUNT_PER_REQUEST: &str = "10000";
 
-type PaymentHandler = Mpay<
-    TempoChargeMethod<mpay::server::TempoProvider>,
-    TempoSessionMethod<mpay::server::TempoProvider>,
+type PaymentHandler = Mpp<
+    TempoChargeMethod<mpp::server::TempoProvider>,
+    TempoSessionMethod<mpp::server::TempoProvider>,
 >;
 
 #[derive(serde::Deserialize)]
@@ -59,7 +59,7 @@ async fn main() {
     println!("Server account funded");
 
     // Create the base payment handler (charge method).
-    let base_payment = Mpay::create(
+    let base_payment = Mpp::create(
         tempo(TempoConfig {
             currency: CURRENCY,
             recipient: &recipient,
@@ -70,7 +70,7 @@ async fn main() {
     .expect("failed to create payment handler");
 
     // Create the session method with an in-memory channel store.
-    let rpc_provider = mpay::server::tempo_provider(RPC_URL).expect("failed to create provider");
+    let rpc_provider = mpp::server::tempo_provider(RPC_URL).expect("failed to create provider");
     let store = Arc::new(SessionChannelStore::new());
     let session_method = TempoSessionMethod::new(
         rpc_provider,

@@ -1,19 +1,19 @@
 //! Payment handler that binds method, realm, and secret_key.
 //!
-//! This module provides the [`Mpay`] struct which wraps a payment method
+//! This module provides the [`Mpp`] struct which wraps a payment method
 //! with server configuration for stateless challenge verification.
 //!
 //! # Example (simple API)
 //!
 //! ```ignore
-//! use mpay::server::{Mpay, tempo};
+//! use mpp::server::{Mpp, tempo};
 //!
-//! let mpay = Mpay::create(tempo(mpay::server::TempoConfig {
+//! let mpp = Mpp::create(tempo(mpp::server::TempoConfig {
 //!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 //! }))?;
 //!
-//! let challenge = mpay.charge("0.10")?;
+//! let challenge = mpp.charge("0.10")?;
 //! ```
 
 #[cfg(feature = "tempo")]
@@ -24,7 +24,7 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, VerificationError};
 
-const SECRET_KEY_ENV_VAR: &str = "MPAY_SECRET_KEY";
+const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;
 
 /// Result of session verification, including optional management response.
@@ -45,30 +45,30 @@ pub struct SessionVerifyResult {
 /// # Simple API
 ///
 /// ```ignore
-/// use mpay::server::{Mpay, tempo, TempoConfig};
+/// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
-/// let mpay = Mpay::create(tempo(TempoConfig {
+/// let mpp = Mpp::create(tempo(TempoConfig {
 ///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
 /// }))?;
 ///
 /// // Charge $0.10 — currency, recipient, realm, secret, expires all handled
-/// let challenge = mpay.charge("0.10")?;
+/// let challenge = mpp.charge("0.10")?;
 /// ```
 ///
 /// # Advanced API
 ///
 /// ```ignore
-/// use mpay::server::{Mpay, tempo_provider, TempoChargeMethod};
+/// use mpp::server::{Mpp, tempo_provider, TempoChargeMethod};
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 /// let method = TempoChargeMethod::new(provider);
-/// let payment = Mpay::new(method, "api.example.com", "my-server-secret");
+/// let payment = Mpp::new(method, "api.example.com", "my-server-secret");
 ///
 /// let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
 /// ```
 #[derive(Clone)]
-pub struct Mpay<M, S = ()> {
+pub struct Mpp<M, S = ()> {
     method: M,
     session_method: Option<S>,
     realm: String,
@@ -80,15 +80,15 @@ pub struct Mpay<M, S = ()> {
     chain_id: Option<u64>,
 }
 
-impl<M> Mpay<M, ()>
+impl<M> Mpp<M, ()>
 where
     M: ChargeMethod,
 {
     /// Create a new payment handler (advanced API).
     ///
-    /// For a simpler API, use [`Mpay::create()`] with [`tempo()`](super::tempo).
-    pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpay<M, ()> {
-        Mpay {
+    /// For a simpler API, use [`Mpp::create()`] with [`tempo()`](super::tempo).
+    pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpp<M, ()> {
+        Mpp {
             method,
             session_method: None,
             realm: realm.into(),
@@ -102,13 +102,13 @@ where
     }
 }
 
-impl<M, S> Mpay<M, S>
+impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
 {
     /// Add a session method to this payment handler.
-    pub fn with_session_method<S2>(self, session_method: S2) -> Mpay<M, S2> {
-        Mpay {
+    pub fn with_session_method<S2>(self, session_method: S2) -> Mpp<M, S2> {
+        Mpp {
             method: self.method,
             session_method: Some(session_method),
             realm: self.realm,
@@ -150,12 +150,12 @@ where
     fn require_bound_config(&self) -> Result<(&str, &str)> {
         let currency = self.currency.as_deref().ok_or_else(|| {
             crate::error::MppError::InvalidConfig(
-                "currency not configured — use Mpay::create() or set currency".into(),
+                "currency not configured — use Mpp::create() or set currency".into(),
             )
         })?;
         let recipient = self.recipient.as_deref().ok_or_else(|| {
             crate::error::MppError::InvalidConfig(
-                "recipient not configured — use Mpay::create() or set recipient".into(),
+                "recipient not configured — use Mpp::create() or set recipient".into(),
             )
         })?;
         Ok((currency, recipient))
@@ -163,7 +163,7 @@ where
 
     /// Generate a charge challenge for a dollar amount.
     ///
-    /// Requires currency and recipient to be bound (via [`Mpay::create()`]).
+    /// Requires currency and recipient to be bound (via [`Mpp::create()`]).
     /// The amount is automatically converted from dollars to base units
     /// using the configured decimals (default: 6).
     ///
@@ -174,7 +174,7 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let challenge = mpay.charge("0.10")?;
+    /// let challenge = mpp.charge("0.10")?;
     /// ```
     #[cfg(feature = "tempo")]
     pub fn charge(&self, amount: &str) -> Result<PaymentChallenge> {
@@ -183,7 +183,7 @@ where
 
     /// Generate a charge challenge with a dollar amount and additional options.
     ///
-    /// Requires currency and recipient to be bound (via [`Mpay::create()`]).
+    /// Requires currency and recipient to be bound (via [`Mpp::create()`]).
     #[cfg(feature = "tempo")]
     pub fn charge_with_options(
         &self,
@@ -305,7 +305,7 @@ where
     }
 }
 
-impl<M, S> Mpay<M, S>
+impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
     S: crate::protocol::traits::SessionMethod,
@@ -362,7 +362,7 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let challenge = mpay.session_challenge_with_details(
+    /// let challenge = mpp.session_challenge_with_details(
     ///     "1000",
     ///     "second",
     ///     "0x20c0...",
@@ -480,26 +480,26 @@ where
     }
 }
 
-/// Tempo-specific `create` constructor for [`Mpay`].
+/// Tempo-specific `create` constructor for [`Mpp`].
 #[cfg(feature = "tempo")]
-impl Mpay<super::TempoChargeMethod<super::TempoProvider>> {
+impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     /// Create a payment handler from a [`TempoBuilder`](super::TempoBuilder).
     ///
     /// This is the simplest way to set up server-side payments.
     /// Currency and recipient are bound at creation time, so
-    /// [`charge()`](Mpay::charge) only needs the dollar amount.
+    /// [`charge()`](Mpp::charge) only needs the dollar amount.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use mpay::server::{Mpay, tempo, TempoConfig};
+    /// use mpp::server::{Mpp, tempo, TempoConfig};
     ///
-    /// let mpay = Mpay::create(tempo(TempoConfig {
+    /// let mpp = Mpp::create(tempo(TempoConfig {
     ///     currency: "0x20c0000000000000000000000000000000000000",
     ///     recipient: "0xabc...123",
     /// }))?;
     ///
-    /// let challenge = mpay.charge("1.00")?;
+    /// let challenge = mpp.charge("1.00")?;
     /// ```
     pub fn create(builder: super::TempoBuilder) -> Result<Self> {
         let secret_key = builder.secret_key.unwrap_or_else(|| {
@@ -632,8 +632,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mpay_creation() {
-        let payment = Mpay::new(MockMethod, "api.example.com", "secret");
+    fn test_mpp_creation() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
         assert_eq!(payment.realm(), "api.example.com");
         assert_eq!(payment.method_name(), "mock");
         assert!(payment.currency().is_none());
@@ -643,7 +643,7 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_challenge_generation() {
-        let payment = Mpay::new(MockMethod, "api.example.com", "test-secret");
+        let payment = Mpp::new(MockMethod, "api.example.com", "test-secret");
         let challenge = payment
             .charge_challenge(
                 "1000000",
@@ -660,7 +660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_returns_receipt_for_success() {
-        let payment = Mpay::new(SuccessReceiptMethod, "api.example.com", "secret");
+        let payment = Mpp::new(SuccessReceiptMethod, "api.example.com", "secret");
         let credential = test_credential("secret");
         let request = test_request();
 
@@ -677,7 +677,7 @@ mod tests {
         use crate::error::{MppError, PaymentError};
         use crate::protocol::traits::ErrorCode;
 
-        let payment = Mpay::new(FailedTransactionMethod, "api.example.com", "secret");
+        let payment = Mpp::new(FailedTransactionMethod, "api.example.com", "secret");
         let credential = test_credential("secret");
         let request = test_request();
 
@@ -694,8 +694,8 @@ mod tests {
     }
 
     #[cfg(feature = "tempo")]
-    fn create_test_mpay() -> Mpay<crate::server::TempoChargeMethod<crate::server::TempoProvider>> {
-        Mpay::create(
+    fn create_test_mpp() -> Mpp<crate::server::TempoChargeMethod<crate::server::TempoProvider>> {
+        Mpp::create(
             tempo(TempoConfig {
                 currency: "0x20c0000000000000000000000000000000000000",
                 recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
@@ -707,26 +707,26 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_mpay_create() {
-        let mpay = create_test_mpay();
-        assert_eq!(mpay.realm(), "MPP Payment");
+    fn test_mpp_create() {
+        let mpp = create_test_mpp();
+        assert_eq!(mpp.realm(), "MPP Payment");
         assert_eq!(
-            mpay.currency(),
+            mpp.currency(),
             Some("0x20c0000000000000000000000000000000000000")
         );
         assert_eq!(
-            mpay.recipient(),
+            mpp.recipient(),
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2")
         );
-        assert_eq!(mpay.decimals(), 6);
+        assert_eq!(mpp.decimals(), 6);
     }
 
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_dollar_amount() {
-        let mpay = create_test_mpay();
+        let mpp = create_test_mpp();
 
-        let challenge = mpay.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap();
         assert_eq!(challenge.method.as_str(), "tempo");
         assert_eq!(challenge.intent.as_str(), "charge");
         assert_eq!(challenge.realm, "MPP Payment");
@@ -746,8 +746,8 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_one_dollar() {
-        let mpay = create_test_mpay();
-        let challenge = mpay.charge("1").unwrap();
+        let mpp = create_test_mpp();
+        let challenge = mpp.charge("1").unwrap();
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "1000000");
     }
@@ -755,15 +755,15 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_default_expires() {
-        let mpay = create_test_mpay();
-        let challenge = mpay.charge("1").unwrap();
+        let mpp = create_test_mpp();
+        let challenge = mpp.charge("1").unwrap();
         assert!(challenge.expires.is_some());
     }
 
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_requires_bound_currency() {
-        let payment = Mpay::new(MockMethod, "api.example.com", "secret");
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
         let result = payment.charge("1.00");
         assert!(result.is_err());
     }
@@ -810,7 +810,7 @@ mod tests {
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 
-        let payment = Mpay::new(SuccessReceiptMethod, "api.example.com", secret);
+        let payment = Mpp::new(SuccessReceiptMethod, "api.example.com", secret);
         let receipt = payment.verify_credential(&credential).await.unwrap();
         assert!(receipt.is_success());
         assert_eq!(receipt.reference, "0xabc123");
@@ -819,8 +819,8 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_with_options() {
-        let mpay = create_test_mpay();
-        let challenge = mpay
+        let mpp = create_test_mpp();
+        let challenge = mpp
             .charge_with_options(
                 "5.50",
                 ChargeOptions {

@@ -20,7 +20,7 @@ use super::MODERATO_CHAIN_ID;
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::methods::tempo::TempoMethodDetails;
+/// use mpp::protocol::methods::tempo::TempoMethodDetails;
 ///
 /// let details = TempoMethodDetails {
 ///     chain_id: Some(42431),

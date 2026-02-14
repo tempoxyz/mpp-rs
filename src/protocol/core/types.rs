@@ -19,7 +19,7 @@ use crate::error::{MppError, Result};
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::core::MethodName;
+/// use mpp::protocol::core::MethodName;
 ///
 /// let method: MethodName = "tempo".into();
 /// assert_eq!(method.as_str(), "tempo");
@@ -91,7 +91,7 @@ impl From<String> for MethodName {
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::core::IntentName;
+/// use mpp::protocol::core::IntentName;
 ///
 /// let intent: IntentName = "charge".into();
 /// assert_eq!(intent.as_str(), "charge");
@@ -168,7 +168,7 @@ impl From<String> for IntentName {
 /// # Examples
 ///
 /// ```
-/// use mpay::protocol::core::Base64UrlJson;
+/// use mpp::protocol::core::Base64UrlJson;
 /// use serde_json::json;
 ///
 /// // Create from JSON value
