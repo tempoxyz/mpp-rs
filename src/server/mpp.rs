@@ -403,6 +403,7 @@ where
             recipient: Some(recipient.to_string()),
             suggested_deposit: options.suggested_deposit.map(|s| s.to_string()),
             method_details,
+            ..Default::default()
         };
         let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
 

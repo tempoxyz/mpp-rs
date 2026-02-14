@@ -69,6 +69,7 @@
 //! # let req = ChargeRequest {
 //! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
 //! #     expires: None, description: None, external_id: None,
+//! #     decimals: None,
 //! #     method_details: Some(serde_json::json!({
 //! #         "feePayer": true
 //! #     })),
@@ -245,7 +246,10 @@ pub fn charge_challenge_with_options(
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
     use time::{Duration, OffsetDateTime};
 
-    let encoded_request = Base64UrlJson::from_typed(request)?;
+    // Apply decimals transform if present (matches TS SDK's parseUnits behavior).
+    let request = request.clone().with_base_units()?;
+
+    let encoded_request = Base64UrlJson::from_typed(&request)?;
 
     let default_expires;
     let expires = match expires {

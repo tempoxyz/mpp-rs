@@ -21,6 +21,7 @@ use crate::error::{MppError, Result};
 /// let req = ChargeRequest {
 ///     amount: "1000000".to_string(),
 ///     currency: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+///     decimals: None,
 ///     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
 ///     expires: None,
 ///     description: Some("API access".to_string()),
@@ -37,6 +38,14 @@ pub struct ChargeRequest {
 
     /// Currency/asset identifier (token address, ISO 4217 code, or symbol)
     pub currency: String,
+
+    /// Token decimals for amount conversion (e.g., 6 for pathUSD).
+    ///
+    /// When set, the amount is treated as a human-readable value and will be
+    /// scaled by `10^decimals` during challenge creation (matching the TS SDK's
+    /// `parseUnits` transform). The field is stripped from wire serialization.
+    #[serde(skip)]
+    pub decimals: Option<u8>,
 
     /// Recipient address (optional, server may be recipient)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,6 +69,21 @@ pub struct ChargeRequest {
 }
 
 impl ChargeRequest {
+    /// Apply the decimals transform, converting human-readable amount to base units.
+    ///
+    /// This matches the TypeScript SDK's `parseUnits(amount, decimals)` transform.
+    /// For example, with `amount = "1.5"` and `decimals = 6`, returns a new
+    /// `ChargeRequest` with `amount = "1500000"`.
+    ///
+    /// If `decimals` is `None`, returns `self` unchanged.
+    pub fn with_base_units(mut self) -> Result<Self> {
+        if let Some(decimals) = self.decimals {
+            self.amount = super::parse_units(&self.amount, decimals)?;
+            self.decimals = None;
+        }
+        Ok(self)
+    }
+
     /// Parse the amount as u128.
     ///
     /// Returns an error if the amount is not a valid unsigned integer.
@@ -110,6 +134,7 @@ mod tests {
                 "chainId": 42431,
                 "feePayer": true
             })),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -134,6 +159,30 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid.parse_amount().is_err());
+    }
+
+    #[test]
+    fn test_with_base_units() {
+        let req = ChargeRequest {
+            amount: "1.5".to_string(),
+            currency: "0x123".to_string(),
+            decimals: Some(6),
+            ..Default::default()
+        };
+        let converted = req.with_base_units().unwrap();
+        assert_eq!(converted.amount, "1500000");
+        assert!(converted.decimals.is_none());
+    }
+
+    #[test]
+    fn test_with_base_units_no_decimals() {
+        let req = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "0x123".to_string(),
+            ..Default::default()
+        };
+        let converted = req.with_base_units().unwrap();
+        assert_eq!(converted.amount, "1000000");
     }
 
     #[test]

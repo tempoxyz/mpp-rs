@@ -84,7 +84,7 @@ impl From<String> for MethodName {
 
 /// Payment intent identifier (newtype over String).
 ///
-/// Represents a payment intent like "charge", "authorize", "subscription", etc.
+/// Represents a payment intent like "charge", "session", etc.
 /// This is a simple string wrapper with no hardcoded variants - the intents
 /// layer interprets specific values.
 ///
@@ -117,19 +117,9 @@ impl IntentName {
         self.0.eq_ignore_ascii_case("charge")
     }
 
-    /// Check if this is the "authorize" intent.
-    pub fn is_authorize(&self) -> bool {
-        self.0.eq_ignore_ascii_case("authorize")
-    }
-
     /// Check if this is the "session" intent.
     pub fn is_session(&self) -> bool {
         self.0.eq_ignore_ascii_case("session")
-    }
-
-    /// Check if this is the "subscription" intent.
-    pub fn is_subscription(&self) -> bool {
-        self.0.eq_ignore_ascii_case("subscription")
     }
 }
 
@@ -397,11 +387,11 @@ mod tests {
     fn test_intent_name() {
         let intent: IntentName = "charge".into();
         assert!(intent.is_charge());
-        assert!(!intent.is_authorize());
+        assert!(!intent.is_session());
 
-        let intent2 = IntentName::new("AUTHORIZE");
-        assert!(intent2.is_authorize());
-        assert_eq!(intent2.as_str(), "authorize");
+        let intent2 = IntentName::new("SESSION");
+        assert!(intent2.is_session());
+        assert_eq!(intent2.as_str(), "session");
     }
 
     #[test]
@@ -409,8 +399,8 @@ mod tests {
         let intent: IntentName = "CHARGE".into();
         assert_eq!(intent.as_str(), "charge");
 
-        let intent2 = IntentName::new("SuBsCrIpTiOn");
-        assert_eq!(intent2.as_str(), "subscription");
+        let intent2 = IntentName::new("SeSsIoN");
+        assert_eq!(intent2.as_str(), "session");
     }
 
     #[test]

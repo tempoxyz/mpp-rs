@@ -239,6 +239,7 @@ mod tests {
                 "chainId": 42431,
                 "feePayer": true
             })),
+            ..Default::default()
         }
     }
 

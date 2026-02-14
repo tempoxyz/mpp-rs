@@ -85,14 +85,13 @@ pub use protocol::intents::{
     deserialize_request,
     deserialize_request_typed,
     from_request,
+    parse_units,
     request_from_challenge,
     request_from_challenge_typed,
     serialize_request,
-    AuthorizeRequest,
     ChargeRequest,
     Request as PaymentRequest,
     SessionRequest,
-    SubscriptionRequest,
 };
 
 // ==================== Alloy Re-exports ====================

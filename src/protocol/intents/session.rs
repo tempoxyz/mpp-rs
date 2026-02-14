@@ -22,6 +22,7 @@ use crate::error::{MppError, Result};
 ///     amount: "1000".to_string(),
 ///     unit_type: "second".to_string(),
 ///     currency: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+///     decimals: None,
 ///     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
 ///     suggested_deposit: Some("60000".to_string()),
 ///     method_details: None,
@@ -42,6 +43,14 @@ pub struct SessionRequest {
     /// Currency/asset identifier (token address, ISO 4217 code, or symbol)
     pub currency: String,
 
+    /// Token decimals for amount conversion (e.g., 6 for pathUSD).
+    ///
+    /// When set, `amount` and `suggested_deposit` are treated as human-readable
+    /// values and will be scaled by `10^decimals` during challenge creation.
+    /// The field is stripped from wire serialization.
+    #[serde(skip)]
+    pub decimals: Option<u8>,
+
     /// Recipient address (optional, server may be recipient)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
@@ -56,6 +65,21 @@ pub struct SessionRequest {
 }
 
 impl SessionRequest {
+    /// Apply the decimals transform, converting human-readable amounts to base units.
+    ///
+    /// Transforms both `amount` and `suggested_deposit` (if present).
+    /// If `decimals` is `None`, returns `self` unchanged.
+    pub fn with_base_units(mut self) -> Result<Self> {
+        if let Some(decimals) = self.decimals {
+            self.amount = super::parse_units(&self.amount, decimals)?;
+            if let Some(ref deposit) = self.suggested_deposit {
+                self.suggested_deposit = Some(super::parse_units(deposit, decimals)?);
+            }
+            self.decimals = None;
+        }
+        Ok(self)
+    }
+
     /// Parse the amount as u128.
     ///
     /// Returns an error if the amount is not a valid unsigned integer.
@@ -105,6 +129,7 @@ mod tests {
                 "chainId": 42431,
                 "feePayer": true
             })),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -172,5 +197,33 @@ mod tests {
         assert!(req.validate_max_amount("2000").is_ok());
         assert!(req.validate_max_amount("1000").is_ok());
         assert!(req.validate_max_amount("500").is_err());
+    }
+
+    #[test]
+    fn test_with_base_units() {
+        let req = SessionRequest {
+            amount: "1.5".to_string(),
+            unit_type: "second".to_string(),
+            currency: "0x123".to_string(),
+            decimals: Some(6),
+            suggested_deposit: Some("60".to_string()),
+            ..Default::default()
+        };
+        let converted = req.with_base_units().unwrap();
+        assert_eq!(converted.amount, "1500000");
+        assert_eq!(converted.suggested_deposit.as_deref(), Some("60000000"));
+        assert!(converted.decimals.is_none());
+    }
+
+    #[test]
+    fn test_with_base_units_no_decimals() {
+        let req = SessionRequest {
+            amount: "1000000".to_string(),
+            unit_type: "second".to_string(),
+            currency: "0x123".to_string(),
+            ..Default::default()
+        };
+        let converted = req.with_base_units().unwrap();
+        assert_eq!(converted.amount, "1000000");
     }
 }
