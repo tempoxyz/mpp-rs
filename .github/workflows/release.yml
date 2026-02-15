@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Changelogs
-        uses: wevm/changelogs-rs@changelogs@0.6.0
+        uses: wevm/changelogs-rs@6da79bce8604f650b0a59697ec434a23c168b9de # changelogs@0.6.0
         with:
           conventional-commit: true
         env:
