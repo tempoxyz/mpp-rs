@@ -1,5 +1,7 @@
 # mpp
 
+[![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://tempoxyz.github.io/mpp)
+
 Rust SDK for the Machine Payments Protocol (MPP) — an implementation of the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ietf-httpauth-payment/).
 
 ## Architecture
