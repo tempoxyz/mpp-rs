@@ -35,6 +35,7 @@ tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", 
 # Core dependencies (always included)
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_json_canonicalizer = "0.3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 hmac = "0.12"

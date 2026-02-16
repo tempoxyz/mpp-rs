@@ -189,14 +189,14 @@ impl Base64UrlJson {
     /// Create from a JSON Value by encoding it.
     #[must_use = "this returns a new Base64UrlJson and does not modify the input"]
     pub fn from_value(value: &serde_json::Value) -> Result<Self> {
-        let json = serde_json::to_string(value)?;
+        let json = serde_json_canonicalizer::to_string(value)?;
         let raw = base64url_encode(json.as_bytes());
         Ok(Self { raw })
     }
 
     /// Create from a serializable type by encoding it.
     pub fn from_typed<T: Serialize>(value: &T) -> Result<Self> {
-        let json = serde_json::to_string(value)?;
+        let json = serde_json_canonicalizer::to_string(value)?;
         let raw = base64url_encode(json.as_bytes());
         Ok(Self { raw })
     }
