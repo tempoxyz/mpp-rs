@@ -21,7 +21,7 @@ pub fn from<T>(request: T) -> T {
 
 /// Serialize a request into base64url JSON (no padding).
 pub fn serialize<T: Serialize>(request: &T) -> Result<String> {
-    let json = serde_json::to_string(request)?;
+    let json = serde_json_canonicalizer::to_string(request)?;
     Ok(base64url_encode(json.as_bytes()))
 }
 
