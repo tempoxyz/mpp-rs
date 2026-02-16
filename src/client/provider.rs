@@ -97,6 +97,7 @@ pub trait PaymentProvider: Clone + Send + Sync {
 pub struct TempoProvider {
     signer: alloy_signer_local::PrivateKeySigner,
     rpc_url: reqwest::Url,
+    client_id: Option<String>,
 }
 
 #[cfg(feature = "tempo")]
@@ -117,7 +118,14 @@ impl TempoProvider {
         Ok(Self {
             signer,
             rpc_url: url,
+            client_id: None,
         })
+    }
+
+    /// Set an optional client identifier for attribution memos.
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
+        self
     }
 
     /// Get a reference to the signer.
@@ -173,8 +181,25 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        // Build TIP-20 transfer calldata.
-        let transfer_data = ITIP20::transferCall::new((recipient, amount)).abi_encode();
+        let memo = charge.memo();
+        let memo_bytes: Option<alloy::primitives::FixedBytes<32>> = if memo.is_some() {
+            let m = memo.as_ref().unwrap();
+            let hex_str = m.strip_prefix("0x").unwrap_or(m);
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| MppError::InvalidConfig(format!("invalid memo hex: {}", e)))?;
+            Some(alloy::primitives::FixedBytes::from_slice(&bytes))
+        } else {
+            let attribution =
+                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref());
+            Some(alloy::primitives::FixedBytes::from(attribution))
+        };
+
+        let transfer_data = match memo_bytes {
+            Some(m) => {
+                ITIP20::transferWithMemoCall::new((recipient, amount, m)).abi_encode()
+            }
+            None => ITIP20::transferCall::new((recipient, amount)).abi_encode(),
+        };
 
         let nonce = provider
             .get_transaction_count(address)
@@ -408,5 +433,34 @@ mod tests {
         let signer = alloy_signer_local::PrivateKeySigner::random();
         let result = TempoProvider::new(signer, "not a url");
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_tempo_provider_with_client_id() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_client_id("my-app");
+
+        assert_eq!(provider.client_id.as_deref(), Some("my-app"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_auto_generated_memo_is_mpp_memo() {
+        let memo = crate::tempo::attribution::encode("api.example.com", Some("my-app"));
+        assert!(crate::tempo::attribution::is_mpp_memo(&memo));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_user_memo_takes_precedence() {
+        let user_memo = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let hex_str = user_memo.strip_prefix("0x").unwrap();
+        let bytes = hex::decode(hex_str).unwrap();
+        let memo_bytes: [u8; 32] = bytes.try_into().unwrap();
+
+        assert!(!crate::tempo::attribution::is_mpp_memo(&memo_bytes));
     }
 }
