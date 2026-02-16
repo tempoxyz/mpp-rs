@@ -190,7 +190,7 @@ async fn chat(
 
     // Use mpp's sse::serve for metered streaming with automatic
     // balance tracking, need-voucher events, and final receipt.
-    let mut rx = mpp::server::sse::serve(mpp::server::sse::ServeOptions {
+    let event_stream = mpp::server::sse::serve(mpp::server::sse::ServeOptions {
         store: state.store.clone(),
         channel_id,
         challenge_id,
@@ -200,7 +200,8 @@ async fn chat(
     });
 
     let body_stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
+        let mut event_stream = std::pin::pin!(event_stream);
+        while let Some(event) = StreamExt::next(&mut event_stream).await {
             yield Ok::<_, std::convert::Infallible>(event);
         }
     };

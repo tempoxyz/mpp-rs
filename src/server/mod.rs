@@ -29,11 +29,13 @@
 
 mod amount;
 mod mpp;
-#[cfg(feature = "tempo")]
 pub mod sse;
 
 #[cfg(feature = "tower")]
 pub mod middleware;
+
+#[cfg(feature = "axum")]
+pub mod axum;
 
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};

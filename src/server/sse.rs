@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "tempo")]
 use crate::protocol::methods::tempo::stream_receipt::StreamReceipt;
 
 // ---------------------------------------------------------------------------
@@ -70,6 +71,7 @@ pub enum SseEvent {
     /// Balance exhausted — client should send a new voucher.
     PaymentNeedVoucher(NeedVoucherEvent),
     /// Final receipt for the stream session.
+    #[cfg(feature = "tempo")]
     PaymentReceipt(StreamReceipt),
 }
 
@@ -96,6 +98,7 @@ pub enum SseEvent {
 /// assert!(event.starts_with("event: payment-receipt\ndata: "));
 /// assert!(event.ends_with("\n\n"));
 /// ```
+#[cfg(feature = "tempo")]
 pub fn format_receipt_event(receipt: &StreamReceipt) -> String {
     format!(
         "event: payment-receipt\ndata: {}\n\n",
@@ -149,7 +152,7 @@ pub fn format_message_event(data: &str) -> String {
 /// Handles the three event types used by mpp streaming:
 /// - `message` (default / no event field) — application data
 /// - `payment-need-voucher` — balance exhausted
-/// - `payment-receipt` — final receipt
+/// - `payment-receipt` — final receipt (requires `tempo` feature)
 ///
 /// Returns `None` if no `data:` lines are present.
 ///
@@ -188,6 +191,7 @@ pub fn parse_event(raw: &str) -> Option<SseEvent> {
         "payment-need-voucher" => serde_json::from_str::<NeedVoucherEvent>(&data)
             .ok()
             .map(SseEvent::PaymentNeedVoucher),
+        #[cfg(feature = "tempo")]
         "payment-receipt" => serde_json::from_str::<StreamReceipt>(&data)
             .ok()
             .map(SseEvent::PaymentReceipt),
@@ -242,15 +246,16 @@ pub struct ServeOptions<G> {
 ///    waits for the client to top up
 /// 4. On completion, yields a final `event: payment-receipt\n...`
 ///
-/// Returns a [`tokio::sync::mpsc::Receiver`] that yields `String` SSE events.
+/// Returns a [`Stream`](futures_core::Stream) that yields `String` SSE events.
 #[cfg(feature = "tempo")]
-pub fn serve<G>(options: ServeOptions<G>) -> tokio::sync::mpsc::Receiver<String>
+pub fn serve<G>(
+    options: ServeOptions<G>,
+) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = String> + Send>>
 where
     G: futures_core::Stream<Item = String> + Send + Unpin + 'static,
 {
     use crate::protocol::methods::tempo::session_method::deduct_from_channel;
 
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
     let ServeOptions {
         store,
         channel_id,
@@ -260,7 +265,7 @@ where
         poll_interval_ms,
     } = options;
 
-    tokio::spawn(async move {
+    Box::pin(async_stream::stream! {
         let mut stream = std::pin::pin!(generate);
 
         while let Some(value) = next_item(&mut stream).await {
@@ -277,9 +282,7 @@ where
                                 accepted_cumulative: ch.highest_voucher_amount.to_string(),
                                 deposit: ch.deposit.to_string(),
                             });
-                            if tx.send(event).await.is_err() {
-                                return;
-                            }
+                            yield event;
                         }
 
                         // Wait for channel update or poll interval
@@ -292,9 +295,7 @@ where
             }
 
             let event = format_message_event(&value);
-            if tx.send(event).await.is_err() {
-                return;
-            }
+            yield event;
         }
 
         // Emit final receipt
@@ -308,11 +309,9 @@ where
             );
             receipt.units = Some(ch.units);
             let event = format_receipt_event(&receipt);
-            let _ = tx.send(event).await;
+            yield event;
         }
-    });
-
-    rx
+    })
 }
 
 /// Poll the next item from a stream (avoids depending on StreamExt).
@@ -370,6 +369,7 @@ mod tests {
 
     // -- Format tests --
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn test_format_receipt_event() {
         let mut receipt =
@@ -438,6 +438,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn test_parse_event_receipt() {
         let data = serde_json::json!({
@@ -498,6 +499,7 @@ mod tests {
 
     // -- StreamReceipt tests --
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn test_stream_receipt_new() {
         let mut receipt =
@@ -515,6 +517,7 @@ mod tests {
         assert!(!receipt.timestamp.is_empty());
     }
 
+    #[cfg(feature = "tempo")]
     #[test]
     fn test_stream_receipt_serialization() {
         let mut receipt =
