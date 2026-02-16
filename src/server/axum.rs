@@ -83,6 +83,7 @@ use crate::protocol::core::{PaymentChallenge, Receipt};
 ///     PaymentRequired(challenge)
 /// }
 /// ```
+#[derive(Debug)]
 pub struct PaymentRequired(pub PaymentChallenge);
 
 impl IntoResponse for PaymentRequired {
@@ -94,9 +95,11 @@ impl IntoResponse for PaymentRequired {
                     serde_json::json!({ "error": "Payment Required" }).to_string(),
                 )
                     .into_response();
-                if let Ok(val) = HeaderValue::from_str(&www_auth) {
-                    resp.headers_mut().insert(WWW_AUTHENTICATE_HEADER, val);
-                }
+                resp.headers_mut().insert(
+                    WWW_AUTHENTICATE_HEADER,
+                    HeaderValue::from_str(&www_auth)
+                        .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
+                );
                 resp.headers_mut().insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -114,10 +117,14 @@ impl IntoResponse for PaymentRequired {
 
 // ==================== Charge amount policy ====================
 
-/// Trait for specifying the charge amount on a per-route basis.
+/// Trait for specifying a static charge amount on a per-route basis.
 ///
 /// Implement this on a marker type and use [`MppChargeFor<P>`] as your
 /// extractor to control the dollar amount charged per route.
+///
+/// This is designed for fixed per-route pricing. For dynamic pricing
+/// (per-user, per-request, etc.), implement [`ChargeChallenger`] directly
+/// or use a custom extractor.
 ///
 /// # Example
 ///
@@ -139,6 +146,7 @@ pub trait ChargeAmount {
 }
 
 /// Default charge amount: $0.01.
+#[derive(Debug)]
 pub struct DefaultAmount;
 
 impl ChargeAmount for DefaultAmount {
@@ -200,6 +208,7 @@ pub type MppCharge = MppChargeFor<DefaultAmount>;
 ///     "premium content"
 /// }
 /// ```
+#[derive(Debug)]
 pub struct MppChargeFor<A: ChargeAmount> {
     /// The verified payment receipt.
     pub receipt: Receipt,
@@ -207,11 +216,13 @@ pub struct MppChargeFor<A: ChargeAmount> {
 }
 
 /// Rejection type for [`MppCharge`] and [`MppChargeFor`] extractors.
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum MppChargeRejection {
     /// No credential — return 402 with challenge.
     Challenge(PaymentRequired),
-    /// Verification failed — return 402 with error.
-    VerificationFailed(String),
+    /// Verification failed — return 402 with challenge for retry.
+    VerificationFailed(PaymentRequired),
     /// Internal error generating challenge.
     InternalError(String),
 }
@@ -220,9 +231,9 @@ impl IntoResponse for MppChargeRejection {
     fn into_response(self) -> axum_core::response::Response {
         match self {
             MppChargeRejection::Challenge(pr) => pr.into_response(),
-            MppChargeRejection::VerificationFailed(msg) => {
-                let body = serde_json::json!({ "error": msg });
-                (StatusCode::PAYMENT_REQUIRED, body.to_string()).into_response()
+            MppChargeRejection::VerificationFailed(pr) => {
+                // Return 402 with challenge so the client can retry.
+                pr.into_response()
             }
             MppChargeRejection::InternalError(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
@@ -314,10 +325,17 @@ where
                 }
             };
 
-            let receipt = challenger
-                .verify_payment(&credential_str)
-                .await
-                .map_err(MppChargeRejection::VerificationFailed)?;
+            let receipt = match challenger.verify_payment(&credential_str).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let challenge = challenger
+                        .challenge(A::amount())
+                        .map_err(MppChargeRejection::InternalError)?;
+                    return Err(MppChargeRejection::VerificationFailed(PaymentRequired(
+                        challenge,
+                    )));
+                }
+            };
 
             Ok(MppChargeFor {
                 receipt,
@@ -368,28 +386,91 @@ impl<T: IntoResponse> IntoResponse for WithReceipt<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::core::Base64UrlJson;
 
-    #[test]
-    fn test_payment_required_into_response() {
-        use crate::protocol::core::Base64UrlJson;
+    // ==================== Test helpers ====================
 
-        let challenge = PaymentChallenge::new(
+    fn test_challenge() -> PaymentChallenge {
+        PaymentChallenge::new(
             "test-id",
             "test-realm",
             "tempo",
             "charge",
             Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
-        );
-        let resp = PaymentRequired(challenge).into_response();
+        )
+    }
+
+    /// Mock [`ChargeChallenger`] for extractor tests.
+    struct MockChallenger {
+        accept: bool,
+    }
+
+    impl ChargeChallenger for MockChallenger {
+        fn challenge(&self, amount: &str) -> Result<PaymentChallenge, String> {
+            Ok(PaymentChallenge::new(
+                "mock-id",
+                "mock-realm",
+                "tempo",
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({"amount": amount})).unwrap(),
+            ))
+        }
+
+        fn verify_payment(
+            &self,
+            _credential_str: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            let accept = self.accept;
+            Box::pin(async move {
+                if accept {
+                    Ok(Receipt {
+                        status: crate::protocol::core::ReceiptStatus::Success,
+                        method: crate::protocol::core::MethodName::new("tempo"),
+                        timestamp: "2025-01-01T00:00:00Z".into(),
+                        reference: "0xabc".into(),
+                    })
+                } else {
+                    Err("payment rejected".into())
+                }
+            })
+        }
+    }
+
+    // ==================== PaymentRequired tests ====================
+
+    #[test]
+    fn test_payment_required_into_response() {
+        let resp = PaymentRequired(test_challenge()).into_response();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
     }
 
     #[test]
-    fn test_rejection_verification_failed() {
-        let rejection = MppChargeRejection::VerificationFailed("bad payment".into());
+    fn test_payment_required_has_json_content_type() {
+        let resp = PaymentRequired(test_challenge()).into_response();
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    // ==================== MppChargeRejection tests ====================
+
+    #[test]
+    fn test_rejection_challenge_returns_402_with_header() {
+        let rejection = MppChargeRejection::Challenge(PaymentRequired(test_challenge()));
         let resp = rejection.into_response();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+    }
+
+    #[test]
+    fn test_rejection_verification_failed_returns_402_with_header() {
+        let rejection = MppChargeRejection::VerificationFailed(PaymentRequired(test_challenge()));
+        let resp = rejection.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
     }
 
     #[test]
@@ -398,6 +479,26 @@ mod tests {
         let resp = rejection.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // ==================== ChargeAmount tests ====================
+
+    #[test]
+    fn test_default_amount() {
+        assert_eq!(DefaultAmount::amount(), "0.01");
+    }
+
+    #[test]
+    fn test_custom_amount() {
+        struct FiveDollars;
+        impl ChargeAmount for FiveDollars {
+            fn amount() -> &'static str {
+                "5.00"
+            }
+        }
+        assert_eq!(FiveDollars::amount(), "5.00");
+    }
+
+    // ==================== WithReceipt tests ====================
 
     #[test]
     fn test_with_receipt_attaches_header() {
@@ -420,8 +521,104 @@ mod tests {
         assert!(resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
     }
 
+    // ==================== ChargeChallenger mock tests ====================
+
     #[test]
-    fn test_default_amount() {
-        assert_eq!(DefaultAmount::amount(), "0.01");
+    fn test_mock_challenger_generates_challenge() {
+        let challenger = MockChallenger { accept: true };
+        let challenge = challenger.challenge("0.50").unwrap();
+        assert_eq!(challenge.id, "mock-id");
+    }
+
+    #[tokio::test]
+    async fn test_mock_challenger_verify_accept() {
+        let challenger = MockChallenger { accept: true };
+        let result = challenger.verify_payment("Payment eyJ...").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().reference, "0xabc");
+    }
+
+    #[tokio::test]
+    async fn test_mock_challenger_verify_reject() {
+        let challenger = MockChallenger { accept: false };
+        let result = challenger.verify_payment("Payment eyJ...").await;
+        assert!(result.is_err());
+    }
+
+    // ==================== FromRequestParts integration tests ====================
+
+    /// Helper to run the extractor against a mock request.
+    async fn run_extractor<A: ChargeAmount>(
+        challenger: MockChallenger,
+        auth_header: Option<&str>,
+    ) -> Result<MppChargeFor<A>, MppChargeRejection> {
+        let state: Arc<dyn ChargeChallenger> = Arc::new(challenger);
+        let mut builder = http_types::Request::builder().uri("/test");
+        if let Some(auth) = auth_header {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        let req = builder.body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        MppChargeFor::<A>::from_request_parts(&mut parts, &state).await
+    }
+
+    #[tokio::test]
+    async fn test_extractor_no_auth_returns_challenge() {
+        let result = run_extractor::<DefaultAmount>(MockChallenger { accept: true }, None).await;
+        let err = result.unwrap_err();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+    }
+
+    #[tokio::test]
+    async fn test_extractor_valid_payment_returns_receipt() {
+        let result = run_extractor::<DefaultAmount>(
+            MockChallenger { accept: true },
+            Some("Payment eyJmYWtlIjp0cnVlfQ"),
+        )
+        .await;
+        let charge = result.unwrap();
+        assert_eq!(charge.receipt.reference, "0xabc");
+    }
+
+    #[tokio::test]
+    async fn test_extractor_invalid_payment_returns_challenge_for_retry() {
+        let result = run_extractor::<DefaultAmount>(
+            MockChallenger { accept: false },
+            Some("Payment eyJmYWtlIjp0cnVlfQ"),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+    }
+
+    #[tokio::test]
+    async fn test_extractor_wrong_scheme_returns_challenge() {
+        let result = run_extractor::<DefaultAmount>(
+            MockChallenger { accept: true },
+            Some("Bearer some-token"),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, MppChargeRejection::Challenge(_)));
+    }
+
+    #[tokio::test]
+    async fn test_extractor_custom_amount() {
+        struct TenCents;
+        impl ChargeAmount for TenCents {
+            fn amount() -> &'static str {
+                "0.10"
+            }
+        }
+
+        // No auth → challenge should be generated (verifying custom amount type works)
+        let result =
+            run_extractor::<TenCents>(MockChallenger { accept: true }, None).await;
+        assert!(result.is_err());
     }
 }

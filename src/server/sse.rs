@@ -36,22 +36,13 @@ use crate::protocol::methods::tempo::stream_receipt::StreamReceipt;
 /// };
 /// assert_eq!(event.channel_id, "0xabc");
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NeedVoucherEvent {
     pub channel_id: String,
     pub required_cumulative: String,
     pub accepted_cumulative: String,
     pub deposit: String,
-}
-
-impl PartialEq for NeedVoucherEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.channel_id == other.channel_id
-            && self.required_cumulative == other.required_cumulative
-            && self.accepted_cumulative == other.accepted_cumulative
-            && self.deposit == other.deposit
-    }
 }
 
 /// Parsed SSE event (discriminated union).
@@ -152,7 +143,8 @@ pub fn format_message_event(data: &str) -> String {
 /// Handles the three event types used by mpp streaming:
 /// - `message` (default / no event field) — application data
 /// - `payment-need-voucher` — balance exhausted
-/// - `payment-receipt` — final receipt (requires `tempo` feature)
+/// - `payment-receipt` — final receipt (requires `tempo` feature;
+///   without it, receipt events are returned as `Message`)
 ///
 /// Returns `None` if no `data:` lines are present.
 ///
