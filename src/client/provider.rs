@@ -150,7 +150,7 @@ impl PaymentProvider for TempoProvider {
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
         use alloy::eips::Encodable2718;
-        use alloy::primitives::{Bytes, TxKind};
+        use alloy::primitives::{Bytes, TxKind, B256};
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
@@ -181,25 +181,17 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        let memo = charge.memo();
-        let memo_bytes: Option<alloy::primitives::FixedBytes<32>> = if memo.is_some() {
-            let m = memo.as_ref().unwrap();
-            let hex_str = m.strip_prefix("0x").unwrap_or(m);
-            let bytes = hex::decode(hex_str)
-                .map_err(|e| MppError::InvalidConfig(format!("invalid memo hex: {}", e)))?;
-            Some(alloy::primitives::FixedBytes::from_slice(&bytes))
-        } else {
-            let attribution =
-                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref());
-            Some(alloy::primitives::FixedBytes::from(attribution))
-        };
+        // Use user memo if valid 32-byte hex, otherwise auto-generate attribution memo.
+        let memo: B256 = charge
+            .memo()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or_else(|| {
+                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref())
+                    .into()
+            });
 
-        let transfer_data = match memo_bytes {
-            Some(m) => {
-                ITIP20::transferWithMemoCall::new((recipient, amount, m)).abi_encode()
-            }
-            None => ITIP20::transferCall::new((recipient, amount)).abi_encode(),
-        };
+        let transfer_data =
+            ITIP20::transferWithMemoCall::new((recipient, amount, memo)).abi_encode();
 
         let nonce = provider
             .get_transaction_count(address)
