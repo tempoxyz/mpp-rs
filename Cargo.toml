@@ -32,7 +32,7 @@ middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-typ
 tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", "server"]
 
 # Axum middleware support (server-side convenience)
-axum = ["dep:axum-core", "dep:axum", "tower"]
+axum = ["dep:axum-core", "dep:axum", "server", "http-types"]
 
 [dependencies]
 # Core dependencies (always included)
