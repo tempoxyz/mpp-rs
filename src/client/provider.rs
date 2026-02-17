@@ -98,7 +98,14 @@ pub struct TempoProvider {
     signer: alloy_signer_local::PrivateKeySigner,
     rpc_url: reqwest::Url,
     client_id: Option<String>,
+    gas_limit: u64,
+    max_priority_fee_per_gas: u128,
 }
+
+#[cfg(feature = "tempo")]
+const DEFAULT_GAS_LIMIT: u64 = 300_000;
+#[cfg(feature = "tempo")]
+const DEFAULT_MAX_PRIORITY_FEE_PER_GAS: u128 = 2;
 
 #[cfg(feature = "tempo")]
 impl TempoProvider {
@@ -119,12 +126,26 @@ impl TempoProvider {
             signer,
             rpc_url: url,
             client_id: None,
+            gas_limit: DEFAULT_GAS_LIMIT,
+            max_priority_fee_per_gas: DEFAULT_MAX_PRIORITY_FEE_PER_GAS,
         })
     }
 
     /// Set an optional client identifier for attribution memos.
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
+        self
+    }
+
+    /// Set the gas limit for transactions (default: 300,000).
+    pub fn with_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = gas_limit;
+        self
+    }
+
+    /// Set the max priority fee per gas (default: 2).
+    pub fn with_max_priority_fee_per_gas(mut self, fee: u128) -> Self {
+        self.max_priority_fee_per_gas = fee;
         self
     }
 
@@ -221,9 +242,9 @@ impl PaymentProvider for TempoProvider {
         let tempo_tx = TempoTransaction {
             chain_id: expected_chain_id,
             nonce,
-            gas_limit: 300_000,
+            gas_limit: self.gas_limit,
             max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: 2,
+            max_priority_fee_per_gas: self.max_priority_fee_per_gas,
             fee_payer_signature,
             calls: vec![Call {
                 to: TxKind::Call(currency),
@@ -462,6 +483,29 @@ mod tests {
             .with_client_id("my-app");
 
         assert_eq!(provider.client_id.as_deref(), Some("my-app"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_tempo_provider_gas_config() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_gas_limit(500_000)
+            .with_max_priority_fee_per_gas(10);
+
+        assert_eq!(provider.gas_limit, 500_000);
+        assert_eq!(provider.max_priority_fee_per_gas, 10);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_tempo_provider_default_gas_config() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert_eq!(provider.gas_limit, DEFAULT_GAS_LIMIT);
+        assert_eq!(provider.max_priority_fee_per_gas, DEFAULT_MAX_PRIORITY_FEE_PER_GAS);
     }
 
     #[cfg(feature = "tempo")]

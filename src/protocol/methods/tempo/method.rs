@@ -389,25 +389,7 @@ where
             ));
         }
 
-        // Skip type byte (0x76) for Tempo transactions
-        let tx_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
-            &tx_bytes[1..]
-        } else {
-            tx_bytes
-        };
-
-        // Decode the signed Tempo transaction (AASigned = tx fields + signature).
-        // Try normal decode first, then fall back to normalizing viem format
-        // (viem uses 0x00 for fee_payer_signature placeholder instead of 0x80).
-        let signed = match tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]) {
-            Ok(s) => s,
-            Err(_) => {
-                let normalized = normalize_viem_tx(tx_data);
-                tempo_primitives::AASigned::rlp_decode(&mut normalized.as_slice()).map_err(|e| {
-                    VerificationError::new(format!("Failed to decode transaction: {}", e))
-                })?
-            }
-        };
+        let signed = decode_tempo_signed_tx(tx_bytes)?;
         let tx = signed.tx();
 
         // Validate chain_id to prevent cross-chain replay attacks
@@ -503,6 +485,7 @@ where
         signed_tx: &str,
         charge: &ChargeRequest,
         expected_chain_id: u64,
+        credential_source: Option<&str>,
     ) -> Result<B256, VerificationError> {
         let tx_bytes = signed_tx
             .parse::<Bytes>()
@@ -545,33 +528,36 @@ where
                 use alloy::eips::Encodable2718;
                 use alloy::signers::SignerSync;
 
-                // Strip type byte for decoding
-                let tx_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
-                    &tx_bytes[1..]
-                } else {
-                    &tx_bytes[..]
-                };
+                let mut signed = decode_tempo_signed_tx(&tx_bytes)?;
 
-                // Decode the tx, normalizing viem format if needed
-                let mut signed =
-                    match tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            let normalized = normalize_viem_tx(tx_data);
-                            tempo_primitives::AASigned::rlp_decode(&mut normalized.as_slice())
-                                .map_err(|e| {
-                                    VerificationError::new(format!(
-                                        "Failed to decode transaction for fee payer: {}",
-                                        e
-                                    ))
-                                })?
-                        }
-                    };
+                // Verify the tx has a placeholder fee_payer_signature (not already signed)
+                if let Some(ref fps) = signed.tx().fee_payer_signature {
+                    let is_placeholder = fps.r().is_zero() && fps.s().is_zero();
+                    if !is_placeholder {
+                        return Err(VerificationError::new(
+                            "Transaction already has a non-placeholder fee_payer_signature"
+                                .to_string(),
+                        ));
+                    }
+                }
 
                 // Recover sender address from the transaction signature
                 let sender = signed.recover_signer().map_err(|e| {
                     VerificationError::new(format!("Failed to recover sender: {}", e))
                 })?;
+
+                // Cross-check recovered sender against credential source DID to prevent
+                // spoofing via the magic trailer or mismatched credentials.
+                if let Some(source) = credential_source {
+                    let expected_suffix =
+                        format!(":{}", sender).to_lowercase();
+                    if !source.to_lowercase().ends_with(&expected_suffix) {
+                        return Err(VerificationError::new(format!(
+                            "Credential source mismatch: recovered sender {} does not match source {}",
+                            sender, source
+                        )));
+                    }
+                }
 
                 // Compute fee payer signature hash and sign it
                 let fee_hash = signed.tx().fee_payer_signature_hash(sender);
@@ -580,7 +566,7 @@ where
                 })?;
 
                 // Set the fee payer signature on the transaction
-                signed.tx_mut().fee_payer_signature = Some(fee_sig.into());
+                signed.tx_mut().fee_payer_signature = Some(fee_sig);
 
                 // Re-encode with the fee payer signature
                 let encoded = signed.encoded_2718();
@@ -707,10 +693,36 @@ where
                         charge_payload.signed_tx().unwrap(),
                         &request,
                         expected_chain_id,
+                        credential.source.as_deref(),
                     )
                     .await?;
                 this.verify_hash(&format!("{:#x}", tx_hash), &request).await
             }
+        }
+    }
+}
+
+/// Strip the Tempo type byte (0x76) prefix and decode a signed Tempo transaction,
+/// with automatic viem format normalization fallback.
+///
+/// viem encodes `fee_payer_signature` placeholder as `0x00` instead of `0x80`,
+/// which fails `AASigned::rlp_decode`. This function tries the normal decode first,
+/// then falls back to [`normalize_viem_tx`] before retrying.
+fn decode_tempo_signed_tx(
+    tx_bytes: &[u8],
+) -> Result<tempo_primitives::AASigned, VerificationError> {
+    let tx_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
+        &tx_bytes[1..]
+    } else {
+        tx_bytes
+    };
+
+    match tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let normalized = normalize_viem_tx(tx_data);
+            tempo_primitives::AASigned::rlp_decode(&mut normalized.as_slice())
+                .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))
         }
     }
 }
@@ -731,7 +743,7 @@ fn normalize_viem_tx(tx_data: &[u8]) -> Vec<u8> {
     }
 
     // Parse outer list header to get start of list content
-    let (content_start, content_end, _header_len) = match tx_data[0] {
+    let (content_start, content_end) = match tx_data[0] {
         0xf8..=0xff => {
             let len_of_len = (tx_data[0] - 0xf7) as usize;
             if tx_data.len() < 1 + len_of_len {
@@ -743,11 +755,20 @@ fn normalize_viem_tx(tx_data: &[u8]) -> Vec<u8> {
                 buf[start..].copy_from_slice(&tx_data[1..1 + len_of_len]);
                 buf
             });
-            (1 + len_of_len, 1 + len_of_len + payload_len, 1 + len_of_len)
+            let cs = 1 + len_of_len;
+            let ce = match cs.checked_add(payload_len) {
+                Some(end) if end <= tx_data.len() => end,
+                _ => return tx_data.to_vec(),
+            };
+            (cs, ce)
         }
         0xc0..=0xf7 => {
             let payload_len = (tx_data[0] - 0xc0) as usize;
-            (1, 1 + payload_len, 1)
+            let ce = 1 + payload_len;
+            if ce > tx_data.len() {
+                return tx_data.to_vec();
+            }
+            (1, ce)
         }
         _ => return tx_data.to_vec(),
     };
@@ -765,7 +786,7 @@ fn normalize_viem_tx(tx_data: &[u8]) -> Vec<u8> {
         }
 
         // fee_payer_sig is field index 11
-        if field_idx == 11 && tx_data[pos] == 0x00 {
+        if field_idx == 11 && item_len == 1 && tx_data[pos] == 0x00 {
             // Replace 0x00 (1 byte) with c3808080 (4 bytes = RLP list [v=0, r=0, s=0])
             // This requires adjusting the outer list header payload length by +3.
             let placeholder_sig: &[u8] = &[0xc3, 0x80, 0x80, 0x80];
@@ -775,15 +796,7 @@ fn normalize_viem_tx(tx_data: &[u8]) -> Vec<u8> {
             let mut result = Vec::with_capacity(tx_data.len() + 3);
 
             // Re-encode the outer list header with the new payload length
-            if new_payload_len <= 55 {
-                result.push(0xc0 + new_payload_len as u8);
-            } else if new_payload_len <= 0xff {
-                result.push(0xf8);
-                result.push(new_payload_len as u8);
-            } else {
-                result.push(0xf9);
-                result.extend_from_slice(&(new_payload_len as u16).to_be_bytes());
-            }
+            encode_rlp_list_header(&mut result, new_payload_len);
 
             // Copy content before the fee_payer_sig field
             result.extend_from_slice(&tx_data[content_start..pos]);
@@ -801,7 +814,22 @@ fn normalize_viem_tx(tx_data: &[u8]) -> Vec<u8> {
     tx_data.to_vec()
 }
 
+/// Encode an RLP list header for the given payload length.
+fn encode_rlp_list_header(buf: &mut Vec<u8>, payload_len: usize) {
+    if payload_len <= 55 {
+        buf.push(0xc0 + payload_len as u8);
+    } else {
+        // Compute minimal big-endian bytes for the length
+        let len_bytes = payload_len.to_be_bytes();
+        let first_nonzero = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        let len_of_len = len_bytes.len() - first_nonzero;
+        buf.push(0xf7 + len_of_len as u8);
+        buf.extend_from_slice(&len_bytes[first_nonzero..]);
+    }
+}
+
 /// Returns the total length (header + payload) of an RLP item at the given position.
+/// Returns 0 if the data is malformed or extends beyond the buffer.
 fn rlp_item_length(data: &[u8], pos: usize) -> usize {
     if pos >= data.len() {
         return 0;
@@ -811,7 +839,14 @@ fn rlp_item_length(data: &[u8], pos: usize) -> usize {
         // Single byte (0x00..=0x7f)
         0x00..=0x7f => 1,
         // Short string (0x80..=0xb7): length = b - 0x80
-        0x80..=0xb7 => 1 + (b - 0x80) as usize,
+        0x80..=0xb7 => {
+            let payload_len = (b - 0x80) as usize;
+            let total = 1 + payload_len;
+            if pos.checked_add(total).is_none_or(|end| end > data.len()) {
+                return 0;
+            }
+            total
+        }
         // Long string (0xb8..=0xbf): length-of-length = b - 0xb7
         0xb8..=0xbf => {
             let len_of_len = (b - 0xb7) as usize;
@@ -821,10 +856,24 @@ fn rlp_item_length(data: &[u8], pos: usize) -> usize {
             let mut buf = [0u8; 8];
             let start = 8 - len_of_len;
             buf[start..].copy_from_slice(&data[pos + 1..pos + 1 + len_of_len]);
-            1 + len_of_len + usize::from_be_bytes(buf)
+            let payload_len = usize::from_be_bytes(buf);
+            let header_len = 1 + len_of_len;
+            match header_len.checked_add(payload_len) {
+                Some(total) if pos.checked_add(total).is_some_and(|end| end <= data.len()) => {
+                    total
+                }
+                _ => 0,
+            }
         }
         // Short list (0xc0..=0xf7): length = b - 0xc0
-        0xc0..=0xf7 => 1 + (b - 0xc0) as usize,
+        0xc0..=0xf7 => {
+            let payload_len = (b - 0xc0) as usize;
+            let total = 1 + payload_len;
+            if pos.checked_add(total).is_none_or(|end| end > data.len()) {
+                return 0;
+            }
+            total
+        }
         // Long list (0xf8..=0xff): length-of-length = b - 0xf7
         0xf8..=0xff => {
             let len_of_len = (b - 0xf7) as usize;
@@ -834,7 +883,14 @@ fn rlp_item_length(data: &[u8], pos: usize) -> usize {
             let mut buf = [0u8; 8];
             let start = 8 - len_of_len;
             buf[start..].copy_from_slice(&data[pos + 1..pos + 1 + len_of_len]);
-            1 + len_of_len + usize::from_be_bytes(buf)
+            let payload_len = usize::from_be_bytes(buf);
+            let header_len = 1 + len_of_len;
+            match header_len.checked_add(payload_len) {
+                Some(total) if pos.checked_add(total).is_some_and(|end| end <= data.len()) => {
+                    total
+                }
+                _ => 0,
+            }
         }
     }
 }
@@ -1177,6 +1233,62 @@ mod tests {
         let first = normalize_viem_tx(&viem_tx);
         let second = normalize_viem_tx(&first);
         assert_eq!(first, second, "Normalizing twice should be idempotent");
+    }
+
+    #[test]
+    fn test_rlp_item_length_truncated_data() {
+        // Short string header claims 3 bytes but only 2 available → 0
+        assert_eq!(rlp_item_length(&[0x83, 0x01, 0x02], 0), 0);
+        // Long string header claims 56 bytes but data is truncated
+        assert_eq!(rlp_item_length(&[0xb8, 0x38, 0xaa], 0), 0);
+        // Short list header claims 10 bytes but only 3 available
+        assert_eq!(rlp_item_length(&[0xca, 0x80, 0x80], 0), 0);
+    }
+
+    #[test]
+    fn test_normalize_viem_tx_truncated_header() {
+        // Long list header (0xf8) but not enough bytes for length
+        let truncated = vec![0xf8];
+        assert_eq!(normalize_viem_tx(&truncated), truncated);
+
+        // Long list header with length claiming more than available data
+        let bad_len = vec![0xf8, 0xff, 0x01, 0x02];
+        assert_eq!(normalize_viem_tx(&bad_len), bad_len);
+    }
+
+    #[test]
+    fn test_decode_tempo_signed_tx_with_type_byte() {
+        // Build a viem tx with the 0x76 type byte prefix
+        let viem_tx = hex::decode(
+            "f8d882a5bf0285059682f00282f299\
+             f87ef87c9420c000000000000000000000000000000000000080\
+             b86495777d59\
+             0000000000000000000000005f270b1a3f160f7dbd21f8840bba82c61f62a029\
+             00000000000000000000000000000000000000000000000000000000000f4240\
+             ef1ed71201546a07b8cebd18e742dc\
+             0000000000000000000075943864ff95b1\
+             c0\
+             80\
+             06\
+             80\
+             80\
+             80\
+             00\
+             c0\
+             b841f94e83c7cae5d97c235de1de04a48cdad0d3a552921b730e5300fd3ce3f6a7f8\
+             1409df263a6f761984537176e7dd30bab5aacdd7a4179f5fdc69d29252bcd5581c"
+        ).unwrap();
+
+        // With 0x76 prefix
+        let mut with_prefix = vec![0x76];
+        with_prefix.extend_from_slice(&viem_tx);
+
+        let result = decode_tempo_signed_tx(&with_prefix);
+        assert!(result.is_ok(), "Should decode viem tx with 0x76 prefix: {:?}", result.err());
+
+        // Without prefix (also works)
+        let result = decode_tempo_signed_tx(&viem_tx);
+        assert!(result.is_ok(), "Should decode viem tx without prefix: {:?}", result.err());
     }
 
     #[test]
