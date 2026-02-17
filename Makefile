@@ -1,4 +1,4 @@
-.PHONY: build release clean check test test-fast fix
+.PHONY: build release clean check test test-fast test-integration fix
 
 build:
 	cargo build
@@ -14,6 +14,13 @@ test:
 
 test-fast:
 	cargo test --lib -- --quiet
+
+# Integration tests require a running Tempo localnet.
+#   docker compose up -d
+#   make test-integration
+#   docker compose down
+test-integration:
+	cargo test --features integration --test integration_charge -- --nocapture
 
 check:
 	cargo fmt --check

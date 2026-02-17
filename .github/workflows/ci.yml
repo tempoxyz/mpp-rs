@@ -40,5 +40,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo test --all-features
-      - run: cargo hack check --each-feature --no-dev-deps
+      - run: cargo test --features tempo,server,client,axum,middleware,tower,utils
+      - run: cargo hack check --each-feature --no-dev-deps --skip integration
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Tempo node
+        run: docker compose up -d
+
+      - name: Wait for Tempo node
+        run: |
+          echo "Waiting for Tempo node to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8545 -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' > /dev/null 2>&1; then
+              echo "Tempo node ready after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Tempo node failed to start"
+          docker compose logs
+          exit 1
+
+      - name: Run integration tests
+        run: cargo test --features integration --test integration_charge -- --nocapture
+        env:
+          TEMPO_RPC_URL: http://localhost:8545
+
+      - name: Tempo node logs
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop Tempo node
+        if: always()
+        run: docker compose down

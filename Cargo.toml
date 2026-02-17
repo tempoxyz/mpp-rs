@@ -34,6 +34,9 @@ tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", 
 # Axum middleware support (server-side convenience)
 axum = ["dep:axum-core", "server", "http-types"]
 
+# Integration tests (requires a running Tempo localnet)
+integration = ["tempo", "server", "client", "axum"]
+
 [dependencies]
 # Core dependencies (always included)
 serde = { version = "1", features = ["derive"] }
@@ -79,7 +82,10 @@ http-body = { version = "1", optional = true }
 axum-core = { version = "0.5", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = { version = "0.8" }
+reqwest = { version = "0.12", features = ["json"] }
+hex = "0.4"
 
 [patch.crates-io]
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
