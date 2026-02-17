@@ -168,23 +168,9 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
     Ok(params)
 }
 
-/// Validate ISO 8601 timestamp format (YYYY-MM-DDTHH:MM:SS...).
+/// Validate ISO 8601 / RFC 3339 timestamp format.
 fn is_iso8601_timestamp(s: &str) -> bool {
-    if s.len() < 19 {
-        return false;
-    }
-    let b = s.as_bytes();
-    b[4] == b'-'
-        && b[7] == b'-'
-        && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && b[0..4].iter().all(|c| c.is_ascii_digit())
-        && b[5..7].iter().all(|c| c.is_ascii_digit())
-        && b[8..10].iter().all(|c| c.is_ascii_digit())
-        && b[11..13].iter().all(|c| c.is_ascii_digit())
-        && b[14..16].iter().all(|c| c.is_ascii_digit())
-        && b[17..19].iter().all(|c| c.is_ascii_digit())
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).is_ok()
 }
 
 /// Validate digest format.
