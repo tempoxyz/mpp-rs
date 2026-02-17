@@ -1,5 +1,15 @@
 # Changelog
 
+## `mpp@0.4.0`
+
+### Minor Changes
+
+- Added Axum middleware support with extractors and response types, updated library description to "402 Protocol", and made SSE stream pluggable by returning a `Stream` instead of `Receiver`. (by @BrendanRyan, [#59](https://github.com/tempoxyz/mpp-rs/pull/59))
+
+### Patch Changes
+
+- Fixed parameter parsing to reject duplicate parameters, empty challenge IDs, and non-ISO8601 timestamp formats in conformance with protocol strictness requirements. (by @BrendanRyan, [#59](https://github.com/tempoxyz/mpp-rs/pull/59))
+
 ## `mpp@0.3.0`
 
 ### Minor Changes
