@@ -659,15 +659,17 @@ mod tests {
             fn verify_payment(
                 &self,
                 _credential_str: &str,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>,
-            > {
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+            {
                 Box::pin(std::future::ready(Err("unused".into())))
             }
         }
 
         let state: Arc<dyn ChargeChallenger> = Arc::new(FailingChallenger);
-        let req = http_types::Request::builder().uri("/test").body(()).unwrap();
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
         let (mut parts, _body) = req.into_parts();
         let result = MppCharge::<OneCent>::from_request_parts(&mut parts, &state).await;
         let err = result.unwrap_err();
