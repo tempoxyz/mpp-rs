@@ -7,7 +7,6 @@
 //!
 //! let mpp = Mpp::create(tempo(TempoConfig {
 //!     recipient: "0xabc...123",
-//!     currency: None, // defaults to pathUSD
 //! }))?;
 //!
 //! // Charge $0.10 — everything else has smart defaults
@@ -64,8 +63,6 @@ pub use crate::protocol::methods::tempo::session_method::{
 pub struct TempoConfig<'a> {
     /// Recipient address for payments.
     pub recipient: &'a str,
-    /// Token address. Defaults to pathUSD (`0x20c0...`).
-    pub currency: Option<&'a str>,
 }
 
 /// Builder returned by [`tempo()`] for configuring a Tempo payment method.
@@ -102,6 +99,12 @@ impl TempoBuilder {
     /// Explicitly set the chain ID for challenges.
     pub fn chain_id(mut self, id: u64) -> Self {
         self.chain_id = Some(id);
+        self
+    }
+
+    /// Override the token currency (default: pathUSD `0x20c0...`).
+    pub fn currency(mut self, addr: &str) -> Self {
+        self.currency = addr.to_string();
         self
     }
 
@@ -193,15 +196,14 @@ pub struct ChargeOptions<'a> {
 /// // Minimal — currency defaults to pathUSD
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     recipient: "0xabc...123",
-///     currency: None,
 /// }))?;
 ///
 /// // With overrides
 /// let mpp = Mpp::create(
 ///     tempo(TempoConfig {
 ///         recipient: "0xabc...123",
-///         currency: Some("0xcustom_token_address"),
 ///     })
+///     .currency("0xcustom_token_address")
 ///     .rpc_url("https://rpc.moderato.tempo.xyz")
 ///     .realm("my-api.com")
 ///     .secret_key("my-secret")
@@ -211,10 +213,7 @@ pub struct ChargeOptions<'a> {
 #[cfg(feature = "tempo")]
 pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
     TempoBuilder {
-        currency: config
-            .currency
-            .unwrap_or(crate::protocol::methods::tempo::DEFAULT_CURRENCY)
-            .to_string(),
+        currency: crate::protocol::methods::tempo::DEFAULT_CURRENCY.to_string(),
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: "MPP Payment".to_string(),

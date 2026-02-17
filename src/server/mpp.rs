@@ -10,7 +10,6 @@
 //!
 //! let mpp = Mpp::create(tempo(mpp::server::TempoConfig {
 //!     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
-//!     currency: None,
 //! }))?;
 //!
 //! let challenge = mpp.charge("0.10")?;
@@ -49,7 +48,6 @@ pub struct SessionVerifyResult {
 ///
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     recipient: "0xabc...123",
-///     currency: None,
 /// }))?;
 ///
 /// // Charge $0.10 — currency, recipient, realm, secret, expires all handled
@@ -702,7 +700,6 @@ mod tests {
         Mpp::create(
             tempo(TempoConfig {
                 recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
-                currency: None,
             })
             .secret_key("test-secret"),
         )

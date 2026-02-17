@@ -62,7 +62,6 @@ async fn main() {
     let base_payment = Mpp::create(
         tempo(TempoConfig {
             recipient: &recipient,
-            currency: None,
         })
         .rpc_url(RPC_URL)
         .fee_payer(true),
