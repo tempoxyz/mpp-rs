@@ -102,7 +102,7 @@ pub const PAYMENT_SCHEME: &str = "Payment";
 /// - Quoted string values with escaped quotes
 /// - Key=value without quotes for simple values
 /// - Comma or space separated parameters
-fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
+fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
     let mut params = HashMap::new();
     let chars: Vec<char> = params_str.chars().collect();
     let mut i = 0;
@@ -157,10 +157,34 @@ fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
             chars[value_start..i].iter().collect()
         };
 
+        if params.contains_key(&key) {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Duplicate parameter: {}", key
+            )));
+        }
         params.insert(key, value);
     }
 
-    params
+    Ok(params)
+}
+
+/// Validate ISO 8601 timestamp format (YYYY-MM-DDTHH:MM:SS...).
+fn is_iso8601_timestamp(s: &str) -> bool {
+    if s.len() < 19 {
+        return false;
+    }
+    let b = s.as_bytes();
+    b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[0..4].iter().all(|c| c.is_ascii_digit())
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[8..10].iter().all(|c| c.is_ascii_digit())
+        && b[11..13].iter().all(|c| c.is_ascii_digit())
+        && b[14..16].iter().all(|c| c.is_ascii_digit())
+        && b[17..19].iter().all(|c| c.is_ascii_digit())
 }
 
 /// Validate digest format.
@@ -197,9 +221,12 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
             MppError::invalid_challenge_reason("Expected space after 'Payment' scheme".to_string())
         })?
         .trim_start();
-    let params = parse_auth_params(params_str);
+    let params = parse_auth_params(params_str)?;
 
     let id = require_param!(params, "id").clone();
+    if id.is_empty() {
+        return Err(MppError::invalid_challenge_reason("Empty 'id' parameter".to_string()));
+    }
     let realm = require_param!(params, "realm").clone();
     let method = MethodName::new(require_param!(params, "method"));
     let intent = IntentName::new(require_param!(params, "intent"));
@@ -409,6 +436,12 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
     let decoded = base64url_decode(token)?;
     let receipt: Receipt = serde_json::from_slice(&decoded)
         .map_err(|e| MppError::invalid_challenge_reason(format!("Invalid receipt JSON: {}", e)))?;
+
+    if !is_iso8601_timestamp(&receipt.timestamp) {
+        return Err(MppError::invalid_challenge_reason(
+            "Invalid timestamp format: expected ISO 8601".to_string(),
+        ));
+    }
 
     Ok(receipt)
 }
