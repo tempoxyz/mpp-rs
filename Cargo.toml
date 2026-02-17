@@ -1,6 +1,6 @@
 [package]
 name = "mpp"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Machine Payment Protocol - Rust library for Web Payment Auth"
 license = "MIT OR Apache-2.0"
