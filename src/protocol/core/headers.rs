@@ -159,7 +159,8 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
 
         if params.contains_key(&key) {
             return Err(MppError::invalid_challenge_reason(format!(
-                "Duplicate parameter: {}", key
+                "Duplicate parameter: {}",
+                key
             )));
         }
         params.insert(key, value);
@@ -211,7 +212,9 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 
     let id = require_param!(params, "id").clone();
     if id.is_empty() {
-        return Err(MppError::invalid_challenge_reason("Empty 'id' parameter".to_string()));
+        return Err(MppError::invalid_challenge_reason(
+            "Empty 'id' parameter".to_string(),
+        ));
     }
     let realm = require_param!(params, "realm").clone();
     let method = MethodName::new(require_param!(params, "method"));
@@ -797,7 +800,8 @@ mod tests {
 
     #[test]
     fn test_parse_www_authenticate_rejects_empty_id() {
-        let header = r#"Payment id="", realm="api", method="tempo", intent="charge", request="e30""#;
+        let header =
+            r#"Payment id="", realm="api", method="tempo", intent="charge", request="e30""#;
         let err = parse_www_authenticate(header).unwrap_err();
         assert!(err.to_string().contains("Empty 'id'"));
     }
