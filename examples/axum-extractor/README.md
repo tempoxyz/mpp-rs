@@ -1,12 +1,12 @@
 # Axum Extractor
 
-Demonstrates payment-gated endpoints using mpp's axum extractors (`MppCharge` and `MppChargeFor`).
+Demonstrates payment-gated endpoints using mpp's axum `MppCharge<C>` extractor.
 
 The server exposes three endpoints:
 
 - `GET /api/health` — Free, returns `{"status": "ok"}`
-- `GET /api/fortune` — Costs $0.01 (default `MppCharge` extractor)
-- `GET /api/premium` — Costs $1.00 (custom `MppChargeFor<OneDollar>` extractor)
+- `GET /api/fortune` — Costs $0.01 (`MppCharge<OneCent>`)
+- `GET /api/premium` — Costs $1.00 (`MppCharge<OneDollar>`)
 
 The extractors handle the full 402 Payment Required flow automatically — no manual header parsing needed.
 
@@ -34,24 +34,27 @@ The client fetches both the cheap and premium fortune, handling 402 challenges a
 
 ## Per-route pricing
 
-The key pattern for per-route pricing:
+Define a `ChargeConfig` for each price point:
 
 ```rust
-use mpp::server::axum::{ChargeAmount, MppCharge, MppChargeFor, WithReceipt};
+use mpp::server::axum::{ChargeConfig, MppCharge, WithReceipt};
 
-// Define a custom price
-struct OneDollar;
-impl ChargeAmount for OneDollar {
-    fn amount() -> &'static str { "1.00" }
+struct OneCent;
+impl ChargeConfig for OneCent {
+    fn amount() -> &'static str { "0.01" }
 }
 
-// Default $0.01
-async fn cheap(charge: MppCharge) -> WithReceipt<&'static str> {
+struct OneDollar;
+impl ChargeConfig for OneDollar {
+    fn amount() -> &'static str { "1.00" }
+    fn description() -> Option<&'static str> { Some("Premium content") }
+}
+
+async fn cheap(charge: MppCharge<OneCent>) -> WithReceipt<&'static str> {
     WithReceipt { receipt: charge.receipt, body: "cheap" }
 }
 
-// Custom $1.00
-async fn expensive(charge: MppChargeFor<OneDollar>) -> WithReceipt<&'static str> {
+async fn expensive(charge: MppCharge<OneDollar>) -> WithReceipt<&'static str> {
     WithReceipt { receipt: charge.receipt, body: "premium" }
 }
 ```

@@ -13,18 +13,28 @@
 //!
 //! # Per-route pricing
 //!
-//! The default [`MppCharge`] charges `$0.01`. To set a different amount
-//! per route, define a [`ChargeAmount`] type and use [`MppChargeFor<P>`]:
+//! Define a [`ChargeConfig`] type for each price point and use
+//! [`MppCharge<C>`] as the extractor:
 //!
 //! ```ignore
-//! use mpp::server::axum::{ChargeAmount, MppChargeFor};
+//! use mpp::server::axum::{ChargeConfig, MppCharge};
 //!
-//! struct OneDollar;
-//! impl ChargeAmount for OneDollar {
-//!     fn amount() -> &'static str { "1.00" }
+//! struct OneCent;
+//! impl ChargeConfig for OneCent {
+//!     fn amount() -> &'static str { "0.01" }
 //! }
 //!
-//! async fn expensive(charge: MppChargeFor<OneDollar>) -> &'static str {
+//! struct OneDollar;
+//! impl ChargeConfig for OneDollar {
+//!     fn amount() -> &'static str { "1.00" }
+//!     fn description() -> Option<&'static str> { Some("Premium content") }
+//! }
+//!
+//! async fn cheap(charge: MppCharge<OneCent>) -> &'static str {
+//!     "basic content"
+//! }
+//!
+//! async fn expensive(charge: MppCharge<OneDollar>) -> &'static str {
 //!     "premium content"
 //! }
 //! ```
@@ -37,15 +47,20 @@
 //! ```ignore
 //! use axum::{routing::get, Router, Json};
 //! use mpp::server::{Mpp, tempo, TempoConfig};
-//! use mpp::server::axum::{MppCharge, ChargeChallenger};
+//! use mpp::server::axum::{MppCharge, ChargeConfig, ChargeChallenger};
 //! use std::sync::Arc;
+//!
+//! struct OneCent;
+//! impl ChargeConfig for OneCent {
+//!     fn amount() -> &'static str { "0.01" }
+//! }
 //!
 //! let mpp = Mpp::create(tempo(TempoConfig {
 //!     currency: "0x20c...",
 //!     recipient: "0xabc...",
 //! })).unwrap();
 //!
-//! async fn handler(charge: MppCharge) -> Json<serde_json::Value> {
+//! async fn handler(charge: MppCharge<OneCent>) -> Json<serde_json::Value> {
 //!     Json(serde_json::json!({ "paid": true }))
 //! }
 //!
@@ -65,8 +80,6 @@ use crate::protocol::core::headers::{
     PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
 };
 use crate::protocol::core::{PaymentChallenge, Receipt};
-
-// ==================== IntoResponse for PaymentChallenge ====================
 
 /// A 402 Payment Required response wrapping a [`PaymentChallenge`].
 ///
@@ -115,52 +128,50 @@ impl IntoResponse for PaymentRequired {
     }
 }
 
-// ==================== Charge amount policy ====================
-
-/// Trait for specifying a static charge amount on a per-route basis.
+/// Per-route charge configuration.
 ///
-/// Implement this on a marker type and use [`MppChargeFor<P>`] as your
-/// extractor to control the dollar amount charged per route.
+/// Implement this on a marker type to define the amount and optional
+/// description for a payment-gated route. Only [`amount()`](ChargeConfig::amount)
+/// is required; [`description()`](ChargeConfig::description) defaults to `None`.
 ///
-/// This is designed for fixed per-route pricing. For dynamic pricing
-/// (per-user, per-request, etc.), implement [`ChargeChallenger`] directly
-/// or use a custom extractor.
+/// Server-level settings like `fee_payer` and `external_id` are configured
+/// on the [`Mpp`](super::Mpp) instance, not per-route.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use mpp::server::axum::{ChargeAmount, MppChargeFor};
+/// use mpp::server::axum::{ChargeConfig, MppCharge};
 ///
-/// struct TenCents;
-/// impl ChargeAmount for TenCents {
-///     fn amount() -> &'static str { "0.10" }
+/// struct PremiumFortune;
+/// impl ChargeConfig for PremiumFortune {
+///     fn amount() -> &'static str { "1.00" }
+///     fn description() -> Option<&'static str> { Some("Premium fortune reading") }
 /// }
 ///
-/// async fn handler(charge: MppChargeFor<TenCents>) -> &'static str {
+/// async fn handler(charge: MppCharge<PremiumFortune>) -> &'static str {
 ///     "paid content"
 /// }
 /// ```
-pub trait ChargeAmount {
+pub trait ChargeConfig {
     /// The dollar amount to charge (e.g., `"0.01"`, `"1.00"`).
     fn amount() -> &'static str;
-}
 
-/// Default charge amount: $0.01.
-#[derive(Debug)]
-pub struct DefaultAmount;
-
-impl ChargeAmount for DefaultAmount {
-    fn amount() -> &'static str {
-        "0.01"
+    /// Human-readable description included in the challenge.
+    fn description() -> Option<&'static str> {
+        None
     }
 }
 
-// ==================== MppCharge extractor ====================
+/// Options passed from a [`ChargeConfig`] to [`ChargeChallenger::challenge`].
+#[derive(Debug, Default)]
+pub struct ChallengeOptions {
+    /// Human-readable description.
+    pub description: Option<&'static str>,
+}
 
-/// Axum extractor that gates a handler behind charge payment verification.
+/// Axum extractor that gates a handler behind payment verification.
 ///
-/// Uses the default charge amount of `$0.01`. For custom amounts, use
-/// [`MppChargeFor`] with a [`ChargeAmount`] implementation.
+/// The type parameter `C` determines the charge configuration via [`ChargeConfig`].
 ///
 /// # State Requirements
 ///
@@ -170,17 +181,22 @@ impl ChargeAmount for DefaultAmount {
 /// # Example
 ///
 /// ```ignore
-/// use axum::{routing::get, Router, Json};
-/// use mpp::server::axum::{MppCharge, ChargeChallenger};
+/// use mpp::server::axum::{ChargeConfig, MppCharge, ChargeChallenger};
 /// use mpp::server::{Mpp, tempo, TempoConfig};
+/// use axum::{routing::get, Router, Json};
 /// use std::sync::Arc;
+///
+/// struct OneCent;
+/// impl ChargeConfig for OneCent {
+///     fn amount() -> &'static str { "0.01" }
+/// }
 ///
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     currency: "0x20c...",
 ///     recipient: "0xabc...",
 /// })).unwrap();
 ///
-/// async fn handler(charge: MppCharge) -> Json<serde_json::Value> {
+/// async fn handler(charge: MppCharge<OneCent>) -> Json<serde_json::Value> {
 ///     Json(serde_json::json!({ "status": "paid", "ref": charge.receipt.reference }))
 /// }
 ///
@@ -188,34 +204,14 @@ impl ChargeAmount for DefaultAmount {
 ///     .route("/premium", get(handler))
 ///     .with_state(Arc::new(mpp) as Arc<dyn ChargeChallenger>);
 /// ```
-pub type MppCharge = MppChargeFor<DefaultAmount>;
-
-/// Axum extractor that gates a handler with a configurable charge amount.
-///
-/// The type parameter `A` determines the dollar amount via [`ChargeAmount`].
-///
-/// # Example
-///
-/// ```ignore
-/// use mpp::server::axum::{ChargeAmount, MppChargeFor};
-///
-/// struct OneDollar;
-/// impl ChargeAmount for OneDollar {
-///     fn amount() -> &'static str { "1.00" }
-/// }
-///
-/// async fn expensive(charge: MppChargeFor<OneDollar>) -> &'static str {
-///     "premium content"
-/// }
-/// ```
 #[derive(Debug)]
-pub struct MppChargeFor<A: ChargeAmount> {
+pub struct MppCharge<C: ChargeConfig> {
     /// The verified payment receipt.
     pub receipt: Receipt,
-    _amount: std::marker::PhantomData<A>,
+    _config: std::marker::PhantomData<C>,
 }
 
-/// Rejection type for [`MppCharge`] and [`MppChargeFor`] extractors.
+/// Rejection type for [`MppCharge`] extractors.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum MppChargeRejection {
@@ -231,18 +227,13 @@ impl IntoResponse for MppChargeRejection {
     fn into_response(self) -> axum_core::response::Response {
         match self {
             MppChargeRejection::Challenge(pr) => pr.into_response(),
-            MppChargeRejection::VerificationFailed(pr) => {
-                // Return 402 with challenge so the client can retry.
-                pr.into_response()
-            }
+            MppChargeRejection::VerificationFailed(pr) => pr.into_response(),
             MppChargeRejection::InternalError(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
         }
     }
 }
-
-// ==================== ChargeChallenger ====================
 
 /// Trait for generating payment challenges and verifying credentials.
 ///
@@ -252,8 +243,12 @@ impl IntoResponse for MppChargeRejection {
 ///
 /// The extractors require `Arc<dyn ChargeChallenger>` in router state.
 pub trait ChargeChallenger: Send + Sync + 'static {
-    /// Generate a charge challenge for the given dollar amount.
-    fn challenge(&self, amount: &str) -> Result<PaymentChallenge, String>;
+    /// Generate a charge challenge for the given dollar amount and options.
+    fn challenge(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<PaymentChallenge, String>;
 
     /// Verify a credential string and return a receipt.
     fn verify_payment(
@@ -268,8 +263,19 @@ where
     P: alloy::providers::Provider<tempo_alloy::TempoNetwork> + Clone + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    fn challenge(&self, amount: &str) -> Result<PaymentChallenge, String> {
-        self.charge(amount).map_err(|e| e.to_string())
+    fn challenge(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<PaymentChallenge, String> {
+        self.charge_with_options(
+            amount,
+            super::ChargeOptions {
+                description: options.description,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn verify_payment(
@@ -294,10 +300,10 @@ where
     }
 }
 
-impl<S, A> FromRequestParts<S> for MppChargeFor<A>
+impl<S, C> FromRequestParts<S> for MppCharge<C>
 where
     Arc<dyn ChargeChallenger>: FromRef<S>,
-    A: ChargeAmount,
+    C: ChargeConfig,
     S: Send + Sync,
 {
     type Rejection = MppChargeRejection;
@@ -315,11 +321,15 @@ where
             .map(|s| s.to_string());
 
         async move {
+            let options = ChallengeOptions {
+                description: C::description(),
+            };
+
             let credential_str = match auth_header {
                 Some(c) => c,
                 None => {
                     let challenge = challenger
-                        .challenge(A::amount())
+                        .challenge(C::amount(), options)
                         .map_err(MppChargeRejection::InternalError)?;
                     return Err(MppChargeRejection::Challenge(PaymentRequired(challenge)));
                 }
@@ -329,7 +339,7 @@ where
                 Ok(r) => r,
                 Err(_) => {
                     let challenge = challenger
-                        .challenge(A::amount())
+                        .challenge(C::amount(), options)
                         .map_err(MppChargeRejection::InternalError)?;
                     return Err(MppChargeRejection::VerificationFailed(PaymentRequired(
                         challenge,
@@ -337,15 +347,13 @@ where
                 }
             };
 
-            Ok(MppChargeFor {
+            Ok(MppCharge {
                 receipt,
-                _amount: std::marker::PhantomData,
+                _config: std::marker::PhantomData,
             })
         }
     }
 }
-
-// ==================== Receipt IntoResponse helper ====================
 
 /// A successful response with a [`Receipt`] attached as a `Payment-Receipt` header.
 ///
@@ -354,10 +362,15 @@ where
 /// # Example
 ///
 /// ```ignore
-/// use mpp::server::axum::{MppCharge, WithReceipt};
+/// use mpp::server::axum::{ChargeConfig, MppCharge, WithReceipt};
 /// use axum::Json;
 ///
-/// async fn handler(charge: MppCharge) -> WithReceipt<Json<serde_json::Value>> {
+/// struct OneCent;
+/// impl ChargeConfig for OneCent {
+///     fn amount() -> &'static str { "0.01" }
+/// }
+///
+/// async fn handler(charge: MppCharge<OneCent>) -> WithReceipt<Json<serde_json::Value>> {
 ///     WithReceipt {
 ///         receipt: charge.receipt,
 ///         body: Json(serde_json::json!({ "fortune": "good luck" })),
@@ -388,8 +401,6 @@ mod tests {
     use super::*;
     use crate::protocol::core::Base64UrlJson;
 
-    // ==================== Test helpers ====================
-
     fn test_challenge() -> PaymentChallenge {
         PaymentChallenge::new(
             "test-id",
@@ -400,13 +411,16 @@ mod tests {
         )
     }
 
-    /// Mock [`ChargeChallenger`] for extractor tests.
     struct MockChallenger {
         accept: bool,
     }
 
     impl ChargeChallenger for MockChallenger {
-        fn challenge(&self, amount: &str) -> Result<PaymentChallenge, String> {
+        fn challenge(
+            &self,
+            amount: &str,
+            _options: ChallengeOptions,
+        ) -> Result<PaymentChallenge, String> {
             Ok(PaymentChallenge::new(
                 "mock-id",
                 "mock-realm",
@@ -437,7 +451,13 @@ mod tests {
         }
     }
 
-    // ==================== PaymentRequired tests ====================
+    #[derive(Debug)]
+    struct OneCent;
+    impl ChargeConfig for OneCent {
+        fn amount() -> &'static str {
+            "0.01"
+        }
+    }
 
     #[test]
     fn test_payment_required_into_response() {
@@ -454,8 +474,6 @@ mod tests {
             "application/json"
         );
     }
-
-    // ==================== MppChargeRejection tests ====================
 
     #[test]
     fn test_rejection_challenge_returns_402_with_header() {
@@ -480,17 +498,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // ==================== ChargeAmount tests ====================
-
-    #[test]
-    fn test_default_amount() {
-        assert_eq!(DefaultAmount::amount(), "0.01");
-    }
-
     #[test]
     fn test_custom_amount() {
         struct FiveDollars;
-        impl ChargeAmount for FiveDollars {
+        impl ChargeConfig for FiveDollars {
             fn amount() -> &'static str {
                 "5.00"
             }
@@ -498,7 +509,25 @@ mod tests {
         assert_eq!(FiveDollars::amount(), "5.00");
     }
 
-    // ==================== WithReceipt tests ====================
+    #[test]
+    fn test_config_defaults() {
+        assert_eq!(OneCent::description(), None);
+    }
+
+    #[test]
+    fn test_config_overrides() {
+        struct Premium;
+        impl ChargeConfig for Premium {
+            fn amount() -> &'static str {
+                "10.00"
+            }
+            fn description() -> Option<&'static str> {
+                Some("Premium access")
+            }
+        }
+        assert_eq!(Premium::amount(), "10.00");
+        assert_eq!(Premium::description(), Some("Premium access"));
+    }
 
     #[test]
     fn test_with_receipt_attaches_header() {
@@ -521,12 +550,12 @@ mod tests {
         assert!(resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
     }
 
-    // ==================== ChargeChallenger mock tests ====================
-
     #[test]
     fn test_mock_challenger_generates_challenge() {
         let challenger = MockChallenger { accept: true };
-        let challenge = challenger.challenge("0.50").unwrap();
+        let challenge = challenger
+            .challenge("0.50", ChallengeOptions::default())
+            .unwrap();
         assert_eq!(challenge.id, "mock-id");
     }
 
@@ -545,13 +574,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ==================== FromRequestParts integration tests ====================
-
-    /// Helper to run the extractor against a mock request.
-    async fn run_extractor<A: ChargeAmount>(
+    async fn run_extractor<C: ChargeConfig>(
         challenger: MockChallenger,
         auth_header: Option<&str>,
-    ) -> Result<MppChargeFor<A>, MppChargeRejection> {
+    ) -> Result<MppCharge<C>, MppChargeRejection> {
         let state: Arc<dyn ChargeChallenger> = Arc::new(challenger);
         let mut builder = http_types::Request::builder().uri("/test");
         if let Some(auth) = auth_header {
@@ -559,12 +585,12 @@ mod tests {
         }
         let req = builder.body(()).unwrap();
         let (mut parts, _body) = req.into_parts();
-        MppChargeFor::<A>::from_request_parts(&mut parts, &state).await
+        MppCharge::<C>::from_request_parts(&mut parts, &state).await
     }
 
     #[tokio::test]
     async fn test_extractor_no_auth_returns_challenge() {
-        let result = run_extractor::<DefaultAmount>(MockChallenger { accept: true }, None).await;
+        let result = run_extractor::<OneCent>(MockChallenger { accept: true }, None).await;
         let err = result.unwrap_err();
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
@@ -573,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_extractor_valid_payment_returns_receipt() {
-        let result = run_extractor::<DefaultAmount>(
+        let result = run_extractor::<OneCent>(
             MockChallenger { accept: true },
             Some("Payment eyJmYWtlIjp0cnVlfQ"),
         )
@@ -584,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_extractor_invalid_payment_returns_challenge_for_retry() {
-        let result = run_extractor::<DefaultAmount>(
+        let result = run_extractor::<OneCent>(
             MockChallenger { accept: false },
             Some("Payment eyJmYWtlIjp0cnVlfQ"),
         )
@@ -598,27 +624,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_extractor_wrong_scheme_returns_challenge() {
-        let result = run_extractor::<DefaultAmount>(
-            MockChallenger { accept: true },
-            Some("Bearer some-token"),
-        )
-        .await;
+        let result =
+            run_extractor::<OneCent>(MockChallenger { accept: true }, Some("Bearer some-token"))
+                .await;
         let err = result.unwrap_err();
         assert!(matches!(err, MppChargeRejection::Challenge(_)));
     }
 
     #[tokio::test]
     async fn test_extractor_custom_amount() {
+        #[derive(Debug)]
         struct TenCents;
-        impl ChargeAmount for TenCents {
+        impl ChargeConfig for TenCents {
             fn amount() -> &'static str {
                 "0.10"
             }
         }
 
-        // No auth → challenge should be generated (verifying custom amount type works)
-        let result =
-            run_extractor::<TenCents>(MockChallenger { accept: true }, None).await;
+        let result = run_extractor::<TenCents>(MockChallenger { accept: true }, None).await;
         assert!(result.is_err());
     }
 }

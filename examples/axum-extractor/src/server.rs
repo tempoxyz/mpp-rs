@@ -3,8 +3,8 @@
 //! Demonstrates payment-gated endpoints using mpp's axum extractors.
 //!
 //! - `/api/health` — Free health check
-//! - `/api/fortune` — $0.01 (default `MppCharge`)
-//! - `/api/premium` — $1.00 (custom `MppChargeFor<OneDollar>`)
+//! - `/api/fortune` — $0.01 (`MppCharge<OneCent>`)
+//! - `/api/premium` — $1.00 (`MppCharge<OneDollar>`)
 //!
 //! ## Running
 //!
@@ -17,7 +17,7 @@
 use axum::{routing::get, Json, Router};
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
-use mpp::server::axum::{ChargeAmount, ChargeChallenger, MppCharge, MppChargeFor, WithReceipt};
+use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};
 use mpp::server::{tempo, Mpp, TempoConfig};
 use mpp::PrivateKeySigner;
 use rand::seq::IndexedRandom;
@@ -47,13 +47,22 @@ const PREMIUM_FORTUNES: &[&str] = &[
     "The answer you seek is already within you. Trust your instincts.",
 ];
 
-// -- Per-route pricing via ChargeAmount trait --
+struct OneCent;
+
+impl ChargeConfig for OneCent {
+    fn amount() -> &'static str {
+        "0.01"
+    }
+}
 
 struct OneDollar;
 
-impl ChargeAmount for OneDollar {
+impl ChargeConfig for OneDollar {
     fn amount() -> &'static str {
         "1.00"
+    }
+    fn description() -> Option<&'static str> {
+        Some("Premium fortune reading")
     }
 }
 
@@ -86,7 +95,6 @@ async fn main() {
     )
     .expect("failed to create payment handler");
 
-    // Cast to Arc<dyn ChargeChallenger> for the axum extractors.
     let state: Arc<dyn ChargeChallenger> = Arc::new(mpp);
 
     let app = Router::new()
@@ -101,8 +109,8 @@ async fn main() {
 
     println!("Axum Extractor Example listening on http://localhost:3000");
     println!("  GET /api/health   — free");
-    println!("  GET /api/fortune  — $0.01 (MppCharge)");
-    println!("  GET /api/premium  — $1.00 (MppChargeFor<OneDollar>)");
+    println!("  GET /api/fortune  — $0.01");
+    println!("  GET /api/premium  — $1.00");
     axum::serve(listener, app).await.expect("server error");
 }
 
@@ -110,11 +118,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-/// $0.01 fortune — uses the default `MppCharge` extractor.
-///
-/// The extractor handles the full 402 flow automatically:
-/// no credential → 402 with challenge, valid credential → receipt.
-async fn fortune(charge: MppCharge) -> WithReceipt<Json<serde_json::Value>> {
+async fn fortune(charge: MppCharge<OneCent>) -> WithReceipt<Json<serde_json::Value>> {
     let fortune = FORTUNES
         .choose(&mut rand::rng())
         .unwrap_or(&"No fortune today.");
@@ -125,9 +129,8 @@ async fn fortune(charge: MppCharge) -> WithReceipt<Json<serde_json::Value>> {
     }
 }
 
-/// $1.00 premium fortune — uses `MppChargeFor<OneDollar>`.
 async fn premium_fortune(
-    charge: MppChargeFor<OneDollar>,
+    charge: MppCharge<OneDollar>,
 ) -> WithReceipt<Json<serde_json::Value>> {
     let fortune = PREMIUM_FORTUNES
         .choose(&mut rand::rng())
