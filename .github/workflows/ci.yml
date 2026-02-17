@@ -59,20 +59,20 @@ jobs:
             ghcr.io/tempoxyz/tempo:latest \
             node \
             --dev \
-            --dev.blockTime 200ms \
+            --dev.block-time 200ms \
             --http.addr 0.0.0.0 \
             --http.port 8545 \
             --http.api all \
             --http.corsdomain '*' \
-            --faucet.enabled true \
-            --faucet.privateKey 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+            --faucet.enabled \
+            --faucet.private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
             --faucet.address 0x20c0000000000000000000000000000000000000 \
             --faucet.address 0x20c0000000000000000000000000000000000001 \
             --faucet.address 0x20c0000000000000000000000000000000000002 \
             --faucet.address 0x20c0000000000000000000000000000000000003 \
             --faucet.amount 1000000000000 \
-            --engine.legacyStateRoot true \
-            --engine.disablePrecompileCache true
+            --engine.legacy-state-root \
+            --engine.disable-precompile-cache
 
       - name: Wait for Tempo node
         run: |
