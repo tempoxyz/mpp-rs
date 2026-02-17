@@ -203,13 +203,28 @@ impl PaymentProvider for TempoProvider {
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
+        // When fee sponsorship is requested, set a placeholder fee_payer_signature
+        // so that encode_for_signing excludes fee_token from the signing hash.
+        // The server will replace this with the real fee payer signature.
+        let is_fee_payer = charge.fee_payer();
+        let fee_payer_signature = if is_fee_payer {
+            Some(alloy::primitives::Signature::new(
+                alloy::primitives::U256::ZERO,
+                alloy::primitives::U256::ZERO,
+                false,
+            ))
+        } else {
+            None
+        };
+
         // Build a Tempo transaction (type 0x76) for proper on-chain processing.
         let tempo_tx = TempoTransaction {
             chain_id: expected_chain_id,
             nonce,
-            gas_limit: 1_000_000,
+            gas_limit: 300_000,
             max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: 2,
+            fee_payer_signature,
             calls: vec![Call {
                 to: TxKind::Call(currency),
                 value: alloy::primitives::U256::ZERO,
@@ -227,7 +242,18 @@ impl PaymentProvider for TempoProvider {
 
         let signed_tx = tempo_tx.into_signed(signature.into());
         let tx_bytes = signed_tx.encoded_2718();
-        let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+        let signed_tx_hex = if is_fee_payer {
+            // Append sender address + magic bytes for fee payer flow.
+            // The server uses this to identify the sender when computing
+            // the fee payer signature hash.
+            format!(
+                "0x{}{}feefeefeefee",
+                hex::encode(&tx_bytes),
+                hex::encode(address.as_slice())
+            )
+        } else {
+            format!("0x{}", hex::encode(&tx_bytes))
+        };
 
         let echo = challenge.to_echo();
 

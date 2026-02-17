@@ -397,8 +397,17 @@ where
         };
 
         // Decode the signed Tempo transaction (AASigned = tx fields + signature).
-        let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
-            .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
+        // Try normal decode first, then fall back to normalizing viem format
+        // (viem uses 0x00 for fee_payer_signature placeholder instead of 0x80).
+        let signed = match tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]) {
+            Ok(s) => s,
+            Err(_) => {
+                let normalized = normalize_viem_tx(tx_data);
+                tempo_primitives::AASigned::rlp_decode(&mut normalized.as_slice()).map_err(|e| {
+                    VerificationError::new(format!("Failed to decode transaction: {}", e))
+                })?
+            }
+        };
         let tx = signed.tx();
 
         // Validate chain_id to prevent cross-chain replay attacks
@@ -528,9 +537,67 @@ where
             ));
         }
 
+        // If fee payer is requested, decode the tx, add the fee payer signature,
+        // and re-encode before broadcasting.
+        let broadcast_bytes = if charge.fee_payer() {
+            if let Some(fee_signer) = &self.fee_payer_signer {
+                use alloy::consensus::transaction::SignerRecoverable;
+                use alloy::eips::Encodable2718;
+                use alloy::signers::SignerSync;
+
+                // Strip type byte for decoding
+                let tx_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
+                    &tx_bytes[1..]
+                } else {
+                    &tx_bytes[..]
+                };
+
+                // Decode the tx, normalizing viem format if needed
+                let mut signed =
+                    match tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            let normalized = normalize_viem_tx(tx_data);
+                            tempo_primitives::AASigned::rlp_decode(&mut normalized.as_slice())
+                                .map_err(|e| {
+                                    VerificationError::new(format!(
+                                        "Failed to decode transaction for fee payer: {}",
+                                        e
+                                    ))
+                                })?
+                        }
+                    };
+
+                // Recover sender address from the transaction signature
+                let sender = signed.recover_signer().map_err(|e| {
+                    VerificationError::new(format!("Failed to recover sender: {}", e))
+                })?;
+                eprintln!("[fee-payer] sender: {sender}");
+                eprintln!("[fee-payer] fee_payer_signer: {}", fee_signer.address());
+
+                // Compute fee payer signature hash and sign it
+                let fee_hash = signed.tx().fee_payer_signature_hash(sender);
+                let fee_sig = fee_signer.sign_hash_sync(&fee_hash).map_err(|e| {
+                    VerificationError::new(format!("Failed to sign fee payer: {}", e))
+                })?;
+
+                // Set the fee payer signature on the transaction
+                signed.tx_mut().fee_payer_signature = Some(fee_sig.into());
+
+                // Re-encode with the fee payer signature
+                let encoded = signed.encoded_2718();
+                eprintln!("[fee-payer] re-encoded tx: 0x{}", hex::encode(&encoded));
+                Bytes::from(encoded)
+            } else {
+                tx_bytes.clone()
+            }
+        } else {
+            tx_bytes.clone()
+        };
+
         let pending = self
             .provider
-            .send_raw_transaction(&tx_bytes)
+            .send_raw_transaction(&broadcast_bytes)
             .await
             .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
 
@@ -647,6 +714,113 @@ where
                     .await?;
                 this.verify_hash(&format!("{:#x}", tx_hash), &request).await
             }
+        }
+    }
+}
+
+/// Normalize a viem-encoded Tempo transaction for RLP decoding compatibility.
+///
+/// viem encodes fee_payer_signature placeholder as `0x00` (RLP single byte) instead of
+/// `0x80` (EMPTY_STRING_CODE). This function replaces all standalone `0x00` bytes in
+/// the fee_payer_signature position with `0x80` so that `AASigned::rlp_decode` can
+/// parse the transaction. The transformation preserves the RLP list envelope length
+/// since both encodings are 1 byte.
+fn normalize_viem_tx(tx_data: &[u8]) -> Vec<u8> {
+    // The RLP structure after the type byte is:
+    //   [outer_header] [chain_id] [max_pri_fee] [max_fee] [gas_limit]
+    //   [calls] [access_list] [nonce_key] [nonce]
+    //   [valid_before] [valid_after] [fee_token] [fee_payer_sig] [auth_list]
+    //   [signature_bytes]
+    //
+    // We need to find the fee_payer_sig field and replace 0x00 with 0x80.
+    // We skip RLP items one by one to find position 11 (fee_payer_sig, 0-indexed).
+    let mut data = tx_data.to_vec();
+
+    if data.len() < 3 {
+        return data;
+    }
+
+    // Parse outer list header to get start of list content
+    let (content_start, content_end) = match data[0] {
+        0xf8..=0xff => {
+            let len_of_len = (data[0] - 0xf7) as usize;
+            if data.len() < 1 + len_of_len {
+                return data;
+            }
+            let payload_len =
+                usize::from_be_bytes({
+                    let mut buf = [0u8; 8];
+                    let start = 8 - len_of_len;
+                    buf[start..].copy_from_slice(&data[1..1 + len_of_len]);
+                    buf
+                });
+            (1 + len_of_len, 1 + len_of_len + payload_len)
+        }
+        0xc0..=0xf7 => {
+            let payload_len = (data[0] - 0xc0) as usize;
+            (1, 1 + payload_len)
+        }
+        _ => return data,
+    };
+
+    // Skip RLP items to find the fee_payer_sig field (index 11)
+    let mut pos = content_start;
+    for field_idx in 0..12 {
+        if pos >= content_end {
+            return data;
+        }
+
+        let item_len = rlp_item_length(&data, pos);
+        if item_len == 0 {
+            return data;
+        }
+
+        // fee_payer_sig is field index 11
+        if field_idx == 11 && data[pos] == 0x00 {
+            data[pos] = 0x80; // Replace with EMPTY_STRING_CODE
+            return data;
+        }
+
+        pos += item_len;
+    }
+
+    data
+}
+
+/// Returns the total length (header + payload) of an RLP item at the given position.
+fn rlp_item_length(data: &[u8], pos: usize) -> usize {
+    if pos >= data.len() {
+        return 0;
+    }
+    let b = data[pos];
+    match b {
+        // Single byte (0x00..=0x7f)
+        0x00..=0x7f => 1,
+        // Short string (0x80..=0xb7): length = b - 0x80
+        0x80..=0xb7 => 1 + (b - 0x80) as usize,
+        // Long string (0xb8..=0xbf): length-of-length = b - 0xb7
+        0xb8..=0xbf => {
+            let len_of_len = (b - 0xb7) as usize;
+            if pos + 1 + len_of_len > data.len() {
+                return 0;
+            }
+            let mut buf = [0u8; 8];
+            let start = 8 - len_of_len;
+            buf[start..].copy_from_slice(&data[pos + 1..pos + 1 + len_of_len]);
+            1 + len_of_len + usize::from_be_bytes(buf)
+        }
+        // Short list (0xc0..=0xf7): length = b - 0xc0
+        0xc0..=0xf7 => 1 + (b - 0xc0) as usize,
+        // Long list (0xf8..=0xff): length-of-length = b - 0xf7
+        0xf8..=0xff => {
+            let len_of_len = (b - 0xf7) as usize;
+            if pos + 1 + len_of_len > data.len() {
+                return 0;
+            }
+            let mut buf = [0u8; 8];
+            let start = 8 - len_of_len;
+            buf[start..].copy_from_slice(&data[pos + 1..pos + 1 + len_of_len]);
+            1 + len_of_len + usize::from_be_bytes(buf)
         }
     }
 }
@@ -801,5 +975,68 @@ mod tests {
         assert!(error
             .to_string()
             .contains("fee sponsorship is not configured"));
+    }
+
+    #[test]
+    fn test_normalize_viem_tx_replaces_zero_fee_payer_sig() {
+        // A viem-encoded tx with 0x00 at the fee_payer_sig position (field index 11)
+        // This is a real transaction from mppx client
+        let viem_tx = hex::decode(
+            "f8d882a5bf0285059682f00282f299\
+             f87ef87c9420c000000000000000000000000000000000000080\
+             b86495777d59\
+             0000000000000000000000005f270b1a3f160f7dbd21f8840bba82c61f62a029\
+             00000000000000000000000000000000000000000000000000000000000f4240\
+             ef1ed71201546a07b8cebd18e742dc\
+             0000000000000000000075943864ff95b1\
+             c0\
+             80\
+             06\
+             80\
+             80\
+             80\
+             00\
+             c0\
+             b841f94e83c7cae5d97c235de1de04a48cdad0d3a552921b730e5300fd3ce3f6a7f8\
+             1409df263a6f761984537176e7dd30bab5aacdd7a4179f5fdc69d29252bcd5581c"
+        ).unwrap();
+
+        let normalized = normalize_viem_tx(&viem_tx);
+
+        // The fee_payer_sig byte (0x00) should now be 0x80
+        // Verify we can decode the normalized tx
+        let result = tempo_primitives::AASigned::rlp_decode(&mut normalized.as_slice());
+        assert!(result.is_ok(), "Failed to decode normalized viem tx: {:?}", result.err());
+
+        let signed = result.unwrap();
+        assert_eq!(signed.tx().chain_id, MODERATO_CHAIN_ID);
+    }
+
+    #[test]
+    fn test_normalize_viem_tx_preserves_normal_tx() {
+        // A normally-encoded tx with 0x80 (empty string) at fee_payer_sig position
+        // should be unchanged
+        let normal_tx = hex::decode(
+            "f8d882a5bf0285059682f00282f299\
+             f87ef87c9420c000000000000000000000000000000000000080\
+             b86495777d59\
+             0000000000000000000000005f270b1a3f160f7dbd21f8840bba82c61f62a029\
+             00000000000000000000000000000000000000000000000000000000000f4240\
+             ef1ed71201546a07b8cebd18e742dc\
+             0000000000000000000075943864ff95b1\
+             c0\
+             80\
+             06\
+             80\
+             80\
+             80\
+             80\
+             c0\
+             b841f94e83c7cae5d97c235de1de04a48cdad0d3a552921b730e5300fd3ce3f6a7f8\
+             1409df263a6f761984537176e7dd30bab5aacdd7a4179f5fdc69d29252bcd5581c"
+        ).unwrap();
+
+        let normalized = normalize_viem_tx(&normal_tx);
+        assert_eq!(normal_tx, normalized, "Normal tx should not be modified");
     }
 }
