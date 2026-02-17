@@ -135,6 +135,9 @@ pub const MODERATO_CHAIN_ID: u64 = 42431;
 /// Default RPC URL for Tempo mainnet.
 pub const DEFAULT_RPC_URL: &str = "https://rpc.tempo.xyz";
 
+/// Default currency address (pathUSD).
+pub const DEFAULT_CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
+
 /// Default challenge expiration in minutes.
 pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;
 

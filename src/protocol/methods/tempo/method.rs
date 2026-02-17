@@ -49,7 +49,7 @@ const TRANSFER_WITH_MEMO_EVENT_TOPIC: B256 =
 const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 
 /// TIP-20 transferWithMemo function selector: bytes4(keccak256("transferWithMemo(address,uint256,bytes32)"))
-const TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = [0x4a, 0x7a, 0x13, 0x64];
+const TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = [0x95, 0x77, 0x7d, 0x59];
 
 /// Parse a hex string (with or without 0x prefix) into a B256.
 fn parse_b256_hex(s: &str) -> Option<B256> {
@@ -455,9 +455,17 @@ where
                     }
                 }
             } else {
-                // Look for transfer(address,uint256)
-                // Exact length: 4 (selector) + 32 (address) + 32 (amount) = 68 bytes
+                // No memo specified — accept either transfer or transferWithMemo
+                // (clients may attach attribution memos even when the request doesn't require one)
                 if selector == TRANSFER_SELECTOR && data.len() == 68 {
+                    let to = Address::from_slice(&data[16..36]);
+                    let amount = U256::from_be_slice(&data[36..68]);
+
+                    if to == expected_recipient && amount == expected_amount {
+                        return Ok(());
+                    }
+                }
+                if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
                     let to = Address::from_slice(&data[16..36]);
                     let amount = U256::from_be_slice(&data[36..68]);
 
@@ -655,8 +663,8 @@ mod tests {
 
     #[test]
     fn test_transfer_with_memo_selector() {
-        // transferWithMemo(address,uint256,bytes32) = 0x4a7a1364
-        assert_eq!(TRANSFER_WITH_MEMO_SELECTOR, [0x4a, 0x7a, 0x13, 0x64]);
+        // transferWithMemo(address,uint256,bytes32) = 0x95777d59
+        assert_eq!(TRANSFER_WITH_MEMO_SELECTOR, [0x95, 0x77, 0x7d, 0x59]);
     }
 
     #[test]

@@ -61,7 +61,6 @@ async fn main() {
     // Create the base payment handler (charge method).
     let base_payment = Mpp::create(
         tempo(TempoConfig {
-            currency: CURRENCY,
             recipient: &recipient,
         })
         .rpc_url(RPC_URL)

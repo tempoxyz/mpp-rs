@@ -9,7 +9,6 @@
 //! use mpp::server::{Mpp, tempo};
 //!
 //! let mpp = Mpp::create(tempo(mpp::server::TempoConfig {
-//!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 //! }))?;
 //!
@@ -48,7 +47,6 @@ pub struct SessionVerifyResult {
 /// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
 /// let mpp = Mpp::create(tempo(TempoConfig {
-///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
 /// }))?;
 ///
@@ -701,7 +699,6 @@ mod tests {
     fn create_test_mpp() -> Mpp<crate::server::TempoChargeMethod<crate::server::TempoProvider>> {
         Mpp::create(
             tempo(TempoConfig {
-                currency: "0x20c0000000000000000000000000000000000000",
                 recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
             })
             .secret_key("test-secret"),

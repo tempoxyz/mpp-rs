@@ -2,7 +2,7 @@
 name = "mpp"
 version = "0.3.0"
 edition = "2021"
-description = "Machine Payment Protocol - Rust library for Web Payment Auth"
+description = "Rust SDK for the Machine Payments Protocol (MPP)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tempoxyz/mpp-rs"
 homepage = "https://github.com/tempoxyz/mpp-rs"
@@ -16,7 +16,7 @@ default = []
 
 # Side selection
 client = ["reqwest"]
-server = ["tokio", "futures-core"]
+server = ["tokio", "futures-core", "async-stream"]
 
 # Method implementations
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
@@ -30,6 +30,9 @@ middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-typ
 
 # Tower middleware support (server-side)
 tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", "server"]
+
+# Axum middleware support (server-side convenience)
+axum = ["dep:axum-core", "server", "http-types"]
 
 [dependencies]
 # Core dependencies (always included)
@@ -48,6 +51,7 @@ rand = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
 alloy = { version = "1.2", features = ["full"], optional = true }
 alloy-signer-local = { version = "1.2", optional = true }
 
@@ -70,6 +74,9 @@ http-types = { package = "http", version = "1", optional = true }
 tower-layer = { version = "0.3", optional = true }
 tower-service = { version = "0.3", optional = true }
 http-body = { version = "1", optional = true }
+
+# Axum dependencies (optional)
+axum-core = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -12,7 +12,6 @@
 //! use mpp::server::{Mpp, tempo, TempoConfig};
 //!
 //! let mpp = Mpp::create(tempo(TempoConfig {
-//!     currency: "0x20c...",
 //!     recipient: "0xabc...",
 //! })).unwrap();
 //!
