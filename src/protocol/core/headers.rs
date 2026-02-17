@@ -787,4 +787,27 @@ mod tests {
         let parsed = parse_authorization(&mixed).unwrap();
         assert_eq!(parsed.challenge.id, "abc123");
     }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_duplicate_params() {
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", id="b""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Duplicate parameter"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_empty_id() {
+        let header = r#"Payment id="", realm="api", method="tempo", intent="charge", request="e30""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Empty 'id'"));
+    }
+
+    #[test]
+    fn test_parse_receipt_rejects_non_iso8601_timestamp() {
+        // {"method":"tempo","reference":"0xabc","status":"success","timestamp":"Jan 29 2026 12:00"}
+        // base64url encoded
+        let wire = "eyJtZXRob2QiOiJ0ZW1wbyIsInJlZmVyZW5jZSI6IjB4YWJjIiwic3RhdHVzIjoic3VjY2VzcyIsInRpbWVzdGFtcCI6IkphbiAyOSAyMDI2IDEyOjAwIn0";
+        let err = parse_receipt(wire).unwrap_err();
+        assert!(err.to_string().contains("timestamp"));
+    }
 }
