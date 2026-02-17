@@ -12,6 +12,9 @@
 //! # Then in another terminal:
 //! cargo run --bin basic-client
 //!
+//! # Or target any external server:
+//! cargo run --bin basic-client -- https://mpp.sh/api/ping/paid
+//!
 //! # Optional: provide your own private key
 //! export PRIVATE_KEY=0x...
 //! cargo run --bin basic-client
@@ -56,13 +59,35 @@ async fn main() {
     let provider =
         TempoProvider::new(signer, &rpc_url).expect("failed to create payment provider");
 
-    let base_url = std::env::var("BASE_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    let client = Client::new();
+    let mut url = "http://localhost:3000/api/fortune".to_string();
+    let mut extra_headers = reqwest::header::HeaderMap::new();
 
-    let url = format!("{base_url}/api/fortune");
-    println!("Fetching fortune from {url} ...");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-H" => {
+                i += 1;
+                if let Some((key, val)) = args.get(i).and_then(|h| h.split_once(':')) {
+                    extra_headers.insert(
+                        reqwest::header::HeaderName::from_bytes(key.trim().as_bytes())
+                            .expect("invalid header name"),
+                        val.trim().parse().expect("invalid header value"),
+                    );
+                }
+            }
+            _ => url = args[i].clone(),
+        }
+        i += 1;
+    }
+
+    let client = Client::builder()
+        .default_headers(extra_headers)
+        .build()
+        .expect("failed to build client");
+
+    println!("Fetching {url} ...");
 
     let resp = client
         .get(&url)
@@ -80,10 +105,14 @@ async fn main() {
         }
     }
 
-    let body: serde_json::Value = resp.json().await.expect("failed to parse response");
+    let body = resp.text().await.expect("failed to read response body");
 
-    if let Some(fortune) = body.get("fortune").and_then(|v| v.as_str()) {
-        println!("\nFortune: {fortune}");
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(fortune) = json.get("fortune").and_then(|v| v.as_str()) {
+            println!("\nFortune: {fortune}");
+        } else {
+            println!("\nResponse: {json}");
+        }
     } else {
         println!("\nResponse: {body}");
     }
