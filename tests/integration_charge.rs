@@ -497,3 +497,282 @@ async fn test_wrong_auth_scheme_returns_402() {
     handle.abort();
     let _ = handle.await;
 }
+
+/// Sending a malformed `Authorization: Payment <garbage>` credential returns
+/// 402 with a fresh challenge (matching mppx's "malformed credential" test).
+#[tokio::test]
+async fn test_malformed_credential_returns_402() {
+    let rpc = rpc_url();
+    let server_signer = PrivateKeySigner::random();
+    fund_account(&rpc, server_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .secret_key("malformed-cred-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .header("authorization", "Payment !!not-valid-base64!!")
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 402);
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "should return a fresh challenge for retry"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Transfer to the wrong recipient on-chain → server rejects the credential
+/// and returns 402 (matching mppx's "rejects hash with non-matching Transfer log").
+#[tokio::test]
+async fn test_wrong_recipient_transfer_rejected() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let wrong_recipient = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("wrong-recipient-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    // Step 1: Get the 402 challenge.
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 402);
+
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let challenge = mpp::parse_www_authenticate(www_auth).expect("failed to parse challenge");
+
+    // Step 2: Send a real TIP-20 transfer to the WRONG recipient.
+    let charge: mpp::ChargeRequest = challenge.request.decode().unwrap();
+    let amount: U256 = charge.amount.parse().unwrap();
+    let currency: Address = charge.currency.parse().unwrap();
+
+    let transfer_data =
+        ITIP20::transferCall::new((wrong_recipient.address(), amount)).abi_encode();
+
+    let tx_hash = dev_send(
+        &rpc,
+        vec![Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: Bytes::from(transfer_data),
+        }],
+    )
+    .await;
+
+    // Step 3: Build a credential with the wrong-recipient tx hash.
+    let echo = challenge.to_echo();
+    let credential =
+        mpp::PaymentCredential::new(echo, mpp::PaymentPayload::hash(format!("{tx_hash:#x}")));
+    let auth_header =
+        mpp::format_authorization(&credential).expect("failed to format authorization");
+
+    // Step 4: Submit — should be rejected with 402.
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .header("authorization", &auth_header)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        402,
+        "wrong-recipient transfer should be rejected"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Two different clients can independently pay for the same endpoint,
+/// each getting their own receipt.
+#[tokio::test]
+async fn test_multiple_sequential_payments() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_a = PrivateKeySigner::random();
+    let client_b = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_a.address()).await;
+    fund_account(&rpc, client_b.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("multi-pay-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    // Client A pays.
+    let provider_a =
+        TempoProvider::new(client_a, &rpc).expect("failed to create TempoProvider A");
+    let resp_a = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider_a)
+        .await
+        .expect("client A payment failed");
+    assert_eq!(resp_a.status(), 200);
+
+    let receipt_a_hdr = resp_a
+        .headers()
+        .get("payment-receipt")
+        .expect("missing receipt A")
+        .to_str()
+        .unwrap();
+    let receipt_a = mpp::parse_receipt(receipt_a_hdr).expect("failed to parse receipt A");
+    assert_eq!(receipt_a.status, mpp::ReceiptStatus::Success);
+
+    // Client B pays.
+    let provider_b =
+        TempoProvider::new(client_b, &rpc).expect("failed to create TempoProvider B");
+    let resp_b = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider_b)
+        .await
+        .expect("client B payment failed");
+    assert_eq!(resp_b.status(), 200);
+
+    let receipt_b_hdr = resp_b
+        .headers()
+        .get("payment-receipt")
+        .expect("missing receipt B")
+        .to_str()
+        .unwrap();
+    let receipt_b = mpp::parse_receipt(receipt_b_hdr).expect("failed to parse receipt B");
+    assert_eq!(receipt_b.status, mpp::ReceiptStatus::Success);
+
+    // Receipts should reference different transactions.
+    assert_ne!(
+        receipt_a.reference, receipt_b.reference,
+        "each payment should produce a unique tx reference"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Verify client balance decreases after a successful payment.
+#[tokio::test]
+async fn test_client_balance_decreases_after_payment() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    // Check balance before payment.
+    let balance_call = ITIP20::balanceOfCall::new((client_signer.address(),)).abi_encode();
+    let balance_before: U256 = {
+        let result = provider_http
+            .call(
+                alloy::rpc::types::TransactionRequest::default()
+                    .to(PATH_USD)
+                    .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
+                        balance_call.clone(),
+                    )))
+                    .into(),
+            )
+            .await
+            .expect("balanceOf call failed");
+        U256::from_be_slice(&result)
+    };
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("balance-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    // Pay $0.01 (10_000 base units with 6 decimals).
+    let provider =
+        TempoProvider::new(client_signer.clone(), &rpc).expect("failed to create TempoProvider");
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("payment failed");
+    assert_eq!(resp.status(), 200);
+
+    // Check balance after payment.
+    let balance_after: U256 = {
+        let result = provider_http
+            .call(
+                alloy::rpc::types::TransactionRequest::default()
+                    .to(PATH_USD)
+                    .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
+                        balance_call,
+                    )))
+                    .into(),
+            )
+            .await
+            .expect("balanceOf call failed");
+        U256::from_be_slice(&result)
+    };
+
+    let expected_decrease = U256::from(10_000u64); // $0.01 with 6 decimals
+    assert_eq!(
+        balance_before - balance_after,
+        expected_decrease,
+        "client balance should decrease by exactly the charge amount"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
