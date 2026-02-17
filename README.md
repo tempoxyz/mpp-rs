@@ -1,39 +1,23 @@
 # mpp
 
+Rust SDK for the [**Machine Payments Protocol**](https://machinepayments.dev)
+
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://tempoxyz.github.io/mpp-rs)
+[![License](https://img.shields.io/crates/l/mpp.svg)](LICENSE)
 
-Rust SDK for the Machine Payments Protocol (MPP) — an implementation of the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ietf-httpauth-payment/).
+## Documentation
 
-## Architecture
+Full documentation, API reference, and guides are available at **[machinepayments.dev/sdk/rust](https://machinepayments.dev/sdk/rust)**.
 
-### Core Types
+## Install
 
-| Type | Role | HTTP Header |
-|------|------|-------------|
-| `PaymentChallenge` | Server's payment request | `WWW-Authenticate: Payment ...` |
-| `ChargeRequest` | Typed request schema (inside challenge) | Base64 in `request=` param |
-| `PaymentCredential` | Client's payment proof | `Authorization: Payment ...` |
-| `Receipt` | Server's confirmation | `Payment-Receipt: ...` |
-
-### Traits
-
-| Trait | Side | Purpose |
-|-------|------|---------|
-| `ChargeMethod` | Server | Verify credentials against `ChargeRequest` |
-| `PaymentProvider` | Client | Create credentials from challenges |
-
-### Intents
-
-Two built-in intent types:
-
-- **`charge`** — One-time immediate payments (`ChargeRequest`)
-- **`session`** — Pay-as-you-go streaming payments (`SessionRequest`)
-
-Both support a `decimals` field for human-readable amounts (e.g., `"1.5"` with `decimals: 6` → `"1500000"`). The `decimals` field is input-only and stripped from wire serialization.
+```bash
+cargo add mpp
+```
 
 ## Quick Start
 
-### Server (simple API)
+### Server
 
 ```rust
 use mpp::server::{Mpp, tempo, TempoConfig};
@@ -46,29 +30,7 @@ let challenge = mpp.charge("1")?;
 let receipt = mpp.verify_credential(&credential).await?;
 ```
 
-### Server (advanced API)
-
-```rust
-use mpp::server::{Mpp, tempo_provider, TempoChargeMethod};
-
-let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
-let method = TempoChargeMethod::new(provider);
-let payment = Mpp::new(method, "api.example.com", "my-server-secret");
-
-let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
-let receipt = payment.verify(&credential, &request).await?;
-```
-
-### Client (extension trait)
-
-```rust
-use mpp::client::{Fetch, TempoProvider};
-
-let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
-let resp = client.get(url).send_with_payment(&provider).await?;
-```
-
-### Client (middleware)
+### Client
 
 ```rust
 use mpp::client::{PaymentMiddleware, TempoProvider};
@@ -78,6 +40,9 @@ let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
 let client = ClientBuilder::new(reqwest::Client::new())
     .with(PaymentMiddleware::new(provider))
     .build();
+
+// Requests now handle 402 automatically
+let resp = client.get("https://api.example.com/resource").send().await?;
 ```
 
 ## Feature Flags
@@ -91,22 +56,9 @@ let client = ClientBuilder::new(reqwest::Client::new())
 | `middleware` | reqwest-middleware support with `PaymentMiddleware` (implies `client`) |
 | `utils` | Hex/random utilities for development and testing |
 
-The `tempo` feature requires a git patch:
+## Protocol
 
-```toml
-[patch.crates-io]
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
-```
-
-## Commands
-
-```bash
-make build      # Build with default features (tempo)
-make test       # Run tests
-make check      # Format check, clippy, test, and build
-make fix        # Auto-fix formatting and clippy warnings
-```
+Built on the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ietf-httpauth-payment/). See [payment-auth-spec](https://github.com/tempoxyz/payment-auth-spec) for the full specification.
 
 ## License
 
