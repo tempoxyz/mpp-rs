@@ -309,7 +309,7 @@ impl PaymentChallenge {
 /// This is the canonical implementation used by both `PaymentChallenge::verify()`
 /// and challenge creation. The algorithm matches the TypeScript and Python SDKs:
 ///
-/// 1. Concatenate non-empty values of `realm|method|intent|request|expires|digest` with `|`
+/// 1. Concatenate all fields `realm|method|intent|request|expires|digest` with `|` (empty string for absent optional fields)
 /// 2. Compute HMAC-SHA256 with the secret key
 /// 3. Base64url-encode the result (no padding)
 ///
@@ -342,9 +342,10 @@ pub fn compute_challenge_id(
 
     type HmacSha256 = Hmac<Sha256>;
 
-    // Match TypeScript SDK's `.filter(Boolean).join('|')` behavior:
-    // empty strings are excluded from the pipe-delimited input.
-    let hmac_input: String = [
+    // All fields are always included in the pipe-delimited HMAC input,
+    // with empty string for absent optional fields. This ensures challenges
+    // with vs without expires/digest produce different HMACs.
+    let hmac_input = [
         realm,
         method,
         intent,
@@ -352,9 +353,6 @@ pub fn compute_challenge_id(
         expires.unwrap_or(""),
         digest.unwrap_or(""),
     ]
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .collect::<Vec<_>>()
     .join("|");
 
     let mut mac =
@@ -1035,7 +1033,145 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(id, "2zBPShTPApayQwXeT8WydrfbsHFLWIC8cosfBzK3UUs");
+        assert_eq!(id, "s0gsoewXwdYI13oPnrtdKTEN4-sIQ-LbQUNV_HttPnA");
+    }
+
+    /// Cross-SDK golden vectors (shared with mppx and pympp).
+    ///
+    /// HMAC input: realm | method | intent | base64url(canonicalize(request)) | expires | digest
+    /// HMAC key:   UTF-8 bytes of secret_key ("test-vector-secret")
+    /// Output:     base64url(HMAC-SHA256(key, input), no padding)
+    ///
+    /// These vectors cover every combination of optional HMAC fields (expires, digest)
+    /// and variations in each required field (realm, method, intent, request).
+    #[test]
+    fn test_golden_vectors() {
+        use crate::protocol::core::base64url_encode as b64;
+        let secret = "test-vector-secret";
+
+        let req_amount = b64(br#"{"amount":"1000000"}"#);
+        let req_multi = b64(br#"{"amount":"1000000","currency":"0x1234","recipient":"0xabcd"}"#);
+        let req_nested =
+            b64(br#"{"amount":"1000000","currency":"0x1234","methodDetails":{"chainId":42431}}"#);
+        let req_empty = b64(br#"{}"#);
+
+        let vectors: Vec<(
+            &str,
+            &str,
+            &str,
+            &str,
+            &str,
+            Option<&str>,
+            Option<&str>,
+            &str,
+        )> = vec![
+            (
+                "required fields only",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_amount,
+                None,
+                None,
+                "SOfbA51LV3LCkGE7RbomqwXdbWVlrZwlW-Z9aOHolxw",
+            ),
+            (
+                "with expires",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_amount,
+                Some("2025-01-06T12:00:00Z"),
+                None,
+                "R1ZSIwoIjkFhMCSzUGiCTesiigf5vV65EQ_3gVNtsNw",
+            ),
+            (
+                "with digest",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_amount,
+                None,
+                Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE"),
+                "AiMmBdsSOkOYpXTupMnzVnrzZbqMY_P2i80vENRUSN4",
+            ),
+            (
+                "with expires and digest",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_amount,
+                Some("2025-01-06T12:00:00Z"),
+                Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE"),
+                "FMBGqN7MzpKagHsCcartZM09CnUqv7UgmaCy45Ozgug",
+            ),
+            (
+                "multi-field request",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_multi,
+                None,
+                None,
+                "5CXJi4bWMz2W54WjnlmoxnwTYe-JKwhw0z32ICQ65Es",
+            ),
+            (
+                "nested methodDetails",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_nested,
+                None,
+                None,
+                "eid66xXUZsj46Pb30AfAf7m5kPehgianI16rZ-QY8HU",
+            ),
+            (
+                "empty request",
+                "api.example.com",
+                "tempo",
+                "charge",
+                &req_empty,
+                None,
+                None,
+                "6kq-PYTyXtaGAHTHCVUrc_hIsAwLeskeQFtDZerMYhM",
+            ),
+            (
+                "different realm",
+                "payments.other.com",
+                "tempo",
+                "charge",
+                &req_amount,
+                None,
+                None,
+                "-gMjd8UeUvBcqUaUzarVj6ikH_YoDowpaNbEwK1Tmx8",
+            ),
+            (
+                "different method",
+                "api.example.com",
+                "stripe",
+                "charge",
+                &req_amount,
+                None,
+                None,
+                "DRH9ycmIlZ2lYUatIHCrxpm9K7ig5pniZ3ulleb7vl0",
+            ),
+            (
+                "different intent",
+                "api.example.com",
+                "tempo",
+                "session",
+                &req_amount,
+                None,
+                None,
+                "INeBi93MhinvbwdUxeUUIaT5Q_ufgLKPYZb5Tg43A1o",
+            ),
+        ];
+
+        for (label, realm, method, intent, request, expires, digest, expected) in &vectors {
+            let id =
+                compute_challenge_id(secret, realm, method, intent, request, *expires, *digest);
+            assert_eq!(&id, expected, "golden vector failed: {}", label);
+        }
     }
 
     #[test]
