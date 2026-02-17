@@ -102,7 +102,7 @@ pub const PAYMENT_SCHEME: &str = "Payment";
 /// - Quoted string values with escaped quotes
 /// - Key=value without quotes for simple values
 /// - Comma or space separated parameters
-fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
+fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
     let mut params = HashMap::new();
     let chars: Vec<char> = params_str.chars().collect();
     let mut i = 0;
@@ -157,10 +157,21 @@ fn parse_auth_params(params_str: &str) -> HashMap<String, String> {
             chars[value_start..i].iter().collect()
         };
 
+        if params.contains_key(&key) {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Duplicate parameter: {}",
+                key
+            )));
+        }
         params.insert(key, value);
     }
 
-    params
+    Ok(params)
+}
+
+/// Validate ISO 8601 / RFC 3339 timestamp format.
+fn is_iso8601_timestamp(s: &str) -> bool {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).is_ok()
 }
 
 /// Validate digest format.
@@ -197,9 +208,14 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
             MppError::invalid_challenge_reason("Expected space after 'Payment' scheme".to_string())
         })?
         .trim_start();
-    let params = parse_auth_params(params_str);
+    let params = parse_auth_params(params_str)?;
 
     let id = require_param!(params, "id").clone();
+    if id.is_empty() {
+        return Err(MppError::invalid_challenge_reason(
+            "Empty 'id' parameter".to_string(),
+        ));
+    }
     let realm = require_param!(params, "realm").clone();
     let method = MethodName::new(require_param!(params, "method"));
     let intent = IntentName::new(require_param!(params, "intent"));
@@ -409,6 +425,12 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
     let decoded = base64url_decode(token)?;
     let receipt: Receipt = serde_json::from_slice(&decoded)
         .map_err(|e| MppError::invalid_challenge_reason(format!("Invalid receipt JSON: {}", e)))?;
+
+    if !is_iso8601_timestamp(&receipt.timestamp) {
+        return Err(MppError::invalid_challenge_reason(
+            "Invalid timestamp format: expected ISO 8601".to_string(),
+        ));
+    }
 
     Ok(receipt)
 }
@@ -767,5 +789,29 @@ mod tests {
         let mixed = format!("Bearer some-token, {}", formatted);
         let parsed = parse_authorization(&mixed).unwrap();
         assert_eq!(parsed.challenge.id, "abc123");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_duplicate_params() {
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", id="b""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Duplicate parameter"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_empty_id() {
+        let header =
+            r#"Payment id="", realm="api", method="tempo", intent="charge", request="e30""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Empty 'id'"));
+    }
+
+    #[test]
+    fn test_parse_receipt_rejects_non_iso8601_timestamp() {
+        // {"method":"tempo","reference":"0xabc","status":"success","timestamp":"Jan 29 2026 12:00"}
+        // base64url encoded
+        let wire = "eyJtZXRob2QiOiJ0ZW1wbyIsInJlZmVyZW5jZSI6IjB4YWJjIiwic3RhdHVzIjoic3VjY2VzcyIsInRpbWVzdGFtcCI6IkphbiAyOSAyMDI2IDEyOjAwIn0";
+        let err = parse_receipt(wire).unwrap_err();
+        assert!(err.to_string().contains("timestamp"));
     }
 }
