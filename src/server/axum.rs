@@ -56,8 +56,8 @@
 //! }
 //!
 //! let mpp = Mpp::create(tempo(TempoConfig {
-//!     currency: "0x20c...",
 //!     recipient: "0xabc...",
+//!     currency: None,
 //! })).unwrap();
 //!
 //! async fn handler(charge: MppCharge<OneCent>) -> Json<serde_json::Value> {
@@ -192,8 +192,8 @@ pub struct ChallengeOptions {
 /// }
 ///
 /// let mpp = Mpp::create(tempo(TempoConfig {
-///     currency: "0x20c...",
 ///     recipient: "0xabc...",
+///     currency: None,
 /// })).unwrap();
 ///
 /// async fn handler(charge: MppCharge<OneCent>) -> Json<serde_json::Value> {

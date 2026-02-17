@@ -39,8 +39,8 @@ Both support a `decimals` field for human-readable amounts (e.g., `"1.5"` with `
 use mpp::server::{Mpp, tempo, TempoConfig};
 
 let mpp = Mpp::create(tempo(TempoConfig {
-    currency: "0x20c0000000000000000000000000000000000000",
     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+    currency: None, // defaults to pathUSD
 }))?;
 
 let challenge = mpp.charge("1")?;

@@ -30,8 +30,6 @@ use tempo_alloy::TempoNetwork;
 
 type Payment = Mpp<TempoChargeMethod<mpp::server::TempoProvider>>;
 
-const PATH_USD: &str = "0x20c0000000000000000000000000000000000000";
-
 const FORTUNES: &[&str] = &[
     "A beautiful, smart, and loving person will come into your life.",
     "A dubious friend may be an enemy in camouflage.",
@@ -65,8 +63,8 @@ async fn main() {
 
     let payment = Mpp::create(
         tempo(TempoConfig {
-            currency: PATH_USD,
             recipient: &recipient,
+            currency: None,
         })
         .rpc_url(&rpc_url)
         .fee_payer(true)

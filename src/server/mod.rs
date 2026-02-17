@@ -6,8 +6,8 @@
 //! use mpp::server::{Mpp, tempo, TempoConfig};
 //!
 //! let mpp = Mpp::create(tempo(TempoConfig {
-//!     currency: "0x20c0000000000000000000000000000000000000",
 //!     recipient: "0xabc...123",
+//!     currency: None, // defaults to pathUSD
 //! }))?;
 //!
 //! // Charge $0.10 — everything else has smart defaults
@@ -59,13 +59,13 @@ pub use crate::protocol::methods::tempo::session_method::{
 
 /// Configuration for the Tempo payment method.
 ///
-/// Only `currency` and `recipient` are required. Everything else has smart defaults.
+/// Only `recipient` is required. Everything else has smart defaults.
 #[cfg(feature = "tempo")]
 pub struct TempoConfig<'a> {
-    /// Token address (e.g., pathUSD).
-    pub currency: &'a str,
     /// Recipient address for payments.
     pub recipient: &'a str,
+    /// Token address. Defaults to pathUSD (`0x20c0...`).
+    pub currency: Option<&'a str>,
 }
 
 /// Builder returned by [`tempo()`] for configuring a Tempo payment method.
@@ -181,6 +181,7 @@ pub struct ChargeOptions<'a> {
 /// - **rpc_url**: `https://rpc.tempo.xyz`
 /// - **realm**: `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var, or generates a random UUID
+/// - **currency**: pathUSD (`0x20c0000000000000000000000000000000000000`)
 /// - **decimals**: `6` (for pathUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
@@ -189,17 +190,17 @@ pub struct ChargeOptions<'a> {
 /// ```ignore
 /// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
-/// // Minimal
+/// // Minimal — currency defaults to pathUSD
 /// let mpp = Mpp::create(tempo(TempoConfig {
-///     currency: "0x20c0000000000000000000000000000000000000",
 ///     recipient: "0xabc...123",
+///     currency: None,
 /// }))?;
 ///
 /// // With overrides
 /// let mpp = Mpp::create(
 ///     tempo(TempoConfig {
-///         currency: "0x20c0000000000000000000000000000000000000",
 ///         recipient: "0xabc...123",
+///         currency: Some("0xcustom_token_address"),
 ///     })
 ///     .rpc_url("https://rpc.moderato.tempo.xyz")
 ///     .realm("my-api.com")
@@ -210,7 +211,10 @@ pub struct ChargeOptions<'a> {
 #[cfg(feature = "tempo")]
 pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
     TempoBuilder {
-        currency: config.currency.to_string(),
+        currency: config
+            .currency
+            .unwrap_or(crate::protocol::methods::tempo::DEFAULT_CURRENCY)
+            .to_string(),
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: "MPP Payment".to_string(),
