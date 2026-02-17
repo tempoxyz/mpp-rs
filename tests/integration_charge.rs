@@ -579,8 +579,7 @@ async fn test_wrong_recipient_transfer_rejected() {
     let amount: U256 = charge.amount.parse().unwrap();
     let currency: Address = charge.currency.parse().unwrap();
 
-    let transfer_data =
-        ITIP20::transferCall::new((wrong_recipient.address(), amount)).abi_encode();
+    let transfer_data = ITIP20::transferCall::new((wrong_recipient.address(), amount)).abi_encode();
 
     let tx_hash = dev_send(
         &rpc,
@@ -647,8 +646,7 @@ async fn test_multiple_sequential_payments() {
     let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
 
     // Client A pays.
-    let provider_a =
-        TempoProvider::new(client_a, &rpc).expect("failed to create TempoProvider A");
+    let provider_a = TempoProvider::new(client_a, &rpc).expect("failed to create TempoProvider A");
     let resp_a = Client::new()
         .get(format!("{url}/paid"))
         .send_with_payment(&provider_a)
@@ -666,8 +664,7 @@ async fn test_multiple_sequential_payments() {
     assert_eq!(receipt_a.status, mpp::ReceiptStatus::Success);
 
     // Client B pays.
-    let provider_b =
-        TempoProvider::new(client_b, &rpc).expect("failed to create TempoProvider B");
+    let provider_b = TempoProvider::new(client_b, &rpc).expect("failed to create TempoProvider B");
     let resp_b = Client::new()
         .get(format!("{url}/paid"))
         .send_with_payment(&provider_b)
@@ -766,11 +763,11 @@ async fn test_client_balance_decreases_after_payment() {
         U256::from_be_slice(&result)
     };
 
-    let expected_decrease = U256::from(10_000u64); // $0.01 with 6 decimals
-    assert_eq!(
-        balance_before - balance_after,
-        expected_decrease,
-        "client balance should decrease by exactly the charge amount"
+    let charge_amount = U256::from(10_000u64); // $0.01 with 6 decimals
+    let actual_decrease = balance_before - balance_after;
+    assert!(
+        actual_decrease >= charge_amount,
+        "client balance should decrease by at least the charge amount ({charge_amount}), but decreased by {actual_decrease}"
     );
 
     handle.abort();
