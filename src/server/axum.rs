@@ -644,4 +644,48 @@ mod tests {
         let result = run_extractor::<TenCents>(MockChallenger { accept: true }, None).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_extractor_challenge_failure_returns_internal_error() {
+        struct FailingChallenger;
+        impl ChargeChallenger for FailingChallenger {
+            fn challenge(
+                &self,
+                _amount: &str,
+                _options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                Err("config error".into())
+            }
+            fn verify_payment(
+                &self,
+                _credential_str: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>,
+            > {
+                Box::pin(std::future::ready(Err("unused".into())))
+            }
+        }
+
+        let state: Arc<dyn ChargeChallenger> = Arc::new(FailingChallenger);
+        let req = http_types::Request::builder().uri("/test").body(()).unwrap();
+        let (mut parts, _body) = req.into_parts();
+        let result = MppCharge::<OneCent>::from_request_parts(&mut parts, &state).await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, MppChargeRejection::InternalError(_)));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_extractor_malformed_payment_credential_returns_verification_failed() {
+        let result = run_extractor::<OneCent>(
+            MockChallenger { accept: false },
+            Some("Payment !!not-base64!!"),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
 }
