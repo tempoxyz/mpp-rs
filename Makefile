@@ -16,8 +16,9 @@ test-fast:
 	cargo test --lib -- --quiet
 
 # Integration tests require a running Tempo localnet.
-# Start one via prool/Docker, then:
-#   TEMPO_RPC_URL=http://localhost:8545 make test-integration
+#   docker compose up -d
+#   make test-integration
+#   docker compose down
 test-integration:
 	cargo test --features integration --test integration_charge -- --nocapture
 

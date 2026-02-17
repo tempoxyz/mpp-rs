@@ -52,42 +52,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Start Tempo localnet
-        run: |
-          docker run -d --name tempo-node \
-            -p 8545:8545 \
-            ghcr.io/tempoxyz/tempo:latest \
-            node \
-            --dev \
-            --dev.block-time 200ms \
-            --http.addr 0.0.0.0 \
-            --http.port 8545 \
-            --http.api all \
-            --http.corsdomain '*' \
-            --faucet.enabled \
-            --faucet.private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-            --faucet.address 0x20c0000000000000000000000000000000000000 \
-            --faucet.address 0x20c0000000000000000000000000000000000001 \
-            --faucet.address 0x20c0000000000000000000000000000000000002 \
-            --faucet.address 0x20c0000000000000000000000000000000000003 \
-            --faucet.amount 1000000000000 \
-            --engine.legacy-state-root \
-            --engine.disable-precompile-cache
+      - name: Start Tempo node
+        run: docker compose up -d
 
       - name: Wait for Tempo node
         run: |
           echo "Waiting for Tempo node to be ready..."
-          for i in $(seq 1 60); do
+          for i in $(seq 1 30); do
             if curl -sf http://localhost:8545 -X POST \
               -H 'Content-Type: application/json' \
               -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' > /dev/null 2>&1; then
               echo "Tempo node ready after ${i}s"
               exit 0
             fi
-            sleep 1
+            sleep 2
           done
           echo "Tempo node failed to start"
-          docker logs tempo-node
+          docker compose logs
           exit 1
 
       - name: Run integration tests
@@ -97,4 +78,8 @@ jobs:
 
       - name: Tempo node logs
         if: failure()
-        run: docker logs tempo-node
+        run: docker compose logs
+
+      - name: Stop Tempo node
+        if: always()
+        run: docker compose down
