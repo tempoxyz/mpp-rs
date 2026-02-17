@@ -40,5 +40,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo test --all-features
-      - run: cargo hack check --each-feature --no-dev-deps
+      - run: cargo test --features tempo,server,client,axum,middleware,tower,utils
+      - run: cargo hack check --each-feature --no-dev-deps --skip integration
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start Tempo localnet
+        run: |
+          docker run -d --name tempo-node \
+            -p 8545:8545 \
+            ghcr.io/tempoxyz/tempo:latest \
+            node \
+            --dev \
+            --dev.blockTime 200ms \
+            --http.addr 0.0.0.0 \
+            --http.port 8545 \
+            --http.api all \
+            --http.corsdomain '*' \
+            --faucet.enabled true \
+            --faucet.privateKey 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+            --faucet.address 0x20c0000000000000000000000000000000000000 \
+            --faucet.address 0x20c0000000000000000000000000000000000001 \
+            --faucet.address 0x20c0000000000000000000000000000000000002 \
+            --faucet.address 0x20c0000000000000000000000000000000000003 \
+            --faucet.amount 1000000000000 \
+            --engine.legacyStateRoot true \
+            --engine.disablePrecompileCache true
+
+      - name: Wait for Tempo node
+        run: |
+          echo "Waiting for Tempo node to be ready..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8545 -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' > /dev/null 2>&1; then
+              echo "Tempo node ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Tempo node failed to start"
+          docker logs tempo-node
+          exit 1
+
+      - name: Run integration tests
+        run: cargo test --features integration --test integration_charge -- --nocapture
+        env:
+          TEMPO_RPC_URL: http://localhost:8545
+
+      - name: Tempo node logs
+        if: failure()
+        run: docker logs tempo-node
