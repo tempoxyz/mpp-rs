@@ -103,8 +103,20 @@ jobs:
           echo "basic-server failed to start"
           exit 1
 
+      - name: Assert /api/ping returns 402 without payment
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/ping)
+          if [ "$status" != "402" ]; then
+            echo "Expected 402 but got $status"
+            exit 1
+          fi
+          echo "Confirmed: /api/ping returns 402 without payment credentials"
+
       - name: Smoke test — mppx pays /api/ping
-        run: mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail
+        run: |
+          response=$(mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
+          echo "$response"
+          echo "$response" | grep -q '"pong"' || { echo "Response missing pong field"; exit 1; }
         env:
           MPPX_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" # well-known Hardhat dev account[1]
 
