@@ -150,6 +150,10 @@ pub const INTENT_CHARGE: &str = "charge";
 /// Session intent name.
 pub const INTENT_SESSION: &str = "session";
 
+/// Fee-payer suffix marker used by viem-based clients to pass the sender
+/// address alongside fee-payer transactions.
+pub const FEE_PAYER_MARKER: [u8; 6] = [0xfe, 0xef, 0xee, 0xfe, 0xef, 0xee];
+
 /// Create a Tempo charge challenge with minimal parameters.
 ///
 /// This is the simplest way to create a payment challenge for the Tempo network.

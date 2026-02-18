@@ -146,6 +146,7 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        use crate::client::fee_payer::encode_fee_payer_proxy_tx;
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
@@ -155,8 +156,8 @@ impl PaymentProvider for TempoProvider {
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
         use tempo_alloy::TempoNetwork;
+        use tempo_alloy::rpc::TempoTransactionRequest;
         use tempo_primitives::transaction::Call;
-        use tempo_primitives::TempoTransaction;
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
@@ -217,21 +218,23 @@ impl PaymentProvider for TempoProvider {
             None
         };
 
+        let mut tempo_request = TempoTransactionRequest::default();
+        tempo_request.inner.chain_id = Some(expected_chain_id);
+        tempo_request.inner.nonce = Some(nonce);
+        tempo_request.inner.gas = Some(1_000_000);
+        tempo_request.inner.max_fee_per_gas = Some(gas_price);
+        tempo_request.inner.max_priority_fee_per_gas = Some(gas_price);
+        tempo_request.calls = vec![Call {
+            to: TxKind::Call(currency),
+            value: alloy::primitives::U256::ZERO,
+            input: Bytes::from(transfer_data),
+        }];
+        tempo_request.fee_payer_signature = fee_payer_signature;
+
         // Build a Tempo transaction (type 0x76) for proper on-chain processing.
-        let tempo_tx = TempoTransaction {
-            chain_id: expected_chain_id,
-            nonce,
-            gas_limit: 1_000_000,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
-            calls: vec![Call {
-                to: TxKind::Call(currency),
-                value: alloy::primitives::U256::ZERO,
-                input: Bytes::from(transfer_data),
-            }],
-            fee_payer_signature,
-            ..Default::default()
-        };
+        let tempo_tx = tempo_request.build_aa().map_err(|e| {
+            MppError::InvalidConfig(format!("failed to build tempo transaction: {}", e))
+        })?;
 
         use alloy::signers::SignerSync;
         let sig_hash = tempo_tx.signature_hash();
@@ -258,85 +261,6 @@ impl PaymentProvider for TempoProvider {
             PaymentPayload::transaction(signed_tx_hex),
         ))
     }
-}
-
-/// Encode a fee-payer transaction in the wire format expected by the fee-payer
-/// proxy server (viem convention).
-///
-/// `encoded_2718()` encodes `fee_payer_signature` as a full `[v, r, s]` RLP list,
-/// but the proxy expects the `0x00` placeholder byte (same as `encode_for_signing`)
-/// so it knows where to inject its own signature.
-///
-/// Output format: `0x76 || rlp([fields…, 0x00 placeholder, user_sig]) || sender || feefeefeefee`
-///
-/// TODO: push this into `tempo-primitives` as a first-class encoder so downstream
-/// crates don't need to do manual RLP manipulation.
-#[cfg(feature = "tempo")]
-fn encode_fee_payer_proxy_tx(
-    tx: &tempo_primitives::TempoTransaction,
-    user_sig: &alloy::primitives::PrimitiveSignature,
-    sender: alloy::primitives::Address,
-) -> Vec<u8> {
-    use alloy::consensus::SignableTransaction;
-    use tempo_primitives::transaction::TEMPO_TX_TYPE_ID;
-
-    // encode_for_signing gives us: 0x76 || rlp([fields…, 0x00 placeholder])
-    let mut signing_buf = Vec::new();
-    tx.encode_for_signing(&mut signing_buf);
-
-    // Strip type byte (0x76), decode the RLP list header to isolate the fields payload.
-    let rlp_data = &signing_buf[1..];
-    let fields_payload = if rlp_data[0] < 0xf8 {
-        let len = (rlp_data[0] - 0xc0) as usize;
-        &rlp_data[1..1 + len]
-    } else {
-        let len_of_len = (rlp_data[0] - 0xf7) as usize;
-        let mut len = 0usize;
-        for &b in &rlp_data[1..1 + len_of_len] {
-            len = (len << 8) | b as usize;
-        }
-        &rlp_data[1 + len_of_len..1 + len_of_len + len]
-    };
-
-    // User signature as 65 bytes (r || s || v).
-    let sig_bytes = {
-        let mut buf = [0u8; 65];
-        buf[..32].copy_from_slice(&user_sig.r().to_be_bytes::<32>());
-        buf[32..64].copy_from_slice(&user_sig.s().to_be_bytes::<32>());
-        buf[64] = user_sig.v() as u8;
-        buf
-    };
-
-    // New RLP list = fields_payload ++ RLP-encoded signature bytestring.
-    let sig_rlp_len = 1 + 1 + 65; // 0xb8 prefix + length byte + 65 data bytes
-    let new_payload_len = fields_payload.len() + sig_rlp_len;
-
-    let mut out = Vec::with_capacity(1 + 4 + new_payload_len + 20 + 6);
-    out.push(TEMPO_TX_TYPE_ID);
-
-    // RLP list header.
-    if new_payload_len < 56 {
-        out.push(0xc0 + new_payload_len as u8);
-    } else {
-        let len_bytes = new_payload_len.to_be_bytes();
-        let start = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
-        let num_len_bytes = 8 - start;
-        out.push(0xf7 + num_len_bytes as u8);
-        out.extend_from_slice(&len_bytes[start..]);
-    }
-
-    out.extend_from_slice(fields_payload);
-
-    // Signature as RLP byte string (65 bytes, uses long-string prefix).
-    out.push(0xb8);
-    out.push(65);
-    out.extend_from_slice(&sig_bytes);
-
-    // Viem convention suffix: sender address + fee marker.
-    out.extend_from_slice(sender.as_slice());
-    out.extend_from_slice(&[0xfe, 0xef, 0xee, 0xfe, 0xef, 0xee]);
-
-    out
 }
 
 /// A provider that wraps multiple payment providers and picks the right one.

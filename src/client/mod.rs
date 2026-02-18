@@ -24,6 +24,9 @@ mod provider;
 pub mod channel_ops;
 
 #[cfg(feature = "tempo")]
+pub(crate) mod fee_payer;
+
+#[cfg(feature = "tempo")]
 mod session_provider;
 
 #[cfg(feature = "client")]

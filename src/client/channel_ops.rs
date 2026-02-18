@@ -11,7 +11,9 @@ use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::TempoNetwork;
+use tempo_alloy::rpc::TempoTransactionRequest;
 
+use crate::client::fee_payer::encode_fee_payer_proxy_tx;
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
@@ -182,8 +184,6 @@ where
 {
     use alloy::sol;
     use tempo_primitives::transaction::Call;
-    use tempo_primitives::TempoTransaction;
-
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
     // Generate random salt
@@ -256,15 +256,28 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-    let tempo_tx = TempoTransaction {
-        chain_id: options.chain_id,
-        nonce,
-        gas_limit: 2_000_000,
-        max_fee_per_gas: gas_price,
-        max_priority_fee_per_gas: gas_price,
-        calls,
-        ..Default::default()
+    let fee_payer_signature = if options.fee_payer {
+        Some(alloy::primitives::Signature::new(
+            U256::ZERO,
+            U256::ZERO,
+            false,
+        ))
+    } else {
+        None
     };
+
+    let mut tempo_request = TempoTransactionRequest::default();
+    tempo_request.inner.chain_id = Some(options.chain_id);
+    tempo_request.inner.nonce = Some(nonce);
+    tempo_request.inner.gas = Some(2_000_000);
+    tempo_request.inner.max_fee_per_gas = Some(gas_price);
+    tempo_request.inner.max_priority_fee_per_gas = Some(gas_price);
+    tempo_request.calls = calls;
+    tempo_request.fee_payer_signature = fee_payer_signature;
+
+    let tempo_tx = tempo_request.build_aa().map_err(|e| {
+        MppError::InvalidConfig(format!("failed to build open transaction: {}", e))
+    })?;
 
     // Sign the transaction
     let sig_hash = tempo_tx.signature_hash();
@@ -273,12 +286,17 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to sign open transaction: {}", e)))?;
 
-    let signed_tx = tempo_tx.into_signed(signature.into());
+    let signed_tx_hex = if options.fee_payer {
+        let tx_bytes = encode_fee_payer_proxy_tx(&tempo_tx, &signature, payer);
+        format!("0x{}", hex::encode(&tx_bytes))
+    } else {
+        let signed_tx = tempo_tx.into_signed(signature.into());
 
-    // EIP-2718 encode the signed transaction
-    use alloy::eips::Encodable2718;
-    let tx_bytes = signed_tx.encoded_2718();
-    let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+        // EIP-2718 encode the signed transaction
+        use alloy::eips::Encodable2718;
+        let tx_bytes = signed_tx.encoded_2718();
+        format!("0x{}", hex::encode(&tx_bytes))
+    };
 
     // Sign the initial voucher
     let voucher_sig = sign_voucher(
