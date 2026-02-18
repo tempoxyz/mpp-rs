@@ -57,6 +57,7 @@ jobs:
           import { tempoLocalnet } from 'viem/chains'
           import { Actions, Addresses } from 'viem/tempo'
 
+          // well-known Hardhat dev account[0] (faucet key)
           const account = privateKeyToAccount(
             '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
           )
