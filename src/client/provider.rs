@@ -146,7 +146,7 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        use crate::client::fee_payer::{encode_fee_payer_proxy_tx, fee_payer_placeholder};
+        use crate::client::fee_payer::encode_fee_payer_proxy_tx;
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
@@ -205,8 +205,6 @@ impl PaymentProvider for TempoProvider {
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-        let fee_payer_signature = fee_payer_placeholder(is_fee_payer);
-
         let mut tempo_request = TempoTransactionRequest::default();
         tempo_request.inner.chain_id = Some(expected_chain_id);
         tempo_request.inner.nonce = Some(nonce);
@@ -218,7 +216,13 @@ impl PaymentProvider for TempoProvider {
             value: alloy::primitives::U256::ZERO,
             input: Bytes::from(transfer_data),
         }];
-        tempo_request.fee_payer_signature = fee_payer_signature;
+        tempo_request.fee_payer_signature = is_fee_payer.then(||
+            alloy::primitives::Signature::new(
+                alloy::primitives::U256::ZERO,
+                alloy::primitives::U256::ZERO,
+                false,
+            )
+        );
 
         let tempo_tx = tempo_request.build_aa().map_err(|e| {
             MppError::InvalidConfig(format!("failed to build tempo transaction: {}", e))
