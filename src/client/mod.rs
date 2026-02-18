@@ -21,6 +21,9 @@ mod error;
 mod provider;
 
 #[cfg(feature = "tempo")]
+mod fee_payer;
+
+#[cfg(feature = "tempo")]
 pub mod channel_ops;
 
 #[cfg(feature = "tempo")]

@@ -146,6 +146,7 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        use crate::client::fee_payer::{encode_fee_payer_proxy_tx, fee_payer_placeholder};
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
@@ -154,12 +155,13 @@ impl PaymentProvider for TempoProvider {
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
+        use tempo_alloy::rpc::TempoTransactionRequest;
         use tempo_alloy::TempoNetwork;
         use tempo_primitives::transaction::Call;
-        use tempo_primitives::TempoTransaction;
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
+        let is_fee_payer = charge.fee_payer();
         let address = self.signer.address();
 
         let provider =
@@ -203,20 +205,24 @@ impl PaymentProvider for TempoProvider {
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-        // Build a Tempo transaction (type 0x76) for proper on-chain processing.
-        let tempo_tx = TempoTransaction {
-            chain_id: expected_chain_id,
-            nonce,
-            gas_limit: 1_000_000,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
-            calls: vec![Call {
-                to: TxKind::Call(currency),
-                value: alloy::primitives::U256::ZERO,
-                input: Bytes::from(transfer_data),
-            }],
-            ..Default::default()
-        };
+        let fee_payer_signature = fee_payer_placeholder(is_fee_payer);
+
+        let mut tempo_request = TempoTransactionRequest::default();
+        tempo_request.inner.chain_id = Some(expected_chain_id);
+        tempo_request.inner.nonce = Some(nonce);
+        tempo_request.inner.gas = Some(1_000_000);
+        tempo_request.inner.max_fee_per_gas = Some(gas_price);
+        tempo_request.inner.max_priority_fee_per_gas = Some(gas_price);
+        tempo_request.calls = vec![Call {
+            to: TxKind::Call(currency),
+            value: alloy::primitives::U256::ZERO,
+            input: Bytes::from(transfer_data),
+        }];
+        tempo_request.fee_payer_signature = fee_payer_signature;
+
+        let tempo_tx = tempo_request.build_aa().map_err(|e| {
+            MppError::InvalidConfig(format!("failed to build tempo transaction: {}", e))
+        })?;
 
         use alloy::signers::SignerSync;
         let sig_hash = tempo_tx.signature_hash();
@@ -225,8 +231,11 @@ impl PaymentProvider for TempoProvider {
             .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-        let signed_tx = tempo_tx.into_signed(signature.into());
-        let tx_bytes = signed_tx.encoded_2718();
+        let tx_bytes = if is_fee_payer {
+            encode_fee_payer_proxy_tx(&tempo_tx, &signature, address)
+        } else {
+            tempo_tx.into_signed(signature.into()).encoded_2718()
+        };
         let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
         let echo = challenge.to_echo();
