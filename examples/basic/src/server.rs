@@ -66,8 +66,8 @@ async fn main() {
     })
     .rpc_url(&rpc_url);
 
-    if rpc_url.contains("localhost") || rpc_url.contains("127.0.0.1") {
-        builder = builder.chain_id(1337);
+    if let Ok(id) = std::env::var("CHAIN_ID") {
+        builder = builder.chain_id(id.parse().expect("CHAIN_ID must be a number"));
     }
 
     let payment = Mpp::create(builder).expect("failed to create payment handler");

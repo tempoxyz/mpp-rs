@@ -90,7 +90,7 @@ jobs:
 
       - name: Start basic-server
         run: |
-          RPC_URL=http://localhost:8545 cargo run --manifest-path examples/basic/Cargo.toml --bin basic-server &
+          RPC_URL=http://localhost:8545 CHAIN_ID=1337 cargo run --manifest-path examples/basic/Cargo.toml --bin basic-server &
           echo "Waiting for basic-server..."
           for i in $(seq 1 30); do
             if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
