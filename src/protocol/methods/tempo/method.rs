@@ -509,158 +509,6 @@ where
         }
     }
 
-    /// Decode a fee-payer wire-format transaction.
-    ///
-    /// The client's `encode_for_signing` uses a `0x00` placeholder byte for
-    /// `fee_payer_signature` (meaning "fee payer will sign later"), which
-    /// differs from the canonical `AASigned` encoding (`0x80` = None, or a
-    /// full RLP-encoded signature list). Standard `AASigned::rlp_decode`
-    /// cannot handle `0x00`, so we patch the byte to `0x80` before decoding
-    /// and restore `fee_payer_signature = Some(placeholder)` afterwards.
-    fn decode_fee_payer_tx(
-        tx_bytes: &[u8],
-    ) -> Result<
-        (
-            tempo_primitives::TempoTransaction,
-            tempo_primitives::transaction::TempoSignature,
-        ),
-        VerificationError,
-    > {
-        // The raw bytes are: 0x76 || RLP-list(fields..., 0x00, auth_list, sig)
-        // We need to locate the 0x00 placeholder byte and change it to 0x80 so
-        // that rlp_decode_fields treats it as None.  The placeholder is always
-        // a single 0x00 byte (see encode_for_signing) right after the fee_token
-        // field. Rather than parsing every field to find it, we scan for the
-        // unique pattern: since 0x00 only appears as the fee_payer_signature
-        // placeholder (all other fields use 0x80 for empty optionals), we can
-        // create a mutable copy and patch it.
-        let mut patched = tx_bytes.to_vec();
-
-        // Skip type byte (0x76) for Tempo transactions
-        let data_start = if !patched.is_empty() && patched[0] == 0x76 {
-            1
-        } else {
-            0
-        };
-
-        // Parse the outer RLP list header to find where fields start
-        let rlp_data = &patched[data_start..];
-        let (header_len, _payload_len) = if !rlp_data.is_empty() {
-            let first = rlp_data[0];
-            if first <= 0xf7 {
-                (1usize, (first - 0xc0) as usize)
-            } else {
-                let ll = (first - 0xf7) as usize;
-                let mut buf = [0u8; 8];
-                if ll < rlp_data.len() {
-                    buf[8 - ll..].copy_from_slice(&rlp_data[1..1 + ll]);
-                }
-                (1 + ll, usize::from_be_bytes(buf))
-            }
-        } else {
-            return Err(VerificationError::new(
-                "Empty transaction bytes".to_string(),
-            ));
-        };
-
-        // Scan inside the payload for a bare 0x00 byte that is the
-        // fee_payer_signature placeholder.  The fields before it
-        // (fee_token) are encoded as either 0x80 (None) or an address.
-        // The placeholder 0x00 is distinguishable because:
-        //   - It follows the fee_token field (0x80 or 0x94 <20 bytes>)
-        //   - A bare 0x00 is not valid at any other position in the
-        //     fee_payer_signature slot (a real sig would start with a
-        //     list header >= 0xc0)
-        let payload_start = data_start + header_len;
-        let payload_end = patched.len();
-
-        // Walk through the RLP items to find the fee_payer_signature slot.
-        // Field order: chain_id, max_priority_fee, max_fee, gas_limit, calls,
-        //   access_list, nonce_key, nonce, valid_before, valid_after,
-        //   fee_token, fee_payer_signature, auth_list, [key_auth], [user_sig]
-        let mut pos = payload_start;
-        let mut field_idx = 0;
-        const FEE_PAYER_SIG_IDX: usize = 11; // 0-indexed
-
-        while pos < payload_end && field_idx < FEE_PAYER_SIG_IDX {
-            let item_len = Self::rlp_item_total_len(&patched[pos..]).ok_or_else(|| {
-                VerificationError::new(format!(
-                    "Failed to parse RLP at field {} offset {}",
-                    field_idx, pos
-                ))
-            })?;
-            pos += item_len;
-            field_idx += 1;
-        }
-
-        // pos should now point to the fee_payer_signature field
-        if pos < payload_end && patched[pos] == 0x00 {
-            patched[pos] = 0x80; // patch placeholder → None
-        }
-
-        // Now decode using standard AASigned::rlp_decode
-        let decode_data = &patched[data_start..];
-        let signed =
-            tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..]).map_err(|e| {
-                VerificationError::new(format!("Failed to decode fee-payer transaction: {}", e))
-            })?;
-
-        let (mut tx, sig, _) = signed.into_parts();
-
-        // Restore the fee_payer_signature as a placeholder
-        tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
-            U256::ZERO,
-            U256::ZERO,
-            false,
-        ));
-
-        Ok((tx, sig))
-    }
-
-    /// Get the total byte length of an RLP item (header + payload).
-    fn rlp_item_total_len(data: &[u8]) -> Option<usize> {
-        if data.is_empty() {
-            return None;
-        }
-        let first = data[0];
-        match first {
-            // Single byte (0x00..=0x7f)
-            0x00..=0x7f => Some(1),
-            // Short string (0x80..=0xb7): length = first - 0x80
-            0x80..=0xb7 => {
-                let len = (first - 0x80) as usize;
-                Some(1 + len)
-            }
-            // Long string (0xb8..=0xbf): next (first - 0xb7) bytes are the length
-            0xb8..=0xbf => {
-                let ll = (first - 0xb7) as usize;
-                if data.len() < 1 + ll {
-                    return None;
-                }
-                let mut buf = [0u8; 8];
-                buf[8 - ll..].copy_from_slice(&data[1..1 + ll]);
-                let len = usize::from_be_bytes(buf);
-                Some(1 + ll + len)
-            }
-            // Short list (0xc0..=0xf7): length = first - 0xc0
-            0xc0..=0xf7 => {
-                let len = (first - 0xc0) as usize;
-                Some(1 + len)
-            }
-            // Long list (0xf8..=0xff): next (first - 0xf7) bytes are the length
-            0xf8..=0xff => {
-                let ll = (first - 0xf7) as usize;
-                if data.len() < 1 + ll {
-                    return None;
-                }
-                let mut buf = [0u8; 8];
-                buf[8 - ll..].copy_from_slice(&data[1..1 + ll]);
-                let len = usize::from_be_bytes(buf);
-                Some(1 + ll + len)
-            }
-        }
-    }
-
     async fn broadcast_transaction(
         &self,
         signed_tx: &str,
@@ -701,30 +549,39 @@ where
         let broadcast_bytes: Bytes = if charge.fee_payer() {
             let fee_payer_signer = self.fee_payer_signer.as_ref().unwrap();
 
-            let sender = fee_payer_sender.ok_or_else(|| {
-                VerificationError::new(
-                    "feePayer requested but transaction is missing the sender address suffix"
-                        .to_string(),
-                )
-            })?;
-
-            // Decode the fee-payer wire format (handles 0x00 placeholder byte).
-            let (mut tx, user_sig) = Self::decode_fee_payer_tx(tx_bytes)?;
-
-            // Validate the payment call before signing.
-            // Re-encode as canonical bytes for validate_transaction.
-            let canonical_signed = tx.clone().into_signed(user_sig.clone());
-            let mut canonical_buf = Vec::new();
-            canonical_signed.eip2718_encode(&mut canonical_buf);
-
+            // Validate the payment call on the canonical bytes.
             self.validate_transaction(
-                &canonical_buf,
+                tx_bytes,
                 currency,
                 expected_recipient,
                 expected_amount,
                 memo.as_deref(),
                 expected_chain_id,
             )?;
+
+            // Decode the canonical transaction (fee_payer_signature is a
+            // proper RLP-encoded placeholder Signature(0,0,false)).
+            let decode_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
+                &tx_bytes[1..]
+            } else {
+                tx_bytes
+            };
+            let signed =
+                tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..]).map_err(|e| {
+                    VerificationError::new(format!("Failed to decode fee-payer transaction: {}", e))
+                })?;
+
+            // Recover sender from the user's signature.
+            use alloy::consensus::transaction::SignerRecoverable;
+            let sender = if let Some(suffix_sender) = fee_payer_sender {
+                suffix_sender
+            } else {
+                signed.recover_signer().map_err(|e| {
+                    VerificationError::new(format!("Failed to recover sender: {}", e))
+                })?
+            };
+
+            let (mut tx, user_sig, _) = signed.into_parts();
 
             // Sign with the fee payer key.
             use alloy::signers::SignerSync;
@@ -1028,7 +885,7 @@ mod tests {
     }
 
     /// Helper: build a signed Tempo transaction with optional fee-payer
-    /// placeholder and optional feefeefeefee suffix, returning hex bytes.
+    /// placeholder, returning canonical EIP-2718 bytes.
     fn build_test_tx(
         signer: &alloy_signer_local::PrivateKeySigner,
         chain_id: u64,
@@ -1038,6 +895,7 @@ mod tests {
         memo: B256,
         fee_payer: bool,
     ) -> (Vec<u8>, tempo_primitives::TempoTransaction) {
+        use alloy::eips::Encodable2718;
         use alloy::primitives::TxKind;
         use alloy::signers::SignerSync;
         use alloy::sol_types::SolCall;
@@ -1076,62 +934,8 @@ mod tests {
         let sig_hash = tx.signature_hash();
         let signature = signer.sign_hash_sync(&sig_hash).unwrap();
 
-        if fee_payer {
-            // Produce viem-convention bytes:
-            // 0x76 || rlp([fields..., 0x00, auth_list, user_sig]) || sender || feefeefeefee
-            use alloy::consensus::SignableTransaction;
-
-            let mut signing_buf = Vec::new();
-            tx.encode_for_signing(&mut signing_buf);
-
-            let rlp_data = &signing_buf[1..]; // skip 0x76
-            let (header_len, fields_len) = {
-                let first = rlp_data[0];
-                if first <= 0xf7 {
-                    (1, (first - 0xc0) as usize)
-                } else {
-                    let ll = (first - 0xf7) as usize;
-                    let mut buf = [0u8; 8];
-                    buf[8 - ll..].copy_from_slice(&rlp_data[1..1 + ll]);
-                    (1 + ll, usize::from_be_bytes(buf))
-                }
-            };
-            let fields_payload = &rlp_data[header_len..header_len + fields_len];
-
-            let mut sig_bytes = [0u8; 65];
-            sig_bytes[..32].copy_from_slice(&signature.r().to_be_bytes::<32>());
-            sig_bytes[32..64].copy_from_slice(&signature.s().to_be_bytes::<32>());
-            sig_bytes[64] = signature.v() as u8;
-
-            let sig_rlp_len = 2 + 65;
-            let new_payload_len = fields_payload.len() + sig_rlp_len;
-
-            let mut out = Vec::with_capacity(1 + 4 + new_payload_len + 26);
-            out.push(0x76);
-            if new_payload_len <= 55 {
-                out.push(0xc0 + new_payload_len as u8);
-            } else {
-                let len_bytes = new_payload_len.to_be_bytes();
-                let start = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
-                let num_len_bytes = 8 - start;
-                out.push(0xf7 + num_len_bytes as u8);
-                out.extend_from_slice(&len_bytes[start..]);
-            }
-            out.extend_from_slice(fields_payload);
-            out.push(0xb8);
-            out.push(65);
-            out.extend_from_slice(&sig_bytes);
-
-            // Append sender + fee marker
-            out.extend_from_slice(signer.address().as_slice());
-            out.extend_from_slice(&[0xfe, 0xef, 0xee, 0xfe, 0xef, 0xee]);
-
-            (out, tx)
-        } else {
-            use alloy::eips::Encodable2718;
-            let signed_tx = tx.clone().into_signed(signature.into());
-            (signed_tx.encoded_2718(), tx)
-        }
+        let signed_tx = tx.clone().into_signed(signature.into());
+        (signed_tx.encoded_2718(), tx)
     }
 
     // ---- Fee-payer suffix stripping tests ----
@@ -1183,9 +987,10 @@ mod tests {
 
     #[test]
     fn test_fee_payer_round_trip_signing() {
-        // Verify that a fee-payer-suffixed tx can be stripped, decoded via
-        // decode_fee_payer_tx, fee-payer-signed, re-encoded, and the fee
-        // payer recovered.
+        // Verify that a canonical fee-payer tx can be decoded via
+        // AASigned::rlp_decode, sender recovered, fee-payer-signed,
+        // re-encoded, and the fee payer recovered.
+        use alloy::consensus::transaction::SignerRecoverable;
         use alloy::signers::SignerSync;
 
         let user_signer = alloy_signer_local::PrivateKeySigner::random();
@@ -1210,14 +1015,16 @@ mod tests {
             true, // fee_payer = true
         );
 
-        // Step 1: Strip suffix
-        let (tx_bytes, sender_opt) = TestChargeMethod::strip_fee_payer_suffix(&raw_bytes);
-        let sender = sender_opt.expect("sender should be present");
+        // Step 1: Decode canonical bytes (skip type byte 0x76)
+        let decode_data = &raw_bytes[1..];
+        let signed = tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..])
+            .expect("should decode canonical fee-payer tx");
+
+        // Step 2: Recover sender from the user's signature
+        let sender = signed.recover_signer().expect("should recover sender");
         assert_eq!(sender, user_signer.address());
 
-        // Step 2: Decode the fee-payer wire format
-        let (mut tx, user_sig) =
-            TestChargeMethod::decode_fee_payer_tx(tx_bytes).expect("should decode fee-payer tx");
+        let (mut tx, user_sig, _) = signed.into_parts();
 
         // The placeholder should be present
         assert!(tx.fee_payer_signature.is_some(), "placeholder should exist");
@@ -1246,9 +1053,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_fee_payer_tx_validates_payment() {
-        // Ensure decode_fee_payer_tx + re-encode produces bytes that
-        // validate_transaction can parse and verify the payment call.
+    fn test_fee_payer_tx_validates_payment() {
+        // Ensure canonical fee-payer tx bytes pass validate_transaction.
         use alloy::providers::ProviderBuilder;
 
         let user_signer = alloy_signer_local::PrivateKeySigner::random();
@@ -1271,22 +1077,12 @@ mod tests {
             true,
         );
 
-        // Strip and decode the fee-payer format
-        let (tx_bytes, _sender) = TestChargeMethod::strip_fee_payer_suffix(&raw_bytes);
-        let (tx, user_sig) =
-            TestChargeMethod::decode_fee_payer_tx(tx_bytes).expect("should decode");
-
-        // Re-encode as canonical bytes
-        let canonical_signed = tx.into_signed(user_sig);
-        let mut canonical_buf = Vec::new();
-        canonical_signed.eip2718_encode(&mut canonical_buf);
-
-        // validate_transaction should succeed on canonical bytes
+        // validate_transaction should work directly on canonical bytes
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_http("https://rpc.moderato.tempo.xyz".parse().unwrap());
         let method = ChargeMethod::new(provider);
         let result = method.validate_transaction(
-            &canonical_buf,
+            &raw_bytes,
             currency,
             recipient,
             amount,
@@ -1295,7 +1091,7 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "should validate after decode + re-encode: {:?}",
+            "fee-payer tx should validate directly: {:?}",
             result.err()
         );
     }
