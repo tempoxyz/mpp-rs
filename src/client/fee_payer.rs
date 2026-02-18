@@ -1,5 +1,19 @@
 //! Fee-payer transaction encoding helpers.
 
+/// Build a placeholder fee payer signature when fee sponsorship is enabled.
+#[cfg(feature = "tempo")]
+pub(crate) fn fee_payer_placeholder(enabled: bool) -> Option<alloy::primitives::Signature> {
+    if enabled {
+        Some(alloy::primitives::Signature::new(
+            alloy::primitives::U256::ZERO,
+            alloy::primitives::U256::ZERO,
+            false,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Encode a fee-payer transaction in the wire format expected by the fee-payer
 /// proxy server (viem convention).
 ///
@@ -68,4 +82,88 @@ pub(crate) fn encode_fee_payer_proxy_tx(
     out.extend_from_slice(&crate::protocol::methods::tempo::FEE_PAYER_MARKER);
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::eips::Encodable2718;
+    use alloy::primitives::{Address, Bytes, TxKind, U256};
+    use alloy::signers::SignerSync;
+    use tempo_alloy::rpc::TempoTransactionRequest;
+    use tempo_primitives::transaction::Call;
+
+    fn build_test_tx(fee_payer: bool) -> tempo_primitives::TempoTransaction {
+        let mut request = TempoTransactionRequest::default();
+        request.inner.chain_id = Some(4217);
+        request.inner.nonce = Some(0);
+        request.inner.gas = Some(100_000);
+        request.inner.max_fee_per_gas = Some(1);
+        request.inner.max_priority_fee_per_gas = Some(1);
+        request.calls = vec![Call {
+            to: TxKind::Call(
+                "0x20c0000000000000000000000000000000000000"
+                    .parse::<Address>()
+                    .unwrap(),
+            ),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }];
+        request.fee_payer_signature =
+            fee_payer.then(|| alloy::primitives::Signature::new(U256::ZERO, U256::ZERO, false));
+
+        request
+            .build_aa()
+            .expect("failed to build test TempoTransaction")
+    }
+
+    #[test]
+    fn test_encode_fee_payer_proxy_tx_suffix_and_placeholder() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let tx = build_test_tx(true);
+
+        let sig_hash = tx.signature_hash();
+        let signature = signer.sign_hash_sync(&sig_hash).unwrap();
+        let wire = encode_fee_payer_proxy_tx(&tx, &signature, signer.address());
+
+        assert!(wire.len() > 26, "output must include suffix");
+        let marker = crate::protocol::methods::tempo::FEE_PAYER_MARKER;
+        assert_eq!(&wire[wire.len() - 6..], &marker);
+        assert_eq!(
+            Address::from_slice(&wire[wire.len() - 26..wire.len() - 6]),
+            signer.address()
+        );
+
+        let stripped = &wire[..wire.len() - 26];
+        let decode_data = if stripped[0] == 0x76 {
+            &stripped[1..]
+        } else {
+            stripped
+        };
+
+        let signed = tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..])
+            .expect("decode should succeed");
+        let (decoded_tx, _, _) = signed.into_parts();
+        let placeholder = decoded_tx
+            .fee_payer_signature
+            .expect("placeholder signature should exist");
+        assert!(placeholder.r().is_zero());
+        assert!(placeholder.s().is_zero());
+        assert!(!placeholder.v());
+    }
+
+    #[test]
+    fn test_standard_encoding_has_no_fee_payer_suffix() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let tx = build_test_tx(false);
+
+        let sig_hash = tx.signature_hash();
+        let signature = signer.sign_hash_sync(&sig_hash).unwrap();
+        let signed = tx.into_signed(signature.into());
+        let encoded = signed.encoded_2718();
+
+        assert!(encoded.len() > 6, "encoded tx must not be empty");
+        let marker = crate::protocol::methods::tempo::FEE_PAYER_MARKER;
+        assert_ne!(&encoded[encoded.len() - 6..], &marker);
+    }
 }

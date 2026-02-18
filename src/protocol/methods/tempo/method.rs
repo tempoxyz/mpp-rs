@@ -496,7 +496,8 @@ where
     /// present, or `(original_bytes, None)` when it is not.
     fn strip_fee_payer_suffix(tx_bytes: &[u8]) -> (&[u8], Option<Address>) {
         const SUFFIX_LEN: usize = 20 + 6; // sender address + marker
-        if tx_bytes.len() > SUFFIX_LEN && tx_bytes[tx_bytes.len() - 6..] == super::FEE_PAYER_MARKER {
+        if tx_bytes.len() > SUFFIX_LEN && tx_bytes[tx_bytes.len() - 6..] == super::FEE_PAYER_MARKER
+        {
             let split = tx_bytes.len() - SUFFIX_LEN;
             let sender = Address::from_slice(&tx_bytes[split..split + 20]);
             (&tx_bytes[..split], Some(sender))
@@ -568,9 +569,9 @@ where
 
             // Always recover sender cryptographically — never trust the suffix alone.
             use alloy::consensus::transaction::SignerRecoverable;
-            let sender = signed.recover_signer().map_err(|e| {
-                VerificationError::new(format!("Failed to recover sender: {}", e))
-            })?;
+            let sender = signed
+                .recover_signer()
+                .map_err(|e| VerificationError::new(format!("Failed to recover sender: {}", e)))?;
 
             // If the suffix included a sender address, verify it matches.
             if let Some(suffix_sender) = fee_payer_sender {
@@ -1179,13 +1180,16 @@ mod tests {
         // The decoded tx should recover user_signer.address(), which differs
         // from wrong_sender. The server should reject.
         let decode_data = &stripped[1..]; // skip 0x76
-        let signed = tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..])
-            .expect("should decode");
+        let signed =
+            tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..]).expect("should decode");
 
         use alloy::consensus::transaction::SignerRecoverable;
         let recovered = signed.recover_signer().expect("should recover");
         assert_eq!(recovered, user_signer.address());
-        assert_ne!(recovered, wrong_sender, "suffix sender must differ from recovered signer");
+        assert_ne!(
+            recovered, wrong_sender,
+            "suffix sender must differ from recovered signer"
+        );
     }
 
     // ---- Fix #9: encode_fee_payer_proxy_tx roundtrip / edge-case tests ----
@@ -1264,6 +1268,9 @@ mod tests {
         let out = encode_fee_payer_proxy_tx(&tx, &signature, signer.address());
 
         assert_eq!(out[0], TEMPO_TX_TYPE_ID);
-        assert!(out.len() > 26 + 2, "output must contain tx data beyond suffix");
+        assert!(
+            out.len() > 26 + 2,
+            "output must contain tx data beyond suffix"
+        );
     }
 }

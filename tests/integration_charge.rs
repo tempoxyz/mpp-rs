@@ -203,6 +203,23 @@ async fn fund_account(rpc: &str, to: Address) {
     .await;
 }
 
+/// Read a TIP-20 balance for PATH_USD.
+async fn tip20_balance<P: Provider<TempoNetwork>>(provider: &P, address: Address) -> U256 {
+    let balance_call = ITIP20::balanceOfCall::new((address,)).abi_encode();
+    let result = provider
+        .call(
+            alloy::rpc::types::TransactionRequest::default()
+                .to(PATH_USD)
+                .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
+                    balance_call,
+                )))
+                .into(),
+        )
+        .await
+        .expect("balanceOf call failed");
+    U256::from_be_slice(&result)
+}
+
 // ==================== ChargeConfig types ====================
 
 struct OneCent;
@@ -707,21 +724,7 @@ async fn test_client_balance_decreases_after_payment() {
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
 
     // Check balance before payment.
-    let balance_call = ITIP20::balanceOfCall::new((client_signer.address(),)).abi_encode();
-    let balance_before: U256 = {
-        let result = provider_http
-            .call(
-                alloy::rpc::types::TransactionRequest::default()
-                    .to(PATH_USD)
-                    .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
-                        balance_call.clone(),
-                    )))
-                    .into(),
-            )
-            .await
-            .expect("balanceOf call failed");
-        U256::from_be_slice(&result)
-    };
+    let balance_before = tip20_balance(&provider_http, client_signer.address()).await;
 
     let mpp = Mpp::create(
         tempo(TempoConfig {
@@ -748,20 +751,7 @@ async fn test_client_balance_decreases_after_payment() {
     assert_eq!(resp.status(), 200);
 
     // Check balance after payment.
-    let balance_after: U256 = {
-        let result = provider_http
-            .call(
-                alloy::rpc::types::TransactionRequest::default()
-                    .to(PATH_USD)
-                    .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
-                        balance_call,
-                    )))
-                    .into(),
-            )
-            .await
-            .expect("balanceOf call failed");
-        U256::from_be_slice(&result)
-    };
+    let balance_after = tip20_balance(&provider_http, client_signer.address()).await;
 
     let charge_amount = U256::from(10_000u64); // $0.01 with 6 decimals
     let actual_decrease = balance_before - balance_after;
@@ -769,6 +759,121 @@ async fn test_client_balance_decreases_after_payment() {
         actual_decrease >= charge_amount,
         "client balance should decrease by at least the charge amount ({charge_amount}), but decreased by {actual_decrease}"
     );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Fee payer sponsorship should charge the fee payer for gas while the client
+/// only transfers the payment amount.
+#[tokio::test]
+async fn test_fee_payer_sponsorship_charges_fee_payer() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    let client_before = tip20_balance(&provider_http, client_signer.address()).await;
+    let fee_payer_before = tip20_balance(&provider_http, server_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("fee-payer-balance-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider =
+        TempoProvider::new(client_signer.clone(), &rpc).expect("failed to create TempoProvider");
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("payment failed");
+    assert_eq!(resp.status(), 200);
+
+    let client_after = tip20_balance(&provider_http, client_signer.address()).await;
+    let fee_payer_after = tip20_balance(&provider_http, server_signer.address()).await;
+
+    let charge_amount = U256::from(10_000u64);
+    assert_eq!(client_before - client_after, charge_amount);
+    assert!(
+        fee_payer_after < fee_payer_before,
+        "fee payer balance should decrease to cover gas"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Without sponsorship, the client should pay the charge amount plus gas.
+#[tokio::test]
+async fn test_non_fee_payer_pays_gas() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    let client_before = tip20_balance(&provider_http, client_signer.address()).await;
+    let gas_price = provider_http
+        .get_gas_price()
+        .await
+        .expect("failed to get gas price");
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("non-fee-payer-balance-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider =
+        TempoProvider::new(client_signer.clone(), &rpc).expect("failed to create TempoProvider");
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("payment failed");
+    assert_eq!(resp.status(), 200);
+
+    let client_after = tip20_balance(&provider_http, client_signer.address()).await;
+    let charge_amount = U256::from(10_000u64);
+    let delta = client_before - client_after;
+
+    if gas_price > U256::ZERO {
+        assert!(
+            delta > charge_amount,
+            "client should pay gas without sponsorship"
+        );
+    } else {
+        assert_eq!(delta, charge_amount);
+    }
 
     handle.abort();
     let _ = handle.await;

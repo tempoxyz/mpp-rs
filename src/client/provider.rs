@@ -146,7 +146,7 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        use crate::client::fee_payer::encode_fee_payer_proxy_tx;
+        use crate::client::fee_payer::{encode_fee_payer_proxy_tx, fee_payer_placeholder};
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
@@ -155,8 +155,8 @@ impl PaymentProvider for TempoProvider {
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
-        use tempo_alloy::TempoNetwork;
         use tempo_alloy::rpc::TempoTransactionRequest;
+        use tempo_alloy::TempoNetwork;
         use tempo_primitives::transaction::Call;
 
         let charge: ChargeRequest = challenge.request.decode()?;
@@ -208,15 +208,7 @@ impl PaymentProvider for TempoProvider {
         // When feePayer is true, set a placeholder fee_payer_signature so the
         // signing hash commits to "fee payer expected" and the serialized tx
         // includes the 0x00 placeholder byte the server expects.
-        let fee_payer_signature = if is_fee_payer {
-            Some(alloy::primitives::Signature::new(
-                alloy::primitives::U256::ZERO,
-                alloy::primitives::U256::ZERO,
-                false,
-            ))
-        } else {
-            None
-        };
+        let fee_payer_signature = fee_payer_placeholder(is_fee_payer);
 
         let mut tempo_request = TempoTransactionRequest::default();
         tempo_request.inner.chain_id = Some(expected_chain_id);
@@ -244,8 +236,7 @@ impl PaymentProvider for TempoProvider {
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
         let signed_tx_hex = if is_fee_payer {
-            let tx_bytes =
-                encode_fee_payer_proxy_tx(&tempo_tx, &signature, address);
+            let tx_bytes = encode_fee_payer_proxy_tx(&tempo_tx, &signature, address);
             format!("0x{}", hex::encode(&tx_bytes))
         } else {
             let signed_tx = tempo_tx.into_signed(signature.into());

@@ -10,10 +10,10 @@ use alloy::primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
-use tempo_alloy::TempoNetwork;
 use tempo_alloy::rpc::TempoTransactionRequest;
+use tempo_alloy::TempoNetwork;
 
-use crate::client::fee_payer::encode_fee_payer_proxy_tx;
+use crate::client::fee_payer::{encode_fee_payer_proxy_tx, fee_payer_placeholder};
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
@@ -256,15 +256,7 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-    let fee_payer_signature = if options.fee_payer {
-        Some(alloy::primitives::Signature::new(
-            U256::ZERO,
-            U256::ZERO,
-            false,
-        ))
-    } else {
-        None
-    };
+    let fee_payer_signature = fee_payer_placeholder(options.fee_payer);
 
     let mut tempo_request = TempoTransactionRequest::default();
     tempo_request.inner.chain_id = Some(options.chain_id);
@@ -275,9 +267,9 @@ where
     tempo_request.calls = calls;
     tempo_request.fee_payer_signature = fee_payer_signature;
 
-    let tempo_tx = tempo_request.build_aa().map_err(|e| {
-        MppError::InvalidConfig(format!("failed to build open transaction: {}", e))
-    })?;
+    let tempo_tx = tempo_request
+        .build_aa()
+        .map_err(|e| MppError::InvalidConfig(format!("failed to build open transaction: {}", e)))?;
 
     // Sign the transaction
     let sig_hash = tempo_tx.signature_hash();
