@@ -61,21 +61,23 @@ async fn main() {
         .expect("faucet funding failed");
     println!("Server account funded");
 
-    let payment = Mpp::create(
-        tempo(TempoConfig {
-            recipient: &recipient,
-        })
-        .rpc_url(&rpc_url)
-        .fee_payer(true)
-        .fee_payer_signer(signer),
-    )
-    .expect("failed to create payment handler");
+    let mut builder = tempo(TempoConfig {
+        recipient: &recipient,
+    })
+    .rpc_url(&rpc_url);
+
+    if let Ok(id) = std::env::var("CHAIN_ID") {
+        builder = builder.chain_id(id.parse().expect("CHAIN_ID must be a number"));
+    }
+
+    let payment = Mpp::create(builder).expect("failed to create payment handler");
 
     let state = Arc::new(payment);
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/fortune", get(fortune))
+        .route("/api/ping", get(ping))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
@@ -88,6 +90,54 @@ async fn main() {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn ping(
+    State(payment): State<Arc<Payment>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Ok(credential) = parse_authorization(auth_str) {
+                match payment.verify_credential(&credential).await {
+                    Ok(receipt) => {
+                        let receipt_header = receipt.to_header().unwrap_or_default();
+                        return (
+                            StatusCode::OK,
+                            [("payment-receipt", receipt_header)],
+                            Json(serde_json::json!({ "pong": true })),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        let body = serde_json::json!({ "error": e.to_string() });
+                        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    match payment.charge("0.01") {
+        Ok(challenge) => match format_www_authenticate(&challenge) {
+            Ok(www_auth) => (
+                StatusCode::PAYMENT_REQUIRED,
+                [(header::WWW_AUTHENTICATE, www_auth)],
+                Json(serde_json::json!({ "error": "Payment Required" })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn fortune(

@@ -1,0 +1,117 @@
+name: Cross-SDK Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: mpp-rs server × mppx CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install mppx CLI
+        run: npm i -g mppx@0.2.2
+
+      - name: Start Tempo node
+        run: docker compose up -d
+
+      - name: Wait for Tempo node
+        run: |
+          echo "Waiting for Tempo node to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8545 -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' > /dev/null 2>&1; then
+              echo "Tempo node ready after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Tempo node failed to start"
+          docker compose logs
+          exit 1
+
+      - name: Provision AMM liquidity
+        run: |
+          cd "$(mktemp -d)"
+          npm init -y > /dev/null
+          npm i viem > /dev/null 2>&1
+          node --input-type=module <<'EOF'
+          import { createClient, http, parseUnits } from 'viem'
+          import { privateKeyToAccount } from 'viem/accounts'
+          import { tempoLocalnet } from 'viem/chains'
+          import { Actions, Addresses } from 'viem/tempo'
+
+          // well-known Hardhat dev account[0] (faucet key)
+          const account = privateKeyToAccount(
+            '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
+          )
+          const client = createClient({
+            account,
+            chain: { ...tempoLocalnet, rpcUrls: { default: { http: ['http://localhost:8545'] } } },
+            transport: http('http://localhost:8545'),
+          })
+
+          for (const id of [1n, 2n, 3n]) {
+            await Actions.amm.mintSync(client, {
+              account,
+              feeToken: Addresses.pathUsd,
+              userTokenAddress: id,
+              validatorTokenAddress: Addresses.pathUsd,
+              validatorTokenAmount: parseUnits('1000', 6),
+              to: account.address,
+            })
+          }
+          console.log('AMM liquidity provisioned')
+          EOF
+
+      - name: Fund client account # well-known Hardhat dev account[1]
+        run: |
+          curl -sf http://localhost:8545 -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","method":"tempo_fundAddress","params":["0x70997970C51812dc3A010C7d01b50e0d17dc79C8"],"id":1}'
+
+      - name: Build basic-server
+        run: cargo build --manifest-path examples/basic/Cargo.toml --bin basic-server
+
+      - name: Start basic-server
+        run: |
+          RPC_URL=http://localhost:8545 CHAIN_ID=1337 cargo run --manifest-path examples/basic/Cargo.toml --bin basic-server &
+          echo "Waiting for basic-server..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
+              echo "basic-server ready after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "basic-server failed to start"
+          exit 1
+
+      - name: Smoke test — mppx pays /api/ping
+        run: mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail
+        env:
+          MPPX_PRIVATE_KEY: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" # well-known Hardhat dev account[1]
+
+      - name: Tempo node logs
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop Tempo node
+        if: always()
+        run: docker compose down
