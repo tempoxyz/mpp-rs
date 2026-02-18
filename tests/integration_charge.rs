@@ -781,7 +781,8 @@ async fn test_fee_payer_sponsorship_charges_fee_payer() {
         ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
 
     let client_before = tip20_balance(&provider_http, client_signer.address()).await;
-    let fee_payer_before = tip20_balance(&provider_http, server_signer.address()).await;
+    let fee_payer_address = server_signer.address();
+    let fee_payer_before = tip20_balance(&provider_http, fee_payer_address).await;
 
     let mpp = Mpp::create(
         tempo(TempoConfig {
@@ -790,7 +791,7 @@ async fn test_fee_payer_sponsorship_charges_fee_payer() {
         .rpc_url(&rpc)
         .chain_id(chain_id)
         .fee_payer(true)
-        .fee_payer_signer(server_signer)
+        .fee_payer_signer(server_signer.clone())
         .secret_key("fee-payer-balance-test"),
     )
     .expect("failed to create Mpp");
@@ -807,7 +808,7 @@ async fn test_fee_payer_sponsorship_charges_fee_payer() {
     assert_eq!(resp.status(), 200);
 
     let client_after = tip20_balance(&provider_http, client_signer.address()).await;
-    let fee_payer_after = tip20_balance(&provider_http, server_signer.address()).await;
+    let fee_payer_after = tip20_balance(&provider_http, fee_payer_address).await;
 
     let charge_amount = U256::from(10_000u64);
     assert_eq!(client_before - client_after, charge_amount);
@@ -866,7 +867,7 @@ async fn test_non_fee_payer_pays_gas() {
     let charge_amount = U256::from(10_000u64);
     let delta = client_before - client_after;
 
-    if gas_price > U256::ZERO {
+    if gas_price > 0 {
         assert!(
             delta > charge_amount,
             "client should pay gas without sponsorship"

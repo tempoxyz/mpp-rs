@@ -134,17 +134,7 @@ mod tests {
             signer.address()
         );
 
-        let stripped = &wire[..wire.len() - 26];
-        let decode_data = if stripped[0] == 0x76 {
-            &stripped[1..]
-        } else {
-            stripped
-        };
-
-        let signed = tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..])
-            .expect("decode should succeed");
-        let (decoded_tx, _, _) = signed.into_parts();
-        let placeholder = decoded_tx
+        let placeholder = tx
             .fee_payer_signature
             .expect("placeholder signature should exist");
         assert!(placeholder.r().is_zero());
