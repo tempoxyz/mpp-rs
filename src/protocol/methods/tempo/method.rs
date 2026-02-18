@@ -489,23 +489,6 @@ where
         }
     }
 
-    /// Strip the viem-convention fee-payer suffix from transaction bytes.
-    ///
-    /// The suffix format is: `<20-byte sender address><6-byte fee marker>`.
-    /// Returns `(canonical_tx_bytes, Some(sender_address))` when the suffix is
-    /// present, or `(original_bytes, None)` when it is not.
-    fn strip_fee_payer_suffix(tx_bytes: &[u8]) -> (&[u8], Option<Address>) {
-        const SUFFIX_LEN: usize = 20 + 6; // sender address + marker
-        if tx_bytes.len() > SUFFIX_LEN && tx_bytes[tx_bytes.len() - 6..] == super::FEE_PAYER_MARKER
-        {
-            let split = tx_bytes.len() - SUFFIX_LEN;
-            let sender = Address::from_slice(&tx_bytes[split..split + 20]);
-            (&tx_bytes[..split], Some(sender))
-        } else {
-            (tx_bytes, None)
-        }
-    }
-
     async fn broadcast_transaction(
         &self,
         signed_tx: &str,
@@ -527,16 +510,9 @@ where
         })?;
         let memo = charge.memo();
 
-        // Only strip the viem fee-payer suffix when fee sponsorship is requested.
-        // This avoids false-positive suffix detection on normal transactions whose
-        // trailing bytes happen to match the marker.
-        let (tx_bytes, fee_payer_sender) = if charge.fee_payer() {
-            Self::strip_fee_payer_suffix(&raw_bytes)
-        } else {
-            (&raw_bytes[..], None)
-        };
+        let tx_bytes = &raw_bytes[..];
 
-        // Validate the payment call on canonical bytes (common to both paths).
+        // Validate the payment call.
         self.validate_transaction(
             tx_bytes,
             currency,
@@ -567,21 +543,11 @@ where
                     VerificationError::new(format!("Failed to decode fee-payer transaction: {}", e))
                 })?;
 
-            // Always recover sender cryptographically — never trust the suffix alone.
+            // Recover sender cryptographically from the user's signature.
             use alloy::consensus::transaction::SignerRecoverable;
             let sender = signed
                 .recover_signer()
                 .map_err(|e| VerificationError::new(format!("Failed to recover sender: {}", e)))?;
-
-            // If the suffix included a sender address, verify it matches.
-            if let Some(suffix_sender) = fee_payer_sender {
-                if suffix_sender != sender {
-                    return Err(VerificationError::new(format!(
-                        "Suffix sender {} does not match recovered signer {}",
-                        suffix_sender, sender
-                    )));
-                }
-            }
 
             let (mut tx, user_sig, _) = signed.into_parts();
 
@@ -931,51 +897,6 @@ mod tests {
         (signed_tx.encoded_2718(), tx)
     }
 
-    // ---- Fee-payer suffix stripping tests ----
-
-    type TestChargeMethod = ChargeMethod<
-        alloy::providers::fillers::FillProvider<
-            alloy::providers::Identity,
-            alloy::providers::RootProvider<TempoNetwork>,
-            TempoNetwork,
-        >,
-    >;
-
-    #[test]
-    fn test_strip_fee_payer_suffix_present() {
-        let mut data = vec![0x76, 0xaa, 0xbb]; // fake tx bytes
-        let sender: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f3bB77"
-            .parse()
-            .unwrap();
-        data.extend_from_slice(sender.as_slice());
-        data.extend_from_slice(&crate::protocol::methods::tempo::FEE_PAYER_MARKER);
-
-        let (stripped, extracted_sender) = TestChargeMethod::strip_fee_payer_suffix(&data);
-        assert_eq!(stripped, &[0x76, 0xaa, 0xbb]);
-        assert_eq!(extracted_sender, Some(sender));
-    }
-
-    #[test]
-    fn test_strip_fee_payer_suffix_absent() {
-        let data = vec![0x76, 0xaa, 0xbb, 0xcc];
-        let (stripped, sender) = TestChargeMethod::strip_fee_payer_suffix(&data);
-        assert_eq!(stripped, &data[..]);
-        assert_eq!(sender, None);
-    }
-
-    #[test]
-    fn test_strip_fee_payer_suffix_too_short() {
-        // Exactly 26 bytes (suffix length) should not match because there'd be
-        // zero canonical bytes.
-        let mut data = vec![0u8; 20]; // "sender"
-        data.extend_from_slice(&crate::protocol::methods::tempo::FEE_PAYER_MARKER);
-        assert_eq!(data.len(), 26);
-
-        let (stripped, sender) = TestChargeMethod::strip_fee_payer_suffix(&data);
-        assert_eq!(stripped.len(), data.len()); // unchanged
-        assert_eq!(sender, None);
-    }
-
     // ---- Fee-payer round-trip signing test ----
 
     #[test]
@@ -1114,11 +1035,6 @@ mod tests {
             false, // no fee payer
         );
 
-        // No suffix should be detected
-        let (stripped, sender) = TestChargeMethod::strip_fee_payer_suffix(&raw_bytes);
-        assert_eq!(stripped.len(), raw_bytes.len());
-        assert!(sender.is_none());
-
         // validate_transaction should work directly
         let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_http("https://rpc.moderato.tempo.xyz".parse().unwrap());
@@ -1138,139 +1054,4 @@ mod tests {
         );
     }
 
-    // ---- Fix #8: suffix sender ≠ recovered sender ----
-
-    #[test]
-    fn test_suffix_sender_mismatch_rejected() {
-        // Build a fee-payer tx signed by user_signer, but attach a DIFFERENT
-        // address in the viem suffix. The server must reject this.
-        let user_signer = alloy_signer_local::PrivateKeySigner::random();
-        let wrong_sender = alloy_signer_local::PrivateKeySigner::random().address();
-
-        let currency: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-        let recipient: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f3bB77"
-            .parse()
-            .unwrap();
-        let amount = U256::from(1_000_000u64);
-        let memo = B256::ZERO;
-
-        let (canonical_bytes, _tx) = build_test_tx(
-            &user_signer,
-            MODERATO_CHAIN_ID,
-            currency,
-            recipient,
-            amount,
-            memo,
-            true,
-        );
-
-        // Append viem suffix with the WRONG sender address
-        let mut wire_bytes = canonical_bytes.clone();
-        wire_bytes.extend_from_slice(wrong_sender.as_slice());
-        wire_bytes.extend_from_slice(&crate::protocol::methods::tempo::FEE_PAYER_MARKER);
-
-        // Verify stripping extracts the wrong sender
-        let (stripped, extracted) = TestChargeMethod::strip_fee_payer_suffix(&wire_bytes);
-        assert_eq!(stripped, &canonical_bytes[..]);
-        assert_eq!(extracted, Some(wrong_sender));
-        assert_ne!(wrong_sender, user_signer.address());
-
-        // The decoded tx should recover user_signer.address(), which differs
-        // from wrong_sender. The server should reject.
-        let decode_data = &stripped[1..]; // skip 0x76
-        let signed =
-            tempo_primitives::AASigned::rlp_decode(&mut &decode_data[..]).expect("should decode");
-
-        use alloy::consensus::transaction::SignerRecoverable;
-        let recovered = signed.recover_signer().expect("should recover");
-        assert_eq!(recovered, user_signer.address());
-        assert_ne!(
-            recovered, wrong_sender,
-            "suffix sender must differ from recovered signer"
-        );
-    }
-
-    // ---- Fix #9: encode_fee_payer_proxy_tx roundtrip / edge-case tests ----
-
-    #[test]
-    fn test_encode_fee_payer_proxy_tx_roundtrip() {
-        // Encode a fee-payer tx via the proxy helper, then verify:
-        // 1. Suffix is present and strippable
-        // 2. After stripping, the tx can be decoded
-        // 3. The sender can be recovered
-        use crate::client::fee_payer::encode_fee_payer_proxy_tx;
-        use alloy::signers::SignerSync;
-
-        let signer = alloy_signer_local::PrivateKeySigner::random();
-        let currency: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-        let recipient: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f3bB77"
-            .parse()
-            .unwrap();
-        let amount = U256::from(500_000u64);
-        let memo = B256::ZERO;
-
-        let (_canonical, tx) = build_test_tx(
-            &signer,
-            MODERATO_CHAIN_ID,
-            currency,
-            recipient,
-            amount,
-            memo,
-            true,
-        );
-
-        // Sign and encode via the proxy helper
-        let sig_hash = tx.signature_hash();
-        let signature = signer.sign_hash_sync(&sig_hash).unwrap();
-        let wire = encode_fee_payer_proxy_tx(&tx, &signature, signer.address());
-
-        // Must end with sender + marker
-        let marker = &crate::protocol::methods::tempo::FEE_PAYER_MARKER;
-        assert_eq!(&wire[wire.len() - 6..], marker);
-        assert_eq!(
-            Address::from_slice(&wire[wire.len() - 26..wire.len() - 6]),
-            signer.address()
-        );
-
-        // Strip suffix and verify canonical bytes decode
-        let (stripped, extracted_sender) = TestChargeMethod::strip_fee_payer_suffix(&wire);
-        assert_eq!(extracted_sender, Some(signer.address()));
-        assert!(stripped[0] == 0x76, "must start with tempo tx type");
-    }
-
-    #[test]
-    fn test_encode_fee_payer_proxy_tx_output_starts_with_type_byte() {
-        use crate::client::fee_payer::encode_fee_payer_proxy_tx;
-        use alloy::signers::SignerSync;
-        use tempo_primitives::transaction::TEMPO_TX_TYPE_ID;
-
-        let signer = alloy_signer_local::PrivateKeySigner::random();
-        let (_canonical, tx) = build_test_tx(
-            &signer,
-            MODERATO_CHAIN_ID,
-            "0x20c0000000000000000000000000000000000000"
-                .parse()
-                .unwrap(),
-            "0x742d35Cc6634C0532925a3b844Bc9e7595f3bB77"
-                .parse()
-                .unwrap(),
-            U256::from(1u64),
-            B256::ZERO,
-            true,
-        );
-
-        let sig_hash = tx.signature_hash();
-        let signature = signer.sign_hash_sync(&sig_hash).unwrap();
-        let out = encode_fee_payer_proxy_tx(&tx, &signature, signer.address());
-
-        assert_eq!(out[0], TEMPO_TX_TYPE_ID);
-        assert!(
-            out.len() > 26 + 2,
-            "output must contain tx data beyond suffix"
-        );
-    }
 }

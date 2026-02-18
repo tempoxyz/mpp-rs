@@ -146,7 +146,7 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        use crate::client::fee_payer::{encode_fee_payer_proxy_tx, fee_payer_placeholder};
+        use crate::client::fee_payer::fee_payer_placeholder;
         use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
@@ -206,8 +206,9 @@ impl PaymentProvider for TempoProvider {
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
         // When feePayer is true, set a placeholder fee_payer_signature so the
-        // signing hash commits to "fee payer expected" and the serialized tx
-        // includes the 0x00 placeholder byte the server expects.
+        // signing hash commits to "fee payer expected". The server will
+        // recover the sender, co-sign as fee payer, and replace the
+        // placeholder with a real signature before broadcasting.
         let fee_payer_signature = fee_payer_placeholder(is_fee_payer);
 
         let mut tempo_request = TempoTransactionRequest::default();
@@ -235,14 +236,12 @@ impl PaymentProvider for TempoProvider {
             .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-        let signed_tx_hex = if is_fee_payer {
-            let tx_bytes = encode_fee_payer_proxy_tx(&tempo_tx, &signature, address);
-            format!("0x{}", hex::encode(&tx_bytes))
-        } else {
-            let signed_tx = tempo_tx.into_signed(signature.into());
-            let tx_bytes = signed_tx.encoded_2718();
-            format!("0x{}", hex::encode(&tx_bytes))
-        };
+        // Standard 2718 encoding: 0x76 || rlp([fields…, fee_payer_placeholder, user_sig])
+        // The server deserializes, normalizes the zero-valued placeholder,
+        // recovers the sender, and co-signs as fee payer.
+        let signed_tx = tempo_tx.into_signed(signature.into());
+        let tx_bytes = signed_tx.encoded_2718();
+        let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
         let echo = challenge.to_echo();
 

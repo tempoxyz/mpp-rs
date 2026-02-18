@@ -13,7 +13,7 @@ use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
 
-use crate::client::fee_payer::{encode_fee_payer_proxy_tx, fee_payer_placeholder};
+use crate::client::fee_payer::fee_payer_placeholder;
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
@@ -278,17 +278,13 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to sign open transaction: {}", e)))?;
 
-    let signed_tx_hex = if options.fee_payer {
-        let tx_bytes = encode_fee_payer_proxy_tx(&tempo_tx, &signature, payer);
-        format!("0x{}", hex::encode(&tx_bytes))
-    } else {
-        let signed_tx = tempo_tx.into_signed(signature.into());
-
-        // EIP-2718 encode the signed transaction
-        use alloy::eips::Encodable2718;
-        let tx_bytes = signed_tx.encoded_2718();
-        format!("0x{}", hex::encode(&tx_bytes))
-    };
+    // Standard 2718 encoding for both fee-payer and non-fee-payer paths.
+    // For fee-payer txs, the placeholder Signature(0,0,false) is included
+    // in the RLP — the server will normalize and co-sign.
+    let signed_tx = tempo_tx.into_signed(signature.into());
+    use alloy::eips::Encodable2718;
+    let tx_bytes = signed_tx.encoded_2718();
+    let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
     // Sign the initial voucher
     let voucher_sig = sign_voucher(
