@@ -160,6 +160,7 @@ impl PaymentProvider for TempoProvider {
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
+        let is_fee_payer = charge.fee_payer();
         let address = self.signer.address();
 
         let provider =
@@ -203,6 +204,19 @@ impl PaymentProvider for TempoProvider {
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
+        // When feePayer is true, set a placeholder fee_payer_signature so the
+        // signing hash commits to "fee payer expected" and the serialized tx
+        // includes the 0x00 placeholder byte the server expects.
+        let fee_payer_signature = if is_fee_payer {
+            Some(alloy::primitives::Signature::new(
+                alloy::primitives::U256::ZERO,
+                alloy::primitives::U256::ZERO,
+                false,
+            ))
+        } else {
+            None
+        };
+
         // Build a Tempo transaction (type 0x76) for proper on-chain processing.
         let tempo_tx = TempoTransaction {
             chain_id: expected_chain_id,
@@ -215,6 +229,7 @@ impl PaymentProvider for TempoProvider {
                 value: alloy::primitives::U256::ZERO,
                 input: Bytes::from(transfer_data),
             }],
+            fee_payer_signature,
             ..Default::default()
         };
 
@@ -225,9 +240,75 @@ impl PaymentProvider for TempoProvider {
             .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-        let signed_tx = tempo_tx.into_signed(signature.into());
-        let tx_bytes = signed_tx.encoded_2718();
-        let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+        let signed_tx_hex = if is_fee_payer {
+            // For fee-payer transactions, produce the serialization format
+            // the TypeScript (viem) server expects:
+            // 0x76 || rlp([fields..., 0x00 placeholder, auth_list, user_sig]) || sender || feefeefeefee
+            //
+            // encode_for_signing outputs: 0x76 || rlp([fields..., 0x00, auth_list])
+            // We unwrap it, append the user signature, re-wrap, and add the
+            // sender+marker suffix that the server uses to identify the sender.
+            use alloy::consensus::SignableTransaction;
+
+            // Get signing payload: [0x76][rlp_header][fields_payload]
+            let mut signing_buf = Vec::new();
+            tempo_tx.encode_for_signing(&mut signing_buf);
+
+            // Parse out the fields payload from the RLP envelope
+            let rlp_data = &signing_buf[1..]; // skip 0x76 type byte
+            let (header_len, fields_len) = {
+                let first = rlp_data[0];
+                if first <= 0xf7 {
+                    (1, (first - 0xc0) as usize)
+                } else {
+                    let ll = (first - 0xf7) as usize;
+                    let mut buf = [0u8; 8];
+                    buf[8 - ll..].copy_from_slice(&rlp_data[1..1 + ll]);
+                    (1 + ll, usize::from_be_bytes(buf))
+                }
+            };
+            let fields_payload = &rlp_data[header_len..header_len + fields_len];
+
+            // Encode user signature as raw 65-byte secp256k1: [r(32) || s(32) || v(1)]
+            let mut sig_bytes = [0u8; 65];
+            sig_bytes[..32].copy_from_slice(&signature.r().to_be_bytes::<32>());
+            sig_bytes[32..64].copy_from_slice(&signature.s().to_be_bytes::<32>());
+            sig_bytes[64] = signature.v() as u8;
+
+            // Build new RLP list: fields + sig_bytes (65 bytes as RLP string)
+            // sig_bytes is 65 bytes, so RLP encoding is: 0xb8 0x41 <65 bytes>
+            let sig_rlp_len = 2 + 65; // 0xb8 + length byte + 65 data bytes
+            let new_payload_len = fields_payload.len() + sig_rlp_len;
+
+            let mut out = Vec::with_capacity(1 + 4 + new_payload_len + 26);
+            // Type byte
+            out.push(0x76);
+            // RLP list header for new payload
+            if new_payload_len <= 55 {
+                out.push(0xc0 + new_payload_len as u8);
+            } else {
+                let len_bytes = new_payload_len.to_be_bytes();
+                let start = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
+                let num_len_bytes = 8 - start;
+                out.push(0xf7 + num_len_bytes as u8);
+                out.extend_from_slice(&len_bytes[start..]);
+            }
+            // Fields payload (from encode_for_signing)
+            out.extend_from_slice(fields_payload);
+            // User signature as RLP string (65 bytes)
+            out.push(0xb8); // long string prefix
+            out.push(65); // length
+            out.extend_from_slice(&sig_bytes);
+
+            // Append sender address + fee marker (viem convention)
+            out.extend_from_slice(address.as_slice());
+            out.extend_from_slice(&[0xfe, 0xef, 0xee, 0xfe, 0xef, 0xee]);
+            format!("0x{}", hex::encode(&out))
+        } else {
+            let signed_tx = tempo_tx.into_signed(signature.into());
+            let tx_bytes = signed_tx.encoded_2718();
+            format!("0x{}", hex::encode(&tx_bytes))
+        };
 
         let echo = challenge.to_echo();
 
