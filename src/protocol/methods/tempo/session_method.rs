@@ -1285,7 +1285,8 @@ mod tests {
 
         // Fourth deduction should fail (no balance left)
         let r4 = deduct_from_channel(&store, "0xchannel1", 1).await;
-        assert!(r4.is_err());
+        let err = r4.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InsufficientBalance));
     }
 
     #[tokio::test]
@@ -1300,6 +1301,12 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.spent, 0);
         assert_eq!(r.units, 1);
+
+        // Verify store state is consistent
+        let ch = store.get_channel_sync("0xchannel1").unwrap();
+        assert_eq!(ch.spent, 0);
+        assert_eq!(ch.units, 1);
+        assert_eq!(ch.highest_voucher_amount, 0);
     }
 
     #[tokio::test]
@@ -1381,16 +1388,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deduct_from_finalized_channel() {
+    async fn test_deduct_from_finalized_channel_succeeds() {
         let store = InMemoryChannelStore::new();
         let mut state = test_channel_state("0xchannel1");
         state.highest_voucher_amount = 10_000;
         state.finalized = true;
         store.insert("0xchannel1", state);
 
-        // deduct_from_channel only checks balance, not finalized flag
-        let result = deduct_from_channel(&store, "0xchannel1", 1_000).await;
-        assert!(result.is_ok());
+        // NOTE: deduct_from_channel intentionally ignores the finalized flag.
+        // Finalization is an on-chain concern; the server-side deduction only
+        // tracks spend against the highest voucher amount.
+        let result = deduct_from_channel(&store, "0xchannel1", 1_000).await.unwrap();
+        assert_eq!(result.spent, 1_000);
+        assert!(result.finalized, "finalized flag should be preserved");
     }
 
     #[tokio::test]
@@ -1400,13 +1410,12 @@ mod tests {
 
         let store2 = store.clone();
         let handle = tokio::spawn(async move {
-            // This should block until update_channel is called
             store2.wait_for_update("0xchannel1").await;
             true
         });
 
-        // Give the spawned task time to start waiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Yield to let the spawned task start waiting
+        tokio::task::yield_now().await;
 
         // Trigger an update
         store.update_channel(
@@ -1418,12 +1427,34 @@ mod tests {
             }),
         ).await.unwrap();
 
-        // The wait should have been notified
+        // The wait should complete within a reasonable time
         let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
+            tokio::time::Duration::from_secs(1),
             handle,
-        ).await;
-        assert!(result.is_ok(), "wait_for_update should have been notified");
-        assert!(result.unwrap().unwrap());
+        ).await
+        .expect("wait_for_update should have been notified within timeout")
+        .expect("spawned task should not panic");
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_deductions_different_channels() {
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let mut s1 = test_channel_state("0xchannel1");
+        s1.highest_voucher_amount = 10_000;
+        let mut s2 = test_channel_state("0xchannel2");
+        s2.highest_voucher_amount = 10_000;
+        store.insert("0xchannel1", s1);
+        store.insert("0xchannel2", s2);
+
+        let store1 = store.clone();
+        let store2 = store.clone();
+        let (r1, r2) = tokio::join!(
+            deduct_from_channel(&*store1, "0xchannel1", 3_000),
+            deduct_from_channel(&*store2, "0xchannel2", 5_000),
+        );
+
+        assert_eq!(r1.unwrap().spent, 3_000);
+        assert_eq!(r2.unwrap().spent, 5_000);
     }
 }
