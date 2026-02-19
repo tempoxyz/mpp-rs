@@ -667,6 +667,168 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
+    // --- cumulative() ---
+
+    #[test]
+    fn test_cumulative_empty_registry() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert_eq!(provider.cumulative(), 0);
+    }
+
+    #[test]
+    fn test_cumulative_with_opened_channel() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let entry = ChannelEntry {
+            channel_id: B256::ZERO,
+            salt: B256::ZERO,
+            cumulative_amount: 42_000,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("key".to_string(), entry);
+
+        assert_eq!(provider.cumulative(), 42_000);
+    }
+
+    #[test]
+    fn test_cumulative_ignores_non_opened_channels() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let entry = ChannelEntry {
+            channel_id: B256::ZERO,
+            salt: B256::ZERO,
+            cumulative_amount: 99_000,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: false,
+        };
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("key".to_string(), entry);
+
+        assert_eq!(
+            provider.cumulative(),
+            0,
+            "non-opened channels should not be counted"
+        );
+    }
+
+    // --- with_signing_mode ---
+
+    #[test]
+    fn test_session_provider_with_signing_mode() {
+        use super::super::signing::TempoSigningMode;
+
+        let signer = PrivateKeySigner::random();
+        let wallet: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet,
+                key_authorization: None,
+            });
+
+        assert!(matches!(
+            provider.signing_mode,
+            TempoSigningMode::Keychain { .. }
+        ));
+    }
+
+    #[test]
+    fn test_session_provider_default_signing_mode() {
+        use super::super::signing::TempoSigningMode;
+
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert!(matches!(provider.signing_mode, TempoSigningMode::Direct));
+    }
+
+    // --- resolve_deposit edge cases ---
+
+    #[test]
+    fn test_resolve_deposit_invalid_suggested_falls_back() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_default_deposit(7000);
+
+        // Non-numeric suggested should be ignored (parsed as None)
+        assert_eq!(
+            provider.resolve_deposit(Some("not-a-number")).unwrap(),
+            7000,
+            "invalid suggested should fall back to default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_deposit_suggested_zero() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert_eq!(provider.resolve_deposit(Some("0")).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resolve_deposit_suggested_equals_max() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_max_deposit(5000);
+
+        assert_eq!(
+            provider.resolve_deposit(Some("5000")).unwrap(),
+            5000,
+            "suggested == max should use that value"
+        );
+    }
+
+    #[test]
+    fn test_resolve_deposit_max_and_default_prefers_max() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_max_deposit(5000)
+            .with_default_deposit(2000);
+
+        // When no suggested, max takes priority over default
+        assert_eq!(provider.resolve_deposit(None).unwrap(), 5000);
+    }
+
+    // --- notify_update without callback ---
+
+    #[test]
+    fn test_notify_update_no_callback() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let entry = ChannelEntry {
+            channel_id: B256::ZERO,
+            salt: B256::ZERO,
+            cumulative_amount: 0,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+
+        // Should not panic when no callback is set
+        provider.notify_update(&entry);
+    }
+
     #[test]
     fn test_session_provider_clone() {
         let signer = PrivateKeySigner::random();

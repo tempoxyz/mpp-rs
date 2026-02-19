@@ -280,6 +280,60 @@ mod tests {
         assert!(crate::tempo::attribution::is_mpp_memo(&memo));
     }
 
+    // --- Re-export verification ---
+
+    #[test]
+    fn test_reexports_accessible_from_client_tempo() {
+        // Verify that all public types are accessible via the expected paths
+        let _: fn() -> TempoSigningMode = || TempoSigningMode::Direct;
+
+        // TempoProvider is accessible (we already use it in tests above)
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let _provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        // ChannelEntry from channel_ops
+        let _entry = crate::client::tempo::ChannelEntry {
+            channel_id: alloy::primitives::B256::ZERO,
+            salt: alloy::primitives::B256::ZERO,
+            cumulative_amount: 0,
+            escrow_contract: alloy::primitives::Address::ZERO,
+            chain_id: 42431,
+            opened: false,
+        };
+    }
+
+    #[test]
+    fn test_reexports_accessible_from_client_level() {
+        // Verify re-exports at crate::client:: level
+        let _: fn() -> crate::client::TempoSigningMode = || crate::client::TempoSigningMode::Direct;
+
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let _provider =
+            crate::client::TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let _entry = crate::client::ChannelEntry {
+            channel_id: alloy::primitives::B256::ZERO,
+            salt: alloy::primitives::B256::ZERO,
+            cumulative_amount: 0,
+            escrow_contract: alloy::primitives::Address::ZERO,
+            chain_id: 42431,
+            opened: false,
+        };
+    }
+
+    #[test]
+    fn test_tempo_provider_supports_only_tempo_charge() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert!(provider.supports("tempo", "charge"));
+        assert!(!provider.supports("tempo", "session"));
+        assert!(!provider.supports("tempo", "open"));
+        assert!(!provider.supports("stripe", "charge"));
+        assert!(!provider.supports("", ""));
+        assert!(!provider.supports("TEMPO", "charge"));
+    }
+
     #[test]
     fn test_user_memo_takes_precedence() {
         let user_memo = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";

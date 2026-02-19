@@ -676,4 +676,274 @@ mod tests {
 
         assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
     }
+
+    #[test]
+    fn test_resolve_chain_id_malformed_request_falls_back() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "not_a_valid_field": true
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        // Should fall back to MODERATO_CHAIN_ID on decode failure
+        assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
+    }
+
+    #[test]
+    fn test_resolve_escrow_challenge_has_invalid_address() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        // escrowContract present but not a valid address
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "unitType": "second",
+                "currency": "0x123",
+                "methodDetails": {
+                    "escrowContract": "not-an-address"
+                }
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        // Invalid address in challenge should fall back to default
+        let result = resolve_escrow(&challenge, 42431, None).unwrap();
+        assert_eq!(result, default_escrow_contract(42431).unwrap());
+    }
+
+    #[test]
+    fn test_resolve_escrow_override_takes_precedence_over_default() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "unitType": "second",
+                "currency": "0x123"
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let override_addr: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();
+        assert_eq!(
+            result, override_addr,
+            "override should take precedence over default"
+        );
+        assert_ne!(result, default_escrow_contract(42431).unwrap());
+    }
+
+    #[test]
+    fn test_default_escrow_contract_known_chains() {
+        let mainnet = default_escrow_contract(4217).unwrap();
+        assert_eq!(
+            mainnet,
+            "0x0901aED692C755b870F9605E56BAA66c35BEfF69"
+                .parse::<Address>()
+                .unwrap()
+        );
+
+        let moderato = default_escrow_contract(42431).unwrap();
+        assert_eq!(
+            moderato,
+            "0x542831e3E4Ace07559b7C8787395f4Fb99F70787"
+                .parse::<Address>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_default_escrow_contract_unknown_chain() {
+        assert!(default_escrow_contract(0).is_none());
+        assert!(default_escrow_contract(999999).is_none());
+    }
+
+    #[test]
+    fn test_build_credential_did_format() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let challenge = PaymentChallenge {
+            id: "test-id".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "unitType": "second",
+                "currency": "0x123"
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let payload = SessionCredentialPayload::Voucher {
+            channel_id: "0xabc".to_string(),
+            cumulative_amount: "5000".to_string(),
+            signature: "0xdef".to_string(),
+        };
+
+        let addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let cred = build_credential(&challenge, payload, 4217, addr);
+        let did = cred.source.as_ref().unwrap();
+        let expected = format!("did:pkh:eip155:4217:{}", addr);
+        assert_eq!(did, &expected, "DID should match exact pkh format");
+    }
+
+    #[cfg(feature = "evm")]
+    #[tokio::test]
+    async fn test_create_voucher_payload_zero_amount() {
+        use alloy_signer_local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xAB);
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+
+        let payload = create_voucher_payload(&signer, channel_id, 0, escrow, 42431)
+            .await
+            .unwrap();
+
+        match payload {
+            SessionCredentialPayload::Voucher {
+                cumulative_amount, ..
+            } => {
+                assert_eq!(cumulative_amount, "0");
+            }
+            _ => panic!("Expected Voucher variant"),
+        }
+    }
+
+    #[cfg(feature = "evm")]
+    #[tokio::test]
+    async fn test_create_close_payload_zero_amount() {
+        use alloy_signer_local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xCD);
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+
+        let payload = create_close_payload(&signer, channel_id, 0, escrow, 42431)
+            .await
+            .unwrap();
+
+        match payload {
+            SessionCredentialPayload::Close {
+                cumulative_amount, ..
+            } => {
+                assert_eq!(cumulative_amount, "0");
+            }
+            _ => panic!("Expected Close variant"),
+        }
+    }
+
+    #[cfg(feature = "evm")]
+    #[tokio::test]
+    async fn test_create_voucher_payload_large_amount() {
+        use alloy_signer_local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xAB);
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+
+        let large_amount = u128::MAX;
+        let payload = create_voucher_payload(&signer, channel_id, large_amount, escrow, 42431)
+            .await
+            .unwrap();
+
+        match payload {
+            SessionCredentialPayload::Voucher {
+                cumulative_amount, ..
+            } => {
+                assert_eq!(cumulative_amount, u128::MAX.to_string());
+            }
+            _ => panic!("Expected Voucher variant"),
+        }
+    }
+
+    #[test]
+    fn test_channel_entry_debug() {
+        let entry = ChannelEntry {
+            channel_id: B256::ZERO,
+            salt: B256::ZERO,
+            cumulative_amount: 0,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: false,
+        };
+        let debug = format!("{:?}", entry);
+        assert!(debug.contains("ChannelEntry"));
+        assert!(debug.contains("42431"));
+    }
+
+    #[test]
+    fn test_resolve_escrow_challenge_priority_order() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        // Challenge has a valid escrow, override is also present.
+        // Challenge should take priority.
+        let escrow_addr = "0x2222222222222222222222222222222222222222";
+        let override_addr: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "unitType": "second",
+                "currency": "0x123",
+                "methodDetails": {
+                    "escrowContract": escrow_addr
+                }
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();
+        assert_eq!(
+            result,
+            escrow_addr.parse::<Address>().unwrap(),
+            "challenge escrow should take priority over override"
+        );
+    }
 }

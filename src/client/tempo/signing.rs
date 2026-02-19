@@ -419,4 +419,168 @@ mod tests {
         assert_eq!(decoded.tx().calls.len(), 3);
         assert_eq!(decoded.tx().calls[1].value, U256::from(42u64));
     }
+
+    // --- Empty calls ---
+
+    #[test]
+    fn test_sign_and_encode_empty_calls_still_encodes() {
+        // Tempo transactions require at least one call; sign_and_encode
+        // produces bytes but they may fail to decode due to RLP validation.
+        let signer = test_signer();
+        let mut tx = test_tx();
+        tx.calls = vec![];
+
+        // sign_and_encode succeeds (signing doesn't validate calls)
+        let result = sign_and_encode(tx, &signer, &TempoSigningMode::Direct);
+        // The result is bytes but decoding will reject empty calls
+        assert!(
+            result.is_ok(),
+            "signing should succeed even with empty calls"
+        );
+    }
+
+    // --- Boundary tx field values ---
+
+    #[test]
+    fn test_sign_and_encode_zero_gas_fields() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let mut tx = test_tx();
+        tx.gas_limit = 0;
+        tx.max_fee_per_gas = 0;
+        tx.max_priority_fee_per_gas = 0;
+        tx.nonce = 0;
+
+        let bytes = sign_and_encode(tx, &signer, &TempoSigningMode::Direct).unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.tx().gas_limit, 0);
+        assert_eq!(decoded.tx().max_fee_per_gas, 0);
+        assert_eq!(decoded.tx().max_priority_fee_per_gas, 0);
+        assert_eq!(decoded.tx().nonce, 0);
+    }
+
+    // --- Determinism for Keychain mode ---
+
+    #[test]
+    fn test_sign_and_encode_deterministic_keychain() {
+        let signer = test_signer();
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAA),
+            key_authorization: None,
+        };
+        let bytes1 = sign_and_encode(test_tx(), &signer, &mode).unwrap();
+        let bytes2 = sign_and_encode(test_tx(), &signer, &mode).unwrap();
+        assert_eq!(
+            bytes1, bytes2,
+            "keychain mode: same tx + signer should produce same bytes"
+        );
+    }
+
+    // --- Signature variant correctness ---
+
+    #[test]
+    fn test_sign_and_encode_direct_produces_primitive_signature() {
+        use alloy::eips::eip2718::Decodable2718;
+        use tempo_primitives::transaction::TempoSignature;
+
+        let signer = test_signer();
+        let bytes = sign_and_encode(test_tx(), &signer, &TempoSigningMode::Direct).unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+
+        assert!(
+            matches!(decoded.signature(), TempoSignature::Primitive(_)),
+            "Direct mode should produce Primitive signature"
+        );
+    }
+
+    #[test]
+    fn test_sign_and_encode_keychain_produces_keychain_signature() {
+        use alloy::eips::eip2718::Decodable2718;
+        use tempo_primitives::transaction::TempoSignature;
+
+        let wallet = Address::repeat_byte(0xAA);
+        let mode = TempoSigningMode::Keychain {
+            wallet,
+            key_authorization: None,
+        };
+        let signer = test_signer();
+        let bytes = sign_and_encode(test_tx(), &signer, &mode).unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+
+        match decoded.signature() {
+            TempoSignature::Keychain(ks) => {
+                assert_eq!(
+                    ks.user_address, wallet,
+                    "keychain signature should embed the wallet address"
+                );
+            }
+            other => panic!("Expected Keychain signature, got {:?}", other),
+        }
+    }
+
+    // --- Async signature variant correctness ---
+
+    #[tokio::test]
+    async fn test_sign_and_encode_async_direct_produces_primitive_signature() {
+        use alloy::eips::eip2718::Decodable2718;
+        use tempo_primitives::transaction::TempoSignature;
+
+        let signer = test_signer();
+        let bytes = sign_and_encode_async(test_tx(), &signer, &TempoSigningMode::Direct)
+            .await
+            .unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+
+        assert!(
+            matches!(decoded.signature(), TempoSignature::Primitive(_)),
+            "Async Direct mode should produce Primitive signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_encode_async_keychain_produces_keychain_signature() {
+        use alloy::eips::eip2718::Decodable2718;
+        use tempo_primitives::transaction::TempoSignature;
+
+        let wallet = Address::repeat_byte(0xBB);
+        let mode = TempoSigningMode::Keychain {
+            wallet,
+            key_authorization: None,
+        };
+        let signer = test_signer();
+        let bytes = sign_and_encode_async(test_tx(), &signer, &mode)
+            .await
+            .unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+
+        match decoded.signature() {
+            TempoSignature::Keychain(ks) => {
+                assert_eq!(ks.user_address, wallet);
+            }
+            other => panic!("Expected Keychain signature, got {:?}", other),
+        }
+    }
+
+    // --- TempoSigningMode clone + debug ---
+
+    #[test]
+    fn test_signing_mode_clone() {
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAA),
+            key_authorization: None,
+        };
+        let cloned = mode.clone();
+        assert_eq!(
+            mode.from_address(Address::ZERO),
+            cloned.from_address(Address::ZERO)
+        );
+    }
+
+    #[test]
+    fn test_signing_mode_debug() {
+        let mode = TempoSigningMode::Direct;
+        let debug = format!("{:?}", mode);
+        assert!(debug.contains("Direct"));
+    }
 }

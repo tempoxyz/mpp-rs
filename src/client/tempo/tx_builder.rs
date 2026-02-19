@@ -156,7 +156,12 @@ fn parse_gas_estimate(gas_hex: &str) -> Result<u64, MppError> {
     let gas_limit = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).map_err(|e| {
         MppError::InvalidConfig(format!("failed to parse gas estimate '{}': {}", gas_hex, e))
     })?;
-    Ok(gas_limit + GAS_ESTIMATE_BUFFER)
+    gas_limit.checked_add(GAS_ESTIMATE_BUFFER).ok_or_else(|| {
+        MppError::InvalidConfig(format!(
+            "gas estimate overflow: {} + {}",
+            gas_limit, GAS_ESTIMATE_BUFFER
+        ))
+    })
 }
 
 /// Build a [`PaymentCredential`] from a signed Tempo transaction.
@@ -542,6 +547,228 @@ mod tests {
         });
 
         assert!(tx.key_authorization.is_some());
+    }
+
+    #[test]
+    fn test_build_tempo_tx_empty_calls() {
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls: vec![],
+            chain_id: 42431,
+            fee_token: Address::ZERO,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            key_authorization: None,
+        });
+
+        assert!(tx.calls.is_empty());
+        assert_eq!(tx.chain_id, 42431);
+    }
+
+    #[test]
+    fn test_build_tempo_tx_zero_fields() {
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls: vec![],
+            chain_id: 0,
+            fee_token: Address::ZERO,
+            nonce: 0,
+            gas_limit: 0,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            key_authorization: None,
+        });
+
+        assert_eq!(tx.chain_id, 0);
+        assert_eq!(tx.nonce, 0);
+        assert_eq!(tx.gas_limit, 0);
+        assert_eq!(tx.max_fee_per_gas, 0);
+        assert_eq!(tx.max_priority_fee_per_gas, 0);
+    }
+
+    // --- build_estimate_gas_request edge cases ---
+
+    #[test]
+    fn test_build_estimate_gas_request_empty_calls() {
+        let req = build_estimate_gas_request(
+            Address::ZERO,
+            42431,
+            0,
+            Address::ZERO,
+            &[],
+            1_000_000_000,
+            100_000_000,
+            None,
+        )
+        .unwrap();
+
+        let calls_json = req["calls"].as_array().unwrap();
+        assert_eq!(calls_json.len(), 0);
+    }
+
+    #[test]
+    fn test_build_estimate_gas_request_empty_input_is_0x() {
+        let calls = vec![Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::new(),
+        }];
+
+        let req = build_estimate_gas_request(
+            Address::ZERO,
+            42431,
+            0,
+            Address::ZERO,
+            &calls,
+            1_000_000_000,
+            100_000_000,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            req["calls"][0]["input"].as_str().unwrap(),
+            "0x",
+            "empty input should be encoded as '0x'"
+        );
+    }
+
+    #[test]
+    fn test_build_estimate_gas_request_nonce_zero() {
+        let req = build_estimate_gas_request(
+            Address::ZERO,
+            42431,
+            0,
+            Address::ZERO,
+            &[],
+            1_000_000_000,
+            100_000_000,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(req["nonce"].as_str().unwrap(), "0x0");
+    }
+
+    #[test]
+    fn test_build_estimate_gas_request_value_formatting() {
+        let calls = vec![Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::from(255u64),
+            input: alloy::primitives::Bytes::new(),
+        }];
+
+        let req = build_estimate_gas_request(
+            Address::ZERO,
+            42431,
+            0,
+            Address::ZERO,
+            &calls,
+            1_000_000_000,
+            100_000_000,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            req["calls"][0]["value"].as_str().unwrap(),
+            "0xff",
+            "U256(255) should format as 0xff"
+        );
+    }
+
+    // --- parse_gas_estimate edge cases ---
+
+    #[test]
+    fn test_parse_gas_estimate_bare_0x() {
+        assert!(
+            parse_gas_estimate("0x").is_err(),
+            "bare '0x' with no digits should error"
+        );
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_zero() {
+        assert_eq!(
+            parse_gas_estimate("0x0").unwrap(),
+            GAS_ESTIMATE_BUFFER,
+            "gas estimate of 0 should return just the buffer"
+        );
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_overflow_u64() {
+        // 0x10000000000000000 = 2^64, exceeds u64::MAX
+        assert!(
+            parse_gas_estimate("0x10000000000000000").is_err(),
+            "value exceeding u64::MAX should error"
+        );
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_near_max_overflow() {
+        // u64::MAX = 0xffffffffffffffff, adding buffer would overflow
+        assert!(
+            parse_gas_estimate("0xffffffffffffffff").is_err(),
+            "near-max value + buffer should error on overflow"
+        );
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_max_safe_value() {
+        // u64::MAX - GAS_ESTIMATE_BUFFER should succeed
+        let max_safe = u64::MAX - GAS_ESTIMATE_BUFFER;
+        let hex = format!("{:#x}", max_safe);
+        assert_eq!(parse_gas_estimate(&hex).unwrap(), u64::MAX);
+    }
+
+    // --- build_charge_credential edge cases ---
+
+    #[test]
+    fn test_build_charge_credential_empty_tx_bytes() {
+        use crate::protocol::core::Base64UrlJson;
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let cred = build_charge_credential(&challenge, &[], 42431, Address::ZERO);
+        let tx_hex = cred
+            .payload
+            .get("signature")
+            .or_else(|| cred.payload.get("transaction"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(tx_hex, "0x", "empty bytes should produce '0x'");
+    }
+
+    #[test]
+    fn test_build_charge_credential_did_exact_format() {
+        use crate::protocol::core::Base64UrlJson;
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let from: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"
+            .parse()
+            .unwrap();
+        let cred = build_charge_credential(&challenge, &[0x76], 4217, from);
+        let did = cred.source.as_ref().unwrap();
+        let expected = format!("did:pkh:eip155:4217:{}", from);
+        assert_eq!(did, &expected, "DID should match exact format");
     }
 
     #[test]
