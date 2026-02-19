@@ -1002,7 +1002,7 @@ mod tests {
         let decoded_tx = signed.tx();
         assert_eq!(decoded_tx.chain_id, CHAIN_ID);
         assert_eq!(decoded_tx.nonce_key, U256::MAX);
-        assert_eq!(decoded_tx.fee_token, Some(fee_token.into()));
+        assert_eq!(decoded_tx.fee_token, Some(fee_token));
         assert!(decoded_tx.fee_payer_signature.is_some());
         assert!(decoded_tx.valid_before.is_some());
     }

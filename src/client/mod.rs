@@ -43,4 +43,4 @@ pub use middleware::PaymentMiddleware;
 pub use tempo::channel_ops::ChannelEntry;
 
 #[cfg(feature = "tempo")]
-pub use tempo::{TempoProvider, TempoSessionProvider, TempoSigningMode};
+pub use tempo::{TempoClientError, TempoProvider, TempoSessionProvider, TempoSigningMode};

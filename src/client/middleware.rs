@@ -195,8 +195,7 @@ mod tests {
         }
 
         fn test_challenge() -> (PaymentChallenge, String) {
-            let request =
-                Base64UrlJson::from_value(&serde_json::json!({"amount": "500"})).unwrap();
+            let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "500"})).unwrap();
             let challenge = PaymentChallenge::new(
                 "mw-test-id",
                 "middleware.example.com",

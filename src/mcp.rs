@@ -580,8 +580,7 @@ mod tests {
         assert_eq!(result["content"][0]["text"], "paid response");
 
         // Deserialize as McpReceipt to verify structure
-        let mcp_receipt: McpReceipt =
-            serde_json::from_value(receipt_value.clone()).unwrap();
+        let mcp_receipt: McpReceipt = serde_json::from_value(receipt_value.clone()).unwrap();
         assert_eq!(mcp_receipt.challenge_id, challenge.id);
         assert!(mcp_receipt.receipt.is_success());
     }

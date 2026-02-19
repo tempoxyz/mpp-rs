@@ -534,9 +534,8 @@ mod tests {
                 &self,
                 _credential: &PaymentCredential,
                 _request: &ChargeRequest,
-            ) -> impl std::future::Future<
-                Output = std::result::Result<Receipt, VerificationError>,
-            > + Send {
+            ) -> impl std::future::Future<Output = std::result::Result<Receipt, VerificationError>> + Send
+            {
                 async { Ok(Receipt::success("tempo", "0xabc123")) }
             }
         }
@@ -557,13 +556,9 @@ mod tests {
         impl tower_service::Service<Request<()>> for OkService {
             type Response = Response<()>;
             type Error = std::convert::Infallible;
-            type Future =
-                Pin<Box<dyn Future<Output = Result<Response<()>, Self::Error>> + Send>>;
+            type Future = Pin<Box<dyn Future<Output = Result<Response<()>, Self::Error>> + Send>>;
 
-            fn poll_ready(
-                &mut self,
-                _cx: &mut Context<'_>,
-            ) -> Poll<Result<(), Self::Error>> {
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
             }
 
@@ -630,10 +625,8 @@ mod tests {
             let challenge = parse_www_authenticate(www_auth).unwrap();
 
             // Build a credential from the challenge.
-            let credential = PaymentCredential::new(
-                challenge.to_echo(),
-                PaymentPayload::hash("0xdeadbeef"),
-            );
+            let credential =
+                PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
             let auth_header = format_authorization(&credential).unwrap();
 
             // Second call: send credential, expect 200 + receipt.
@@ -653,8 +646,8 @@ mod tests {
                 .expect("missing Payment-Receipt header")
                 .to_str()
                 .unwrap();
-            let receipt = parse_receipt(receipt_header)
-                .expect("Payment-Receipt header should be parseable");
+            let receipt =
+                parse_receipt(receipt_header).expect("Payment-Receipt header should be parseable");
             assert!(receipt.is_success());
             assert_eq!(receipt.method.as_str(), "tempo");
             assert_eq!(receipt.reference, "0xabc123");

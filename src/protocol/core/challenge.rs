@@ -1055,6 +1055,7 @@ mod tests {
             b64(br#"{"amount":"1000000","currency":"0x1234","methodDetails":{"chainId":42431}}"#);
         let req_empty = b64(br#"{}"#);
 
+        #[allow(clippy::type_complexity)]
         let vectors: Vec<(
             &str,
             &str,

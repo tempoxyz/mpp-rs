@@ -960,8 +960,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded =
-            crate::protocol::core::Base64UrlJson::from_typed(&tampered_request).unwrap();
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered_request).unwrap();
         echo.request = encoded.raw().to_string();
 
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -990,7 +989,10 @@ mod tests {
         let result = mpp.verify_credential(&credential).await;
         // Verification succeeds because the server uses its own realm for
         // HMAC recomputation, not the echoed one.
-        assert!(result.is_ok(), "echoed realm is ignored by server HMAC check");
+        assert!(
+            result.is_ok(),
+            "echoed realm is ignored by server HMAC check"
+        );
     }
 
     #[cfg(feature = "tempo")]
