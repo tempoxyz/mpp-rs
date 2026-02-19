@@ -1192,12 +1192,15 @@ mod tests {
     #[tokio::test]
     async fn test_verify_session_happy_path() {
         let mpp = create_session_test_mpp();
-        let credential = make_session_credential(&mpp, serde_json::json!({
-            "action": "voucher",
-            "channelId": "0xabc",
-            "cumulativeAmount": "5000",
-            "signature": "0xdef"
-        }));
+        let credential = make_session_credential(
+            &mpp,
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": "0xabc",
+                "cumulativeAmount": "5000",
+                "signature": "0xdef"
+            }),
+        );
 
         let result = mpp.verify_session(&credential).await;
         assert!(result.is_ok());
@@ -1280,7 +1283,10 @@ mod tests {
         let result = mpp.verify_session(&credential).await;
         let err = result.unwrap_err();
         assert!(err.message.contains("No session method"));
-        assert!(err.code.is_none(), "no-session-method should not have an error code");
+        assert!(
+            err.code.is_none(),
+            "no-session-method should not have an error code"
+        );
     }
 
     #[cfg(feature = "tempo")]
@@ -1337,8 +1343,7 @@ mod tests {
 
         assert_eq!(challenge.method.as_str(), "tempo");
         assert_eq!(challenge.intent.as_str(), "session");
-        let request: crate::protocol::intents::SessionRequest =
-            challenge.request.decode().unwrap();
+        let request: crate::protocol::intents::SessionRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "1000");
         assert_eq!(request.unit_type.as_deref(), Some("second"));
         assert_eq!(request.suggested_deposit.as_deref(), Some("60000"));

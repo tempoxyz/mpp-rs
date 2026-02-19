@@ -1269,17 +1269,23 @@ mod tests {
         store.insert("0xchannel1", state);
 
         // First deduction
-        let r1 = deduct_from_channel(&store, "0xchannel1", 3_000).await.unwrap();
+        let r1 = deduct_from_channel(&store, "0xchannel1", 3_000)
+            .await
+            .unwrap();
         assert_eq!(r1.spent, 3_000);
         assert_eq!(r1.units, 1);
 
         // Second deduction
-        let r2 = deduct_from_channel(&store, "0xchannel1", 2_000).await.unwrap();
+        let r2 = deduct_from_channel(&store, "0xchannel1", 2_000)
+            .await
+            .unwrap();
         assert_eq!(r2.spent, 5_000);
         assert_eq!(r2.units, 2);
 
         // Third deduction that exactly exhausts balance
-        let r3 = deduct_from_channel(&store, "0xchannel1", 5_000).await.unwrap();
+        let r3 = deduct_from_channel(&store, "0xchannel1", 5_000)
+            .await
+            .unwrap();
         assert_eq!(r3.spent, 10_000);
         assert_eq!(r3.units, 3);
 
@@ -1315,10 +1321,10 @@ mod tests {
         store.insert("0xchannel1", test_channel_state("0xchannel1"));
         assert!(store.get_channel_sync("0xchannel1").is_some());
 
-        let result = store.update_channel(
-            "0xchannel1",
-            Box::new(|_current| Ok(None)),
-        ).await.unwrap();
+        let result = store
+            .update_channel("0xchannel1", Box::new(|_current| Ok(None)))
+            .await
+            .unwrap();
         assert!(result.is_none());
         assert!(store.get_channel_sync("0xchannel1").is_none());
     }
@@ -1330,12 +1336,12 @@ mod tests {
         state.highest_voucher_amount = 5000;
         store.insert("0xchannel1", state);
 
-        let result = store.update_channel(
-            "0xchannel1",
-            Box::new(|_current| {
-                Err(VerificationError::new("intentional test error"))
-            }),
-        ).await;
+        let result = store
+            .update_channel(
+                "0xchannel1",
+                Box::new(|_current| Err(VerificationError::new("intentional test error"))),
+            )
+            .await;
         assert!(result.is_err());
 
         // Original state should be unchanged
@@ -1354,7 +1360,9 @@ mod tests {
         store.insert("0xchannel2", state2);
 
         // Deduct from channel 1
-        let r1 = deduct_from_channel(&store, "0xchannel1", 5_000).await.unwrap();
+        let r1 = deduct_from_channel(&store, "0xchannel1", 5_000)
+            .await
+            .unwrap();
         assert_eq!(r1.spent, 5_000);
 
         // Channel 2 should be unaffected
@@ -1398,7 +1406,9 @@ mod tests {
         // NOTE: deduct_from_channel intentionally ignores the finalized flag.
         // Finalization is an on-chain concern; the server-side deduction only
         // tracks spend against the highest voucher amount.
-        let result = deduct_from_channel(&store, "0xchannel1", 1_000).await.unwrap();
+        let result = deduct_from_channel(&store, "0xchannel1", 1_000)
+            .await
+            .unwrap();
         assert_eq!(result.spent, 1_000);
         assert!(result.finalized, "finalized flag should be preserved");
     }
@@ -1418,22 +1428,23 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Trigger an update
-        store.update_channel(
-            "0xchannel1",
-            Box::new(|current| {
-                let mut s = current.unwrap();
-                s.highest_voucher_amount = 9999;
-                Ok(Some(s))
-            }),
-        ).await.unwrap();
+        store
+            .update_channel(
+                "0xchannel1",
+                Box::new(|current| {
+                    let mut s = current.unwrap();
+                    s.highest_voucher_amount = 9999;
+                    Ok(Some(s))
+                }),
+            )
+            .await
+            .unwrap();
 
         // The wait should complete within a reasonable time
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            handle,
-        ).await
-        .expect("wait_for_update should have been notified within timeout")
-        .expect("spawned task should not panic");
+        let result = tokio::time::timeout(tokio::time::Duration::from_secs(1), handle)
+            .await
+            .expect("wait_for_update should have been notified within timeout")
+            .expect("spawned task should not panic");
         assert!(result);
     }
 
