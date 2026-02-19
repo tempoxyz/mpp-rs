@@ -5,6 +5,7 @@
 
 pub mod channel_ops;
 mod error;
+pub mod keychain;
 mod provider;
 mod session_provider;
 pub mod signing;

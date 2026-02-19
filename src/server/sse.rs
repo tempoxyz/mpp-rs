@@ -604,9 +604,9 @@ mod tests {
 
         // 3 message events + 1 receipt = 4
         assert_eq!(events.len(), 4);
-        for i in 0..3 {
+        for (i, event) in events.iter().enumerate().take(3) {
             assert!(
-                events[i].starts_with("event: message\ndata: "),
+                event.starts_with("event: message\ndata: "),
                 "event {i} should be a message"
             );
         }

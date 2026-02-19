@@ -97,6 +97,7 @@
 //! ```
 
 pub mod charge;
+pub mod network;
 pub mod session;
 pub mod stream_receipt;
 pub mod transaction;
@@ -109,6 +110,7 @@ pub mod method;
 pub mod session_method;
 
 pub use charge::TempoChargeExt;
+pub use network::TempoNetwork;
 pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};
 pub use stream_receipt::StreamReceipt;
 pub use transaction::{
