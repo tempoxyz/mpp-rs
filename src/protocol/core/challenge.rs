@@ -302,6 +302,83 @@ impl PaymentChallenge {
         );
         constant_time_eq(&self.id, &expected_id)
     }
+
+    /// Returns true if the challenge has expired.
+    ///
+    /// Parses the `expires` field as RFC 3339. If `expires` is `None` or
+    /// can't be parsed, returns `false` (fail-open, let the server decide).
+    pub fn is_expired(&self) -> bool {
+        match self.expires_at() {
+            Some(expires) => expires <= time::OffsetDateTime::now_utc(),
+            None => false,
+        }
+    }
+
+    /// Returns the parsed expiry timestamp if present and valid, `None` otherwise.
+    pub fn expires_at(&self) -> Option<time::OffsetDateTime> {
+        self.expires.as_ref().and_then(|s| {
+            time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+        })
+    }
+
+    /// Validate that this challenge can be used for a charge payment with the given method.
+    ///
+    /// Checks that:
+    /// - The payment method matches (case-insensitive)
+    /// - The intent is "charge"
+    /// - The challenge has not expired
+    pub fn validate_for_charge(&self, method: &str) -> crate::error::Result<()> {
+        if !self.method.eq_ignore_ascii_case(method) {
+            return Err(crate::error::MppError::UnsupportedPaymentMethod(format!(
+                "Payment method '{}' is not supported. Supported methods: {}",
+                self.method, method
+            )));
+        }
+
+        if !self.intent.is_charge() {
+            return Err(crate::error::MppError::InvalidChallenge {
+                id: Some(self.id.clone()),
+                reason: Some(format!(
+                    "Only 'charge' intent is supported, got: {}",
+                    self.intent
+                )),
+            });
+        }
+
+        if self.is_expired() {
+            return Err(crate::error::MppError::PaymentExpired(self.expires.clone()));
+        }
+
+        Ok(())
+    }
+
+    /// Validate that this challenge can be used for a session with the given method.
+    ///
+    /// Checks that:
+    /// - The payment method matches (case-insensitive)
+    /// - The intent is "session"
+    /// - The challenge has not expired
+    pub fn validate_for_session(&self, method: &str) -> crate::error::Result<()> {
+        if !self.method.eq_ignore_ascii_case(method) {
+            return Err(crate::error::MppError::UnsupportedPaymentMethod(format!(
+                "Payment method '{}' is not supported. Supported methods: {}",
+                self.method, method
+            )));
+        }
+
+        if !self.intent.is_session() {
+            return Err(crate::error::MppError::InvalidChallenge {
+                id: Some(self.id.clone()),
+                reason: Some(format!("Expected 'session' intent, got: {}", self.intent)),
+            });
+        }
+
+        if self.is_expired() {
+            return Err(crate::error::MppError::PaymentExpired(self.expires.clone()));
+        }
+
+        Ok(())
+    }
 }
 
 /// Compute an HMAC-SHA256 challenge ID from challenge parameters.
@@ -700,6 +777,22 @@ fn now_iso8601() -> String {
     OffsetDateTime::now_utc()
         .format(&Iso8601::DEFAULT)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Extract the `txHash` field from a base64url-encoded receipt JSON.
+///
+/// The receipt is base64url-encoded JSON that may contain a `txHash` field
+/// with the on-chain transaction hash.
+pub fn extract_tx_hash(receipt_b64: &str) -> Option<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let decoded = URL_SAFE_NO_PAD.decode(receipt_b64.trim()).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json.get("txHash")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -1351,5 +1444,254 @@ mod tests {
         assert_eq!(challenge.expires.as_deref(), Some("2026-01-01T00:00:00Z"));
         assert_eq!(challenge.description.as_deref(), Some("test"));
         assert_eq!(challenge.digest.as_deref(), Some("sha-256=abc"));
+    }
+
+    #[test]
+    fn test_is_expired_no_expires() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request);
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_future() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_past() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2020-01-01T00:00:00Z");
+        assert!(challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_unparseable() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("not-a-date");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_expires_at_valid() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00Z");
+        assert!(challenge.expires_at().is_some());
+    }
+
+    #[test]
+    fn test_expires_at_missing() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request);
+        assert!(challenge.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_expires_at_invalid() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("garbage");
+        assert!(challenge.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_is_expired_positive_timezone_offset_future() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00+05:00");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_some());
+    }
+
+    #[test]
+    fn test_is_expired_negative_timezone_offset_past() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2020-01-01T00:00:00-07:00");
+        assert!(challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_fractional_seconds_millis() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00.123Z");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_some());
+    }
+
+    #[test]
+    fn test_is_expired_fractional_seconds_micros() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00.123456Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_empty_string() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_is_expired_whitespace_only() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("   ");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_is_expired_unix_epoch() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("1970-01-01T00:00:00Z");
+        assert!(challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_month() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-13-01T00:00:00Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_day() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-32T00:00:00Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_plain_text() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("just some text");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_numeric_string() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("12345");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_validate_for_charge_valid() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request);
+        assert!(challenge.validate_for_charge("tempo").is_ok());
+    }
+
+    #[test]
+    fn test_validate_for_charge_case_insensitive() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request);
+        assert!(challenge.validate_for_charge("TEMPO").is_ok());
+        assert!(challenge.validate_for_charge("Tempo").is_ok());
+    }
+
+    #[test]
+    fn test_validate_for_charge_wrong_method() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request);
+        assert!(challenge.validate_for_charge("stripe").is_err());
+    }
+
+    #[test]
+    fn test_validate_for_charge_wrong_intent() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "session", request);
+        assert!(challenge.validate_for_charge("tempo").is_err());
+    }
+
+    #[test]
+    fn test_validate_for_charge_expired() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2020-01-01T00:00:00Z");
+        assert!(challenge.validate_for_charge("tempo").is_err());
+    }
+
+    #[test]
+    fn test_validate_for_session_valid() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "session", request);
+        assert!(challenge.validate_for_session("tempo").is_ok());
+    }
+
+    #[test]
+    fn test_validate_for_session_wrong_intent() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request);
+        assert!(challenge.validate_for_session("tempo").is_err());
+    }
+
+    #[test]
+    fn test_validate_for_session_expired() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "session", request)
+            .with_expires("2020-01-01T00:00:00Z");
+        assert!(challenge.validate_for_session("tempo").is_err());
+    }
+
+    #[test]
+    fn test_extract_tx_hash_valid() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let json = serde_json::json!({"txHash": "0xabc123", "status": "success"});
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(extract_tx_hash(&encoded), Some("0xabc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_tx_hash_missing() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let json = serde_json::json!({"status": "success"});
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(extract_tx_hash(&encoded), None);
+    }
+
+    #[test]
+    fn test_extract_tx_hash_empty() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let json = serde_json::json!({"txHash": ""});
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json).unwrap());
+        assert_eq!(extract_tx_hash(&encoded), None);
+    }
+
+    #[test]
+    fn test_extract_tx_hash_invalid_base64() {
+        assert_eq!(extract_tx_hash("not-valid-base64!!!"), None);
+    }
+
+    #[test]
+    fn test_extract_tx_hash_invalid_json() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let encoded = URL_SAFE_NO_PAD.encode(b"not json");
+        assert_eq!(extract_tx_hash(&encoded), None);
     }
 }

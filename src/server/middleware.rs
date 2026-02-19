@@ -530,13 +530,12 @@ mod tests {
                 "tempo"
             }
 
-            fn verify(
+            async fn verify(
                 &self,
                 _credential: &PaymentCredential,
                 _request: &ChargeRequest,
-            ) -> impl std::future::Future<Output = std::result::Result<Receipt, VerificationError>> + Send
-            {
-                async { Ok(Receipt::success("tempo", "0xabc123")) }
+            ) -> std::result::Result<Receipt, VerificationError> {
+                Ok(Receipt::success("tempo", "0xabc123"))
             }
         }
 

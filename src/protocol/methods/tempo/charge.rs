@@ -45,6 +45,9 @@ pub trait TempoChargeExt {
 
     /// Check if this request is for Tempo Moderato network.
     fn is_tempo_moderato(&self) -> bool;
+
+    /// Get the Tempo network from chain ID, if recognized.
+    fn network(&self) -> Option<super::network::TempoNetwork>;
 }
 
 impl TempoChargeExt for ChargeRequest {
@@ -98,6 +101,28 @@ impl TempoChargeExt for ChargeRequest {
     fn is_tempo_moderato(&self) -> bool {
         self.chain_id() == Some(super::MODERATO_CHAIN_ID)
     }
+
+    fn network(&self) -> Option<super::network::TempoNetwork> {
+        self.chain_id()
+            .and_then(super::network::TempoNetwork::from_chain_id)
+    }
+}
+
+/// Parse a hex-encoded memo string to a 32-byte array.
+///
+/// Returns `None` if the input is `None`, not valid hex, or not exactly 32 bytes.
+pub fn parse_memo_bytes(memo: Option<String>) -> Option<[u8; 32]> {
+    memo.and_then(|s| {
+        let hex_str = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes = hex::decode(hex_str).ok()?;
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Some(arr)
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]
@@ -168,5 +193,56 @@ mod tests {
             req_with_memo.memo(),
             Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string())
         );
+    }
+
+    #[test]
+    fn test_network_moderato() {
+        use crate::protocol::methods::tempo::network::TempoNetwork;
+        let req = test_charge_request();
+        let network = req.network();
+        assert_eq!(network, Some(TempoNetwork::Moderato));
+    }
+
+    #[test]
+    fn test_network_none() {
+        let req = ChargeRequest {
+            method_details: Some(serde_json::json!({"chainId": 1})),
+            ..test_charge_request()
+        };
+        assert!(req.network().is_none());
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_valid() {
+        let memo =
+            Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
+        let result = parse_memo_bytes(memo);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap()[0], 0x12);
+        assert_eq!(result.unwrap()[31], 0xef);
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_without_prefix() {
+        let memo =
+            Some("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
+        assert!(parse_memo_bytes(memo).is_some());
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_none() {
+        assert!(parse_memo_bytes(None).is_none());
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_wrong_length() {
+        let memo = Some("0x1234".to_string());
+        assert!(parse_memo_bytes(memo).is_none());
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_invalid_hex() {
+        let memo = Some("0xnotvalidhex".to_string());
+        assert!(parse_memo_bytes(memo).is_none());
     }
 }

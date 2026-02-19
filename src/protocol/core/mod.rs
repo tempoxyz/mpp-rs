@@ -72,8 +72,8 @@ pub mod types;
 
 // Re-export all public types
 pub use challenge::{
-    compute_challenge_id, ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload,
-    Receipt,
+    compute_challenge_id, extract_tx_hash, ChallengeEcho, PaymentChallenge, PaymentCredential,
+    PaymentPayload, Receipt,
 };
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
