@@ -204,7 +204,7 @@ where
     );
 
     // Build approve calldata
-    use crate::protocol::methods::tempo::abi::ITIP20;
+    use super::abi::ITIP20;
 
     sol! {
         interface IEscrow {

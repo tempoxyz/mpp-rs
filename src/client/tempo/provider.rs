@@ -85,10 +85,8 @@ impl TempoProvider {
         self
     }
 
-    /// Override sign options (nonce, gas fees, etc.).
-    ///
-    /// Power users (like presto) use this to inject pre-resolved nonce
-    /// and gas values (e.g., from stuck transaction detection).
+    /// Override sign options (nonce, gas fees, etc.) for power users
+    /// who want to inject pre-resolved values.
     pub fn with_sign_options(mut self, options: SignOptions) -> Self {
         self.sign_options_overrides = Some(options);
         self

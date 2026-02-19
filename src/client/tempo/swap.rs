@@ -3,10 +3,8 @@
 use alloy::primitives::{Address, TxKind, U256};
 use tempo_primitives::transaction::Call;
 
+use super::abi::{encode_approve, encode_swap_exact_amount_out, encode_transfer, DEX_ADDRESS};
 use crate::error::MppError;
-use crate::protocol::methods::tempo::abi::{
-    encode_approve, encode_swap_exact_amount_out, encode_transfer, DEX_ADDRESS,
-};
 
 /// Slippage tolerance in basis points (0.5% = 50 bps).
 pub const SWAP_SLIPPAGE_BPS: u128 = 50;

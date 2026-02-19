@@ -31,6 +31,7 @@
 use alloy::primitives::{Address, TxKind, U256};
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
 
+use super::abi::encode_transfer;
 use super::signing::{sign_and_encode_async, TempoSigningMode};
 use super::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::error::MppError;
@@ -38,7 +39,7 @@ use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::methods::tempo::charge::{parse_memo_bytes, TempoChargeExt};
 use crate::protocol::methods::tempo::network::TempoNetwork;
-use crate::protocol::methods::tempo::{abi::encode_transfer, CHAIN_ID};
+use crate::protocol::methods::tempo::CHAIN_ID;
 
 /// A parsed, validated Tempo charge ready to be signed.
 ///
@@ -148,8 +149,8 @@ impl TempoCharge {
 
     /// Sign the charge with explicit options for gas, nonce, signing mode, etc.
     ///
-    /// Power users (like presto) use this to inject their own nonce resolution,
-    /// gas bumping, keychain signing mode, and key authorization provisioning.
+    /// Power users use this to inject their own nonce resolution, gas bumping,
+    /// keychain signing mode, and key authorization provisioning.
     pub async fn sign_with_options(
         self,
         signer: &(impl alloy::signers::Signer + Clone),

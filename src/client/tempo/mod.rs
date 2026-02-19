@@ -3,6 +3,7 @@
 //! Contains the Tempo payment providers, transaction building,
 //! signing strategies, charge builder, and channel operations.
 
+pub mod abi;
 pub mod balance;
 pub mod channel_ops;
 pub mod charge;

@@ -2,8 +2,8 @@
 
 use alloy::primitives::{Address, U256};
 
+use super::abi::ITIP20;
 use crate::error::MppError;
-use crate::protocol::methods::tempo::abi::ITIP20;
 
 /// Query the TIP-20 balance of a token for an account.
 ///
