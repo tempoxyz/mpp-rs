@@ -17,4 +17,4 @@ pub use error::TempoClientError;
 pub use provider::TempoProvider;
 pub use session_provider::TempoSessionProvider;
 pub use signing::TempoSigningMode;
-pub use swap::{BPS_DENOMINATOR, SWAP_SLIPPAGE_BPS, SwapInfo};
+pub use swap::{SwapInfo, BPS_DENOMINATOR, SWAP_SLIPPAGE_BPS};

@@ -214,7 +214,8 @@ mod tests {
 
     #[test]
     fn test_parse_memo_bytes_valid() {
-        let memo = Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
+        let memo =
+            Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
         let result = parse_memo_bytes(memo);
         assert!(result.is_some());
         assert_eq!(result.unwrap()[0], 0x12);
@@ -223,7 +224,8 @@ mod tests {
 
     #[test]
     fn test_parse_memo_bytes_without_prefix() {
-        let memo = Some("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
+        let memo =
+            Some("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
         assert!(parse_memo_bytes(memo).is_some());
     }
 

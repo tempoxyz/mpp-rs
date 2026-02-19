@@ -346,9 +346,7 @@ impl PaymentChallenge {
         }
 
         if self.is_expired() {
-            return Err(crate::error::MppError::PaymentExpired(
-                self.expires.clone(),
-            ));
+            return Err(crate::error::MppError::PaymentExpired(self.expires.clone()));
         }
 
         Ok(())
@@ -371,17 +369,12 @@ impl PaymentChallenge {
         if !self.intent.is_session() {
             return Err(crate::error::MppError::InvalidChallenge {
                 id: Some(self.id.clone()),
-                reason: Some(format!(
-                    "Expected 'session' intent, got: {}",
-                    self.intent
-                )),
+                reason: Some(format!("Expected 'session' intent, got: {}", self.intent)),
             });
         }
 
         if self.is_expired() {
-            return Err(crate::error::MppError::PaymentExpired(
-                self.expires.clone(),
-            ));
+            return Err(crate::error::MppError::PaymentExpired(self.expires.clone()));
         }
 
         Ok(())
