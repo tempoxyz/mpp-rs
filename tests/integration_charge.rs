@@ -203,6 +203,79 @@ async fn fund_account(rpc: &str, to: Address) {
     .await;
 }
 
+// ==================== Fee payer test helpers ====================
+
+/// Encode a 0x78 fee payer envelope for testing (mirrors encode_fee_payer_envelope
+/// in provider.rs which is private).
+fn encode_fee_payer_envelope_for_test(
+    tx: &TempoTransaction,
+    sender: Address,
+    signature: tempo_primitives::transaction::TempoSignature,
+) -> Vec<u8> {
+    use alloy::primitives::bytes::BufMut;
+    use alloy::rlp::{Encodable, EMPTY_STRING_CODE};
+
+    let mut fields = Vec::new();
+
+    tx.chain_id.encode(&mut fields);
+    tx.max_priority_fee_per_gas.encode(&mut fields);
+    tx.max_fee_per_gas.encode(&mut fields);
+    tx.gas_limit.encode(&mut fields);
+    tx.calls.encode(&mut fields);
+    tx.access_list.encode(&mut fields);
+    tx.nonce_key.encode(&mut fields);
+    tx.nonce.encode(&mut fields);
+
+    if let Some(vb) = tx.valid_before {
+        vb.encode(&mut fields);
+    } else {
+        fields.put_u8(EMPTY_STRING_CODE);
+    }
+    if let Some(va) = tx.valid_after {
+        va.encode(&mut fields);
+    } else {
+        fields.put_u8(EMPTY_STRING_CODE);
+    }
+    fields.put_u8(EMPTY_STRING_CODE); // feeToken — always empty
+    sender.encode(&mut fields); // fee_payer_signature slot
+    tx.tempo_authorization_list.encode(&mut fields);
+    if let Some(key_auth) = &tx.key_authorization {
+        key_auth.encode(&mut fields);
+    }
+    signature.encode(&mut fields);
+
+    let rlp_header = alloy::rlp::Header {
+        list: true,
+        payload_length: fields.len(),
+    };
+
+    let mut out = Vec::with_capacity(1 + rlp_header.length() + fields.len());
+    out.put_u8(0x78);
+    rlp_header.encode(&mut out);
+    out.extend_from_slice(&fields);
+    out
+}
+
+/// Query TIP-20 pathUSD balance for an address.
+async fn tip20_balance(
+    provider: &impl Provider<TempoNetwork>,
+    addr: Address,
+) -> U256 {
+    let balance_call = ITIP20::balanceOfCall::new((addr,)).abi_encode();
+    let result = provider
+        .call(
+            alloy::rpc::types::TransactionRequest::default()
+                .to(PATH_USD)
+                .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
+                    balance_call,
+                )))
+                .into(),
+        )
+        .await
+        .expect("balanceOf call failed");
+    U256::from_be_slice(&result)
+}
+
 // ==================== ChargeConfig types ====================
 
 struct OneCent;
@@ -935,6 +1008,207 @@ async fn test_fee_payer_requested_but_no_signer_returns_402() {
     assert!(
         resp.headers().contains_key("www-authenticate"),
         "should return a fresh challenge for retry"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Fee payer with malicious 0x78 envelope (wrong recipient) → server rejects with 402.
+/// The server co-signs (it can't avoid it) but validate_transaction catches the
+/// wrong recipient before broadcasting.
+#[tokio::test]
+async fn test_fee_payer_wrong_recipient_rejected() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+    let wrong_recipient = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer.clone())
+        .secret_key("wrong-recipient-fp-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    // Step 1: Get a 402 challenge.
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 402);
+
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let challenge = mpp::parse_www_authenticate(www_auth).expect("failed to parse challenge");
+
+    // Step 2: Build a 0x78 fee payer envelope that sends to the WRONG recipient.
+    let charge: mpp::ChargeRequest = challenge.request.decode().unwrap();
+    let amount: U256 = charge.amount.parse().unwrap();
+    let currency: Address = charge.currency.parse().unwrap();
+
+    // Build transferWithMemo to wrong_recipient instead of server_signer
+    let transfer_data =
+        ITIP20::transferCall::new((wrong_recipient.address(), amount)).abi_encode();
+
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+    let gas_price = provider_http
+        .get_gas_price()
+        .await
+        .expect("failed to get gas price");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let tx = TempoTransaction {
+        chain_id,
+        nonce: 0,
+        nonce_key: U256::MAX,
+        gas_limit: 1_000_000,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price,
+        fee_token: None,
+        fee_payer_signature: Some(alloy::primitives::Signature::new(
+            U256::ZERO,
+            U256::ZERO,
+            false,
+        )),
+        valid_before: Some(now + 25),
+        valid_after: None,
+        calls: vec![Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: Bytes::from(transfer_data),
+        }],
+        ..Default::default()
+    };
+
+    // Sign and encode as 0x78 envelope
+    let sig_hash = tx.signature_hash();
+    let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
+
+    let tx_bytes = encode_fee_payer_envelope_for_test(&tx, client_signer.address(), sig.into());
+    let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+
+    // Step 3: Build a credential with the malicious envelope.
+    let echo = challenge.to_echo();
+    let credential = mpp::PaymentCredential::with_source(
+        echo,
+        format!("did:pkh:eip155:{}:{}", chain_id, client_signer.address()),
+        mpp::PaymentPayload::transaction(signed_tx_hex),
+    );
+    let auth_header =
+        mpp::format_authorization(&credential).expect("failed to format authorization");
+
+    // Step 4: Submit — should be rejected with 402.
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .header("authorization", &auth_header)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        402,
+        "wrong-recipient fee payer envelope should be rejected"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Verify that with fee payer enabled, the client's pathUSD balance decreases
+/// (payment amount) while the fee payer's native/pathUSD balance is used for gas.
+#[tokio::test]
+async fn test_fee_payer_balance_accounting() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    // Record balances before payment.
+    let client_balance_before = tip20_balance(&provider_http, client_signer.address()).await;
+    let server_balance_before = tip20_balance(&provider_http, server_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer.clone())
+        .secret_key("balance-accounting-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider =
+        TempoProvider::new(client_signer.clone(), &rpc).expect("failed to create TempoProvider");
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("fee-payer payment failed");
+    assert_eq!(resp.status(), 200);
+
+    // Record balances after payment.
+    let client_balance_after = tip20_balance(&provider_http, client_signer.address()).await;
+    let server_balance_after = tip20_balance(&provider_http, server_signer.address()).await;
+
+    let charge_amount = U256::from(10_000u64); // $0.01 with 6 decimals
+
+    // Client's pathUSD should decrease by at least the charge amount.
+    let client_decrease = client_balance_before - client_balance_after;
+    assert!(
+        client_decrease >= charge_amount,
+        "client pathUSD should decrease by at least {charge_amount}, but decreased by {client_decrease}"
+    );
+
+    // Server (recipient) should receive the payment amount.
+    let server_increase = server_balance_after - server_balance_before;
+    assert!(
+        server_increase >= charge_amount,
+        "server pathUSD should increase by at least {charge_amount}, but increased by {server_increase}"
+    );
+
+    // In fee payer mode, the fee payer (server) pays gas. The client's decrease
+    // should be exactly the charge amount — no gas cost for the client.
+    // Allow a small tolerance in case of rounding.
+    assert_eq!(
+        client_decrease, charge_amount,
+        "in fee payer mode, client should only pay the charge amount (no gas), \
+         but client balance decreased by {client_decrease} instead of {charge_amount}"
     );
 
     handle.abort();

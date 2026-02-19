@@ -692,10 +692,25 @@ where
                 "Fee payer envelope must use expiring nonce key (U256::MAX)",
             ));
         }
-        if valid_before.is_none() {
-            return Err(VerificationError::new(
-                "Fee payer envelope must include valid_before",
-            ));
+        match valid_before {
+            None => {
+                return Err(VerificationError::new(
+                    "Fee payer envelope must include valid_before",
+                ));
+            }
+            Some(vb) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| {
+                        VerificationError::new(format!("System clock error: {e}"))
+                    })?
+                    .as_secs();
+                if vb <= now {
+                    return Err(VerificationError::new(format!(
+                        "Fee payer envelope expired: valid_before ({vb}) is not in the future (now={now})"
+                    )));
+                }
+            }
         }
 
         // Rebuild the transaction with fee_token set
@@ -980,5 +995,338 @@ mod tests {
         assert!(error
             .to_string()
             .contains("fee sponsorship is not configured"));
+    }
+
+    // ==================== Fee payer co-sign unit tests ====================
+
+    /// Helper: build a 0x78 fee payer envelope using encode_fee_payer_envelope
+    /// from provider.rs (replicated here since it's private to that module).
+    fn build_fee_payer_envelope(
+        tx: &tempo_primitives::TempoTransaction,
+        sender: Address,
+        signature: tempo_primitives::transaction::TempoSignature,
+    ) -> Vec<u8> {
+        use alloy::primitives::bytes::BufMut;
+        use alloy::rlp::{Encodable, EMPTY_STRING_CODE};
+
+        let mut fields = Vec::new();
+
+        tx.chain_id.encode(&mut fields);
+        tx.max_priority_fee_per_gas.encode(&mut fields);
+        tx.max_fee_per_gas.encode(&mut fields);
+        tx.gas_limit.encode(&mut fields);
+        tx.calls.encode(&mut fields);
+        tx.access_list.encode(&mut fields);
+        tx.nonce_key.encode(&mut fields);
+        tx.nonce.encode(&mut fields);
+
+        if let Some(vb) = tx.valid_before {
+            vb.encode(&mut fields);
+        } else {
+            fields.put_u8(EMPTY_STRING_CODE);
+        }
+        if let Some(va) = tx.valid_after {
+            va.encode(&mut fields);
+        } else {
+            fields.put_u8(EMPTY_STRING_CODE);
+        }
+        // feeToken — always empty in fee payer envelope
+        fields.put_u8(EMPTY_STRING_CODE);
+        // Sender address in the fee_payer_signature slot
+        sender.encode(&mut fields);
+        tx.tempo_authorization_list.encode(&mut fields);
+        if let Some(key_auth) = &tx.key_authorization {
+            key_auth.encode(&mut fields);
+        }
+        signature.encode(&mut fields);
+
+        let rlp_header = alloy::rlp::Header {
+            list: true,
+            payload_length: fields.len(),
+        };
+
+        let mut out = Vec::with_capacity(1 + rlp_header.length() + fields.len());
+        out.put_u8(0x78);
+        rlp_header.encode(&mut out);
+        out.extend_from_slice(&fields);
+
+        out
+    }
+
+    /// Helper: build a valid TempoTransaction for fee payer tests.
+    fn make_fee_payer_tx(valid_before_secs_from_now: u64) -> tempo_primitives::TempoTransaction {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        tempo_primitives::TempoTransaction {
+            chain_id: CHAIN_ID,
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit: 1_000_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            fee_token: None,
+            fee_payer_signature: Some(alloy::primitives::Signature::new(
+                U256::ZERO,
+                U256::ZERO,
+                false,
+            )),
+            valid_before: Some(now + valid_before_secs_from_now),
+            valid_after: None,
+            calls: vec![tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x20)),
+                value: U256::ZERO,
+                input: Bytes::from(vec![0xa9, 0x05, 0x9c, 0xbb]), // transfer selector
+            }],
+            access_list: Default::default(),
+            tempo_authorization_list: vec![],
+            key_authorization: None,
+        }
+    }
+
+    /// Helper: sign a tx and build a 0x78 envelope.
+    fn sign_and_encode_fee_payer_envelope(
+        tx: &tempo_primitives::TempoTransaction,
+        signer: &alloy_signer_local::PrivateKeySigner,
+    ) -> Vec<u8> {
+        use alloy::signers::SignerSync;
+
+        let sig_hash = tx.signature_hash();
+        let sig = signer.sign_hash_sync(&sig_hash).unwrap();
+        build_fee_payer_envelope(tx, signer.address(), sig.into())
+    }
+
+    /// Round-trip: encode_fee_payer_envelope → cosign_fee_payer_transaction
+    /// succeeds and produces a valid 0x76 transaction.
+    #[test]
+    fn test_fee_payer_envelope_round_trip() {
+        use alloy::eips::Decodable2718;
+
+        let client_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let tx = make_fee_payer_tx(60);
+        let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
+
+        // Verify it starts with 0x78
+        assert_eq!(envelope[0], 0x78);
+
+        // Create a dummy ChargeMethod to call cosign_fee_payer_transaction.
+        // We need a Provider<TempoNetwork>, but cosign doesn't use it — use
+        // a mock HTTP provider that we never call.
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<
+            tempo_alloy::TempoNetwork,
+        >()
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &envelope,
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let co_signed = result.expect("cosign should succeed for valid 0x78 envelope");
+
+        // Result should be a valid 0x76 transaction
+        assert_eq!(
+            co_signed[0],
+            tempo_primitives::transaction::TEMPO_TX_TYPE_ID,
+            "co-signed output should be 0x76"
+        );
+
+        // It should be decodable by AASigned
+        let signed = tempo_primitives::AASigned::decode_2718(&mut &co_signed[..])
+            .expect("co-signed tx should be decodable as AASigned");
+
+        let decoded_tx = signed.tx();
+        assert_eq!(decoded_tx.chain_id, CHAIN_ID);
+        assert_eq!(decoded_tx.nonce_key, U256::MAX);
+        assert_eq!(decoded_tx.fee_token, Some(fee_token.into()));
+        assert!(decoded_tx.fee_payer_signature.is_some());
+        assert!(decoded_tx.valid_before.is_some());
+    }
+
+    /// cosign_fee_payer_transaction rejects a standard 0x76 transaction.
+    #[test]
+    fn test_cosign_rejects_0x76_input() {
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+
+        let client_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let tx = make_fee_payer_tx(60);
+        let sig_hash = tx.signature_hash();
+        let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
+        let signed = tx.into_signed(sig.into());
+        let encoded_0x76 = signed.encoded_2718();
+
+        assert_eq!(encoded_0x76[0], tempo_primitives::transaction::TEMPO_TX_TYPE_ID);
+
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<
+            tempo_alloy::TempoNetwork,
+        >()
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &encoded_0x76,
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let err = result.expect_err("should reject 0x76 input");
+        assert!(
+            err.to_string().contains("Expected fee payer envelope (0x78)"),
+            "error should mention 0x78, got: {err}"
+        );
+    }
+
+    /// cosign_fee_payer_transaction rejects envelopes with wrong nonce_key.
+    #[test]
+    fn test_cosign_rejects_wrong_nonce_key() {
+        let client_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let mut tx = make_fee_payer_tx(60);
+        tx.nonce_key = U256::ZERO; // Wrong — should be U256::MAX
+
+        let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
+
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<
+            tempo_alloy::TempoNetwork,
+        >()
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &envelope,
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let err = result.expect_err("should reject wrong nonce_key");
+        assert!(
+            err.to_string().contains("expiring nonce key"),
+            "error should mention expiring nonce key, got: {err}"
+        );
+    }
+
+    /// cosign_fee_payer_transaction rejects envelopes without valid_before.
+    #[test]
+    fn test_cosign_rejects_missing_valid_before() {
+        let client_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let mut tx = make_fee_payer_tx(60);
+        tx.valid_before = None; // Missing
+
+        let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
+
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<
+            tempo_alloy::TempoNetwork,
+        >()
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &envelope,
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let err = result.expect_err("should reject missing valid_before");
+        assert!(
+            err.to_string().contains("must include valid_before"),
+            "error should mention valid_before, got: {err}"
+        );
+    }
+
+    /// cosign_fee_payer_transaction rejects envelopes with expired valid_before.
+    #[test]
+    fn test_cosign_rejects_expired_valid_before() {
+        let client_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        // Build a tx with valid_before in the past
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10;
+
+        let mut tx = make_fee_payer_tx(60);
+        tx.valid_before = Some(past);
+
+        let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
+
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<
+            tempo_alloy::TempoNetwork,
+        >()
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &envelope,
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let err = result.expect_err("should reject expired valid_before");
+        assert!(
+            err.to_string().contains("expired"),
+            "error should mention expiration, got: {err}"
+        );
+    }
+
+    /// cosign_fee_payer_transaction rejects empty input.
+    #[test]
+    fn test_cosign_rejects_empty_input() {
+        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<
+            tempo_alloy::TempoNetwork,
+        >()
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &[],
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let err = result.expect_err("should reject empty input");
+        assert!(
+            err.to_string().contains("Empty transaction bytes"),
+            "error should mention empty, got: {err}"
+        );
     }
 }
