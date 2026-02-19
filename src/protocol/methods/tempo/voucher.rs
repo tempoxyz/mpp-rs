@@ -1,4 +1,4 @@
-//! Voucher signing and channel ID computation for Tempo streaming payments.
+//! Voucher signing and channel ID computation for Tempo session payments.
 //!
 //! Client-side helpers for EIP-712 voucher signing and channel ID computation,
 //! matching the TypeScript SDK's `Voucher.ts` and `Channel.ts`.

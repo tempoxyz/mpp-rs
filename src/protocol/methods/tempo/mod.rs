@@ -98,7 +98,7 @@
 
 pub mod charge;
 pub mod session;
-pub mod stream_receipt;
+pub mod session_receipt;
 pub mod transaction;
 pub mod types;
 pub mod voucher;
@@ -110,7 +110,15 @@ pub mod session_method;
 
 pub use charge::TempoChargeExt;
 pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};
-pub use stream_receipt::StreamReceipt;
+pub use session_receipt::SessionReceipt;
+
+/// Deprecated: use [`session_receipt`] instead. Remove in next major version.
+#[deprecated(since = "0.5.0", note = "renamed to session_receipt")]
+pub use session_receipt as stream_receipt;
+
+/// Deprecated: use [`SessionReceipt`] instead. Remove in next major version.
+#[deprecated(since = "0.5.0", note = "renamed to SessionReceipt")]
+pub type StreamReceipt = SessionReceipt;
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,

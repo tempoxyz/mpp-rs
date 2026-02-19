@@ -1,6 +1,6 @@
 //! Server-side session payment verification for Tempo.
 //!
-//! Implements the `SessionMethod` trait for Tempo streaming payments (pay-as-you-go).
+//! Implements the `SessionMethod` trait for Tempo session payments (pay-as-you-go).
 //! Handles four channel lifecycle actions: open, topUp, voucher, close.
 //!
 //! Ported from the TypeScript SDK's `Session.ts`.
@@ -195,7 +195,7 @@ pub struct SessionMethodConfig {
     pub min_voucher_delta: u128,
 }
 
-/// Tempo session method for server-side streaming payment verification.
+/// Tempo session method for server-side session payment verification.
 ///
 /// Handles four channel lifecycle actions:
 /// - `open`: broadcast open tx, verify initial voucher, create channel in store
@@ -582,7 +582,7 @@ where
 
         // Use cached channel state (verified during open/topUp) instead of
         // reading on-chain for every voucher. This avoids an RPC round-trip
-        // per voucher, critical for high-frequency streaming.
+        // per voucher, critical for high-frequency sessions.
         self.verify_and_accept_voucher(
             channel_id_str,
             &channel,

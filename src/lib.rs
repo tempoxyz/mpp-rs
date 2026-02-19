@@ -52,8 +52,12 @@ pub use error::{MppError, Result};
 
 // RFC 9457 Problem Details
 pub use error::{
-    PaymentError, PaymentErrorDetails, CORE_PROBLEM_TYPE_BASE, STREAM_PROBLEM_TYPE_BASE,
+    PaymentError, PaymentErrorDetails, CORE_PROBLEM_TYPE_BASE, SESSION_PROBLEM_TYPE_BASE,
 };
+
+// Deprecated: remove in next major version.
+#[allow(deprecated)]
+pub use error::STREAM_PROBLEM_TYPE_BASE;
 
 // Core protocol types
 pub use protocol::core::{
