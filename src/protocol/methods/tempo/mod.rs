@@ -160,7 +160,10 @@ pub const DEFAULT_CURRENCY_MAINNET: &str = USDC;
 pub const DEFAULT_CURRENCY_TESTNET: &str = PATH_USD;
 
 /// Default currency address (USDC on mainnet).
-#[deprecated(since = "0.6.0", note = "use DEFAULT_CURRENCY_MAINNET or DEFAULT_CURRENCY_TESTNET")]
+#[deprecated(
+    since = "0.6.0",
+    note = "use DEFAULT_CURRENCY_MAINNET or DEFAULT_CURRENCY_TESTNET"
+)]
 pub const DEFAULT_CURRENCY: &str = USDC;
 
 /// Default challenge expiration in minutes.
