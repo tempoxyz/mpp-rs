@@ -100,10 +100,6 @@ const EXPIRING_NONCE_KEY: alloy::primitives::U256 = alloy::primitives::U256::MAX
 #[cfg(feature = "tempo")]
 const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 
-/// Type byte for the fee payer envelope format.
-#[cfg(feature = "tempo")]
-const FEE_PAYER_TX_TYPE: u8 = 0x78;
-
 #[cfg(feature = "tempo")]
 #[derive(Clone)]
 pub struct TempoProvider {
@@ -233,12 +229,14 @@ impl PaymentProvider for TempoProvider {
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-        // Build a Tempo transaction (type 0x76) for proper on-chain processing.
+        // Build a Tempo transaction (type 0x76).
         // When fee_payer is true:
         //   - fee_token is None (server chooses at co-sign time)
         //   - fee_payer_signature is a placeholder (triggers skip_fee_token in signing hash)
         //   - nonce_key = U256::MAX (expiring nonce)
         //   - valid_before is set to now + 25s
+        // The server decodes this standard 0x76 tx, recovers the sender via
+        // ecrecover, then co-signs and broadcasts.
         let tempo_tx = TempoTransaction {
             chain_id: expected_chain_id,
             nonce,
@@ -272,15 +270,8 @@ impl PaymentProvider for TempoProvider {
             .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-        let tx_bytes = if fee_payer {
-            // Serialize as 0x78 fee payer envelope:
-            // The server expects this format so it can co-sign before broadcasting.
-            // Format: 0x78 || RLP([...tx_fields_with_sender_addr, client_signature])
-            encode_fee_payer_envelope(&tempo_tx, address, signature.into())
-        } else {
-            let signed_tx = tempo_tx.into_signed(signature.into());
-            signed_tx.encoded_2718()
-        };
+        let signed_tx = tempo_tx.into_signed(signature.into());
+        let tx_bytes = signed_tx.encoded_2718();
         let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
         let echo = challenge.to_echo();
@@ -402,74 +393,6 @@ impl Clone for Box<dyn DynPaymentProvider> {
     fn clone(&self) -> Self {
         self.clone_box()
     }
-}
-
-/// Encode a fee payer envelope (0x78 format).
-///
-/// This produces the serialized bytes that the mppx server expects when
-/// `feePayer: true`. The format is:
-///
-/// ```text
-/// 0x78 || RLP([chainId, maxPriorityFeePerGas, maxFeePerGas, gas, calls,
-///              accessList, nonceKey, nonce, validBefore, validAfter,
-///              feeToken, senderAddress, authorizationList, signature])
-/// ```
-///
-/// Key differences from the standard 0x76 format:
-/// - Type prefix is 0x78 instead of 0x76
-/// - The fee_payer_signature slot contains the sender address (not a placeholder)
-/// - The fee_token is empty (server chooses at co-sign time)
-#[cfg(feature = "tempo")]
-fn encode_fee_payer_envelope(
-    tx: &tempo_primitives::TempoTransaction,
-    sender: alloy::primitives::Address,
-    signature: tempo_primitives::transaction::TempoSignature,
-) -> Vec<u8> {
-    use alloy::primitives::bytes::BufMut;
-    use alloy::rlp::{Encodable, EMPTY_STRING_CODE};
-
-    let mut fields = Vec::new();
-
-    tx.chain_id.encode(&mut fields);
-    tx.max_priority_fee_per_gas.encode(&mut fields);
-    tx.max_fee_per_gas.encode(&mut fields);
-    tx.gas_limit.encode(&mut fields);
-    tx.calls.encode(&mut fields);
-    tx.access_list.encode(&mut fields);
-    tx.nonce_key.encode(&mut fields);
-    tx.nonce.encode(&mut fields);
-
-    if let Some(vb) = tx.valid_before {
-        vb.encode(&mut fields);
-    } else {
-        fields.put_u8(EMPTY_STRING_CODE);
-    }
-    if let Some(va) = tx.valid_after {
-        va.encode(&mut fields);
-    } else {
-        fields.put_u8(EMPTY_STRING_CODE);
-    }
-    // feeToken — always empty in fee payer envelope
-    fields.put_u8(EMPTY_STRING_CODE);
-    // Sender address in the fee_payer_signature slot
-    sender.encode(&mut fields);
-    tx.tempo_authorization_list.encode(&mut fields);
-    if let Some(key_auth) = &tx.key_authorization {
-        key_auth.encode(&mut fields);
-    }
-    signature.encode(&mut fields);
-
-    let rlp_header = alloy::rlp::Header {
-        list: true,
-        payload_length: fields.len(),
-    };
-
-    let mut out = Vec::with_capacity(1 + rlp_header.length() + fields.len());
-    out.put_u8(FEE_PAYER_TX_TYPE);
-    rlp_header.encode(&mut out);
-    out.extend_from_slice(&fields);
-
-    out
 }
 
 #[cfg(test)]
