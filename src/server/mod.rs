@@ -217,7 +217,7 @@ pub struct ChargeOptions<'a> {
 #[cfg(feature = "tempo")]
 pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
     TempoBuilder {
-        currency: crate::protocol::methods::tempo::DEFAULT_CURRENCY.to_string(),
+        currency: crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET.to_string(),
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: mpp::detect_realm(),

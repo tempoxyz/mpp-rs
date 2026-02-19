@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(mpp.realm(), "MPP Payment");
         assert_eq!(
             mpp.currency(),
-            Some("0x20c0000000000000000000000000000000000000")
+            Some("0x20C000000000000000000000b9537d11c60E8b50")
         );
         assert_eq!(
             mpp.recipient(),
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(request.amount, "100000");
         assert_eq!(
             request.currency,
-            "0x20c0000000000000000000000000000000000000"
+            "0x20C000000000000000000000b9537d11c60E8b50"
         );
         assert_eq!(
             request.recipient,
