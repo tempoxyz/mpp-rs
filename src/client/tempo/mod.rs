@@ -7,6 +7,7 @@ pub mod balance;
 pub mod channel_ops;
 pub mod charge;
 mod error;
+pub mod gas;
 pub mod keychain;
 mod provider;
 mod session_provider;
@@ -15,6 +16,7 @@ pub mod swap;
 pub mod tx_builder;
 
 pub use balance::{effective_capacity, query_token_balance};
+pub use gas::{resolve_gas, ResolvedGas};
 pub use channel_ops::ChannelEntry;
 pub use charge::{SignOptions, SignedTempoCharge, TempoCharge};
 pub use error::TempoClientError;
