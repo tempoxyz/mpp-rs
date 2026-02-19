@@ -71,6 +71,7 @@ pub struct TempoConfig<'a> {
 #[cfg(feature = "tempo")]
 pub struct TempoBuilder {
     pub(crate) currency: String,
+    pub(crate) currency_explicit: bool,
     pub(crate) recipient: String,
     pub(crate) rpc_url: String,
     pub(crate) realm: String,
@@ -102,9 +103,10 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the token currency (default: pathUSD `0x20c0...`).
+    /// Override the token currency (default: USDC on mainnet, pathUSD on testnet).
     pub fn currency(mut self, addr: &str) -> Self {
         self.currency = addr.to_string();
+        self.currency_explicit = true;
         self
     }
 
@@ -218,6 +220,7 @@ pub struct ChargeOptions<'a> {
 pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
     TempoBuilder {
         currency: crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET.to_string(),
+        currency_explicit: false,
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: mpp::detect_realm(),
