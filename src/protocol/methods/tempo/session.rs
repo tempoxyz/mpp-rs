@@ -159,6 +159,9 @@ pub trait TempoSessionExt {
 
     /// Parse the method_details as Tempo session-specific details.
     fn tempo_session_details(&self) -> Result<TempoSessionMethodDetails>;
+
+    /// Get the Tempo network from chain ID, if recognized.
+    fn network(&self) -> Option<crate::protocol::methods::tempo::network::TempoNetwork>;
 }
 
 impl TempoSessionExt for SessionRequest {
@@ -218,6 +221,11 @@ impl TempoSessionExt for SessionRequest {
                 "Missing methodDetails for session intent".to_string(),
             )),
         }
+    }
+
+    fn network(&self) -> Option<crate::protocol::methods::tempo::network::TempoNetwork> {
+        self.chain_id()
+            .and_then(crate::protocol::methods::tempo::network::TempoNetwork::from_chain_id)
     }
 }
 
@@ -583,5 +591,27 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("expected \"transaction\""), "error was: {err}");
+    }
+
+    #[test]
+    fn test_network_moderato() {
+        let req = test_session_request();
+        let network = req.network();
+        assert_eq!(
+            network,
+            Some(crate::protocol::methods::tempo::network::TempoNetwork::Moderato)
+        );
+    }
+
+    #[test]
+    fn test_network_none() {
+        let req = SessionRequest {
+            method_details: Some(serde_json::json!({
+                "escrowContract": "0xEscrow",
+                "chainId": 1
+            })),
+            ..test_session_request()
+        };
+        assert!(req.network().is_none());
     }
 }
