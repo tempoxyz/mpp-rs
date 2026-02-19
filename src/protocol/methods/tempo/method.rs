@@ -701,9 +701,7 @@ where
             Some(vb) => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| {
-                        VerificationError::new(format!("System clock error: {e}"))
-                    })?
+                    .map_err(|e| VerificationError::new(format!("System clock error: {e}")))?
                     .as_secs();
                 if vb <= now {
                     return Err(VerificationError::new(format!(
@@ -1119,10 +1117,9 @@ mod tests {
         // Create a dummy ChargeMethod to call cosign_fee_payer_transaction.
         // We need a Provider<TempoNetwork>, but cosign doesn't use it — use
         // a mock HTTP provider that we never call.
-        let provider = alloy::providers::ProviderBuilder::new_with_network::<
-            tempo_alloy::TempoNetwork,
-        >()
-        .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
@@ -1171,12 +1168,14 @@ mod tests {
         let signed = tx.into_signed(sig.into());
         let encoded_0x76 = signed.encoded_2718();
 
-        assert_eq!(encoded_0x76[0], tempo_primitives::transaction::TEMPO_TX_TYPE_ID);
+        assert_eq!(
+            encoded_0x76[0],
+            tempo_primitives::transaction::TEMPO_TX_TYPE_ID
+        );
 
-        let provider = alloy::providers::ProviderBuilder::new_with_network::<
-            tempo_alloy::TempoNetwork,
-        >()
-        .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
@@ -1188,7 +1187,8 @@ mod tests {
 
         let err = result.expect_err("should reject 0x76 input");
         assert!(
-            err.to_string().contains("Expected fee payer envelope (0x78)"),
+            err.to_string()
+                .contains("Expected fee payer envelope (0x78)"),
             "error should mention 0x78, got: {err}"
         );
     }
@@ -1207,10 +1207,9 @@ mod tests {
 
         let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
 
-        let provider = alloy::providers::ProviderBuilder::new_with_network::<
-            tempo_alloy::TempoNetwork,
-        >()
-        .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
@@ -1241,10 +1240,9 @@ mod tests {
 
         let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
 
-        let provider = alloy::providers::ProviderBuilder::new_with_network::<
-            tempo_alloy::TempoNetwork,
-        >()
-        .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
@@ -1282,10 +1280,9 @@ mod tests {
 
         let envelope = sign_and_encode_fee_payer_envelope(&tx, &client_signer);
 
-        let provider = alloy::providers::ProviderBuilder::new_with_network::<
-            tempo_alloy::TempoNetwork,
-        >()
-        .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
@@ -1310,10 +1307,9 @@ mod tests {
             .parse()
             .unwrap();
 
-        let provider = alloy::providers::ProviderBuilder::new_with_network::<
-            tempo_alloy::TempoNetwork,
-        >()
-        .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
