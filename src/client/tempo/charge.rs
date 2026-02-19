@@ -132,7 +132,8 @@ impl TempoCharge {
     /// Sign the charge with default options.
     ///
     /// This is the simple path — resolves the RPC provider from chain_id,
-    /// fetches the nonce, estimates gas, builds and signs the transaction.
+    /// fetches the pending nonce, reads the current base fee, estimates gas,
+    /// builds and signs the transaction.
     ///
     /// # Errors
     ///
@@ -191,20 +192,20 @@ impl TempoCharge {
         // Determine fee token
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
-        // Resolve nonce
-        let nonce = match options.nonce {
-            Some(n) => n,
-            None => {
-                use alloy::providers::Provider;
-                provider.get_transaction_count(from).await.map_err(|e| {
-                    MppError::Http(format!("failed to get nonce: {}", e))
-                })?
-            }
-        };
+        // Resolve nonce and gas fees
+        let resolved = super::gas::resolve_gas(
+            &provider,
+            from,
+            options.max_fee_per_gas.unwrap_or(1_000_000_000),   // 1 gwei floor
+            options.max_priority_fee_per_gas.unwrap_or(1_000_000_000), // 1 gwei floor
+        )
+        .await?;
 
-        // Gas config
-        let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(20_000_000_000); // 20 gwei default
-        let max_priority_fee_per_gas = options.max_priority_fee_per_gas.unwrap_or(1_000_000_000); // 1 gwei default
+        let nonce = options.nonce.unwrap_or(resolved.nonce);
+        let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(resolved.max_fee_per_gas);
+        let max_priority_fee_per_gas = options
+            .max_priority_fee_per_gas
+            .unwrap_or(resolved.max_priority_fee_per_gas);
 
         // Estimate gas
         let gas_limit = match options.gas_limit {
@@ -269,15 +270,15 @@ impl TempoCharge {
 pub struct SignOptions {
     /// Override the RPC URL (otherwise resolved from chain_id).
     pub rpc_url: Option<String>,
-    /// Override the transaction nonce (otherwise fetched via `eth_getTransactionCount`).
+    /// Override the transaction nonce (otherwise fetched as pending via `eth_getTransactionCount`).
     pub nonce: Option<u64>,
     /// Override the nonce key (default: `U256::ZERO`).
     pub nonce_key: Option<U256>,
     /// Override the gas limit (otherwise estimated via `eth_estimateGas`).
     pub gas_limit: Option<u64>,
-    /// Override max fee per gas in wei (default: 20 gwei).
+    /// Override max fee per gas in wei (otherwise derived from the latest block's base fee).
     pub max_fee_per_gas: Option<u128>,
-    /// Override max priority fee per gas in wei (default: 1 gwei).
+    /// Override max priority fee per gas in wei (default: 1 gwei floor).
     pub max_priority_fee_per_gas: Option<u128>,
     /// Override the fee token address (default: the charge currency).
     pub fee_token: Option<Address>,

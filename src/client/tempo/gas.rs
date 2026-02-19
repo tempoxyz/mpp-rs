@@ -1,8 +1,7 @@
-//! Gas-aware nonce resolution and stuck transaction detection.
+//! Gas fee resolution from on-chain state.
 //!
-//! Detects stuck pending transactions by comparing confirmed vs pending nonce,
-//! reads stuck tx gas prices via `txpool_content`, and bumps gas fees to replace.
-//! Falls back to base fee × 2 + priority when no stuck transactions exist.
+//! Queries the pending nonce and latest block's base fee to produce
+//! gas parameters that are competitive in the current fee market.
 
 use alloy::primitives::Address;
 
@@ -11,7 +10,7 @@ use crate::error::MppError;
 /// Resolved nonce and gas fees, ready for transaction building.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedGas {
-    /// The confirmed nonce to use (replaces any stuck pending tx).
+    /// The pending nonce (queues after any in-flight transactions).
     pub nonce: u64,
     /// Max fee per gas in wei.
     pub max_fee_per_gas: u128,
@@ -19,13 +18,12 @@ pub struct ResolvedGas {
     pub max_priority_fee_per_gas: u128,
 }
 
-/// Resolve the nonce and gas fees for an account, detecting and replacing stuck transactions.
+/// Resolve the pending nonce and gas fees for an account.
 ///
 /// This function:
-/// 1. Fetches the confirmed (latest) nonce
-/// 2. Compares against the pending nonce to detect stuck transactions
-/// 3. If stuck txs exist: reads their gas via `txpool_content` and bids 2× to replace
-/// 4. If no stuck txs: checks the latest block's base fee and ensures max_fee covers it
+/// 1. Fetches the pending nonce (so sequential payments queue correctly)
+/// 2. Reads the latest block's base fee
+/// 3. Sets `max_fee_per_gas = max(base_fee * 2 + priority_fee, default_max_fee)`
 ///
 /// # Arguments
 ///
@@ -39,37 +37,14 @@ pub async fn resolve_gas<P: alloy::providers::Provider>(
     default_max_fee: u128,
     default_priority_fee: u128,
 ) -> Result<ResolvedGas, MppError> {
-    // Confirmed (latest) nonce — we use this so we replace any stuck txs.
     let nonce = provider
-        .get_transaction_count(from)
-        .await
-        .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
-
-    // Pending nonce — if higher, there are stuck txs in the mempool.
-    let pending_nonce = provider
         .get_transaction_count(from)
         .pending()
         .await
-        .unwrap_or(nonce);
+        .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
 
-    let (max_fee_per_gas, max_priority_fee_per_gas) = if pending_nonce > nonce {
-        // Stuck pending txs detected — bump gas to replace them.
-        let stuck_gas = read_stuck_tx_gas(provider, from, nonce).await;
-
-        if let Some((stuck_max_fee, stuck_priority)) = stuck_gas {
-            // Bid 2× the stuck tx's gas, floored by defaults.
-            (
-                std::cmp::max(stuck_max_fee as u128 * 2, default_max_fee),
-                std::cmp::max(stuck_priority as u128 * 2, default_priority_fee),
-            )
-        } else {
-            // Can't read stuck tx — use 10× default as safe fallback.
-            (default_max_fee * 10, default_priority_fee * 10)
-        }
-    } else {
-        // No stuck txs — check current base fee and bump if needed.
-        bump_for_base_fee(provider, default_max_fee, default_priority_fee).await
-    };
+    let (max_fee_per_gas, max_priority_fee_per_gas) =
+        resolve_fees(provider, default_max_fee, default_priority_fee).await;
 
     Ok(ResolvedGas {
         nonce,
@@ -78,57 +53,12 @@ pub async fn resolve_gas<P: alloy::providers::Provider>(
     })
 }
 
-/// Read a stuck transaction's gas fees from `txpool_content`.
-///
-/// Returns `Some((max_fee_per_gas, max_priority_fee_per_gas))` if the stuck tx
-/// at the given nonce is found, `None` otherwise.
-async fn read_stuck_tx_gas<P: alloy::providers::Provider>(
-    provider: &P,
-    from: Address,
-    nonce: u64,
-) -> Option<(u64, u64)> {
-    let pool: serde_json::Value = provider
-        .raw_request("txpool_content".into(), ())
-        .await
-        .ok()?;
-
-    let from_hex = format!("{:#x}", from);
-    let nonce_str = format!("{}", nonce);
-
-    let tx = pool
-        .get("pending")?
-        .get(&from_hex)
-        .or_else(|| {
-            // txpool keys may use checksummed addresses
-            pool.get("pending")?
-                .as_object()?
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == from_hex.to_lowercase())
-                .map(|(_, v)| v)
-        })?
-        .get(&nonce_str)?;
-
-    let max_fee = u64::from_str_radix(
-        tx.get("maxFeePerGas")?.as_str()?.trim_start_matches("0x"),
-        16,
-    )
-    .ok()?;
-    let max_priority = u64::from_str_radix(
-        tx.get("maxPriorityFeePerGas")?
-            .as_str()?
-            .trim_start_matches("0x"),
-        16,
-    )
-    .ok()?;
-
-    Some((max_fee, max_priority))
-}
-
-/// Check the latest block's base fee and bump max_fee if it's too low.
+/// Resolve gas fees from the latest block's base fee.
 ///
 /// Ensures `max_fee_per_gas >= base_fee * 2 + priority_fee` so the transaction
-/// is competitive in the current fee market.
-async fn bump_for_base_fee<P: alloy::providers::Provider>(
+/// is competitive in the current fee market. Returns the defaults if the
+/// base fee cannot be read.
+async fn resolve_fees<P: alloy::providers::Provider>(
     provider: &P,
     default_max_fee: u128,
     default_priority_fee: u128,
