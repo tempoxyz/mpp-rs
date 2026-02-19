@@ -55,6 +55,25 @@ impl TempoSigningMode {
     }
 }
 
+/// Build the [`TempoSignature`] for a given inner signature and signing mode.
+fn build_tempo_signature(
+    inner_signature: alloy::signers::Signature,
+    mode: &TempoSigningMode,
+) -> tempo_primitives::transaction::TempoSignature {
+    use tempo_primitives::transaction::{KeychainSignature, PrimitiveSignature, TempoSignature};
+
+    match mode {
+        TempoSigningMode::Direct => {
+            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(inner_signature))
+        }
+        TempoSigningMode::Keychain { wallet, .. } => {
+            let keychain_sig =
+                KeychainSignature::new(*wallet, PrimitiveSignature::Secp256k1(inner_signature));
+            TempoSignature::Keychain(keychain_sig)
+        }
+    }
+}
+
 /// Sign a [`TempoTransaction`] and return the EIP-2718 encoded bytes.
 ///
 /// Uses the provided signing mode to produce either a primitive ECDSA
@@ -65,25 +84,13 @@ pub fn sign_and_encode(
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
     use alloy::eips::Encodable2718;
-    use tempo_primitives::transaction::{KeychainSignature, PrimitiveSignature, TempoSignature};
 
     let sig_hash = tx.signature_hash();
     let inner_signature = signer
         .sign_hash_sync(&sig_hash)
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-    let tempo_signature = match mode {
-        TempoSigningMode::Direct => {
-            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(inner_signature))
-        }
-        TempoSigningMode::Keychain { wallet, .. } => {
-            let keychain_sig =
-                KeychainSignature::new(*wallet, PrimitiveSignature::Secp256k1(inner_signature));
-            TempoSignature::Keychain(keychain_sig)
-        }
-    };
-
-    let signed_tx = tx.into_signed(tempo_signature);
+    let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
     Ok(signed_tx.encoded_2718())
 }
 
@@ -94,7 +101,6 @@ pub async fn sign_and_encode_async(
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
     use alloy::eips::Encodable2718;
-    use tempo_primitives::transaction::{KeychainSignature, PrimitiveSignature, TempoSignature};
 
     let sig_hash = tx.signature_hash();
     let inner_signature = signer
@@ -102,17 +108,6 @@ pub async fn sign_and_encode_async(
         .await
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-    let tempo_signature = match mode {
-        TempoSigningMode::Direct => {
-            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(inner_signature))
-        }
-        TempoSigningMode::Keychain { wallet, .. } => {
-            let keychain_sig =
-                KeychainSignature::new(*wallet, PrimitiveSignature::Secp256k1(inner_signature));
-            TempoSignature::Keychain(keychain_sig)
-        }
-    };
-
-    let signed_tx = tx.into_signed(tempo_signature);
+    let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
     Ok(signed_tx.encoded_2718())
 }

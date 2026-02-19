@@ -459,7 +459,7 @@ impl PaymentProvider for TempoSessionProvider {
         let (entry, payload) = create_open_payload(
             &provider,
             &self.signer,
-            &self.signing_mode,
+            Some(&self.signing_mode),
             payer,
             OpenPayloadOptions {
                 authorized_signer: self.authorized_signer,

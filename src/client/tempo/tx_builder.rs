@@ -148,12 +148,15 @@ pub async fn estimate_gas<P: alloy::providers::Provider>(
     parse_gas_estimate(&gas_hex)
 }
 
+/// Safety buffer added to gas estimates to account for estimation variance.
+const GAS_ESTIMATE_BUFFER: u64 = 5_000;
+
 /// Parse a hex gas estimate string and add a safety buffer.
 fn parse_gas_estimate(gas_hex: &str) -> Result<u64, MppError> {
     let gas_limit = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).map_err(|e| {
         MppError::InvalidConfig(format!("failed to parse gas estimate '{}': {}", gas_hex, e))
     })?;
-    Ok(gas_limit + 5_000)
+    Ok(gas_limit + GAS_ESTIMATE_BUFFER)
 }
 
 /// Build a [`PaymentCredential`] from a signed Tempo transaction.

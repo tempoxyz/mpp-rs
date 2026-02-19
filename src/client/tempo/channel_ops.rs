@@ -173,7 +173,7 @@ pub struct OpenPayloadOptions {
 pub async fn create_open_payload<P, S>(
     provider: &P,
     signer: &S,
-    signing_mode: &super::signing::TempoSigningMode,
+    signing_mode: Option<&super::signing::TempoSigningMode>,
     payer: Address,
     options: OpenPayloadOptions,
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
@@ -183,6 +183,9 @@ where
 {
     use alloy::sol;
     use tempo_primitives::transaction::Call;
+
+    let default_mode = super::signing::TempoSigningMode::Direct;
+    let signing_mode = signing_mode.unwrap_or(&default_mode);
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
