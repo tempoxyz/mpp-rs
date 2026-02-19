@@ -565,12 +565,24 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             method = method.with_fee_payer(signer);
         }
 
+        // Resolve currency from chain_id when not explicitly set
+        let currency = if builder.currency_explicit {
+            builder.currency
+        } else {
+            use crate::protocol::methods::tempo::network::TempoNetwork;
+            builder
+                .chain_id
+                .and_then(TempoNetwork::from_chain_id)
+                .map(|n| n.default_currency().to_string())
+                .unwrap_or_else(|| crate::protocol::methods::tempo::PATH_USD.to_string())
+        };
+
         Ok(Self {
             method,
             session_method: None,
             realm: builder.realm,
             secret_key,
-            currency: Some(builder.currency),
+            currency: Some(currency),
             recipient: Some(builder.recipient),
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
@@ -765,6 +777,7 @@ mod tests {
     fn test_mpp_create() {
         let mpp = create_test_mpp();
         assert_eq!(mpp.realm(), "MPP Payment");
+        // No chain_id set → unknown chain → defaults to pathUSD
         assert_eq!(
             mpp.currency(),
             Some("0x20c0000000000000000000000000000000000000")
