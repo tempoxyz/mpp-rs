@@ -370,7 +370,6 @@ where
     pub fn session_challenge(
         &self,
         amount: &str,
-        unit_type: &str,
         currency: &str,
         recipient: &str,
     ) -> crate::error::Result<PaymentChallenge> {
@@ -378,7 +377,6 @@ where
 
         let request = SessionRequest {
             amount: amount.to_string(),
-            unit_type: unit_type.to_string(),
             currency: currency.to_string(),
             recipient: Some(recipient.to_string()),
             ..Default::default()
@@ -419,10 +417,10 @@ where
     /// ```ignore
     /// let challenge = mpp.session_challenge_with_details(
     ///     "1000",
-    ///     "second",
     ///     "0x20c0...",
     ///     "0x742d...",
     ///     SessionChallengeOptions {
+    ///         unit_type: Some("second"),
     ///         suggested_deposit: Some("60000"),
     ///         fee_payer: true,
     ///         ..Default::default()
@@ -433,7 +431,6 @@ where
     pub fn session_challenge_with_details(
         &self,
         amount: &str,
-        unit_type: &str,
         currency: &str,
         recipient: &str,
         options: super::SessionChallengeOptions<'_>,
@@ -453,7 +450,7 @@ where
 
         let request = SessionRequest {
             amount: amount.to_string(),
-            unit_type: unit_type.to_string(),
+            unit_type: options.unit_type.map(|s| s.to_string()),
             currency: currency.to_string(),
             recipient: Some(recipient.to_string()),
             suggested_deposit: options.suggested_deposit.map(|s| s.to_string()),

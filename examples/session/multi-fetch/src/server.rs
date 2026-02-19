@@ -148,10 +148,10 @@ async fn scrape(
     let challenge = payment
         .session_challenge_with_details(
             AMOUNT_PER_REQUEST,
-            "page",
             currency,
             recipient,
             SessionChallengeOptions {
+                unit_type: Some("page"),
                 suggested_deposit: Some("1000000"),
                 ..Default::default()
             },
