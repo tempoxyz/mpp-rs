@@ -26,6 +26,36 @@ use crate::protocol::traits::{ChargeMethod, VerificationError};
 const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;
 
+/// Environment variables checked (in order) to auto-detect the server realm.
+const REALM_ENV_VARS: &[&str] = &[
+    "MPP_REALM",
+    "FLY_APP_NAME",
+    "HEROKU_APP_NAME",
+    "HOST",
+    "HOSTNAME",
+    "RAILWAY_PUBLIC_DOMAIN",
+    "RENDER_EXTERNAL_HOSTNAME",
+    "VERCEL_URL",
+    "WEBSITE_HOSTNAME",
+];
+
+const DEFAULT_REALM: &str = "MPP Payment";
+
+/// Detect the server realm from environment variables.
+///
+/// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
+/// falling back to `"MPP Payment"`.
+fn detect_realm() -> String {
+    for name in REALM_ENV_VARS {
+        if let Ok(value) = std::env::var(name) {
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    DEFAULT_REALM.to_string()
+}
+
 /// Result of session verification, including optional management response.
 pub struct SessionVerifyResult {
     /// The payment receipt.

@@ -108,7 +108,7 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the realm (default: `"MPP Payment"`).
+    /// Override the realm (default: auto-detected from environment variables).
     pub fn realm(mut self, realm: &str) -> Self {
         self.realm = realm.to_string();
         self
@@ -182,7 +182,9 @@ pub struct ChargeOptions<'a> {
 /// # Defaults
 ///
 /// - **rpc_url**: `https://rpc.tempo.xyz`
-/// - **realm**: `"MPP Payment"`
+/// - **realm**: auto-detected from `MPP_REALM`, `FLY_APP_NAME`, `HEROKU_APP_NAME`,
+///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
+///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var, or generates a random UUID
 /// - **currency**: pathUSD (`0x20c0000000000000000000000000000000000000`)
 /// - **decimals**: `6` (for pathUSD / standard stablecoins)
@@ -216,7 +218,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         currency: crate::protocol::methods::tempo::DEFAULT_CURRENCY.to_string(),
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
-        realm: "MPP Payment".to_string(),
+        realm: mpp::detect_realm(),
         secret_key: None,
         decimals: 6,
         fee_payer: false,
