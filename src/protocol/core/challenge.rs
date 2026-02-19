@@ -1424,4 +1424,96 @@ mod tests {
             PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("garbage");
         assert!(challenge.expires_at().is_none());
     }
+
+    #[test]
+    fn test_is_expired_positive_timezone_offset_future() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00+05:00");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_some());
+    }
+
+    #[test]
+    fn test_is_expired_negative_timezone_offset_past() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2020-01-01T00:00:00-07:00");
+        assert!(challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_fractional_seconds_millis() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00.123Z");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_some());
+    }
+
+    #[test]
+    fn test_is_expired_fractional_seconds_micros() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-01T00:00:00.123456Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_empty_string() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_is_expired_whitespace_only() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("   ");
+        assert!(!challenge.is_expired());
+        assert!(challenge.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_is_expired_unix_epoch() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("1970-01-01T00:00:00Z");
+        assert!(challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_month() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-13-01T00:00:00Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_day() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("2099-01-32T00:00:00Z");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_plain_text() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_expires("just some text");
+        assert!(!challenge.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_numeric_string() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("12345");
+        assert!(!challenge.is_expired());
+    }
 }

@@ -86,4 +86,60 @@ mod tests {
         assert_eq!(format!("{}", TempoNetwork::Mainnet), "tempo");
         assert_eq!(format!("{}", TempoNetwork::Moderato), "tempo-moderato");
     }
+
+    #[test]
+    fn chain_id_values() {
+        assert_eq!(TempoNetwork::Mainnet.chain_id(), 4217);
+        assert_eq!(TempoNetwork::Moderato.chain_id(), 42431);
+    }
+
+    #[test]
+    fn constants_consistency() {
+        assert_eq!(TempoNetwork::Mainnet.chain_id(), super::super::CHAIN_ID);
+        assert_eq!(
+            TempoNetwork::Moderato.chain_id(),
+            super::super::MODERATO_CHAIN_ID
+        );
+        assert_eq!(
+            TempoNetwork::Mainnet.default_rpc_url(),
+            super::super::DEFAULT_RPC_URL
+        );
+        assert_eq!(
+            TempoNetwork::Mainnet.default_currency(),
+            super::super::DEFAULT_CURRENCY
+        );
+        assert_eq!(
+            TempoNetwork::Moderato.default_currency(),
+            super::super::DEFAULT_CURRENCY
+        );
+    }
+
+    #[test]
+    fn rpc_url_values() {
+        assert_eq!(
+            TempoNetwork::Mainnet.default_rpc_url(),
+            "https://rpc.tempo.xyz"
+        );
+        assert_eq!(
+            TempoNetwork::Moderato.default_rpc_url(),
+            "https://rpc.moderato.tempo.xyz"
+        );
+    }
+
+    #[test]
+    fn default_currency_identical_across_networks() {
+        assert_eq!(
+            TempoNetwork::Mainnet.default_currency(),
+            TempoNetwork::Moderato.default_currency()
+        );
+        assert_eq!(
+            TempoNetwork::Mainnet.default_currency(),
+            "0x20c0000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn from_chain_id_u64_max_returns_none() {
+        assert_eq!(TempoNetwork::from_chain_id(u64::MAX), None);
+    }
 }
