@@ -15,8 +15,12 @@ pub type Result<T> = std::result::Result<T, MppError>;
 /// Base URI for core payment-auth problem types.
 pub const CORE_PROBLEM_TYPE_BASE: &str = "https://tempoxyz.github.io/payment-auth-spec/problems";
 
-/// Base URI for stream/channel problem types.
-pub const STREAM_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/stream";
+/// Base URI for session/channel problem types.
+pub const SESSION_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/session";
+
+/// Deprecated: use [`SESSION_PROBLEM_TYPE_BASE`] instead. Remove in next major version.
+#[deprecated(since = "0.5.0", note = "renamed to SESSION_PROBLEM_TYPE_BASE")]
+pub const STREAM_PROBLEM_TYPE_BASE: &str = SESSION_PROBLEM_TYPE_BASE;
 
 /// RFC 9457 Problem Details structure for payment errors.
 ///
@@ -75,11 +79,17 @@ impl PaymentErrorDetails {
         Self::new(format!("{}/{}", CORE_PROBLEM_TYPE_BASE, suffix))
     }
 
-    /// Create a PaymentErrorDetails for a stream/channel problem.
+    /// Create a PaymentErrorDetails for a session/channel problem.
     ///
-    /// The full type URI will be `{STREAM_PROBLEM_TYPE_BASE}/{suffix}`.
+    /// The full type URI will be `{SESSION_PROBLEM_TYPE_BASE}/{suffix}`.
+    pub fn session(suffix: impl std::fmt::Display) -> Self {
+        Self::new(format!("{}/{}", SESSION_PROBLEM_TYPE_BASE, suffix))
+    }
+
+    /// Deprecated: use [`PaymentErrorDetails::session`] instead. Remove in next major version.
+    #[deprecated(since = "0.5.0", note = "renamed to session()")]
     pub fn stream(suffix: impl std::fmt::Display) -> Self {
-        Self::new(format!("{}/{}", STREAM_PROBLEM_TYPE_BASE, suffix))
+        Self::session(suffix)
     }
 
     /// Set the title.
@@ -518,13 +528,13 @@ impl MppError {
             Self::PaymentRequired { .. } => Some("payment-required"),
             Self::InvalidPayload(_) => Some("invalid-payload"),
             Self::BadRequest(_) => Some("bad-request"),
-            Self::InsufficientBalance(_) => Some("stream/insufficient-balance"),
-            Self::InvalidSignature(_) => Some("stream/invalid-signature"),
-            Self::SignerMismatch(_) => Some("stream/signer-mismatch"),
-            Self::AmountExceedsDeposit(_) => Some("stream/amount-exceeds-deposit"),
-            Self::DeltaTooSmall(_) => Some("stream/delta-too-small"),
-            Self::ChannelNotFound(_) => Some("stream/channel-not-found"),
-            Self::ChannelClosed(_) => Some("stream/channel-finalized"),
+            Self::InsufficientBalance(_) => Some("session/insufficient-balance"),
+            Self::InvalidSignature(_) => Some("session/invalid-signature"),
+            Self::SignerMismatch(_) => Some("session/signer-mismatch"),
+            Self::AmountExceedsDeposit(_) => Some("session/amount-exceeds-deposit"),
+            Self::DeltaTooSmall(_) => Some("session/delta-too-small"),
+            Self::ChannelNotFound(_) => Some("session/channel-not-found"),
+            Self::ChannelClosed(_) => Some("session/channel-finalized"),
             _ => None,
         }
     }
@@ -560,26 +570,26 @@ impl PaymentError for MppError {
             Self::BadRequest(_) => PaymentErrorDetails::core("bad-request")
                 .with_title("BadRequestError")
                 .with_status(400),
-            // Stream/channel errors
-            Self::InsufficientBalance(_) => PaymentErrorDetails::stream("insufficient-balance")
+            // Session/channel errors
+            Self::InsufficientBalance(_) => PaymentErrorDetails::session("insufficient-balance")
                 .with_title("InsufficientBalanceError")
                 .with_status(402),
-            Self::InvalidSignature(_) => PaymentErrorDetails::stream("invalid-signature")
+            Self::InvalidSignature(_) => PaymentErrorDetails::session("invalid-signature")
                 .with_title("InvalidSignatureError")
                 .with_status(402),
-            Self::SignerMismatch(_) => PaymentErrorDetails::stream("signer-mismatch")
+            Self::SignerMismatch(_) => PaymentErrorDetails::session("signer-mismatch")
                 .with_title("SignerMismatchError")
                 .with_status(402),
-            Self::AmountExceedsDeposit(_) => PaymentErrorDetails::stream("amount-exceeds-deposit")
+            Self::AmountExceedsDeposit(_) => PaymentErrorDetails::session("amount-exceeds-deposit")
                 .with_title("AmountExceedsDepositError")
                 .with_status(402),
-            Self::DeltaTooSmall(_) => PaymentErrorDetails::stream("delta-too-small")
+            Self::DeltaTooSmall(_) => PaymentErrorDetails::session("delta-too-small")
                 .with_title("DeltaTooSmallError")
                 .with_status(402),
-            Self::ChannelNotFound(_) => PaymentErrorDetails::stream("channel-not-found")
+            Self::ChannelNotFound(_) => PaymentErrorDetails::session("channel-not-found")
                 .with_title("ChannelNotFoundError")
                 .with_status(410),
-            Self::ChannelClosed(_) => PaymentErrorDetails::stream("channel-finalized")
+            Self::ChannelClosed(_) => PaymentErrorDetails::session("channel-finalized")
                 .with_title("ChannelClosedError")
                 .with_status(410),
             // Non-payment-problem errors get a generic problem type
@@ -694,15 +704,15 @@ mod tests {
     }
 
     #[test]
-    fn test_problem_details_stream() {
-        let problem = PaymentErrorDetails::stream("insufficient-balance")
+    fn test_problem_details_session() {
+        let problem = PaymentErrorDetails::session("insufficient-balance")
             .with_title("InsufficientBalanceError")
             .with_status(402)
             .with_detail("Insufficient balance.");
 
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/insufficient-balance"
+            "https://paymentauth.org/problems/session/insufficient-balance"
         );
         assert_eq!(problem.title, "InsufficientBalanceError");
         assert_eq!(problem.status, 402);
@@ -868,7 +878,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/insufficient-balance"
+            "https://paymentauth.org/problems/session/insufficient-balance"
         );
         assert_eq!(problem.title, "InsufficientBalanceError");
         assert_eq!(problem.status, 402);
@@ -884,7 +894,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/invalid-signature"
+            "https://paymentauth.org/problems/session/invalid-signature"
         );
         assert_eq!(problem.title, "InvalidSignatureError");
         assert_eq!(problem.status, 402);
@@ -903,7 +913,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/signer-mismatch"
+            "https://paymentauth.org/problems/session/signer-mismatch"
         );
         assert_eq!(problem.title, "SignerMismatchError");
         assert_eq!(problem.status, 402);
@@ -925,7 +935,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/amount-exceeds-deposit"
+            "https://paymentauth.org/problems/session/amount-exceeds-deposit"
         );
         assert_eq!(problem.title, "AmountExceedsDepositError");
         assert_eq!(problem.status, 402);
@@ -941,7 +951,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/delta-too-small"
+            "https://paymentauth.org/problems/session/delta-too-small"
         );
         assert_eq!(problem.title, "DeltaTooSmallError");
         assert_eq!(problem.status, 402);
@@ -960,7 +970,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/channel-not-found"
+            "https://paymentauth.org/problems/session/channel-not-found"
         );
         assert_eq!(problem.title, "ChannelNotFoundError");
         assert_eq!(problem.status, 410);
@@ -979,7 +989,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://paymentauth.org/problems/stream/channel-finalized"
+            "https://paymentauth.org/problems/session/channel-finalized"
         );
         assert_eq!(problem.title, "ChannelClosedError");
         assert_eq!(problem.status, 410);

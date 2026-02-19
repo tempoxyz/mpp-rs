@@ -3,7 +3,7 @@
 //! This module provides typed request structures for payment intents:
 //!
 //! - [`ChargeRequest`]: One-time payment (charge intent)
-//! - [`SessionRequest`]: Pay-as-you-go streaming payment (session intent)
+//! - [`SessionRequest`]: Pay-as-you-go session payment (session intent)
 //!
 //! **Zero heavy dependencies** - only serde and serde_json. No alloy, no blockchain types.
 //!

@@ -1,21 +1,21 @@
-//! Stream receipt type for Tempo streaming payments.
+//! Session receipt type for Tempo session payments.
 
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::core::{MethodName, Receipt, ReceiptStatus};
 
-/// Stream receipt for Tempo session/streaming payments.
+/// Session receipt for Tempo session/pay-as-you-go payments.
 ///
-/// Extends the base [`Receipt`] with stream-specific fields like channel ID,
+/// Extends the base [`Receipt`] with session-specific fields like channel ID,
 /// cumulative amounts, and units consumed. The `reference` field mirrors
 /// `channel_id` for compatibility with the base receipt contract.
 ///
 /// # Examples
 ///
 /// ```
-/// use mpp::protocol::methods::tempo::StreamReceipt;
+/// use mpp::protocol::methods::tempo::SessionReceipt;
 ///
-/// let receipt = StreamReceipt::new(
+/// let receipt = SessionReceipt::new(
 ///     "2026-01-01T00:00:00Z",
 ///     "challenge-123",
 ///     "0xabc",
@@ -28,7 +28,7 @@ use crate::protocol::core::{MethodName, Receipt, ReceiptStatus};
 /// assert_eq!(receipt.reference, "0xabc");
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StreamReceipt {
+pub struct SessionReceipt {
     /// Payment method (always "tempo").
     pub method: String,
 
@@ -68,8 +68,8 @@ pub struct StreamReceipt {
     pub tx_hash: Option<String>,
 }
 
-impl StreamReceipt {
-    /// Create a new stream receipt with default method/intent/status.
+impl SessionReceipt {
+    /// Create a new session receipt with default method/intent/status.
     ///
     /// Sets `reference` to `channel_id` for base receipt compatibility.
     #[must_use]
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_new_sets_defaults() {
-        let receipt = StreamReceipt::new(
+        let receipt = SessionReceipt::new(
             "2026-01-01T00:00:00Z",
             "challenge-123",
             "0xabc",
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let mut receipt = StreamReceipt::new(
+        let mut receipt = SessionReceipt::new(
             "2026-01-01T00:00:00Z",
             "challenge-123",
             "0xabc",
@@ -148,7 +148,7 @@ mod tests {
         receipt.tx_hash = Some("0xdef".to_string());
 
         let json = serde_json::to_string(&receipt).unwrap();
-        let parsed: StreamReceipt = serde_json::from_str(&json).unwrap();
+        let parsed: SessionReceipt = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.method, receipt.method);
         assert_eq!(parsed.intent, receipt.intent);
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_serialization_camel_case_keys() {
-        let receipt = StreamReceipt::new(
+        let receipt = SessionReceipt::new(
             "2026-01-01T00:00:00Z",
             "challenge-123",
             "0xabc",
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_serialization_optional_fields_present() {
-        let mut receipt = StreamReceipt::new(
+        let mut receipt = SessionReceipt::new(
             "2026-01-01T00:00:00Z",
             "challenge-123",
             "0xabc",
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_to_base_receipt() {
-        let receipt = StreamReceipt::new(
+        let receipt = SessionReceipt::new(
             "2026-01-01T00:00:00Z",
             "challenge-123",
             "0xabc",

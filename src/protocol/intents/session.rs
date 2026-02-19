@@ -1,6 +1,6 @@
 //! Session intent request type.
 //!
-//! The session intent represents a pay-as-you-go streaming payment request.
+//! The session intent represents a pay-as-you-go session payment request.
 //! This module provides the `SessionRequest` type with string-only fields -
 //! no typed helpers like `amount_u256()`. Those are provided by the methods layer.
 
@@ -10,7 +10,7 @@ use crate::error::{MppError, Result};
 
 /// Session request (for session intent).
 ///
-/// Represents a pay-as-you-go streaming payment request. All fields are strings
+/// Represents a pay-as-you-go session payment request. All fields are strings
 /// to remain method-agnostic. Use the methods layer for typed accessors.
 ///
 /// # Examples
@@ -36,7 +36,7 @@ pub struct SessionRequest {
     /// Amount per unit in base units (e.g., wei per second)
     pub amount: String,
 
-    /// Unit type for the streaming rate (e.g., "second", "minute", "request"). Optional.
+    /// Unit type for the session rate (e.g., "second", "minute", "request"). Optional.
     #[serde(rename = "unitType", skip_serializing_if = "Option::is_none")]
     pub unit_type: Option<String>,
 

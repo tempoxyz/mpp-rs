@@ -11,7 +11,7 @@ use std::future::Future;
 
 /// Trait for payment methods that implement the "session" intent.
 ///
-/// SessionMethod verifies session (streaming/pay-as-you-go) payment credentials
+/// SessionMethod verifies session (pay-as-you-go) payment credentials
 /// on the server side. All implementations use the same [`SessionRequest`] schema,
 /// enforcing consistent field names per the IETF spec.
 ///

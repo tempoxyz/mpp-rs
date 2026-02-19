@@ -1,11 +1,11 @@
-//! SSE (Server-Sent Events) utilities for metered streaming payments.
+//! SSE (Server-Sent Events) utilities for metered session payments.
 //!
 //! Provides event formatting/parsing and helpers for building HTTP responses
 //! from SSE streams.
 //!
 //! # Event types
 //!
-//! Three SSE event types are used by mpp streaming:
+//! Three SSE event types are used by mpp sessions:
 //! - `message` — application data
 //! - `payment-need-voucher` — balance exhausted, client should send voucher
 //! - `payment-receipt` — final receipt
@@ -13,13 +13,13 @@
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "tempo")]
-use crate::protocol::methods::tempo::stream_receipt::StreamReceipt;
+use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/// SSE event emitted when session balance is exhausted mid-stream.
+/// SSE event emitted when session balance is exhausted mid-session.
 ///
 /// The client responds by sending a new voucher credential.
 ///
@@ -61,24 +61,24 @@ pub enum SseEvent {
     Message(String),
     /// Balance exhausted — client should send a new voucher.
     PaymentNeedVoucher(NeedVoucherEvent),
-    /// Final receipt for the stream session.
+    /// Final receipt for the session.
     #[cfg(feature = "tempo")]
-    PaymentReceipt(StreamReceipt),
+    PaymentReceipt(SessionReceipt),
 }
 
 // ---------------------------------------------------------------------------
 // Event formatting
 // ---------------------------------------------------------------------------
 
-/// Format a stream receipt as a Server-Sent Event.
+/// Format a session receipt as a Server-Sent Event.
 ///
 /// # Example
 ///
 /// ```
 /// use mpp::server::sse::format_receipt_event;
-/// use mpp::protocol::methods::tempo::stream_receipt::StreamReceipt;
+/// use mpp::protocol::methods::tempo::session_receipt::SessionReceipt;
 ///
-/// let receipt = StreamReceipt::new(
+/// let receipt = SessionReceipt::new(
 ///     "2025-01-01T00:00:00Z",
 ///     "ch-1",
 ///     "0xabc",
@@ -90,16 +90,16 @@ pub enum SseEvent {
 /// assert!(event.ends_with("\n\n"));
 /// ```
 #[cfg(feature = "tempo")]
-pub fn format_receipt_event(receipt: &StreamReceipt) -> String {
+pub fn format_receipt_event(receipt: &SessionReceipt) -> String {
     format!(
         "event: payment-receipt\ndata: {}\n\n",
-        serde_json::to_string(receipt).expect("StreamReceipt serialization cannot fail")
+        serde_json::to_string(receipt).expect("SessionReceipt serialization cannot fail")
     )
 }
 
 /// Format a need-voucher event as a Server-Sent Event.
 ///
-/// Emitted when the channel balance is exhausted mid-stream.
+/// Emitted when the channel balance is exhausted mid-session.
 ///
 /// # Example
 ///
@@ -140,7 +140,7 @@ pub fn format_message_event(data: &str) -> String {
 
 /// Parse a raw SSE event string into a typed event.
 ///
-/// Handles the three event types used by mpp streaming:
+/// Handles the three event types used by mpp sessions:
 /// - `message` (default / no event field) — application data
 /// - `payment-need-voucher` — balance exhausted
 /// - `payment-receipt` — final receipt (requires `tempo` feature;
@@ -184,7 +184,7 @@ pub fn parse_event(raw: &str) -> Option<SseEvent> {
             .ok()
             .map(SseEvent::PaymentNeedVoucher),
         #[cfg(feature = "tempo")]
-        "payment-receipt" => serde_json::from_str::<StreamReceipt>(&data)
+        "payment-receipt" => serde_json::from_str::<SessionReceipt>(&data)
             .ok()
             .map(SseEvent::PaymentReceipt),
         _ => Some(SseEvent::Message(data)),
@@ -292,7 +292,7 @@ where
 
         // Emit final receipt
         if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-            let mut receipt = StreamReceipt::new(
+            let mut receipt = SessionReceipt::new(
                 now_iso8601(),
                 &challenge_id,
                 &channel_id,
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn test_format_receipt_event() {
         let mut receipt =
-            StreamReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
+            SessionReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         let event = format_receipt_event(&receipt);
         assert!(event.starts_with("event: payment-receipt\ndata: "));
@@ -489,13 +489,13 @@ mod tests {
         assert!(!is_event_stream(""));
     }
 
-    // -- StreamReceipt tests --
+    // -- SessionReceipt tests --
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_stream_receipt_new() {
+    fn test_session_receipt_new() {
         let mut receipt =
-            StreamReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
+            SessionReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         receipt.tx_hash = Some("0xtx".into());
         assert_eq!(receipt.method, "tempo");
@@ -511,16 +511,16 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_stream_receipt_serialization() {
+    fn test_session_receipt_serialization() {
         let mut receipt =
-            StreamReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
+            SessionReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         let json = serde_json::to_string(&receipt).unwrap();
         assert!(json.contains("\"challengeId\":\"ch-1\""));
         assert!(json.contains("\"acceptedCumulative\":\"1000000\""));
         assert!(!json.contains("\"txHash\""));
 
-        let roundtrip: StreamReceipt = serde_json::from_str(&json).unwrap();
+        let roundtrip: SessionReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.challenge_id, "ch-1");
         assert_eq!(roundtrip.units, Some(5));
         assert_eq!(roundtrip.tx_hash, None);

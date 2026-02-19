@@ -1,4 +1,4 @@
-//! Shared client-side channel operations for Tempo streaming payments.
+//! Shared client-side channel operations for Tempo session payments.
 //!
 //! Provides low-level helpers for escrow resolution, channel ID computation,
 //! voucher/close/open payload construction, channel recovery from on-chain state,

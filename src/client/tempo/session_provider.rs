@@ -183,7 +183,7 @@ impl TempoSessionProvider {
 
     /// Send a voucher for a need-voucher SSE event.
     ///
-    /// Called during SSE streaming when the server emits a `payment-need-voucher`
+    /// Called during SSE session metering when the server emits a `payment-need-voucher`
     /// event. Updates the internal cumulative amount and POSTs a signed voucher
     /// credential to the server.
     ///

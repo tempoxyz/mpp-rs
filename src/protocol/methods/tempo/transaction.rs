@@ -38,7 +38,7 @@
 /// This is the main builder type for Tempo transactions, wrapping alloy's
 /// `TransactionRequest` with Tempo-specific fields:
 /// - `fee_token`: Optional TIP-20 token for gas payment
-/// - `nonce_key`: 2D nonce key for parallel transaction streams
+/// - `nonce_key`: 2D nonce key for parallel transaction sessions
 /// - `calls`: Optional multi-call support
 /// - `tempo_authorization_list`: Tempo-specific authorization list
 pub use tempo_alloy::rpc::TempoTransactionRequest;
