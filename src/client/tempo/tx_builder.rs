@@ -540,9 +540,12 @@ mod tests {
             chain_id: 42431,
             fee_token: Address::ZERO,
             nonce: 0,
+            nonce_key: U256::ZERO,
             gas_limit: 100_000,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
             key_authorization: Some(signed_auth),
         });
 
@@ -556,9 +559,12 @@ mod tests {
             chain_id: 42431,
             fee_token: Address::ZERO,
             nonce: 0,
+            nonce_key: U256::ZERO,
             gas_limit: 100_000,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
             key_authorization: None,
         });
 
@@ -573,9 +579,12 @@ mod tests {
             chain_id: 0,
             fee_token: Address::ZERO,
             nonce: 0,
+            nonce_key: U256::ZERO,
             gas_limit: 0,
             max_fee_per_gas: 0,
             max_priority_fee_per_gas: 0,
+            fee_payer: false,
+            valid_before: None,
             key_authorization: None,
         });
 
@@ -791,9 +800,12 @@ mod tests {
             chain_id: 4217,
             fee_token: Address::repeat_byte(0x33),
             nonce: 0,
+            nonce_key: U256::ZERO,
             gas_limit: 2_000_000,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
             key_authorization: None,
         });
 
