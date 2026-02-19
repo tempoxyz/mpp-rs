@@ -1,16 +1,9 @@
 //! TIP-20 token balance queries for Tempo networks.
 
 use alloy::primitives::{Address, U256};
-use alloy::sol;
 
 use crate::error::MppError;
-
-sol! {
-    #[sol(rpc)]
-    interface ITIP20 {
-        function balanceOf(address account) external view returns (uint256);
-    }
-}
+use crate::protocol::methods::tempo::abi::ITIP20;
 
 /// Query the TIP-20 balance of a token for an account.
 ///

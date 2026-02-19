@@ -10,8 +10,16 @@ use alloy::sol_types::SolCall;
 sol! {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferWithMemo(address to, uint256 amount, bytes32 memo) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
     function swapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut, uint128 maxAmountIn) external returns (uint128 amountIn);
+}
+
+sol! {
+    /// TIP-20 token interface for balance queries and approvals.
+    #[sol(rpc)]
+    interface ITIP20 {
+        function balanceOf(address account) external view returns (uint256);
+        function approve(address spender, uint256 amount) external returns (bool);
+    }
 }
 
 /// StablecoinDEX contract address on Tempo networks.
@@ -40,7 +48,7 @@ pub fn encode_transfer(recipient: Address, amount: U256, memo: Option<[u8; 32]>)
 
 /// Encode a TIP-20 approve call.
 pub fn encode_approve(spender: Address, amount: U256) -> Bytes {
-    let call = approveCall { spender, amount };
+    let call = ITIP20::approveCall { spender, amount };
     Bytes::from(call.abi_encode())
 }
 

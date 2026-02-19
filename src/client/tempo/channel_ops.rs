@@ -204,11 +204,7 @@ where
     );
 
     // Build approve calldata
-    sol! {
-        interface ITIP20 {
-            function approve(address spender, uint256 amount) external returns (bool);
-        }
-    }
+    use crate::protocol::methods::tempo::abi::ITIP20;
 
     sol! {
         interface IEscrow {
