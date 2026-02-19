@@ -1,13 +1,5 @@
 # Changelog
 
-## `mpp@0.4.1`
-
-### Patch Changes
-
-- Consolidated Tempo client transaction logic into `src/client/tempo/` with dedicated signing, transaction building, and channel operations modules. Extracted `TempoSigningMode` (Direct/Keychain) and `sign_and_encode`/`sign_and_encode_async` helpers to deduplicate signing across providers. Added `TempoTxOptions`, `build_tempo_tx`, and AA-aware gas estimation utilities.
-- Fixed potential `u64` overflow in `parse_gas_estimate` by using `checked_add` for the gas buffer.
-- Added 46 new unit tests (432 → 478) covering signature variant correctness, encoding boundary conditions, escrow resolution priority, deposit edge cases, re-export verification, and gas estimate overflow protection.
-
 ## `mpp@0.4.0`
 
 ### Minor Changes
