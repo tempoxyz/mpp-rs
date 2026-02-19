@@ -45,6 +45,40 @@ jobs:
       - run: cargo test --features tempo,server,client,axum,middleware,tower,utils
       - run: cargo hack check --each-feature --no-dev-deps --skip integration
 
+  feature-matrix:
+    name: "Features: ${{ matrix.name }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "core only"
+            features: "--no-default-features"
+          - name: "client"
+            features: "--features client"
+          - name: "server"
+            features: "--features server"
+          - name: "evm"
+            features: "--features evm"
+          - name: "tempo"
+            features: "--features tempo"
+          - name: "server,tempo"
+            features: "--features server,tempo"
+          - name: "client,server,tempo"
+            features: "--features client,server,tempo"
+          - name: "client,server,tempo,middleware"
+            features: "--features client,server,tempo,middleware"
+          - name: "all (no integration)"
+            features: "--features client,server,tempo,axum,tower,middleware,utils"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo check ${{ matrix.features }}
+      - run: cargo test ${{ matrix.features }}
+
   integration-test:
     name: Integration Test
     runs-on: ubuntu-latest

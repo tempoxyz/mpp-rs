@@ -502,4 +502,195 @@ mod tests {
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
     }
+
+    // ==================== Real ChargeVerifier tests ====================
+    //
+    // These tests exercise PaymentLayer with real challenge formatting,
+    // HMAC-bound IDs, and the full parse_authorization → verify_credential
+    // round-trip, using a mock ChargeMethod to avoid RPC calls.
+
+    #[cfg(feature = "tempo")]
+    mod real_charge_verifier {
+        use super::*;
+        use crate::protocol::core::challenge::{PaymentCredential, PaymentPayload, Receipt};
+        use crate::protocol::core::headers::{
+            format_authorization, parse_receipt, parse_www_authenticate,
+        };
+        use crate::protocol::intents::ChargeRequest;
+        use crate::protocol::traits::{ChargeMethod, VerificationError};
+        use crate::server::Mpp;
+        use tower_layer::Layer;
+        use tower_service::Service;
+
+        #[derive(Clone)]
+        struct SuccessChargeMethod;
+
+        impl ChargeMethod for SuccessChargeMethod {
+            fn method(&self) -> &str {
+                "tempo"
+            }
+
+            fn verify(
+                &self,
+                _credential: &PaymentCredential,
+                _request: &ChargeRequest,
+            ) -> impl std::future::Future<
+                Output = std::result::Result<Receipt, VerificationError>,
+            > + Send {
+                async { Ok(Receipt::success("tempo", "0xabc123")) }
+            }
+        }
+
+        fn create_mpp_with_mock() -> Mpp<SuccessChargeMethod> {
+            Mpp::new_with_config(
+                SuccessChargeMethod,
+                "test-realm",
+                "test-secret",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+        }
+
+        #[derive(Clone)]
+        struct OkService;
+
+        impl tower_service::Service<Request<()>> for OkService {
+            type Response = Response<()>;
+            type Error = std::convert::Infallible;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Response<()>, Self::Error>> + Send>>;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<()>) -> Self::Future {
+                Box::pin(async { Ok(Response::new(())) })
+            }
+        }
+
+        #[tokio::test]
+        async fn test_no_auth_returns_402_with_parseable_challenge() {
+            let mpp = create_mpp_with_mock();
+            let layer = PaymentLayer::charge(&mpp, "0.10").unwrap();
+            let mut svc = layer.layer(OkService);
+
+            let req = Request::builder().uri("/premium").body(()).unwrap();
+            let resp = svc.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+            let www_auth = resp
+                .headers()
+                .get(WWW_AUTHENTICATE_HEADER)
+                .expect("missing WWW-Authenticate header")
+                .to_str()
+                .unwrap();
+
+            let challenge = parse_www_authenticate(www_auth)
+                .expect("WWW-Authenticate header should be parseable");
+
+            assert_eq!(challenge.method.as_str(), "tempo");
+            assert_eq!(challenge.intent.as_str(), "charge");
+            assert_eq!(challenge.realm, "test-realm");
+            assert!(!challenge.id.is_empty());
+
+            let request: ChargeRequest = challenge.request.decode().unwrap();
+            assert_eq!(request.amount, "100000");
+            assert_eq!(
+                request.currency,
+                "0x20c0000000000000000000000000000000000000"
+            );
+            assert_eq!(
+                request.recipient,
+                Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_valid_credential_roundtrip_returns_200_with_receipt() {
+            let mpp = create_mpp_with_mock();
+            let layer = PaymentLayer::charge(&mpp, "0.10").unwrap();
+
+            // First call: get the challenge from 402.
+            let mut svc = layer.layer(OkService);
+            let req = Request::builder().uri("/premium").body(()).unwrap();
+            let resp = svc.call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+            let www_auth = resp
+                .headers()
+                .get(WWW_AUTHENTICATE_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let challenge = parse_www_authenticate(www_auth).unwrap();
+
+            // Build a credential from the challenge.
+            let credential = PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::hash("0xdeadbeef"),
+            );
+            let auth_header = format_authorization(&credential).unwrap();
+
+            // Second call: send credential, expect 200 + receipt.
+            let mut svc = layer.layer(OkService);
+            let req = Request::builder()
+                .uri("/premium")
+                .header(header::AUTHORIZATION, &auth_header)
+                .body(())
+                .unwrap();
+            let resp = svc.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let receipt_header = resp
+                .headers()
+                .get(PAYMENT_RECEIPT_HEADER)
+                .expect("missing Payment-Receipt header")
+                .to_str()
+                .unwrap();
+            let receipt = parse_receipt(receipt_header)
+                .expect("Payment-Receipt header should be parseable");
+            assert!(receipt.is_success());
+            assert_eq!(receipt.method.as_str(), "tempo");
+            assert_eq!(receipt.reference, "0xabc123");
+        }
+
+        #[tokio::test]
+        async fn test_wrong_scheme_returns_402() {
+            let mpp = create_mpp_with_mock();
+            let layer = PaymentLayer::charge(&mpp, "0.10").unwrap();
+            let mut svc = layer.layer(OkService);
+
+            let req = Request::builder()
+                .uri("/premium")
+                .header(header::AUTHORIZATION, "Bearer some-token")
+                .body(())
+                .unwrap();
+            let resp = svc.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        }
+
+        #[tokio::test]
+        async fn test_garbage_authorization_returns_402() {
+            let mpp = create_mpp_with_mock();
+            let layer = PaymentLayer::charge(&mpp, "0.10").unwrap();
+            let mut svc = layer.layer(OkService);
+
+            let req = Request::builder()
+                .uri("/premium")
+                .header(header::AUTHORIZATION, "Payment not-valid-base64!!!")
+                .body(())
+                .unwrap();
+            let resp = svc.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        }
+    }
 }

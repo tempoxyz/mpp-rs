@@ -130,6 +130,33 @@ where
     }
 }
 
+impl<M> Mpp<M, ()>
+where
+    M: ChargeMethod,
+{
+    /// Create a payment handler with bound currency/recipient for testing.
+    #[cfg(test)]
+    pub(crate) fn new_with_config(
+        method: M,
+        realm: impl Into<String>,
+        secret_key: impl Into<String>,
+        currency: impl Into<String>,
+        recipient: impl Into<String>,
+    ) -> Self {
+        Mpp {
+            method,
+            session_method: None,
+            realm: realm.into(),
+            secret_key: secret_key.into(),
+            currency: Some(currency.into()),
+            recipient: Some(recipient.into()),
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            chain_id: None,
+        }
+    }
+}
+
 impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
@@ -864,5 +891,170 @@ mod tests {
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "5500000");
         assert_eq!(challenge.description, Some("API access fee".to_string()));
+    }
+
+    // ── Real HMAC challenge verification tests ─────────────────────────
+
+    /// A mock ChargeMethod that always returns a success receipt, using
+    /// the "tempo" method name so it matches challenges from create_test_mpp().
+    #[derive(Clone)]
+    struct TempoSuccessMethod;
+
+    #[allow(clippy::manual_async_fn)]
+    impl ChargeMethod for TempoSuccessMethod {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            async { Ok(Receipt::success("tempo", "0xtxhash")) }
+        }
+    }
+
+    /// Helper: build an Mpp with TempoSuccessMethod whose realm, secret_key,
+    /// currency, recipient, and decimals match create_test_mpp().
+    #[cfg(feature = "tempo")]
+    fn create_hmac_test_mpp() -> Mpp<TempoSuccessMethod> {
+        Mpp {
+            method: TempoSuccessMethod,
+            session_method: None,
+            realm: "MPP Payment".into(),
+            secret_key: "test-secret".into(),
+            currency: Some("0x20c0000000000000000000000000000000000000".into()),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            chain_id: None,
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_hmac_verify_happy_path() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let receipt = mpp.verify_credential(&credential).await.unwrap();
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "0xtxhash");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_hmac_tampered_request_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let mut echo = challenge.to_echo();
+        // Tamper: replace the request with a different amount
+        let tampered_request = ChargeRequest {
+            amount: "999999".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+        let encoded =
+            crate::protocol::core::Base64UrlJson::from_typed(&tampered_request).unwrap();
+        echo.request = encoded.raw().to_string();
+
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().message.contains("mismatch"),
+            "expected HMAC mismatch error"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_hmac_tampered_realm_ignored() {
+        // The server recomputes the HMAC using its own realm (self.realm),
+        // not the echoed realm from the credential. So tampering the echoed
+        // realm has no effect on HMAC verification — the server is the
+        // authority on its own realm. This is correct security behavior.
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.realm = "evil.example.com".into();
+
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        // Verification succeeds because the server uses its own realm for
+        // HMAC recomputation, not the echoed one.
+        assert!(result.is_ok(), "echoed realm is ignored by server HMAC check");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_hmac_tampered_method_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.method = "evil-method".into();
+
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().message.contains("mismatch"),
+            "expected HMAC mismatch error"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_hmac_tampered_intent_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.intent = "session".into();
+
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().message.contains("mismatch"),
+            "expected HMAC mismatch error"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_hmac_charge_with_options_roundtrip() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp
+            .charge_with_options(
+                "2.50",
+                ChargeOptions {
+                    description: Some("Premium access"),
+                    fee_payer: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Verify challenge fields
+        assert_eq!(challenge.description, Some("Premium access".to_string()));
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        assert_eq!(request.amount, "2500000");
+        let details = request.method_details.unwrap();
+        assert_eq!(details["feePayer"], serde_json::json!(true));
+
+        // Roundtrip: credential built from this challenge verifies
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let receipt = mpp.verify_credential(&credential).await.unwrap();
+        assert!(receipt.is_success());
     }
 }
