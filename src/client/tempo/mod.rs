@@ -17,7 +17,7 @@ pub mod swap;
 pub mod tx_builder;
 
 pub use balance::{effective_capacity, query_token_balance};
-pub use gas::{resolve_gas, ResolvedGas};
+pub use gas::{resolve_gas, resolve_gas_with_stuck_detection, ResolvedGas};
 pub use routing::{find_swap_source, SwapCandidate, SwapSource};
 pub use channel_ops::ChannelEntry;
 pub use charge::{SignOptions, SignedTempoCharge, TempoCharge};

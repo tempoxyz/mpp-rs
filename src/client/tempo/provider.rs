@@ -3,14 +3,10 @@
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
+use super::charge::SignOptions;
+use super::routing::SwapCandidate;
 use super::signing::TempoSigningMode;
 use crate::client::PaymentProvider;
-
-/// Nonce key for expiring nonce transactions (fee payer mode).
-const EXPIRING_NONCE_KEY: alloy::primitives::U256 = alloy::primitives::U256::MAX;
-
-/// Validity window (in seconds) for fee payer transactions.
-const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 
 /// Tempo payment provider using EVM signing.
 ///
@@ -38,12 +34,17 @@ const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
+/// TIP-20 tokens use 6 decimal places.
+const TIP20_DECIMALS: u8 = 6;
+
 #[derive(Clone)]
 pub struct TempoProvider {
     signer: alloy_signer_local::PrivateKeySigner,
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
+    sign_options_overrides: Option<SignOptions>,
+    replace_stuck_txs: bool,
 }
 
 impl TempoProvider {
@@ -65,6 +66,8 @@ impl TempoProvider {
             rpc_url: url,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
+            sign_options_overrides: None,
+            replace_stuck_txs: false,
         })
     }
 
@@ -82,6 +85,27 @@ impl TempoProvider {
         self
     }
 
+    /// Override sign options (nonce, gas fees, etc.).
+    ///
+    /// Power users (like presto) use this to inject pre-resolved nonce
+    /// and gas values (e.g., from stuck transaction detection).
+    pub fn with_sign_options(mut self, options: SignOptions) -> Self {
+        self.sign_options_overrides = Some(options);
+        self
+    }
+
+    /// Enable stuck-transaction detection and replacement.
+    ///
+    /// When enabled, compares confirmed vs pending nonce at payment time.
+    /// If a stuck transaction is detected, aggressively bumps gas to
+    /// replace it. See [`super::gas::resolve_gas_with_stuck_detection`].
+    ///
+    /// Default: `false`.
+    pub fn with_replace_stuck_transactions(mut self, enabled: bool) -> Self {
+        self.replace_stuck_txs = enabled;
+        self
+    }
+
     /// Get the signing mode.
     pub fn signing_mode(&self) -> &TempoSigningMode {
         &self.signing_mode
@@ -96,6 +120,34 @@ impl TempoProvider {
     pub fn rpc_url(&self) -> &reqwest::Url {
         &self.rpc_url
     }
+
+    /// Build swap candidates from known tokens for a chain ID.
+    fn swap_candidates_for(chain_id: u64) -> Vec<SwapCandidate> {
+        use crate::protocol::methods::tempo::network::TempoNetwork;
+
+        let Some(network) = TempoNetwork::from_chain_id(chain_id) else {
+            return Vec::new();
+        };
+        network
+            .known_tokens()
+            .iter()
+            .filter_map(|(addr, symbol)| {
+                Some(SwapCandidate {
+                    address: addr.parse().ok()?,
+                    symbol: symbol.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// Look up a token symbol from candidates, falling back to hex address.
+    fn token_symbol_for(candidates: &[SwapCandidate], address: alloy::primitives::Address) -> String {
+        candidates
+            .iter()
+            .find(|c| c.address == address)
+            .map(|c| c.symbol.clone())
+            .unwrap_or_else(|| format!("{:#x}", address))
+    }
 }
 
 impl PaymentProvider for TempoProvider {
@@ -104,106 +156,156 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        use crate::protocol::intents::ChargeRequest;
-        use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
-        use alloy::primitives::{Bytes, TxKind, B256, U256};
-        use alloy::providers::{Provider, ProviderBuilder};
-        use alloy::sol_types::SolCall;
-        use tempo_alloy::contracts::precompiles::tip20::ITIP20;
-        use tempo_alloy::TempoNetwork;
-        use tempo_primitives::transaction::Call;
-
-        use super::signing;
-        use super::tx_builder;
-
-        let charge: ChargeRequest = challenge.request.decode()?;
-        let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
+        let charge = super::charge::TempoCharge::from_challenge(challenge)?;
         let from = self.signing_mode.from_address(self.signer.address());
-        let fee_payer = charge.fee_payer();
+        let swap_candidates = Self::swap_candidates_for(charge.chain_id());
 
-        let provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
-
-        let actual_chain_id: u64 = provider
-            .get_chain_id()
-            .await
-            .map_err(|e| MppError::Http(format!("failed to get chain ID: {}", e)))?;
-
-        if actual_chain_id != expected_chain_id {
-            return Err(MppError::ChainIdMismatch {
-                expected: expected_chain_id,
-                got: actual_chain_id,
-            });
+        let mut options = self.sign_options_overrides.clone().unwrap_or_default();
+        options.rpc_url = Some(self.rpc_url.to_string());
+        if options.signing_mode.is_none() {
+            options.signing_mode = Some(self.signing_mode.clone());
+        }
+        if self.replace_stuck_txs {
+            options.replace_stuck_txs = true;
         }
 
-        let recipient = charge.recipient_address()?;
-        let amount = charge.amount_u256()?;
-        let currency = charge.currency_address()?;
+        // Check balance and spending limits regardless of swap config
+        // so users get a clear error instead of an opaque on-chain revert.
+        let provider = alloy::providers::RootProvider::new_http(self.rpc_url.clone());
 
-        let memo: B256 = charge
-            .memo()
-            .and_then(|m| m.parse().ok())
-            .unwrap_or_else(|| {
-                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref())
-                    .into()
-            });
+        let balance =
+            super::balance::query_token_balance(&provider, charge.currency(), from).await?;
 
-        let transfer_data =
-            ITIP20::transferWithMemoCall::new((recipient, amount, memo)).abi_encode();
+        let keychain_info = match &self.signing_mode {
+            TempoSigningMode::Keychain { wallet, .. } => Some((*wallet, self.signer.address())),
+            TempoSigningMode::Direct => None,
+        };
+        let local_auth = self.signing_mode.key_authorization();
 
-        // Fee payer mode: use expiring nonces to avoid nonce collisions
-        // when the server broadcasts on the client's behalf.
-        let (nonce_key, nonce, valid_before) = if fee_payer {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| MppError::Http(format!("system clock error: {}", e)))?
-                .as_secs();
-            (
-                EXPIRING_NONCE_KEY,
-                0u64,
-                Some(now + FEE_PAYER_VALID_BEFORE_SECS),
+        let spending_limit = if let Some((wallet_addr, key_addr)) = keychain_info {
+            match super::keychain::query_key_spending_limit(
+                &provider,
+                wallet_addr,
+                key_addr,
+                charge.currency(),
             )
+            .await
+            {
+                Ok(limit) => limit,
+                Err(_) if local_auth.is_some() => {
+                    super::keychain::local_key_spending_limit(
+                        local_auth.unwrap(),
+                        charge.currency(),
+                    )
+                }
+                Err(e) => {
+                    return Err(MppError::Http(format!(
+                        "Cannot verify key spending limit: {}",
+                        e
+                    )))
+                }
+            }
         } else {
-            let n = provider
-                .get_transaction_count(from)
-                .await
-                .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
-            (U256::ZERO, n, None)
+            None
         };
 
-        let gas_price = provider
-            .get_gas_price()
-            .await
-            .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
+        let capacity = super::balance::effective_capacity(balance, spending_limit);
 
-        let calls = vec![Call {
-            to: TxKind::Call(currency),
-            value: alloy::primitives::U256::ZERO,
-            input: Bytes::from(transfer_data),
-        }];
+        // Direct transfer if sufficient capacity
+        if capacity >= charge.amount() {
+            let signed = charge.sign_with_options(&self.signer, options).await?;
+            return Ok(signed.into_credential());
+        }
 
-        let tx = tx_builder::build_tempo_tx(tx_builder::TempoTxOptions {
-            calls,
-            chain_id: expected_chain_id,
-            fee_token: currency,
-            nonce,
-            nonce_key,
-            gas_limit: 1_000_000,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
-            fee_payer,
-            valid_before,
-            key_authorization: self.signing_mode.key_authorization().cloned(),
-        });
+        // Spending limit is the bottleneck — no swap can help.
+        // Only error when the user has enough balance to pay directly but the
+        // limit blocks them. When balance is also insufficient, fall through
+        // to auto-swap which may find a different token with a higher limit.
+        let limit_is_bottleneck = spending_limit
+            .map(|limit| limit < charge.amount())
+            .unwrap_or(false);
 
-        let tx_bytes = signing::sign_and_encode_async(tx, &self.signer, &self.signing_mode).await?;
+        if limit_is_bottleneck && balance >= charge.amount() {
+            let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
+            return Err(super::error::TempoClientError::SpendingLimitExceeded {
+                token: token_symbol,
+                limit: crate::evm::format_u256_with_decimals(
+                    spending_limit.unwrap_or(alloy::primitives::U256::ZERO),
+                    TIP20_DECIMALS,
+                ),
+                required: crate::evm::format_u256_with_decimals(
+                    charge.amount(),
+                    TIP20_DECIMALS,
+                ),
+            }
+            .into());
+        }
 
-        Ok(tx_builder::build_charge_credential(
-            challenge,
-            &tx_bytes,
-            expected_chain_id,
+        // No swap candidates available — return a clear insufficient balance error
+        if swap_candidates.is_empty() {
+            let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
+            return Err(super::error::TempoClientError::InsufficientBalance {
+                token: token_symbol,
+                available: crate::evm::format_u256_with_decimals(
+                    balance,
+                    TIP20_DECIMALS,
+                ),
+                required: crate::evm::format_u256_with_decimals(
+                    charge.amount(),
+                    TIP20_DECIMALS,
+                ),
+            }
+            .into());
+        }
+
+        // Try auto-swap
+        let swap_source = super::routing::find_swap_source(
+            &provider,
             from,
-        ))
+            charge.currency(),
+            charge.amount(),
+            &swap_candidates,
+            keychain_info,
+            local_auth,
+        )
+        .await?;
+
+        match swap_source {
+            Some(source) => {
+                let swap_info = super::swap::SwapInfo::new(
+                    source.token_address,
+                    charge.currency(),
+                    charge.amount(),
+                );
+                let calls = super::swap::build_swap_calls(
+                    &swap_info,
+                    charge.recipient(),
+                    charge.amount(),
+                    charge.memo(),
+                )?;
+                options.fee_token = Some(swap_info.token_in);
+                let signed = charge
+                    .with_calls(calls)
+                    .sign_with_options(&self.signer, options)
+                    .await?;
+                Ok(signed.into_credential())
+            }
+            None => {
+                let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
+                Err(super::error::TempoClientError::InsufficientBalance {
+                    token: token_symbol,
+                    available: crate::evm::format_u256_with_decimals(
+                        balance,
+                        TIP20_DECIMALS,
+                    ),
+                    required: crate::evm::format_u256_with_decimals(
+                        charge.amount(),
+                        TIP20_DECIMALS,
+                    ),
+                }
+                .into())
+            }
+        }
     }
 }
 
@@ -343,4 +445,51 @@ mod tests {
 
         assert!(!crate::tempo::attribution::is_mpp_memo(&memo_bytes));
     }
+
+    #[test]
+    fn test_swap_candidates_for_known_chain() {
+        let candidates = TempoProvider::swap_candidates_for(42431); // moderato
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().any(|c| c.symbol == "pathUSD"));
+    }
+
+    #[test]
+    fn test_swap_candidates_for_unknown_chain() {
+        let candidates = TempoProvider::swap_candidates_for(999999);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_tempo_provider_with_sign_options() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let opts = SignOptions {
+            nonce: Some(42),
+            max_fee_per_gas: Some(20_000_000_000),
+            ..Default::default()
+        };
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_sign_options(opts);
+
+        assert!(provider.sign_options_overrides.is_some());
+        assert_eq!(
+            provider.sign_options_overrides.as_ref().unwrap().nonce,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn test_token_symbol_lookup() {
+        let addr: alloy::primitives::Address =
+            "0x20c0000000000000000000000000000000000000".parse().unwrap();
+        let candidates = vec![SwapCandidate {
+            address: addr,
+            symbol: "pathUSD".to_string(),
+        }];
+
+        assert_eq!(TempoProvider::token_symbol_for(&candidates, addr), "pathUSD");
+        assert!(TempoProvider::token_symbol_for(&candidates, alloy::primitives::Address::ZERO)
+            .starts_with("0x"));
+    }
+
 }

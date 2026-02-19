@@ -34,6 +34,22 @@ impl TempoNetwork {
         }
     }
 
+    /// Returns the known TIP-20 token addresses and symbols for this network.
+    ///
+    /// Used by the client to automatically resolve swap candidates when the
+    /// wallet doesn't hold the exact token a server requests.
+    pub fn known_tokens(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Mainnet => &[
+                ("0x20c000000000000000000000b9537d11c60e8b50", "USDC"),
+                ("0x20c0000000000000000000000000000000000000", "pathUSD"),
+            ],
+            Self::Moderato => &[
+                ("0x20c0000000000000000000000000000000000000", "pathUSD"),
+            ],
+        }
+    }
+
     /// Returns the network for a given chain ID, if known.
     pub fn from_chain_id(chain_id: u64) -> Option<Self> {
         match chain_id {

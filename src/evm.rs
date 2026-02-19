@@ -231,4 +231,60 @@ mod tests {
             "42 ETH"
         );
     }
+
+    #[test]
+    fn test_format_u256_trimmed_trailing_zero_trimming() {
+        assert_eq!(
+            format_u256_trimmed(U256::from(1_230_000u64), 6, "TOKEN"),
+            "1.23 TOKEN"
+        );
+    }
+
+    #[test]
+    fn test_format_u256_trimmed_sub_unit_value() {
+        assert_eq!(
+            format_u256_trimmed(U256::from(1u64), 6, "USDC"),
+            "0.000001 USDC"
+        );
+    }
+
+    #[test]
+    fn test_format_u256_with_decimals_padding() {
+        assert_eq!(
+            format_u256_with_decimals(U256::from(1000u64), 6),
+            "0.001000"
+        );
+    }
+
+    #[test]
+    fn test_format_u256_with_decimals_18_decimals() {
+        assert_eq!(
+            format_u256_with_decimals(U256::from(1_500_000_000_000_000_000u64), 18),
+            "1.500000000000000000"
+        );
+    }
+
+    #[test]
+    fn test_format_u256_trimmed_18_decimals() {
+        assert_eq!(
+            format_u256_trimmed(U256::from(1_500_000_000_000_000_000u64), 18, "ETH"),
+            "1.5 ETH"
+        );
+    }
+
+    #[test]
+    fn test_format_u256_with_decimals_exact_divisor() {
+        assert_eq!(
+            format_u256_with_decimals(U256::from(2_000_000u64), 6),
+            "2.000000"
+        );
+    }
+
+    #[test]
+    fn test_format_u256_trimmed_large_whole_number() {
+        assert_eq!(
+            format_u256_trimmed(U256::from(123_456_789_000_000u64), 6, "TOKEN"),
+            "123456789 TOKEN"
+        );
+    }
 }

@@ -274,4 +274,146 @@ mod tests {
         // approve selector: 0x095ea7b3
         assert_eq!(&calls[0].input[..4], &[0x09, 0x5e, 0xa7, 0xb3]);
     }
+
+    // --- calldata semantic correctness ---
+
+    #[test]
+    fn test_build_swap_calls_approve_calldata() {
+        let token_in: Address = "0x20c0000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let token_out: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let recipient: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let amount = U256::from(1_000_000u64);
+
+        let swap_info = SwapInfo::new(token_in, token_out, amount);
+        let calls = build_swap_calls(&swap_info, recipient, amount, None).unwrap();
+
+        let expected = encode_approve(DEX_ADDRESS, swap_info.max_amount_in);
+        assert_eq!(calls[0].input, expected);
+    }
+
+    #[test]
+    fn test_build_swap_calls_swap_calldata() {
+        let token_in: Address = "0x20c0000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let token_out: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let recipient: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let amount = U256::from(1_000_000u64);
+
+        let swap_info = SwapInfo::new(token_in, token_out, amount);
+        let amount_out: u128 = swap_info.amount_out.try_into().unwrap();
+        let max_amount_in: u128 = swap_info.max_amount_in.try_into().unwrap();
+        let calls = build_swap_calls(&swap_info, recipient, amount, None).unwrap();
+
+        let expected =
+            encode_swap_exact_amount_out(token_in, token_out, amount_out, max_amount_in);
+        assert_eq!(calls[1].input, expected);
+    }
+
+    #[test]
+    fn test_build_swap_calls_transfer_calldata_no_memo() {
+        let token_in: Address = "0x20c0000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let token_out: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let recipient: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let amount = U256::from(1_000_000u64);
+
+        let swap_info = SwapInfo::new(token_in, token_out, amount);
+        let calls = build_swap_calls(&swap_info, recipient, amount, None).unwrap();
+
+        let expected = encode_transfer(recipient, amount, None);
+        assert_eq!(calls[2].input, expected);
+    }
+
+    #[test]
+    fn test_build_swap_calls_transfer_calldata_with_memo() {
+        let token_in: Address = "0x20c0000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let token_out: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+        let recipient: Address = "0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let amount = U256::from(1_000_000u64);
+        let memo = [0xab; 32];
+
+        let swap_info = SwapInfo::new(token_in, token_out, amount);
+        let calls = build_swap_calls(&swap_info, recipient, amount, Some(memo)).unwrap();
+
+        let expected = encode_transfer(recipient, amount, Some(memo));
+        assert_eq!(calls[2].input, expected);
+    }
+
+    #[test]
+    fn test_build_swap_calls_amount_out_overflow() {
+        let swap_info = SwapInfo {
+            token_in: Address::repeat_byte(0x01),
+            token_out: Address::repeat_byte(0x02),
+            amount_out: U256::from(u128::MAX) + U256::from(1u64),
+            max_amount_in: U256::from(100u64),
+        };
+        let recipient = Address::repeat_byte(0x03);
+
+        let result = build_swap_calls(&swap_info, recipient, U256::from(100u64), None);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MppError::InvalidAmount(_)));
+    }
+
+    #[test]
+    fn test_build_swap_calls_max_amount_in_overflow() {
+        let swap_info = SwapInfo {
+            token_in: Address::repeat_byte(0x01),
+            token_out: Address::repeat_byte(0x02),
+            amount_out: U256::from(100u64),
+            max_amount_in: U256::from(u128::MAX) + U256::from(1u64),
+        };
+        let recipient = Address::repeat_byte(0x03);
+
+        let result = build_swap_calls(&swap_info, recipient, U256::from(100u64), None);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MppError::InvalidAmount(_)));
+    }
+
+    #[test]
+    fn test_build_open_calls_approve_calldata() {
+        let currency = Address::repeat_byte(0x01);
+        let escrow = Address::repeat_byte(0x02);
+        let payee = Address::repeat_byte(0x03);
+        let signer = Address::repeat_byte(0x04);
+        let salt = alloy::primitives::B256::repeat_byte(0x05);
+        let deposit: u128 = 1_000_000;
+
+        let calls = build_open_calls(currency, escrow, deposit, payee, salt, signer);
+
+        let expected = encode_approve(escrow, U256::from(deposit));
+        assert_eq!(calls[0].input, expected);
+    }
+
+    #[test]
+    fn test_swap_info_zero_amount() {
+        let token_in = Address::repeat_byte(0x01);
+        let token_out = Address::repeat_byte(0x02);
+
+        let swap_info = SwapInfo::new(token_in, token_out, U256::ZERO);
+
+        assert_eq!(swap_info.amount_out, U256::ZERO);
+        assert_eq!(swap_info.max_amount_in, U256::ZERO);
+    }
 }

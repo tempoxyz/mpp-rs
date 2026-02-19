@@ -126,4 +126,66 @@ mod tests {
             "0xDEc0000000000000000000000000000000000000"
         );
     }
+
+    #[test]
+    fn test_transfer_encodes_correct_args() {
+        let recipient = Address::repeat_byte(0x42);
+        let amount = U256::from(999_999u64);
+        let encoded = encode_transfer(recipient, amount, None);
+        let decoded = transferCall::abi_decode_raw(&encoded[4..]).unwrap();
+        assert_eq!(decoded.to, recipient);
+        assert_eq!(decoded.amount, amount);
+    }
+
+    #[test]
+    fn test_transfer_with_memo_encodes_correct_args() {
+        let recipient = Address::repeat_byte(0x42);
+        let amount = U256::from(500_000u64);
+        let memo = [0xAB; 32];
+        let encoded = encode_transfer(recipient, amount, Some(memo));
+        let decoded = transferWithMemoCall::abi_decode_raw(&encoded[4..]).unwrap();
+        assert_eq!(decoded.to, recipient);
+        assert_eq!(decoded.amount, amount);
+        assert_eq!(decoded.memo, memo);
+    }
+
+    #[test]
+    fn test_approve_encodes_correct_args() {
+        let spender = Address::repeat_byte(0x42);
+        let amount = U256::from(2_000_000u64);
+        let encoded = encode_approve(spender, amount);
+        let decoded = ITIP20::approveCall::abi_decode_raw(&encoded[4..]).unwrap();
+        assert_eq!(decoded.spender, spender);
+        assert_eq!(decoded.amount, amount);
+    }
+
+    #[test]
+    fn test_swap_encodes_correct_args() {
+        let token_in = Address::repeat_byte(0x42);
+        let token_out = Address::repeat_byte(0x43);
+        let amount_out: u128 = 1_000_000;
+        let max_amount_in: u128 = 1_005_000;
+        let encoded = encode_swap_exact_amount_out(token_in, token_out, amount_out, max_amount_in);
+        let decoded = swapExactAmountOutCall::abi_decode_raw(&encoded[4..]).unwrap();
+        assert_eq!(decoded.tokenIn, token_in);
+        assert_eq!(decoded.tokenOut, token_out);
+        assert_eq!(decoded.amountOut, amount_out);
+        assert_eq!(decoded.maxAmountIn, max_amount_in);
+    }
+
+    #[test]
+    fn test_encode_transfer_zero_amount() {
+        let recipient = Address::repeat_byte(0x42);
+        let encoded = encode_transfer(recipient, U256::ZERO, None);
+        let decoded = transferCall::abi_decode_raw(&encoded[4..]).unwrap();
+        assert_eq!(decoded.amount, U256::ZERO);
+    }
+
+    #[test]
+    fn test_encode_approve_max_amount() {
+        let spender = Address::repeat_byte(0x42);
+        let encoded = encode_approve(spender, U256::MAX);
+        let decoded = ITIP20::approveCall::abi_decode_raw(&encoded[4..]).unwrap();
+        assert_eq!(decoded.amount, U256::MAX);
+    }
 }

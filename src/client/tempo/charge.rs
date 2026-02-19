@@ -193,13 +193,26 @@ impl TempoCharge {
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
         // Resolve nonce and gas fees
-        let resolved = super::gas::resolve_gas(
-            &provider,
-            from,
-            options.max_fee_per_gas.unwrap_or(1_000_000_000),   // 1 gwei floor
-            options.max_priority_fee_per_gas.unwrap_or(1_000_000_000), // 1 gwei floor
-        )
-        .await?;
+        let default_max_fee = options.max_fee_per_gas.unwrap_or(1_000_000_000); // 1 gwei floor
+        let default_priority_fee = options.max_priority_fee_per_gas.unwrap_or(1_000_000_000); // 1 gwei floor
+
+        let resolved = if options.replace_stuck_txs {
+            super::gas::resolve_gas_with_stuck_detection(
+                &provider,
+                from,
+                default_max_fee,
+                default_priority_fee,
+            )
+            .await?
+        } else {
+            super::gas::resolve_gas(
+                &provider,
+                from,
+                default_max_fee,
+                default_priority_fee,
+            )
+            .await?
+        };
 
         let nonce = options.nonce.unwrap_or(resolved.nonce);
         let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(resolved.max_fee_per_gas);
@@ -288,6 +301,12 @@ pub struct SignOptions {
     pub key_authorization: Option<Box<SignedKeyAuthorization>>,
     /// Optional validity window upper bound (unix timestamp) for fee payer mode.
     pub valid_before: Option<u64>,
+    /// Enable stuck-transaction detection and replacement.
+    ///
+    /// When `true`, uses confirmed nonce (instead of pending) and aggressively
+    /// bumps gas to replace stuck transactions. Useful for CLI tools and
+    /// interactive clients. Default: `false`.
+    pub replace_stuck_txs: bool,
 }
 
 /// A signed Tempo charge, ready to be converted into a [`PaymentCredential`].
