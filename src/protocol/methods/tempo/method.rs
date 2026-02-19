@@ -972,10 +972,7 @@ mod tests {
         let encoded = sign_and_encode(tx, &client_signer);
 
         // Verify it starts with 0x76
-        assert_eq!(
-            encoded[0],
-            tempo_primitives::transaction::TEMPO_TX_TYPE_ID
-        );
+        assert_eq!(encoded[0], tempo_primitives::transaction::TEMPO_TX_TYPE_ID);
 
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
