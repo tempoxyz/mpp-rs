@@ -315,8 +315,7 @@ mod tests {
         let max_amount_in: u128 = swap_info.max_amount_in.try_into().unwrap();
         let calls = build_swap_calls(&swap_info, recipient, amount, None).unwrap();
 
-        let expected =
-            encode_swap_exact_amount_out(token_in, token_out, amount_out, max_amount_in);
+        let expected = encode_swap_exact_amount_out(token_in, token_out, amount_out, max_amount_in);
         assert_eq!(calls[1].input, expected);
     }
 

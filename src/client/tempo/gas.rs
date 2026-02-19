@@ -257,8 +257,7 @@ mod tests {
     #[test]
     fn test_compute_fees_base_fee_raises_max() {
         // base_fee=2gwei → min_max_fee = 2*2gwei + 1gwei = 5gwei > 1gwei default
-        let (max_fee, priority) =
-            compute_fees(Some(2_000_000_000), 1_000_000_000, 1_000_000_000);
+        let (max_fee, priority) = compute_fees(Some(2_000_000_000), 1_000_000_000, 1_000_000_000);
         assert_eq!(max_fee, 5_000_000_000);
         assert_eq!(priority, 1_000_000_000);
     }
@@ -283,8 +282,7 @@ mod tests {
     #[test]
     fn test_compute_fees_zero_base_fee() {
         // base_fee=0 → min_max_fee = 0 + 1gwei = 1gwei == default_max_fee
-        let (max_fee, priority) =
-            compute_fees(Some(0), 1_000_000_000, 1_000_000_000);
+        let (max_fee, priority) = compute_fees(Some(0), 1_000_000_000, 1_000_000_000);
         assert_eq!(max_fee, 1_000_000_000);
         assert_eq!(priority, 1_000_000_000);
     }

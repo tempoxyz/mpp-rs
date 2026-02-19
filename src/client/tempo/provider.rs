@@ -141,7 +141,10 @@ impl TempoProvider {
     }
 
     /// Look up a token symbol from candidates, falling back to hex address.
-    fn token_symbol_for(candidates: &[SwapCandidate], address: alloy::primitives::Address) -> String {
+    fn token_symbol_for(
+        candidates: &[SwapCandidate],
+        address: alloy::primitives::Address,
+    ) -> String {
         candidates
             .iter()
             .find(|c| c.address == address)
@@ -192,12 +195,10 @@ impl PaymentProvider for TempoProvider {
             .await
             {
                 Ok(limit) => limit,
-                Err(_) if local_auth.is_some() => {
-                    super::keychain::local_key_spending_limit(
-                        local_auth.unwrap(),
-                        charge.currency(),
-                    )
-                }
+                Err(_) if local_auth.is_some() => super::keychain::local_key_spending_limit(
+                    local_auth.unwrap(),
+                    charge.currency(),
+                ),
                 Err(e) => {
                     return Err(MppError::Http(format!(
                         "Cannot verify key spending limit: {}",
@@ -233,10 +234,7 @@ impl PaymentProvider for TempoProvider {
                     spending_limit.unwrap_or(alloy::primitives::U256::ZERO),
                     TIP20_DECIMALS,
                 ),
-                required: crate::evm::format_u256_with_decimals(
-                    charge.amount(),
-                    TIP20_DECIMALS,
-                ),
+                required: crate::evm::format_u256_with_decimals(charge.amount(), TIP20_DECIMALS),
             }
             .into());
         }
@@ -246,14 +244,8 @@ impl PaymentProvider for TempoProvider {
             let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
             return Err(super::error::TempoClientError::InsufficientBalance {
                 token: token_symbol,
-                available: crate::evm::format_u256_with_decimals(
-                    balance,
-                    TIP20_DECIMALS,
-                ),
-                required: crate::evm::format_u256_with_decimals(
-                    charge.amount(),
-                    TIP20_DECIMALS,
-                ),
+                available: crate::evm::format_u256_with_decimals(balance, TIP20_DECIMALS),
+                required: crate::evm::format_u256_with_decimals(charge.amount(), TIP20_DECIMALS),
             }
             .into());
         }
@@ -294,10 +286,7 @@ impl PaymentProvider for TempoProvider {
                 let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
                 Err(super::error::TempoClientError::InsufficientBalance {
                     token: token_symbol,
-                    available: crate::evm::format_u256_with_decimals(
-                        balance,
-                        TIP20_DECIMALS,
-                    ),
+                    available: crate::evm::format_u256_with_decimals(balance, TIP20_DECIMALS),
                     required: crate::evm::format_u256_with_decimals(
                         charge.amount(),
                         TIP20_DECIMALS,
@@ -480,16 +469,21 @@ mod tests {
 
     #[test]
     fn test_token_symbol_lookup() {
-        let addr: alloy::primitives::Address =
-            "0x20c0000000000000000000000000000000000000".parse().unwrap();
+        let addr: alloy::primitives::Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
         let candidates = vec![SwapCandidate {
             address: addr,
             symbol: "pathUSD".to_string(),
         }];
 
-        assert_eq!(TempoProvider::token_symbol_for(&candidates, addr), "pathUSD");
-        assert!(TempoProvider::token_symbol_for(&candidates, alloy::primitives::Address::ZERO)
-            .starts_with("0x"));
+        assert_eq!(
+            TempoProvider::token_symbol_for(&candidates, addr),
+            "pathUSD"
+        );
+        assert!(
+            TempoProvider::token_symbol_for(&candidates, alloy::primitives::Address::ZERO)
+                .starts_with("0x")
+        );
     }
-
 }

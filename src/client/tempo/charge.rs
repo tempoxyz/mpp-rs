@@ -164,13 +164,12 @@ impl TempoCharge {
                 .parse()
                 .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?,
             None => {
-                let network =
-                    TempoNetwork::from_chain_id(self.chain_id).ok_or_else(|| {
-                        MppError::InvalidConfig(format!(
-                            "unknown chain ID {}: provide rpc_url in SignOptions",
-                            self.chain_id
-                        ))
-                    })?;
+                let network = TempoNetwork::from_chain_id(self.chain_id).ok_or_else(|| {
+                    MppError::InvalidConfig(format!(
+                        "unknown chain ID {}: provide rpc_url in SignOptions",
+                        self.chain_id
+                    ))
+                })?;
                 network
                     .default_rpc_url()
                     .parse()
@@ -205,13 +204,7 @@ impl TempoCharge {
             )
             .await?
         } else {
-            super::gas::resolve_gas(
-                &provider,
-                from,
-                default_max_fee,
-                default_priority_fee,
-            )
-            .await?
+            super::gas::resolve_gas(&provider, from, default_max_fee, default_priority_fee).await?
         };
 
         let nonce = options.nonce.unwrap_or(resolved.nonce);
@@ -383,16 +376,14 @@ mod tests {
     #[test]
     fn test_from_challenge_wrong_method() {
         let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
-        let challenge =
-            PaymentChallenge::new("id", "api", "stripe", "charge", request);
+        let challenge = PaymentChallenge::new("id", "api", "stripe", "charge", request);
         assert!(TempoCharge::from_challenge(&challenge).is_err());
     }
 
     #[test]
     fn test_from_challenge_wrong_intent() {
         let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
-        let challenge =
-            PaymentChallenge::new("id", "api", "tempo", "session", request);
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "session", request);
         assert!(TempoCharge::from_challenge(&challenge).is_err());
     }
 

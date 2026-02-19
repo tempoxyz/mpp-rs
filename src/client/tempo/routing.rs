@@ -162,7 +162,12 @@ pub async fn find_swap_source<P: alloy::providers::Provider + Clone>(
         entries.push((candidate.clone(), balance, spending_limit));
     }
 
-    Ok(select_swap_source(&entries, required_token, threshold, use_keychain))
+    Ok(select_swap_source(
+        &entries,
+        required_token,
+        threshold,
+        use_keychain,
+    ))
 }
 
 #[cfg(test)]
@@ -228,12 +233,11 @@ mod tests {
     fn test_select_no_keychain_picks_first_with_balance() {
         let threshold = U256::from(1_005_000u64);
         let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(500_000u64)), None),   // too low
+            (candidate(0x01, "A"), Some(U256::from(500_000u64)), None), // too low
             (candidate(0x02, "B"), Some(U256::from(2_000_000u64)), None), // sufficient
             (candidate(0x03, "C"), Some(U256::from(3_000_000u64)), None), // also sufficient
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false);
         let src = result.unwrap();
         assert_eq!(src.token_address, Address::repeat_byte(0x02));
         assert_eq!(src.symbol, "B");
@@ -255,11 +259,10 @@ mod tests {
     fn test_select_no_keychain_skips_balance_errors() {
         let threshold = U256::from(1_000u64);
         let entries = vec![
-            (candidate(0x01, "A"), None, None),                         // balance error
-            (candidate(0x02, "B"), Some(U256::from(2_000u64)), None),   // ok
+            (candidate(0x01, "A"), None, None), // balance error
+            (candidate(0x02, "B"), Some(U256::from(2_000u64)), None), // ok
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false);
         let src = result.unwrap();
         assert_eq!(src.token_address, Address::repeat_byte(0x02));
     }
@@ -281,18 +284,14 @@ mod tests {
     fn test_select_all_are_required_token() {
         let required = Address::repeat_byte(0x01);
         let threshold = U256::from(100u64);
-        let entries = vec![
-            (candidate(0x01, "REQ"), Some(U256::from(999_999u64)), None),
-        ];
+        let entries = vec![(candidate(0x01, "REQ"), Some(U256::from(999_999u64)), None)];
         assert!(select_swap_source(&entries, required, threshold, false).is_none());
     }
 
     #[test]
     fn test_select_empty_candidates() {
         let threshold = U256::from(100u64);
-        assert!(
-            select_swap_source(&[], Address::repeat_byte(0xFF), threshold, false).is_none()
-        );
+        assert!(select_swap_source(&[], Address::repeat_byte(0xFF), threshold, false).is_none());
     }
 
     #[test]
@@ -301,17 +300,14 @@ mod tests {
         let entries = vec![
             (candidate(0x01, "A"), Some(U256::from(1_000u64)), None), // exactly at threshold
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false);
         assert!(result.is_some());
     }
 
     #[test]
     fn test_select_balance_one_below_threshold() {
         let threshold = U256::from(1_000u64);
-        let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(999u64)), None),
-        ];
+        let entries = vec![(candidate(0x01, "A"), Some(U256::from(999u64)), None)];
         assert!(
             select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, false).is_none()
         );
@@ -323,20 +319,19 @@ mod tests {
     fn test_select_keychain_unlimited_spending_limit() {
         let threshold = U256::from(1_000u64);
         // None spending limit = unlimited
-        let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(2_000u64)), None),
-        ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
+        let entries = vec![(candidate(0x01, "A"), Some(U256::from(2_000u64)), None)];
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
         assert!(result.is_some());
     }
 
     #[test]
     fn test_select_keychain_limit_below_threshold_excluded() {
         let threshold = U256::from(1_000u64);
-        let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(2_000u64)), Some(U256::from(500u64))),
-        ];
+        let entries = vec![(
+            candidate(0x01, "A"),
+            Some(U256::from(2_000u64)),
+            Some(U256::from(500u64)),
+        )];
         assert!(
             select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true).is_none()
         );
@@ -345,11 +340,12 @@ mod tests {
     #[test]
     fn test_select_keychain_limit_at_threshold_included() {
         let threshold = U256::from(1_000u64);
-        let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(2_000u64)), Some(U256::from(1_000u64))),
-        ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
+        let entries = vec![(
+            candidate(0x01, "A"),
+            Some(U256::from(2_000u64)),
+            Some(U256::from(1_000u64)),
+        )];
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
         assert!(result.is_some());
     }
 
@@ -359,11 +355,18 @@ mod tests {
         // Token B has higher limit, even though it appears second.
         // Both have sufficient balance; B should be selected first.
         let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(5_000u64)), Some(U256::from(2_000u64))),
-            (candidate(0x02, "B"), Some(U256::from(5_000u64)), Some(U256::from(9_000u64))),
+            (
+                candidate(0x01, "A"),
+                Some(U256::from(5_000u64)),
+                Some(U256::from(2_000u64)),
+            ),
+            (
+                candidate(0x02, "B"),
+                Some(U256::from(5_000u64)),
+                Some(U256::from(9_000u64)),
+            ),
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
         let src = result.unwrap();
         assert_eq!(src.token_address, Address::repeat_byte(0x02));
         assert_eq!(src.symbol, "B");
@@ -374,11 +377,18 @@ mod tests {
         let threshold = U256::from(1_000u64);
         // B has higher limit but insufficient balance; A should be selected.
         let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(5_000u64)), Some(U256::from(2_000u64))),
-            (candidate(0x02, "B"), Some(U256::from(500u64)), Some(U256::from(9_000u64))),
+            (
+                candidate(0x01, "A"),
+                Some(U256::from(5_000u64)),
+                Some(U256::from(2_000u64)),
+            ),
+            (
+                candidate(0x02, "B"),
+                Some(U256::from(500u64)),
+                Some(U256::from(9_000u64)),
+            ),
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
         let src = result.unwrap();
         assert_eq!(src.token_address, Address::repeat_byte(0x01));
         assert_eq!(src.symbol, "A");
@@ -389,10 +399,13 @@ mod tests {
         let threshold = U256::from(1_000u64);
         let entries = vec![
             (candidate(0x01, "A"), None, Some(U256::from(5_000u64))), // balance error
-            (candidate(0x02, "B"), Some(U256::from(2_000u64)), Some(U256::from(3_000u64))),
+            (
+                candidate(0x02, "B"),
+                Some(U256::from(2_000u64)),
+                Some(U256::from(3_000u64)),
+            ),
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
         let src = result.unwrap();
         assert_eq!(src.token_address, Address::repeat_byte(0x02));
     }
@@ -400,9 +413,11 @@ mod tests {
     #[test]
     fn test_select_keychain_zero_limit_excluded() {
         let threshold = U256::from(1_000u64);
-        let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(5_000u64)), Some(U256::ZERO)),
-        ];
+        let entries = vec![(
+            candidate(0x01, "A"),
+            Some(U256::from(5_000u64)),
+            Some(U256::ZERO),
+        )];
         assert!(
             select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true).is_none()
         );
@@ -412,12 +427,19 @@ mod tests {
     fn test_select_keychain_mixed_eligible_and_ineligible() {
         let threshold = U256::from(1_000u64);
         let entries = vec![
-            (candidate(0x01, "A"), Some(U256::from(5_000u64)), Some(U256::from(500u64))), // limit too low
+            (
+                candidate(0x01, "A"),
+                Some(U256::from(5_000u64)),
+                Some(U256::from(500u64)),
+            ), // limit too low
             (candidate(0x02, "B"), Some(U256::from(200u64)), None), // unlimited but low balance
-            (candidate(0x03, "C"), Some(U256::from(5_000u64)), Some(U256::from(5_000u64))), // eligible
+            (
+                candidate(0x03, "C"),
+                Some(U256::from(5_000u64)),
+                Some(U256::from(5_000u64)),
+            ), // eligible
         ];
-        let result =
-            select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
+        let result = select_swap_source(&entries, Address::repeat_byte(0xFF), threshold, true);
         let src = result.unwrap();
         assert_eq!(src.token_address, Address::repeat_byte(0x03));
     }

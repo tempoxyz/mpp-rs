@@ -168,10 +168,7 @@ mod tests {
             format_u256_with_decimals(U256::from(1_000_000u64), 6),
             "1.000000"
         );
-        assert_eq!(
-            format_u256_with_decimals(U256::from(1u64), 6),
-            "0.000001"
-        );
+        assert_eq!(format_u256_with_decimals(U256::from(1u64), 6), "0.000001");
     }
 
     #[test]
@@ -183,7 +180,10 @@ mod tests {
     #[test]
     fn test_format_u256_with_decimals_zero_value() {
         assert_eq!(format_u256_with_decimals(U256::ZERO, 6), "0.000000");
-        assert_eq!(format_u256_with_decimals(U256::ZERO, 18), "0.000000000000000000");
+        assert_eq!(
+            format_u256_with_decimals(U256::ZERO, 18),
+            "0.000000000000000000"
+        );
     }
 
     #[test]
@@ -218,18 +218,12 @@ mod tests {
 
     #[test]
     fn test_format_u256_trimmed_zero() {
-        assert_eq!(
-            format_u256_trimmed(U256::ZERO, 6, "USDC"),
-            "0 USDC"
-        );
+        assert_eq!(format_u256_trimmed(U256::ZERO, 6, "USDC"), "0 USDC");
     }
 
     #[test]
     fn test_format_u256_trimmed_zero_decimals() {
-        assert_eq!(
-            format_u256_trimmed(U256::from(42u64), 0, "ETH"),
-            "42 ETH"
-        );
+        assert_eq!(format_u256_trimmed(U256::from(42u64), 0, "ETH"), "42 ETH");
     }
 
     #[test]
