@@ -258,7 +258,7 @@ pub enum MppError {
     /// Tempo-specific client error (transaction reverts, keychain issues, etc.).
     ///
     /// See [`crate::client::tempo::TempoClientError`] for variants.
-    #[cfg(feature = "tempo")]
+    #[cfg(all(feature = "client", feature = "tempo"))]
     #[error("{0}")]
     Tempo(#[from] crate::client::tempo::TempoClientError),
 
@@ -1009,7 +1009,7 @@ mod tests {
 
     // --- Tempo error wrapping ---
 
-    #[cfg(feature = "tempo")]
+    #[cfg(all(feature = "client", feature = "tempo"))]
     #[test]
     fn test_tempo_error_wraps_through_from() {
         use crate::client::tempo::TempoClientError;

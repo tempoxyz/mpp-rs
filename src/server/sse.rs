@@ -529,16 +529,30 @@ mod tests {
     // -- serve() metered streaming tests --
 
     #[cfg(feature = "tempo")]
-    fn test_channel_state(channel_id: &str, voucher_amount: u128, deposit: u128) -> crate::protocol::methods::tempo::session_method::ChannelState {
+    fn test_channel_state(
+        channel_id: &str,
+        voucher_amount: u128,
+        deposit: u128,
+    ) -> crate::protocol::methods::tempo::session_method::ChannelState {
         use crate::protocol::methods::tempo::session_method::ChannelState;
         ChannelState {
             channel_id: channel_id.to_string(),
             chain_id: 42431,
-            escrow_contract: "0x5555555555555555555555555555555555555555".parse().unwrap(),
-            payer: "0x1111111111111111111111111111111111111111".parse().unwrap(),
-            payee: "0x2222222222222222222222222222222222222222".parse().unwrap(),
-            token: "0x3333333333333333333333333333333333333333".parse().unwrap(),
-            authorized_signer: "0x4444444444444444444444444444444444444444".parse().unwrap(),
+            escrow_contract: "0x5555555555555555555555555555555555555555"
+                .parse()
+                .unwrap(),
+            payer: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            payee: "0x2222222222222222222222222222222222222222"
+                .parse()
+                .unwrap(),
+            token: "0x3333333333333333333333333333333333333333"
+                .parse()
+                .unwrap(),
+            authorized_signer: "0x4444444444444444444444444444444444444444"
+                .parse()
+                .unwrap(),
             deposit,
             settled_on_chain: 0,
             highest_voucher_amount: voucher_amount,
@@ -591,11 +605,23 @@ mod tests {
         // 3 message events + 1 receipt = 4
         assert_eq!(events.len(), 4);
         for i in 0..3 {
-            assert!(events[i].starts_with("event: message\ndata: "), "event {i} should be a message");
+            assert!(
+                events[i].starts_with("event: message\ndata: "),
+                "event {i} should be a message"
+            );
         }
-        assert_eq!(parse_event(&events[0]), Some(SseEvent::Message("hello".into())));
-        assert_eq!(parse_event(&events[1]), Some(SseEvent::Message("world".into())));
-        assert_eq!(parse_event(&events[2]), Some(SseEvent::Message("end".into())));
+        assert_eq!(
+            parse_event(&events[0]),
+            Some(SseEvent::Message("hello".into()))
+        );
+        assert_eq!(
+            parse_event(&events[1]),
+            Some(SseEvent::Message("world".into()))
+        );
+        assert_eq!(
+            parse_event(&events[2]),
+            Some(SseEvent::Message("end".into()))
+        );
 
         // Verify receipt
         let receipt_event = parse_event(&events[3]);
@@ -655,7 +681,9 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn test_serve_balance_exhausted_then_topup() {
-        use crate::protocol::methods::tempo::session_method::{ChannelState, ChannelStore, InMemoryChannelStore};
+        use crate::protocol::methods::tempo::session_method::{
+            ChannelState, ChannelStore, InMemoryChannelStore,
+        };
 
         let store = std::sync::Arc::new(InMemoryChannelStore::new());
         let channel_id = "0xchannel_exhaust";
@@ -694,16 +722,19 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Top up: increase highest_voucher_amount
-        store.update_channel(
-            channel_id,
-            Box::new(|current: Option<ChannelState>| {
-                let state = current.unwrap();
-                Ok(Some(ChannelState {
-                    highest_voucher_amount: 500,
-                    ..state
-                }))
-            }),
-        ).await.unwrap();
+        store
+            .update_channel(
+                channel_id,
+                Box::new(|current: Option<ChannelState>| {
+                    let state = current.unwrap();
+                    Ok(Some(ChannelState {
+                        highest_voucher_amount: 500,
+                        ..state
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
 
         // Send one more item then close
         tx.send("d".to_string()).await.unwrap();
@@ -726,7 +757,10 @@ mod tests {
         }
 
         assert_eq!(messages, vec!["a", "b", "c", "d"]);
-        assert!(!need_vouchers.is_empty(), "should have emitted at least one need-voucher event");
+        assert!(
+            !need_vouchers.is_empty(),
+            "should have emitted at least one need-voucher event"
+        );
         // Verify need-voucher content
         let nv = &need_vouchers[0];
         assert_eq!(nv.channel_id, channel_id);

@@ -167,8 +167,13 @@ mod tests {
         fn test_challenge() -> (PaymentChallenge, String) {
             let request =
                 Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-            let challenge =
-                PaymentChallenge::new("test-id-123", "test.example.com", "tempo", "charge", request);
+            let challenge = PaymentChallenge::new(
+                "test-id-123",
+                "test.example.com",
+                "tempo",
+                "charge",
+                request,
+            );
             let header = format_www_authenticate(&challenge).unwrap();
             (challenge, header)
         }
