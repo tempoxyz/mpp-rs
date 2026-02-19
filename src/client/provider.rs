@@ -150,7 +150,7 @@ impl PaymentProvider for TempoProvider {
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
         use alloy::eips::Encodable2718;
-        use alloy::primitives::{Bytes, TxKind, B256};
+        use alloy::primitives::{Bytes, TxKind, B256, U256};
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
@@ -161,6 +161,7 @@ impl PaymentProvider for TempoProvider {
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
         let address = self.signer.address();
+        let fee_payer = charge.fee_payer();
 
         let provider =
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
@@ -193,10 +194,21 @@ impl PaymentProvider for TempoProvider {
         let transfer_data =
             ITIP20::transferWithMemoCall::new((recipient, amount, memo)).abi_encode();
 
-        let nonce = provider
-            .get_transaction_count(address)
-            .await
-            .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
+        // Fee payer mode: use expiring nonces to avoid nonce collisions
+        // when the server broadcasts on the client's behalf.
+        let (nonce_key, nonce, valid_before) = if fee_payer {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            (U256::MAX, 0u64, Some(now + 25))
+        } else {
+            let n = provider
+                .get_transaction_count(address)
+                .await
+                .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
+            (U256::ZERO, n, None)
+        };
 
         let gas_price = provider
             .get_gas_price()
@@ -204,15 +216,32 @@ impl PaymentProvider for TempoProvider {
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
         // Build a Tempo transaction (type 0x76) for proper on-chain processing.
+        // When fee_payer is true:
+        //   - fee_token is None (server chooses at co-sign time)
+        //   - fee_payer_signature is a placeholder (triggers skip_fee_token in signing hash)
+        //   - nonce_key = U256::MAX (expiring nonce)
+        //   - valid_before is set to now + 25s
         let tempo_tx = TempoTransaction {
             chain_id: expected_chain_id,
             nonce,
+            nonce_key,
             gas_limit: 1_000_000,
             max_fee_per_gas: gas_price,
             max_priority_fee_per_gas: gas_price,
+            fee_token: None,
+            fee_payer_signature: if fee_payer {
+                Some(alloy::primitives::Signature::new(
+                    U256::ZERO,
+                    U256::ZERO,
+                    false,
+                ))
+            } else {
+                None
+            },
+            valid_before,
             calls: vec![Call {
                 to: TxKind::Call(currency),
-                value: alloy::primitives::U256::ZERO,
+                value: U256::ZERO,
                 input: Bytes::from(transfer_data),
             }],
             ..Default::default()
@@ -225,8 +254,15 @@ impl PaymentProvider for TempoProvider {
             .sign_hash_sync(&sig_hash)
             .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
-        let signed_tx = tempo_tx.into_signed(signature.into());
-        let tx_bytes = signed_tx.encoded_2718();
+        let tx_bytes = if fee_payer {
+            // Serialize as 0x78 fee payer envelope:
+            // The server expects this format so it can co-sign before broadcasting.
+            // Format: 0x78 || RLP([...tx_fields_with_sender_addr, client_signature])
+            encode_fee_payer_envelope(&tempo_tx, address, signature.into())
+        } else {
+            let signed_tx = tempo_tx.into_signed(signature.into());
+            signed_tx.encoded_2718()
+        };
         let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
         let echo = challenge.to_echo();
@@ -348,6 +384,84 @@ impl Clone for Box<dyn DynPaymentProvider> {
     fn clone(&self) -> Self {
         self.clone_box()
     }
+}
+
+/// Encode a fee payer envelope (0x78 format).
+///
+/// This produces the serialized bytes that the mppx server expects when
+/// `feePayer: true`. The format is:
+///
+/// ```text
+/// 0x78 || RLP([chainId, maxPriorityFeePerGas, maxFeePerGas, gas, calls,
+///              accessList, nonceKey, nonce, validBefore, validAfter,
+///              feeToken, senderAddress, authorizationList, signature])
+/// ```
+///
+/// Key differences from the standard 0x76 format:
+/// - Type prefix is 0x78 instead of 0x76
+/// - The fee_payer_signature slot contains the sender address (not a placeholder)
+/// - The fee_token is empty (server chooses at co-sign time)
+#[cfg(feature = "tempo")]
+fn encode_fee_payer_envelope(
+    tx: &tempo_primitives::TempoTransaction,
+    sender: alloy::primitives::Address,
+    signature: tempo_primitives::transaction::TempoSignature,
+) -> Vec<u8> {
+    use alloy::primitives::bytes::BufMut;
+    use alloy::rlp::Encodable;
+
+    const FEE_PAYER_MAGIC: u8 = 0x78;
+    const EMPTY_STRING_CODE: u8 = 0x80;
+
+    // Encode all fields into a temporary buffer to compute payload length
+    let mut fields = Vec::new();
+
+    tx.chain_id.encode(&mut fields);
+    tx.max_priority_fee_per_gas.encode(&mut fields);
+    tx.max_fee_per_gas.encode(&mut fields);
+    tx.gas_limit.encode(&mut fields);
+    tx.calls.encode(&mut fields);
+    tx.access_list.encode(&mut fields);
+    tx.nonce_key.encode(&mut fields);
+    tx.nonce.encode(&mut fields);
+
+    // validBefore
+    if let Some(vb) = tx.valid_before {
+        vb.encode(&mut fields);
+    } else {
+        fields.put_u8(EMPTY_STRING_CODE);
+    }
+    // validAfter
+    if let Some(va) = tx.valid_after {
+        va.encode(&mut fields);
+    } else {
+        fields.put_u8(EMPTY_STRING_CODE);
+    }
+    // feeToken — always empty in fee payer envelope
+    fields.put_u8(EMPTY_STRING_CODE);
+    // Sender address in the fee_payer_signature slot
+    sender.encode(&mut fields);
+    // authorizationList
+    tx.tempo_authorization_list.encode(&mut fields);
+    // keyAuthorization (optional)
+    if let Some(key_auth) = &tx.key_authorization {
+        key_auth.encode(&mut fields);
+    }
+    // Client signature
+    signature.encode(&mut fields);
+
+    // Build final: 0x78 || RLP header || fields
+    let rlp_header = alloy::rlp::Header {
+        list: true,
+        payload_length: fields.len(),
+    };
+
+    let mut out = Vec::with_capacity(1 + rlp_header.length() + fields.len());
+    out.put_u8(FEE_PAYER_MAGIC);
+    rlp_header.encode(&mut out);
+    out.extend_from_slice(&fields);
+
+    out
 }
 
 #[cfg(test)]

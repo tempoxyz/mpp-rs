@@ -389,12 +389,13 @@ where
             ));
         }
 
-        // Skip type byte (0x76) for Tempo transactions
-        let tx_data = if !tx_bytes.is_empty() && tx_bytes[0] == 0x76 {
-            &tx_bytes[1..]
-        } else {
-            tx_bytes
-        };
+        // Skip type byte (0x76 or 0x78) for Tempo transactions
+        let tx_data =
+            if !tx_bytes.is_empty() && (tx_bytes[0] == 0x76 || tx_bytes[0] == 0x78) {
+                &tx_bytes[1..]
+            } else {
+                tx_bytes
+            };
 
         // Decode the signed Tempo transaction (AASigned = tx fields + signature).
         let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
@@ -520,17 +521,23 @@ where
             expected_chain_id,
         )?;
 
-        // Fail fast if fee payer is requested but no signer is configured.
-        if charge.fee_payer() && self.fee_payer_signer.is_none() {
-            return Err(VerificationError::new(
-                "feePayer requested but fee sponsorship is not configured on this server"
-                    .to_string(),
-            ));
-        }
+        // Fee payer co-signing: decode the client tx, set fee_token, co-sign, re-encode
+        let final_tx_bytes = if charge.fee_payer() {
+            let fee_payer_signer = self.fee_payer_signer.as_ref().ok_or_else(|| {
+                VerificationError::new(
+                    "feePayer requested but fee sponsorship is not configured on this server"
+                        .to_string(),
+                )
+            })?;
+
+            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer, currency)?
+        } else {
+            tx_bytes.to_vec()
+        };
 
         let pending = self
             .provider
-            .send_raw_transaction(&tx_bytes)
+            .send_raw_transaction(&final_tx_bytes)
             .await
             .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
 
@@ -547,6 +554,66 @@ where
         }
 
         Ok(receipt.transaction_hash())
+    }
+
+    /// Co-sign a fee payer transaction.
+    ///
+    /// Handles both 0x78 (fee payer envelope) and 0x76 (standard) formats.
+    /// Decodes the client-signed transaction, recovers the sender, sets the fee_token,
+    /// computes the fee payer signature hash (0x78 domain), signs it, and re-encodes
+    /// as a standard 0x76 transaction with both signatures.
+    fn cosign_fee_payer_transaction(
+        &self,
+        tx_bytes: &[u8],
+        fee_payer_signer: &alloy_signer_local::PrivateKeySigner,
+        fee_token: Address,
+    ) -> Result<Vec<u8>, VerificationError> {
+        use alloy::consensus::transaction::SignerRecoverable;
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+
+        if tx_bytes.is_empty() {
+            return Err(VerificationError::new("Empty transaction bytes"));
+        }
+
+        // Both 0x78 (fee payer envelope) and 0x76 (standard) formats use the
+        // same RLP field layout. The AASigned decoder handles both — the
+        // fee_payer_signature slot may contain a sender address (0x78 format)
+        // or a placeholder (0x76 format), both of which decode successfully.
+        let type_byte = tx_bytes[0];
+        let rlp_data = if type_byte == 0x76 || type_byte == 0x78 {
+            &tx_bytes[1..]
+        } else {
+            tx_bytes
+        };
+
+        // Decode the signed transaction (AASigned = tx fields + sender signature)
+        let signed = tempo_primitives::AASigned::rlp_decode(&mut &rlp_data[..])
+            .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
+
+        // Recover the sender address from the client's signature
+        let sender = signed
+            .recover_signer()
+            .map_err(|e| VerificationError::new(format!("Failed to recover sender: {}", e)))?;
+
+        let client_signature = signed.signature().clone();
+        let mut tx = signed.into_parts().0;
+
+        // Set the fee token (server chooses which token to pay gas with)
+        tx.fee_token = Some(fee_token);
+
+        // Compute the fee payer signature hash (0x78 domain) and sign
+        let fp_hash = tx.fee_payer_signature_hash(sender);
+        let fp_sig = fee_payer_signer
+            .sign_hash_sync(&fp_hash)
+            .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {}", e)))?;
+
+        // Set the real fee payer signature (replacing the placeholder)
+        tx.fee_payer_signature = Some(fp_sig);
+
+        // Re-encode as standard 0x76 transaction with both signatures
+        let signed_tx = tx.into_signed(client_signature);
+        Ok(signed_tx.encoded_2718())
     }
 }
 
