@@ -21,10 +21,7 @@ mod error;
 mod provider;
 
 #[cfg(feature = "tempo")]
-pub mod channel_ops;
-
-#[cfg(feature = "tempo")]
-mod session_provider;
+pub mod tempo;
 
 #[cfg(feature = "client")]
 mod fetch;
@@ -41,11 +38,9 @@ pub use fetch::PaymentExt as Fetch;
 #[cfg(feature = "middleware")]
 pub use middleware::PaymentMiddleware;
 
+// Re-export Tempo types at client level for convenience
 #[cfg(feature = "tempo")]
-pub use provider::TempoProvider;
+pub use tempo::channel_ops::ChannelEntry;
 
 #[cfg(feature = "tempo")]
-pub use channel_ops::ChannelEntry;
-
-#[cfg(feature = "tempo")]
-pub use session_provider::TempoSessionProvider;
+pub use tempo::{TempoProvider, TempoSessionProvider, TempoSigningMode};
