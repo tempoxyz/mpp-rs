@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use alloy::eips::Encodable2718;
+use alloy::network::ReceiptResponse;
 use alloy::primitives::{address, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::SignerSync;
@@ -203,6 +204,23 @@ async fn fund_account(rpc: &str, to: Address) {
     .await;
 }
 
+/// Fund an account with an exact amount of pathUSD.
+async fn fund_account_amount(rpc: &str, to: Address, amount: U256) {
+    setup_liquidity(rpc).await;
+
+    let transfer_data = ITIP20::transferCall::new((to, amount)).abi_encode();
+
+    dev_send(
+        rpc,
+        vec![Call {
+            to: TxKind::Call(PATH_USD),
+            value: U256::ZERO,
+            input: Bytes::from(transfer_data),
+        }],
+    )
+    .await;
+}
+
 // ==================== Fee payer test helpers ====================
 
 /// Encode a 0x78 fee payer envelope for testing (mirrors encode_fee_payer_envelope
@@ -271,6 +289,19 @@ async fn tip20_balance(provider: &impl Provider<TempoNetwork>, addr: Address) ->
         .await
         .expect("balanceOf call failed");
     U256::from_be_slice(&result)
+}
+
+async fn wait_for_receipt(
+    provider: &impl Provider<TempoNetwork>,
+    tx_hash: B256,
+) -> tempo_alloy::rpc::TempoTransactionReceipt {
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+            return receipt;
+        }
+    }
+    panic!("transaction receipt not found after 10s: {tx_hash:#x}");
 }
 
 // ==================== ChargeConfig types ====================
@@ -856,6 +887,9 @@ async fn test_e2e_charge_without_fee_payer() {
     let server_signer = PrivateKeySigner::random();
     let client_signer = PrivateKeySigner::random();
 
+    let _server_addr = server_signer.address();
+    let client_addr = client_signer.address();
+
     fund_account(&rpc, server_signer.address()).await;
     fund_account(&rpc, client_signer.address()).await;
 
@@ -897,6 +931,20 @@ async fn test_e2e_charge_without_fee_payer() {
     assert_eq!(receipt.method.as_str(), "tempo");
     assert!(receipt.reference.starts_with("0x"));
 
+    // Assert on-chain receipt reports sender as fee payer (no sponsorship).
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+    let tx_hash: B256 = receipt
+        .reference
+        .parse()
+        .expect("receipt reference should be B256");
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    assert_eq!(chain_receipt.from(), client_addr);
+    assert_eq!(
+        chain_receipt.fee_payer, client_addr,
+        "without fee sponsorship, fee_payer should equal sender"
+    );
+
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["message"], "paid content");
 
@@ -914,12 +962,15 @@ async fn test_e2e_charge_with_fee_payer() {
     let server_signer = PrivateKeySigner::random();
     let client_signer = PrivateKeySigner::random();
 
+    let fee_payer_addr = server_signer.address();
+    let client_addr = client_signer.address();
+
     fund_account(&rpc, server_signer.address()).await;
     fund_account(&rpc, client_signer.address()).await;
 
     let mpp = Mpp::create(
         tempo(TempoConfig {
-            recipient: &format!("{}", server_signer.address()),
+            recipient: &format!("{}", fee_payer_addr),
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
@@ -955,6 +1006,31 @@ async fn test_e2e_charge_with_fee_payer() {
     assert_eq!(receipt.status, mpp::ReceiptStatus::Success);
     assert_eq!(receipt.method.as_str(), "tempo");
     assert!(receipt.reference.starts_with("0x"));
+
+    // Assert on-chain receipt reports fee_payer as the sponsor (server), not the sender.
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+    let tx_hash: B256 = receipt
+        .reference
+        .parse()
+        .expect("receipt reference should be B256");
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+
+    assert_eq!(chain_receipt.from(), client_addr);
+    assert_eq!(
+        chain_receipt.fee_payer, fee_payer_addr,
+        "with fee sponsorship, fee_payer should be the configured sponsor"
+    );
+    assert_ne!(
+        chain_receipt.fee_payer,
+        chain_receipt.from(),
+        "with sponsorship, fee_payer must differ from sender"
+    );
+    assert_eq!(
+        chain_receipt.fee_token,
+        Some(PATH_USD),
+        "server should choose pathUSD as the fee token on localnet"
+    );
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["message"], "paid content");
@@ -1178,6 +1254,22 @@ async fn test_fee_payer_balance_accounting() {
         .expect("fee-payer payment failed");
     assert_eq!(resp.status(), 200);
 
+    // Assert on-chain receipt shows sponsorship.
+    let receipt_hdr = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    let tx_hash: B256 = receipt
+        .reference
+        .parse()
+        .expect("receipt reference should be B256");
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    assert_eq!(chain_receipt.from(), client_signer.address());
+    assert_eq!(chain_receipt.fee_payer, server_signer.address());
+
     // Record balances after payment.
     let client_balance_after = tip20_balance(&provider_http, client_signer.address()).await;
     let server_balance_after = tip20_balance(&provider_http, server_signer.address()).await;
@@ -1208,6 +1300,114 @@ async fn test_fee_payer_balance_accounting() {
         "in fee payer mode, client should only pay the charge amount (no gas), \
          but client balance decreased by {client_decrease} instead of {charge_amount}"
     );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Regression: without fee sponsorship, a client that only has `amount` pathUSD should
+/// fail to pay (because it also needs gas). With fee sponsorship enabled, the same
+/// client should succeed (client only pays `amount`; sponsor pays gas).
+#[tokio::test]
+async fn test_fee_payer_allows_client_without_gas_buffer() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    let fee_payer_addr = server_signer.address();
+    let client_addr = client_signer.address();
+
+    // Sponsor has plenty of funds.
+    fund_account(&rpc, fee_payer_addr).await;
+
+    // Client has ONLY the charge amount.
+    let charge_amount = U256::from(10_000u64); // $0.01 with 6 decimals
+    fund_account_amount(&rpc, client_addr, charge_amount).await;
+
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    // Sanity check: balance starts exactly at charge_amount.
+    let client_balance_before = tip20_balance(&provider_http, client_addr).await;
+    assert_eq!(client_balance_before, charge_amount);
+
+    // --- Case 1: NO fee payer → should fail with insufficient funds for gas.
+    let mpp_no_fp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", fee_payer_addr),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("no-fp-no-buffer"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp_no_fp) as Arc<dyn ChargeChallenger>).await;
+    let provider = TempoProvider::new(client_signer.clone(), &rpc).expect("TempoProvider");
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("request should complete");
+
+    // In the non-sponsored flow, the server broadcasts the tx. With only `amount` funded,
+    // the broadcast should fail, and the server will return a fresh 402 challenge.
+    assert_eq!(resp.status(), 402);
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "server should return a fresh challenge"
+    );
+
+    // The transaction should not have succeeded on-chain; the client should still have the funds.
+    let client_balance_after_failed = tip20_balance(&provider_http, client_addr).await;
+    assert_eq!(client_balance_after_failed, charge_amount);
+
+    handle.abort();
+    let _ = handle.await;
+
+    // --- Case 2: Fee payer enabled → should succeed.
+    let mpp_fp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", fee_payer_addr),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("fp-no-buffer"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp_fp) as Arc<dyn ChargeChallenger>).await;
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("fee payer payment should succeed");
+    assert_eq!(resp.status(), 200);
+
+    let receipt_hdr = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    let tx_hash: B256 = receipt
+        .reference
+        .parse()
+        .expect("receipt reference should be B256");
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    assert_eq!(chain_receipt.from(), client_addr);
+    assert_eq!(chain_receipt.fee_payer, fee_payer_addr);
+
+    // Client should have paid exactly `charge_amount` and nothing else.
+    let client_balance_after = tip20_balance(&provider_http, client_addr).await;
+    assert_eq!(client_balance_after, U256::ZERO);
 
     handle.abort();
     let _ = handle.await;
