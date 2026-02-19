@@ -390,12 +390,15 @@ where
         }
 
         // Skip type byte (0x76 or 0x78) for Tempo transactions
-        let tx_data =
-            if !tx_bytes.is_empty() && (tx_bytes[0] == 0x76 || tx_bytes[0] == 0x78) {
-                &tx_bytes[1..]
-            } else {
-                tx_bytes
-            };
+        let tx_data = if !tx_bytes.is_empty()
+            && (tx_bytes[0] == tempo_primitives::transaction::TEMPO_TX_TYPE_ID
+                || tx_bytes[0]
+                    == tempo_primitives::transaction::tempo_transaction::FEE_PAYER_SIGNATURE_MAGIC_BYTE)
+        {
+            &tx_bytes[1..]
+        } else {
+            tx_bytes
+        };
 
         // Decode the signed Tempo transaction (AASigned = tx fields + signature).
         let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
@@ -500,7 +503,6 @@ where
             .parse::<Bytes>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {}", e)))?;
 
-        // Pre-broadcast validation: verify transaction contains expected payment call
         let expected_recipient = charge.recipient_address().map_err(|e| {
             VerificationError::new(format!("Invalid recipient address in request: {}", e))
         })?;
@@ -512,16 +514,10 @@ where
         })?;
         let memo = charge.memo();
 
-        self.validate_transaction(
-            &tx_bytes,
-            currency,
-            expected_recipient,
-            expected_amount,
-            memo.as_deref(),
-            expected_chain_id,
-        )?;
-
-        // Fee payer co-signing: decode the client tx, set fee_token, co-sign, re-encode
+        // Fee payer co-signing must happen before validation because the 0x78
+        // envelope contains a sender address in the fee_payer_signature slot,
+        // which AASigned::rlp_decode cannot parse. Co-signing converts it to a
+        // standard 0x76 transaction that validate_transaction can decode.
         let final_tx_bytes = if charge.fee_payer() {
             let fee_payer_signer = self.fee_payer_signer.as_ref().ok_or_else(|| {
                 VerificationError::new(
@@ -534,6 +530,15 @@ where
         } else {
             tx_bytes.to_vec()
         };
+
+        self.validate_transaction(
+            &final_tx_bytes,
+            currency,
+            expected_recipient,
+            expected_amount,
+            memo.as_deref(),
+            expected_chain_id,
+        )?;
 
         let pending = self
             .provider
@@ -558,60 +563,167 @@ where
 
     /// Co-sign a fee payer transaction.
     ///
-    /// Handles both 0x78 (fee payer envelope) and 0x76 (standard) formats.
-    /// Decodes the client-signed transaction, recovers the sender, sets the fee_token,
-    /// computes the fee payer signature hash (0x78 domain), signs it, and re-encodes
-    /// as a standard 0x76 transaction with both signatures.
+    /// Requires a 0x78 fee payer envelope from the client. The 0x78 format
+    /// places the sender address in the fee_payer_signature slot, which
+    /// standard `AASigned::rlp_decode` cannot parse. This method manually
+    /// decodes the RLP, extracts the sender address, then rebuilds and
+    /// co-signs as a standard 0x76 transaction.
     fn cosign_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
         fee_payer_signer: &alloy_signer_local::PrivateKeySigner,
         fee_token: Address,
     ) -> Result<Vec<u8>, VerificationError> {
-        use alloy::consensus::transaction::SignerRecoverable;
         use alloy::eips::Encodable2718;
+        use alloy::rlp::Decodable;
         use alloy::signers::SignerSync;
+        use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
         if tx_bytes.is_empty() {
             return Err(VerificationError::new("Empty transaction bytes"));
         }
 
-        // Both 0x78 (fee payer envelope) and 0x76 (standard) formats use the
-        // same RLP field layout. The AASigned decoder handles both — the
-        // fee_payer_signature slot may contain a sender address (0x78 format)
-        // or a placeholder (0x76 format), both of which decode successfully.
+        // Require 0x78 fee payer envelope — reject standard 0x76 or untyped.
         let type_byte = tx_bytes[0];
-        let rlp_data = if type_byte == 0x76 || type_byte == 0x78 {
-            &tx_bytes[1..]
+        if type_byte
+            != tempo_primitives::transaction::tempo_transaction::FEE_PAYER_SIGNATURE_MAGIC_BYTE
+        {
+            return Err(VerificationError::new(format!(
+                "Expected fee payer envelope (0x78), got 0x{type_byte:02x}"
+            )));
+        }
+
+        let mut rlp_data = &tx_bytes[1..];
+
+        // Decode the outer RLP list header
+        let header = alloy::rlp::Header::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode RLP header: {e}")))?;
+        if !header.list {
+            return Err(VerificationError::new(
+                "Expected RLP list for fee payer envelope",
+            ));
+        }
+
+        // Decode fields in the same order as rlp_encode_fields:
+        // chain_id, max_priority_fee_per_gas, max_fee_per_gas, gas_limit,
+        // calls, access_list, nonce_key, nonce, valid_before, valid_after,
+        // fee_token, fee_payer_signature_slot (sender addr), authorization_list,
+        // [key_authorization], client_signature
+        let chain_id: u64 = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode chain_id: {e}")))?;
+        let max_priority_fee_per_gas: u128 = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode gas fields: {e}")))?;
+        let max_fee_per_gas: u128 = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode gas fields: {e}")))?;
+        let gas_limit: u64 = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode gas_limit: {e}")))?;
+        let calls: Vec<tempo_primitives::transaction::Call> = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode calls: {e}")))?;
+        let access_list: alloy::eips::eip2930::AccessList = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode access_list: {e}")))?;
+        let nonce_key: U256 = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode nonce_key: {e}")))?;
+        let nonce: u64 = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode nonce: {e}")))?;
+
+        // valid_before / valid_after: 0x80 = None, otherwise u64
+        let valid_before: Option<u64> = if rlp_data.first() == Some(&alloy::rlp::EMPTY_STRING_CODE)
+        {
+            rlp_data = &rlp_data[1..];
+            None
         } else {
-            tx_bytes
+            Some(Decodable::decode(&mut rlp_data).map_err(|e| {
+                VerificationError::new(format!("Failed to decode valid_before: {e}"))
+            })?)
+        };
+        let valid_after: Option<u64> = if rlp_data.first() == Some(&alloy::rlp::EMPTY_STRING_CODE) {
+            rlp_data = &rlp_data[1..];
+            None
+        } else {
+            Some(Decodable::decode(&mut rlp_data).map_err(|e| {
+                VerificationError::new(format!("Failed to decode valid_after: {e}"))
+            })?)
         };
 
-        // Decode the signed transaction (AASigned = tx fields + sender signature)
-        let signed = tempo_primitives::AASigned::rlp_decode(&mut &rlp_data[..])
-            .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
+        // fee_token: should be empty (0x80) in fee payer envelope
+        if rlp_data.first() == Some(&alloy::rlp::EMPTY_STRING_CODE) {
+            rlp_data = &rlp_data[1..];
+        } else {
+            return Err(VerificationError::new(
+                "Fee payer envelope must not include fee_token (server sets it)",
+            ));
+        }
 
-        // Recover the sender address from the client's signature
-        let sender = signed
-            .recover_signer()
-            .map_err(|e| VerificationError::new(format!("Failed to recover sender: {}", e)))?;
+        // fee_payer_signature slot: contains sender address (20 bytes) in 0x78 format
+        let sender: Address = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode sender address: {e}")))?;
 
-        let client_signature = signed.signature().clone();
-        let mut tx = signed.into_parts().0;
+        // authorization_list
+        let tempo_authorization_list: Vec<tempo_primitives::transaction::TempoSignedAuthorization> =
+            Decodable::decode(&mut rlp_data).map_err(|e| {
+                VerificationError::new(format!("Failed to decode authorization_list: {e}"))
+            })?;
 
-        // Set the fee token (server chooses which token to pay gas with)
-        tx.fee_token = Some(fee_token);
+        // key_authorization (optional — only present if next byte starts an RLP list)
+        let key_authorization: Option<
+            tempo_primitives::transaction::key_authorization::SignedKeyAuthorization,
+        > = if let Some(&first) = rlp_data.first() {
+            if first >= 0xc0 {
+                Some(Decodable::decode(&mut rlp_data).map_err(|e| {
+                    VerificationError::new(format!("Failed to decode key_authorization: {e}"))
+                })?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        // Compute the fee payer signature hash (0x78 domain) and sign
+        // Client signature (remaining bytes)
+        let sig_bytes: alloy::primitives::Bytes = Decodable::decode(&mut rlp_data)
+            .map_err(|e| VerificationError::new(format!("Failed to decode signature: {e}")))?;
+        let client_signature =
+            tempo_primitives::transaction::TempoSignature::from_bytes(&sig_bytes)
+                .map_err(|e| VerificationError::new(format!("Invalid client signature: {e}")))?;
+
+        // Validate fee-payer invariants
+        if nonce_key != TEMPO_EXPIRING_NONCE_KEY {
+            return Err(VerificationError::new(
+                "Fee payer envelope must use expiring nonce key (U256::MAX)",
+            ));
+        }
+        if valid_before.is_none() {
+            return Err(VerificationError::new(
+                "Fee payer envelope must include valid_before",
+            ));
+        }
+
+        // Rebuild the transaction with fee_token set
+        let mut tx = tempo_primitives::TempoTransaction {
+            chain_id,
+            nonce,
+            nonce_key,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            fee_token: Some(fee_token),
+            fee_payer_signature: None,
+            valid_before,
+            valid_after,
+            calls,
+            access_list,
+            tempo_authorization_list,
+            key_authorization,
+        };
+
+        // Compute the fee payer signature hash and co-sign
         let fp_hash = tx.fee_payer_signature_hash(sender);
         let fp_sig = fee_payer_signer
             .sign_hash_sync(&fp_hash)
-            .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {}", e)))?;
+            .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {e}")))?;
 
-        // Set the real fee payer signature (replacing the placeholder)
         tx.fee_payer_signature = Some(fp_sig);
 
-        // Re-encode as standard 0x76 transaction with both signatures
         let signed_tx = tx.into_signed(client_signature);
         Ok(signed_tx.encoded_2718())
     }

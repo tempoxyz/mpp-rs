@@ -92,6 +92,18 @@ pub trait PaymentProvider: Clone + Send + Sync {
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
+/// Nonce key for expiring nonce transactions (fee payer mode).
+#[cfg(feature = "tempo")]
+const EXPIRING_NONCE_KEY: alloy::primitives::U256 = alloy::primitives::U256::MAX;
+
+/// Validity window (in seconds) for fee payer transactions.
+#[cfg(feature = "tempo")]
+const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+
+/// Type byte for the fee payer envelope format.
+#[cfg(feature = "tempo")]
+const FEE_PAYER_TX_TYPE: u8 = 0x78;
+
 #[cfg(feature = "tempo")]
 #[derive(Clone)]
 pub struct TempoProvider {
@@ -199,9 +211,15 @@ impl PaymentProvider for TempoProvider {
         let (nonce_key, nonce, valid_before) = if fee_payer {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .map_err(|e| MppError::Http(format!("system clock error: {}", e)))?
                 .as_secs();
-            (U256::MAX, 0u64, Some(now + 25))
+            // Expiring nonce transactions require nonce=0. Replay protection
+            // comes from the valid_before window + tx hash, not the nonce value.
+            (
+                EXPIRING_NONCE_KEY,
+                0u64,
+                Some(now + FEE_PAYER_VALID_BEFORE_SECS),
+            )
         } else {
             let n = provider
                 .get_transaction_count(address)
@@ -408,12 +426,8 @@ fn encode_fee_payer_envelope(
     signature: tempo_primitives::transaction::TempoSignature,
 ) -> Vec<u8> {
     use alloy::primitives::bytes::BufMut;
-    use alloy::rlp::Encodable;
+    use alloy::rlp::{Encodable, EMPTY_STRING_CODE};
 
-    const FEE_PAYER_MAGIC: u8 = 0x78;
-    const EMPTY_STRING_CODE: u8 = 0x80;
-
-    // Encode all fields into a temporary buffer to compute payload length
     let mut fields = Vec::new();
 
     tx.chain_id.encode(&mut fields);
@@ -425,13 +439,11 @@ fn encode_fee_payer_envelope(
     tx.nonce_key.encode(&mut fields);
     tx.nonce.encode(&mut fields);
 
-    // validBefore
     if let Some(vb) = tx.valid_before {
         vb.encode(&mut fields);
     } else {
         fields.put_u8(EMPTY_STRING_CODE);
     }
-    // validAfter
     if let Some(va) = tx.valid_after {
         va.encode(&mut fields);
     } else {
@@ -441,23 +453,19 @@ fn encode_fee_payer_envelope(
     fields.put_u8(EMPTY_STRING_CODE);
     // Sender address in the fee_payer_signature slot
     sender.encode(&mut fields);
-    // authorizationList
     tx.tempo_authorization_list.encode(&mut fields);
-    // keyAuthorization (optional)
     if let Some(key_auth) = &tx.key_authorization {
         key_auth.encode(&mut fields);
     }
-    // Client signature
     signature.encode(&mut fields);
 
-    // Build final: 0x78 || RLP header || fields
     let rlp_header = alloy::rlp::Header {
         list: true,
         payload_length: fields.len(),
     };
 
     let mut out = Vec::with_capacity(1 + rlp_header.length() + fields.len());
-    out.put_u8(FEE_PAYER_MAGIC);
+    out.put_u8(FEE_PAYER_TX_TYPE);
     rlp_header.encode(&mut out);
     out.extend_from_slice(&fields);
 

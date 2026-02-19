@@ -773,3 +773,223 @@ async fn test_client_balance_decreases_after_payment() {
     handle.abort();
     let _ = handle.await;
 }
+
+// ==================== Fee payer vs non-fee-payer tests ====================
+
+/// E2E round-trip WITHOUT fee payer: client signs a standard 0x76 transaction
+/// and broadcasts it directly. Server verifies on-chain.
+#[tokio::test]
+async fn test_e2e_charge_without_fee_payer() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    // Server configured WITHOUT fee_payer
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("no-fee-payer-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("non-fee-payer payment failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "expected 200 after successful non-fee-payer payment"
+    );
+
+    let receipt_hdr = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    assert_eq!(receipt.status, mpp::ReceiptStatus::Success);
+    assert_eq!(receipt.method.as_str(), "tempo");
+    assert!(receipt.reference.starts_with("0x"));
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"], "paid content");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// E2E round-trip WITH fee payer: client signs a 0x78 fee payer envelope,
+/// server co-signs and broadcasts as 0x76.
+#[tokio::test]
+async fn test_e2e_charge_with_fee_payer() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("fee-payer-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("fee-payer payment failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "expected 200 after successful fee-payer payment"
+    );
+
+    let receipt_hdr = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    assert_eq!(receipt.status, mpp::ReceiptStatus::Success);
+    assert_eq!(receipt.method.as_str(), "tempo");
+    assert!(receipt.reference.starts_with("0x"));
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"], "paid content");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Fee payer requested but server has no signer configured → 402.
+#[tokio::test]
+async fn test_fee_payer_requested_but_no_signer_returns_402() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    // Enable fee_payer in challenges but do NOT set a fee_payer_signer
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .secret_key("no-signer-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        402,
+        "fee payer requested without signer should return 402"
+    );
+    assert!(
+        resp.headers().contains_key("www-authenticate"),
+        "should return a fresh challenge for retry"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Fee-payer-enabled server handles premium ($1) charges correctly.
+#[tokio::test]
+async fn test_e2e_fee_payer_premium_charge() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("fee-payer-premium-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    let resp = Client::new()
+        .get(format!("{url}/premium"))
+        .send_with_payment(&provider)
+        .await
+        .expect("fee-payer premium payment failed");
+
+    assert_eq!(resp.status(), 200);
+
+    let receipt_hdr = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    assert_eq!(receipt.status, mpp::ReceiptStatus::Success);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["message"], "premium content");
+    assert_eq!(body["tier"], "gold");
+
+    handle.abort();
+    let _ = handle.await;
+}
