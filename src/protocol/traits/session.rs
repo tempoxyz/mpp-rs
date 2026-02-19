@@ -155,7 +155,7 @@ mod tests {
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
         let request = SessionRequest {
             amount: "1000".into(),
-            unit_type: "second".into(),
+            unit_type: Some("second".into()),
             currency: "usd".into(),
             ..Default::default()
         };

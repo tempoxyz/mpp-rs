@@ -133,10 +133,12 @@ async fn chat(
                 .payment
                 .session_challenge_with_details(
                     &PRICE_PER_TOKEN.to_string(),
-                    UNIT_TYPE,
                     CURRENCY,
                     state.payment.recipient().unwrap(),
-                    SessionChallengeOptions::default(),
+                    SessionChallengeOptions {
+                        unit_type: Some(UNIT_TYPE),
+                        ..Default::default()
+                    },
                 )
                 .expect("failed to create session challenge");
 

@@ -151,6 +151,8 @@ impl TempoBuilder {
 /// Options for [`Mpp::session_challenge_with_details()`].
 #[derive(Debug, Default)]
 pub struct SessionChallengeOptions<'a> {
+    /// Unit type label (e.g., "token", "byte", "request"). Optional.
+    pub unit_type: Option<&'a str>,
     /// Suggested deposit amount in base units.
     pub suggested_deposit: Option<&'a str>,
     /// Enable fee sponsorship.

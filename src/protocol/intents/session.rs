@@ -20,7 +20,7 @@ use crate::error::{MppError, Result};
 ///
 /// let req = SessionRequest {
 ///     amount: "1000".to_string(),
-///     unit_type: "second".to_string(),
+///     unit_type: Some("second".to_string()),
 ///     currency: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
 ///     decimals: None,
 ///     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
@@ -29,16 +29,16 @@ use crate::error::{MppError, Result};
 /// };
 ///
 /// assert_eq!(req.amount, "1000");
-/// assert_eq!(req.unit_type, "second");
+/// assert_eq!(req.unit_type, Some("second".to_string()));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionRequest {
     /// Amount per unit in base units (e.g., wei per second)
     pub amount: String,
 
-    /// Unit type for the streaming rate (e.g., "second", "minute", "request")
-    #[serde(rename = "unitType")]
-    pub unit_type: String,
+    /// Unit type for the streaming rate (e.g., "second", "minute", "request"). Optional.
+    #[serde(rename = "unitType", skip_serializing_if = "Option::is_none")]
+    pub unit_type: Option<String>,
 
     /// Currency/asset identifier (token address, ISO 4217 code, or symbol)
     pub currency: String,
@@ -121,7 +121,7 @@ mod tests {
     fn test_session_request_serialization() {
         let req = SessionRequest {
             amount: "1000".to_string(),
-            unit_type: "second".to_string(),
+            unit_type: Some("second".to_string()),
             currency: "0x123".to_string(),
             recipient: Some("0x456".to_string()),
             suggested_deposit: Some("60000".to_string()),
@@ -141,7 +141,7 @@ mod tests {
 
         let parsed: SessionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.amount, "1000");
-        assert_eq!(parsed.unit_type, "second");
+        assert_eq!(parsed.unit_type, Some("second".to_string()));
         assert_eq!(parsed.suggested_deposit.as_deref(), Some("60000"));
     }
 
@@ -149,7 +149,7 @@ mod tests {
     fn test_session_request_optional_fields_omitted() {
         let req = SessionRequest {
             amount: "500".to_string(),
-            unit_type: "request".to_string(),
+            unit_type: Some("request".to_string()),
             currency: "USD".to_string(),
             ..Default::default()
         };
@@ -165,7 +165,7 @@ mod tests {
         let json = r#"{"amount":"2000","unitType":"minute","currency":"0xabc"}"#;
         let parsed: SessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.amount, "2000");
-        assert_eq!(parsed.unit_type, "minute");
+        assert_eq!(parsed.unit_type, Some("minute".to_string()));
         assert_eq!(parsed.currency, "0xabc");
         assert!(parsed.recipient.is_none());
         assert!(parsed.suggested_deposit.is_none());
@@ -203,7 +203,7 @@ mod tests {
     fn test_with_base_units() {
         let req = SessionRequest {
             amount: "1.5".to_string(),
-            unit_type: "second".to_string(),
+            unit_type: Some("second".to_string()),
             currency: "0x123".to_string(),
             decimals: Some(6),
             suggested_deposit: Some("60".to_string()),
@@ -219,11 +219,19 @@ mod tests {
     fn test_with_base_units_no_decimals() {
         let req = SessionRequest {
             amount: "1000000".to_string(),
-            unit_type: "second".to_string(),
+            unit_type: Some("second".to_string()),
             currency: "0x123".to_string(),
             ..Default::default()
         };
         let converted = req.with_base_units().unwrap();
         assert_eq!(converted.amount, "1000000");
+    }
+
+    #[test]
+    fn test_session_request_without_unit_type() {
+        let json = r#"{"amount":"2000","currency":"0xabc"}"#;
+        let parsed: SessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.amount, "2000");
+        assert!(parsed.unit_type.is_none());
     }
 }
