@@ -15,7 +15,7 @@ use super::channel_ops::{
     build_credential, create_close_payload, create_open_payload, create_voucher_payload,
     resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry, OpenPayloadOptions,
 };
-use super::provider::PaymentProvider;
+use crate::client::PaymentProvider;
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use crate::protocol::intents::SessionRequest;

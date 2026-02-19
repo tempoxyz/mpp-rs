@@ -50,16 +50,16 @@ pub use crate::protocol::methods::tempo::session_method::{
 };
 
 #[cfg(feature = "client")]
-pub use crate::client::TempoProvider;
+pub use crate::client::tempo::TempoProvider;
 
 #[cfg(feature = "client")]
-pub use crate::client::{ChannelEntry, TempoSessionProvider};
+pub use crate::client::tempo::{ChannelEntry, TempoSessionProvider};
 
 #[cfg(feature = "client")]
-pub use crate::client::signing::TempoSigningMode;
+pub use crate::client::tempo::signing::TempoSigningMode;
 
 #[cfg(feature = "client")]
-pub use crate::client::tx_builder::{
+pub use crate::client::tempo::tx_builder::{
     build_charge_credential, build_estimate_gas_request, build_tempo_tx, estimate_gas,
     TempoTxOptions,
 };
