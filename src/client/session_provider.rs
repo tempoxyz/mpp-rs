@@ -50,6 +50,8 @@ pub struct TempoSessionProvider {
     escrow_contract: Option<Address>,
     /// Address authorized to sign vouchers. Defaults to signer address.
     authorized_signer: Option<Address>,
+    /// Signing mode (direct or keychain).
+    signing_mode: super::signing::TempoSigningMode,
     /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`.
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
@@ -83,6 +85,7 @@ impl TempoSessionProvider {
             rpc_url: url,
             escrow_contract: None,
             authorized_signer: None,
+            signing_mode: super::signing::TempoSigningMode::Direct,
             max_deposit: None,
             default_deposit: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
@@ -101,6 +104,14 @@ impl TempoSessionProvider {
     /// Set the authorized signer address (for delegated voucher signing).
     pub fn with_authorized_signer(mut self, addr: Address) -> Self {
         self.authorized_signer = Some(addr);
+        self
+    }
+
+    /// Set the signing mode (direct or keychain).
+    ///
+    /// Default is [`TempoSigningMode::Direct`].
+    pub fn with_signing_mode(mut self, mode: super::signing::TempoSigningMode) -> Self {
+        self.signing_mode = mode;
         self
     }
 
@@ -377,7 +388,7 @@ impl PaymentProvider for TempoSessionProvider {
             .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
 
         let amount: u128 = session_req.parse_amount()?;
-        let payer = self.signer.address();
+        let payer = self.signing_mode.from_address(self.signer.address());
         let key = Self::channel_key(&payee, &currency, &escrow_contract);
 
         // Check if we already have a channel
@@ -448,6 +459,7 @@ impl PaymentProvider for TempoSessionProvider {
         let (entry, payload) = create_open_payload(
             &provider,
             &self.signer,
+            &self.signing_mode,
             payer,
             OpenPayloadOptions {
                 authorized_signer: self.authorized_signer,

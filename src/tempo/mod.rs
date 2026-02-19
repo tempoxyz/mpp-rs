@@ -54,3 +54,12 @@ pub use crate::client::TempoProvider;
 
 #[cfg(feature = "client")]
 pub use crate::client::{ChannelEntry, TempoSessionProvider};
+
+#[cfg(feature = "client")]
+pub use crate::client::signing::TempoSigningMode;
+
+#[cfg(feature = "client")]
+pub use crate::client::tx_builder::{
+    build_charge_credential, build_estimate_gas_request, build_tempo_tx, estimate_gas,
+    TempoTxOptions,
+};

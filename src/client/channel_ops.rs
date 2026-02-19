@@ -173,6 +173,7 @@ pub struct OpenPayloadOptions {
 pub async fn create_open_payload<P, S>(
     provider: &P,
     signer: &S,
+    signing_mode: &super::signing::TempoSigningMode,
     payer: Address,
     options: OpenPayloadOptions,
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
@@ -182,7 +183,6 @@ where
 {
     use alloy::sol;
     use tempo_primitives::transaction::Call;
-    use tempo_primitives::TempoTransaction;
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
@@ -256,28 +256,21 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-    let tempo_tx = TempoTransaction {
+    let tempo_tx = super::tx_builder::build_tempo_tx(super::tx_builder::TempoTxOptions {
+        calls,
         chain_id: options.chain_id,
+        fee_token: options.currency,
         nonce,
+        nonce_key: U256::ZERO,
         gas_limit: 2_000_000,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
-        calls,
-        ..Default::default()
-    };
+        fee_payer: options.fee_payer,
+        valid_before: None,
+        key_authorization: signing_mode.key_authorization().cloned(),
+    });
 
-    // Sign the transaction
-    let sig_hash = tempo_tx.signature_hash();
-    let signature = signer
-        .sign_hash(&sig_hash)
-        .await
-        .map_err(|e| MppError::Http(format!("failed to sign open transaction: {}", e)))?;
-
-    let signed_tx = tempo_tx.into_signed(signature.into());
-
-    // EIP-2718 encode the signed transaction
-    use alloy::eips::Encodable2718;
-    let tx_bytes = signed_tx.encoded_2718();
+    let tx_bytes = super::signing::sign_and_encode_async(tempo_tx, signer, signing_mode).await?;
     let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
     // Sign the initial voucher

@@ -26,6 +26,12 @@ pub mod channel_ops;
 #[cfg(feature = "tempo")]
 mod session_provider;
 
+#[cfg(feature = "tempo")]
+pub mod signing;
+
+#[cfg(feature = "tempo")]
+pub mod tx_builder;
+
 #[cfg(feature = "client")]
 mod fetch;
 
@@ -49,3 +55,6 @@ pub use channel_ops::ChannelEntry;
 
 #[cfg(feature = "tempo")]
 pub use session_provider::TempoSessionProvider;
+
+#[cfg(feature = "tempo")]
+pub use signing::TempoSigningMode;

@@ -1,0 +1,331 @@
+//! Tempo transaction building and gas estimation utilities.
+//!
+//! Provides [`estimate_gas`] for AA-aware gas estimation via `eth_estimateGas`,
+//! and [`build_charge_credential`] for constructing a signed Tempo transaction
+//! wrapped in a [`PaymentCredential`].
+
+use alloy::primitives::Address;
+use alloy::primitives::U256;
+use tempo_primitives::transaction::{Call, SignedKeyAuthorization, TempoTransaction};
+
+use crate::error::MppError;
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
+
+/// Options for building a Tempo transaction.
+#[derive(Debug, Clone)]
+pub struct TempoTxOptions {
+    /// Calls to include in the transaction.
+    pub calls: Vec<Call>,
+    /// Chain ID for the transaction.
+    pub chain_id: u64,
+    /// Fee token address.
+    pub fee_token: Address,
+    /// Transaction nonce.
+    pub nonce: u64,
+    /// Nonce key (use `U256::MAX` for expiring nonce / fee payer mode).
+    pub nonce_key: U256,
+    /// Gas limit for the transaction.
+    pub gas_limit: u64,
+    /// Max fee per gas (EIP-1559 style).
+    pub max_fee_per_gas: u128,
+    /// Max priority fee per gas (EIP-1559 style).
+    pub max_priority_fee_per_gas: u128,
+    /// Whether the server pays fees (fee payer / fee sponsorship mode).
+    pub fee_payer: bool,
+    /// Optional validity window upper bound (unix timestamp).
+    pub valid_before: Option<u64>,
+    /// Optional key authorization to include in the transaction.
+    pub key_authorization: Option<SignedKeyAuthorization>,
+}
+
+/// Build a [`TempoTransaction`] from options.
+pub fn build_tempo_tx(options: TempoTxOptions) -> TempoTransaction {
+    TempoTransaction {
+        chain_id: options.chain_id,
+        // Fee payer mode: fee_token is None (server chooses at co-sign time)
+        fee_token: if options.fee_payer {
+            None
+        } else {
+            Some(options.fee_token)
+        },
+        max_priority_fee_per_gas: options.max_priority_fee_per_gas,
+        max_fee_per_gas: options.max_fee_per_gas,
+        gas_limit: options.gas_limit,
+        calls: options.calls,
+        nonce_key: options.nonce_key,
+        nonce: options.nonce,
+        key_authorization: options.key_authorization,
+        access_list: Default::default(),
+        // Fee payer mode: placeholder signature triggers skip_fee_token in signing hash
+        fee_payer_signature: if options.fee_payer {
+            Some(alloy::primitives::Signature::new(
+                U256::ZERO,
+                U256::ZERO,
+                false,
+            ))
+        } else {
+            None
+        },
+        valid_before: options.valid_before,
+        valid_after: None,
+        tempo_authorization_list: vec![],
+    }
+}
+
+/// Build an `eth_estimateGas` JSON-RPC request body for a Tempo AA transaction.
+///
+/// Constructs the request with AA-specific fields (`feeToken`, `calls`, `nonceKey`)
+/// that Tempo nodes understand.
+#[allow(clippy::too_many_arguments)]
+pub fn build_estimate_gas_request(
+    from: Address,
+    chain_id: u64,
+    nonce: u64,
+    fee_token: Address,
+    calls: &[Call],
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    key_authorization: Option<&SignedKeyAuthorization>,
+) -> Result<serde_json::Value, MppError> {
+    let mut req = serde_json::json!({
+        "from": format!("{:#x}", from),
+        "chainId": format!("{:#x}", chain_id),
+        "nonce": format!("{:#x}", nonce),
+        "maxFeePerGas": format!("{:#x}", max_fee_per_gas),
+        "maxPriorityFeePerGas": format!("{:#x}", max_priority_fee_per_gas),
+        "feeToken": format!("{:#x}", fee_token),
+        "nonceKey": "0x0",
+        "calls": calls.iter().map(|c| {
+            serde_json::json!({
+                "to": c.to.to().map(|a| format!("{:#x}", a)),
+                "value": format!("{:#x}", c.value),
+                "input": format!("0x{}", hex::encode(&c.input)),
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    if let Some(auth) = key_authorization {
+        req["keyAuthorization"] = serde_json::to_value(auth).map_err(|e| {
+            MppError::InvalidConfig(format!("failed to serialize key authorization: {}", e))
+        })?;
+    }
+
+    Ok(req)
+}
+
+/// Estimate gas for a Tempo AA transaction via `eth_estimateGas` RPC.
+///
+/// Sends an AA-aware gas estimation request and returns the estimated gas
+/// limit with a small buffer (+5000) added.
+#[allow(clippy::too_many_arguments)]
+pub async fn estimate_gas<P: alloy::providers::Provider>(
+    provider: &P,
+    from: Address,
+    chain_id: u64,
+    nonce: u64,
+    fee_token: Address,
+    calls: &[Call],
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    key_authorization: Option<&SignedKeyAuthorization>,
+) -> Result<u64, MppError> {
+    let req = build_estimate_gas_request(
+        from,
+        chain_id,
+        nonce,
+        fee_token,
+        calls,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        key_authorization,
+    )?;
+
+    let gas_hex: String = provider
+        .raw_request("eth_estimateGas".into(), [req])
+        .await
+        .map_err(|e| MppError::Http(format!("gas estimation failed: {}", e)))?;
+
+    parse_gas_estimate(&gas_hex)
+}
+
+/// Parse a hex gas estimate string and add a safety buffer.
+fn parse_gas_estimate(gas_hex: &str) -> Result<u64, MppError> {
+    let gas_limit = u64::from_str_radix(gas_hex.trim_start_matches("0x"), 16).map_err(|e| {
+        MppError::InvalidConfig(format!("failed to parse gas estimate '{}': {}", gas_hex, e))
+    })?;
+    Ok(gas_limit + 5_000)
+}
+
+/// Build a [`PaymentCredential`] from a signed Tempo transaction.
+///
+/// This is the final step: wrapping a signed, encoded transaction into
+/// an MPP credential with the challenge echo and DID source.
+pub fn build_charge_credential(
+    challenge: &PaymentChallenge,
+    signed_tx_bytes: &[u8],
+    chain_id: u64,
+    from: Address,
+) -> PaymentCredential {
+    let signed_tx_hex = format!("0x{}", hex::encode(signed_tx_bytes));
+    let did = format!("did:pkh:eip155:{}:{}", chain_id, from);
+    PaymentCredential::with_source(
+        challenge.to_echo(),
+        did,
+        PaymentPayload::transaction(signed_tx_hex),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::TxKind;
+
+    #[test]
+    fn test_build_estimate_gas_request_basic() {
+        let from = Address::repeat_byte(0x11);
+        let calls = vec![Call {
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::from_static(&[0xaa, 0xbb]),
+        }];
+
+        let req = build_estimate_gas_request(
+            from,
+            42431,
+            5,
+            Address::repeat_byte(0x33),
+            &calls,
+            1_000_000_000,
+            100_000_000,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(req["from"], format!("{:#x}", from));
+        assert_eq!(req["chainId"], format!("{:#x}", 42431u64));
+        assert_eq!(req["nonceKey"], "0x0");
+        assert!(req.get("keyAuthorization").is_none());
+
+        let calls_json = req["calls"].as_array().unwrap();
+        assert_eq!(calls_json.len(), 1);
+    }
+
+    #[test]
+    fn test_build_estimate_gas_request_with_key_authorization() {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+
+        let auth = KeyAuthorization {
+            chain_id: 42431,
+            key_type: SignatureType::Secp256k1,
+            key_id: signer.address(),
+            expiry: Some(9999999999),
+            limits: None,
+        };
+        let inner_sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
+        let signed_auth = auth.into_signed(PrimitiveSignature::Secp256k1(inner_sig));
+
+        let calls = vec![Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::new(),
+        }];
+
+        let req = build_estimate_gas_request(
+            Address::ZERO,
+            42431,
+            0,
+            Address::ZERO,
+            &calls,
+            1_000_000_000,
+            100_000_000,
+            Some(&signed_auth),
+        )
+        .unwrap();
+
+        assert!(req.get("keyAuthorization").is_some());
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_with_prefix() {
+        assert_eq!(parse_gas_estimate("0x186a0").unwrap(), 105_000);
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_without_prefix() {
+        assert_eq!(parse_gas_estimate("186a0").unwrap(), 105_000);
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_small() {
+        assert_eq!(parse_gas_estimate("0x1").unwrap(), 5_001);
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_invalid() {
+        assert!(parse_gas_estimate("0xGGGG").is_err());
+    }
+
+    #[test]
+    fn test_build_charge_credential() {
+        use crate::protocol::core::Base64UrlJson;
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let tx_bytes = vec![0x76, 0xab, 0xcd];
+        let from: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let cred = build_charge_credential(&challenge, &tx_bytes, 42431, from);
+
+        assert!(cred.source.as_ref().unwrap().contains("42431"));
+        let tx_hex = cred
+            .payload
+            .get("signature")
+            .or_else(|| cred.payload.get("transaction"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(tx_hex.starts_with("0x"));
+    }
+
+    #[test]
+    fn test_build_tempo_tx() {
+        let calls = vec![Call {
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::new(),
+        }];
+
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls,
+            chain_id: 42431,
+            fee_token: Address::repeat_byte(0x33),
+            nonce: 5,
+            nonce_key: U256::ZERO,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
+            key_authorization: None,
+        });
+
+        assert_eq!(tx.chain_id, 42431);
+        assert_eq!(tx.nonce, 5);
+        assert_eq!(tx.gas_limit, 500_000);
+        assert_eq!(tx.calls.len(), 1);
+    }
+}

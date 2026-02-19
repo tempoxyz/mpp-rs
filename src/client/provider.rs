@@ -106,6 +106,7 @@ pub struct TempoProvider {
     signer: alloy_signer_local::PrivateKeySigner,
     rpc_url: reqwest::Url,
     client_id: Option<String>,
+    signing_mode: super::signing::TempoSigningMode,
 }
 
 #[cfg(feature = "tempo")]
@@ -127,6 +128,7 @@ impl TempoProvider {
             signer,
             rpc_url: url,
             client_id: None,
+            signing_mode: super::signing::TempoSigningMode::Direct,
         })
     }
 
@@ -134,6 +136,19 @@ impl TempoProvider {
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
         self
+    }
+
+    /// Set the signing mode (direct or keychain).
+    ///
+    /// Default is [`TempoSigningMode::Direct`].
+    pub fn with_signing_mode(mut self, mode: super::signing::TempoSigningMode) -> Self {
+        self.signing_mode = mode;
+        self
+    }
+
+    /// Get the signing mode.
+    pub fn signing_mode(&self) -> &super::signing::TempoSigningMode {
+        &self.signing_mode
     }
 
     /// Get a reference to the signer.
@@ -154,21 +169,21 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        use crate::protocol::core::PaymentPayload;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
-        use alloy::eips::Encodable2718;
         use alloy::primitives::{Bytes, TxKind, B256, U256};
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
         use tempo_alloy::TempoNetwork;
         use tempo_primitives::transaction::Call;
-        use tempo_primitives::TempoTransaction;
+
+        use super::signing;
+        use super::tx_builder;
 
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
-        let address = self.signer.address();
+        let from = self.signing_mode.from_address(self.signer.address());
         let fee_payer = charge.fee_payer();
 
         let provider =
@@ -190,7 +205,6 @@ impl PaymentProvider for TempoProvider {
         let amount = charge.amount_u256()?;
         let currency = charge.currency_address()?;
 
-        // Use user memo if valid 32-byte hex, otherwise auto-generate attribution memo.
         let memo: B256 = charge
             .memo()
             .and_then(|m| m.parse().ok())
@@ -209,8 +223,6 @@ impl PaymentProvider for TempoProvider {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| MppError::Http(format!("system clock error: {}", e)))?
                 .as_secs();
-            // Expiring nonce transactions require nonce=0. Replay protection
-            // comes from the valid_before window + tx hash, not the nonce value.
             (
                 EXPIRING_NONCE_KEY,
                 0u64,
@@ -218,7 +230,7 @@ impl PaymentProvider for TempoProvider {
             )
         } else {
             let n = provider
-                .get_transaction_count(address)
+                .get_transaction_count(from)
                 .await
                 .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
             (U256::ZERO, n, None)
@@ -229,57 +241,33 @@ impl PaymentProvider for TempoProvider {
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-        // Build a Tempo transaction (type 0x76).
-        // When fee_payer is true:
-        //   - fee_token is None (server chooses at co-sign time)
-        //   - fee_payer_signature is a placeholder (triggers skip_fee_token in signing hash)
-        //   - nonce_key = U256::MAX (expiring nonce)
-        //   - valid_before is set to now + 25s
-        // The server decodes this standard 0x76 tx, recovers the sender via
-        // ecrecover, then co-signs and broadcasts.
-        let tempo_tx = TempoTransaction {
+        let calls = vec![Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: Bytes::from(transfer_data),
+        }];
+
+        let tx = tx_builder::build_tempo_tx(tx_builder::TempoTxOptions {
+            calls,
             chain_id: expected_chain_id,
+            fee_token: currency,
             nonce,
             nonce_key,
             gas_limit: 1_000_000,
             max_fee_per_gas: gas_price,
             max_priority_fee_per_gas: gas_price,
-            fee_token: None,
-            fee_payer_signature: if fee_payer {
-                Some(alloy::primitives::Signature::new(
-                    U256::ZERO,
-                    U256::ZERO,
-                    false,
-                ))
-            } else {
-                None
-            },
+            fee_payer,
             valid_before,
-            calls: vec![Call {
-                to: TxKind::Call(currency),
-                value: U256::ZERO,
-                input: Bytes::from(transfer_data),
-            }],
-            ..Default::default()
-        };
+            key_authorization: self.signing_mode.key_authorization().cloned(),
+        });
 
-        use alloy::signers::SignerSync;
-        let sig_hash = tempo_tx.signature_hash();
-        let signature = self
-            .signer
-            .sign_hash_sync(&sig_hash)
-            .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+        let tx_bytes = signing::sign_and_encode_async(tx, &self.signer, &self.signing_mode).await?;
 
-        let signed_tx = tempo_tx.into_signed(signature.into());
-        let tx_bytes = signed_tx.encoded_2718();
-        let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
-
-        let echo = challenge.to_echo();
-
-        Ok(PaymentCredential::with_source(
-            echo,
-            format!("did:pkh:eip155:{}:{}", expected_chain_id, address),
-            PaymentPayload::transaction(signed_tx_hex),
+        Ok(tx_builder::build_charge_credential(
+            challenge,
+            &tx_bytes,
+            expected_chain_id,
+            from,
         ))
     }
 }

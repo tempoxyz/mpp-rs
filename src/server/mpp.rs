@@ -45,7 +45,7 @@ const DEFAULT_REALM: &str = "MPP Payment";
 ///
 /// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
 /// falling back to `"MPP Payment"`.
-fn detect_realm() -> String {
+pub(crate) fn detect_realm() -> String {
     for name in REALM_ENV_VARS {
         if let Ok(value) = std::env::var(name) {
             if !value.is_empty() {
