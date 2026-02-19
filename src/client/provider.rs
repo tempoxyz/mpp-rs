@@ -92,6 +92,14 @@ pub trait PaymentProvider: Clone + Send + Sync {
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
+/// Nonce key for expiring nonce transactions (fee payer mode).
+#[cfg(feature = "tempo")]
+const EXPIRING_NONCE_KEY: alloy::primitives::U256 = alloy::primitives::U256::MAX;
+
+/// Validity window (in seconds) for fee payer transactions.
+#[cfg(feature = "tempo")]
+const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+
 #[cfg(feature = "tempo")]
 #[derive(Clone)]
 pub struct TempoProvider {
@@ -150,7 +158,7 @@ impl PaymentProvider for TempoProvider {
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
         use alloy::eips::Encodable2718;
-        use alloy::primitives::{Bytes, TxKind, B256};
+        use alloy::primitives::{Bytes, TxKind, B256, U256};
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::sol_types::SolCall;
         use tempo_alloy::contracts::precompiles::tip20::ITIP20;
@@ -161,6 +169,7 @@ impl PaymentProvider for TempoProvider {
         let charge: ChargeRequest = challenge.request.decode()?;
         let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
         let address = self.signer.address();
+        let fee_payer = charge.fee_payer();
 
         let provider =
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
@@ -193,26 +202,62 @@ impl PaymentProvider for TempoProvider {
         let transfer_data =
             ITIP20::transferWithMemoCall::new((recipient, amount, memo)).abi_encode();
 
-        let nonce = provider
-            .get_transaction_count(address)
-            .await
-            .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
+        // Fee payer mode: use expiring nonces to avoid nonce collisions
+        // when the server broadcasts on the client's behalf.
+        let (nonce_key, nonce, valid_before) = if fee_payer {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| MppError::Http(format!("system clock error: {}", e)))?
+                .as_secs();
+            // Expiring nonce transactions require nonce=0. Replay protection
+            // comes from the valid_before window + tx hash, not the nonce value.
+            (
+                EXPIRING_NONCE_KEY,
+                0u64,
+                Some(now + FEE_PAYER_VALID_BEFORE_SECS),
+            )
+        } else {
+            let n = provider
+                .get_transaction_count(address)
+                .await
+                .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
+            (U256::ZERO, n, None)
+        };
 
         let gas_price = provider
             .get_gas_price()
             .await
             .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-        // Build a Tempo transaction (type 0x76) for proper on-chain processing.
+        // Build a Tempo transaction (type 0x76).
+        // When fee_payer is true:
+        //   - fee_token is None (server chooses at co-sign time)
+        //   - fee_payer_signature is a placeholder (triggers skip_fee_token in signing hash)
+        //   - nonce_key = U256::MAX (expiring nonce)
+        //   - valid_before is set to now + 25s
+        // The server decodes this standard 0x76 tx, recovers the sender via
+        // ecrecover, then co-signs and broadcasts.
         let tempo_tx = TempoTransaction {
             chain_id: expected_chain_id,
             nonce,
+            nonce_key,
             gas_limit: 1_000_000,
             max_fee_per_gas: gas_price,
             max_priority_fee_per_gas: gas_price,
+            fee_token: None,
+            fee_payer_signature: if fee_payer {
+                Some(alloy::primitives::Signature::new(
+                    U256::ZERO,
+                    U256::ZERO,
+                    false,
+                ))
+            } else {
+                None
+            },
+            valid_before,
             calls: vec![Call {
                 to: TxKind::Call(currency),
-                value: alloy::primitives::U256::ZERO,
+                value: U256::ZERO,
                 input: Bytes::from(transfer_data),
             }],
             ..Default::default()
