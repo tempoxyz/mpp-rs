@@ -111,3 +111,312 @@ pub async fn sign_and_encode_async(
     let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
     Ok(signed_tx.encoded_2718())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Bytes, TxKind, U256};
+    use alloy::signers::local::PrivateKeySigner;
+    use tempo_primitives::transaction::{AASigned, Call, TempoTransaction};
+
+    fn test_signer() -> PrivateKeySigner {
+        "0x1234567890123456789012345678901234567890123456789012345678901234"
+            .parse()
+            .unwrap()
+    }
+
+    fn test_tx() -> TempoTransaction {
+        TempoTransaction {
+            chain_id: 42431,
+            nonce: 1,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_token: Some(Address::repeat_byte(0x33)),
+            calls: vec![Call {
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::ZERO,
+                input: Bytes::from_static(&[0xaa, 0xbb]),
+            }],
+            nonce_key: U256::ZERO,
+            key_authorization: None,
+            access_list: Default::default(),
+            fee_payer_signature: None,
+            valid_before: None,
+            valid_after: None,
+            tempo_authorization_list: vec![],
+        }
+    }
+
+    // --- TempoSigningMode ---
+
+    #[test]
+    fn test_default_is_direct() {
+        assert!(matches!(
+            TempoSigningMode::default(),
+            TempoSigningMode::Direct
+        ));
+    }
+
+    #[test]
+    fn test_from_address_direct() {
+        let mode = TempoSigningMode::Direct;
+        let signer_addr = Address::repeat_byte(0x01);
+        assert_eq!(mode.from_address(signer_addr), signer_addr);
+    }
+
+    #[test]
+    fn test_from_address_keychain() {
+        let wallet = Address::repeat_byte(0xAA);
+        let mode = TempoSigningMode::Keychain {
+            wallet,
+            key_authorization: None,
+        };
+        let signer_addr = Address::repeat_byte(0x01);
+        assert_eq!(mode.from_address(signer_addr), wallet);
+    }
+
+    #[test]
+    fn test_key_authorization_direct_returns_none() {
+        let mode = TempoSigningMode::Direct;
+        assert!(mode.key_authorization().is_none());
+    }
+
+    #[test]
+    fn test_key_authorization_keychain_none() {
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::ZERO,
+            key_authorization: None,
+        };
+        assert!(mode.key_authorization().is_none());
+    }
+
+    #[test]
+    fn test_key_authorization_keychain_some() {
+        use alloy::signers::SignerSync;
+        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+
+        let signer = test_signer();
+        let auth = KeyAuthorization {
+            chain_id: 42431,
+            key_type: SignatureType::Secp256k1,
+            key_id: signer.address(),
+            expiry: Some(9999999999),
+            limits: None,
+        };
+        let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
+        let signed = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
+
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::ZERO,
+            key_authorization: Some(Box::new(signed)),
+        };
+        assert!(mode.key_authorization().is_some());
+    }
+
+    // --- sign_and_encode (sync) ---
+
+    #[test]
+    fn test_sign_and_encode_direct_produces_valid_2718() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let tx = test_tx();
+        let bytes = sign_and_encode(tx, &signer, &TempoSigningMode::Direct).unwrap();
+
+        // Must start with Tempo tx type 0x76
+        assert_eq!(bytes[0], 0x76, "should start with Tempo tx type byte");
+
+        // Must be decodable back
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.tx().chain_id, 42431);
+        assert_eq!(decoded.tx().nonce, 1);
+        assert_eq!(decoded.tx().gas_limit, 500_000);
+    }
+
+    #[test]
+    fn test_sign_and_encode_keychain_produces_valid_2718() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let wallet = Address::repeat_byte(0xAA);
+        let mode = TempoSigningMode::Keychain {
+            wallet,
+            key_authorization: None,
+        };
+        let tx = test_tx();
+        let bytes = sign_and_encode(tx, &signer, &mode).unwrap();
+
+        assert_eq!(bytes[0], 0x76);
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.tx().chain_id, 42431);
+    }
+
+    #[test]
+    fn test_sign_and_encode_keychain_larger_than_direct() {
+        let signer = test_signer();
+        let direct_bytes = sign_and_encode(test_tx(), &signer, &TempoSigningMode::Direct).unwrap();
+
+        let keychain_bytes = sign_and_encode(
+            test_tx(),
+            &signer,
+            &TempoSigningMode::Keychain {
+                wallet: Address::repeat_byte(0xAA),
+                key_authorization: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            keychain_bytes.len() > direct_bytes.len(),
+            "keychain envelope should be larger than direct signature"
+        );
+    }
+
+    #[test]
+    fn test_sign_and_encode_deterministic() {
+        let signer = test_signer();
+        let mode = TempoSigningMode::Direct;
+        let bytes1 = sign_and_encode(test_tx(), &signer, &mode).unwrap();
+        let bytes2 = sign_and_encode(test_tx(), &signer, &mode).unwrap();
+        assert_eq!(bytes1, bytes2, "same tx + signer should produce same bytes");
+    }
+
+    #[test]
+    fn test_sign_and_encode_different_signers_produce_different_bytes() {
+        let signer1 = test_signer();
+        let signer2 = PrivateKeySigner::random();
+        let mode = TempoSigningMode::Direct;
+        let bytes1 = sign_and_encode(test_tx(), &signer1, &mode).unwrap();
+        let bytes2 = sign_and_encode(test_tx(), &signer2, &mode).unwrap();
+        assert_ne!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn test_sign_and_encode_preserves_tx_fields() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let bytes = sign_and_encode(test_tx(), &signer, &TempoSigningMode::Direct).unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        let tx = decoded.tx();
+
+        assert_eq!(tx.chain_id, 42431);
+        assert_eq!(tx.nonce, 1);
+        assert_eq!(tx.gas_limit, 500_000);
+        assert_eq!(tx.max_fee_per_gas, 1_000_000_000);
+        assert_eq!(tx.max_priority_fee_per_gas, 100_000_000);
+        assert_eq!(tx.calls.len(), 1);
+        assert_eq!(tx.calls[0].input.as_ref(), &[0xaa, 0xbb]);
+    }
+
+    // --- sign_and_encode_async ---
+
+    #[tokio::test]
+    async fn test_sign_and_encode_async_direct() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let bytes = sign_and_encode_async(test_tx(), &signer, &TempoSigningMode::Direct)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes[0], 0x76);
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.tx().chain_id, 42431);
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_encode_async_keychain() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xBB),
+            key_authorization: None,
+        };
+        let bytes = sign_and_encode_async(test_tx(), &signer, &mode)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes[0], 0x76);
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.tx().chain_id, 42431);
+    }
+
+    #[tokio::test]
+    async fn test_sync_and_async_produce_same_output() {
+        let signer = test_signer();
+        let mode = TempoSigningMode::Direct;
+        let sync_bytes = sign_and_encode(test_tx(), &signer, &mode).unwrap();
+        let async_bytes = sign_and_encode_async(test_tx(), &signer, &mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_bytes, async_bytes,
+            "sync and async should produce identical output"
+        );
+    }
+
+    // --- sign_and_encode with key_authorization in tx ---
+
+    #[test]
+    fn test_sign_and_encode_with_key_authorization_in_tx() {
+        use alloy::eips::eip2718::Decodable2718;
+        use alloy::signers::SignerSync;
+        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+
+        let signer = test_signer();
+        let auth = KeyAuthorization {
+            chain_id: 42431,
+            key_type: SignatureType::Secp256k1,
+            key_id: signer.address(),
+            expiry: Some(9999999999),
+            limits: None,
+        };
+        let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
+        let signed_auth = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
+
+        let mut tx = test_tx();
+        tx.key_authorization = Some(signed_auth);
+
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAA),
+            key_authorization: None,
+        };
+
+        let bytes = sign_and_encode(tx, &signer, &mode).unwrap();
+        assert_eq!(bytes[0], 0x76);
+
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert!(
+            decoded.tx().key_authorization.is_some(),
+            "key_authorization should survive encode/decode roundtrip"
+        );
+    }
+
+    // --- Multiple calls ---
+
+    #[test]
+    fn test_sign_and_encode_multiple_calls() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = test_signer();
+        let mut tx = test_tx();
+        tx.calls.push(Call {
+            to: TxKind::Call(Address::repeat_byte(0x44)),
+            value: U256::from(42u64),
+            input: Bytes::from_static(&[0xcc, 0xdd]),
+        });
+        tx.calls.push(Call {
+            to: TxKind::Call(Address::repeat_byte(0x55)),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        });
+
+        let bytes = sign_and_encode(tx, &signer, &TempoSigningMode::Direct).unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert_eq!(decoded.tx().calls.len(), 3);
+        assert_eq!(decoded.tx().calls[1].value, U256::from(42u64));
+    }
+}

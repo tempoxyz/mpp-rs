@@ -183,6 +183,8 @@ mod tests {
     use super::*;
     use alloy::primitives::TxKind;
 
+    // --- build_estimate_gas_request ---
+
     #[test]
     fn test_build_estimate_gas_request_basic() {
         let from = Address::repeat_byte(0x11);
@@ -255,6 +257,81 @@ mod tests {
     }
 
     #[test]
+    fn test_build_estimate_gas_request_multiple_calls() {
+        let calls = vec![
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x01)),
+                value: U256::ZERO,
+                input: alloy::primitives::Bytes::new(),
+            },
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x02)),
+                value: U256::from(42u64),
+                input: alloy::primitives::Bytes::from_static(&[0xff]),
+            },
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x03)),
+                value: U256::ZERO,
+                input: alloy::primitives::Bytes::new(),
+            },
+        ];
+
+        let req = build_estimate_gas_request(
+            Address::ZERO,
+            4217,
+            0,
+            Address::ZERO,
+            &calls,
+            1_000_000_000,
+            100_000_000,
+            None,
+        )
+        .unwrap();
+
+        let calls_json = req["calls"].as_array().unwrap();
+        assert_eq!(calls_json.len(), 3);
+        assert_eq!(calls_json[1]["value"], format!("{:#x}", 42u64));
+        assert_eq!(calls_json[1]["input"], "0xff");
+    }
+
+    #[test]
+    fn test_build_estimate_gas_request_hex_formatting() {
+        let from = Address::repeat_byte(0x11);
+        let fee_token = Address::repeat_byte(0x22);
+        let calls = vec![Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::new(),
+        }];
+
+        let req = build_estimate_gas_request(
+            from,
+            4217,
+            10,
+            fee_token,
+            &calls,
+            2_000_000_000,
+            500_000_000,
+            None,
+        )
+        .unwrap();
+
+        // All numeric fields should be hex-formatted
+        assert!(req["nonce"].as_str().unwrap().starts_with("0x"));
+        assert!(req["maxFeePerGas"].as_str().unwrap().starts_with("0x"));
+        assert!(req["maxPriorityFeePerGas"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+        assert!(req["feeToken"].as_str().unwrap().starts_with("0x"));
+        assert!(req["chainId"].as_str().unwrap().starts_with("0x"));
+        // Input in calls should be hex-formatted
+        assert!(req["calls"][0]["input"].as_str().unwrap().starts_with("0x"));
+    }
+
+    // --- parse_gas_estimate ---
+
+    #[test]
     fn test_parse_gas_estimate_with_prefix() {
         assert_eq!(parse_gas_estimate("0x186a0").unwrap(), 105_000);
     }
@@ -273,6 +350,19 @@ mod tests {
     fn test_parse_gas_estimate_invalid() {
         assert!(parse_gas_estimate("0xGGGG").is_err());
     }
+
+    #[test]
+    fn test_parse_gas_estimate_empty() {
+        assert!(parse_gas_estimate("").is_err());
+    }
+
+    #[test]
+    fn test_parse_gas_estimate_large_value() {
+        // 1_000_000 = 0xf4240 → with buffer = 1_005_000
+        assert_eq!(parse_gas_estimate("0xf4240").unwrap(), 1_005_000);
+    }
+
+    // --- build_charge_credential ---
 
     #[test]
     fn test_build_charge_credential() {
@@ -305,6 +395,85 @@ mod tests {
     }
 
     #[test]
+    fn test_build_charge_credential_did_format() {
+        use crate::protocol::core::Base64UrlJson;
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let from: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"
+            .parse()
+            .unwrap();
+        let cred = build_charge_credential(&challenge, &[0x76, 0xab], 4217, from);
+
+        let did = cred.source.as_ref().unwrap();
+        assert!(
+            did.starts_with("did:pkh:eip155:4217:"),
+            "DID should use eip155 format with chain ID"
+        );
+    }
+
+    #[test]
+    fn test_build_charge_credential_tx_hex_encoding() {
+        use crate::protocol::core::Base64UrlJson;
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let tx_bytes = vec![0x76, 0xab, 0xcd, 0xef];
+        let cred = build_charge_credential(&challenge, &tx_bytes, 42431, Address::ZERO);
+
+        let tx_hex = cred
+            .payload
+            .get("signature")
+            .or_else(|| cred.payload.get("transaction"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+
+        assert_eq!(
+            tx_hex, "0x76abcdef",
+            "tx bytes should be hex-encoded with 0x prefix"
+        );
+    }
+
+    #[test]
+    fn test_build_charge_credential_echoes_challenge() {
+        use crate::protocol::core::Base64UrlJson;
+        let challenge = PaymentChallenge {
+            id: "unique-challenge-id".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+
+        let cred = build_charge_credential(&challenge, &[0x76], 42431, Address::ZERO);
+
+        // The echo should contain the challenge ID
+        let echo_str = serde_json::to_string(&cred.challenge).unwrap();
+        assert!(echo_str.contains("unique-challenge-id"));
+    }
+
+    // --- build_tempo_tx ---
+
+    #[test]
     fn test_build_tempo_tx() {
         let calls = vec![Call {
             to: TxKind::Call(Address::repeat_byte(0x22)),
@@ -329,6 +498,80 @@ mod tests {
         assert_eq!(tx.chain_id, 42431);
         assert_eq!(tx.nonce, 5);
         assert_eq!(tx.gas_limit, 500_000);
+        assert_eq!(tx.max_fee_per_gas, 1_000_000_000);
+        assert_eq!(tx.max_priority_fee_per_gas, 100_000_000);
+        assert_eq!(tx.fee_token, Some(Address::repeat_byte(0x33)));
         assert_eq!(tx.calls.len(), 1);
+        assert_eq!(tx.nonce_key, U256::ZERO);
+        assert!(tx.key_authorization.is_none());
+        assert!(tx.fee_payer_signature.is_none());
+        assert!(tx.valid_before.is_none());
+        assert!(tx.valid_after.is_none());
+        assert!(tx.tempo_authorization_list.is_empty());
+    }
+
+    #[test]
+    fn test_build_tempo_tx_with_key_authorization() {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+
+        let signer: PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+
+        let auth = KeyAuthorization {
+            chain_id: 42431,
+            key_type: SignatureType::Secp256k1,
+            key_id: signer.address(),
+            expiry: Some(9999999999),
+            limits: None,
+        };
+        let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
+        let signed_auth = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
+
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls: vec![],
+            chain_id: 42431,
+            fee_token: Address::ZERO,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            key_authorization: Some(signed_auth),
+        });
+
+        assert!(tx.key_authorization.is_some());
+    }
+
+    #[test]
+    fn test_build_tempo_tx_multiple_calls() {
+        let calls = vec![
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x01)),
+                value: U256::ZERO,
+                input: alloy::primitives::Bytes::new(),
+            },
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x02)),
+                value: U256::from(100u64),
+                input: alloy::primitives::Bytes::from_static(&[0xab]),
+            },
+        ];
+
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls,
+            chain_id: 4217,
+            fee_token: Address::repeat_byte(0x33),
+            nonce: 0,
+            gas_limit: 2_000_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            key_authorization: None,
+        });
+
+        assert_eq!(tx.calls.len(), 2);
+        assert_eq!(tx.chain_id, 4217);
+        assert_eq!(tx.calls[1].value, U256::from(100u64));
     }
 }

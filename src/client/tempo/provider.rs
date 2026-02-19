@@ -238,6 +238,43 @@ mod tests {
     }
 
     #[test]
+    fn test_tempo_provider_default_signing_mode() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert!(matches!(provider.signing_mode(), TempoSigningMode::Direct));
+    }
+
+    #[test]
+    fn test_tempo_provider_with_signing_mode() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let wallet: alloy::primitives::Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet,
+                key_authorization: None,
+            });
+
+        assert!(matches!(
+            provider.signing_mode(),
+            TempoSigningMode::Keychain { .. }
+        ));
+    }
+
+    #[test]
+    fn test_tempo_provider_supports() {
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        assert!(provider.supports("tempo", "charge"));
+        assert!(!provider.supports("tempo", "session"));
+        assert!(!provider.supports("stripe", "charge"));
+    }
+
+    #[test]
     fn test_auto_generated_memo_is_mpp_memo() {
         let memo = crate::tempo::attribution::encode("api.example.com", Some("my-app"));
         assert!(crate::tempo::attribution::is_mpp_memo(&memo));
