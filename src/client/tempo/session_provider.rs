@@ -856,4 +856,151 @@ mod tests {
             .insert("key".to_string(), entry);
         assert_eq!(cloned.channels().len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_send_voucher_missing_challenge() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let client = reqwest::Client::new();
+        let result = provider
+            .send_voucher(&client, "https://example.com/pay", "0xdeadbeef", 1000)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no challenge available"),
+            "expected 'no challenge available', got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_voucher_missing_channel_id_mapping() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+        );
+        *provider.last_challenge.lock().unwrap() = Some(challenge);
+
+        let client = reqwest::Client::new();
+        let result = provider
+            .send_voucher(&client, "https://example.com/pay", "0xnosuchid", 1000)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no channel found"),
+            "expected 'no channel found', got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_no_challenge_returns_none() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let client = reqwest::Client::new();
+        let result = provider.close(&client, "https://example.com/pay").await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_close_no_open_channel_returns_none() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+        );
+        *provider.last_challenge.lock().unwrap() = Some(challenge);
+
+        let client = reqwest::Client::new();
+        let result = provider.close(&client, "https://example.com/pay").await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_send_voucher_updates_cumulative_if_higher() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let entry = ChannelEntry {
+            channel_id: B256::repeat_byte(0xAB),
+            salt: B256::ZERO,
+            cumulative_amount: 1000,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("key".to_string(), entry);
+
+        assert_eq!(provider.cumulative(), 1000);
+
+        // Update cumulative to a higher value
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut("key")
+            .unwrap()
+            .cumulative_amount = 2000;
+
+        assert_eq!(provider.cumulative(), 2000);
+    }
+
+    #[test]
+    fn test_channel_registry_multiple_channels() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let opened_entry = ChannelEntry {
+            channel_id: B256::repeat_byte(0x01),
+            salt: B256::ZERO,
+            cumulative_amount: 5000,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: true,
+        };
+        let unopened_entry = ChannelEntry {
+            channel_id: B256::repeat_byte(0x02),
+            salt: B256::ZERO,
+            cumulative_amount: 3000,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened: false,
+        };
+
+        {
+            let mut channels = provider.channels.lock().unwrap();
+            channels.insert("key-a".to_string(), opened_entry);
+            channels.insert("key-b".to_string(), unopened_entry);
+        }
+
+        assert_eq!(provider.channels().len(), 2);
+        assert_eq!(
+            provider.cumulative(),
+            5000,
+            "cumulative should only count the opened channel"
+        );
+    }
 }
