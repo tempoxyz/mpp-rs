@@ -526,6 +526,263 @@ mod tests {
         assert_eq!(roundtrip.tx_hash, None);
     }
 
+    // -- serve() metered streaming tests --
+
+    #[cfg(feature = "tempo")]
+    fn test_channel_state(channel_id: &str, voucher_amount: u128, deposit: u128) -> crate::protocol::methods::tempo::session_method::ChannelState {
+        use crate::protocol::methods::tempo::session_method::ChannelState;
+        ChannelState {
+            channel_id: channel_id.to_string(),
+            chain_id: 42431,
+            escrow_contract: "0x5555555555555555555555555555555555555555".parse().unwrap(),
+            payer: "0x1111111111111111111111111111111111111111".parse().unwrap(),
+            payee: "0x2222222222222222222222222222222222222222".parse().unwrap(),
+            token: "0x3333333333333333333333333333333333333333".parse().unwrap(),
+            authorized_signer: "0x4444444444444444444444444444444444444444".parse().unwrap(),
+            deposit,
+            settled_on_chain: 0,
+            highest_voucher_amount: voucher_amount,
+            highest_voucher_signature: None,
+            spent: 0,
+            units: 0,
+            finalized: false,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    async fn collect_stream(
+        mut stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = String> + Send>>,
+    ) -> Vec<String> {
+        let mut events = Vec::new();
+        while let Some(item) = next_item(&mut stream).await {
+            events.push(item);
+        }
+        events
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_balance_sufficient() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_ok";
+        // 3 items × tick_cost 100 = 300 needed; voucher has 1000
+        store.insert(channel_id, test_channel_state(channel_id, 1000, 5000));
+
+        let gen = Box::pin(async_stream::stream! {
+            yield "hello".to_string();
+            yield "world".to_string();
+            yield "end".to_string();
+        });
+
+        let stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: channel_id.to_string(),
+            challenge_id: "ch-test".to_string(),
+            tick_cost: 100,
+            generate: gen,
+            poll_interval_ms: 10,
+        });
+
+        let events = collect_stream(stream).await;
+
+        // 3 message events + 1 receipt = 4
+        assert_eq!(events.len(), 4);
+        for i in 0..3 {
+            assert!(events[i].starts_with("event: message\ndata: "), "event {i} should be a message");
+        }
+        assert_eq!(parse_event(&events[0]), Some(SseEvent::Message("hello".into())));
+        assert_eq!(parse_event(&events[1]), Some(SseEvent::Message("world".into())));
+        assert_eq!(parse_event(&events[2]), Some(SseEvent::Message("end".into())));
+
+        // Verify receipt
+        let receipt_event = parse_event(&events[3]);
+        assert!(matches!(receipt_event, Some(SseEvent::PaymentReceipt(_))));
+        if let Some(SseEvent::PaymentReceipt(r)) = receipt_event {
+            assert_eq!(r.challenge_id, "ch-test");
+            assert_eq!(r.channel_id, channel_id);
+            assert_eq!(r.accepted_cumulative, "1000");
+            assert_eq!(r.spent, "300");
+            assert_eq!(r.units, Some(3));
+        }
+
+        // Verify store accounting
+        let ch = store.get_channel_sync(channel_id).unwrap();
+        assert_eq!(ch.spent, 300);
+        assert_eq!(ch.units, 3);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_empty_generator() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_empty";
+        store.insert(channel_id, test_channel_state(channel_id, 1000, 5000));
+
+        let gen = Box::pin(async_stream::stream! {
+            if false { yield String::new(); }
+        });
+
+        let stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: channel_id.to_string(),
+            challenge_id: "ch-empty".to_string(),
+            tick_cost: 100,
+            generate: gen,
+            poll_interval_ms: 10,
+        });
+
+        let events = collect_stream(stream).await;
+
+        // Only the final receipt
+        assert_eq!(events.len(), 1);
+        let receipt_event = parse_event(&events[0]);
+        assert!(matches!(receipt_event, Some(SseEvent::PaymentReceipt(_))));
+        if let Some(SseEvent::PaymentReceipt(r)) = receipt_event {
+            assert_eq!(r.spent, "0");
+            assert_eq!(r.units, Some(0));
+        }
+
+        let ch = store.get_channel_sync(channel_id).unwrap();
+        assert_eq!(ch.spent, 0);
+        assert_eq!(ch.units, 0);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_balance_exhausted_then_topup() {
+        use crate::protocol::methods::tempo::session_method::{ChannelState, ChannelStore, InMemoryChannelStore};
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_exhaust";
+        // Only enough for 2 ticks (200), third will exhaust
+        store.insert(channel_id, test_channel_state(channel_id, 200, 5000));
+
+        // Use a channel to control the generator so we can observe intermediate events
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10);
+        let gen = Box::pin(async_stream::stream! {
+            while let Some(val) = rx.recv().await {
+                yield val;
+            }
+        });
+
+        let store2 = store.clone();
+        let cid = channel_id.to_string();
+        let handle = tokio::spawn(async move {
+            let stream = serve(ServeOptions {
+                store: store2,
+                channel_id: cid,
+                challenge_id: "ch-exhaust".to_string(),
+                tick_cost: 100,
+                generate: gen,
+                poll_interval_ms: 10,
+            });
+            collect_stream(stream).await
+        });
+
+        // Send 2 items that will succeed
+        tx.send("a".to_string()).await.unwrap();
+        tx.send("b".to_string()).await.unwrap();
+        // Send 3rd item — this will trigger need-voucher
+        tx.send("c".to_string()).await.unwrap();
+
+        // Wait for need-voucher to be emitted (store spent should be 200)
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Top up: increase highest_voucher_amount
+        store.update_channel(
+            channel_id,
+            Box::new(|current: Option<ChannelState>| {
+                let state = current.unwrap();
+                Ok(Some(ChannelState {
+                    highest_voucher_amount: 500,
+                    ..state
+                }))
+            }),
+        ).await.unwrap();
+
+        // Send one more item then close
+        tx.send("d".to_string()).await.unwrap();
+        drop(tx);
+
+        let events = handle.await.unwrap();
+
+        // Verify event sequence: msg(a), msg(b), need-voucher, msg(c), msg(d), receipt
+        // There may be multiple need-voucher events if poll fires before top-up
+        let mut messages = Vec::new();
+        let mut need_vouchers = Vec::new();
+        let mut receipts = Vec::new();
+        for e in &events {
+            match parse_event(e) {
+                Some(SseEvent::Message(m)) => messages.push(m),
+                Some(SseEvent::PaymentNeedVoucher(nv)) => need_vouchers.push(nv),
+                Some(SseEvent::PaymentReceipt(r)) => receipts.push(r),
+                None => {}
+            }
+        }
+
+        assert_eq!(messages, vec!["a", "b", "c", "d"]);
+        assert!(!need_vouchers.is_empty(), "should have emitted at least one need-voucher event");
+        // Verify need-voucher content
+        let nv = &need_vouchers[0];
+        assert_eq!(nv.channel_id, channel_id);
+        assert_eq!(nv.deposit, "5000");
+
+        assert_eq!(receipts.len(), 1);
+        let r = &receipts[0];
+        assert_eq!(r.challenge_id, "ch-exhaust");
+        assert_eq!(r.spent, "400"); // 4 messages × 100
+        assert_eq!(r.units, Some(4));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_deduct_accounting() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_accounting";
+        store.insert(channel_id, test_channel_state(channel_id, 10_000, 50_000));
+
+        let gen = Box::pin(async_stream::stream! {
+            for i in 0..5 {
+                yield format!("item-{i}");
+            }
+        });
+
+        let stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: channel_id.to_string(),
+            challenge_id: "ch-acc".to_string(),
+            tick_cost: 250,
+            generate: gen,
+            poll_interval_ms: 10,
+        });
+
+        let events = collect_stream(stream).await;
+
+        // 5 messages + 1 receipt
+        assert_eq!(events.len(), 6);
+
+        // Verify final store state: 5 × 250 = 1250 spent, 5 units
+        let ch = store.get_channel_sync(channel_id).unwrap();
+        assert_eq!(ch.spent, 1250);
+        assert_eq!(ch.units, 5);
+
+        // Verify receipt matches
+        if let Some(SseEvent::PaymentReceipt(r)) = parse_event(&events[5]) {
+            assert_eq!(r.spent, "1250");
+            assert_eq!(r.units, Some(5));
+            assert_eq!(r.accepted_cumulative, "10000");
+        } else {
+            panic!("last event should be a receipt");
+        }
+    }
+
     #[test]
     fn test_need_voucher_event_serialization() {
         let event = NeedVoucherEvent {

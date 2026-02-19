@@ -498,4 +498,109 @@ mod tests {
         assert_eq!(parsed.challenge_id, "ch_abc");
         assert!(parsed.receipt.is_success());
     }
+
+    // ---- Full MCP payment roundtrip ----
+
+    #[test]
+    fn test_mcp_payment_roundtrip() {
+        let secret = "mcp-test-secret";
+
+        // 1. Server creates an HMAC-bound challenge
+        let challenge = PaymentChallenge::with_secret_key(
+            secret,
+            "api.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&json!({"amount": "1000", "currency": "USD"})).unwrap(),
+        );
+        assert!(challenge.verify(secret));
+
+        // 2. Server builds MCP payment-required error
+        let error = payment_required_error(&challenge);
+        let error_json = serde_json::to_value(&error).unwrap();
+
+        // 3. Client detects payment required
+        assert!(is_payment_required(&error_json));
+
+        // 4. Client extracts challenges
+        let challenges = extract_challenges(&error_json).unwrap();
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(challenges[0].id, challenge.id);
+        assert_eq!(challenges[0].method.as_str(), "tempo");
+        assert_eq!(challenges[0].intent.as_str(), "charge");
+
+        // 5. Client "pays" — build credential from echoed challenge
+        let received = &challenges[0];
+        let credential = PaymentCredential::with_source(
+            received.to_echo(),
+            "did:pkh:eip155:42161:0xabc",
+            PaymentPayload::hash("0xtxhash_roundtrip"),
+        );
+
+        // 6. Client attaches credential to request params
+        let mut params = json!({"name": "premium_tool", "arguments": {"query": "test"}});
+        attach_credential(&mut params, &credential);
+        assert!(params["_meta"][CREDENTIAL_META_KEY].is_object());
+
+        // 7. Server extracts credential from params._meta
+        let meta = params.get("_meta").unwrap();
+        let extracted = extract_credential(meta).unwrap();
+        assert_eq!(extracted.challenge.id, challenge.id);
+        assert_eq!(extracted.challenge.realm, "api.example.com");
+        assert_eq!(
+            extracted.source.as_deref(),
+            Some("did:pkh:eip155:42161:0xabc")
+        );
+
+        // 8. Server verifies the HMAC-bound challenge ID
+        let echoed_challenge = PaymentChallenge {
+            id: extracted.challenge.id.clone(),
+            realm: extracted.challenge.realm.clone(),
+            method: extracted.challenge.method.clone(),
+            intent: extracted.challenge.intent.clone(),
+            request: Base64UrlJson::from_raw(extracted.challenge.request.clone()),
+            expires: None,
+            description: None,
+            digest: None,
+        };
+        assert!(echoed_challenge.verify(secret));
+
+        // 9. Server creates receipt and attaches to result
+        let receipt = Receipt::success("tempo", "0xtxhash_roundtrip");
+        let mut result = json!({"content": [{"type": "text", "text": "paid response"}]});
+        attach_receipt(&mut result, &receipt, &challenge.id);
+
+        // 10. Assert final result has receipt in _meta
+        let receipt_value = &result["_meta"][RECEIPT_META_KEY];
+        assert_eq!(receipt_value["status"], "success");
+        assert_eq!(receipt_value["method"], "tempo");
+        assert_eq!(receipt_value["reference"], "0xtxhash_roundtrip");
+        assert_eq!(receipt_value["challengeId"], challenge.id);
+        // Original content preserved
+        assert_eq!(result["content"][0]["text"], "paid response");
+
+        // Deserialize as McpReceipt to verify structure
+        let mcp_receipt: McpReceipt =
+            serde_json::from_value(receipt_value.clone()).unwrap();
+        assert_eq!(mcp_receipt.challenge_id, challenge.id);
+        assert!(mcp_receipt.receipt.is_success());
+    }
+
+    // ---- Verification-failed error code ----
+
+    #[test]
+    fn test_verification_failed_code_not_payment_required() {
+        let error = json!({
+            "code": PAYMENT_VERIFICATION_FAILED_CODE,
+            "message": "Payment Verification Failed",
+            "data": {
+                "httpStatus": 403,
+                "reason": "invalid signature"
+            }
+        });
+        // -32043 is NOT -32042, so is_payment_required must return false
+        assert!(!is_payment_required(&error));
+        // extract_challenges should still work if data.challenges is present
+        assert!(extract_challenges(&error).is_none());
+    }
 }
