@@ -1,6 +1,6 @@
 //! ABI encoding helpers for Tempo token operations.
 //!
-//! Provides encode functions for TIP-20 transfers, ERC20 approvals,
+//! Provides encode functions for TIP-20 transfers, approvals,
 //! and DEX swap operations.
 
 use alloy::primitives::{Address, Bytes, U256};
@@ -38,7 +38,7 @@ pub fn encode_transfer(recipient: Address, amount: U256, memo: Option<[u8; 32]>)
     }
 }
 
-/// Encode an ERC20 approve call.
+/// Encode a TIP-20 approve call.
 pub fn encode_approve(spender: Address, amount: U256) -> Bytes {
     let call = approveCall { spender, amount };
     Bytes::from(call.abi_encode())

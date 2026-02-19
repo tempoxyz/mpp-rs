@@ -3,6 +3,7 @@
 //! Contains the Tempo payment providers, transaction building,
 //! signing strategies, charge builder, and channel operations.
 
+pub mod balance;
 pub mod channel_ops;
 pub mod charge;
 mod error;
@@ -13,6 +14,7 @@ pub mod signing;
 pub mod swap;
 pub mod tx_builder;
 
+pub use balance::{effective_capacity, query_token_balance};
 pub use channel_ops::ChannelEntry;
 pub use charge::{SignOptions, SignedTempoCharge, TempoCharge};
 pub use error::TempoClientError;
