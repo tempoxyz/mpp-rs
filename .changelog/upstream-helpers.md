@@ -10,5 +10,4 @@ Added client and protocol helpers upstreamed from presto:
 - `PaymentChallenge::validate_for_charge()` and `validate_for_session()` for common challenge validation
 - `network()` convenience methods on `TempoChargeExt` and `TempoSessionExt`
 - `parse_memo_bytes()` utility for hex memo string to 32-byte array conversion
-- `SwapInfo` struct with slippage calculation in `client::tempo::swap`
 - `extract_tx_hash()` utility for extracting transaction hashes from base64url receipts

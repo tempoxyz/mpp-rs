@@ -96,7 +96,6 @@
 //! assert_eq!(MODERATO_CHAIN_ID, 42431);
 //! ```
 
-pub mod abi;
 pub mod charge;
 pub mod network;
 pub mod session;
@@ -110,7 +109,6 @@ pub mod method;
 #[cfg(feature = "server")]
 pub mod session_method;
 
-pub use abi::{encode_approve, encode_swap_exact_amount_out, encode_transfer, DEX_ADDRESS};
 pub use charge::TempoChargeExt;
 pub use network::TempoNetwork;
 pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};

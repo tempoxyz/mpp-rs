@@ -3,14 +3,9 @@
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
+use super::charge::SignOptions;
 use super::signing::TempoSigningMode;
 use crate::client::PaymentProvider;
-
-/// Nonce key for expiring nonce transactions (fee payer mode).
-const EXPIRING_NONCE_KEY: alloy::primitives::U256 = alloy::primitives::U256::MAX;
-
-/// Validity window (in seconds) for fee payer transactions.
-const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 
 /// Tempo payment provider using EVM signing.
 ///
@@ -38,12 +33,14 @@ const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
+
 #[derive(Clone)]
 pub struct TempoProvider {
     signer: alloy_signer_local::PrivateKeySigner,
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
+    replace_stuck_txs: bool,
 }
 
 impl TempoProvider {
@@ -65,6 +62,7 @@ impl TempoProvider {
             rpc_url: url,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
+            replace_stuck_txs: false,
         })
     }
 
@@ -79,6 +77,18 @@ impl TempoProvider {
     /// Default is [`TempoSigningMode::Direct`].
     pub fn with_signing_mode(mut self, mode: TempoSigningMode) -> Self {
         self.signing_mode = mode;
+        self
+    }
+
+    /// Enable stuck-transaction detection and replacement.
+    ///
+    /// When enabled, compares confirmed vs pending nonce at payment time.
+    /// If a stuck transaction is detected, aggressively bumps gas to
+    /// replace it. See [`super::gas::resolve_gas_with_stuck_detection`].
+    ///
+    /// Default: `false`.
+    pub fn with_replace_stuck_transactions(mut self, enabled: bool) -> Self {
+        self.replace_stuck_txs = enabled;
         self
     }
 
@@ -104,106 +114,17 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        use crate::protocol::intents::ChargeRequest;
-        use crate::protocol::methods::tempo::{TempoChargeExt, CHAIN_ID};
-        use alloy::primitives::{Bytes, TxKind, B256, U256};
-        use alloy::providers::{Provider, ProviderBuilder};
-        use alloy::sol_types::SolCall;
-        use tempo_alloy::contracts::precompiles::tip20::ITIP20;
-        use tempo_alloy::TempoNetwork;
-        use tempo_primitives::transaction::Call;
+        let charge = super::charge::TempoCharge::from_challenge(challenge)?;
 
-        use super::signing;
-        use super::tx_builder;
-
-        let charge: ChargeRequest = challenge.request.decode()?;
-        let expected_chain_id = charge.chain_id().unwrap_or(CHAIN_ID);
-        let from = self.signing_mode.from_address(self.signer.address());
-        let fee_payer = charge.fee_payer();
-
-        let provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
-
-        let actual_chain_id: u64 = provider
-            .get_chain_id()
-            .await
-            .map_err(|e| MppError::Http(format!("failed to get chain ID: {}", e)))?;
-
-        if actual_chain_id != expected_chain_id {
-            return Err(MppError::ChainIdMismatch {
-                expected: expected_chain_id,
-                got: actual_chain_id,
-            });
-        }
-
-        let recipient = charge.recipient_address()?;
-        let amount = charge.amount_u256()?;
-        let currency = charge.currency_address()?;
-
-        let memo: B256 = charge
-            .memo()
-            .and_then(|m| m.parse().ok())
-            .unwrap_or_else(|| {
-                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref())
-                    .into()
-            });
-
-        let transfer_data =
-            ITIP20::transferWithMemoCall::new((recipient, amount, memo)).abi_encode();
-
-        // Fee payer mode: use expiring nonces to avoid nonce collisions
-        // when the server broadcasts on the client's behalf.
-        let (nonce_key, nonce, valid_before) = if fee_payer {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| MppError::Http(format!("system clock error: {}", e)))?
-                .as_secs();
-            (
-                EXPIRING_NONCE_KEY,
-                0u64,
-                Some(now + FEE_PAYER_VALID_BEFORE_SECS),
-            )
-        } else {
-            let n = provider
-                .get_transaction_count(from)
-                .await
-                .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
-            (U256::ZERO, n, None)
+        let options = SignOptions {
+            rpc_url: Some(self.rpc_url.to_string()),
+            signing_mode: Some(self.signing_mode.clone()),
+            replace_stuck_txs: self.replace_stuck_txs,
+            ..Default::default()
         };
 
-        let gas_price = provider
-            .get_gas_price()
-            .await
-            .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
-
-        let calls = vec![Call {
-            to: TxKind::Call(currency),
-            value: alloy::primitives::U256::ZERO,
-            input: Bytes::from(transfer_data),
-        }];
-
-        let tx = tx_builder::build_tempo_tx(tx_builder::TempoTxOptions {
-            calls,
-            chain_id: expected_chain_id,
-            fee_token: currency,
-            nonce,
-            nonce_key,
-            gas_limit: 1_000_000,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
-            fee_payer,
-            valid_before,
-            key_authorization: self.signing_mode.key_authorization().cloned(),
-        });
-
-        let tx_bytes = signing::sign_and_encode_async(tx, &self.signer, &self.signing_mode).await?;
-
-        Ok(tx_builder::build_charge_credential(
-            challenge,
-            &tx_bytes,
-            expected_chain_id,
-            from,
-        ))
+        let signed = charge.sign_with_options(&self.signer, options).await?;
+        Ok(signed.into_credential())
     }
 }
 

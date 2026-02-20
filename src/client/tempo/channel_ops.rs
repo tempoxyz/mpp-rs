@@ -204,11 +204,7 @@ where
     );
 
     // Build approve calldata
-    sol! {
-        interface IERC20 {
-            function approve(address spender, uint256 amount) external returns (bool);
-        }
-    }
+    use super::abi::ITIP20;
 
     sol! {
         interface IEscrow {
@@ -223,7 +219,7 @@ where
     }
 
     let approve_data =
-        IERC20::approveCall::new((options.escrow_contract, U256::from(options.deposit)))
+        ITIP20::approveCall::new((options.escrow_contract, U256::from(options.deposit)))
             .abi_encode();
 
     let open_data = IEscrow::openCall::new((
