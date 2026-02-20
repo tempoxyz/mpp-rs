@@ -6,6 +6,14 @@
 //! `0x78 || rlp([...])` envelope to a sponsoring server, which validates the
 //! envelope, reconstitutes a normal 0x76 Tempo transaction, attaches a
 //! `fee_payer_signature`, and then broadcasts.
+//!
+//! Note: this envelope format is specific to mpp-rs. The TypeScript/Viem SDK
+//! (mppx) achieves fee sponsorship differently — the client sends a standard
+//! `0x76` transaction to a JSON-RPC sidecar (`Handler.feePayer()` in tempo-ts)
+//! via viem's `withFeePayer` transport, which cosigns using
+//! `signTransaction({ feePayer: account })` and returns a complete `0x76`.
+//! The `0x78` envelope exists in mpp-rs because it embeds the fee-payer flow
+//! inline in the MPP credential exchange rather than using a separate RPC hop.
 
 use alloy::eips::eip2930::AccessList;
 use alloy::primitives::{Address, Bytes, U256};
