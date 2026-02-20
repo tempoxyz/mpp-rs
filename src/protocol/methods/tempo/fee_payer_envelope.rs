@@ -288,3 +288,234 @@ impl Decodable for FeePayerEnvelope78 {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Bytes, TxKind};
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+    use tempo_primitives::transaction::{
+        Call, KeyAuthorization, PrimitiveSignature, SignatureType, TempoTransaction, TokenLimit,
+    };
+
+    fn test_signer() -> PrivateKeySigner {
+        "0x1234567890123456789012345678901234567890123456789012345678901234"
+            .parse()
+            .unwrap()
+    }
+
+    /// Build a minimal fee-payer-shaped tx (fee_token=None, placeholder fp sig,
+    /// expiring nonce key, valid_before set).
+    fn base_fee_payer_tx() -> TempoTransaction {
+        TempoTransaction {
+            chain_id: 42431,
+            nonce: 1,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_token: None,
+            calls: vec![Call {
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::ZERO,
+                input: Bytes::from_static(&[0xaa, 0xbb]),
+            }],
+            nonce_key: U256::MAX,
+            key_authorization: None,
+            access_list: Default::default(),
+            fee_payer_signature: Some(alloy::primitives::Signature::new(
+                U256::ZERO,
+                U256::ZERO,
+                false,
+            )),
+            valid_before: Some(9999999999),
+            valid_after: None,
+            tempo_authorization_list: vec![],
+        }
+    }
+
+    /// Sign a tx and produce a `FeePayerEnvelope78`.
+    fn sign_envelope(tx: TempoTransaction, signer: &PrivateKeySigner) -> FeePayerEnvelope78 {
+        let sig_hash = tx.signature_hash();
+        let inner_sig = signer.sign_hash_sync(&sig_hash).unwrap();
+        let signature = TempoSignature::Primitive(PrimitiveSignature::Secp256k1(inner_sig));
+        FeePayerEnvelope78::from_signing_tx(tx, signer.address(), signature)
+    }
+
+    fn make_signed_key_auth(signer: &PrivateKeySigner) -> SignedKeyAuthorization {
+        let auth = KeyAuthorization {
+            chain_id: 42431,
+            key_type: SignatureType::Secp256k1,
+            key_id: signer.address(),
+            expiry: Some(9999999999),
+            limits: Some(vec![TokenLimit {
+                token: Address::repeat_byte(0x33),
+                limit: U256::from(1_000_000u64),
+            }]),
+        };
+        let inner_sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
+        auth.into_signed(PrimitiveSignature::Secp256k1(inner_sig))
+    }
+
+    /// Assert encode→decode roundtrip preserves all fields.
+    fn assert_roundtrip(original: &FeePayerEnvelope78) {
+        let bytes = original.encoded_envelope();
+        assert_eq!(
+            bytes[0], TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID,
+            "envelope must start with 0x78"
+        );
+        let decoded = FeePayerEnvelope78::decode_envelope(&bytes)
+            .expect("decode_envelope should succeed");
+        assert_eq!(&decoded, original);
+    }
+
+    // ---- roundtrip tests ----
+
+    #[test]
+    fn roundtrip_minimal_no_optionals() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.valid_before = None;
+        tx.valid_after = None;
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.valid_before.is_none());
+        assert!(env.valid_after.is_none());
+        assert!(env.fee_token.is_none());
+        assert!(env.key_authorization.is_none());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_with_valid_before() {
+        let signer = test_signer();
+        let tx = base_fee_payer_tx(); // valid_before = Some(9999999999)
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.valid_before.is_some());
+        assert!(env.valid_after.is_none());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_with_valid_before_and_after() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.valid_after = Some(1000);
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.valid_before.is_some());
+        assert!(env.valid_after.is_some());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_with_fee_token() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.fee_token = Some(Address::repeat_byte(0x44));
+
+        let env = sign_envelope(tx, &signer);
+        assert_eq!(env.fee_token, Some(Address::repeat_byte(0x44)));
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_all_optionals_set() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.valid_after = Some(500);
+        tx.fee_token = Some(Address::repeat_byte(0x55));
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.valid_before.is_some());
+        assert!(env.valid_after.is_some());
+        assert!(env.fee_token.is_some());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_with_key_authorization() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.key_authorization = Some(make_signed_key_auth(&signer));
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.key_authorization.is_some());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_with_key_authorization_and_all_optionals() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.valid_after = Some(42);
+        tx.fee_token = Some(Address::repeat_byte(0x66));
+        tx.key_authorization = Some(make_signed_key_auth(&signer));
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.key_authorization.is_some());
+        assert!(env.valid_before.is_some());
+        assert!(env.valid_after.is_some());
+        assert!(env.fee_token.is_some());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_multiple_calls() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.calls = vec![
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                value: U256::from(100u64),
+                input: Bytes::from_static(&[0x01]),
+            },
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::ZERO,
+                input: Bytes::from_static(&[0x02, 0x03, 0x04]),
+            },
+            Call {
+                to: TxKind::Call(Address::repeat_byte(0x33)),
+                value: U256::from(999u64),
+                input: Bytes::new(),
+            },
+        ];
+
+        let env = sign_envelope(tx, &signer);
+        assert_eq!(env.calls.len(), 3);
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_empty_calls() {
+        let signer = test_signer();
+        let mut tx = base_fee_payer_tx();
+        tx.calls = vec![];
+
+        let env = sign_envelope(tx, &signer);
+        assert!(env.calls.is_empty());
+        assert_roundtrip(&env);
+    }
+
+    #[test]
+    fn roundtrip_with_keychain_signature() {
+        use tempo_primitives::transaction::KeychainSignature;
+
+        let signer = test_signer();
+        let tx = base_fee_payer_tx();
+        let sig_hash = tx.signature_hash();
+        let inner_sig = signer.sign_hash_sync(&sig_hash).unwrap();
+
+        let wallet = Address::repeat_byte(0xAB);
+        let keychain_sig = KeychainSignature::new(
+            wallet,
+            PrimitiveSignature::Secp256k1(inner_sig),
+        );
+        let signature = TempoSignature::Keychain(keychain_sig);
+
+        let env = FeePayerEnvelope78::from_signing_tx(tx, wallet, signature);
+        assert_roundtrip(&env);
+    }
+}
