@@ -4,7 +4,6 @@ use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
 use super::charge::SignOptions;
-use super::routing::SwapCandidate;
 use super::signing::TempoSigningMode;
 use crate::client::PaymentProvider;
 
@@ -34,8 +33,6 @@ use crate::client::PaymentProvider;
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
-/// TIP-20 tokens use 6 decimal places.
-const TIP20_DECIMALS: u8 = 6;
 
 #[derive(Clone)]
 pub struct TempoProvider {
@@ -118,37 +115,6 @@ impl TempoProvider {
     pub fn rpc_url(&self) -> &reqwest::Url {
         &self.rpc_url
     }
-
-    /// Build swap candidates from known tokens for a chain ID.
-    fn swap_candidates_for(chain_id: u64) -> Vec<SwapCandidate> {
-        use crate::protocol::methods::tempo::network::TempoNetwork;
-
-        let Some(network) = TempoNetwork::from_chain_id(chain_id) else {
-            return Vec::new();
-        };
-        network
-            .known_tokens()
-            .iter()
-            .filter_map(|(addr, symbol)| {
-                Some(SwapCandidate {
-                    address: addr.parse().ok()?,
-                    symbol: symbol.to_string(),
-                })
-            })
-            .collect()
-    }
-
-    /// Look up a token symbol from candidates, falling back to hex address.
-    fn token_symbol_for(
-        candidates: &[SwapCandidate],
-        address: alloy::primitives::Address,
-    ) -> String {
-        candidates
-            .iter()
-            .find(|c| c.address == address)
-            .map(|c| c.symbol.clone())
-            .unwrap_or_else(|| format!("{:#x}", address))
-    }
 }
 
 impl PaymentProvider for TempoProvider {
@@ -158,8 +124,6 @@ impl PaymentProvider for TempoProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let charge = super::charge::TempoCharge::from_challenge(challenge)?;
-        let from = self.signing_mode.from_address(self.signer.address());
-        let swap_candidates = Self::swap_candidates_for(charge.chain_id());
 
         let mut options = self.sign_options_overrides.clone().unwrap_or_default();
         options.rpc_url = Some(self.rpc_url.to_string());
@@ -170,129 +134,8 @@ impl PaymentProvider for TempoProvider {
             options.replace_stuck_txs = true;
         }
 
-        // Check balance and spending limits regardless of swap config
-        // so users get a clear error instead of an opaque on-chain revert.
-        let provider = alloy::providers::RootProvider::new_http(self.rpc_url.clone());
-
-        let balance =
-            super::balance::query_token_balance(&provider, charge.currency(), from).await?;
-
-        let keychain_info = match &self.signing_mode {
-            TempoSigningMode::Keychain { wallet, .. } => Some((*wallet, self.signer.address())),
-            TempoSigningMode::Direct => None,
-        };
-        let local_auth = self.signing_mode.key_authorization();
-
-        let spending_limit = if let Some((wallet_addr, key_addr)) = keychain_info {
-            match super::keychain::query_key_spending_limit(
-                &provider,
-                wallet_addr,
-                key_addr,
-                charge.currency(),
-            )
-            .await
-            {
-                Ok(limit) => limit,
-                Err(_) if local_auth.is_some() => super::keychain::local_key_spending_limit(
-                    local_auth.unwrap(),
-                    charge.currency(),
-                ),
-                Err(e) => {
-                    return Err(MppError::Http(format!(
-                        "Cannot verify key spending limit: {}",
-                        e
-                    )))
-                }
-            }
-        } else {
-            None
-        };
-
-        let capacity = super::balance::effective_capacity(balance, spending_limit);
-
-        // Direct transfer if sufficient capacity
-        if capacity >= charge.amount() {
-            let signed = charge.sign_with_options(&self.signer, options).await?;
-            return Ok(signed.into_credential());
-        }
-
-        // Spending limit is the bottleneck — no swap can help.
-        // Only error when the user has enough balance to pay directly but the
-        // limit blocks them. When balance is also insufficient, fall through
-        // to auto-swap which may find a different token with a higher limit.
-        let limit_is_bottleneck = spending_limit
-            .map(|limit| limit < charge.amount())
-            .unwrap_or(false);
-
-        if limit_is_bottleneck && balance >= charge.amount() {
-            let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
-            return Err(super::error::TempoClientError::SpendingLimitExceeded {
-                token: token_symbol,
-                limit: crate::evm::format_u256_with_decimals(
-                    spending_limit.unwrap_or(alloy::primitives::U256::ZERO),
-                    TIP20_DECIMALS,
-                ),
-                required: crate::evm::format_u256_with_decimals(charge.amount(), TIP20_DECIMALS),
-            }
-            .into());
-        }
-
-        // No swap candidates available — return a clear insufficient balance error
-        if swap_candidates.is_empty() {
-            let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
-            return Err(super::error::TempoClientError::InsufficientBalance {
-                token: token_symbol,
-                available: crate::evm::format_u256_with_decimals(balance, TIP20_DECIMALS),
-                required: crate::evm::format_u256_with_decimals(charge.amount(), TIP20_DECIMALS),
-            }
-            .into());
-        }
-
-        // Try auto-swap
-        let swap_source = super::routing::find_swap_source(
-            &provider,
-            from,
-            charge.currency(),
-            charge.amount(),
-            &swap_candidates,
-            keychain_info,
-            local_auth,
-        )
-        .await?;
-
-        match swap_source {
-            Some(source) => {
-                let swap_info = super::swap::SwapInfo::new(
-                    source.token_address,
-                    charge.currency(),
-                    charge.amount(),
-                );
-                let calls = super::swap::build_swap_calls(
-                    &swap_info,
-                    charge.recipient(),
-                    charge.amount(),
-                    charge.memo(),
-                )?;
-                options.fee_token = Some(swap_info.token_in);
-                let signed = charge
-                    .with_calls(calls)
-                    .sign_with_options(&self.signer, options)
-                    .await?;
-                Ok(signed.into_credential())
-            }
-            None => {
-                let token_symbol = Self::token_symbol_for(&swap_candidates, charge.currency());
-                Err(super::error::TempoClientError::InsufficientBalance {
-                    token: token_symbol,
-                    available: crate::evm::format_u256_with_decimals(balance, TIP20_DECIMALS),
-                    required: crate::evm::format_u256_with_decimals(
-                        charge.amount(),
-                        TIP20_DECIMALS,
-                    ),
-                }
-                .into())
-            }
-        }
+        let signed = charge.sign_with_options(&self.signer, options).await?;
+        Ok(signed.into_credential())
     }
 }
 
@@ -434,19 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn test_swap_candidates_for_known_chain() {
-        let candidates = TempoProvider::swap_candidates_for(42431); // moderato
-        assert!(!candidates.is_empty());
-        assert!(candidates.iter().any(|c| c.symbol == "pathUSD"));
-    }
-
-    #[test]
-    fn test_swap_candidates_for_unknown_chain() {
-        let candidates = TempoProvider::swap_candidates_for(999999);
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
     fn test_tempo_provider_with_sign_options() {
         let signer = alloy_signer_local::PrivateKeySigner::random();
         let opts = SignOptions {
@@ -462,26 +292,6 @@ mod tests {
         assert_eq!(
             provider.sign_options_overrides.as_ref().unwrap().nonce,
             Some(42)
-        );
-    }
-
-    #[test]
-    fn test_token_symbol_lookup() {
-        let addr: alloy::primitives::Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-        let candidates = vec![SwapCandidate {
-            address: addr,
-            symbol: "pathUSD".to_string(),
-        }];
-
-        assert_eq!(
-            TempoProvider::token_symbol_for(&candidates, addr),
-            "pathUSD"
-        );
-        assert!(
-            TempoProvider::token_symbol_for(&candidates, alloy::primitives::Address::ZERO)
-                .starts_with("0x")
         );
     }
 }

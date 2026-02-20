@@ -90,9 +90,6 @@ impl TempoCharge {
 
     /// Override the default transfer call with custom calls.
     ///
-    /// Use this for swap flows ([`build_swap_calls`](super::swap::build_swap_calls))
-    /// or escrow flows ([`build_open_calls`](super::swap::build_open_calls)).
-    ///
     /// When calls are overridden, the first call's target address is used as the
     /// fee token unless a fee_token is explicitly set via [`SignOptions::fee_token`].
     pub fn with_calls(mut self, calls: Vec<Call>) -> Self {
