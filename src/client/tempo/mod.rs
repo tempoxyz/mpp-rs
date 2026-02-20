@@ -4,7 +4,6 @@
 //! signing strategies, charge builder, and channel operations.
 
 pub mod abi;
-pub mod balance;
 pub mod channel_ops;
 pub mod charge;
 mod error;
@@ -15,7 +14,6 @@ mod session_provider;
 pub mod signing;
 pub mod tx_builder;
 
-pub use balance::query_token_balance;
 pub use channel_ops::ChannelEntry;
 pub use charge::{SignOptions, SignedTempoCharge, TempoCharge};
 pub use error::TempoClientError;
