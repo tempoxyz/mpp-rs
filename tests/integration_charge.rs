@@ -230,48 +230,12 @@ fn encode_fee_payer_envelope_for_test(
     sender: Address,
     signature: tempo_primitives::transaction::TempoSignature,
 ) -> Vec<u8> {
-    use alloy::primitives::bytes::BufMut;
-    use alloy::rlp::{Encodable, EMPTY_STRING_CODE};
-
-    let mut fields = Vec::new();
-
-    tx.chain_id.encode(&mut fields);
-    tx.max_priority_fee_per_gas.encode(&mut fields);
-    tx.max_fee_per_gas.encode(&mut fields);
-    tx.gas_limit.encode(&mut fields);
-    tx.calls.encode(&mut fields);
-    tx.access_list.encode(&mut fields);
-    tx.nonce_key.encode(&mut fields);
-    tx.nonce.encode(&mut fields);
-
-    if let Some(vb) = tx.valid_before {
-        vb.encode(&mut fields);
-    } else {
-        fields.put_u8(EMPTY_STRING_CODE);
-    }
-    if let Some(va) = tx.valid_after {
-        va.encode(&mut fields);
-    } else {
-        fields.put_u8(EMPTY_STRING_CODE);
-    }
-    fields.put_u8(EMPTY_STRING_CODE); // feeToken — always empty
-    sender.encode(&mut fields); // fee_payer_signature slot
-    tx.tempo_authorization_list.encode(&mut fields);
-    if let Some(key_auth) = &tx.key_authorization {
-        key_auth.encode(&mut fields);
-    }
-    signature.encode(&mut fields);
-
-    let rlp_header = alloy::rlp::Header {
-        list: true,
-        payload_length: fields.len(),
-    };
-
-    let mut out = Vec::with_capacity(1 + rlp_header.length() + fields.len());
-    out.put_u8(0x78);
-    rlp_header.encode(&mut out);
-    out.extend_from_slice(&fields);
-    out
+    mpp::protocol::methods::tempo::FeePayerEnvelope78::from_signing_tx(
+        tx.clone(),
+        sender,
+        signature,
+    )
+    .encoded_envelope()
 }
 
 /// Query TIP-20 pathUSD balance for an address.
@@ -294,14 +258,16 @@ async fn tip20_balance(provider: &impl Provider<TempoNetwork>, addr: Address) ->
 async fn wait_for_receipt(
     provider: &impl Provider<TempoNetwork>,
     tx_hash: B256,
-) -> tempo_alloy::rpc::TempoTransactionReceipt {
+) -> Result<tempo_alloy::rpc::TempoTransactionReceipt, String> {
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-            return receipt;
+            return Ok(receipt);
         }
     }
-    panic!("transaction receipt not found after 10s: {tx_hash:#x}");
+    Err(format!(
+        "transaction receipt not found after 10s: {tx_hash:#x}"
+    ))
 }
 
 // ==================== ChargeConfig types ====================
@@ -887,7 +853,6 @@ async fn test_e2e_charge_without_fee_payer() {
     let server_signer = PrivateKeySigner::random();
     let client_signer = PrivateKeySigner::random();
 
-    let _server_addr = server_signer.address();
     let client_addr = client_signer.address();
 
     fund_account(&rpc, server_signer.address()).await;
@@ -938,7 +903,9 @@ async fn test_e2e_charge_without_fee_payer() {
         .reference
         .parse()
         .expect("receipt reference should be B256");
-    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash)
+        .await
+        .expect("receipt not found");
     assert_eq!(chain_receipt.from(), client_addr);
     assert_eq!(
         chain_receipt.fee_payer, client_addr,
@@ -1014,7 +981,9 @@ async fn test_e2e_charge_with_fee_payer() {
         .reference
         .parse()
         .expect("receipt reference should be B256");
-    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash)
+        .await
+        .expect("receipt not found");
 
     assert_eq!(chain_receipt.from(), client_addr);
     assert_eq!(
@@ -1266,7 +1235,9 @@ async fn test_fee_payer_balance_accounting() {
         .reference
         .parse()
         .expect("receipt reference should be B256");
-    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash)
+        .await
+        .expect("receipt not found");
     assert_eq!(chain_receipt.from(), client_signer.address());
     assert_eq!(chain_receipt.fee_payer, server_signer.address());
 
@@ -1401,7 +1372,9 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
         .reference
         .parse()
         .expect("receipt reference should be B256");
-    let chain_receipt = wait_for_receipt(&provider_http, tx_hash).await;
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash)
+        .await
+        .expect("receipt not found");
     assert_eq!(chain_receipt.from(), client_addr);
     assert_eq!(chain_receipt.fee_payer, fee_payer_addr);
 

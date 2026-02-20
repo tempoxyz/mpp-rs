@@ -20,7 +20,7 @@ server = ["tokio", "futures-core", "async-stream"]
 
 # Method implementations
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid", "alloy-rlp"]
+tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
 
 # Utilities
 utils = ["hex", "rand"]
@@ -57,7 +57,6 @@ futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
 alloy = { version = "1.2", features = ["full"], optional = true }
 alloy-signer-local = { version = "1.2", optional = true }
-alloy-rlp = { version = "0.3", optional = true }
 
 # Tempo dependencies (optional)
 # Note: tempo feature requires git dependency - add to your Cargo.toml:

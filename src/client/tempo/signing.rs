@@ -8,19 +8,7 @@ use alloy::primitives::Address;
 use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::error::MppError;
-
-/// Fee payer envelope magic byte.
-///
-/// This is **not** a broadcastable Tempo transaction type.
-///
-/// It is a helper encoding used when `feePayer: true` (fee sponsorship) is
-/// requested:
-/// - Client sends `0x78 || rlp([... senderAddress ... signatureEnvelope ])`
-/// - Server/fee payer turns it into a standard `0x76...` Tempo transaction by
-///   attaching a `fee_payer_signature`, then broadcasts.
-///
-/// This matches the `ox/tempo` / `viem/tempo` `format: 'feePayer'` serializer.
-const TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID: u8 = 0x78;
+use crate::protocol::methods::tempo::FeePayerEnvelope78;
 
 /// How to sign Tempo transactions.
 ///
@@ -115,20 +103,44 @@ pub fn sign_and_encode_fee_payer_envelope(
     tx: tempo_primitives::transaction::TempoTransaction,
     signer: &impl alloy::signers::SignerSync,
     mode: &TempoSigningMode,
-    sender: Address,
 ) -> Result<Vec<u8>, MppError> {
+    use alloy::primitives::U256;
+
+    let sender = mode.from_address(signer.address());
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".to_string(),
+        ));
+    }
+
     let sig_hash = tx.signature_hash();
     let inner_signature = signer
         .sign_hash_sync(&sig_hash)
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
     let signature = build_tempo_signature(inner_signature, mode);
-    Ok(encode_fee_payer_envelope(tx, sender, signature))
+    Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
 }
 
 /// Async version of [`sign_and_encode`] for signers that require async signing.
 pub async fn sign_and_encode_async(
     tx: tempo_primitives::transaction::TempoTransaction,
-    signer: &(impl alloy::signers::Signer + Clone),
+    signer: &impl alloy::signers::Signer,
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
     use alloy::eips::Encodable2718;
@@ -146,114 +158,41 @@ pub async fn sign_and_encode_async(
 /// Async version of [`sign_and_encode_fee_payer_envelope`].
 pub async fn sign_and_encode_fee_payer_envelope_async(
     tx: tempo_primitives::transaction::TempoTransaction,
-    signer: &(impl alloy::signers::Signer + Clone),
+    signer: &impl alloy::signers::Signer,
     mode: &TempoSigningMode,
-    sender: Address,
 ) -> Result<Vec<u8>, MppError> {
+    use alloy::primitives::U256;
+
+    let sender = mode.from_address(signer.address());
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".to_string(),
+        ));
+    }
+
     let sig_hash = tx.signature_hash();
     let inner_signature = signer
         .sign_hash(&sig_hash)
         .await
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
     let signature = build_tempo_signature(inner_signature, mode);
-    Ok(encode_fee_payer_envelope(tx, sender, signature))
-}
-
-fn encode_fee_payer_envelope(
-    tx: tempo_primitives::transaction::TempoTransaction,
-    sender: Address,
-    signature: tempo_primitives::transaction::TempoSignature,
-) -> Vec<u8> {
-    // Import traits here so `.encode()` and `.length()` resolve correctly.
-    use alloy_rlp::{BufMut, Encodable, Header, EMPTY_STRING_CODE};
-
-    // RLP list payload length (sum of each element length).
-    //
-    // Order matches `ox/tempo` `TxEnvelopeTempo.serialize` and Tempo's
-    // canonical `0x76` envelope field order, except the `feePayerSignature`
-    // slot is replaced with the `sender` address.
-    let mut payload_length = 0usize;
-    payload_length += tx.chain_id.length();
-    payload_length += tx.max_priority_fee_per_gas.length();
-    payload_length += tx.max_fee_per_gas.length();
-    payload_length += tx.gas_limit.length();
-    payload_length += tx.calls.length();
-    payload_length += tx.access_list.length();
-    payload_length += tx.nonce_key.length();
-    payload_length += tx.nonce.length();
-
-    payload_length += tx
-        .valid_before
-        .map_or(1, |valid_before| valid_before.length());
-    payload_length += tx.valid_after.map_or(1, |valid_after| valid_after.length());
-
-    payload_length += tx.fee_token.map_or(1, |fee_token| fee_token.length());
-
-    // feePayerSignatureOrSender
-    payload_length += sender.length();
-
-    // authorizationList
-    payload_length += tx.tempo_authorization_list.length();
-
-    if let Some(key_authorization) = &tx.key_authorization {
-        payload_length += key_authorization.length();
-    }
-
-    // signature envelope
-    payload_length += signature.length();
-
-    let header = Header {
-        list: true,
-        payload_length,
-    };
-
-    let mut out = Vec::with_capacity(1 + header.length_with_payload());
-
-    out.put_u8(TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID);
-    header.encode(&mut out);
-
-    tx.chain_id.encode(&mut out);
-    tx.max_priority_fee_per_gas.encode(&mut out);
-    tx.max_fee_per_gas.encode(&mut out);
-    tx.gas_limit.encode(&mut out);
-    tx.calls.encode(&mut out);
-    tx.access_list.encode(&mut out);
-    tx.nonce_key.encode(&mut out);
-    tx.nonce.encode(&mut out);
-
-    if let Some(valid_before) = tx.valid_before {
-        valid_before.encode(&mut out);
-    } else {
-        out.put_u8(EMPTY_STRING_CODE);
-    }
-
-    if let Some(valid_after) = tx.valid_after {
-        valid_after.encode(&mut out);
-    } else {
-        out.put_u8(EMPTY_STRING_CODE);
-    }
-
-    if let Some(fee_token) = tx.fee_token {
-        fee_token.encode(&mut out);
-    } else {
-        out.put_u8(EMPTY_STRING_CODE);
-    }
-
-    // feePayerSignatureOrSender
-    sender.encode(&mut out);
-
-    // authorizationList
-    tx.tempo_authorization_list.encode(&mut out);
-
-    // key_authorization (truly optional - only encoded if present)
-    if let Some(key_authorization) = tx.key_authorization {
-        key_authorization.encode(&mut out);
-    }
-
-    // signature envelope (always present for client credentials)
-    signature.encode(&mut out);
-
-    out
+    Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
 }
 
 #[cfg(test)]
@@ -380,9 +319,6 @@ mod tests {
 
     #[test]
     fn test_sign_and_encode_fee_payer_envelope_encodes_sender_address() {
-        use alloy_rlp::Decodable;
-        use tempo_primitives::transaction::{TempoSignature, TempoSignedAuthorization};
-
         let signer = test_signer();
 
         // The tx must have `fee_payer_signature.is_some()` so the user's
@@ -395,66 +331,20 @@ mod tests {
             false,
         ));
 
-        let sender = Address::repeat_byte(0xAB);
-        let bytes =
-            sign_and_encode_fee_payer_envelope(tx, &signer, &TempoSigningMode::Direct, sender)
-                .unwrap();
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAB),
+            key_authorization: None,
+        };
 
-        assert_eq!(bytes[0], 0x78, "fee payer envelope must start with 0x78");
-
-        // Decode enough of the RLP payload to ensure the `feePayerSignatureOrSender`
-        // slot is the sender address.
-        let mut buf = &bytes[1..];
-        let header = alloy_rlp::Header::decode(&mut buf).unwrap();
-        let before_len = buf.len();
-
-        let _chain_id: u64 = Decodable::decode(&mut buf).unwrap();
-        let _max_priority_fee_per_gas: u128 = Decodable::decode(&mut buf).unwrap();
-        let _max_fee_per_gas: u128 = Decodable::decode(&mut buf).unwrap();
-        let _gas_limit: u64 = Decodable::decode(&mut buf).unwrap();
-        let _calls: Vec<tempo_primitives::transaction::Call> = Decodable::decode(&mut buf).unwrap();
-        let _access_list: alloy::eips::eip2930::AccessList = Decodable::decode(&mut buf).unwrap();
-        let _nonce_key: alloy::primitives::U256 = Decodable::decode(&mut buf).unwrap();
-        let _nonce: u64 = Decodable::decode(&mut buf).unwrap();
-
-        // validBefore
-        if buf.first() == Some(&alloy_rlp::EMPTY_STRING_CODE) {
-            buf = &buf[1..];
-        } else {
-            let _: u64 = Decodable::decode(&mut buf).unwrap();
-        }
-
-        // validAfter
-        if buf.first() == Some(&alloy_rlp::EMPTY_STRING_CODE) {
-            buf = &buf[1..];
-        } else {
-            let _: u64 = Decodable::decode(&mut buf).unwrap();
-        }
-
-        // feeToken
-        if buf.first() == Some(&alloy_rlp::EMPTY_STRING_CODE) {
-            buf = &buf[1..];
-        } else {
-            let _: Address = Decodable::decode(&mut buf).unwrap();
-        }
-
-        // feePayerSignatureOrSender
-        let decoded_sender: Address = Decodable::decode(&mut buf).unwrap();
-        assert_eq!(decoded_sender, sender);
-
-        // authorizationList
-        let _authz: Vec<TempoSignedAuthorization> = Decodable::decode(&mut buf).unwrap();
-
-        // signature envelope bytes
-        let sig_bytes: alloy::primitives::Bytes = Decodable::decode(&mut buf).unwrap();
-        TempoSignature::from_bytes(&sig_bytes).expect("signature envelope should parse");
-
-        // Ensure we consumed exactly the RLP list payload.
-        let consumed = before_len - buf.len();
+        let bytes = sign_and_encode_fee_payer_envelope(tx, &signer, &mode).unwrap();
         assert_eq!(
-            consumed, header.payload_length,
-            "RLP decode should consume the whole list payload"
+            bytes[0],
+            crate::protocol::methods::tempo::TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID,
+            "fee payer envelope must start with 0x78"
         );
+
+        let env = FeePayerEnvelope78::decode_envelope(&bytes).unwrap();
+        assert_eq!(env.sender, Address::repeat_byte(0xAB));
     }
 
     #[test]

@@ -277,7 +277,7 @@ impl TempoCharge {
         // If fee sponsorship is requested, send the `0x78` fee payer envelope
         // so MPPx servers can co-sign and broadcast (standard `0x76`).
         let tx_bytes = if self.fee_payer {
-            sign_and_encode_fee_payer_envelope_async(tx, signer, &signing_mode, from).await?
+            sign_and_encode_fee_payer_envelope_async(tx, signer, &signing_mode).await?
         } else {
             sign_and_encode_async(tx, signer, &signing_mode).await?
         };
