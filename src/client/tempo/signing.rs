@@ -101,7 +101,7 @@ pub fn sign_and_encode(
 /// (or fee payer proxy) which will co-sign and broadcast.
 pub fn sign_and_encode_fee_payer_envelope(
     tx: tempo_primitives::transaction::TempoTransaction,
-    signer: &impl alloy::signers::SignerSync,
+    signer: &(impl alloy::signers::SignerSync + alloy::signers::Signer),
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
     use alloy::primitives::U256;
@@ -325,6 +325,8 @@ mod tests {
         // signature_hash skips feeToken commitment (fee sponsorship flow).
         let mut tx = test_tx();
         tx.fee_token = None;
+        tx.nonce_key = alloy::primitives::U256::MAX;
+        tx.valid_before = Some(9999999999);
         tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
             alloy::primitives::U256::ZERO,
             alloy::primitives::U256::ZERO,
