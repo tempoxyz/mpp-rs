@@ -57,14 +57,22 @@ impl TempoClientError {
         }
 
         if lower.contains("spendinglimitexceeded") || lower.contains("spending limit") {
-            return Some(Self::TransactionReverted(msg));
+            return Some(Self::SpendingLimitExceeded {
+                token: String::new(),
+                limit: String::new(),
+                required: msg,
+            });
         }
 
         if lower.contains("insufficientbalance")
             || lower.contains("transfer amount exceeds balance")
             || (lower.contains("insufficient") && lower.contains("balance"))
         {
-            return Some(Self::TransactionReverted(msg));
+            return Some(Self::InsufficientBalance {
+                token: String::new(),
+                available: String::new(),
+                required: msg,
+            });
         }
 
         if lower.contains("revert") || lower.contains("execution reverted") {
@@ -137,7 +145,7 @@ mod tests {
             TempoClientError::classify_rpc_error("SpendingLimitExceeded: limit is 0.50, need 1.00");
         assert!(matches!(
             err,
-            Some(TempoClientError::TransactionReverted(_))
+            Some(TempoClientError::SpendingLimitExceeded { .. })
         ));
     }
 
@@ -146,7 +154,7 @@ mod tests {
         let err = TempoClientError::classify_rpc_error("InsufficientBalance for transfer");
         assert!(matches!(
             err,
-            Some(TempoClientError::TransactionReverted(_))
+            Some(TempoClientError::InsufficientBalance { .. })
         ));
     }
 
@@ -155,7 +163,7 @@ mod tests {
         let err = TempoClientError::classify_rpc_error("transfer amount exceeds balance");
         assert!(matches!(
             err,
-            Some(TempoClientError::TransactionReverted(_))
+            Some(TempoClientError::InsufficientBalance { .. })
         ));
     }
 

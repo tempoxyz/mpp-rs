@@ -41,6 +41,12 @@ use crate::protocol::methods::tempo::charge::{parse_memo_bytes, TempoChargeExt};
 use crate::protocol::methods::tempo::network::TempoNetwork;
 use crate::protocol::methods::tempo::CHAIN_ID;
 
+/// Nonce key for expiring nonce transactions (fee payer mode).
+const EXPIRING_NONCE_KEY: U256 = U256::MAX;
+
+/// Validity window (in seconds) for fee payer transactions.
+const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+
 /// A parsed, validated Tempo charge ready to be signed.
 ///
 /// Created from a [`PaymentChallenge`] via [`TempoCharge::from_challenge`].
@@ -86,15 +92,6 @@ impl TempoCharge {
             fee_payer,
             calls: None,
         })
-    }
-
-    /// Override the default transfer call with custom calls.
-    ///
-    /// When calls are overridden, the first call's target address is used as the
-    /// fee token unless a fee_token is explicitly set via [`SignOptions::fee_token`].
-    pub fn with_calls(mut self, calls: Vec<Call>) -> Self {
-        self.calls = Some(calls);
-        self
     }
 
     /// Get the chain ID extracted from the challenge.
@@ -189,9 +186,9 @@ impl TempoCharge {
         // Determine fee token
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
-        // Resolve nonce and gas fees
+        // Resolve gas fees from chain state (shared by both modes)
         let default_max_fee = options.max_fee_per_gas.unwrap_or(1_000_000_000); // 1 gwei floor
-        let default_priority_fee = options.max_priority_fee_per_gas.unwrap_or(1_000_000_000); // 1 gwei floor
+        let default_priority_fee = options.max_priority_fee_per_gas.unwrap_or(1_000_000_000);
 
         let resolved = if options.replace_stuck_txs {
             super::gas::resolve_gas_with_stuck_detection(
@@ -205,32 +202,53 @@ impl TempoCharge {
             super::gas::resolve_gas(&provider, from, default_max_fee, default_priority_fee).await?
         };
 
-        let nonce = options.nonce.unwrap_or(resolved.nonce);
         let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(resolved.max_fee_per_gas);
         let max_priority_fee_per_gas = options
             .max_priority_fee_per_gas
             .unwrap_or(resolved.max_priority_fee_per_gas);
 
-        // Estimate gas
-        let gas_limit = match options.gas_limit {
-            Some(g) => g,
-            None => {
-                estimate_gas(
-                    &provider,
-                    from,
-                    self.chain_id,
-                    nonce,
-                    fee_token,
-                    &calls,
-                    max_fee_per_gas,
-                    max_priority_fee_per_gas,
-                    options
-                        .key_authorization
-                        .as_deref()
-                        .or_else(|| signing_mode.key_authorization()),
-                )
-                .await?
-            }
+        // Fee payer mode: use expiring nonces to avoid nonce collisions
+        // when the server co-signs and broadcasts on the client's behalf.
+        let (nonce, nonce_key, valid_before, gas_limit) = if self.fee_payer {
+            let nonce = options.nonce.unwrap_or(0);
+            let nonce_key = options.nonce_key.unwrap_or(EXPIRING_NONCE_KEY);
+            let valid_before = options.valid_before.or_else(|| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                Some(now + FEE_PAYER_VALID_BEFORE_SECS)
+            });
+            let gas = options.gas_limit.unwrap_or(1_000_000);
+            (nonce, nonce_key, valid_before, gas)
+        } else {
+            let nonce = options.nonce.unwrap_or(resolved.nonce);
+            let gas = match options.gas_limit {
+                Some(g) => g,
+                None => {
+                    estimate_gas(
+                        &provider,
+                        from,
+                        self.chain_id,
+                        nonce,
+                        fee_token,
+                        &calls,
+                        max_fee_per_gas,
+                        max_priority_fee_per_gas,
+                        options
+                            .key_authorization
+                            .as_deref()
+                            .or_else(|| signing_mode.key_authorization()),
+                    )
+                    .await?
+                }
+            };
+            (
+                nonce,
+                options.nonce_key.unwrap_or(U256::ZERO),
+                options.valid_before,
+                gas,
+            )
         };
 
         // Build the key_authorization for the transaction
@@ -245,12 +263,12 @@ impl TempoCharge {
             chain_id: self.chain_id,
             fee_token,
             nonce,
-            nonce_key: options.nonce_key.unwrap_or(U256::ZERO),
+            nonce_key,
             gas_limit,
             max_fee_per_gas,
             max_priority_fee_per_gas,
             fee_payer: self.fee_payer,
-            valid_before: options.valid_before,
+            valid_before,
             key_authorization: tx_key_authorization,
         });
 
@@ -383,23 +401,6 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
         let challenge = PaymentChallenge::new("id", "api", "tempo", "session", request);
         assert!(TempoCharge::from_challenge(&challenge).is_err());
-    }
-
-    #[test]
-    fn test_with_calls_overrides_default() {
-        let challenge = test_challenge();
-        let charge = TempoCharge::from_challenge(&challenge).unwrap();
-
-        assert!(charge.calls.is_none());
-
-        let custom_calls = vec![Call {
-            to: TxKind::Call(Address::repeat_byte(0x01)),
-            value: U256::ZERO,
-            input: alloy::primitives::Bytes::new(),
-        }];
-        let charge = charge.with_calls(custom_calls.clone());
-        assert!(charge.calls.is_some());
-        assert_eq!(charge.calls.as_ref().unwrap().len(), 1);
     }
 
     #[test]

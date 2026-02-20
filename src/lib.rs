@@ -102,8 +102,5 @@ pub use alloy_signer_local::PrivateKeySigner;
 #[cfg(feature = "evm")]
 pub use alloy::primitives::{Address, U256};
 
-#[cfg(feature = "evm")]
-pub use evm::{format_u256_trimmed, format_u256_with_decimals};
-
 #[cfg(feature = "tempo")]
 pub use alloy::providers::{ProviderBuilder, RootProvider};

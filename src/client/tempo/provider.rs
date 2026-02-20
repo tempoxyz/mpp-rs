@@ -40,7 +40,6 @@ pub struct TempoProvider {
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
-    sign_options_overrides: Option<SignOptions>,
     replace_stuck_txs: bool,
 }
 
@@ -63,7 +62,6 @@ impl TempoProvider {
             rpc_url: url,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
-            sign_options_overrides: None,
             replace_stuck_txs: false,
         })
     }
@@ -79,13 +77,6 @@ impl TempoProvider {
     /// Default is [`TempoSigningMode::Direct`].
     pub fn with_signing_mode(mut self, mode: TempoSigningMode) -> Self {
         self.signing_mode = mode;
-        self
-    }
-
-    /// Override sign options (nonce, gas fees, etc.) for power users
-    /// who want to inject pre-resolved values.
-    pub fn with_sign_options(mut self, options: SignOptions) -> Self {
-        self.sign_options_overrides = Some(options);
         self
     }
 
@@ -125,14 +116,12 @@ impl PaymentProvider for TempoProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let charge = super::charge::TempoCharge::from_challenge(challenge)?;
 
-        let mut options = self.sign_options_overrides.clone().unwrap_or_default();
-        options.rpc_url = Some(self.rpc_url.to_string());
-        if options.signing_mode.is_none() {
-            options.signing_mode = Some(self.signing_mode.clone());
-        }
-        if self.replace_stuck_txs {
-            options.replace_stuck_txs = true;
-        }
+        let options = SignOptions {
+            rpc_url: Some(self.rpc_url.to_string()),
+            signing_mode: Some(self.signing_mode.clone()),
+            replace_stuck_txs: self.replace_stuck_txs,
+            ..Default::default()
+        };
 
         let signed = charge.sign_with_options(&self.signer, options).await?;
         Ok(signed.into_credential())
@@ -274,24 +263,5 @@ mod tests {
         let memo_bytes: [u8; 32] = bytes.try_into().unwrap();
 
         assert!(!crate::tempo::attribution::is_mpp_memo(&memo_bytes));
-    }
-
-    #[test]
-    fn test_tempo_provider_with_sign_options() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
-        let opts = SignOptions {
-            nonce: Some(42),
-            max_fee_per_gas: Some(20_000_000_000),
-            ..Default::default()
-        };
-        let provider = TempoProvider::new(signer, "https://rpc.example.com")
-            .unwrap()
-            .with_sign_options(opts);
-
-        assert!(provider.sign_options_overrides.is_some());
-        assert_eq!(
-            provider.sign_options_overrides.as_ref().unwrap().nonce,
-            Some(42)
-        );
     }
 }
