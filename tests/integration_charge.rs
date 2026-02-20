@@ -1318,18 +1318,18 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
     let (url, handle) = start_server(Arc::new(mpp_no_fp) as Arc<dyn ChargeChallenger>).await;
     let provider = TempoProvider::new(client_signer.clone(), &rpc).expect("TempoProvider");
 
-    let resp = Client::new()
+    let result = Client::new()
         .get(format!("{url}/paid"))
         .send_with_payment(&provider)
-        .await
-        .expect("request should complete");
+        .await;
 
-    // In the non-sponsored flow, the server broadcasts the tx. With only `amount` funded,
-    // the broadcast should fail, and the server will return a fresh 402 challenge.
-    assert_eq!(resp.status(), 402);
+    // Without fee sponsorship, client-side gas estimation reverts because the
+    // account only holds the charge amount (no gas buffer). The payment
+    // provider surfaces this as an error before anything reaches the server.
     assert!(
-        resp.headers().contains_key("www-authenticate"),
-        "server should return a fresh challenge"
+        result.is_err(),
+        "expected client-side failure without fee payer, got: {:?}",
+        result,
     );
 
     // The transaction should not have succeeded on-chain; the client should still have the funds.
