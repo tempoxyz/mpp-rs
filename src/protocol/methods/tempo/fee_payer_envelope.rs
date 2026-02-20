@@ -364,8 +364,8 @@ mod tests {
             bytes[0], TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID,
             "envelope must start with 0x78"
         );
-        let decoded = FeePayerEnvelope78::decode_envelope(&bytes)
-            .expect("decode_envelope should succeed");
+        let decoded =
+            FeePayerEnvelope78::decode_envelope(&bytes).expect("decode_envelope should succeed");
         assert_eq!(&decoded, original);
     }
 
@@ -509,10 +509,7 @@ mod tests {
         let inner_sig = signer.sign_hash_sync(&sig_hash).unwrap();
 
         let wallet = Address::repeat_byte(0xAB);
-        let keychain_sig = KeychainSignature::new(
-            wallet,
-            PrimitiveSignature::Secp256k1(inner_sig),
-        );
+        let keychain_sig = KeychainSignature::new(wallet, PrimitiveSignature::Secp256k1(inner_sig));
         let signature = TempoSignature::Keychain(keychain_sig);
 
         let env = FeePayerEnvelope78::from_signing_tx(tx, wallet, signature);

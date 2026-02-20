@@ -585,14 +585,13 @@ where
             )));
         }
 
-        let env = FeePayerEnvelope78::decode_envelope(tx_bytes).map_err(|e| {
-            VerificationError::new(format!("Failed to decode 0x78 envelope: {e}"))
-        })?;
+        let env = FeePayerEnvelope78::decode_envelope(tx_bytes)
+            .map_err(|e| VerificationError::new(format!("Failed to decode 0x78 envelope: {e}")))?;
 
         let signed = env.to_recoverable_signed();
-        let sender = signed.recover_signer().map_err(|e| {
-            VerificationError::new(format!("Failed to recover sender: {e}"))
-        })?;
+        let sender = signed
+            .recover_signer()
+            .map_err(|e| VerificationError::new(format!("Failed to recover sender: {e}")))?;
         if sender != env.sender {
             return Err(VerificationError::new(format!(
                 "Sender mismatch in 0x78 envelope: envelope={:#x} recovered={:#x}",
@@ -958,8 +957,8 @@ mod tests {
         let sig_hash = tx.signature_hash();
         let sig = signer.sign_hash_sync(&sig_hash).unwrap();
         let signature: tempo_primitives::transaction::TempoSignature = sig.into();
-        let encoded = FeePayerEnvelope78::from_signing_tx(tx, signer.address(), signature)
-            .encoded_envelope();
+        let encoded =
+            FeePayerEnvelope78::from_signing_tx(tx, signer.address(), signature).encoded_envelope();
         assert_eq!(encoded[0], TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID);
         encoded
     }
