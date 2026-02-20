@@ -244,6 +244,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
         digest,
+        opaque: params.get("opaque").cloned(),
     })
 }
 
@@ -298,6 +299,7 @@ pub fn parse_www_authenticate_all<'a>(
 ///     expires: None,
 ///     description: None,
 ///     digest: None,
+///     opaque: None,
 /// };
 /// let header = format_www_authenticate(&challenge).unwrap();
 /// assert!(header.starts_with("Payment id=\"abc123\""));
@@ -336,6 +338,10 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
         parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
     }
 
+    if let Some(ref opaque) = challenge.opaque {
+        parts.push(format!("opaque=\"{}\"", escape_quoted_value(opaque)?));
+    }
+
     Ok(format!("Payment {}", parts.join(", ")))
 }
 
@@ -358,6 +364,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
 ///     expires: None,
 ///     description: None,
 ///     digest: None,
+///     opaque: None,
 /// };
 /// let headers = format_www_authenticate_many(&[challenge]).unwrap();
 /// assert_eq!(headers.len(), 1);
@@ -463,6 +470,7 @@ mod tests {
             expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
             digest: None,
+            opaque: None,
         }
     }
 

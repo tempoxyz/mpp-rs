@@ -151,6 +151,7 @@ mod tests {
             request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
             expires: None,
             digest: None,
+            opaque: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
         let request = SessionRequest {
