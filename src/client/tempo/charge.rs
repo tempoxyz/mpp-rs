@@ -32,7 +32,9 @@ use alloy::primitives::{Address, TxKind, U256};
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
 
 use super::abi::encode_transfer;
-use super::signing::{sign_and_encode_async, TempoSigningMode};
+use super::signing::{
+    sign_and_encode_async, sign_and_encode_fee_payer_envelope_async, TempoSigningMode,
+};
 use super::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
@@ -272,7 +274,13 @@ impl TempoCharge {
             key_authorization: tx_key_authorization,
         });
 
-        let tx_bytes = sign_and_encode_async(tx, signer, &signing_mode).await?;
+        // If fee sponsorship is requested, send the `0x78` fee payer envelope
+        // so MPPx servers can co-sign and broadcast (standard `0x76`).
+        let tx_bytes = if self.fee_payer {
+            sign_and_encode_fee_payer_envelope_async(tx, signer, &signing_mode).await?
+        } else {
+            sign_and_encode_async(tx, signer, &signing_mode).await?
+        };
 
         Ok(SignedTempoCharge {
             challenge: self.challenge,

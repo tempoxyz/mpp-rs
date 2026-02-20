@@ -97,6 +97,7 @@
 //! ```
 
 pub mod charge;
+pub mod fee_payer_envelope;
 pub mod network;
 pub mod session;
 pub mod session_receipt;
@@ -110,6 +111,7 @@ pub mod method;
 pub mod session_method;
 
 pub use charge::TempoChargeExt;
+pub use fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
 pub use network::TempoNetwork;
 pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};
 pub use session_receipt::SessionReceipt;
