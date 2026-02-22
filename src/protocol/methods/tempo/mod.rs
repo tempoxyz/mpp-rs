@@ -96,8 +96,8 @@
 //! assert_eq!(MODERATO_CHAIN_ID, 42431);
 //! ```
 
-pub mod abi;
 pub mod charge;
+pub mod fee_payer_envelope;
 pub mod network;
 pub mod session;
 pub mod session_receipt;
@@ -110,8 +110,8 @@ pub mod method;
 #[cfg(feature = "server")]
 pub mod session_method;
 
-pub use abi::{encode_approve, encode_swap_exact_amount_out, encode_transfer, DEX_ADDRESS};
 pub use charge::TempoChargeExt;
+pub use fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
 pub use network::TempoNetwork;
 pub use session::{SessionCredentialPayload, TempoSessionExt, TempoSessionMethodDetails};
 pub use session_receipt::SessionReceipt;
@@ -147,8 +147,24 @@ pub const MODERATO_CHAIN_ID: u64 = 42431;
 /// Default RPC URL for Tempo mainnet.
 pub const DEFAULT_RPC_URL: &str = "https://rpc.tempo.xyz";
 
-/// Default currency address (pathUSD).
-pub const DEFAULT_CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
+/// USDC currency address (USDC.e on Tempo mainnet).
+pub const USDC: &str = "0x20C000000000000000000000b9537d11c60E8b50";
+
+/// pathUSD currency address.
+pub const PATH_USD: &str = "0x20c0000000000000000000000000000000000000";
+
+/// Default currency address for Tempo mainnet (USDC).
+pub const DEFAULT_CURRENCY_MAINNET: &str = USDC;
+
+/// Default currency address for Tempo testnet (pathUSD).
+pub const DEFAULT_CURRENCY_TESTNET: &str = PATH_USD;
+
+/// Default currency address (USDC on mainnet).
+#[deprecated(
+    since = "0.6.0",
+    note = "use DEFAULT_CURRENCY_MAINNET or DEFAULT_CURRENCY_TESTNET"
+)]
+pub const DEFAULT_CURRENCY: &str = USDC;
 
 /// Default challenge expiration in minutes.
 pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;

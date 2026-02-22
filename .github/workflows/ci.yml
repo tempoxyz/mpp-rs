@@ -79,6 +79,18 @@ jobs:
       - run: cargo check ${{ matrix.features }}
       - run: cargo test ${{ matrix.features }}
 
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs: [lint, test, feature-matrix, integration-test]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more required jobs failed or were cancelled"
+            exit 1
+          fi
+
   integration-test:
     name: Integration Test
     runs-on: ubuntu-latest

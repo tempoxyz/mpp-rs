@@ -559,18 +559,18 @@ where
 
     /// Co-sign a fee payer transaction.
     ///
-    /// Accepts a standard 0x76 Tempo transaction with a placeholder
-    /// fee_payer_signature. Recovers the sender address via ecrecover,
-    /// validates fee-payer invariants, then co-signs and returns a
-    /// complete 0x76 transaction ready for broadcast.
+    /// Accepts a `0x78` fee payer envelope, recovers the sender via
+    /// ecrecover, validates fee-payer invariants, then co-signs and
+    /// returns a complete `0x76` transaction ready for broadcast.
     fn cosign_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
         fee_payer_signer: &alloy_signer_local::PrivateKeySigner,
         fee_token: Address,
     ) -> Result<Vec<u8>, VerificationError> {
+        use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::consensus::transaction::SignerRecoverable;
-        use alloy::eips::{Decodable2718, Encodable2718};
+        use alloy::eips::Encodable2718;
         use alloy::signers::SignerSync;
         use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
@@ -578,22 +578,26 @@ where
             return Err(VerificationError::new("Empty transaction bytes"));
         }
 
-        // Require 0x76 Tempo transaction type
         let type_byte = tx_bytes[0];
-        if type_byte != tempo_primitives::transaction::TEMPO_TX_TYPE_ID {
+        if type_byte != TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID {
             return Err(VerificationError::new(format!(
-                "Expected Tempo transaction (0x76), got 0x{type_byte:02x}"
+                "Expected fee payer envelope (0x78), got 0x{type_byte:02x}"
             )));
         }
 
-        // Decode the standard 0x76 transaction
-        let signed = tempo_primitives::AASigned::decode_2718(&mut &tx_bytes[..])
-            .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {e}")))?;
+        let env = FeePayerEnvelope78::decode_envelope(tx_bytes)
+            .map_err(|e| VerificationError::new(format!("Failed to decode 0x78 envelope: {e}")))?;
 
-        // Recover sender address from client signature via ecrecover
+        let signed = env.to_recoverable_signed();
         let sender = signed
             .recover_signer()
             .map_err(|e| VerificationError::new(format!("Failed to recover sender: {e}")))?;
+        if sender != env.sender {
+            return Err(VerificationError::new(format!(
+                "Sender mismatch in 0x78 envelope: envelope={:#x} recovered={:#x}",
+                env.sender, sender
+            )));
+        }
 
         let tx = signed.tx();
 
@@ -942,25 +946,30 @@ mod tests {
         }
     }
 
-    /// Helper: sign a tx and encode as standard 0x76.
-    fn sign_and_encode(
+    /// Helper: sign a tx and encode as a 0x78 fee payer envelope.
+    fn sign_and_encode_0x78(
         tx: tempo_primitives::TempoTransaction,
         signer: &alloy_signer_local::PrivateKeySigner,
     ) -> Vec<u8> {
-        use alloy::eips::Encodable2718;
+        use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::signers::SignerSync;
 
         let sig_hash = tx.signature_hash();
         let sig = signer.sign_hash_sync(&sig_hash).unwrap();
-        let signed = tx.into_signed(sig.into());
-        signed.encoded_2718()
+        let signature: tempo_primitives::transaction::TempoSignature = sig.into();
+        let encoded =
+            FeePayerEnvelope78::from_signing_tx(tx, signer.address(), signature).encoded_envelope();
+        assert_eq!(encoded[0], TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID);
+        encoded
     }
 
-    /// Round-trip: sign 0x76 → cosign_fee_payer_transaction
+    /// Round-trip: sign 0x78 envelope → cosign_fee_payer_transaction
     /// succeeds and produces a valid co-signed 0x76 transaction.
     #[test]
-    fn test_fee_payer_round_trip() {
+    fn test_fee_payer_round_trip_0x78_envelope() {
+        use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::eips::Decodable2718;
+        use alloy::signers::SignerSync;
 
         let client_signer = alloy_signer_local::PrivateKeySigner::random();
         let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
@@ -969,10 +978,15 @@ mod tests {
             .unwrap();
 
         let tx = make_fee_payer_tx(60);
-        let encoded = sign_and_encode(tx, &client_signer);
 
-        // Verify it starts with 0x76
-        assert_eq!(encoded[0], tempo_primitives::transaction::TEMPO_TX_TYPE_ID);
+        // Encode as a 0x78 fee payer envelope (sender address in the fee_payer slot).
+        let sig_hash = tx.signature_hash();
+        let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
+        let signature: tempo_primitives::transaction::TempoSignature = sig.into();
+
+        let encoded = FeePayerEnvelope78::from_signing_tx(tx, client_signer.address(), signature)
+            .encoded_envelope();
+        assert_eq!(encoded[0], TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID);
 
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -986,7 +1000,7 @@ mod tests {
             fee_token,
         );
 
-        let co_signed = result.expect("cosign should succeed for valid 0x76 tx");
+        let co_signed = result.expect("cosign should succeed for valid 0x78 envelope");
 
         // Result should be a valid 0x76 transaction
         assert_eq!(
@@ -1007,46 +1021,6 @@ mod tests {
         assert!(decoded_tx.valid_before.is_some());
     }
 
-    /// cosign_fee_payer_transaction rejects a tx without fee_payer_signature placeholder.
-    #[test]
-    fn test_cosign_rejects_no_placeholder() {
-        use alloy::eips::Encodable2718;
-        use alloy::signers::SignerSync;
-
-        let client_signer = alloy_signer_local::PrivateKeySigner::random();
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
-
-        // Build a tx WITHOUT fee_payer_signature placeholder
-        let mut tx = make_fee_payer_tx(60);
-        tx.fee_payer_signature = None;
-
-        let sig_hash = tx.signature_hash();
-        let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
-        let signed = tx.into_signed(sig.into());
-        let encoded = signed.encoded_2718();
-
-        let provider =
-            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
-                .connect_http("http://127.0.0.1:1".parse().unwrap());
-
-        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
-
-        let result = method.cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
-
-        let err = result.expect_err("should reject tx without placeholder");
-        assert!(
-            err.to_string().contains("fee_payer_signature placeholder"),
-            "error should mention placeholder, got: {err}"
-        );
-    }
-
     /// cosign_fee_payer_transaction rejects txs with wrong nonce_key.
     #[test]
     fn test_cosign_rejects_wrong_nonce_key() {
@@ -1059,7 +1033,7 @@ mod tests {
         let mut tx = make_fee_payer_tx(60);
         tx.nonce_key = U256::ZERO; // Wrong — should be U256::MAX
 
-        let encoded = sign_and_encode(tx, &client_signer);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
 
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -1092,7 +1066,7 @@ mod tests {
         let mut tx = make_fee_payer_tx(60);
         tx.valid_before = None; // Missing
 
-        let encoded = sign_and_encode(tx, &client_signer);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
 
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -1132,7 +1106,7 @@ mod tests {
         let mut tx = make_fee_payer_tx(60);
         tx.valid_before = Some(past);
 
-        let encoded = sign_and_encode(tx, &client_signer);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
 
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -1180,7 +1154,7 @@ mod tests {
         );
     }
 
-    /// cosign_fee_payer_transaction rejects non-0x76 type byte.
+    /// cosign_fee_payer_transaction rejects non-0x78 type byte.
     #[test]
     fn test_cosign_rejects_wrong_type_byte() {
         let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
@@ -1195,16 +1169,16 @@ mod tests {
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
         let result = method.cosign_fee_payer_transaction(
-            &[0x78, 0xc0], // wrong type byte
+            &[0x79, 0xc0], // wrong type byte
             method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let err = result.expect_err("should reject 0x78 input");
+        let err = result.expect_err("should reject wrong type");
         assert!(
             err.to_string()
-                .contains("Expected Tempo transaction (0x76)"),
-            "error should mention 0x76, got: {err}"
+                .contains("Expected fee payer envelope (0x78)"),
+            "error should mention 0x78, got: {err}"
         );
     }
 }

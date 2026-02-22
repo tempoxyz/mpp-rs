@@ -28,7 +28,10 @@ impl TempoNetwork {
 
     /// Returns the default currency address for this network.
     pub const fn default_currency(self) -> &'static str {
-        super::DEFAULT_CURRENCY
+        match self {
+            Self::Mainnet => super::DEFAULT_CURRENCY_MAINNET,
+            Self::Moderato => super::DEFAULT_CURRENCY_TESTNET,
+        }
     }
 
     /// Returns the network for a given chain ID, if known.
@@ -106,11 +109,11 @@ mod tests {
         );
         assert_eq!(
             TempoNetwork::Mainnet.default_currency(),
-            super::super::DEFAULT_CURRENCY
+            super::super::DEFAULT_CURRENCY_MAINNET
         );
         assert_eq!(
             TempoNetwork::Moderato.default_currency(),
-            super::super::DEFAULT_CURRENCY
+            super::super::DEFAULT_CURRENCY_TESTNET
         );
     }
 
@@ -127,14 +130,18 @@ mod tests {
     }
 
     #[test]
-    fn default_currency_identical_across_networks() {
+    fn default_currency_per_network() {
         assert_eq!(
             TempoNetwork::Mainnet.default_currency(),
-            TempoNetwork::Moderato.default_currency()
+            "0x20C000000000000000000000b9537d11c60E8b50"
         );
         assert_eq!(
-            TempoNetwork::Mainnet.default_currency(),
+            TempoNetwork::Moderato.default_currency(),
             "0x20c0000000000000000000000000000000000000"
+        );
+        assert_ne!(
+            TempoNetwork::Mainnet.default_currency(),
+            TempoNetwork::Moderato.default_currency()
         );
     }
 

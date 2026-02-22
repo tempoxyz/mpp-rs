@@ -8,6 +8,7 @@ use alloy::primitives::Address;
 use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::error::MppError;
+use crate::protocol::methods::tempo::FeePayerEnvelope78;
 
 /// How to sign Tempo transactions.
 ///
@@ -94,10 +95,52 @@ pub fn sign_and_encode(
     Ok(signed_tx.encoded_2718())
 }
 
+/// Sign a [`TempoTransaction`] and return the **fee payer envelope** encoded bytes.
+///
+/// The resulting bytes start with `0x78` and are meant to be sent to an MPPx server
+/// (or fee payer proxy) which will co-sign and broadcast.
+pub fn sign_and_encode_fee_payer_envelope(
+    tx: tempo_primitives::transaction::TempoTransaction,
+    signer: &(impl alloy::signers::SignerSync + alloy::signers::Signer),
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    use alloy::primitives::U256;
+
+    let sender = mode.from_address(signer.address());
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".to_string(),
+        ));
+    }
+
+    let sig_hash = tx.signature_hash();
+    let inner_signature = signer
+        .sign_hash_sync(&sig_hash)
+        .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+    let signature = build_tempo_signature(inner_signature, mode);
+    Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
+}
+
 /// Async version of [`sign_and_encode`] for signers that require async signing.
 pub async fn sign_and_encode_async(
     tx: tempo_primitives::transaction::TempoTransaction,
-    signer: &(impl alloy::signers::Signer + Clone),
+    signer: &impl alloy::signers::Signer,
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
     use alloy::eips::Encodable2718;
@@ -110,6 +153,46 @@ pub async fn sign_and_encode_async(
 
     let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
     Ok(signed_tx.encoded_2718())
+}
+
+/// Async version of [`sign_and_encode_fee_payer_envelope`].
+pub async fn sign_and_encode_fee_payer_envelope_async(
+    tx: tempo_primitives::transaction::TempoTransaction,
+    signer: &impl alloy::signers::Signer,
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    use alloy::primitives::U256;
+
+    let sender = mode.from_address(signer.address());
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".to_string(),
+        ));
+    }
+
+    let sig_hash = tx.signature_hash();
+    let inner_signature = signer
+        .sign_hash(&sig_hash)
+        .await
+        .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+    let signature = build_tempo_signature(inner_signature, mode);
+    Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
 }
 
 #[cfg(test)]
@@ -232,6 +315,38 @@ mod tests {
         assert_eq!(decoded.tx().chain_id, 42431);
         assert_eq!(decoded.tx().nonce, 1);
         assert_eq!(decoded.tx().gas_limit, 500_000);
+    }
+
+    #[test]
+    fn test_sign_and_encode_fee_payer_envelope_encodes_sender_address() {
+        let signer = test_signer();
+
+        // The tx must have `fee_payer_signature.is_some()` so the user's
+        // signature_hash skips feeToken commitment (fee sponsorship flow).
+        let mut tx = test_tx();
+        tx.fee_token = None;
+        tx.nonce_key = alloy::primitives::U256::MAX;
+        tx.valid_before = Some(9999999999);
+        tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
+            alloy::primitives::U256::ZERO,
+            alloy::primitives::U256::ZERO,
+            false,
+        ));
+
+        let mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAB),
+            key_authorization: None,
+        };
+
+        let bytes = sign_and_encode_fee_payer_envelope(tx, &signer, &mode).unwrap();
+        assert_eq!(
+            bytes[0],
+            crate::protocol::methods::tempo::TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID,
+            "fee payer envelope must start with 0x78"
+        );
+
+        let env = FeePayerEnvelope78::decode_envelope(&bytes).unwrap();
+        assert_eq!(env.sender, Address::repeat_byte(0xAB));
     }
 
     #[test]
