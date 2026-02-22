@@ -856,4 +856,182 @@ mod tests {
             .insert("key".to_string(), entry);
         assert_eq!(cloned.channels().len(), 1);
     }
+
+    // --- shared test helpers ---
+
+    fn make_test_provider() -> TempoSessionProvider {
+        let signer = PrivateKeySigner::random();
+        TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap()
+    }
+
+    fn make_channel_entry(channel_id_byte: u8, cumulative: u128, opened: bool) -> ChannelEntry {
+        ChannelEntry {
+            channel_id: B256::repeat_byte(channel_id_byte),
+            salt: B256::ZERO,
+            cumulative_amount: cumulative,
+            escrow_contract: Address::ZERO,
+            chain_id: 42431,
+            opened,
+        }
+    }
+
+    fn make_test_challenge() -> PaymentChallenge {
+        PaymentChallenge::new(
+            "test-id",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        )
+    }
+
+    // --- send_voucher error paths ---
+
+    #[tokio::test]
+    async fn test_send_voucher_missing_challenge() {
+        let provider = make_test_provider();
+
+        let client = reqwest::Client::new();
+        let err = provider
+            .send_voucher(&client, "https://example.com/pay", "0xdeadbeef", 1000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MppError::InvalidConfig(ref msg) if msg.contains("no challenge available")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_send_voucher_missing_channel_id_mapping() {
+        let provider = make_test_provider();
+        *provider.last_challenge.lock().unwrap() = Some(make_test_challenge());
+
+        let client = reqwest::Client::new();
+        let err = provider
+            .send_voucher(&client, "https://example.com/pay", "0xnosuchid", 1000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MppError::InvalidConfig(ref msg) if msg.contains("no channel found")
+        ));
+    }
+
+    // --- close early-return paths ---
+
+    #[tokio::test]
+    async fn test_close_no_challenge_returns_none() {
+        let provider = make_test_provider();
+
+        let client = reqwest::Client::new();
+        let result = provider.close(&client, "https://example.com/pay").await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_close_no_open_channel_returns_none() {
+        let provider = make_test_provider();
+        *provider.last_challenge.lock().unwrap() = Some(make_test_challenge());
+
+        let client = reqwest::Client::new();
+        let result = provider.close(&client, "https://example.com/pay").await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    // --- cumulative() behavior ---
+    // Note: send_voucher's cumulative update cannot be integration-tested without
+    // a mock HTTP server because the update is written back to the registry only
+    // after payload creation, and the method then POSTs to a URL which would fail.
+
+    #[test]
+    fn test_cumulative_reflects_channel_state() {
+        let provider = make_test_provider();
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("key".to_string(), make_channel_entry(0xAB, 1000, true));
+
+        assert_eq!(provider.cumulative(), 1000);
+
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut("key")
+            .unwrap()
+            .cumulative_amount = 2000;
+
+        assert_eq!(provider.cumulative(), 2000);
+    }
+
+    #[test]
+    fn test_cumulative_does_not_decrease() {
+        let provider = make_test_provider();
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert("key".to_string(), make_channel_entry(0x01, 5000, true));
+
+        assert_eq!(provider.cumulative(), 5000);
+
+        // Lowering cumulative_amount in the entry still reflects the stored value;
+        // the "never decrease" invariant is enforced by send_voucher (line 219),
+        // not by cumulative() itself.
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut("key")
+            .unwrap()
+            .cumulative_amount = 3000;
+
+        assert_eq!(provider.cumulative(), 3000);
+    }
+
+    #[test]
+    fn test_cumulative_returns_first_opened_channel_only() {
+        let provider = make_test_provider();
+        {
+            let mut channels = provider.channels.lock().unwrap();
+            channels.insert("key-a".to_string(), make_channel_entry(0x01, 5000, true));
+            channels.insert("key-b".to_string(), make_channel_entry(0x02, 9000, true));
+        }
+
+        let cum = provider.cumulative();
+        // cumulative() returns the first opened channel it finds (HashMap iteration
+        // order), not a sum. Verify it returns one of the two values.
+        assert!(
+            cum == 5000 || cum == 9000,
+            "expected cumulative to be one channel's value, got: {cum}"
+        );
+    }
+
+    #[test]
+    fn test_channel_registry_multiple_channels() {
+        let provider = make_test_provider();
+        {
+            let mut channels = provider.channels.lock().unwrap();
+            channels.insert("key-a".to_string(), make_channel_entry(0x01, 5000, true));
+            channels.insert("key-b".to_string(), make_channel_entry(0x02, 3000, false));
+        }
+
+        assert_eq!(provider.channels().len(), 2);
+        assert_eq!(
+            provider.cumulative(),
+            5000,
+            "cumulative should only count the opened channel"
+        );
+    }
 }

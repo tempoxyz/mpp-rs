@@ -57,6 +57,7 @@ pub(crate) fn detect_realm() -> String {
 }
 
 /// Result of session verification, including optional management response.
+#[derive(Debug)]
 pub struct SessionVerifyResult {
     /// The payment receipt.
     pub receipt: Receipt,
@@ -595,6 +596,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
 mod tests {
     use super::*;
     use crate::protocol::core::{ChallengeEcho, PaymentPayload};
+    use crate::protocol::traits::ErrorCode;
     #[cfg(feature = "tempo")]
     use crate::server::{tempo, ChargeOptions, TempoConfig};
     use std::future::Future;
@@ -1068,5 +1070,348 @@ mod tests {
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
         let receipt = mpp.verify_credential(&credential).await.unwrap();
         assert!(receipt.is_success());
+    }
+
+    // ── Mock SessionMethod for session verification tests ─────────────
+
+    #[derive(Clone)]
+    struct MockSessionMethod {
+        receipt: Receipt,
+        management_response: Option<serde_json::Value>,
+    }
+
+    impl MockSessionMethod {
+        fn success() -> Self {
+            Self {
+                receipt: Receipt::success("tempo", "0xsession_ref"),
+                management_response: None,
+            }
+        }
+
+        fn with_management_response(mut self, resp: serde_json::Value) -> Self {
+            self.management_response = Some(resp);
+            self
+        }
+    }
+
+    impl crate::protocol::traits::SessionMethod for MockSessionMethod {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        fn verify_session(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &crate::protocol::intents::SessionRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            let receipt = self.receipt.clone();
+            async move { Ok(receipt) }
+        }
+
+        fn respond(
+            &self,
+            _credential: &PaymentCredential,
+            _receipt: &Receipt,
+        ) -> Option<serde_json::Value> {
+            self.management_response.clone()
+        }
+    }
+
+    // ── Mock SessionMethod that always returns an error ─────────────────
+
+    #[derive(Clone)]
+    struct MockFailingSessionMethod {
+        error: VerificationError,
+    }
+
+    impl MockFailingSessionMethod {
+        fn with_error(code: ErrorCode, message: &str) -> Self {
+            Self {
+                error: VerificationError::with_code(message, code),
+            }
+        }
+    }
+
+    impl crate::protocol::traits::SessionMethod for MockFailingSessionMethod {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        fn verify_session(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &crate::protocol::intents::SessionRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            let error = self.error.clone();
+            async move { Err(error) }
+        }
+
+        fn respond(
+            &self,
+            _credential: &PaymentCredential,
+            _receipt: &Receipt,
+        ) -> Option<serde_json::Value> {
+            None
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    fn create_session_test_mpp() -> Mpp<TempoSuccessMethod, MockSessionMethod> {
+        Mpp {
+            method: TempoSuccessMethod,
+            session_method: Some(MockSessionMethod::success()),
+            realm: "MPP Payment".into(),
+            secret_key: "test-secret".into(),
+            currency: Some("0x20c0000000000000000000000000000000000000".into()),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            chain_id: None,
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    fn make_session_credential(
+        mpp: &Mpp<TempoSuccessMethod, MockSessionMethod>,
+        payload: serde_json::Value,
+    ) -> PaymentCredential {
+        let challenge = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+        PaymentCredential::new(challenge.to_echo(), payload)
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_session_challenge_roundtrip() {
+        let mpp = create_session_test_mpp();
+        let challenge = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "session");
+        assert!(!challenge.id.is_empty());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_session_happy_path() {
+        let mpp = create_session_test_mpp();
+        let credential = make_session_credential(
+            &mpp,
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": "0xabc",
+                "cumulativeAmount": "5000",
+                "signature": "0xdef"
+            }),
+        );
+
+        let result = mpp.verify_session(&credential).await;
+        assert!(result.is_ok());
+        let session_result = result.unwrap();
+        assert!(session_result.receipt.is_success());
+        assert_eq!(session_result.receipt.reference, "0xsession_ref");
+        assert!(session_result.management_response.is_none());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_session_management_response() {
+        let mock_session = MockSessionMethod::success()
+            .with_management_response(serde_json::json!({"status": "ok", "channelId": "0xabc"}));
+        let mpp: Mpp<TempoSuccessMethod, MockSessionMethod> = Mpp {
+            method: TempoSuccessMethod,
+            session_method: Some(mock_session),
+            realm: "MPP Payment".into(),
+            secret_key: "test-secret".into(),
+            currency: Some("0x20c0000000000000000000000000000000000000".into()),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            chain_id: None,
+        };
+
+        let challenge = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+
+        let echo = challenge.to_echo();
+        let payload_json = serde_json::json!({
+            "action": "open",
+            "type": "transaction",
+            "channelId": "0xabc",
+            "transaction": "0x1234",
+            "cumulativeAmount": "5000",
+            "signature": "0xdef"
+        });
+        let credential = PaymentCredential::new(echo, payload_json);
+
+        let result = mpp.verify_session(&credential).await;
+        assert!(result.is_ok());
+        let session_result = result.unwrap();
+        assert!(session_result.management_response.is_some());
+        let mgmt = session_result.management_response.unwrap();
+        assert_eq!(mgmt["channelId"], "0xabc");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_session_no_session_method() {
+        let mpp: Mpp<TempoSuccessMethod, MockSessionMethod> = Mpp {
+            method: TempoSuccessMethod,
+            session_method: None,
+            realm: "MPP Payment".into(),
+            secret_key: "test-secret".into(),
+            currency: Some("0x20c0000000000000000000000000000000000000".into()),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            chain_id: None,
+        };
+
+        let echo = ChallengeEcho {
+            id: "test".into(),
+            realm: "MPP Payment".into(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            expires: None,
+            digest: None,
+        };
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
+
+        let result = mpp.verify_session(&credential).await;
+        let err = result.unwrap_err();
+        assert!(err.message.contains("No session method"));
+        assert!(
+            err.code.is_none(),
+            "no-session-method should not have an error code"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_session_hmac_mismatch() {
+        let mpp = create_session_test_mpp();
+        let challenge = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+
+        let mut echo = challenge.to_echo();
+        let tampered = crate::protocol::intents::SessionRequest {
+            amount: "999999".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            ..Default::default()
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered).unwrap();
+        echo.request = encoded.raw().to_string();
+
+        let payload_json = serde_json::json!({
+            "action": "voucher",
+            "channelId": "0xabc",
+            "cumulativeAmount": "5000",
+            "signature": "0xdef"
+        });
+        let credential = PaymentCredential::new(echo, payload_json);
+
+        let result = mpp.verify_session(&credential).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_session_challenge_with_details() {
+        let mpp = create_session_test_mpp();
+        let challenge = mpp
+            .session_challenge_with_details(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                super::super::SessionChallengeOptions {
+                    unit_type: Some("second"),
+                    suggested_deposit: Some("60000"),
+                    fee_payer: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "session");
+        let request: crate::protocol::intents::SessionRequest = challenge.request.decode().unwrap();
+        assert_eq!(request.amount, "1000");
+        assert_eq!(request.unit_type.as_deref(), Some("second"));
+        assert_eq!(request.suggested_deposit.as_deref(), Some("60000"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_session_method_returns_error() {
+        let mock_session = MockFailingSessionMethod::with_error(
+            ErrorCode::InsufficientBalance,
+            "channel balance exhausted",
+        );
+        let mpp: Mpp<TempoSuccessMethod, MockFailingSessionMethod> = Mpp {
+            method: TempoSuccessMethod,
+            session_method: Some(mock_session),
+            realm: "MPP Payment".into(),
+            secret_key: "test-secret".into(),
+            currency: Some("0x20c0000000000000000000000000000000000000".into()),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            chain_id: None,
+        };
+
+        let challenge = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+
+        let echo = challenge.to_echo();
+        let payload_json = serde_json::json!({
+            "action": "voucher",
+            "channelId": "0xabc",
+            "cumulativeAmount": "5000",
+            "signature": "0xdef"
+        });
+        let credential = PaymentCredential::new(echo, payload_json);
+
+        let result = mpp.verify_session(&credential).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InsufficientBalance));
+        assert!(err.message.contains("channel balance exhausted"));
+    }
+
+    #[test]
+    fn test_session_verify_result_debug() {
+        let result = SessionVerifyResult {
+            receipt: Receipt::success("tempo", "0xref"),
+            management_response: Some(serde_json::json!({"status": "ok"})),
+        };
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("0xref"));
+        assert!(debug.contains("status"));
     }
 }
