@@ -13,7 +13,7 @@ pub type Result<T> = std::result::Result<T, MppError>;
 // ==================== RFC 9457 Problem Details ====================
 
 /// Base URI for core payment-auth problem types.
-pub const CORE_PROBLEM_TYPE_BASE: &str = "https://tempoxyz.github.io/payment-auth-spec/problems";
+pub const CORE_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems";
 
 /// Base URI for session/channel problem types.
 pub const SESSION_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/session";
@@ -695,7 +695,7 @@ mod tests {
 
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/test-error"
+            "https://paymentauth.org/problems/test-error"
         );
         assert_eq!(problem.title, "TestError");
         assert_eq!(problem.status, 400);
@@ -755,7 +755,7 @@ mod tests {
         let problem = err.to_problem_details(Some("test-id"));
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/malformed-credential"
+            "https://paymentauth.org/problems/malformed-credential"
         );
         assert_eq!(problem.title, "MalformedCredentialError");
         assert_eq!(problem.challenge_id, Some("test-id".to_string()));
@@ -781,7 +781,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/invalid-challenge"
+            "https://paymentauth.org/problems/invalid-challenge"
         );
         assert_eq!(problem.challenge_id, Some("abc123".to_string()));
     }
@@ -800,7 +800,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/verification-failed"
+            "https://paymentauth.org/problems/verification-failed"
         );
         assert_eq!(problem.title, "VerificationFailedError");
     }
@@ -816,7 +816,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/payment-expired"
+            "https://paymentauth.org/problems/payment-expired"
         );
     }
 
@@ -846,7 +846,7 @@ mod tests {
         let problem = err.to_problem_details(Some("chal-id"));
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/payment-required"
+            "https://paymentauth.org/problems/payment-required"
         );
         assert_eq!(problem.challenge_id, Some("chal-id".to_string()));
     }
@@ -862,7 +862,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/bad-request"
+            "https://paymentauth.org/problems/bad-request"
         );
         assert_eq!(problem.title, "BadRequestError");
         assert_eq!(problem.status, 400);
@@ -1012,7 +1012,7 @@ mod tests {
         let problem = err.to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            "https://tempoxyz.github.io/payment-auth-spec/problems/invalid-payload"
+            "https://paymentauth.org/problems/invalid-payload"
         );
         assert_eq!(problem.title, "InvalidPayloadError");
     }

@@ -32,6 +32,7 @@ jobs:
           fi
           ~/.local/bin/changelogs add --ecosystem rust --ai "claude -p" --ref origin/${{ github.base_ref }}
       - name: Commit changelog
+        id: commit
         run: |
           if [ -n "$(git status --porcelain .changelog/)" ]; then
             git config user.name "github-actions[bot]"
@@ -39,4 +40,12 @@ jobs:
             git add .changelog/
             git commit -m "chore: add changelog"
             git push
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
           fi
+
+  ci:
+    needs: changelog
+    if: always()
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.head_ref }}
