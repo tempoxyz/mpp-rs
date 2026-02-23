@@ -209,6 +209,7 @@ mod tests {
                 request: "eyJhbW91bnQiOiIxMDAwIn0".to_string(),
                 expires: None,
                 digest: None,
+                opaque: None,
             },
             "did:pkh:eip155:42161:0xabc",
             PaymentPayload::transaction("0xdeadbeef"),
@@ -562,6 +563,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
         assert!(echoed_challenge.verify(secret));
 

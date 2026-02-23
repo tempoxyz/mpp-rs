@@ -346,6 +346,7 @@ where
                 &credential.challenge.request,
                 credential.challenge.expires.as_deref(),
                 credential.challenge.digest.as_deref(),
+                credential.challenge.opaque.as_deref(),
             );
 
             if credential.challenge.id != expected_id {
@@ -392,6 +393,7 @@ where
             encoded.raw(),
             None,
             None,
+            None,
         );
 
         Ok(PaymentChallenge {
@@ -403,6 +405,7 @@ where
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         })
     }
 
@@ -468,6 +471,7 @@ where
             encoded.raw(),
             options.expires,
             None,
+            None,
         );
 
         Ok(PaymentChallenge {
@@ -479,6 +483,7 @@ where
             expires: options.expires.map(|s| s.to_string()),
             description: options.description.map(|s| s.to_string()),
             digest: None,
+            opaque: None,
         })
     }
 
@@ -502,6 +507,7 @@ where
                 &credential.challenge.request,
                 credential.challenge.expires.as_deref(),
                 credential.challenge.digest.as_deref(),
+                credential.challenge.opaque.as_deref(),
             );
             if credential.challenge.id != expected_id {
                 return Err(crate::protocol::traits::VerificationError::with_code(
@@ -672,6 +678,7 @@ mod tests {
                     request,
                     None,
                     None,
+                    None,
                 )
             }
             #[cfg(not(feature = "tempo"))]
@@ -688,6 +695,7 @@ mod tests {
             request: request.into(),
             expires: None,
             digest: None,
+            opaque: None,
         };
         PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
     }
@@ -861,6 +869,7 @@ mod tests {
                     &raw,
                     None,
                     None,
+                    None,
                 )
             }
             #[cfg(not(feature = "tempo"))]
@@ -877,6 +886,7 @@ mod tests {
             request: raw,
             expires: None,
             digest: None,
+            opaque: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 
@@ -1290,6 +1300,7 @@ mod tests {
             request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
             expires: None,
             digest: None,
+            opaque: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 

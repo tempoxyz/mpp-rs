@@ -305,6 +305,7 @@ pub fn charge_challenge_with_options(
         encoded_request.raw(),
         expires,
         None,
+        None,
     );
 
     Ok(PaymentChallenge {
@@ -316,6 +317,7 @@ pub fn charge_challenge_with_options(
         expires: expires.map(|s| s.to_string()),
         description: description.map(|s| s.to_string()),
         digest: None,
+        opaque: None,
     })
 }
 
@@ -351,8 +353,10 @@ pub fn charge_challenge_with_options(
 ///     "eyJhbW91bnQiOiIxMDAwMDAwIn0",
 ///     None,
 ///     None,
+///     None,
 /// );
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn generate_challenge_id(
     secret_key: &str,
     realm: &str,
@@ -361,9 +365,10 @@ pub fn generate_challenge_id(
     request: &str,
     expires: Option<&str>,
     digest: Option<&str>,
+    opaque: Option<&str>,
 ) -> String {
     crate::protocol::core::compute_challenge_id(
-        secret_key, realm, method, intent, request, expires, digest,
+        secret_key, realm, method, intent, request, expires, digest, opaque,
     )
 }
 
@@ -400,8 +405,10 @@ pub fn generate_challenge_id(
 ///     }),
 ///     None,
 ///     None,
+///     None,
 /// ).unwrap();
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn generate_challenge_id_from_request(
     secret_key: &str,
     realm: &str,
@@ -410,6 +417,7 @@ pub fn generate_challenge_id_from_request(
     request: &serde_json::Value,
     expires: Option<&str>,
     digest: Option<&str>,
+    opaque: Option<&str>,
 ) -> crate::error::Result<String> {
     use crate::protocol::core::base64url_encode;
 
@@ -424,6 +432,7 @@ pub fn generate_challenge_id_from_request(
         &request_b64,
         expires,
         digest,
+        opaque,
     ))
 }
 
@@ -621,10 +630,11 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "s0gsoewXwdYI13oPnrtdKTEN4-sIQ-LbQUNV_HttPnA");
+            assert_eq!(id, "XmJ98SdsAdzwP9Oa-8In322Uh6yweMO6rywdomWk_V4");
         }
 
         #[test]
@@ -641,10 +651,11 @@ mod tests {
                 }),
                 Some("2026-01-29T12:00:00Z"),
                 None,
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "0rMv3trZIudpkJCQxeL2RLQz6uALKTNErWulN07hDLk");
+            assert_eq!(id, "EvqUWMPJjqhoVJVG3mhTYVqCa3Mk7bUVd_OjeJGek1A");
         }
 
         #[test]
@@ -661,10 +672,11 @@ mod tests {
                 }),
                 None,
                 Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE="),
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "EAX2sqwdeg8Km8LIKRBFhM5xDQvEgIlbTif9FKBsOiU");
+            assert_eq!(id, "qcJUPoapy4bFLznQjQUutwPLyXW7FvALrWA_sMENgAY");
         }
 
         #[test]
@@ -683,10 +695,11 @@ mod tests {
                 }),
                 Some("2026-02-01T00:00:00Z"),
                 Some("sha-256=abc123def456"),
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "96xfZu2wzXD-f-l-hClS9OgODVgIoPWSCWhUw6a4I1Q");
+            assert_eq!(id, "JYtuAXY3wf1gGVFa4L0MsUOwQ90BQISm7wkepNiHbeM");
         }
 
         #[test]
@@ -703,10 +716,11 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "UMEn_1WPt2vz3XK8rrkbHET6RwqfwtK8VVNz0Xc2x4A");
+            assert_eq!(id, "_o55RP0duNvJYtw9PXnf44mGyY5ajV_wwGzoGdTFuNs");
         }
 
         #[test]
@@ -719,10 +733,11 @@ mod tests {
                 &json!({}),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "jUTqTVe3kCv5rVizv1XBCs9qKCLg4AZLwBUnk4N3MR8");
+            assert_eq!(id, "MYEC2oq3_B3cHa_My1Lx3NQKn_iUiMfsns6361N0SX0");
         }
 
         #[test]
@@ -740,10 +755,11 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "76lyru2p7i7Xw6fGTJtWzd9c7Z6mt33LIW7968Mlkz8");
+            assert_eq!(id, "54NwtlhzrjHd2Qox2EaElEA9dl73bZ1Y-rig6Ri8Xy8");
         }
 
         #[test]
@@ -764,10 +780,11 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
             )
             .unwrap();
 
-            assert_eq!(id, "xPIM2fN55BNq6ADKIFvGCR5zB7DhH6YbwDtAqtExwI0");
+            assert_eq!(id, "BdPQxVJ56pvRJnM-r7wh_ppka5hOJH_6XpRK4gM9paI");
         }
     }
 }

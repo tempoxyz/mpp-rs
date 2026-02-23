@@ -449,6 +449,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let override_addr: Address = "0x1111111111111111111111111111111111111111"
@@ -476,6 +477,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
@@ -504,6 +506,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
@@ -528,6 +531,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let result = resolve_escrow(&challenge, 9999, None);
@@ -552,6 +556,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -645,6 +650,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         assert_eq!(resolve_chain_id(&challenge), 4217);
@@ -668,6 +674,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
@@ -689,6 +696,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         // Should fall back to MODERATO_CHAIN_ID on decode failure
@@ -717,6 +725,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         // Invalid address in challenge should fall back to default
@@ -742,6 +751,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
@@ -798,6 +808,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -933,6 +944,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();

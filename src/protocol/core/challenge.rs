@@ -55,6 +55,11 @@ pub struct PaymentChallenge {
     /// Request body digest for body binding (RFC 9530 Content-Digest)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+
+    /// Server-defined correlation data (base64url-encoded JSON).
+    /// Clients MUST NOT modify.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opaque: Option<String>,
 }
 
 impl PaymentChallenge {
@@ -94,6 +99,7 @@ impl PaymentChallenge {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         }
     }
 
@@ -140,6 +146,7 @@ impl PaymentChallenge {
             request.raw(),
             None,
             None,
+            None,
         );
         Self {
             id,
@@ -150,6 +157,7 @@ impl PaymentChallenge {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         }
     }
 
@@ -167,6 +175,7 @@ impl PaymentChallenge {
         expires: Option<&str>,
         digest: Option<&str>,
         description: Option<&str>,
+        opaque: Option<&str>,
     ) -> Self {
         let realm = realm.into();
         let method = method.into();
@@ -179,6 +188,7 @@ impl PaymentChallenge {
             request.raw(),
             expires,
             digest,
+            opaque,
         );
         Self {
             id,
@@ -189,6 +199,7 @@ impl PaymentChallenge {
             expires: expires.map(String::from),
             description: description.map(String::from),
             digest: digest.map(String::from),
+            opaque: opaque.map(String::from),
         }
     }
 
@@ -232,6 +243,7 @@ impl PaymentChallenge {
             request: self.request.raw().to_string(),
             expires: self.expires.clone(),
             digest: self.digest.clone(),
+            opaque: self.opaque.clone(),
         }
     }
 
@@ -275,7 +287,7 @@ impl PaymentChallenge {
 
     /// Verify that this challenge's ID matches the expected HMAC for the given secret key.
     ///
-    /// Recomputes HMAC-SHA256 over `realm|method|intent|request|expires|digest`
+    /// Recomputes HMAC-SHA256 over `realm|method|intent|request|expires|digest|opaque`
     /// and performs a constant-time comparison against the challenge ID.
     ///
     /// This is the Rust equivalent of `Challenge.verify(challenge, { secretKey })` in the TS SDK.
@@ -299,6 +311,7 @@ impl PaymentChallenge {
             self.request.raw(),
             self.expires.as_deref(),
             self.digest.as_deref(),
+            self.opaque.as_deref(),
         );
         constant_time_eq(&self.id, &expected_id)
     }
@@ -386,7 +399,7 @@ impl PaymentChallenge {
 /// This is the canonical implementation used by both `PaymentChallenge::verify()`
 /// and challenge creation. The algorithm matches the TypeScript and Python SDKs:
 ///
-/// 1. Concatenate all fields `realm|method|intent|request|expires|digest` with `|` (empty string for absent optional fields)
+/// 1. Concatenate all fields `realm|method|intent|request|expires|digest|opaque` with `|` (empty string for absent optional fields)
 /// 2. Compute HMAC-SHA256 with the secret key
 /// 3. Base64url-encode the result (no padding)
 ///
@@ -403,8 +416,10 @@ impl PaymentChallenge {
 ///     "eyJhbW91bnQiOiIxMDAwMDAwIn0",
 ///     None,
 ///     None,
+///     None,
 /// );
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn compute_challenge_id(
     secret_key: &str,
     realm: &str,
@@ -413,6 +428,7 @@ pub fn compute_challenge_id(
     request: &str,
     expires: Option<&str>,
     digest: Option<&str>,
+    opaque: Option<&str>,
 ) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -421,7 +437,7 @@ pub fn compute_challenge_id(
 
     // All fields are always included in the pipe-delimited HMAC input,
     // with empty string for absent optional fields. This ensures challenges
-    // with vs without expires/digest produce different HMACs.
+    // with vs without expires/digest/opaque produce different HMACs.
     let hmac_input = [
         realm,
         method,
@@ -429,6 +445,7 @@ pub fn compute_challenge_id(
         request,
         expires.unwrap_or(""),
         digest.unwrap_or(""),
+        opaque.unwrap_or(""),
     ]
     .join("|");
 
@@ -480,6 +497,10 @@ pub struct ChallengeEcho {
     /// Request body digest for body binding (RFC 9530 Content-Digest)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+
+    /// Server-defined correlation data (base64url-encoded JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opaque: Option<String>,
 }
 
 /// Payment payload in credential.
@@ -813,6 +834,7 @@ mod tests {
             expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
             digest: None,
+            opaque: None,
         }
     }
 
@@ -1020,6 +1042,7 @@ mod tests {
             request.raw(),
             None,
             None,
+            None,
         );
 
         let challenge = PaymentChallenge {
@@ -1031,6 +1054,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         assert!(challenge.verify(secret));
@@ -1047,6 +1071,7 @@ mod tests {
             request.raw(),
             None,
             None,
+            None,
         );
 
         let challenge = PaymentChallenge {
@@ -1058,6 +1083,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         assert!(!challenge.verify("wrong-secret"));
@@ -1076,6 +1102,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         assert!(!challenge.verify("any-secret"));
@@ -1096,6 +1123,7 @@ mod tests {
             request.raw(),
             expires,
             digest,
+            None,
         );
 
         let challenge = PaymentChallenge {
@@ -1107,6 +1135,7 @@ mod tests {
             expires: expires.map(String::from),
             description: Some("test payment".to_string()),
             digest: digest.map(String::from),
+            opaque: None,
         };
 
         assert!(challenge.verify(secret));
@@ -1125,13 +1154,14 @@ mod tests {
             ),
             None,
             None,
+            None,
         );
-        assert_eq!(id, "s0gsoewXwdYI13oPnrtdKTEN4-sIQ-LbQUNV_HttPnA");
+        assert_eq!(id, "XmJ98SdsAdzwP9Oa-8In322Uh6yweMO6rywdomWk_V4");
     }
 
     /// Cross-SDK golden vectors (shared with mppx and pympp).
     ///
-    /// HMAC input: realm | method | intent | base64url(canonicalize(request)) | expires | digest
+    /// HMAC input: realm | method | intent | base64url(canonicalize(request)) | expires | digest | opaque
     /// HMAC key:   UTF-8 bytes of secret_key ("test-vector-secret")
     /// Output:     base64url(HMAC-SHA256(key, input), no padding)
     ///
@@ -1167,7 +1197,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "SOfbA51LV3LCkGE7RbomqwXdbWVlrZwlW-Z9aOHolxw",
+                "X6v1eo7fJ76gAxqY0xN9Jd__4lUyDDYmriryOM-5FO4",
             ),
             (
                 "with expires",
@@ -1177,7 +1207,7 @@ mod tests {
                 &req_amount,
                 Some("2025-01-06T12:00:00Z"),
                 None,
-                "R1ZSIwoIjkFhMCSzUGiCTesiigf5vV65EQ_3gVNtsNw",
+                "ChPX33RkKSZoSUyZcu8ai4hhkvjZJFkZVnvWs5s0iXI",
             ),
             (
                 "with digest",
@@ -1187,7 +1217,7 @@ mod tests {
                 &req_amount,
                 None,
                 Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE"),
-                "AiMmBdsSOkOYpXTupMnzVnrzZbqMY_P2i80vENRUSN4",
+                "JHB7EFsPVb-xsYCo8LHcOzeX1gfXWVoUSzQsZhKAfKM",
             ),
             (
                 "with expires and digest",
@@ -1197,7 +1227,7 @@ mod tests {
                 &req_amount,
                 Some("2025-01-06T12:00:00Z"),
                 Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE"),
-                "FMBGqN7MzpKagHsCcartZM09CnUqv7UgmaCy45Ozgug",
+                "m39jbWWCIfmfJZSwCfvKFFtBl0Qwf9X4nOmDb21peLA",
             ),
             (
                 "multi-field request",
@@ -1207,7 +1237,7 @@ mod tests {
                 &req_multi,
                 None,
                 None,
-                "5CXJi4bWMz2W54WjnlmoxnwTYe-JKwhw0z32ICQ65Es",
+                "_H5TOnnlW0zduQ5OhQ3EyLVze_TqxLDPda2CGZPZxOc",
             ),
             (
                 "nested methodDetails",
@@ -1217,7 +1247,7 @@ mod tests {
                 &req_nested,
                 None,
                 None,
-                "eid66xXUZsj46Pb30AfAf7m5kPehgianI16rZ-QY8HU",
+                "TqujwpuDDg_zsWGINAd5XObO2rRe6uYufpqvtDmr6N8",
             ),
             (
                 "empty request",
@@ -1227,7 +1257,7 @@ mod tests {
                 &req_empty,
                 None,
                 None,
-                "6kq-PYTyXtaGAHTHCVUrc_hIsAwLeskeQFtDZerMYhM",
+                "yLN7yChAejW9WNmb54HpJIWpdb1WWXeA3_aCx4dxmkU",
             ),
             (
                 "different realm",
@@ -1237,7 +1267,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "-gMjd8UeUvBcqUaUzarVj6ikH_YoDowpaNbEwK1Tmx8",
+                "3F5bOo2a9RUihdwKk4hGRvBvzQmVPBMDvW0YM-8GD00",
             ),
             (
                 "different method",
@@ -1247,7 +1277,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "DRH9ycmIlZ2lYUatIHCrxpm9K7ig5pniZ3ulleb7vl0",
+                "o0ra2sd7HcB4Ph0Vns69gRDUhSj5WNOnUopcDqKPLz4",
             ),
             (
                 "different intent",
@@ -1257,13 +1287,14 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "INeBi93MhinvbwdUxeUUIaT5Q_ufgLKPYZb5Tg43A1o",
+                "aAY7_IEDzsznNYplhOSE8cERQxvjFcT4Lcn-7FHjLVE",
             ),
         ];
 
         for (label, realm, method, intent, request, expires, digest, expected) in &vectors {
-            let id =
-                compute_challenge_id(secret, realm, method, intent, request, *expires, *digest);
+            let id = compute_challenge_id(
+                secret, realm, method, intent, request, *expires, *digest, None,
+            );
             assert_eq!(&id, expected, "golden vector failed: {}", label);
         }
     }
@@ -1323,6 +1354,7 @@ mod tests {
             request.raw(),
             None,
             None,
+            None,
         );
         let id2 = compute_challenge_id(
             "secret",
@@ -1330,6 +1362,7 @@ mod tests {
             "tempo",
             "charge",
             request.raw(),
+            None,
             None,
             None,
         );
@@ -1349,6 +1382,7 @@ mod tests {
             request.raw(),
             None,
             None,
+            None,
         );
         let id2 = compute_challenge_id(
             "secret-b",
@@ -1356,6 +1390,7 @@ mod tests {
             "tempo",
             "charge",
             request.raw(),
+            None,
             None,
             None,
         );
@@ -1368,7 +1403,16 @@ mod tests {
         let secret = "test-secret";
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
 
-        let id = compute_challenge_id(secret, "api", "tempo", "charge", request.raw(), None, None);
+        let id = compute_challenge_id(
+            secret,
+            "api",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+            None,
+        );
 
         // Build challenge with the valid HMAC ID but tampered request data
         let tampered_request =
@@ -1382,6 +1426,7 @@ mod tests {
             expires: None,
             description: None,
             digest: None,
+            opaque: None,
         };
 
         assert!(!challenge.verify(secret));
@@ -1427,11 +1472,107 @@ mod tests {
             Some("2026-01-01T00:00:00Z"),
             Some("sha-256=abc"),
             Some("test payment"),
+            None,
         );
         assert!(challenge.verify("my-secret"));
         assert_eq!(challenge.expires.as_deref(), Some("2026-01-01T00:00:00Z"));
         assert_eq!(challenge.digest.as_deref(), Some("sha-256=abc"));
         assert_eq!(challenge.description.as_deref(), Some("test payment"));
+    }
+
+    #[test]
+    fn test_opaque_affects_challenge_id() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let id_without = compute_challenge_id(
+            "test-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+            None,
+        );
+        let opaque_json =
+            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let id_with = compute_challenge_id(
+            "test-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request.raw(),
+            None,
+            None,
+            Some(&opaque_b64),
+        );
+        assert_ne!(id_without, id_with);
+    }
+
+    #[test]
+    fn test_opaque_verify_roundtrip() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let opaque_json =
+            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let challenge = PaymentChallenge::with_secret_key_full(
+            "my-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            Some(&opaque_b64),
+        );
+        assert_eq!(challenge.opaque.as_deref(), Some(opaque_b64.as_str()));
+        assert!(challenge.verify("my-secret"));
+    }
+
+    #[test]
+    fn test_opaque_tamper_fails_verify() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let opaque_json =
+            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let mut challenge = PaymentChallenge::with_secret_key_full(
+            "my-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            Some(&opaque_b64),
+        );
+        let tampered_json =
+            serde_json::to_string(&serde_json::json!({"pi": "pi_TAMPERED"})).unwrap();
+        let tampered = crate::protocol::core::base64url_encode(tampered_json.as_bytes());
+        challenge.opaque = Some(tampered);
+        assert!(!challenge.verify("my-secret"));
+    }
+
+    #[test]
+    fn test_opaque_echo_roundtrip() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let opaque_json =
+            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let challenge = PaymentChallenge::with_secret_key_full(
+            "my-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            Some(&opaque_b64),
+        );
+        let echo = challenge.to_echo();
+        assert_eq!(echo.opaque.as_deref(), Some(opaque_b64.as_str()));
     }
 
     #[test]
