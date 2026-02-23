@@ -42,7 +42,7 @@ let client = ClientBuilder::new(reqwest::Client::new())
     .build();
 
 // Requests now handle 402 automatically
-let resp = client.get("https://mpp.sh/api/ping/paid ").send().await?;
+let resp = client.get("https://mpp.sh/api/ping/paid").send().await?;
 ```
 
 ## Feature Flags
