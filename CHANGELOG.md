@@ -1,5 +1,34 @@
 # Changelog
 
+## `mpp@0.5.0`
+
+### Minor Changes
+
+- Added fee payer support to the Tempo payment provider. The client now builds 0x76 transactions with expiring nonces and a placeholder fee payer signature, and the server co-signs them by recovering the sender, setting the fee token, and re-encoding as a standard 0x76 transaction with both signatures. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added comprehensive integration and unit test coverage across client fetch, client middleware, MCP payment roundtrip, server middleware, server HMAC challenge verification, and SSE metered streaming flows. Also added a `feature-matrix` CI job to validate all feature flag combinations, and introduced `Mpp::new_with_config` test helper and made `detect_realm` pub(crate). (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added network-specific default currencies for Tempo, defaulting to USDC (USDC.e) on mainnet and pathUSD on testnet. Deprecated the `DEFAULT_CURRENCY` constant in favor of `DEFAULT_CURRENCY_MAINNET` and `DEFAULT_CURRENCY_TESTNET`. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added `TempoCharge` builder API (`from_challenge() → sign() → into_credential()`), gas resolution (`resolve_gas()` and `resolve_gas_with_stuck_detection()` for mempool stuck-tx replacement), `SignOptions` for overriding nonce/gas/signing parameters, and `TempoClientError` with `classify_rpc_error()` for structured error classification. Moved `abi.rs` from `protocol::methods::tempo` to `client::tempo` and consolidated the `ITIP20` sol! definition. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added end-to-end support for the `0x78` fee payer envelope format, enabling clients to request gas sponsorship by sending a `0x78 || RLP(...)` encoded transaction that servers co-sign and broadcast as a standard `0x76` Tempo transaction. Extended server-side verification to accept both `0x76` and `0x78` transaction types, added `sign_and_encode_fee_payer_envelope` signing helpers, and added integration tests asserting on-chain fee payer and sender addresses. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added integration tests for the MPP charge flow against a live Tempo blockchain. Introduced an `integration` feature flag, updated dev dependencies (`axum`, `reqwest`, `hex`, tokio `net` feature), added a `test-integration` Makefile target, and added `tests/integration_charge.rs` with E2E tests covering health checks, 402 challenge flow, full charge round-trips, and auth scheme validation. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+
+### Patch Changes
+
+- Added comprehensive test coverage for session provider, channel store, and session verification logic. Tests cover voucher sending edge cases, channel state management, HMAC validation, and `SessionVerifyResult` debug formatting. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Auto-detect `realm` from environment variables in `Mpp::create()`. Checks `MPP_REALM`, `FLY_APP_NAME`, `HEROKU_APP_NAME`, `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`, `VERCEL_URL`, `WEBSITE_HOSTNAME` in order, falling back to `"MPP Payment"`. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Updated URLs from `machinepayments.dev` to `mpp.sh` in README and removed "web3" keyword from Cargo.toml metadata. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added auto-detection of `realm` from environment variables in `Mpp::create()`. Checks `MPP_REALM`, `FLY_APP_NAME`, `HEROKU_APP_NAME`, `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`, `VERCEL_URL`, and `WEBSITE_HOSTNAME` in order, falling back to `"MPP Payment"`. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Introduced `TempoClientError` enum scoped under `client::tempo` for typed Tempo-specific client errors (AccessKeyNotProvisioned, SpendingLimitExceeded, InsufficientBalance, TransactionReverted). Added `MppError::Tempo` variant gated on `client + tempo` features with `classify_rpc_error` to parse RPC error messages into typed variants, replacing brittle string matching in downstream consumers. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added `TempoSigningMode` enum (Direct/Keychain) and centralized transaction helpers for client-side Tempo payments. New `client::signing` module provides `sign_and_encode` / `sign_and_encode_async` with keychain envelope support. New `client::tx_builder` module provides `TempoTxOptions`, `build_tempo_tx`, `estimate_gas`, `build_estimate_gas_request`, and `build_charge_credential`. Updated `TempoProvider`, `TempoSessionProvider`, and `create_open_payload` to use the new signing mode abstraction, eliminating duplicated transaction construction logic across consumers. Fixed potential `u64` overflow in `parse_gas_estimate` by using `checked_add`. Added 46 new unit tests (432 → 478) covering signature variant correctness, encoding boundary conditions, escrow resolution priority, deposit edge cases, re-export verification, and gas estimate overflow protection. (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+- Added client and protocol helpers upstreamed from presto:
+- `PaymentChallenge::is_expired()` and `expires_at()` for RFC 3339 challenge expiry checks
+- `TempoNetwork` enum with `from_chain_id()`, `default_rpc_url()`, and `default_currency()` lookups
+- `client::tempo::keychain` module with `query_key_spending_limit()` and `local_key_spending_limit()` for Tempo access key spending limit queries
+- ABI encoding helpers (`encode_transfer`, `encode_approve`, `encode_swap_exact_amount_out`, `DEX_ADDRESS`) in `protocol::methods::tempo::abi`
+- `PaymentChallenge::validate_for_charge()` and `validate_for_session()` for common challenge validation
+- `network()` convenience methods on `TempoChargeExt` and `TempoSessionExt`
+- `parse_memo_bytes()` utility for hex memo string to 32-byte array conversion
+- `extract_tx_hash()` utility for extracting transaction hashes from base64url receipts (by @BrendanRyan, [#89](https://github.com/tempoxyz/mpp-rs/pull/89))
+
 ## `mpp@0.4.0`
 
 ### Minor Changes
