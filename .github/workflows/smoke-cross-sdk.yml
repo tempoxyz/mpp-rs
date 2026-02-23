@@ -47,6 +47,11 @@ jobs:
           docker compose logs
           exit 1
 
+      - name: Run integration tests
+        run: cargo test --features integration --test integration_charge -- --nocapture
+        env:
+          TEMPO_RPC_URL: http://localhost:8545
+
       - name: Provision AMM liquidity
         run: |
           cd "$(mktemp -d)"

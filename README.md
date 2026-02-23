@@ -1,13 +1,13 @@
 # mpp
 
-Rust SDK for the [**Machine Payments Protocol**](https://machinepayments.dev)
+Rust SDK for the [**Machine Payments Protocol**](https://mpp.sh)
 
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://tempoxyz.github.io/mpp-rs)
 [![License](https://img.shields.io/crates/l/mpp.svg)](LICENSE)
 
 ## Documentation
 
-Full documentation, API reference, and guides are available at **[machinepayments.dev/sdk/rust](https://machinepayments.dev/sdk/rust)**.
+Full documentation, API reference, and guides are available at **[mpp.sh/sdk/rust](https://mpp.sh/sdk/rust)**.
 
 ## Install
 
@@ -42,7 +42,7 @@ let client = ClientBuilder::new(reqwest::Client::new())
     .build();
 
 // Requests now handle 402 automatically
-let resp = client.get("https://api.example.com/resource").send().await?;
+let resp = client.get("https://mpp.sh/api/ping/paid").send().await?;
 ```
 
 ## Feature Flags
@@ -58,7 +58,7 @@ let resp = client.get("https://api.example.com/resource").send().await?;
 
 ## Protocol
 
-Built on the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ietf-httpauth-payment/). See [mpp-specs](https://tempoxyz.github.io/mpp-specs/) for the full specification.
+Built on the ["Payment" HTTP Authentication Scheme](https://datatracker.ietf.org/doc/draft-ryan-httpauth-payment/). See [mpp-specs](https://tempoxyz.github.io/mpp-specs/) for the full specification.
 
 ## License
 
