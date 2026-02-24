@@ -244,7 +244,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
         digest,
-        opaque: params.get("opaque").map(|s| Base64UrlJson::from_raw(s)),
+        opaque: params.get("opaque").map(Base64UrlJson::from_raw),
     })
 }
 
