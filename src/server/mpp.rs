@@ -346,7 +346,7 @@ where
                 &credential.challenge.request,
                 credential.challenge.expires.as_deref(),
                 credential.challenge.digest.as_deref(),
-                credential.challenge.opaque.as_ref().map(|o| o.raw()),
+                credential.challenge.opaque.as_deref(),
             );
 
             if credential.challenge.id != expected_id {
@@ -507,7 +507,7 @@ where
                 &credential.challenge.request,
                 credential.challenge.expires.as_deref(),
                 credential.challenge.digest.as_deref(),
-                credential.challenge.opaque.as_ref().map(|o| o.raw()),
+                credential.challenge.opaque.as_deref(),
             );
             if credential.challenge.id != expected_id {
                 return Err(crate::protocol::traits::VerificationError::with_code(
