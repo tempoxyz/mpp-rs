@@ -56,10 +56,13 @@ pub struct PaymentChallenge {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
 
-    /// Server-defined correlation data (base64url-encoded JSON).
-    /// Clients MUST NOT modify.
+    /// Server-defined correlation data (base64url-encoded JSON, flat string-to-string map).
+    ///
+    /// Stored as `Base64UrlJson` matching mppx's `Record<string, string>`.
+    /// On the wire (WWW-Authenticate header) it appears as a base64url-encoded
+    /// JCS-serialized JSON object. Clients MUST NOT modify.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub opaque: Option<String>,
+    pub opaque: Option<Base64UrlJson>,
 }
 
 impl PaymentChallenge {
@@ -165,6 +168,10 @@ impl PaymentChallenge {
     ///
     /// Unlike [`with_secret_key`], this includes `expires` and `digest` in the HMAC
     /// computation, matching the full TS SDK `Challenge.from()` behavior.
+    ///
+    /// The `opaque` parameter accepts a `Base64UrlJson` value (use
+    /// `Base64UrlJson::from_value()` to create from a JSON object). This matches
+    /// the mppx SDK where opaque is `Record<string, string>`.
     #[allow(clippy::too_many_arguments)]
     pub fn with_secret_key_full(
         secret_key: &str,
@@ -175,7 +182,7 @@ impl PaymentChallenge {
         expires: Option<&str>,
         digest: Option<&str>,
         description: Option<&str>,
-        opaque: Option<&str>,
+        opaque: Option<Base64UrlJson>,
     ) -> Self {
         let realm = realm.into();
         let method = method.into();
@@ -188,7 +195,7 @@ impl PaymentChallenge {
             request.raw(),
             expires,
             digest,
-            opaque,
+            opaque.as_ref().map(|o| o.raw()),
         );
         Self {
             id,
@@ -199,7 +206,7 @@ impl PaymentChallenge {
             expires: expires.map(String::from),
             description: description.map(String::from),
             digest: digest.map(String::from),
-            opaque: opaque.map(String::from),
+            opaque,
         }
     }
 
@@ -225,6 +232,16 @@ impl PaymentChallenge {
         self
     }
 
+    /// Set the opaque correlation data from a JSON value.
+    ///
+    /// Note: When using `with_secret_key`, set opaque BEFORE creating the challenge
+    /// since it affects the HMAC. Use [`with_secret_key_full`] instead if opaque
+    /// is needed in the HMAC.
+    pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
+        self.opaque = Some(opaque);
+        self
+    }
+
     /// Get the effective expiration time for this payment challenge.
     ///
     /// Returns `challenge.expires` if set. Callers should also check
@@ -243,7 +260,7 @@ impl PaymentChallenge {
             request: self.request.raw().to_string(),
             expires: self.expires.clone(),
             digest: self.digest.clone(),
-            opaque: self.opaque.clone(),
+            opaque: self.opaque.as_ref().map(|o| o.raw().to_string()),
         }
     }
 
@@ -311,7 +328,7 @@ impl PaymentChallenge {
             self.request.raw(),
             self.expires.as_deref(),
             self.digest.as_deref(),
-            self.opaque.as_deref(),
+            self.opaque.as_ref().map(|o| o.raw()),
         );
         constant_time_eq(&self.id, &expected_id)
     }
@@ -1493,9 +1510,7 @@ mod tests {
             None,
             None,
         );
-        let opaque_json =
-            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
-        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let opaque = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
         let id_with = compute_challenge_id(
             "test-secret",
             "api.example.com",
@@ -1504,7 +1519,7 @@ mod tests {
             request.raw(),
             None,
             None,
-            Some(&opaque_b64),
+            Some(opaque.raw()),
         );
         assert_ne!(id_without, id_with);
     }
@@ -1512,9 +1527,8 @@ mod tests {
     #[test]
     fn test_opaque_verify_roundtrip() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
-        let opaque_json =
-            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
-        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let opaque = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let opaque_raw = opaque.raw().to_string();
         let challenge = PaymentChallenge::with_secret_key_full(
             "my-secret",
             "api.example.com",
@@ -1524,18 +1538,16 @@ mod tests {
             None,
             None,
             None,
-            Some(&opaque_b64),
+            Some(opaque),
         );
-        assert_eq!(challenge.opaque.as_deref(), Some(opaque_b64.as_str()));
+        assert_eq!(challenge.opaque.as_ref().unwrap().raw(), opaque_raw);
         assert!(challenge.verify("my-secret"));
     }
 
     #[test]
     fn test_opaque_tamper_fails_verify() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
-        let opaque_json =
-            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
-        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let opaque = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
         let mut challenge = PaymentChallenge::with_secret_key_full(
             "my-secret",
             "api.example.com",
@@ -1545,11 +1557,9 @@ mod tests {
             None,
             None,
             None,
-            Some(&opaque_b64),
+            Some(opaque),
         );
-        let tampered_json =
-            serde_json::to_string(&serde_json::json!({"pi": "pi_TAMPERED"})).unwrap();
-        let tampered = crate::protocol::core::base64url_encode(tampered_json.as_bytes());
+        let tampered = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_TAMPERED"})).unwrap();
         challenge.opaque = Some(tampered);
         assert!(!challenge.verify("my-secret"));
     }
@@ -1557,9 +1567,8 @@ mod tests {
     #[test]
     fn test_opaque_echo_roundtrip() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
-        let opaque_json =
-            serde_json::to_string(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
-        let opaque_b64 = crate::protocol::core::base64url_encode(opaque_json.as_bytes());
+        let opaque = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let opaque_raw = opaque.raw().to_string();
         let challenge = PaymentChallenge::with_secret_key_full(
             "my-secret",
             "api.example.com",
@@ -1569,10 +1578,114 @@ mod tests {
             None,
             None,
             None,
-            Some(&opaque_b64),
+            Some(opaque),
         );
         let echo = challenge.to_echo();
-        assert_eq!(echo.opaque.as_deref(), Some(opaque_b64.as_str()));
+        assert_eq!(echo.opaque.as_deref(), Some(opaque_raw.as_str()));
+    }
+
+    /// Cross-SDK opaque golden vectors (computed from mppx reference SDK).
+    ///
+    /// These vectors verify that opaque (meta) data produces identical HMAC
+    /// challenge IDs across mpp-rs and mppx. The opaque value is JCS-serialized
+    /// then base64url-encoded before entering the HMAC computation.
+    #[test]
+    fn test_opaque_golden_vectors() {
+        let secret = "test-vector-secret";
+        let req = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+
+        // Vector 1: with opaque {pi: "pi_3abc123XYZ"}
+        let opaque1 = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let id1 = compute_challenge_id(
+            secret, "api.example.com", "tempo", "charge",
+            req.raw(), None, None, Some(opaque1.raw()),
+        );
+        assert_eq!(id1, "rxzKZ2qjXvinqCH96RORTZEPs1KXsA-0AUjrCAPFOWc",
+            "opaque golden vector failed: with opaque");
+
+        // Vector 2: with opaque and expires
+        let id2 = compute_challenge_id(
+            secret, "api.example.com", "tempo", "charge",
+            req.raw(), Some("2025-01-06T12:00:00Z"), None, Some(opaque1.raw()),
+        );
+        assert_eq!(id2, "KAfoMrA4fnzS1DPWN_cUv_b3_yHxCizdp6OhH7gluMY",
+            "opaque golden vector failed: with opaque and expires");
+
+        // Vector 3: with empty opaque {}
+        let opaque_empty = Base64UrlJson::from_value(&serde_json::json!({})).unwrap();
+        let id3 = compute_challenge_id(
+            secret, "api.example.com", "tempo", "charge",
+            req.raw(), None, None, Some(opaque_empty.raw()),
+        );
+        assert_eq!(id3, "vb4IyH-0LdJ3s7L0QAw8jIzcZkyxksPhIvEfmHmzA9k",
+            "opaque golden vector failed: with empty opaque");
+
+        // Vector 4: with multi-key opaque (JCS sorts keys alphabetically)
+        let opaque_multi = Base64UrlJson::from_value(
+            &serde_json::json!({"deposit": "dep_456", "pi": "pi_3abc123XYZ"})
+        ).unwrap();
+        let id4 = compute_challenge_id(
+            secret, "api.example.com", "tempo", "charge",
+            req.raw(), None, None, Some(opaque_multi.raw()),
+        );
+        assert_eq!(id4, "aKskU8sadR5ZuFbUCsIwhO-ENxuVpTw17FdwHEXsJDk",
+            "opaque golden vector failed: with multi-key opaque");
+    }
+
+    /// Verify that opaque roundtrips through header serialize/deserialize
+    /// and still passes HMAC verification — the critical cross-SDK path.
+    #[test]
+    fn test_opaque_header_roundtrip_with_hmac() {
+        let opaque = Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let challenge = PaymentChallenge::with_secret_key_full(
+            "test-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            Some("2025-01-06T12:00:00Z"),
+            None,
+            None,
+            Some(opaque),
+        );
+        assert!(challenge.verify("test-secret"));
+
+        // Serialize to header, parse back, verify HMAC still holds
+        let header = challenge.to_header().unwrap();
+        assert!(header.contains("opaque="));
+        let parsed = PaymentChallenge::from_header(&header).unwrap();
+        assert!(parsed.opaque.is_some());
+        assert_eq!(parsed.opaque.as_ref().unwrap().raw(), challenge.opaque.as_ref().unwrap().raw());
+
+        // Decoded opaque should match original
+        let decoded: std::collections::HashMap<String, String> = parsed.opaque.unwrap().decode().unwrap();
+        assert_eq!(decoded.get("pi").unwrap(), "pi_3abc123XYZ");
+    }
+
+    /// Verify opaque value can be decoded to a typed HashMap.
+    #[test]
+    fn test_opaque_decode_to_hashmap() {
+        let opaque = Base64UrlJson::from_value(
+            &serde_json::json!({"deposit": "dep_456", "pi": "pi_3abc123XYZ"})
+        ).unwrap();
+        let decoded: std::collections::HashMap<String, String> = opaque.decode().unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded.get("pi").unwrap(), "pi_3abc123XYZ");
+        assert_eq!(decoded.get("deposit").unwrap(), "dep_456");
+    }
+
+    /// Verify with_opaque builder method works and affects HMAC.
+    #[test]
+    fn test_with_opaque_builder() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let opaque = Base64UrlJson::from_value(&serde_json::json!({"key": "val"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_opaque(opaque);
+        assert!(challenge.opaque.is_some());
+        let decoded: std::collections::HashMap<String, String> =
+            challenge.opaque.unwrap().decode().unwrap();
+        assert_eq!(decoded.get("key").unwrap(), "val");
     }
 
     #[test]

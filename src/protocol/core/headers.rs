@@ -244,7 +244,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
         digest,
-        opaque: params.get("opaque").cloned(),
+        opaque: params.get("opaque").map(|s| Base64UrlJson::from_raw(s)),
     })
 }
 
@@ -339,7 +339,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     }
 
     if let Some(ref opaque) = challenge.opaque {
-        parts.push(format!("opaque=\"{}\"", escape_quoted_value(opaque)?));
+        parts.push(format!("opaque=\"{}\"", escape_quoted_value(opaque.raw())?));
     }
 
     Ok(format!("Payment {}", parts.join(", ")))
