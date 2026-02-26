@@ -13,7 +13,7 @@
 //! cargo run --bin basic-client
 //!
 //! # Or target any external server:
-//! cargo run --bin basic-client -- https://mpp.sh/api/ping/paid
+//! cargo run --bin basic-client -- https://mpp.dev/api/ping/paid
 //!
 //! # Optional: provide your own private key
 //! export PRIVATE_KEY=0x...
