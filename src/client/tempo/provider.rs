@@ -41,6 +41,7 @@ pub struct TempoProvider {
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
     replace_stuck_txs: bool,
+    expiring_nonces: bool,
 }
 
 impl TempoProvider {
@@ -63,6 +64,7 @@ impl TempoProvider {
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
             replace_stuck_txs: false,
+            expiring_nonces: false,
         })
     }
 
@@ -89,6 +91,18 @@ impl TempoProvider {
     /// Default: `false`.
     pub fn with_replace_stuck_transactions(mut self, enabled: bool) -> Self {
         self.replace_stuck_txs = enabled;
+        self
+    }
+
+    /// Use expiring nonces (TIP-1009) for all transactions.
+    ///
+    /// When enabled, transactions use `nonce_key = U256::MAX` with a
+    /// `valid_before` timestamp instead of sequential nonces. This avoids
+    /// nonce collisions when multiple transactions are sent concurrently.
+    ///
+    /// Default: `false`.
+    pub fn with_expiring_nonces(mut self, enabled: bool) -> Self {
+        self.expiring_nonces = enabled;
         self
     }
 
@@ -120,6 +134,7 @@ impl PaymentProvider for TempoProvider {
             rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
             replace_stuck_txs: self.replace_stuck_txs,
+            expiring_nonces: self.expiring_nonces,
             ..Default::default()
         };
 

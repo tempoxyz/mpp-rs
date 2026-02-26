@@ -209,9 +209,12 @@ impl TempoCharge {
             .max_priority_fee_per_gas
             .unwrap_or(resolved.max_priority_fee_per_gas);
 
-        // Fee payer mode: use expiring nonces to avoid nonce collisions
-        // when the server co-signs and broadcasts on the client's behalf.
-        let (nonce, nonce_key, valid_before, gas_limit) = if self.fee_payer {
+        // Use expiring nonces when fee_payer mode or explicitly requested.
+        // Expiring nonces (TIP-1009) avoid nonce collisions by using a
+        // circular buffer keyed by transaction hash instead of sequential nonces.
+        let use_expiring = self.fee_payer || options.expiring_nonces;
+
+        let (nonce, nonce_key, valid_before, gas_limit) = if use_expiring {
             let nonce = options.nonce.unwrap_or(0);
             let nonce_key = options.nonce_key.unwrap_or(EXPIRING_NONCE_KEY);
             let valid_before = options.valid_before.or_else(|| {
@@ -324,6 +327,12 @@ pub struct SignOptions {
     /// bumps gas to replace stuck transactions. Useful for CLI tools and
     /// interactive clients. Default: `false`.
     pub replace_stuck_txs: bool,
+    /// Use expiring nonces (TIP-1009) instead of sequential nonces.
+    ///
+    /// When `true`, transactions use `nonce_key = U256::MAX` with a
+    /// `valid_before` timestamp, avoiding nonce collisions when multiple
+    /// transactions are sent concurrently. Default: `false`.
+    pub expiring_nonces: bool,
 }
 
 /// A signed Tempo charge, ready to be converted into a [`PaymentCredential`].
