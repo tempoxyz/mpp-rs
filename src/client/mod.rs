@@ -47,3 +47,5 @@ pub use tempo::{
     SignOptions, SignedTempoCharge, TempoCharge, TempoClientError, TempoProvider,
     TempoSessionProvider, TempoSigningMode,
 };
+#[cfg(feature = "tempo")]
+pub use tempo_alloy::TempoNetwork;

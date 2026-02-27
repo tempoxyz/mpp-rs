@@ -3,7 +3,9 @@
 //! Queries the pending nonce and latest block's base fee to produce
 //! gas parameters that are competitive in the current fee market.
 
+use alloy::consensus::BlockHeader;
 use alloy::primitives::Address;
+use tempo_alloy::TempoNetwork;
 
 use crate::error::MppError;
 
@@ -31,7 +33,7 @@ pub struct ResolvedGas {
 /// * `from` - The account address to resolve nonce for
 /// * `default_max_fee` - Default max fee per gas in wei (used as floor)
 /// * `default_priority_fee` - Default max priority fee per gas in wei
-pub async fn resolve_gas<P: alloy::providers::Provider>(
+pub async fn resolve_gas<P: alloy::providers::Provider<TempoNetwork>>(
     provider: &P,
     from: Address,
     default_max_fee: u128,
@@ -79,7 +81,7 @@ fn compute_fees(
 /// Ensures `max_fee_per_gas >= base_fee * 2 + priority_fee` so the transaction
 /// is competitive in the current fee market. Returns the defaults if the
 /// base fee cannot be read.
-async fn resolve_fees<P: alloy::providers::Provider>(
+async fn resolve_fees<P: alloy::providers::Provider<TempoNetwork>>(
     provider: &P,
     default_max_fee: u128,
     default_priority_fee: u128,
@@ -90,7 +92,7 @@ async fn resolve_fees<P: alloy::providers::Provider>(
             .get_block_by_number(block_num.into())
             .await
             .ok()??;
-        block.header.base_fee_per_gas
+        block.header.base_fee_per_gas()
     }
     .await;
 
@@ -115,7 +117,7 @@ async fn resolve_fees<P: alloy::providers::Provider>(
 /// Use this for CLI tools or interactive clients where a previously stuck
 /// transaction should be replaced automatically. Library consumers that
 /// want standard queuing behavior should use [`resolve_gas`] instead.
-pub async fn resolve_gas_with_stuck_detection<P: alloy::providers::Provider>(
+pub async fn resolve_gas_with_stuck_detection<P: alloy::providers::Provider<TempoNetwork>>(
     provider: &P,
     from: Address,
     default_max_fee: u128,
@@ -185,7 +187,7 @@ fn compute_stuck_tx_fees(
 ///
 /// Falls back to a capped 10x default if the RPC doesn't support `txpool_content`.
 /// Also ensures the result is competitive with the current base fee.
-async fn resolve_stuck_tx_fees<P: alloy::providers::Provider>(
+async fn resolve_stuck_tx_fees<P: alloy::providers::Provider<TempoNetwork>>(
     provider: &P,
     from: Address,
     nonce: u64,
@@ -210,7 +212,7 @@ async fn resolve_stuck_tx_fees<P: alloy::providers::Provider>(
 /// Returns `Some((max_fee_per_gas, max_priority_fee_per_gas))` if the stuck
 /// tx can be found, `None` if the RPC doesn't support txpool or the tx
 /// can't be parsed.
-async fn read_stuck_tx_gas<P: alloy::providers::Provider>(
+async fn read_stuck_tx_gas<P: alloy::providers::Provider<TempoNetwork>>(
     provider: &P,
     from: Address,
     nonce: u64,

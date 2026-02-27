@@ -173,7 +173,8 @@ impl TempoCharge {
                     .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?
             }
         };
-        let provider = alloy::providers::RootProvider::new_http(rpc_url);
+        let provider =
+            alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
 
         // Build calls
         let calls = self.calls.unwrap_or_else(|| {
