@@ -72,10 +72,22 @@ pub fn build_tempo_tx(options: TempoTxOptions) -> TempoTransaction {
     }
 }
 
+/// Default gas cap for `eth_estimateGas` requests.
+///
+/// Without an explicit `gas` field, Tempo nodes use the block gas limit (~500M)
+/// as the simulation cap. This causes the fee-token balance reservation
+/// (`gasCap × baseFee / conversionRate`) to exceed moderate wallet balances,
+/// triggering spurious `InsufficientBalance` errors during estimation.
+///
+/// 3M covers key provisioning (~1M intrinsic) with headroom for execution,
+/// while keeping the fee-token reservation manageable (~0.06 USDC at 20 gwei).
+const GAS_ESTIMATION_CAP: u64 = 3_000_000;
+
 /// Build an `eth_estimateGas` JSON-RPC request body for a Tempo AA transaction.
 ///
 /// Constructs the request with AA-specific fields (`feeToken`, `calls`, `nonceKey`)
-/// that Tempo nodes understand.
+/// that Tempo nodes understand. Includes a `gas` cap to prevent the node from
+/// reserving the full block gas limit worth of fee tokens during simulation.
 #[allow(clippy::too_many_arguments)]
 pub fn build_estimate_gas_request(
     from: Address,
@@ -91,6 +103,7 @@ pub fn build_estimate_gas_request(
         "from": format!("{:#x}", from),
         "chainId": format!("{:#x}", chain_id),
         "nonce": format!("{:#x}", nonce),
+        "gas": format!("{:#x}", GAS_ESTIMATION_CAP),
         "maxFeePerGas": format!("{:#x}", max_fee_per_gas),
         "maxPriorityFeePerGas": format!("{:#x}", max_priority_fee_per_gas),
         "feeToken": format!("{:#x}", fee_token),
@@ -118,7 +131,7 @@ pub fn build_estimate_gas_request(
 /// Sends an AA-aware gas estimation request and returns the estimated gas
 /// limit with a small buffer (+5000) added.
 #[allow(clippy::too_many_arguments)]
-pub async fn estimate_gas<P: alloy::providers::Provider>(
+pub async fn estimate_gas<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>>(
     provider: &P,
     from: Address,
     chain_id: u64,
