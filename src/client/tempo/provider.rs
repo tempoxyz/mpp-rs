@@ -160,6 +160,7 @@ mod tests {
             .with_signing_mode(TempoSigningMode::Keychain {
                 wallet,
                 key_authorization: None,
+                version: None,
             });
 
         assert!(matches!(
