@@ -69,7 +69,7 @@ fn build_tempo_signature(
         }
         TempoSigningMode::Keychain { wallet, .. } => {
             let keychain_sig =
-                KeychainSignature::new(*wallet, PrimitiveSignature::Secp256k1(inner_signature));
+                KeychainSignature::new_v1(*wallet, PrimitiveSignature::Secp256k1(inner_signature));
             TempoSignature::Keychain(keychain_sig)
         }
     }
