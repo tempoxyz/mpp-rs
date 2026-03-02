@@ -1,0 +1,10 @@
+name: PR Audit
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  pr-audit:
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@main
+    secrets: inherit
