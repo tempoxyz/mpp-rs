@@ -207,6 +207,11 @@ impl TempoCharge {
 
         let gas_limit = if let Some(gas) = options.gas_limit {
             gas
+        } else if self.fee_payer {
+            // In fee-payer mode the client may not hold native gas, so
+            // eth_estimateGas would revert. Use a safe default; the server
+            // co-signs and pays for gas.
+            1_000_000
         } else {
             let key_auth = options
                 .key_authorization
