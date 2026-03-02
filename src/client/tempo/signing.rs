@@ -35,8 +35,7 @@ pub enum TempoSigningMode {
         key_authorization: Option<Box<SignedKeyAuthorization>>,
         /// Keychain signature version. V1 signs `sig_hash` directly (legacy,
         /// deprecated at T1C). V2 signs `keccak256(0x04 || sig_hash || user_address)`.
-        /// Defaults to V1 for pre-T1C compatibility when omitted.
-        version: Option<KeychainVersion>,
+        version: KeychainVersion,
     },
 }
 
@@ -77,7 +76,7 @@ fn effective_signing_hash(
         TempoSigningMode::Direct => sig_hash,
         TempoSigningMode::Keychain {
             wallet, version, ..
-        } => match version.unwrap_or_default() {
+        } => match version {
             KeychainVersion::V1 => sig_hash,
             KeychainVersion::V2 => KeychainSignature::signing_hash(sig_hash, *wallet),
         },
@@ -99,7 +98,7 @@ fn build_tempo_signature(
             wallet, version, ..
         } => {
             let primitive = PrimitiveSignature::Secp256k1(inner_signature);
-            let keychain_sig = match version.unwrap_or_default() {
+            let keychain_sig = match version {
                 KeychainVersion::V1 => KeychainSignature::new_v1(*wallet, primitive),
                 KeychainVersion::V2 => KeychainSignature::new(*wallet, primitive),
             };
@@ -291,7 +290,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet,
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let signer_addr = Address::repeat_byte(0x01);
         assert_eq!(mode.from_address(signer_addr), wallet);
@@ -308,7 +307,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::ZERO,
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         assert!(mode.key_authorization().is_none());
     }
@@ -332,7 +331,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::ZERO,
             key_authorization: Some(Box::new(signed)),
-            version: None,
+            version: KeychainVersion::V1,
         };
         assert!(mode.key_authorization().is_some());
     }
@@ -376,7 +375,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xAB),
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
 
         let bytes = sign_and_encode_fee_payer_envelope(tx, &signer, &mode).unwrap();
@@ -399,7 +398,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet,
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let tx = test_tx();
         let bytes = sign_and_encode(tx, &signer, &mode).unwrap();
@@ -420,7 +419,7 @@ mod tests {
             &TempoSigningMode::Keychain {
                 wallet: Address::repeat_byte(0xAA),
                 key_authorization: None,
-                version: None,
+                version: KeychainVersion::V1,
             },
         )
         .unwrap();
@@ -492,7 +491,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xBB),
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let bytes = sign_and_encode_async(test_tx(), &signer, &mode)
             .await
@@ -542,7 +541,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xAA),
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
 
         let bytes = sign_and_encode(tx, &signer, &mode).unwrap();
@@ -628,7 +627,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xAA),
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let bytes1 = sign_and_encode(test_tx(), &signer, &mode).unwrap();
         let bytes2 = sign_and_encode(test_tx(), &signer, &mode).unwrap();
@@ -664,7 +663,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet,
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let signer = test_signer();
         let bytes = sign_and_encode(test_tx(), &signer, &mode).unwrap();
@@ -709,7 +708,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet,
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let signer = test_signer();
         let bytes = sign_and_encode_async(test_tx(), &signer, &mode)
@@ -727,7 +726,7 @@ mod tests {
 
     // --- Keychain V1 vs V2 ---
 
-    fn keychain_mode(version: Option<KeychainVersion>) -> TempoSigningMode {
+    fn keychain_mode(version: KeychainVersion) -> TempoSigningMode {
         TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xAA),
             key_authorization: None,
@@ -738,9 +737,12 @@ mod tests {
     #[test]
     fn test_v1_and_v2_produce_different_bytes() {
         let signer = test_signer();
-        let v1 = sign_and_encode(test_tx(), &signer, &keychain_mode(Some(KeychainVersion::V1))).unwrap();
-        let v2 = sign_and_encode(test_tx(), &signer, &keychain_mode(Some(KeychainVersion::V2))).unwrap();
-        assert_ne!(v1, v2, "V1 and V2 should sign different hashes and produce different bytes");
+        let v1 = sign_and_encode(test_tx(), &signer, &keychain_mode(KeychainVersion::V1)).unwrap();
+        let v2 = sign_and_encode(test_tx(), &signer, &keychain_mode(KeychainVersion::V2)).unwrap();
+        assert_ne!(
+            v1, v2,
+            "V1 and V2 should sign different hashes and produce different bytes"
+        );
     }
 
     #[test]
@@ -748,7 +750,7 @@ mod tests {
         use alloy::eips::eip2718::Decodable2718;
 
         let signer = test_signer();
-        let mode = keychain_mode(Some(KeychainVersion::V2));
+        let mode = keychain_mode(KeychainVersion::V2);
         let bytes = sign_and_encode(test_tx(), &signer, &mode).unwrap();
         assert_eq!(bytes[0], 0x76);
         let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
@@ -758,11 +760,10 @@ mod tests {
     #[test]
     fn test_v1_key_id_recovers_signer() {
         use alloy::eips::eip2718::Decodable2718;
-        use alloy::signers::Signer;
         use tempo_primitives::transaction::TempoSignature;
 
         let signer = test_signer();
-        let mode = keychain_mode(Some(KeychainVersion::V1));
+        let mode = keychain_mode(KeychainVersion::V1);
         let tx = test_tx();
         let sig_hash = tx.signature_hash();
         let bytes = sign_and_encode(tx, &signer, &mode).unwrap();
@@ -770,8 +771,13 @@ mod tests {
 
         match decoded.signature() {
             TempoSignature::Keychain(ks) => {
-                assert!(ks.is_legacy(), "V1 should produce legacy keychain signature");
-                let key_id = ks.key_id(&sig_hash).expect("V1 key_id recovery should succeed");
+                assert!(
+                    ks.is_legacy(),
+                    "V1 should produce legacy keychain signature"
+                );
+                let key_id = ks
+                    .key_id(&sig_hash)
+                    .expect("V1 key_id recovery should succeed");
                 assert_eq!(key_id, signer.address());
             }
             other => panic!("Expected Keychain, got {:?}", other),
@@ -781,11 +787,10 @@ mod tests {
     #[test]
     fn test_v2_key_id_recovers_signer() {
         use alloy::eips::eip2718::Decodable2718;
-        use alloy::signers::Signer;
         use tempo_primitives::transaction::TempoSignature;
 
         let signer = test_signer();
-        let mode = keychain_mode(Some(KeychainVersion::V2));
+        let mode = keychain_mode(KeychainVersion::V2);
         let tx = test_tx();
         let sig_hash = tx.signature_hash();
         let bytes = sign_and_encode(tx, &signer, &mode).unwrap();
@@ -793,30 +798,26 @@ mod tests {
 
         match decoded.signature() {
             TempoSignature::Keychain(ks) => {
-                assert!(!ks.is_legacy(), "V2 should produce non-legacy keychain signature");
-                let key_id = ks.key_id(&sig_hash).expect("V2 key_id recovery should succeed");
+                assert!(
+                    !ks.is_legacy(),
+                    "V2 should produce non-legacy keychain signature"
+                );
+                let key_id = ks
+                    .key_id(&sig_hash)
+                    .expect("V2 key_id recovery should succeed");
                 assert_eq!(key_id, signer.address());
             }
             other => panic!("Expected Keychain, got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_none_version_defaults_to_v1() {
-        let signer = test_signer();
-        let v1_explicit = sign_and_encode(test_tx(), &signer, &keychain_mode(Some(KeychainVersion::V1))).unwrap();
-        let v1_default = sign_and_encode(test_tx(), &signer, &keychain_mode(None)).unwrap();
-        assert_eq!(v1_explicit, v1_default, "None should default to V1");
-    }
-
     #[tokio::test]
     async fn test_v2_async_key_id_recovers_signer() {
         use alloy::eips::eip2718::Decodable2718;
-        use alloy::signers::Signer;
         use tempo_primitives::transaction::TempoSignature;
 
         let signer = test_signer();
-        let mode = keychain_mode(Some(KeychainVersion::V2));
+        let mode = keychain_mode(KeychainVersion::V2);
         let tx = test_tx();
         let sig_hash = tx.signature_hash();
         let bytes = sign_and_encode_async(tx, &signer, &mode).await.unwrap();
@@ -824,7 +825,9 @@ mod tests {
 
         match decoded.signature() {
             TempoSignature::Keychain(ks) => {
-                let key_id = ks.key_id(&sig_hash).expect("async V2 key_id recovery should succeed");
+                let key_id = ks
+                    .key_id(&sig_hash)
+                    .expect("async V2 key_id recovery should succeed");
                 assert_eq!(key_id, signer.address());
             }
             other => panic!("Expected Keychain, got {:?}", other),
@@ -834,10 +837,15 @@ mod tests {
     #[tokio::test]
     async fn test_v2_sync_and_async_produce_same_output() {
         let signer = test_signer();
-        let mode = keychain_mode(Some(KeychainVersion::V2));
+        let mode = keychain_mode(KeychainVersion::V2);
         let sync_bytes = sign_and_encode(test_tx(), &signer, &mode).unwrap();
-        let async_bytes = sign_and_encode_async(test_tx(), &signer, &mode).await.unwrap();
-        assert_eq!(sync_bytes, async_bytes, "V2 sync and async should produce identical output");
+        let async_bytes = sign_and_encode_async(test_tx(), &signer, &mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_bytes, async_bytes,
+            "V2 sync and async should produce identical output"
+        );
     }
 
     // --- TempoSigningMode clone + debug ---
@@ -847,7 +855,7 @@ mod tests {
         let mode = TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xAA),
             key_authorization: None,
-            version: None,
+            version: KeychainVersion::V1,
         };
         let cloned = mode.clone();
         assert_eq!(

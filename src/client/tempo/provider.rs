@@ -151,6 +151,7 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_with_signing_mode() {
+        use crate::client::tempo::signing::KeychainVersion;
         let signer = alloy_signer_local::PrivateKeySigner::random();
         let wallet: alloy::primitives::Address = "0x1111111111111111111111111111111111111111"
             .parse()
@@ -160,7 +161,7 @@ mod tests {
             .with_signing_mode(TempoSigningMode::Keychain {
                 wallet,
                 key_authorization: None,
-                version: None,
+                version: KeychainVersion::V1,
             });
 
         assert!(matches!(
