@@ -98,6 +98,8 @@ pub fn build_estimate_gas_request(
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     key_authorization: Option<&SignedKeyAuthorization>,
+    nonce_key: U256,
+    valid_before: Option<u64>,
 ) -> Result<serde_json::Value, MppError> {
     let mut req = serde_json::json!({
         "from": format!("{:#x}", from),
@@ -107,7 +109,7 @@ pub fn build_estimate_gas_request(
         "maxFeePerGas": format!("{:#x}", max_fee_per_gas),
         "maxPriorityFeePerGas": format!("{:#x}", max_priority_fee_per_gas),
         "feeToken": format!("{:#x}", fee_token),
-        "nonceKey": "0x0",
+        "nonceKey": format!("{:#x}", nonce_key),
         "calls": calls.iter().map(|c| {
             serde_json::json!({
                 "to": c.to.to().map(|a| format!("{:#x}", a)),
@@ -116,6 +118,10 @@ pub fn build_estimate_gas_request(
             })
         }).collect::<Vec<_>>(),
     });
+
+    if let Some(vb) = valid_before {
+        req["validBefore"] = serde_json::Value::String(format!("{:#x}", vb));
+    }
 
     if let Some(auth) = key_authorization {
         req["keyAuthorization"] = serde_json::to_value(auth).map_err(|e| {
@@ -141,6 +147,8 @@ pub async fn estimate_gas<P: alloy::providers::Provider<tempo_alloy::TempoNetwor
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     key_authorization: Option<&SignedKeyAuthorization>,
+    nonce_key: U256,
+    valid_before: Option<u64>,
 ) -> Result<u64, MppError> {
     let req = build_estimate_gas_request(
         from,
@@ -151,6 +159,8 @@ pub async fn estimate_gas<P: alloy::providers::Provider<tempo_alloy::TempoNetwor
         max_fee_per_gas,
         max_priority_fee_per_gas,
         key_authorization,
+        nonce_key,
+        valid_before,
     )?;
 
     let gas_hex: String = provider
@@ -227,12 +237,14 @@ mod tests {
             1_000_000_000,
             100_000_000,
             None,
+            U256::ZERO,
+            None,
         )
         .unwrap();
 
         assert_eq!(req["from"], format!("{:#x}", from));
         assert_eq!(req["chainId"], format!("{:#x}", 42431u64));
-        assert_eq!(req["nonceKey"], "0x0");
+        assert_eq!(req["nonceKey"], format!("{:#x}", U256::ZERO));
         assert!(req.get("keyAuthorization").is_none());
 
         let calls_json = req["calls"].as_array().unwrap();
@@ -274,6 +286,8 @@ mod tests {
             1_000_000_000,
             100_000_000,
             Some(&signed_auth),
+            U256::ZERO,
+            None,
         )
         .unwrap();
 
@@ -309,6 +323,8 @@ mod tests {
             1_000_000_000,
             100_000_000,
             None,
+            U256::ZERO,
+            None,
         )
         .unwrap();
 
@@ -336,6 +352,8 @@ mod tests {
             &calls,
             2_000_000_000,
             500_000_000,
+            None,
+            U256::ZERO,
             None,
         )
         .unwrap();
@@ -631,6 +649,8 @@ mod tests {
             1_000_000_000,
             100_000_000,
             None,
+            U256::ZERO,
+            None,
         )
         .unwrap();
 
@@ -655,6 +675,8 @@ mod tests {
             1_000_000_000,
             100_000_000,
             None,
+            U256::ZERO,
+            None,
         )
         .unwrap();
 
@@ -675,6 +697,8 @@ mod tests {
             &[],
             1_000_000_000,
             100_000_000,
+            None,
+            U256::ZERO,
             None,
         )
         .unwrap();
@@ -698,6 +722,8 @@ mod tests {
             &calls,
             1_000_000_000,
             100_000_000,
+            None,
+            U256::ZERO,
             None,
         )
         .unwrap();

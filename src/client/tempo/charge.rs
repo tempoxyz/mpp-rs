@@ -155,7 +155,7 @@ impl TempoCharge {
         let signing_mode = options.signing_mode.unwrap_or_default();
         let from = signing_mode.from_address(signer.address());
 
-        // Resolve RPC provider
+        // Resolve RPC provider + build calls
         let rpc_url = match options.rpc_url {
             Some(url) => url
                 .parse()
@@ -176,7 +176,6 @@ impl TempoCharge {
         let provider =
             alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
 
-        // Build calls
         let calls = self.calls.unwrap_or_else(|| {
             let transfer_data = encode_transfer(self.recipient, self.amount, self.memo);
             vec![Call {
@@ -186,72 +185,52 @@ impl TempoCharge {
             }]
         });
 
-        // Determine fee token
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
-        // Resolve gas fees from chain state (shared by both modes)
-        let default_max_fee = options.max_fee_per_gas.unwrap_or(1_000_000_000); // 1 gwei floor
-        let default_priority_fee = options.max_priority_fee_per_gas.unwrap_or(1_000_000_000);
-
-        let resolved = if options.replace_stuck_txs {
-            super::gas::resolve_gas_with_stuck_detection(
-                &provider,
-                from,
-                default_max_fee,
-                default_priority_fee,
-            )
-            .await?
-        } else {
-            super::gas::resolve_gas(&provider, from, default_max_fee, default_priority_fee).await?
-        };
-
-        let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(resolved.max_fee_per_gas);
+        // All charge payments use expiring nonces (nonceKey=MAX, nonce=0,
+        // validBefore=now+25s) so we never need a nonce fetch.
+        // Tempo uses a fixed 20 gwei base fee, so gas fees are static.
+        let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(super::MAX_FEE_PER_GAS);
         let max_priority_fee_per_gas = options
             .max_priority_fee_per_gas
-            .unwrap_or(resolved.max_priority_fee_per_gas);
+            .unwrap_or(super::MAX_PRIORITY_FEE_PER_GAS);
 
-        // Fee payer mode: use expiring nonces to avoid nonce collisions
-        // when the server co-signs and broadcasts on the client's behalf.
-        let (nonce, nonce_key, valid_before, gas_limit) = if self.fee_payer {
-            let nonce = options.nonce.unwrap_or(0);
-            let nonce_key = options.nonce_key.unwrap_or(EXPIRING_NONCE_KEY);
-            let valid_before = options.valid_before.or_else(|| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                Some(now + FEE_PAYER_VALID_BEFORE_SECS)
-            });
-            let gas = options.gas_limit.unwrap_or(1_000_000);
-            (nonce, nonce_key, valid_before, gas)
+        let nonce = options.nonce.unwrap_or(0);
+        let nonce_key = options.nonce_key.unwrap_or(EXPIRING_NONCE_KEY);
+        let valid_before = options.valid_before.or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Some(now + FEE_PAYER_VALID_BEFORE_SECS)
+        });
+
+        let gas_limit = if let Some(gas) = options.gas_limit {
+            gas
+        } else if self.fee_payer {
+            // In fee-payer mode the client may not hold native gas, so
+            // eth_estimateGas would revert. Use a safe default; the server
+            // co-signs and pays for gas.
+            1_000_000
         } else {
-            let nonce = options.nonce.unwrap_or(resolved.nonce);
-            let gas = match options.gas_limit {
-                Some(g) => g,
-                None => {
-                    estimate_gas(
-                        &provider,
-                        from,
-                        self.chain_id,
-                        nonce,
-                        fee_token,
-                        &calls,
-                        max_fee_per_gas,
-                        max_priority_fee_per_gas,
-                        options
-                            .key_authorization
-                            .as_deref()
-                            .or_else(|| signing_mode.key_authorization()),
-                    )
-                    .await?
-                }
-            };
-            (
+            let key_auth = options
+                .key_authorization
+                .as_deref()
+                .or_else(|| signing_mode.key_authorization());
+            estimate_gas(
+                &provider,
+                from,
+                self.chain_id,
                 nonce,
-                options.nonce_key.unwrap_or(U256::ZERO),
-                options.valid_before,
-                gas,
+                fee_token,
+                &calls,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                key_auth,
+                nonce_key,
+                valid_before,
             )
+            .await?
         };
 
         // Build the key_authorization for the transaction
@@ -319,12 +298,6 @@ pub struct SignOptions {
     pub key_authorization: Option<Box<SignedKeyAuthorization>>,
     /// Optional validity window upper bound (unix timestamp) for fee payer mode.
     pub valid_before: Option<u64>,
-    /// Enable stuck-transaction detection and replacement.
-    ///
-    /// When `true`, uses confirmed nonce (instead of pending) and aggressively
-    /// bumps gas to replace stuck transactions. Useful for CLI tools and
-    /// interactive clients. Default: `false`.
-    pub replace_stuck_txs: bool,
 }
 
 /// A signed Tempo charge, ready to be converted into a [`PaymentCredential`].

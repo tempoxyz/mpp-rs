@@ -40,7 +40,6 @@ pub struct TempoProvider {
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
-    replace_stuck_txs: bool,
 }
 
 impl TempoProvider {
@@ -62,7 +61,6 @@ impl TempoProvider {
             rpc_url: url,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
-            replace_stuck_txs: false,
         })
     }
 
@@ -77,18 +75,6 @@ impl TempoProvider {
     /// Default is [`TempoSigningMode::Direct`].
     pub fn with_signing_mode(mut self, mode: TempoSigningMode) -> Self {
         self.signing_mode = mode;
-        self
-    }
-
-    /// Enable stuck-transaction detection and replacement.
-    ///
-    /// When enabled, compares confirmed vs pending nonce at payment time.
-    /// If a stuck transaction is detected, aggressively bumps gas to
-    /// replace it. See [`super::gas::resolve_gas_with_stuck_detection`].
-    ///
-    /// Default: `false`.
-    pub fn with_replace_stuck_transactions(mut self, enabled: bool) -> Self {
-        self.replace_stuck_txs = enabled;
         self
     }
 
@@ -115,14 +101,11 @@ impl PaymentProvider for TempoProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let charge = super::charge::TempoCharge::from_challenge(challenge)?;
-
         let options = SignOptions {
             rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
-            replace_stuck_txs: self.replace_stuck_txs,
             ..Default::default()
         };
-
         let signed = charge.sign_with_options(&self.signer, options).await?;
         Ok(signed.into_credential())
     }
