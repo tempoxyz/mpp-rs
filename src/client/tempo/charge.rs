@@ -190,9 +190,7 @@ impl TempoCharge {
         // All charge payments use expiring nonces (nonceKey=MAX, nonce=0,
         // validBefore=now+25s) so we never need a nonce fetch.
         // Tempo uses a fixed 20 gwei base fee, so gas fees are static.
-        let max_fee_per_gas = options
-            .max_fee_per_gas
-            .unwrap_or(super::MAX_FEE_PER_GAS);
+        let max_fee_per_gas = options.max_fee_per_gas.unwrap_or(super::MAX_FEE_PER_GAS);
         let max_priority_fee_per_gas = options
             .max_priority_fee_per_gas
             .unwrap_or(super::MAX_PRIORITY_FEE_PER_GAS);
