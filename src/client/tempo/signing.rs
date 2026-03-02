@@ -390,6 +390,50 @@ mod tests {
     }
 
     #[test]
+    fn test_sign_and_encode_fee_payer_envelope_v2() {
+        let signer = test_signer();
+
+        let mut tx = test_tx();
+        tx.fee_token = None;
+        tx.nonce_key = alloy::primitives::U256::MAX;
+        tx.valid_before = Some(9999999999);
+        tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
+            alloy::primitives::U256::ZERO,
+            alloy::primitives::U256::ZERO,
+            false,
+        ));
+
+        let v1_mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAB),
+            key_authorization: None,
+            version: KeychainVersion::V1,
+        };
+        let v2_mode = TempoSigningMode::Keychain {
+            wallet: Address::repeat_byte(0xAB),
+            key_authorization: None,
+            version: KeychainVersion::V2,
+        };
+
+        let v1_bytes = sign_and_encode_fee_payer_envelope(tx.clone(), &signer, &v1_mode).unwrap();
+        let v2_bytes = sign_and_encode_fee_payer_envelope(tx, &signer, &v2_mode).unwrap();
+
+        // Both should be valid fee payer envelopes with same sender
+        assert_eq!(
+            v1_bytes[0],
+            crate::protocol::methods::tempo::TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID
+        );
+        assert_eq!(
+            v2_bytes[0],
+            crate::protocol::methods::tempo::TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID
+        );
+        let v2_env = FeePayerEnvelope78::decode_envelope(&v2_bytes).unwrap();
+        assert_eq!(v2_env.sender, Address::repeat_byte(0xAB));
+
+        // V1 and V2 should produce different signatures
+        assert_ne!(v1_bytes, v2_bytes, "fee payer V1 and V2 should differ");
+    }
+
+    #[test]
     fn test_sign_and_encode_keychain_produces_valid_2718() {
         use alloy::eips::eip2718::Decodable2718;
 
