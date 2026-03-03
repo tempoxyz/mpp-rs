@@ -335,12 +335,18 @@ impl PaymentChallenge {
 
     /// Returns true if the challenge has expired.
     ///
-    /// Parses the `expires` field as RFC 3339. If `expires` is `None` or
-    /// can't be parsed, returns `false` (fail-open, let the server decide).
+    /// Parses the `expires` field as RFC 3339. If `expires` is `None`,
+    /// returns `false`. If set but unparseable, returns `true` (fail-closed).
     pub fn is_expired(&self) -> bool {
-        match self.expires_at() {
-            Some(expires) => expires <= time::OffsetDateTime::now_utc(),
+        match &self.expires {
             None => false,
+            Some(s) => {
+                match time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                {
+                    Ok(expires) => expires <= time::OffsetDateTime::now_utc(),
+                    Err(_) => true, // fail-closed: unparseable timestamps are treated as expired
+                }
+            }
         }
     }
 
@@ -1773,7 +1779,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
             .with_expires("not-a-date");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
     }
 
     #[test]
@@ -1838,7 +1844,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge =
             PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
         assert!(challenge.expires_at().is_none());
     }
 
@@ -1847,7 +1853,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge =
             PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("   ");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
         assert!(challenge.expires_at().is_none());
     }
 
@@ -1864,7 +1870,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
             .with_expires("2099-13-01T00:00:00Z");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
     }
 
     #[test]
@@ -1872,7 +1878,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
             .with_expires("2099-01-32T00:00:00Z");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
     }
 
     #[test]
@@ -1880,7 +1886,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
             .with_expires("just some text");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
     }
 
     #[test]
@@ -1888,7 +1894,7 @@ mod tests {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge =
             PaymentChallenge::new("id", "api", "tempo", "charge", request).with_expires("12345");
-        assert!(!challenge.is_expired());
+        assert!(challenge.is_expired()); // fail-closed: unparseable → expired
     }
 
     #[test]

@@ -40,7 +40,6 @@ pub struct TempoProvider {
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
-    replace_stuck_txs: bool,
 }
 
 impl TempoProvider {
@@ -62,7 +61,6 @@ impl TempoProvider {
             rpc_url: url,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
-            replace_stuck_txs: false,
         })
     }
 
@@ -77,18 +75,6 @@ impl TempoProvider {
     /// Default is [`TempoSigningMode::Direct`].
     pub fn with_signing_mode(mut self, mode: TempoSigningMode) -> Self {
         self.signing_mode = mode;
-        self
-    }
-
-    /// Enable stuck-transaction detection and replacement.
-    ///
-    /// When enabled, compares confirmed vs pending nonce at payment time.
-    /// If a stuck transaction is detected, aggressively bumps gas to
-    /// replace it. See [`super::gas::resolve_gas_with_stuck_detection`].
-    ///
-    /// Default: `false`.
-    pub fn with_replace_stuck_transactions(mut self, enabled: bool) -> Self {
-        self.replace_stuck_txs = enabled;
         self
     }
 
@@ -115,14 +101,11 @@ impl PaymentProvider for TempoProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let charge = super::charge::TempoCharge::from_challenge(challenge)?;
-
         let options = SignOptions {
             rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
-            replace_stuck_txs: self.replace_stuck_txs,
             ..Default::default()
         };
-
         let signed = charge.sign_with_options(&self.signer, options).await?;
         Ok(signed.into_credential())
     }
@@ -168,6 +151,7 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_with_signing_mode() {
+        use crate::client::tempo::signing::KeychainVersion;
         let signer = alloy_signer_local::PrivateKeySigner::random();
         let wallet: alloy::primitives::Address = "0x1111111111111111111111111111111111111111"
             .parse()
@@ -177,6 +161,7 @@ mod tests {
             .with_signing_mode(TempoSigningMode::Keychain {
                 wallet,
                 key_authorization: None,
+                version: KeychainVersion::V1,
             });
 
         assert!(matches!(
@@ -199,47 +184,6 @@ mod tests {
     fn test_auto_generated_memo_is_mpp_memo() {
         let memo = crate::tempo::attribution::encode("api.example.com", Some("my-app"));
         assert!(crate::tempo::attribution::is_mpp_memo(&memo));
-    }
-
-    // --- Re-export verification ---
-
-    #[test]
-    fn test_reexports_accessible_from_client_tempo() {
-        // Verify that all public types are accessible via the expected paths
-        let _: fn() -> TempoSigningMode = || TempoSigningMode::Direct;
-
-        // TempoProvider is accessible (we already use it in tests above)
-        let signer = alloy_signer_local::PrivateKeySigner::random();
-        let _provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
-
-        // ChannelEntry from channel_ops
-        let _entry = crate::client::tempo::ChannelEntry {
-            channel_id: alloy::primitives::B256::ZERO,
-            salt: alloy::primitives::B256::ZERO,
-            cumulative_amount: 0,
-            escrow_contract: alloy::primitives::Address::ZERO,
-            chain_id: 42431,
-            opened: false,
-        };
-    }
-
-    #[test]
-    fn test_reexports_accessible_from_client_level() {
-        // Verify re-exports at crate::client:: level
-        let _: fn() -> crate::client::TempoSigningMode = || crate::client::TempoSigningMode::Direct;
-
-        let signer = alloy_signer_local::PrivateKeySigner::random();
-        let _provider =
-            crate::client::TempoProvider::new(signer, "https://rpc.example.com").unwrap();
-
-        let _entry = crate::client::ChannelEntry {
-            channel_id: alloy::primitives::B256::ZERO,
-            salt: alloy::primitives::B256::ZERO,
-            cumulative_amount: 0,
-            escrow_contract: alloy::primitives::Address::ZERO,
-            chain_id: 42431,
-            opened: false,
-        };
     }
 
     #[test]
