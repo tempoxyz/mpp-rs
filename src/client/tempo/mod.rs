@@ -4,21 +4,14 @@
 //! signing strategies, charge builder, and channel operations.
 
 pub mod abi;
-pub mod channel_ops;
 pub mod charge;
 mod error;
-pub mod keychain;
 mod provider;
-mod session_provider;
+pub mod session;
 pub mod signing;
-pub mod tx_builder;
 
-pub use channel_ops::ChannelEntry;
-pub use charge::{SignOptions, SignedTempoCharge, TempoCharge};
 pub use error::TempoClientError;
 pub use provider::TempoProvider;
-pub use session_provider::TempoSessionProvider;
-pub use signing::TempoSigningMode;
 
 /// Static max fee per gas: 41 gwei (`base_fee * 2 + priority_fee`).
 ///

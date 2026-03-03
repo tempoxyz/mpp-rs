@@ -6,12 +6,13 @@
 //!
 //! Ported from the TypeScript SDK's `Session.ts`.
 
+pub mod channel_ops;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alloy::primitives::{Address, B256};
 
-use super::channel_ops::{
+use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload, create_voucher_payload,
     resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry, OpenPayloadOptions,
 };
@@ -51,7 +52,7 @@ pub struct TempoSessionProvider {
     /// Address authorized to sign vouchers. Defaults to signer address.
     authorized_signer: Option<Address>,
     /// Signing mode (direct or keychain).
-    signing_mode: super::signing::TempoSigningMode,
+    signing_mode: crate::client::tempo::signing::TempoSigningMode,
     /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`.
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
@@ -85,7 +86,7 @@ impl TempoSessionProvider {
             rpc_url: url,
             escrow_contract: None,
             authorized_signer: None,
-            signing_mode: super::signing::TempoSigningMode::Direct,
+            signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
             max_deposit: None,
             default_deposit: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
@@ -110,7 +111,10 @@ impl TempoSessionProvider {
     /// Set the signing mode (direct or keychain).
     ///
     /// Default is [`TempoSigningMode::Direct`].
-    pub fn with_signing_mode(mut self, mode: super::signing::TempoSigningMode) -> Self {
+    pub fn with_signing_mode(
+        mut self,
+        mode: crate::client::tempo::signing::TempoSigningMode,
+    ) -> Self {
         self.signing_mode = mode;
         self
     }
@@ -729,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_session_provider_with_signing_mode() {
-        use super::super::signing::{KeychainVersion, TempoSigningMode};
+        use crate::client::tempo::signing::{KeychainVersion, TempoSigningMode};
 
         let signer = PrivateKeySigner::random();
         let wallet: Address = "0x1111111111111111111111111111111111111111"
@@ -751,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_session_provider_default_signing_mode() {
-        use super::super::signing::TempoSigningMode;
+        use crate::client::tempo::signing::TempoSigningMode;
 
         let signer = PrivateKeySigner::random();
         let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
