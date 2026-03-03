@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn test_session_provider_with_signing_mode() {
-        use super::super::signing::TempoSigningMode;
+        use super::super::signing::{KeychainVersion, TempoSigningMode};
 
         let signer = PrivateKeySigner::random();
         let wallet: Address = "0x1111111111111111111111111111111111111111"
@@ -740,6 +740,7 @@ mod tests {
             .with_signing_mode(TempoSigningMode::Keychain {
                 wallet,
                 key_authorization: None,
+                version: KeychainVersion::V1,
             });
 
         assert!(matches!(
