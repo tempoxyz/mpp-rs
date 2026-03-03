@@ -221,16 +221,16 @@ where
         );
 
         if credential.challenge.id != expected_id {
-            return Err(VerificationError::new(
+            return Err(VerificationError::with_code(
                 "Challenge ID mismatch - not issued by this server",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
             ));
         }
 
         if let Some(ref expires) = credential.challenge.expires {
-            if let Ok(expires_at) = time::OffsetDateTime::parse(
-                expires,
-                &time::format_description::well_known::Rfc3339,
-            ) {
+            if let Ok(expires_at) =
+                time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+            {
                 if expires_at <= time::OffsetDateTime::now_utc() {
                     return Err(VerificationError::expired(format!(
                         "Challenge expired at {}",
