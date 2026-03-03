@@ -48,9 +48,7 @@ fn extract_field(raw: &str, key: &str) -> Option<String> {
     let needle = format!("{key}: ");
     let start = raw.find(&needle)? + needle.len();
     let rest = &raw[start..];
-    let end = rest
-        .find([',', '}', ')'])
-        .unwrap_or(rest.len());
+    let end = rest.find([',', '}', ')']).unwrap_or(rest.len());
     let value = rest[..end].trim();
     if value.is_empty() {
         return None;

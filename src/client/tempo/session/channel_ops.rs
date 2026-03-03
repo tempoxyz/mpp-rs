@@ -255,21 +255,25 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-    let tempo_tx = crate::client::tempo::charge::tx_builder::build_tempo_tx(crate::client::tempo::charge::tx_builder::TempoTxOptions {
-        calls,
-        chain_id: options.chain_id,
-        fee_token: options.currency,
-        nonce,
-        nonce_key: U256::ZERO,
-        gas_limit: 2_000_000,
-        max_fee_per_gas: gas_price,
-        max_priority_fee_per_gas: gas_price,
-        fee_payer: options.fee_payer,
-        valid_before: None,
-        key_authorization: signing_mode.key_authorization().cloned(),
-    });
+    let tempo_tx = crate::client::tempo::charge::tx_builder::build_tempo_tx(
+        crate::client::tempo::charge::tx_builder::TempoTxOptions {
+            calls,
+            chain_id: options.chain_id,
+            fee_token: options.currency,
+            nonce,
+            nonce_key: U256::ZERO,
+            gas_limit: 2_000_000,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: gas_price,
+            fee_payer: options.fee_payer,
+            valid_before: None,
+            key_authorization: signing_mode.key_authorization().cloned(),
+        },
+    );
 
-    let tx_bytes = crate::client::tempo::signing::sign_and_encode_async(tempo_tx, signer, signing_mode).await?;
+    let tx_bytes =
+        crate::client::tempo::signing::sign_and_encode_async(tempo_tx, signer, signing_mode)
+            .await?;
     let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
     // Sign the initial voucher

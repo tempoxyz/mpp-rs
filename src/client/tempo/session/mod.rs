@@ -111,7 +111,10 @@ impl TempoSessionProvider {
     /// Set the signing mode (direct or keychain).
     ///
     /// Default is [`TempoSigningMode::Direct`].
-    pub fn with_signing_mode(mut self, mode: crate::client::tempo::signing::TempoSigningMode) -> Self {
+    pub fn with_signing_mode(
+        mut self,
+        mode: crate::client::tempo::signing::TempoSigningMode,
+    ) -> Self {
         self.signing_mode = mode;
         self
     }

@@ -48,5 +48,3 @@ pub use crate::protocol::methods::tempo::session_method::{
     ChannelState, ChannelStore, InMemoryChannelStore as SessionChannelStore,
     SessionMethod as TempoSessionMethod, SessionMethodConfig,
 };
-
-

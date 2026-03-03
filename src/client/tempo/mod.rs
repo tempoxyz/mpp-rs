@@ -10,12 +10,8 @@ mod provider;
 pub mod session;
 pub mod signing;
 
-pub use charge::{SignOptions, SignedTempoCharge, TempoCharge};
 pub use error::TempoClientError;
 pub use provider::TempoProvider;
-pub use session::channel_ops::ChannelEntry;
-pub use session::TempoSessionProvider;
-pub use signing::TempoSigningMode;
 
 /// Static max fee per gas: 41 gwei (`base_fee * 2 + priority_fee`).
 ///
