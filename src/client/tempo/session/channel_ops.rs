@@ -173,7 +173,7 @@ pub struct OpenPayloadOptions {
 pub async fn create_open_payload<P, S>(
     provider: &P,
     signer: &S,
-    signing_mode: Option<&super::signing::TempoSigningMode>,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
     payer: Address,
     options: OpenPayloadOptions,
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
@@ -184,7 +184,7 @@ where
     use alloy::sol;
     use tempo_primitives::transaction::Call;
 
-    let default_mode = super::signing::TempoSigningMode::Direct;
+    let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
@@ -204,7 +204,7 @@ where
     );
 
     // Build approve calldata
-    use super::abi::ITIP20;
+    use crate::client::tempo::abi::ITIP20;
 
     sol! {
         interface IEscrow {
@@ -255,7 +255,7 @@ where
         .await
         .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
 
-    let tempo_tx = super::tx_builder::build_tempo_tx(super::tx_builder::TempoTxOptions {
+    let tempo_tx = crate::client::tempo::charge::tx_builder::build_tempo_tx(crate::client::tempo::charge::tx_builder::TempoTxOptions {
         calls,
         chain_id: options.chain_id,
         fee_token: options.currency,
@@ -269,7 +269,7 @@ where
         key_authorization: signing_mode.key_authorization().cloned(),
     });
 
-    let tx_bytes = super::signing::sign_and_encode_async(tempo_tx, signer, signing_mode).await?;
+    let tx_bytes = crate::client::tempo::signing::sign_and_encode_async(tempo_tx, signer, signing_mode).await?;
     let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
     // Sign the initial voucher

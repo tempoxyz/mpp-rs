@@ -168,7 +168,7 @@ pub async fn estimate_gas<P: alloy::providers::Provider<tempo_alloy::TempoNetwor
         .await
         .map_err(|e| {
             let msg = format!("gas estimation failed: {}", e);
-            match super::TempoClientError::classify_rpc_error(&msg) {
+            match crate::client::tempo::TempoClientError::classify_rpc_error(&msg) {
                 Some(tempo_err) => MppError::from(tempo_err),
                 None => MppError::Http(msg),
             }

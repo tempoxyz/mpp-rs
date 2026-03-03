@@ -4,6 +4,8 @@
 //! and keychain (access key) signing, plus helpers to sign and encode
 //! Tempo transactions.
 
+pub mod keychain;
+
 use alloy::primitives::Address;
 use tempo_primitives::transaction::SignedKeyAuthorization;
 
