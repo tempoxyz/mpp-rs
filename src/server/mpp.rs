@@ -202,6 +202,51 @@ where
         self.decimals
     }
 
+    /// Verify the challenge HMAC and reject expired challenges.
+    ///
+    /// Shared validation used by both charge and session verification paths.
+    fn verify_hmac_and_expiry(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<(), VerificationError> {
+        let expected_id = crate::protocol::core::compute_challenge_id(
+            &self.secret_key,
+            &self.realm,
+            credential.challenge.method.as_str(),
+            credential.challenge.intent.as_str(),
+            &credential.challenge.request,
+            credential.challenge.expires.as_deref(),
+            credential.challenge.digest.as_deref(),
+            credential.challenge.opaque.as_deref(),
+        );
+
+        if credential.challenge.id != expected_id {
+            return Err(VerificationError::with_code(
+                "Challenge ID mismatch - not issued by this server",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if let Some(ref expires) = credential.challenge.expires {
+            if let Ok(expires_at) =
+                time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+            {
+                if expires_at <= time::OffsetDateTime::now_utc() {
+                    return Err(VerificationError::expired(format!(
+                        "Challenge expired at {}",
+                        expires
+                    )));
+                }
+            } else {
+                return Err(VerificationError::new(
+                    "Invalid expires timestamp in challenge",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     #[cfg(feature = "tempo")]
     fn require_bound_config(&self) -> Result<(&str, &str)> {
         let currency = self.currency.as_deref().ok_or_else(|| {
@@ -330,34 +375,59 @@ where
         self.verify(credential, &request).await
     }
 
+    /// Verify a payment credential, ensuring the charge request matches the server's expected values.
+    ///
+    /// This prevents cross-route credential replay attacks where a credential
+    /// obtained from a cheaper endpoint (or different recipient/currency) is
+    /// replayed on another.
+    pub async fn verify_credential_with_expected_request(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request: ChargeRequest =
+            crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
+                .decode()
+                .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+
+        if request.amount != expected.amount {
+            return Err(VerificationError::with_code(
+                format!(
+                    "Amount mismatch: credential has {} but endpoint expects {}",
+                    request.amount, expected.amount
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if request.currency != expected.currency {
+            return Err(VerificationError::with_code(
+                format!(
+                    "Currency mismatch: credential has {} but endpoint expects {}",
+                    request.currency, expected.currency
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if request.recipient != expected.recipient {
+            return Err(VerificationError::with_code(
+                "Recipient mismatch: credential was issued for a different recipient",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        self.verify(credential, &request).await
+    }
+
     /// Verify a charge credential with an explicit request.
     pub async fn verify(
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        #[cfg(feature = "tempo")]
-        {
-            let expected_id = crate::protocol::methods::tempo::generate_challenge_id(
-                &self.secret_key,
-                &self.realm,
-                credential.challenge.method.as_str(),
-                credential.challenge.intent.as_str(),
-                &credential.challenge.request,
-                credential.challenge.expires.as_deref(),
-                credential.challenge.digest.as_deref(),
-                credential.challenge.opaque.as_deref(),
-            );
-
-            if credential.challenge.id != expected_id {
-                return Err(VerificationError::new(
-                    "Challenge ID mismatch - not issued by this server",
-                ));
-            }
-        }
-
+        self.verify_hmac_and_expiry(credential)?;
         let receipt = self.method.verify(credential, request).await?;
-
         Ok(receipt)
     }
 }
@@ -496,26 +566,7 @@ where
             crate::protocol::traits::VerificationError::new("No session method configured")
         })?;
 
-        // Verify HMAC
-        #[cfg(feature = "tempo")]
-        {
-            let expected_id = crate::protocol::methods::tempo::generate_challenge_id(
-                &self.secret_key,
-                &self.realm,
-                credential.challenge.method.as_str(),
-                credential.challenge.intent.as_str(),
-                &credential.challenge.request,
-                credential.challenge.expires.as_deref(),
-                credential.challenge.digest.as_deref(),
-                credential.challenge.opaque.as_deref(),
-            );
-            if credential.challenge.id != expected_id {
-                return Err(crate::protocol::traits::VerificationError::with_code(
-                    "Challenge ID mismatch",
-                    crate::protocol::traits::ErrorCode::CredentialMismatch,
-                ));
-            }
-        }
+        self.verify_hmac_and_expiry(credential)?;
 
         let request: crate::protocol::intents::SessionRequest =
             crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
@@ -1424,5 +1475,195 @@ mod tests {
         let debug = format!("{:?}", result);
         assert!(debug.contains("0xref"));
         assert!(debug.contains("status"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_expired_challenge_rejected() {
+        let mpp = create_hmac_test_mpp();
+
+        // Create a credential with an expired timestamp so the HMAC matches
+        let past = (time::OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+
+        let challenge = mpp
+            .charge_with_options(
+                "0.10",
+                crate::server::ChargeOptions {
+                    expires: Some(&past),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::Expired));
+        assert!(
+            err.message.contains("expired"),
+            "expected expiry error, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_non_expired_challenge_accepted() {
+        let mpp = create_hmac_test_mpp();
+        // Default charge generates an expires 5 minutes in the future
+        let challenge = mpp.charge("0.10").unwrap();
+        assert!(
+            challenge.expires.is_some(),
+            "charge should have default expires"
+        );
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_ok(), "non-expired challenge should be accepted");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_malformed_expires_rejected() {
+        let mpp = create_hmac_test_mpp();
+
+        // Manually create a credential with a malformed expires that has a valid HMAC
+        let challenge = mpp
+            .charge_with_options(
+                "0.10",
+                crate::server::ChargeOptions {
+                    expires: Some("not-a-timestamp"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().message.contains("Invalid expires"),
+            "expected invalid expires error"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_credential_with_wrong_amount_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap(); // 100000 base units
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let wrong_request = ChargeRequest {
+            amount: "999999999".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+        let result = mpp
+            .verify_credential_with_expected_request(&credential, &wrong_request)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("Amount mismatch"),
+            "expected amount mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_credential_with_correct_request_accepted() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap(); // 100000 base units
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let expected_request = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+        let result = mpp
+            .verify_credential_with_expected_request(&credential, &expected_request)
+            .await;
+        assert!(result.is_ok(), "correct request should be accepted");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_credential_with_wrong_recipient_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let wrong_recipient = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x0000000000000000000000000000000000000001".into()),
+            ..Default::default()
+        };
+        let result = mpp
+            .verify_credential_with_expected_request(&credential, &wrong_recipient)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("Recipient mismatch"),
+            "expected recipient mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_session_expired_challenge_rejected() {
+        let mpp = create_session_test_mpp();
+
+        let past = (time::OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+
+        let challenge = mpp
+            .session_challenge_with_details(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                crate::server::SessionChallengeOptions {
+                    expires: Some(&past),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let echo = challenge.to_echo();
+        let payload_json = serde_json::json!({
+            "action": "voucher",
+            "channelId": "0xabc",
+            "cumulativeAmount": "5000",
+            "signature": "0xdef"
+        });
+        let credential = PaymentCredential::new(echo, payload_json);
+
+        let result = mpp.verify_session(&credential).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::Expired));
     }
 }

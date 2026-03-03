@@ -279,15 +279,27 @@ impl PaymentLayer<ChargeVerifier> {
             crate::error::MppError::InvalidConfig(format!("Failed to format challenge: {}", e))
         })?;
 
+        // Extract expected request from the challenge for cross-route validation
+        let expected_request: crate::protocol::intents::ChargeRequest =
+            crate::protocol::core::Base64UrlJson::from_raw(challenge.request.raw().to_string())
+                .decode()
+                .map_err(|e| {
+                    crate::error::MppError::InvalidConfig(format!(
+                        "Failed to decode charge request: {}",
+                        e
+                    ))
+                })?;
+
         let mpp = mpp.clone();
         let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
             let mpp = mpp.clone();
+            let expected_request = expected_request.clone();
             Box::pin(async move {
                 let credential = parse_authorization(&credential_str)
                     .map_err(|e| format!("Invalid credential: {}", e))?;
 
                 let receipt = mpp
-                    .verify_credential(&credential)
+                    .verify_credential_with_expected_request(&credential, &expected_request)
                     .await
                     .map_err(|e| format!("{}", e))?;
 
