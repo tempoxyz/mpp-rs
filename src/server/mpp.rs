@@ -1477,8 +1477,6 @@ mod tests {
         assert!(debug.contains("status"));
     }
 
-    // ── Security fix tests ─────────────────────────────────────────────
-
     #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn test_expired_challenge_rejected() {
