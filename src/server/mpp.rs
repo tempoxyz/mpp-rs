@@ -202,6 +202,51 @@ where
         self.decimals
     }
 
+    /// Verify the challenge HMAC and reject expired challenges.
+    ///
+    /// Shared validation used by both charge and session verification paths.
+    fn verify_hmac_and_expiry(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<(), VerificationError> {
+        let expected_id = crate::protocol::core::compute_challenge_id(
+            &self.secret_key,
+            &self.realm,
+            credential.challenge.method.as_str(),
+            credential.challenge.intent.as_str(),
+            &credential.challenge.request,
+            credential.challenge.expires.as_deref(),
+            credential.challenge.digest.as_deref(),
+            credential.challenge.opaque.as_deref(),
+        );
+
+        if credential.challenge.id != expected_id {
+            return Err(VerificationError::new(
+                "Challenge ID mismatch - not issued by this server",
+            ));
+        }
+
+        if let Some(ref expires) = credential.challenge.expires {
+            if let Ok(expires_at) = time::OffsetDateTime::parse(
+                expires,
+                &time::format_description::well_known::Rfc3339,
+            ) {
+                if expires_at <= time::OffsetDateTime::now_utc() {
+                    return Err(VerificationError::expired(format!(
+                        "Challenge expired at {}",
+                        expires
+                    )));
+                }
+            } else {
+                return Err(VerificationError::new(
+                    "Invalid expires timestamp in challenge",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     #[cfg(feature = "tempo")]
     fn require_bound_config(&self) -> Result<(&str, &str)> {
         let currency = self.currency.as_deref().ok_or_else(|| {
@@ -330,26 +375,44 @@ where
         self.verify(credential, &request).await
     }
 
-    /// Verify a payment credential, ensuring the amount matches the server's expected amount.
+    /// Verify a payment credential, ensuring the charge request matches the server's expected values.
     ///
-    /// This prevents cross-route price substitution attacks (Finding 3) where
-    /// a credential obtained from a cheaper endpoint is replayed on an expensive one.
-    pub async fn verify_credential_with_expected_amount(
+    /// This prevents cross-route credential replay attacks where a credential
+    /// obtained from a cheaper endpoint (or different recipient/currency) is
+    /// replayed on another.
+    pub async fn verify_credential_with_expected_request(
         &self,
         credential: &PaymentCredential,
-        expected_amount: &str,
+        expected: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
         let request: ChargeRequest =
             crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
                 .decode()
                 .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
 
-        if request.amount != expected_amount {
+        if request.amount != expected.amount {
             return Err(VerificationError::with_code(
                 format!(
                     "Amount mismatch: credential has {} but endpoint expects {}",
-                    request.amount, expected_amount
+                    request.amount, expected.amount
                 ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if request.currency != expected.currency {
+            return Err(VerificationError::with_code(
+                format!(
+                    "Currency mismatch: credential has {} but endpoint expects {}",
+                    request.currency, expected.currency
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if request.recipient != expected.recipient {
+            return Err(VerificationError::with_code(
+                "Recipient mismatch: credential was issued for a different recipient",
                 crate::protocol::traits::ErrorCode::CredentialMismatch,
             ));
         }
@@ -363,44 +426,8 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        // Verify challenge HMAC — unconditional, not feature-gated (Finding 6)
-        let expected_id = crate::protocol::core::compute_challenge_id(
-            &self.secret_key,
-            &self.realm,
-            credential.challenge.method.as_str(),
-            credential.challenge.intent.as_str(),
-            &credential.challenge.request,
-            credential.challenge.expires.as_deref(),
-            credential.challenge.digest.as_deref(),
-            credential.challenge.opaque.as_deref(),
-        );
-
-        if credential.challenge.id != expected_id {
-            return Err(VerificationError::new(
-                "Challenge ID mismatch - not issued by this server",
-            ));
-        }
-
-        // Reject expired challenges (Finding 4 — fail-closed)
-        if let Some(ref expires) = credential.challenge.expires {
-            if let Ok(expires_at) =
-                time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
-            {
-                if expires_at <= time::OffsetDateTime::now_utc() {
-                    return Err(VerificationError::expired(format!(
-                        "Challenge expired at {}",
-                        expires
-                    )));
-                }
-            } else {
-                return Err(VerificationError::new(
-                    "Invalid expires timestamp in challenge",
-                ));
-            }
-        }
-
+        self.verify_hmac_and_expiry(credential)?;
         let receipt = self.method.verify(credential, request).await?;
-
         Ok(receipt)
     }
 }
@@ -539,40 +566,7 @@ where
             crate::protocol::traits::VerificationError::new("No session method configured")
         })?;
 
-        // Verify challenge HMAC — unconditional, not feature-gated (Finding 6)
-        let expected_id = crate::protocol::core::compute_challenge_id(
-            &self.secret_key,
-            &self.realm,
-            credential.challenge.method.as_str(),
-            credential.challenge.intent.as_str(),
-            &credential.challenge.request,
-            credential.challenge.expires.as_deref(),
-            credential.challenge.digest.as_deref(),
-            credential.challenge.opaque.as_deref(),
-        );
-        if credential.challenge.id != expected_id {
-            return Err(crate::protocol::traits::VerificationError::with_code(
-                "Challenge ID mismatch",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
-            ));
-        }
-
-        // Reject expired challenges (Finding 4)
-        if let Some(ref expires) = credential.challenge.expires {
-            if let Ok(expires_at) =
-                time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
-            {
-                if expires_at <= time::OffsetDateTime::now_utc() {
-                    return Err(crate::protocol::traits::VerificationError::expired(
-                        format!("Challenge expired at {}", expires),
-                    ));
-                }
-            } else {
-                return Err(crate::protocol::traits::VerificationError::new(
-                    "Invalid expires timestamp in challenge",
-                ));
-            }
-        }
+        self.verify_hmac_and_expiry(credential)?;
 
         let request: crate::protocol::intents::SessionRequest =
             crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
@@ -1571,9 +1565,14 @@ mod tests {
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
 
-        // Verify with a different expected amount (cross-route attack)
+        let wrong_request = ChargeRequest {
+            amount: "999999999".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
         let result = mpp
-            .verify_credential_with_expected_amount(&credential, "999999999")
+            .verify_credential_with_expected_request(&credential, &wrong_request)
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1587,17 +1586,51 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[tokio::test]
-    async fn test_verify_credential_with_correct_amount_accepted() {
+    async fn test_verify_credential_with_correct_request_accepted() {
         let mpp = create_hmac_test_mpp();
         let challenge = mpp.charge("0.10").unwrap(); // 100000 base units
 
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
 
+        let expected_request = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
         let result = mpp
-            .verify_credential_with_expected_amount(&credential, "100000")
+            .verify_credential_with_expected_request(&credential, &expected_request)
             .await;
-        assert!(result.is_ok(), "correct amount should be accepted");
+        assert!(result.is_ok(), "correct request should be accepted");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_credential_with_wrong_recipient_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let wrong_recipient = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x0000000000000000000000000000000000000001".into()),
+            ..Default::default()
+        };
+        let result = mpp
+            .verify_credential_with_expected_request(&credential, &wrong_recipient)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("Recipient mismatch"),
+            "expected recipient mismatch error, got: {}",
+            err.message
+        );
     }
 
     #[cfg(feature = "tempo")]
