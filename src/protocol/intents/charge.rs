@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MppError, Result};
+#[cfg(feature = "evm")]
+use crate::evm::U256;
 
 /// Charge request (for charge intent).
 ///
@@ -93,6 +95,15 @@ impl ChargeRequest {
             .map_err(|_| MppError::InvalidAmount(format!("Invalid amount: {}", self.amount)))
     }
 
+    /// Parse the amount as U256 when EVM support is enabled.
+    ///
+    /// This matches bigint semantics in the TypeScript SDK and avoids the
+    /// `u128` ceiling of [`parse_amount`].
+    #[cfg(feature = "evm")]
+    pub fn parse_amount_u256(&self) -> Result<U256> {
+        crate::evm::parse_amount(&self.amount)
+    }
+
     /// Validate that the charge amount does not exceed a maximum.
     ///
     /// # Arguments
@@ -159,6 +170,21 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid.parse_amount().is_err());
+    }
+
+    #[cfg(feature = "evm")]
+    #[test]
+    fn test_parse_amount_u256() {
+        let req = ChargeRequest {
+            amount: "340282366920938463463374607431768211456".to_string(), // u128::MAX + 1
+            ..Default::default()
+        };
+
+        let parsed = req.parse_amount_u256().unwrap();
+        assert_eq!(
+            parsed.to_string(),
+            "340282366920938463463374607431768211456"
+        );
     }
 
     #[test]
