@@ -616,6 +616,13 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         let secret_key = builder
             .secret_key
             .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            })
             .ok_or_else(|| {
                 crate::error::MppError::InvalidConfig(format!(
                     "Missing secret key. Set {} environment variable or pass .secret_key(...).",
@@ -878,6 +885,26 @@ mod tests {
         }));
         match result {
             Ok(_) => panic!("missing secret key should fail creation"),
+            Err(err) => assert!(err.to_string().contains("Missing secret key")),
+        }
+
+        unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, "   ") };
+        let whitespace_env = Mpp::create(tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        }));
+        match whitespace_env {
+            Ok(_) => panic!("whitespace-only env secret key should fail creation"),
+            Err(err) => assert!(err.to_string().contains("Missing secret key")),
+        }
+
+        let whitespace_builder = Mpp::create(
+            tempo(TempoConfig {
+                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            })
+            .secret_key(""),
+        );
+        match whitespace_builder {
+            Ok(_) => panic!("empty builder secret key should fail creation"),
             Err(err) => assert!(err.to_string().contains("Missing secret key")),
         }
     }

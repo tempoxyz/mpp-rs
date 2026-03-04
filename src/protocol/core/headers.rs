@@ -217,13 +217,14 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         ));
     }
     let realm = require_param!(params, "realm").clone();
-    let method = MethodName::new(require_param!(params, "method"));
-    if !method.is_valid() {
+    let method_raw = require_param!(params, "method").clone();
+    if method_raw.is_empty() || !method_raw.chars().all(|c| c.is_ascii_lowercase()) {
         return Err(MppError::invalid_challenge_reason(format!(
             "Invalid method: \"{}\". Must match method-name ABNF.",
-            method.as_str()
+            method_raw
         )));
     }
+    let method = MethodName::new(method_raw);
     let intent = IntentName::new(require_param!(params, "intent"));
     let request_b64 = require_param!(params, "request").clone();
 
@@ -832,6 +833,14 @@ mod tests {
     fn test_parse_www_authenticate_rejects_invalid_method_name_digit_prefix() {
         let header =
             r#"Payment id="abc", realm="api", method="1tempo", intent="charge", request="e30""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Invalid method"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_mixed_case_method_name() {
+        let header =
+            r#"Payment id="abc", realm="api", method="Tempo", intent="charge", request="e30""#;
         let err = parse_www_authenticate(header).unwrap_err();
         assert!(err.to_string().contains("Invalid method"));
     }
