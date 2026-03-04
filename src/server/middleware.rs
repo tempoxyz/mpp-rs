@@ -258,7 +258,7 @@ impl PaymentVerifier for ChargeVerifier {
 impl PaymentLayer<ChargeVerifier> {
     /// Create a payment layer that charges a dollar amount per request.
     ///
-    /// This generates a fresh challenge for each request and verifies each
+    /// Generates a fresh challenge for each request and verifies each
     /// incoming credential against the provided `Mpp` instance.
     ///
     /// # Example
