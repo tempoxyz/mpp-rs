@@ -156,10 +156,10 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let verifier = Arc::clone(&self.verifier);
-        let mut inner = self.inner.clone();
-        // Swap so the clone (which is ready) is used for this call,
-        // and self retains the original for the next poll_ready cycle.
-        std::mem::swap(&mut self.inner, &mut inner);
+        // Keep a clone in `self` for future poll_ready cycles and call the
+        // currently-ready service instance moved out of `self`.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             // Extract the Authorization header.
@@ -232,8 +232,8 @@ fn error_response<B: Default>(status: StatusCode, _message: &str) -> Response<B>
 /// Created via [`PaymentLayer::charge()`].
 #[allow(clippy::type_complexity)]
 struct ChargeVerifier {
-    /// Pre-formatted `WWW-Authenticate` header value.
-    challenge_header: String,
+    /// Builds a fresh `WWW-Authenticate` header value per request.
+    challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
     /// Shared mpp instance for verification (type-erased).
     verify_fn: Box<
         dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
@@ -244,7 +244,7 @@ struct ChargeVerifier {
 
 impl PaymentVerifier for ChargeVerifier {
     fn challenge(&self) -> Result<String, String> {
-        Ok(self.challenge_header.clone())
+        (self.challenge_fn)()
     }
 
     fn verify(
@@ -258,8 +258,8 @@ impl PaymentVerifier for ChargeVerifier {
 impl PaymentLayer<ChargeVerifier> {
     /// Create a payment layer that charges a dollar amount per request.
     ///
-    /// This pre-generates the challenge at construction time and verifies
-    /// each incoming credential against the provided `Mpp` instance.
+    /// This generates a fresh challenge for each request and verifies each
+    /// incoming credential against the provided `Mpp` instance.
     ///
     /// # Example
     ///
@@ -274,29 +274,30 @@ impl PaymentLayer<ChargeVerifier> {
         M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
     {
-        let challenge = mpp.charge(amount)?;
-        let challenge_header = format_www_authenticate(&challenge).map_err(|e| {
-            crate::error::MppError::InvalidConfig(format!("Failed to format challenge: {}", e))
-        })?;
+        let mpp_for_challenge = mpp.clone();
+        let charge_amount = amount.to_string();
+        let challenge_fn = Box::new(move || {
+            let challenge = mpp_for_challenge
+                .charge(&charge_amount)
+                .map_err(|e| format!("Failed to generate challenge: {}", e))?;
+            format_www_authenticate(&challenge).map_err(|e| {
+                format!("Failed to format challenge: {}", e)
+            })
+        });
 
-        // Extract expected request from the challenge for cross-route validation
-        let expected_request: crate::protocol::intents::ChargeRequest =
-            crate::protocol::core::Base64UrlJson::from_raw(challenge.request.raw().to_string())
-                .decode()
-                .map_err(|e| {
-                    crate::error::MppError::InvalidConfig(format!(
-                        "Failed to decode charge request: {}",
-                        e
-                    ))
-                })?;
-
-        let mpp = mpp.clone();
+        let mpp_for_verify = mpp.clone();
         let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-            let mpp = mpp.clone();
-            let expected_request = expected_request.clone();
+            let mpp = mpp_for_verify.clone();
             Box::pin(async move {
                 let credential = parse_authorization(&credential_str)
                     .map_err(|e| format!("Invalid credential: {}", e))?;
+
+                let expected_request: crate::protocol::intents::ChargeRequest =
+                    crate::protocol::core::Base64UrlJson::from_raw(
+                        credential.challenge.request.clone(),
+                    )
+                    .decode()
+                    .map_err(|e| format!("Failed to decode challenge request: {}", e))?;
 
                 let receipt = mpp
                     .verify_credential_with_expected_request(&credential, &expected_request)
@@ -308,7 +309,7 @@ impl PaymentLayer<ChargeVerifier> {
         });
 
         Ok(Self::new(ChargeVerifier {
-            challenge_header,
+            challenge_fn,
             verify_fn,
         }))
     }
