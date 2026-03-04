@@ -613,9 +613,15 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     /// let challenge = mpp.charge("1.00")?;
     /// ```
     pub fn create(builder: super::TempoBuilder) -> Result<Self> {
-        let secret_key = builder.secret_key.unwrap_or_else(|| {
-            std::env::var(SECRET_KEY_ENV_VAR).unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
-        });
+        let secret_key = builder
+            .secret_key
+            .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
+            .ok_or_else(|| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "Missing secret key. Set {} environment variable or pass .secret_key(...).",
+                    SECRET_KEY_ENV_VAR
+                ))
+            })?;
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
         let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
@@ -848,6 +854,32 @@ mod tests {
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2")
         );
         assert_eq!(mpp.decimals(), 6);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_mpp_create_requires_secret_key() {
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 {
+                    unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, value) };
+                } else {
+                    unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
+                }
+            }
+        }
+
+        let _guard = EnvGuard(std::env::var(SECRET_KEY_ENV_VAR).ok());
+        unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
+
+        let result = Mpp::create(tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        }));
+        match result {
+            Ok(_) => panic!("missing secret key should fail creation"),
+            Err(err) => assert!(err.to_string().contains("Missing secret key")),
+        }
     }
 
     #[cfg(feature = "tempo")]

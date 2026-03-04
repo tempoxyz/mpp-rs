@@ -48,6 +48,12 @@ pub use session::SessionRequest;
 /// - `parse_units("100", 6)` → `"100000000"`
 /// - `parse_units("0.001", 18)` → `"1000000000000000"`
 pub fn parse_units(amount: &str, decimals: u8) -> crate::error::Result<String> {
+    if amount.is_empty() {
+        return Err(crate::error::MppError::InvalidAmount(
+            "Amount cannot be empty".to_string(),
+        ));
+    }
+
     let parts: Vec<&str> = amount.split('.').collect();
     if parts.len() > 2 {
         return Err(crate::error::MppError::InvalidAmount(format!(
@@ -118,5 +124,10 @@ mod tests {
     #[test]
     fn test_parse_units_no_integer_part() {
         assert_eq!(parse_units("0.5", 6).unwrap(), "500000");
+    }
+
+    #[test]
+    fn test_parse_units_empty_string() {
+        assert!(parse_units("", 6).is_err());
     }
 }
