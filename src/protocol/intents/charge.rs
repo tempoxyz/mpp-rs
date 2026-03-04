@@ -181,7 +181,10 @@ mod tests {
         };
 
         let parsed = req.parse_amount_u256().unwrap();
-        assert_eq!(parsed.to_string(), "340282366920938463463374607431768211456");
+        assert_eq!(
+            parsed.to_string(),
+            "340282366920938463463374607431768211456"
+        );
     }
 
     #[test]

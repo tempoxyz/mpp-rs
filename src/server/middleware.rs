@@ -280,9 +280,8 @@ impl PaymentLayer<ChargeVerifier> {
             let challenge = mpp_for_challenge
                 .charge(&charge_amount)
                 .map_err(|e| format!("Failed to generate challenge: {}", e))?;
-            format_www_authenticate(&challenge).map_err(|e| {
-                format!("Failed to format challenge: {}", e)
-            })
+            format_www_authenticate(&challenge)
+                .map_err(|e| format!("Failed to format challenge: {}", e))
         });
 
         let mpp_for_verify = mpp.clone();
