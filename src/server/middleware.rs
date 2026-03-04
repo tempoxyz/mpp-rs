@@ -274,6 +274,21 @@ impl PaymentLayer<ChargeVerifier> {
         M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
     {
+        // Capture route-scoped expected request once so credential verification
+        // compares against endpoint configuration, not echoed credential data.
+        let expected_challenge = mpp.charge(amount)?;
+        let expected_request: crate::protocol::intents::ChargeRequest =
+            crate::protocol::core::Base64UrlJson::from_raw(
+                expected_challenge.request.raw().to_string(),
+            )
+            .decode()
+            .map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "Failed to decode route charge request: {}",
+                    e
+                ))
+            })?;
+
         let mpp_for_challenge = mpp.clone();
         let charge_amount = amount.to_string();
         let challenge_fn = Box::new(move || {
@@ -287,16 +302,10 @@ impl PaymentLayer<ChargeVerifier> {
         let mpp_for_verify = mpp.clone();
         let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
             let mpp = mpp_for_verify.clone();
+            let expected_request = expected_request.clone();
             Box::pin(async move {
                 let credential = parse_authorization(&credential_str)
                     .map_err(|e| format!("Invalid credential: {}", e))?;
-
-                let expected_request: crate::protocol::intents::ChargeRequest =
-                    crate::protocol::core::Base64UrlJson::from_raw(
-                        credential.challenge.request.clone(),
-                    )
-                    .decode()
-                    .map_err(|e| format!("Failed to decode challenge request: {}", e))?;
 
                 let receipt = mpp
                     .verify_credential_with_expected_request(&credential, &expected_request)
