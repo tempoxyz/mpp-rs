@@ -34,7 +34,7 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 
-use super::{parse_iso8601_timestamp, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
+use super::{TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
 
 /// TIP-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
 /// TIP-20 is Tempo's token standard (compatible with ERC-20 Transfer events).
@@ -335,27 +335,6 @@ where
                 expected_amount, currency, expected_recipient
             )))
         }
-    }
-
-    fn check_expiration(&self, expires: &str) -> Result<(), VerificationError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let expires_ts = parse_iso8601_timestamp(expires)
-            .ok_or_else(|| VerificationError::new("Invalid expires timestamp"))?;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        if now > expires_ts {
-            return Err(VerificationError::expired(format!(
-                "Request expired at {}",
-                expires
-            )));
-        }
-
-        Ok(())
     }
 
     /// Validate that a transaction contains the expected payment call.
@@ -715,10 +694,6 @@ where
                     "Intent mismatch: expected {}, got {}",
                     INTENT_CHARGE, credential.challenge.intent
                 )));
-            }
-
-            if let Some(ref expires) = request.expires {
-                this.check_expiration(expires)?;
             }
 
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);

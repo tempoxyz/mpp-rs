@@ -25,7 +25,6 @@ use crate::evm::U256;
 ///     currency: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
 ///     decimals: None,
 ///     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
-///     expires: None,
 ///     description: Some("API access".to_string()),
 ///     external_id: None,
 ///     method_details: None,
@@ -52,10 +51,6 @@ pub struct ChargeRequest {
     /// Recipient address (optional, server may be recipient)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
-
-    /// Request expiration (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires: Option<String>,
 
     /// Human-readable description
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,7 +133,6 @@ mod tests {
             amount: "10000".to_string(),
             currency: "0x123".to_string(),
             recipient: Some("0x456".to_string()),
-            expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
             external_id: None,
             method_details: Some(serde_json::json!({

@@ -244,8 +244,8 @@ impl PaymentChallenge {
 
     /// Get the effective expiration time for this payment challenge.
     ///
-    /// Returns `challenge.expires` if set. Callers should also check
-    /// the intent-specific request (e.g., `ChargeRequest.expires`).
+    /// Returns `challenge.expires` if set. Expiry is a property of
+    /// the challenge lifecycle, not the payment request content.
     pub fn effective_expires(&self) -> Option<&str> {
         self.expires.as_deref()
     }

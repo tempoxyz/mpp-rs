@@ -68,7 +68,7 @@
 //!
 //! # let req = ChargeRequest {
 //! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
-//! #     expires: None, description: None, external_id: None,
+//! #     description: None, external_id: None,
 //! #     decimals: None,
 //! #     method_details: Some(serde_json::json!({
 //! #         "feePayer": true
@@ -434,17 +434,6 @@ pub fn generate_challenge_id_from_request(
         digest,
         opaque,
     ))
-}
-
-/// Parse an ISO 8601 timestamp string (e.g. "2024-01-15T12:00:00Z") to Unix timestamp.
-#[cfg(feature = "server")]
-pub(crate) fn parse_iso8601_timestamp(s: &str) -> Option<u64> {
-    use time::format_description::well_known::Iso8601;
-    use time::OffsetDateTime;
-
-    OffsetDateTime::parse(s.trim(), &Iso8601::DEFAULT)
-        .ok()
-        .map(|dt| dt.unix_timestamp() as u64)
 }
 
 #[cfg(test)]
