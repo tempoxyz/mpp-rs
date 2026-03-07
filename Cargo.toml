@@ -67,7 +67,7 @@ tempo-alloy = { version = "1", optional = true }
 tempo-primitives = { version = "1", optional = true }
 
 # Pin: revm-database-interface 9.0.1 bumps revm-state to v10, breaking revm v34 (still on v9)
-revm-database-interface = { version = ">=9.0.0, <9.0.1", optional = true }
+revm-database-interface = { version = ">=9.0.0, <10.0.1", optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.12", features = ["json"], optional = true }
