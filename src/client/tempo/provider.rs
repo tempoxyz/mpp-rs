@@ -101,6 +101,17 @@ impl PaymentProvider for TempoProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let charge = super::charge::TempoCharge::from_challenge(challenge)?;
+
+        // Auto-generate an MPP attribution memo when the server doesn't provide one.
+        // This makes MPP transactions identifiable on-chain via transferWithMemo.
+        let charge = if charge.memo().is_none() {
+            let memo =
+                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref());
+            charge.with_auto_memo(memo)
+        } else {
+            charge
+        };
+
         let options = SignOptions {
             rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
@@ -197,6 +208,16 @@ mod tests {
         assert!(!provider.supports("stripe", "charge"));
         assert!(!provider.supports("", ""));
         assert!(!provider.supports("TEMPO", "charge"));
+    }
+
+    #[test]
+    fn test_auto_generated_memo_includes_client_id() {
+        let memo_with = crate::tempo::attribution::encode("api.example.com", Some("tempo-cli"));
+        let memo_without = crate::tempo::attribution::encode("api.example.com", None);
+        assert!(crate::tempo::attribution::is_mpp_memo(&memo_with));
+        assert!(crate::tempo::attribution::is_mpp_memo(&memo_without));
+        // Client fingerprint bytes differ when client_id is present
+        assert_ne!(memo_with[15..25], memo_without[15..25]);
     }
 
     #[test]

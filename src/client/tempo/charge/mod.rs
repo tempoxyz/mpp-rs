@@ -123,6 +123,18 @@ impl TempoCharge {
         self.memo
     }
 
+    /// Set the memo bytes, overriding any memo from the challenge.
+    ///
+    /// This is a no-op if the charge already has a server-provided memo.
+    /// Use this to inject auto-generated attribution memos when the server
+    /// does not provide one.
+    pub fn with_auto_memo(mut self, memo: [u8; 32]) -> Self {
+        if self.memo.is_none() {
+            self.memo = Some(memo);
+        }
+        self
+    }
+
     /// Whether fee sponsorship is requested.
     pub fn fee_payer(&self) -> bool {
         self.fee_payer
@@ -440,6 +452,40 @@ mod tests {
         let charge = TempoCharge::from_challenge(&challenge).unwrap();
 
         assert!(charge.memo.is_some());
+    }
+
+    #[test]
+    fn test_with_auto_memo_sets_memo_when_none() {
+        let challenge = test_challenge();
+        let charge = TempoCharge::from_challenge(&challenge).unwrap();
+        assert!(charge.memo().is_none());
+
+        let memo = [0xAB; 32];
+        let charge = charge.with_auto_memo(memo);
+        assert_eq!(charge.memo(), Some(memo));
+    }
+
+    #[test]
+    fn test_with_auto_memo_preserves_server_memo() {
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {
+                "chainId": 42431,
+                "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            }
+        });
+        let request = Base64UrlJson::from_value(&request_json).unwrap();
+        let challenge =
+            PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+        let charge = TempoCharge::from_challenge(&challenge).unwrap();
+        let server_memo = charge.memo().unwrap();
+
+        let auto_memo = [0xAB; 32];
+        let charge = charge.with_auto_memo(auto_memo);
+        assert_eq!(charge.memo(), Some(server_memo));
+        assert_ne!(charge.memo(), Some(auto_memo));
     }
 
     #[test]
