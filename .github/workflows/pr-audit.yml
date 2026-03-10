@@ -3,6 +3,8 @@ name: PR Audit
 on:
   pull_request:
     types: [labeled]
+  issue_comment:
+    types: [created]
 
 jobs:
   pr-audit:
