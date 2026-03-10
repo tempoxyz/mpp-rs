@@ -9,14 +9,6 @@ pub fn format_eth_address(addr: &str) -> String {
     }
 }
 
-/// Strip 0x prefix from hex string if present
-pub fn strip_0x_prefix(s: &str) -> &str {
-    s.trim()
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s)
-}
-
 /// Truncate an address for display.
 ///
 /// If the address is longer than `max_len`, it will be truncated to show
@@ -53,15 +45,6 @@ mod tests {
         assert_eq!(format_eth_address("abc123"), "0xabc123");
         assert_eq!(format_eth_address("0xabc123"), "0xabc123");
         assert_eq!(format_eth_address("0Xabc123"), "0Xabc123");
-    }
-
-    #[test]
-    fn test_strip_0x_prefix() {
-        assert_eq!(strip_0x_prefix("0xabc123"), "abc123");
-        assert_eq!(strip_0x_prefix("0Xabc123"), "abc123");
-        assert_eq!(strip_0x_prefix("abc123"), "abc123");
-        // ast-grep-ignore: no-leading-whitespace-strings
-        assert_eq!(strip_0x_prefix(" 0xabc123 "), "abc123"); // Intentional: testing whitespace trimming
     }
 
     #[test]
