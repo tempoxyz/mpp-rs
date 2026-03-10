@@ -31,7 +31,6 @@ pub mod mcp;
 pub mod protocol;
 pub mod proxy;
 pub mod store;
-pub mod utils;
 
 #[cfg(feature = "evm")]
 pub mod evm;
