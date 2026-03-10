@@ -86,9 +86,9 @@ pub use store::ChannelStoreAdapter;
 
 // Intent types
 pub use protocol::intents::{
-    deserialize_request, deserialize_request_typed, from_request, parse_units,
-    request_from_challenge, request_from_challenge_typed, serialize_request, ChargeRequest,
-    Request as PaymentRequest, SessionRequest,
+    deserialize_request, deserialize_request_typed, parse_units, request_from_challenge,
+    request_from_challenge_typed, serialize_request, ChargeRequest, Request as PaymentRequest,
+    SessionRequest,
 };
 
 // ==================== Alloy Re-exports ====================
