@@ -67,10 +67,7 @@ impl TempoChargeExt for ChargeRequest {
     }
 
     fn chain_id(&self) -> Option<u64> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("chainId"))
-            .and_then(|v| v.as_u64())
+        self.tempo_method_details().ok().and_then(|d| d.chain_id)
     }
 
     fn tempo_method_details(&self) -> Result<TempoMethodDetails> {
@@ -83,23 +80,19 @@ impl TempoChargeExt for ChargeRequest {
     }
 
     fn fee_payer(&self) -> bool {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("feePayer"))
-            .and_then(|v| v.as_bool())
+        self.tempo_method_details()
+            .map(|d| d.fee_payer())
             .unwrap_or(false)
     }
 
     fn memo(&self) -> Option<String> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("memo"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        self.tempo_method_details().ok().and_then(|d| d.memo)
     }
 
     fn is_tempo_moderato(&self) -> bool {
-        self.chain_id() == Some(super::MODERATO_CHAIN_ID)
+        self.tempo_method_details()
+            .map(|d| d.is_tempo_moderato())
+            .unwrap_or(false)
     }
 
     fn network(&self) -> Option<super::network::TempoNetwork> {

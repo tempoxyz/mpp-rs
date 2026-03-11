@@ -166,46 +166,27 @@ pub trait TempoSessionExt {
 
 impl TempoSessionExt for SessionRequest {
     fn escrow_contract(&self) -> Result<String> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("escrowContract"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                MppError::invalid_challenge_reason(
-                    "Missing escrowContract in methodDetails".to_string(),
-                )
-            })
+        self.tempo_session_details()
+            .map(|d| d.escrow_contract)
     }
 
     fn channel_id(&self) -> Option<String> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("channelId"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        self.tempo_session_details().ok().and_then(|d| d.channel_id)
     }
 
     fn min_voucher_delta(&self) -> Option<String> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("minVoucherDelta"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        self.tempo_session_details()
+            .ok()
+            .and_then(|d| d.min_voucher_delta)
     }
 
     fn chain_id(&self) -> Option<u64> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("chainId"))
-            .and_then(|v| v.as_u64())
+        self.tempo_session_details().ok().and_then(|d| d.chain_id)
     }
 
     fn fee_payer(&self) -> bool {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("feePayer"))
-            .and_then(|v| v.as_bool())
+        self.tempo_session_details()
+            .map(|d| d.fee_payer.unwrap_or(false))
             .unwrap_or(false)
     }
 
