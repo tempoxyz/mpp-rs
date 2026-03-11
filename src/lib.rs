@@ -26,7 +26,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod body_digest;
 pub mod error;
-pub mod expires;
 pub mod mcp;
 pub mod protocol;
 pub mod proxy;
