@@ -54,6 +54,12 @@ pub use crate::protocol::methods::tempo::session_method::{
     SessionMethodConfig,
 };
 
+#[cfg(feature = "stripe")]
+pub use crate::protocol::methods::stripe::StripeChargeMethod;
+
+#[cfg(feature = "stripe")]
+pub use crate::protocol::methods::stripe::{StripeConfig, StripeMethodDetails};
+
 // ==================== Simple API ====================
 
 /// Configuration for the Tempo payment method.

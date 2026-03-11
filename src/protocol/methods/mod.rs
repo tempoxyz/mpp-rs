@@ -19,3 +19,6 @@
 
 #[cfg(feature = "tempo")]
 pub mod tempo;
+
+#[cfg(feature = "stripe")]
+pub mod stripe;

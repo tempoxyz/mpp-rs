@@ -44,6 +44,9 @@ pub mod server;
 #[cfg(feature = "tempo")]
 pub mod tempo;
 
+#[cfg(feature = "stripe")]
+pub mod stripe;
+
 // ==================== Flat Re-exports ====================
 
 // Error types
