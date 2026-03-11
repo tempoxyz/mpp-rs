@@ -12,13 +12,6 @@ use crate::protocol::core::{base64url_decode, base64url_encode, PaymentChallenge
 /// Generic payment request value.
 pub type Request = serde_json::Value;
 
-/// Identity constructor for request values.
-///
-/// Mirrors TypeScript's `PaymentRequest.from()` convenience helper.
-pub fn from<T>(request: T) -> T {
-    request
-}
-
 /// Serialize a request into base64url JSON (no padding).
 pub fn serialize<T: Serialize>(request: &T) -> Result<String> {
     let json = serde_json_canonicalizer::to_string(request)?;
@@ -52,16 +45,6 @@ mod tests {
     use super::*;
     use crate::protocol::core::Base64UrlJson;
     use crate::protocol::intents::ChargeRequest;
-
-    #[test]
-    fn test_from_identity() {
-        let request = from(serde_json::json!({
-            "amount": "1000000",
-            "currency": "USD",
-            "recipient": "0x1234"
-        }));
-        assert_eq!(request["amount"], "1000000");
-    }
 
     #[test]
     fn test_serialize_is_base64url() {

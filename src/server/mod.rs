@@ -116,7 +116,7 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the secret key (default: reads `MPP_SECRET_KEY` env var or generates UUID).
+    /// Override the secret key (default: reads `MPP_SECRET_KEY` env var).
     pub fn secret_key(mut self, key: &str) -> Self {
         self.secret_key = Some(key.to_string());
         self
@@ -189,7 +189,7 @@ pub struct ChargeOptions<'a> {
 /// - **realm**: auto-detected from `MPP_REALM`, `FLY_APP_NAME`, `HEROKU_APP_NAME`,
 ///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
 ///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
-/// - **secret_key**: reads `MPP_SECRET_KEY` env var, or generates a random UUID
+/// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
 /// - **currency**: pathUSD (`0x20c0000000000000000000000000000000000000`)
 /// - **decimals**: `6` (for pathUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
