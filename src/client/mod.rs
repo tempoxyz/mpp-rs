@@ -40,10 +40,6 @@ pub use middleware::PaymentMiddleware;
 
 // Re-export Tempo types at client level for convenience
 #[cfg(feature = "tempo")]
-pub use tempo::channel_ops::ChannelEntry;
-
+pub use tempo::{TempoClientError, TempoProvider};
 #[cfg(feature = "tempo")]
-pub use tempo::{
-    SignOptions, SignedTempoCharge, TempoCharge, TempoClientError, TempoProvider,
-    TempoSessionProvider, TempoSigningMode,
-};
+pub use tempo_alloy::TempoNetwork;

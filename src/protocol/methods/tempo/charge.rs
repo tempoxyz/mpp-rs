@@ -134,7 +134,6 @@ mod tests {
             amount: "1000000".to_string(),
             currency: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
-            expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
             external_id: None,
             method_details: Some(serde_json::json!({
