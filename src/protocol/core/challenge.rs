@@ -257,10 +257,10 @@ impl PaymentChallenge {
             realm: self.realm.clone(),
             method: self.method.clone(),
             intent: self.intent.clone(),
-            request: self.request.raw().to_string(),
+            request: self.request.clone(),
             expires: self.expires.clone(),
             digest: self.digest.clone(),
-            opaque: self.opaque.as_ref().map(|o| o.raw().to_string()),
+            opaque: self.opaque.clone(),
         }
     }
 
@@ -511,7 +511,7 @@ pub struct ChallengeEcho {
     pub intent: IntentName,
 
     /// Base64url-encoded request (as received from server)
-    pub request: String,
+    pub request: Base64UrlJson,
 
     /// Challenge expiration time (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -523,7 +523,7 @@ pub struct ChallengeEcho {
 
     /// Server-defined correlation data (base64url-encoded JSON).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub opaque: Option<String>,
+    pub opaque: Option<Base64UrlJson>,
 }
 
 /// Payment payload in credential.
@@ -870,7 +870,7 @@ mod tests {
         assert_eq!(echo.realm, "api");
         assert_eq!(echo.method.as_str(), "tempo");
         assert_eq!(echo.intent.as_str(), "charge");
-        assert_eq!(echo.request, challenge.request.raw());
+        assert_eq!(echo.request.raw(), challenge.request.raw());
     }
 
     #[test]
@@ -1592,7 +1592,7 @@ mod tests {
             Some(opaque),
         );
         let echo = challenge.to_echo();
-        assert_eq!(echo.opaque.as_deref(), Some(opaque_raw.as_str()));
+        assert_eq!(echo.opaque.as_ref().map(|o| o.raw()), Some(opaque_raw.as_str()));
     }
 
     /// Cross-SDK opaque golden vectors (computed from mppx reference SDK).
