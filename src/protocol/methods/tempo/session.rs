@@ -3,22 +3,25 @@
 //! Provides Tempo-specific accessors and credential payload types for SessionRequest.
 
 use crate::error::{MppError, Result};
+use crate::protocol::core::PayloadType;
 use crate::protocol::intents::SessionRequest;
 use serde::{Deserialize, Serialize};
 
-/// Custom deserializer that only accepts the literal string "transaction".
-fn deserialize_transaction_literal<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+/// Custom deserializer that only accepts `PayloadType::Transaction`.
+fn deserialize_transaction_type<'de, D>(
+    deserializer: D,
+) -> std::result::Result<PayloadType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    if s != "transaction" {
+    let t = PayloadType::deserialize(deserializer)?;
+    if t != PayloadType::Transaction {
         return Err(serde::de::Error::custom(format!(
             "expected \"transaction\", got \"{}\"",
-            s
+            t
         )));
     }
-    Ok(s)
+    Ok(t)
 }
 
 /// Tempo session-specific method details.
@@ -79,8 +82,8 @@ pub struct TempoSessionMethodDetails {
 pub enum SessionCredentialPayload {
     #[serde(rename = "open")]
     Open {
-        #[serde(rename = "type", deserialize_with = "deserialize_transaction_literal")]
-        payload_type: String,
+        #[serde(rename = "type", deserialize_with = "deserialize_transaction_type")]
+        payload_type: PayloadType,
         #[serde(rename = "channelId")]
         channel_id: String,
         transaction: String,
@@ -92,8 +95,8 @@ pub enum SessionCredentialPayload {
     },
     #[serde(rename = "topUp")]
     TopUp {
-        #[serde(rename = "type", deserialize_with = "deserialize_transaction_literal")]
-        payload_type: String,
+        #[serde(rename = "type", deserialize_with = "deserialize_transaction_type")]
+        payload_type: PayloadType,
         #[serde(rename = "channelId")]
         channel_id: String,
         transaction: String,
@@ -301,7 +304,7 @@ mod tests {
     #[test]
     fn test_open_payload_serialization() {
         let payload = SessionCredentialPayload::Open {
-            payload_type: "transaction".to_string(),
+            payload_type: PayloadType::Transaction,
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx456".to_string(),
             authorized_signer: Some("0xsigner789".to_string()),
@@ -326,7 +329,7 @@ mod tests {
                 authorized_signer,
                 ..
             } => {
-                assert_eq!(payload_type, "transaction");
+                assert_eq!(payload_type, PayloadType::Transaction);
                 assert_eq!(channel_id, "0xchannel123");
                 assert_eq!(authorized_signer.as_deref(), Some("0xsigner789"));
             }
@@ -337,7 +340,7 @@ mod tests {
     #[test]
     fn test_open_payload_without_authorized_signer() {
         let payload = SessionCredentialPayload::Open {
-            payload_type: "transaction".to_string(),
+            payload_type: PayloadType::Transaction,
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx456".to_string(),
             authorized_signer: None,
@@ -362,7 +365,7 @@ mod tests {
     #[test]
     fn test_topup_payload_serialization() {
         let payload = SessionCredentialPayload::TopUp {
-            payload_type: "transaction".to_string(),
+            payload_type: PayloadType::Transaction,
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx789".to_string(),
             additional_deposit: "5000".to_string(),
@@ -383,7 +386,7 @@ mod tests {
                 additional_deposit,
                 ..
             } => {
-                assert_eq!(payload_type, "transaction");
+                assert_eq!(payload_type, PayloadType::Transaction);
                 assert_eq!(channel_id, "0xchannel123");
                 assert_eq!(additional_deposit, "5000");
             }

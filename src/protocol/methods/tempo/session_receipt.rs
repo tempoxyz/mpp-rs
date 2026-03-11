@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::core::{MethodName, Receipt, ReceiptStatus};
+use crate::protocol::core::{IntentName, MethodName, Receipt, ReceiptStatus};
 
 /// Session receipt for Tempo session/pay-as-you-go payments.
 ///
@@ -22,21 +22,21 @@ use crate::protocol::core::{MethodName, Receipt, ReceiptStatus};
 ///     "5000",
 ///     "1000",
 /// );
-/// assert_eq!(receipt.method, "tempo");
-/// assert_eq!(receipt.intent, "session");
-/// assert_eq!(receipt.status, "success");
+/// assert_eq!(receipt.method, MethodName::new("tempo"));
+/// assert_eq!(receipt.intent, IntentName::new("session"));
+/// assert_eq!(receipt.status, ReceiptStatus::Success);
 /// assert_eq!(receipt.reference, "0xabc");
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReceipt {
     /// Payment method (always "tempo").
-    pub method: String,
+    pub method: MethodName,
 
     /// Payment intent (always "session").
-    pub intent: String,
+    pub intent: IntentName,
 
     /// Receipt status (always "success").
-    pub status: String,
+    pub status: ReceiptStatus,
 
     /// Timestamp (ISO 8601).
     pub timestamp: String,
@@ -82,9 +82,9 @@ impl SessionReceipt {
     ) -> Self {
         let channel_id = channel_id.into();
         Self {
-            method: "tempo".to_string(),
-            intent: "session".to_string(),
-            status: "success".to_string(),
+            method: MethodName::new("tempo"),
+            intent: IntentName::new("session"),
+            status: ReceiptStatus::Success,
             timestamp: timestamp.into(),
             reference: channel_id.clone(),
             challenge_id: challenge_id.into(),
@@ -101,7 +101,7 @@ impl SessionReceipt {
     pub fn to_base_receipt(&self) -> Receipt {
         Receipt {
             status: ReceiptStatus::Success,
-            method: MethodName::new(&self.method),
+            method: self.method.clone(),
             timestamp: self.timestamp.clone(),
             reference: self.reference.clone(),
         }
@@ -122,9 +122,9 @@ mod tests {
             "1000",
         );
 
-        assert_eq!(receipt.method, "tempo");
-        assert_eq!(receipt.intent, "session");
-        assert_eq!(receipt.status, "success");
+        assert_eq!(receipt.method, MethodName::new("tempo"));
+        assert_eq!(receipt.intent, IntentName::new("session"));
+        assert_eq!(receipt.status, ReceiptStatus::Success);
         assert_eq!(receipt.timestamp, "2026-01-01T00:00:00Z");
         assert_eq!(receipt.reference, "0xabc");
         assert_eq!(receipt.challenge_id, "challenge-123");

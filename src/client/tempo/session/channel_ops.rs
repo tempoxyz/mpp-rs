@@ -13,7 +13,7 @@ use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::TempoNetwork;
 
 use crate::error::MppError;
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PayloadType, PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSessionExt};
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
@@ -296,7 +296,7 @@ where
     };
 
     let payload = SessionCredentialPayload::Open {
-        payload_type: "transaction".to_string(),
+        payload_type: PayloadType::Transaction,
         channel_id: format!("{}", channel_id),
         transaction: signed_tx_hex,
         authorized_signer: Some(format!("{}", authorized_signer)),

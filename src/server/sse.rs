@@ -498,9 +498,9 @@ mod tests {
             SessionReceipt::new("2025-01-01T00:00:00Z", "ch-1", "0xabc", "1000000", "500000");
         receipt.units = Some(5);
         receipt.tx_hash = Some("0xtx".into());
-        assert_eq!(receipt.method, "tempo");
-        assert_eq!(receipt.intent, "session");
-        assert_eq!(receipt.status, "success");
+        assert_eq!(receipt.method, crate::protocol::core::MethodName::new("tempo"));
+        assert_eq!(receipt.intent, crate::protocol::core::IntentName::new("session"));
+        assert_eq!(receipt.status, crate::protocol::core::ReceiptStatus::Success);
         assert_eq!(receipt.reference, "0xabc");
         assert_eq!(receipt.challenge_id, "ch-1");
         assert_eq!(receipt.channel_id, "0xabc");
