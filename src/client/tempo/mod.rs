@@ -5,11 +5,13 @@
 
 pub mod abi;
 pub mod charge;
+pub mod cli;
 mod error;
 mod provider;
 pub mod session;
 pub mod signing;
 
+pub use cli::TempoCliProvider;
 pub use error::TempoClientError;
 pub use provider::TempoProvider;
 
