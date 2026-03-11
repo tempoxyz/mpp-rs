@@ -48,18 +48,3 @@ pub use crate::protocol::methods::tempo::session_method::{
     ChannelState, ChannelStore, InMemoryChannelStore as SessionChannelStore,
     SessionMethod as TempoSessionMethod, SessionMethodConfig,
 };
-
-#[cfg(feature = "client")]
-pub use crate::client::tempo::TempoProvider;
-
-#[cfg(feature = "client")]
-pub use crate::client::tempo::{ChannelEntry, TempoSessionProvider};
-
-#[cfg(feature = "client")]
-pub use crate::client::tempo::signing::TempoSigningMode;
-
-#[cfg(feature = "client")]
-pub use crate::client::tempo::tx_builder::{
-    build_charge_credential, build_estimate_gas_request, build_tempo_tx, estimate_gas,
-    TempoTxOptions,
-};

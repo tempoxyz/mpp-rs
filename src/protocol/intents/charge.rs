@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MppError, Result};
+#[cfg(feature = "evm")]
+use crate::evm::U256;
 
 /// Charge request (for charge intent).
 ///
@@ -23,7 +25,6 @@ use crate::error::{MppError, Result};
 ///     currency: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
 ///     decimals: None,
 ///     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
-///     expires: None,
 ///     description: Some("API access".to_string()),
 ///     external_id: None,
 ///     method_details: None,
@@ -50,10 +51,6 @@ pub struct ChargeRequest {
     /// Recipient address (optional, server may be recipient)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
-
-    /// Request expiration (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires: Option<String>,
 
     /// Human-readable description
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +90,15 @@ impl ChargeRequest {
             .map_err(|_| MppError::InvalidAmount(format!("Invalid amount: {}", self.amount)))
     }
 
+    /// Parse the amount as U256 when EVM support is enabled.
+    ///
+    /// This matches bigint semantics in the TypeScript SDK and avoids the
+    /// `u128` ceiling of [`parse_amount`].
+    #[cfg(feature = "evm")]
+    pub fn parse_amount_u256(&self) -> Result<U256> {
+        crate::evm::parse_amount(&self.amount)
+    }
+
     /// Validate that the charge amount does not exceed a maximum.
     ///
     /// # Arguments
@@ -127,7 +133,6 @@ mod tests {
             amount: "10000".to_string(),
             currency: "0x123".to_string(),
             recipient: Some("0x456".to_string()),
-            expires: Some("2024-01-01T00:00:00Z".to_string()),
             description: None,
             external_id: None,
             method_details: Some(serde_json::json!({
@@ -159,6 +164,21 @@ mod tests {
             ..Default::default()
         };
         assert!(invalid.parse_amount().is_err());
+    }
+
+    #[cfg(feature = "evm")]
+    #[test]
+    fn test_parse_amount_u256() {
+        let req = ChargeRequest {
+            amount: "340282366920938463463374607431768211456".to_string(), // u128::MAX + 1
+            ..Default::default()
+        };
+
+        let parsed = req.parse_amount_u256().unwrap();
+        assert_eq!(
+            parsed.to_string(),
+            "340282366920938463463374607431768211456"
+        );
     }
 
     #[test]

@@ -41,6 +41,21 @@ pub enum TempoClientError {
     TransactionReverted(String),
 }
 
+/// Extract the value for `key` from a revert string like `"{ key: value, ... }"`.
+///
+/// Looks for `"{key}: "` and returns the text up to the next `,`, `}`, or `)`.
+fn extract_field(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}: ");
+    let start = raw.find(&needle)? + needle.len();
+    let rest = &raw[start..];
+    let end = rest.find([',', '}', ')']).unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 impl TempoClientError {
     /// Classify an RPC or on-chain error message into a typed error.
     ///
@@ -57,6 +72,17 @@ impl TempoClientError {
         }
 
         if lower.contains("spendinglimitexceeded") || lower.contains("spending limit") {
+            if let (Some(token), Some(limit), Some(required)) = (
+                extract_field(&msg, "token"),
+                extract_field(&msg, "limit"),
+                extract_field(&msg, "required"),
+            ) {
+                return Some(Self::SpendingLimitExceeded {
+                    token,
+                    limit,
+                    required,
+                });
+            }
             return Some(Self::SpendingLimitExceeded {
                 token: String::new(),
                 limit: String::new(),
@@ -68,6 +94,17 @@ impl TempoClientError {
             || lower.contains("transfer amount exceeds balance")
             || (lower.contains("insufficient") && lower.contains("balance"))
         {
+            if let (Some(token), Some(available), Some(required)) = (
+                extract_field(&msg, "token"),
+                extract_field(&msg, "available"),
+                extract_field(&msg, "required"),
+            ) {
+                return Some(Self::InsufficientBalance {
+                    token,
+                    available,
+                    required,
+                });
+            }
             return Some(Self::InsufficientBalance {
                 token: String::new(),
                 available: String::new(),
@@ -180,5 +217,94 @@ mod tests {
     fn test_classify_unknown_returns_none() {
         let err = TempoClientError::classify_rpc_error("failed to get nonce");
         assert!(err.is_none());
+    }
+
+    // --- extract_field ---
+
+    #[test]
+    fn test_extract_field_basic() {
+        let raw = "InsufficientBalance { available: 0, required: 64467, token: 0xabc }";
+        assert_eq!(extract_field(raw, "available"), Some("0".to_string()));
+        assert_eq!(extract_field(raw, "required"), Some("64467".to_string()));
+        assert_eq!(extract_field(raw, "token"), Some("0xabc".to_string()));
+    }
+
+    #[test]
+    fn test_extract_field_missing() {
+        assert_eq!(extract_field("no fields here", "token"), None);
+    }
+
+    // --- classify with field extraction ---
+
+    #[test]
+    fn test_classify_insufficient_balance_with_fields() {
+        let msg = "server returned error: execution reverted: revert: InsufficientBalance(InsufficientBalance { available: 0, required: 64467, token: 0x20c000000000000000000000b9537d11c60e8b50 })";
+        let err = TempoClientError::classify_rpc_error(msg).unwrap();
+        match err {
+            TempoClientError::InsufficientBalance {
+                token,
+                available,
+                required,
+            } => {
+                assert_eq!(available, "0");
+                assert_eq!(required, "64467");
+                assert_eq!(token, "0x20c000000000000000000000b9537d11c60e8b50");
+            }
+            other => panic!("expected InsufficientBalance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_spending_limit_with_fields() {
+        let msg = "execution reverted: SpendingLimitExceeded(SpendingLimitExceeded { token: 0xabc, limit: 1000, required: 5000 })";
+        let err = TempoClientError::classify_rpc_error(msg).unwrap();
+        match err {
+            TempoClientError::SpendingLimitExceeded {
+                token,
+                limit,
+                required,
+            } => {
+                assert_eq!(token, "0xabc");
+                assert_eq!(limit, "1000");
+                assert_eq!(required, "5000");
+            }
+            other => panic!("expected SpendingLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_insufficient_balance_fallback_no_fields() {
+        let msg = "InsufficientBalance for transfer";
+        let err = TempoClientError::classify_rpc_error(msg).unwrap();
+        match err {
+            TempoClientError::InsufficientBalance {
+                token,
+                available,
+                required,
+            } => {
+                assert!(token.is_empty());
+                assert!(available.is_empty());
+                assert_eq!(required, msg);
+            }
+            other => panic!("expected InsufficientBalance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_spending_limit_fallback_no_fields() {
+        let msg = "SpendingLimitExceeded: limit is 0.50, need 1.00";
+        let err = TempoClientError::classify_rpc_error(msg).unwrap();
+        match err {
+            TempoClientError::SpendingLimitExceeded {
+                token,
+                limit,
+                required,
+            } => {
+                assert!(token.is_empty());
+                assert!(limit.is_empty());
+                assert_eq!(required, msg);
+            }
+            other => panic!("expected SpendingLimitExceeded, got {other:?}"),
+        }
     }
 }

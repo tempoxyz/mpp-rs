@@ -1,13 +1,13 @@
 # mpp
 
-Rust SDK for the [**Machine Payments Protocol**](https://mpp.sh)
+Rust SDK for the [**Machine Payments Protocol**](https://mpp.dev)
 
 [![Docs](https://img.shields.io/badge/docs-github%20pages-blue)](https://tempoxyz.github.io/mpp-rs)
 [![License](https://img.shields.io/crates/l/mpp.svg)](LICENSE)
 
 ## Documentation
 
-Full documentation, API reference, and guides are available at **[mpp.sh/sdk/rust](https://mpp.sh/sdk/rust)**.
+Full documentation, API reference, and guides are available at **[mpp.dev/sdk/rust](https://mpp.dev/sdk/rust)**.
 
 ## Install
 
@@ -42,7 +42,7 @@ let client = ClientBuilder::new(reqwest::Client::new())
     .build();
 
 // Requests now handle 402 automatically
-let resp = client.get("https://mpp.sh/api/ping/paid").send().await?;
+let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 ```
 
 ## Feature Flags

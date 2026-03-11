@@ -64,7 +64,11 @@ async fn main() {
     let mut builder = tempo(TempoConfig {
         recipient: &recipient,
     })
-    .rpc_url(&rpc_url);
+    .rpc_url(&rpc_url)
+    // Keep the demo runnable out-of-the-box while honoring required secret key semantics.
+    .secret_key(
+        &std::env::var("MPP_SECRET_KEY").unwrap_or_else(|_| "basic-example-secret".to_string()),
+    );
 
     if let Ok(id) = std::env::var("CHAIN_ID") {
         builder = builder.chain_id(id.parse().expect("CHAIN_ID must be a number"));

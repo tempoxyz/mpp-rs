@@ -217,7 +217,14 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         ));
     }
     let realm = require_param!(params, "realm").clone();
-    let method = MethodName::new(require_param!(params, "method"));
+    let method_raw = require_param!(params, "method").clone();
+    if method_raw.is_empty() || !method_raw.chars().all(|c| c.is_ascii_lowercase()) {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid method: \"{}\". Must match method-name ABNF.",
+            method_raw
+        )));
+    }
+    let method = MethodName::new(method_raw);
     let intent = IntentName::new(require_param!(params, "intent"));
     let request_b64 = require_param!(params, "request").clone();
 
@@ -244,7 +251,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         expires: params.get("expires").cloned(),
         description: params.get("description").cloned(),
         digest,
-        opaque: params.get("opaque").cloned(),
+        opaque: params.get("opaque").map(Base64UrlJson::from_raw),
     })
 }
 
@@ -339,7 +346,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     }
 
     if let Some(ref opaque) = challenge.opaque {
-        parts.push(format!("opaque=\"{}\"", escape_quoted_value(opaque)?));
+        parts.push(format!("opaque=\"{}\"", escape_quoted_value(opaque.raw())?));
     }
 
     Ok(format!("Payment {}", parts.join(", ")))
@@ -812,6 +819,30 @@ mod tests {
             r#"Payment id="", realm="api", method="tempo", intent="charge", request="e30""#;
         let err = parse_www_authenticate(header).unwrap_err();
         assert!(err.to_string().contains("Empty 'id'"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_invalid_method_name_dash() {
+        let header =
+            r#"Payment id="abc", realm="api", method="tempo-v2", intent="charge", request="e30""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Invalid method"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_invalid_method_name_digit_prefix() {
+        let header =
+            r#"Payment id="abc", realm="api", method="1tempo", intent="charge", request="e30""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Invalid method"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_mixed_case_method_name() {
+        let header =
+            r#"Payment id="abc", realm="api", method="Tempo", intent="charge", request="e30""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Invalid method"));
     }
 
     #[test]
