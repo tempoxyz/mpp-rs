@@ -3,6 +3,7 @@
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
+use super::autoswap::AutoswapConfig;
 use super::charge::SignOptions;
 use super::signing::TempoSigningMode;
 use crate::client::PaymentProvider;
@@ -40,6 +41,7 @@ pub struct TempoProvider {
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
+    autoswap: Option<AutoswapConfig>,
 }
 
 impl TempoProvider {
@@ -61,6 +63,7 @@ impl TempoProvider {
             rpc_url: url,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
+            autoswap: None,
         })
     }
 
@@ -76,6 +79,30 @@ impl TempoProvider {
     pub fn with_signing_mode(mut self, mode: TempoSigningMode) -> Self {
         self.signing_mode = mode;
         self
+    }
+
+    /// Enable autoswap: if the client doesn't hold enough of the challenge
+    /// currency, automatically swap from `config.token_in` via the Tempo
+    /// Stablecoin DEX before paying.
+    ///
+    /// The swap and payment execute atomically in a single AA transaction.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use mpp::client::tempo::autoswap::AutoswapConfig;
+    ///
+    /// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?
+    ///     .with_autoswap(AutoswapConfig::new(usdc_address, 100)); // 1% slippage
+    /// ```
+    pub fn with_autoswap(mut self, config: AutoswapConfig) -> Self {
+        self.autoswap = Some(config);
+        self
+    }
+
+    /// Get the autoswap configuration, if set.
+    pub fn autoswap(&self) -> Option<&AutoswapConfig> {
+        self.autoswap.as_ref()
     }
 
     /// Get the signing mode.
@@ -100,7 +127,28 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        let charge = super::charge::TempoCharge::from_challenge(challenge)?;
+        let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
+
+        // If autoswap is enabled, check balance and prepend a swap call if needed.
+        if let Some(autoswap_config) = &self.autoswap {
+            let from = self.signing_mode.from_address(self.signer.address());
+            let rpc_url: reqwest::Url = self.rpc_url.clone();
+            let provider =
+                alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
+
+            if let Some(swap_call) = super::autoswap::resolve_autoswap(
+                &provider,
+                from,
+                charge.currency(),
+                charge.amount(),
+                autoswap_config,
+            )
+            .await?
+            {
+                charge = charge.with_prepended_call(swap_call);
+            }
+        }
+
         let options = SignOptions {
             rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
