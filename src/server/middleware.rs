@@ -278,9 +278,7 @@ impl PaymentLayer<ChargeVerifier> {
         // compares against endpoint configuration, not echoed credential data.
         let expected_challenge = mpp.charge(amount)?;
         let expected_request: crate::protocol::intents::ChargeRequest =
-            expected_challenge.request
-            .decode()
-            .map_err(|e| {
+            expected_challenge.request.decode().map_err(|e| {
                 crate::error::MppError::InvalidConfig(format!(
                     "Failed to decode route charge request: {}",
                     e

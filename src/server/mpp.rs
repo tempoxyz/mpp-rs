@@ -368,10 +368,11 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest =
-            credential.challenge.request
-                .decode()
-                .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+        let request: ChargeRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
         self.verify(credential, &request).await
     }
 
@@ -385,10 +386,11 @@ where
         credential: &PaymentCredential,
         expected: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest =
-            credential.challenge.request
-                .decode()
-                .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+        let request: ChargeRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
 
         if request.amount != expected.amount {
             return Err(VerificationError::with_code(
@@ -569,14 +571,12 @@ where
         self.verify_hmac_and_expiry(credential)?;
 
         let request: crate::protocol::intents::SessionRequest =
-            credential.challenge.request
-                .decode()
-                .map_err(|e| {
-                    crate::protocol::traits::VerificationError::new(format!(
-                        "Failed to decode session request: {}",
-                        e
-                    ))
-                })?;
+            credential.challenge.request.decode().map_err(|e| {
+                crate::protocol::traits::VerificationError::new(format!(
+                    "Failed to decode session request: {}",
+                    e
+                ))
+            })?;
 
         let receipt = session.verify_session(credential, &request).await?;
 

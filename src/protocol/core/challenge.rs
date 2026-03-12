@@ -1592,7 +1592,10 @@ mod tests {
             Some(opaque),
         );
         let echo = challenge.to_echo();
-        assert_eq!(echo.opaque.as_ref().map(|o| o.raw()), Some(opaque_raw.as_str()));
+        assert_eq!(
+            echo.opaque.as_ref().map(|o| o.raw()),
+            Some(opaque_raw.as_str())
+        );
     }
 
     /// Cross-SDK opaque golden vectors (computed from mppx reference SDK).
