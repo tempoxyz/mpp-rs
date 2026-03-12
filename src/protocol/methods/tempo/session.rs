@@ -166,8 +166,7 @@ pub trait TempoSessionExt {
 
 impl TempoSessionExt for SessionRequest {
     fn escrow_contract(&self) -> Result<String> {
-        self.tempo_session_details()
-            .map(|d| d.escrow_contract)
+        self.tempo_session_details().map(|d| d.escrow_contract)
     }
 
     fn channel_id(&self) -> Option<String> {
