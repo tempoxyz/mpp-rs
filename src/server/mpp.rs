@@ -214,10 +214,10 @@ where
             &self.realm,
             credential.challenge.method.as_str(),
             credential.challenge.intent.as_str(),
-            &credential.challenge.request,
+            credential.challenge.request.raw(),
             credential.challenge.expires.as_deref(),
             credential.challenge.digest.as_deref(),
-            credential.challenge.opaque.as_deref(),
+            credential.challenge.opaque.as_ref().map(|o| o.raw()),
         );
 
         if credential.challenge.id != expected_id {
@@ -368,10 +368,11 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest =
-            crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
-                .decode()
-                .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+        let request: ChargeRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
         self.verify(credential, &request).await
     }
 
@@ -385,10 +386,11 @@ where
         credential: &PaymentCredential,
         expected: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest =
-            crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
-                .decode()
-                .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+        let request: ChargeRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
 
         if request.amount != expected.amount {
             return Err(VerificationError::with_code(
@@ -569,14 +571,12 @@ where
         self.verify_hmac_and_expiry(credential)?;
 
         let request: crate::protocol::intents::SessionRequest =
-            crate::protocol::core::Base64UrlJson::from_raw(credential.challenge.request.clone())
-                .decode()
-                .map_err(|e| {
-                    crate::protocol::traits::VerificationError::new(format!(
-                        "Failed to decode session request: {}",
-                        e
-                    ))
-                })?;
+            credential.challenge.request.decode().map_err(|e| {
+                crate::protocol::traits::VerificationError::new(format!(
+                    "Failed to decode session request: {}",
+                    e
+                ))
+            })?;
 
         let receipt = session.verify_session(credential, &request).await?;
 
@@ -756,7 +756,7 @@ mod tests {
             realm: "api.example.com".into(),
             method: "mock".into(),
             intent: "charge".into(),
-            request: request.into(),
+            request: crate::protocol::core::Base64UrlJson::from_raw(request),
             expires: None,
             digest: None,
             opaque: None,
@@ -993,7 +993,7 @@ mod tests {
             realm: "api.example.com".into(),
             method: "mock".into(),
             intent: "charge".into(),
-            request: raw,
+            request: crate::protocol::core::Base64UrlJson::from_raw(raw),
             expires: None,
             digest: None,
             opaque: None,
@@ -1093,7 +1093,7 @@ mod tests {
             ..Default::default()
         };
         let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered_request).unwrap();
-        echo.request = encoded.raw().to_string();
+        echo.request = encoded;
 
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
         let result = mpp.verify_credential(&credential).await;
@@ -1407,7 +1407,7 @@ mod tests {
             realm: "MPP Payment".into(),
             method: "tempo".into(),
             intent: "session".into(),
-            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            request: crate::protocol::core::Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
             expires: None,
             digest: None,
             opaque: None,
@@ -1442,7 +1442,7 @@ mod tests {
             ..Default::default()
         };
         let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered).unwrap();
-        echo.request = encoded.raw().to_string();
+        echo.request = encoded;
 
         let payload_json = serde_json::json!({
             "action": "voucher",

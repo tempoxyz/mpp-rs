@@ -148,7 +148,7 @@ mod tests {
             realm: "test.com".into(),
             method: "test".into(),
             intent: "session".into(),
-            request: "eyJ0ZXN0IjoidmFsdWUifQ".into(),
+            request: crate::protocol::core::Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
             expires: None,
             digest: None,
             opaque: None,
