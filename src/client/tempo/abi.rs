@@ -2,7 +2,7 @@
 //!
 //! Provides encode functions for TIP-20 transfers.
 
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{address, Address, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
 
@@ -18,6 +18,37 @@ sol! {
         function balanceOf(address account) external view returns (uint256);
         function approve(address spender, uint256 amount) external returns (bool);
     }
+}
+
+sol! {
+    /// Stablecoin DEX interface for swap operations.
+    #[sol(rpc)]
+    interface IStablecoinDEX {
+        function swapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut, uint128 maxAmountIn) external returns (uint128 amountIn);
+        function quoteSwapExactAmountOut(address tokenIn, address tokenOut, uint128 amountOut) external view returns (uint128 amountIn);
+    }
+}
+
+/// Stablecoin DEX precompile address on Tempo.
+pub const DEX_ADDRESS: Address = address!("0xdec0000000000000000000000000000000000000");
+
+/// Encode a `swapExactAmountOut` call for the Stablecoin DEX.
+///
+/// Swaps `token_in` for exactly `amount_out` of `token_out`, with a maximum
+/// input amount of `max_amount_in` to protect against slippage.
+pub fn encode_swap_exact_amount_out(
+    token_in: Address,
+    token_out: Address,
+    amount_out: u128,
+    max_amount_in: u128,
+) -> Bytes {
+    let call = IStablecoinDEX::swapExactAmountOutCall {
+        tokenIn: token_in,
+        tokenOut: token_out,
+        amountOut: amount_out,
+        maxAmountIn: max_amount_in,
+    };
+    Bytes::from(call.abi_encode())
 }
 
 /// Encode a token transfer call, optionally with memo.

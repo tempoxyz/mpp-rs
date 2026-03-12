@@ -4,12 +4,14 @@
 //! signing strategies, charge builder, and channel operations.
 
 pub mod abi;
+pub mod autoswap;
 pub mod charge;
 mod error;
 mod provider;
 pub mod session;
 pub mod signing;
 
+pub use autoswap::AutoswapConfig;
 pub use error::TempoClientError;
 pub use provider::TempoProvider;
 

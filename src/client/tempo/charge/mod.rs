@@ -128,6 +128,24 @@ impl TempoCharge {
         self.fee_payer
     }
 
+    /// Prepend a call to the transaction's call list.
+    ///
+    /// Used by autoswap to insert a DEX swap call before the transfer call.
+    /// The swap and transfer then execute atomically in a single AA transaction.
+    pub fn with_prepended_call(mut self, call: Call) -> Self {
+        let calls = self.calls.get_or_insert_with(|| {
+            let transfer_data =
+                crate::client::tempo::abi::encode_transfer(self.recipient, self.amount, self.memo);
+            vec![Call {
+                to: TxKind::Call(self.currency),
+                value: U256::ZERO,
+                input: transfer_data,
+            }]
+        });
+        calls.insert(0, call);
+        self
+    }
+
     /// Sign the charge with default options.
     ///
     /// This is the simple path — resolves the RPC provider from chain_id,
