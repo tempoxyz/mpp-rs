@@ -123,6 +123,12 @@ impl TempoCharge {
         self.memo
     }
 
+    /// Set the memo bytes (e.g. an auto-generated attribution memo).
+    pub fn with_memo(mut self, memo: [u8; 32]) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
     /// Whether fee sponsorship is requested.
     pub fn fee_payer(&self) -> bool {
         self.fee_payer
