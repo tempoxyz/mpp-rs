@@ -129,6 +129,14 @@ impl PaymentProvider for TempoProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
 
+        // Auto-generate an attribution memo when the server doesn't provide one,
+        // so MPP transactions are identifiable on-chain via `TransferWithMemo` events.
+        if charge.memo().is_none() {
+            let memo =
+                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref());
+            charge = charge.with_memo(memo);
+        }
+
         // If autoswap is enabled, check balance and prepend a swap call if needed.
         if let Some(autoswap_config) = &self.autoswap {
             let from = self.signing_mode.from_address(self.signer.address());
