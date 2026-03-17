@@ -153,14 +153,14 @@ async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
         #[sol(rpc)]
         interface IEscrow {
             function getChannel(bytes32 channelId) external view returns (
+                bool finalized,
+                uint64 closeRequestedAt,
                 address payer,
                 address payee,
                 address token,
                 address authorizedSigner,
                 uint128 deposit,
-                uint128 settled,
-                uint64 closeRequestedAt,
-                bool finalized
+                uint128 settled
             );
         }
     }
