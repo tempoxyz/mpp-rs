@@ -28,7 +28,7 @@ pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
                 .unwrap(),
         ),
         42431 => Some(
-            "0x542831e3E4Ace07559b7C8787395f4Fb99F70787"
+            "0xe1c4d3dce17bc111181ddf716f75bae49e61a336"
                 .parse()
                 .unwrap(),
         ),
@@ -782,7 +782,7 @@ mod tests {
         let moderato = default_escrow_contract(42431).unwrap();
         assert_eq!(
             moderato,
-            "0x542831e3E4Ace07559b7C8787395f4Fb99F70787"
+            "0xe1c4d3dce17bc111181ddf716f75bae49e61a336"
                 .parse::<Address>()
                 .unwrap()
         );
