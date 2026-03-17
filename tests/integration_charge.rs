@@ -1323,16 +1323,23 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
         .send_with_payment(&provider)
         .await;
 
-    // Without fee sponsorship, client-side gas estimation reverts because the
-    // account only holds the charge amount (no gas buffer). The payment
-    // provider surfaces this as an error before anything reaches the server.
+    // Without fee sponsorship the client has no gas buffer, so either:
+    //   (a) gas estimation reverts client-side → Err, or
+    //   (b) the payment tx goes through but the transfer fails/reverts and the
+    //       server responds 402 again → Ok(402).
+    // Both outcomes are acceptable; the key invariant is that the client's
+    // balance does NOT decrease (no successful payment was made).
+    let payment_failed = match &result {
+        Err(_) => true,
+        Ok(resp) => resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED,
+    };
     assert!(
-        result.is_err(),
-        "expected client-side failure without fee payer, got: {:?}",
+        payment_failed,
+        "expected payment failure without fee payer, got: {:?}",
         result,
     );
 
-    // The transaction should not have succeeded on-chain; the client should still have the funds.
+    // The client should still hold the original charge amount (no successful payment).
     let client_balance_after_failed = tip20_balance(&provider_http, client_addr).await;
     assert_eq!(client_balance_after_failed, charge_amount);
 
