@@ -23,7 +23,7 @@ use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
     match chain_id {
         4217 => Some(
-            "0x0901aED692C755b870F9605E56BAA66c35BEfF69"
+            "0x33b901018174DDabE4841042ab76ba85D4e24f25"
                 .parse()
                 .unwrap(),
         ),
@@ -774,7 +774,7 @@ mod tests {
         let mainnet = default_escrow_contract(4217).unwrap();
         assert_eq!(
             mainnet,
-            "0x0901aED692C755b870F9605E56BAA66c35BEfF69"
+            "0x33b901018174DDabE4841042ab76ba85D4e24f25"
                 .parse::<Address>()
                 .unwrap()
         );
