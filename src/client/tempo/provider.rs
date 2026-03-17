@@ -132,10 +132,8 @@ impl PaymentProvider for TempoProvider {
         // Auto-generate an attribution memo when the server doesn't provide one,
         // so MPP transactions are identifiable on-chain via `TransferWithMemo` events.
         if charge.memo().is_none() {
-            let memo = crate::tempo::attribution::encode(
-                &challenge.realm,
-                self.client_id.as_deref(),
-            );
+            let memo =
+                crate::tempo::attribution::encode(&challenge.realm, self.client_id.as_deref());
             charge = charge.with_memo(memo);
         }
 
