@@ -331,14 +331,14 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     sol! {
         interface IEscrowRead {
             function getChannel(bytes32 channelId) external view returns (
+                bool finalized,
+                uint64 closeRequestedAt,
                 address payer,
                 address payee,
                 address token,
                 address authorizedSigner,
                 uint128 deposit,
-                uint128 settled,
-                uint64 closeRequestedAt,
-                bool finalized
+                uint128 settled
             );
         }
     }
@@ -362,18 +362,18 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
         .map_err(|e| MppError::Http(format!("failed to read channel: {}", e)))?;
 
     let decoded =
-        <(Address, Address, Address, Address, u128, u128, u64, bool)>::abi_decode(&result)
+        <(bool, u64, Address, Address, Address, Address, u128, u128)>::abi_decode(&result)
             .map_err(|e| MppError::Http(format!("failed to decode channel data: {}", e)))?;
 
     Ok(OnChainChannel {
-        payer: decoded.0,
-        payee: decoded.1,
-        token: decoded.2,
-        authorized_signer: decoded.3,
-        deposit: decoded.4,
-        settled: decoded.5,
-        close_requested_at: decoded.6,
-        finalized: decoded.7,
+        finalized: decoded.0,
+        close_requested_at: decoded.1,
+        payer: decoded.2,
+        payee: decoded.3,
+        token: decoded.4,
+        authorized_signer: decoded.5,
+        deposit: decoded.6,
+        settled: decoded.7,
     })
 }
 
