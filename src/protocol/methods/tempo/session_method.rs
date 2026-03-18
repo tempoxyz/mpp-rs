@@ -814,8 +814,36 @@ where
             ));
         }
 
-        // If voucher is not higher than what we already have, accept idempotently.
+        // If voucher is not higher than what we already have, accept idempotently
+        // but still verify the signature to prevent channel hijacking via stale
+        // vouchers with forged signatures. Skip ecrecover only for exact replays
+        // of the already-verified highest voucher.
         if cumulative_amount <= channel.highest_voucher_amount {
+            let sig_bytes = Self::parse_signature(signature_str)?;
+            let is_exact_replay =
+                channel
+                    .highest_voucher_signature
+                    .as_ref()
+                    .is_some_and(|stored_sig| {
+                        stored_sig == &sig_bytes
+                            && cumulative_amount == channel.highest_voucher_amount
+                    });
+            if !is_exact_replay {
+                let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+                let is_valid = verify_voucher(
+                    escrow,
+                    chain_id,
+                    channel_id_b256,
+                    cumulative_amount,
+                    &sig_bytes,
+                    channel.authorized_signer,
+                );
+                if !is_valid {
+                    return Err(VerificationError::invalid_signature(
+                        "invalid voucher signature",
+                    ));
+                }
+            }
             return Ok(Receipt::success(METHOD_NAME, &channel.channel_id));
         }
 
@@ -1446,6 +1474,161 @@ mod tests {
             .expect("wait_for_update should have been notified within timeout")
             .expect("spawned task should not panic");
         assert!(result);
+    }
+
+    /// Create a SessionMethod with a dummy provider for testing voucher logic
+    /// (which doesn't touch the provider).
+    fn test_session_method(
+        store: Arc<InMemoryChannelStore>,
+    ) -> SessionMethod<crate::server::TempoProvider> {
+        let provider =
+            crate::server::tempo_provider("https://rpc.test.invalid").expect("valid URL");
+        let config = SessionMethodConfig {
+            escrow_contract: "0x5555555555555555555555555555555555555555"
+                .parse()
+                .unwrap(),
+            chain_id: 42431,
+            min_voucher_delta: 0,
+        };
+        SessionMethod::new(provider, store, config)
+    }
+
+    #[tokio::test]
+    async fn test_stale_voucher_with_garbage_signature_rejected() {
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+
+        // Set up channel with a known highest_voucher_amount and valid signature
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.highest_voucher_signature = Some(vec![0xAA; 65]);
+        state.deposit = 100_000;
+        store.insert(&channel_id, state.clone());
+
+        let method = test_session_method(store);
+
+        // Submit a stale voucher (cumulative_amount=0 <= highest=1000) with garbage signature.
+        // This should be REJECTED because the signature is invalid.
+        let garbage_sig = format!("0x{}", "ff".repeat(65));
+        let result = method
+            .verify_and_accept_voucher(
+                &channel_id,
+                &state,
+                0,            // cumulative_amount <= highest_voucher_amount
+                &garbage_sig, // garbage signature
+                state.escrow_contract,
+                42431,
+                0,       // min_delta
+                100_000, // deposit
+                0,       // settled
+                false,   // not finalized
+                0,       // no close request
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InvalidSignature));
+    }
+
+    #[tokio::test]
+    async fn test_stale_voucher_same_amount_different_signature_rejected() {
+        use crate::protocol::methods::tempo::voucher::sign_voucher;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id_hex = format!("0x{}", "ab".repeat(32));
+        let channel_id_b256 = channel_id_hex.parse::<alloy::primitives::B256>().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+
+        // Sign a real voucher for amount=1000
+        let real_sig = sign_voucher(&signer, channel_id_b256, 1000u128, escrow, 42431)
+            .await
+            .unwrap();
+
+        let mut state = test_channel_state(&channel_id_hex);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1000;
+        state.highest_voucher_signature = Some(real_sig.to_vec());
+        state.deposit = 100_000;
+        store.insert(&channel_id_hex, state.clone());
+
+        let method = test_session_method(store);
+
+        // Submit same amount but forged signature — should be rejected
+        let forged_sig = format!("0x{}", "cd".repeat(65));
+        let result = method
+            .verify_and_accept_voucher(
+                &channel_id_hex,
+                &state,
+                1000,        // same amount as highest
+                &forged_sig, // different signature
+                escrow,
+                42431,
+                0,
+                100_000,
+                0,
+                false,
+                0,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, Some(ErrorCode::InvalidSignature));
+    }
+
+    #[tokio::test]
+    async fn test_exact_replay_of_highest_voucher_allowed() {
+        use crate::protocol::methods::tempo::voucher::sign_voucher;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id_hex = format!("0x{}", "ab".repeat(32));
+        let channel_id_b256 = channel_id_hex.parse::<alloy::primitives::B256>().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+
+        let real_sig = sign_voucher(&signer, channel_id_b256, 1000u128, escrow, 42431)
+            .await
+            .unwrap();
+        let sig_hex = format!("0x{}", alloy::primitives::hex::encode(&real_sig));
+
+        let mut state = test_channel_state(&channel_id_hex);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1000;
+        state.highest_voucher_signature = Some(real_sig.to_vec());
+        state.deposit = 100_000;
+        store.insert(&channel_id_hex, state.clone());
+
+        let method = test_session_method(store);
+
+        // Exact replay: same amount AND same signature — should be accepted (idempotent)
+        let result = method
+            .verify_and_accept_voucher(
+                &channel_id_hex,
+                &state,
+                1000,
+                &sig_hex,
+                escrow,
+                42431,
+                0,
+                100_000,
+                0,
+                false,
+                0,
+            )
+            .await;
+
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
