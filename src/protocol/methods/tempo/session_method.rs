@@ -1660,7 +1660,7 @@ mod tests {
             .verify_and_accept_voucher(
                 &channel_id,
                 &state,
-                500,          // stale: below highest_voucher_amount of 1000
+                500, // stale: below highest_voucher_amount of 1000
                 &forged_sig,
                 state.escrow_contract,
                 42431,
@@ -1674,7 +1674,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(crate::protocol::traits::ErrorCode::InvalidSignature));
+        assert_eq!(
+            err.code,
+            Some(crate::protocol::traits::ErrorCode::InvalidSignature)
+        );
     }
 
     #[tokio::test]
