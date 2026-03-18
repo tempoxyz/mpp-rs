@@ -37,7 +37,7 @@ use crate::client::PaymentProvider;
 
 #[derive(Clone)]
 pub struct TempoProvider {
-    signer: alloy_signer_local::PrivateKeySigner,
+    signer: alloy::signers::local::PrivateKeySigner,
     rpc_url: reqwest::Url,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
@@ -51,7 +51,7 @@ impl TempoProvider {
     ///
     /// Returns an error if the RPC URL is invalid.
     pub fn new(
-        signer: alloy_signer_local::PrivateKeySigner,
+        signer: alloy::signers::local::PrivateKeySigner,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
         let url = rpc_url
@@ -111,7 +111,7 @@ impl TempoProvider {
     }
 
     /// Get a reference to the signer.
-    pub fn signer(&self) -> &alloy_signer_local::PrivateKeySigner {
+    pub fn signer(&self) -> &alloy::signers::local::PrivateKeySigner {
         &self.signer
     }
 
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_new() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let provider = TempoProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
 
         assert_eq!(provider.rpc_url().as_str(), "https://rpc.example.com/");
@@ -182,14 +182,14 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_invalid_url() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let result = TempoProvider::new(signer, "not a url");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_tempo_provider_with_client_id() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let provider = TempoProvider::new(signer, "https://rpc.example.com")
             .unwrap()
             .with_client_id("my-app");
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_default_signing_mode() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
 
         assert!(matches!(provider.signing_mode(), TempoSigningMode::Direct));
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn test_tempo_provider_with_signing_mode() {
         use crate::client::tempo::signing::KeychainVersion;
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let wallet: alloy::primitives::Address = "0x1111111111111111111111111111111111111111"
             .parse()
             .unwrap();
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_supports() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
 
         assert!(provider.supports("tempo", "charge"));
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_tempo_provider_supports_only_tempo_charge() {
-        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
         let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
 
         assert!(provider.supports("tempo", "charge"));

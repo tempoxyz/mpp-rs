@@ -96,7 +96,7 @@ pub use protocol::intents::{
 pub use alloy::signers::Signer;
 
 #[cfg(feature = "evm")]
-pub use alloy_signer_local::PrivateKeySigner;
+pub use alloy::signers::local::PrivateKeySigner;
 
 #[cfg(feature = "evm")]
 pub use alloy::primitives::{Address, U256};

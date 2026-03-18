@@ -79,7 +79,7 @@ pub struct TempoBuilder {
     pub(crate) decimals: u32,
     pub(crate) fee_payer: bool,
     pub(crate) chain_id: Option<u64>,
-    pub(crate) fee_payer_signer: Option<alloy_signer_local::PrivateKeySigner>,
+    pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
 }
 
 #[cfg(feature = "tempo")]
@@ -144,7 +144,7 @@ impl TempoBuilder {
     /// When clients send transactions with `feePayer: true`, the server
     /// uses this signer to co-sign and sponsor the transaction gas fees.
     /// The signer's account must have sufficient balance for gas.
-    pub fn fee_payer_signer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+    pub fn fee_payer_signer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
         self.fee_payer_signer = Some(signer);
         self
     }

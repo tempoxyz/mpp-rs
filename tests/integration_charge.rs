@@ -21,7 +21,7 @@ use alloy::primitives::{address, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::SignerSync;
 use alloy::sol_types::SolCall;
-use alloy_signer_local::PrivateKeySigner;
+use alloy::signers::local::PrivateKeySigner;
 use axum::{routing::get, Json, Router};
 use mpp::client::{Fetch, TempoProvider};
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};

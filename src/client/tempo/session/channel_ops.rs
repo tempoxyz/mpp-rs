@@ -580,7 +580,7 @@ mod tests {
     #[cfg(feature = "evm")]
     #[tokio::test]
     async fn test_create_voucher_payload() {
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xAB);
@@ -609,7 +609,7 @@ mod tests {
     #[cfg(feature = "evm")]
     #[tokio::test]
     async fn test_create_close_payload() {
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xCD);
@@ -833,7 +833,7 @@ mod tests {
     #[cfg(feature = "evm")]
     #[tokio::test]
     async fn test_create_voucher_payload_zero_amount() {
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xAB);
@@ -858,7 +858,7 @@ mod tests {
     #[cfg(feature = "evm")]
     #[tokio::test]
     async fn test_create_close_payload_zero_amount() {
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xCD);
@@ -883,7 +883,7 @@ mod tests {
     #[cfg(feature = "evm")]
     #[tokio::test]
     async fn test_create_voucher_payload_large_amount() {
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xAB);

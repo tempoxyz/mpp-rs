@@ -293,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn test_sign_voucher_roundtrip() {
         use alloy::primitives::{Address, B256};
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xAB);
@@ -349,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_voucher_roundtrip() {
         use alloy::primitives::{Address, B256};
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xCD);
@@ -545,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_voucher_ecdsa_still_works() {
         use alloy::primitives::{Address, B256};
-        use alloy_signer_local::PrivateKeySigner;
+        use alloy::signers::local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::random();
         let channel_id = B256::repeat_byte(0xEE);

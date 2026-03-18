@@ -102,7 +102,7 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 #[derive(Clone)]
 pub struct ChargeMethod<P> {
     provider: Arc<P>,
-    fee_payer_signer: Option<Arc<alloy_signer_local::PrivateKeySigner>>,
+    fee_payer_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
 }
 
 impl<P> ChargeMethod<P>
@@ -124,7 +124,7 @@ where
     ///
     /// When set, requests with `feePayer: true` will be accepted and
     /// broadcast. Without a fee payer signer, such requests are rejected.
-    pub fn with_fee_payer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+    pub fn with_fee_payer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
         self.fee_payer_signer = Some(Arc::new(signer));
         self
     }
@@ -544,7 +544,7 @@ where
     fn cosign_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
-        fee_payer_signer: &alloy_signer_local::PrivateKeySigner,
+        fee_payer_signer: &alloy::signers::local::PrivateKeySigner,
         fee_token: Address,
     ) -> Result<Vec<u8>, VerificationError> {
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
@@ -924,7 +924,7 @@ mod tests {
     /// Helper: sign a tx and encode as a 0x78 fee payer envelope.
     fn sign_and_encode_0x78(
         tx: tempo_primitives::TempoTransaction,
-        signer: &alloy_signer_local::PrivateKeySigner,
+        signer: &alloy::signers::local::PrivateKeySigner,
     ) -> Vec<u8> {
         use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::signers::SignerSync;
@@ -946,8 +946,8 @@ mod tests {
         use alloy::eips::Decodable2718;
         use alloy::signers::SignerSync;
 
-        let client_signer = alloy_signer_local::PrivateKeySigner::random();
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
             .unwrap();
@@ -999,8 +999,8 @@ mod tests {
     /// cosign_fee_payer_transaction rejects txs with wrong nonce_key.
     #[test]
     fn test_cosign_rejects_wrong_nonce_key() {
-        let client_signer = alloy_signer_local::PrivateKeySigner::random();
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
             .unwrap();
@@ -1032,8 +1032,8 @@ mod tests {
     /// cosign_fee_payer_transaction rejects txs without valid_before.
     #[test]
     fn test_cosign_rejects_missing_valid_before() {
-        let client_signer = alloy_signer_local::PrivateKeySigner::random();
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
             .unwrap();
@@ -1065,8 +1065,8 @@ mod tests {
     /// cosign_fee_payer_transaction rejects txs with expired valid_before.
     #[test]
     fn test_cosign_rejects_expired_valid_before() {
-        let client_signer = alloy_signer_local::PrivateKeySigner::random();
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
             .unwrap();
@@ -1105,7 +1105,7 @@ mod tests {
     /// cosign_fee_payer_transaction rejects empty input.
     #[test]
     fn test_cosign_rejects_empty_input() {
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
             .unwrap();
@@ -1132,7 +1132,7 @@ mod tests {
     /// cosign_fee_payer_transaction rejects non-0x78 type byte.
     #[test]
     fn test_cosign_rejects_wrong_type_byte() {
-        let fee_payer_signer = alloy_signer_local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
             .unwrap();

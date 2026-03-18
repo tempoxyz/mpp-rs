@@ -208,7 +208,7 @@ pub struct SessionMethod<P> {
     store: Arc<dyn ChannelStore>,
     config: SessionMethodConfig,
     /// Optional signer for submitting on-chain close transactions.
-    close_signer: Option<Arc<alloy_signer_local::PrivateKeySigner>>,
+    close_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
 }
 
 impl<P> SessionMethod<P> {
@@ -249,7 +249,7 @@ where
     }
 
     /// Set the signer used for submitting on-chain close transactions.
-    pub fn with_close_signer(mut self, signer: alloy_signer_local::PrivateKeySigner) -> Self {
+    pub fn with_close_signer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
         self.close_signer = Some(Arc::new(signer));
         self
     }

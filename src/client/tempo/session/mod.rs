@@ -45,7 +45,7 @@ use crate::protocol::methods::tempo::session::TempoSessionExt;
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
 pub struct TempoSessionProvider {
-    signer: alloy_signer_local::PrivateKeySigner,
+    signer: alloy::signers::local::PrivateKeySigner,
     rpc_url: reqwest::Url,
     /// Escrow contract address override. If None, resolved from challenge or defaults.
     escrow_contract: Option<Address>,
@@ -74,7 +74,7 @@ impl TempoSessionProvider {
     ///
     /// Returns an error if the RPC URL is invalid.
     pub fn new(
-        signer: alloy_signer_local::PrivateKeySigner,
+        signer: alloy::signers::local::PrivateKeySigner,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
         let url = rpc_url
@@ -141,7 +141,7 @@ impl TempoSessionProvider {
     }
 
     /// Get a reference to the signer.
-    pub fn signer(&self) -> &alloy_signer_local::PrivateKeySigner {
+    pub fn signer(&self) -> &alloy::signers::local::PrivateKeySigner {
         &self.signer
     }
 
@@ -492,7 +492,7 @@ impl PaymentProvider for TempoSessionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_signer_local::PrivateKeySigner;
+    use alloy::signers::local::PrivateKeySigner;
 
     #[test]
     fn test_session_provider_new() {
