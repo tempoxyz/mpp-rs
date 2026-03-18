@@ -20,7 +20,7 @@ server = ["tokio", "futures-core", "async-stream"]
 
 # Method implementations
 evm = ["alloy", "alloy-signer-local", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid", "revm-database-interface"]
+tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
 
 # Utilities
 utils = ["hex", "rand"]
@@ -55,7 +55,20 @@ uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { version = "1.2", features = ["full"], optional = true }
+alloy = { version = "1.2", default-features = false, features = [
+    "consensus",
+    "contract",
+    "eips",
+    "k256",
+    "network",
+    "provider-http",
+    "rpc-types",
+    "rlp",
+    "signers",
+    "sol-types",
+    "reqwest",
+    "reqwest-rustls-tls",
+], optional = true }
 alloy-signer-local = { version = "1.2", optional = true }
 
 # Tempo dependencies (optional)
@@ -63,11 +76,8 @@ alloy-signer-local = { version = "1.2", optional = true }
 #   [patch.crates-io]
 #   tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
 #   tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
-tempo-alloy = { version = "1", optional = true }
-tempo-primitives = { version = "1", optional = true }
-
-# Pin: revm-database-interface 9.0.1 bumps revm-state to v10, breaking revm v34 (still on v9)
-revm-database-interface = { version = ">=9.0.0, <9.0.1", optional = true }
+tempo-alloy = { version = "1", default-features = false, optional = true }
+tempo-primitives = { version = "1", default-features = false, features = ["std", "serde"], optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.12", features = ["json"], optional = true }
