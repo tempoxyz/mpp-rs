@@ -64,6 +64,7 @@ alloy = { version = "1.2", default-features = false, features = [
     "provider-http",
     "rpc-types",
     "rlp",
+    "signer-local",
     "signers",
     "sol-types",
     "reqwest",
