@@ -1420,7 +1420,7 @@ mod tests {
         assert_eq!(deserialized.channel_id, "0xchannel1");
         assert_eq!(deserialized.deposit, 100_000);
         assert_eq!(deserialized.chain_id, 42431);
-        assert_eq!(deserialized.finalized, false);
+        assert!(!deserialized.finalized);
     }
 
     #[tokio::test]
@@ -1629,6 +1629,52 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stale_voucher_with_forged_keychain_envelope_rejected() {
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.highest_voucher_signature = Some(vec![0xAA; 65]);
+        state.deposit = 100_000;
+        store.insert(&channel_id, state.clone());
+
+        let method = test_session_method(store);
+
+        // Forge a keychain envelope: 0x03 + authorized_signer address + garbage inner sig.
+        // This previously would have passed verify_voucher because it only checked the
+        // embedded address against expected_signer without verifying the inner signature.
+        let mut forged_envelope = vec![0x03u8];
+        forged_envelope.extend_from_slice(signer.address().as_slice());
+        forged_envelope.extend_from_slice(&[0xBB; 65]);
+        let forged_sig = format!("0x{}", hex::encode(&forged_envelope));
+
+        let result = method
+            .verify_and_accept_voucher(
+                &channel_id,
+                &state,
+                500,          // stale: below highest_voucher_amount of 1000
+                &forged_sig,
+                state.escrow_contract,
+                42431,
+                0,
+                100_000,
+                0,
+                false,
+                0,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(crate::protocol::traits::ErrorCode::InvalidSignature));
     }
 
     #[tokio::test]

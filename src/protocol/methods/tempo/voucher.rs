@@ -132,13 +132,13 @@ pub fn verify_voucher(
 ) -> bool {
     let sig = strip_magic_trailer(signature_bytes);
 
-    // 65 bytes is always a raw secp256k1 ECDSA signature (matches TS SDK behavior
-    // where `size === 65` is checked before the type prefix byte).
-    // For longer signatures starting with 0x03, try keychain envelope parsing.
-    if sig.len() != 65 {
-        if let Some(user_address) = parse_keychain_user_address(sig) {
-            return user_address == expected_signer;
-        }
+    // Reject keychain envelopes — the escrow contract verifies raw ECDSA
+    // signatures against authorizedSigner via ecrecover, not keychain-wrapped
+    // ones. Accepting them with only an address comparison (no inner signature
+    // verification) would allow trivial voucher forgery.
+    // Matches the TS SDK (mppx) behavior which returns false for keychain type.
+    if sig.len() != 65 && parse_keychain_user_address(sig).is_some() {
+        return false;
     }
 
     // Fall through to raw ECDSA signature recovery.
@@ -486,27 +486,16 @@ mod tests {
         envelope.extend_from_slice(user_address.as_slice());
         envelope.extend_from_slice(&[0xAA; 65]); // dummy inner signature
 
-        // Should match the user address
-        assert!(verify_voucher(
-            escrow_contract,
-            chain_id,
-            channel_id,
-            cumulative_amount,
-            &envelope,
-            user_address,
-        ));
-
-        // Should fail for a different expected signer
-        let other: Address = "0x1111111111111111111111111111111111111111"
-            .parse()
-            .unwrap();
+        // Keychain envelopes must be rejected — the escrow contract only
+        // supports raw ECDSA via ecrecover, so accepting keychain envelopes
+        // without verifying the inner signature would allow trivial forgery.
         assert!(!verify_voucher(
             escrow_contract,
             chain_id,
             channel_id,
             cumulative_amount,
             &envelope,
-            other,
+            user_address,
         ));
     }
 
@@ -531,7 +520,8 @@ mod tests {
         envelope.extend_from_slice(&[0xAA; 65]);
         envelope.extend_from_slice(&MAGIC_BYTES);
 
-        assert!(verify_voucher(
+        // Keychain envelopes are rejected even with magic trailer
+        assert!(!verify_voucher(
             escrow_contract,
             chain_id,
             channel_id,
