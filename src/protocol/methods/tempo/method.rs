@@ -33,6 +33,7 @@ use tempo_alloy::TempoNetwork;
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
+use crate::store::Store;
 
 use super::{TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
 
@@ -103,6 +104,7 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 pub struct ChargeMethod<P> {
     provider: Arc<P>,
     fee_payer_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    store: Option<Arc<dyn Store>>,
 }
 
 impl<P> ChargeMethod<P>
@@ -117,7 +119,17 @@ where
         Self {
             provider: Arc::new(provider),
             fee_payer_signer: None,
+            store: None,
         }
+    }
+
+    /// Configure a store for transaction hash deduplication.
+    ///
+    /// When set, each verified transaction hash is recorded and subsequent
+    /// attempts to replay the same hash are rejected.
+    pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Configure a fee payer signer for sponsoring transaction fees.
@@ -142,6 +154,20 @@ where
         let hash = tx_hash
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
+
+        let replay_key = format!("mpp:charge:{tx_hash}");
+
+        if let Some(store) = &self.store {
+            let seen = store
+                .get(&replay_key)
+                .await
+                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
+            if seen.is_some() {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
+        }
 
         let receipt = self
             .provider
@@ -183,6 +209,13 @@ where
             expected_amount,
             memo.as_deref(),
         )?;
+
+        if let Some(store) = &self.store {
+            store
+                .put(&replay_key, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+        }
 
         Ok(Receipt::success(METHOD_NAME, tx_hash))
     }
@@ -676,11 +709,13 @@ where
         let request = request.clone();
         let provider = Arc::clone(&self.provider);
         let fee_payer_signer = self.fee_payer_signer.clone();
+        let store = self.store.clone();
 
         async move {
             let this = ChargeMethod {
                 provider,
                 fee_payer_signer,
+                store,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -1155,5 +1190,64 @@ mod tests {
                 .contains("Expected fee payer envelope (0x78)"),
             "error should mention 0x78, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_store_rejects_replayed_hash() {
+        use crate::store::{MemoryStore, Store};
+
+        let store = Arc::new(MemoryStore::new());
+        let hash = "0xabc123def456";
+
+        // Simulate first successful verification: record the hash
+        let key = format!("mpp:charge:{hash}");
+        store
+            .put(&key, serde_json::Value::Bool(true))
+            .await
+            .unwrap();
+
+        // Verify the hash is now in the store
+        let seen = store.get(&key).await.unwrap();
+        assert!(seen.is_some(), "hash should be recorded after first use");
+
+        // A second lookup should find it (replay detected)
+        let seen_again = store.get(&key).await.unwrap();
+        assert!(
+            seen_again.is_some(),
+            "replayed hash should be detected via store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_allows_unseen_hash() {
+        use crate::store::{MemoryStore, Store};
+
+        let store = Arc::new(MemoryStore::new());
+
+        // A hash that was never recorded should not be found
+        let key = "mpp:charge:0xnever_seen";
+        let seen = store.get(key).await.unwrap();
+        assert!(seen.is_none(), "unseen hash should not be in store");
+    }
+
+    #[tokio::test]
+    async fn test_store_dedup_different_hashes_independent() {
+        use crate::store::{MemoryStore, Store};
+
+        let store = Arc::new(MemoryStore::new());
+
+        // Record one hash
+        store
+            .put("mpp:charge:0xhash_a", serde_json::Value::Bool(true))
+            .await
+            .unwrap();
+
+        // Different hash should not be affected
+        let seen = store.get("mpp:charge:0xhash_b").await.unwrap();
+        assert!(seen.is_none(), "different hash should not be blocked");
+
+        // Original hash should still be blocked
+        let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
+        assert!(seen.is_some(), "original hash should still be recorded");
     }
 }
