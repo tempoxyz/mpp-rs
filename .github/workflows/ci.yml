@@ -53,6 +53,8 @@ jobs:
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo test --features tempo,server,client,axum,middleware,tower,utils
       - run: cargo hack check --each-feature --no-dev-deps --skip integration
+      - name: Check examples
+        run: find examples -name Cargo.toml -exec cargo check --manifest-path {} \;
 
   ci-gate:
     name: CI Gate
