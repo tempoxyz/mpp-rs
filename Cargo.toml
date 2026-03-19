@@ -86,6 +86,7 @@ axum = { version = "0.8" }
 reqwest = { version = "0.12", features = ["json"] }
 hex = "0.4"
 
-# [patch.crates-io]
+[patch.crates-io]
+alloy = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
 # tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
 # tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
