@@ -55,7 +55,7 @@ uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { version = "1.2", features = ["full"], optional = true }
+alloy = { version = "1.7", features = ["full"], optional = true }
 
 # Tempo dependencies (optional)
 # Note: tempo feature requires git dependency - add to your Cargo.toml:
