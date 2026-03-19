@@ -46,6 +46,9 @@ jobs:
   ci:
     needs: changelog
     if: always()
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ github.head_ref }}
