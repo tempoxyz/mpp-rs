@@ -204,7 +204,7 @@ where
     );
 
     // Build approve calldata
-    use crate::client::tempo::abi::ITIP20;
+    use tempo_alloy::contracts::precompiles::ITIP20;
 
     sol! {
         interface IEscrow {
