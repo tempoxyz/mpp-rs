@@ -353,7 +353,8 @@ impl TempoSessionProvider {
 
 impl PaymentProvider for TempoSessionProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "tempo" && intent == "session"
+        method == crate::protocol::methods::tempo::METHOD_NAME
+            && intent == crate::protocol::methods::tempo::INTENT_SESSION
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
