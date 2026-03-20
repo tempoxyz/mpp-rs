@@ -31,7 +31,7 @@ use tempo_alloy::contracts::precompiles::{
 };
 use tempo_primitives::transaction::Call;
 
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 
 /// Maximum allowed slippage in basis points (50% = 5000 bps).
 const MAX_SLIPPAGE_BPS: u16 = 5_000;
@@ -73,7 +73,7 @@ pub async fn check_balance_deficit<P: alloy::providers::Provider<tempo_alloy::Te
         .balanceOf(owner)
         .call()
         .await
-        .map_err(|e| MppError::Http(format!("failed to query balance: {e}")))?;
+        .mpp_http("failed to query balance")?;
 
     if balance >= amount {
         Ok(None)
@@ -94,7 +94,7 @@ pub async fn quote_swap<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>
         .quoteSwapExactAmountOut(token_in, token_out, amount_out)
         .call()
         .await
-        .map_err(|e| MppError::Http(format!("DEX quote failed: {e}")))?;
+        .mpp_http("DEX quote failed")?;
 
     Ok(amount_in)
 }
@@ -175,9 +175,9 @@ pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNe
     if token_in_balance.is_some() {
         return Err(MppError::from(
             crate::client::tempo::TempoClientError::InsufficientBalance {
-                token: format!("{}", config.token_in),
+                token: config.token_in.to_string(),
                 available: String::new(),
-                required: format!("{}", max_amount_in),
+                required: max_amount_in.to_string(),
             },
         ));
     }

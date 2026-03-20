@@ -121,8 +121,8 @@ pub fn build_charge_credential(
     chain_id: u64,
     from: Address,
 ) -> PaymentCredential {
-    let signed_tx_hex = format!("0x{}", hex::encode(signed_tx_bytes));
-    let did = format!("did:pkh:eip155:{}:{}", chain_id, from);
+    let signed_tx_hex = alloy::hex::encode_prefixed(signed_tx_bytes);
+    let did = PaymentCredential::evm_did(chain_id, &from.to_string());
     PaymentCredential::with_source(
         challenge.to_echo(),
         did,

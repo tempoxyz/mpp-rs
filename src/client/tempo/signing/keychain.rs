@@ -9,7 +9,7 @@ use tempo_alloy::contracts::precompiles::{IAccountKeychain, ACCOUNT_KEYCHAIN_ADD
 use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::client::tempo::TempoClientError;
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 
 /// Validate key info returned from the keychain precompile.
 ///
@@ -56,7 +56,7 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
         .getKey(wallet_address, key_address)
         .call()
         .await
-        .map_err(|e| MppError::Http(format!("Failed to query key info: {}", e)))?;
+        .mpp_http("failed to query key info")?;
 
     let enforces_limits = validate_key_info(&key_info, now_secs)?;
     if !enforces_limits {
@@ -67,7 +67,7 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
         .getRemainingLimit(wallet_address, key_address, token)
         .call()
         .await
-        .map_err(|e| MppError::Http(format!("Failed to query remaining limit: {}", e)))?;
+        .mpp_http("failed to query remaining limit")?;
 
     Ok(Some(result))
 }

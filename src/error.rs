@@ -286,6 +286,27 @@ pub enum MppError {
     SystemTime(#[from] std::time::SystemTimeError),
 }
 
+// ==================== Result Extension Trait ====================
+
+/// Extension trait for mapping errors into [`MppError`] with a contextual message.
+pub(crate) trait ResultExt<T> {
+    /// Map the error into [`MppError::Http`] with the given context prefix.
+    fn mpp_http(self, context: &str) -> std::result::Result<T, MppError>;
+
+    /// Map the error into [`MppError::InvalidConfig`] with the given context prefix.
+    fn mpp_config(self, context: &str) -> std::result::Result<T, MppError>;
+}
+
+impl<T, E: std::fmt::Display> ResultExt<T> for std::result::Result<T, E> {
+    fn mpp_http(self, context: &str) -> std::result::Result<T, MppError> {
+        self.map_err(|e| MppError::Http(format!("{context}: {e}")))
+    }
+
+    fn mpp_config(self, context: &str) -> std::result::Result<T, MppError> {
+        self.map_err(|e| MppError::InvalidConfig(format!("{context}: {e}")))
+    }
+}
+
 // ==================== RFC 9457 Format Helpers ====================
 
 fn format_malformed_credential(reason: &Option<String>) -> String {

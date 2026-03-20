@@ -12,7 +12,7 @@ use tempo_primitives::transaction::SignedKeyAuthorization;
 // Re-export so callers can set the version without importing tempo_primitives directly.
 pub use tempo_primitives::transaction::KeychainVersion;
 
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::methods::tempo::FeePayerEnvelope78;
 
 /// How to sign Tempo transactions.
@@ -124,7 +124,7 @@ pub fn sign_and_encode(
     let hash_to_sign = effective_signing_hash(sig_hash, mode);
     let inner_signature = signer
         .sign_hash_sync(&hash_to_sign)
-        .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+        .mpp_http("failed to sign transaction")?;
 
     let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
     Ok(signed_tx.encoded_2718())
@@ -168,7 +168,7 @@ pub fn sign_and_encode_fee_payer_envelope(
     let hash_to_sign = effective_signing_hash(sig_hash, mode);
     let inner_signature = signer
         .sign_hash_sync(&hash_to_sign)
-        .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+        .mpp_http("failed to sign transaction")?;
     let signature = build_tempo_signature(inner_signature, mode);
     Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
 }
@@ -186,7 +186,7 @@ pub async fn sign_and_encode_async(
     let inner_signature = signer
         .sign_hash(&hash_to_sign)
         .await
-        .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+        .mpp_http("failed to sign transaction")?;
 
     let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
     Ok(signed_tx.encoded_2718())
@@ -228,7 +228,7 @@ pub async fn sign_and_encode_fee_payer_envelope_async(
     let inner_signature = signer
         .sign_hash(&hash_to_sign)
         .await
-        .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
+        .mpp_http("failed to sign transaction")?;
     let signature = build_tempo_signature(inner_signature, mode);
     Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
 }

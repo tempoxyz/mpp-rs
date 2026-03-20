@@ -37,7 +37,7 @@ use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, Te
 use crate::client::tempo::signing::{
     sign_and_encode_async, sign_and_encode_fee_payer_envelope_async, TempoSigningMode,
 };
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::methods::tempo::charge::{parse_memo_bytes, TempoChargeExt};
@@ -210,9 +210,7 @@ impl TempoCharge {
 
         // Resolve RPC provider + build calls
         let rpc_url = match options.rpc_url {
-            Some(url) => url
-                .parse()
-                .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?,
+            Some(url) => url.parse().mpp_config("invalid RPC URL")?,
             None => {
                 let network = TempoNetwork::from_chain_id(self.chain_id).ok_or_else(|| {
                     MppError::InvalidConfig(format!(
@@ -223,7 +221,7 @@ impl TempoCharge {
                 network
                     .default_rpc_url()
                     .parse()
-                    .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?
+                    .mpp_config("invalid RPC URL")?
             }
         };
         let provider =
