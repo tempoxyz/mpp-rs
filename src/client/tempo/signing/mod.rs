@@ -58,17 +58,6 @@ impl TempoSigningMode {
     }
 }
 
-/// Compute the hash that the signer should sign, given the tx sig_hash and mode.
-///
-/// - `Direct`: signs the raw `sig_hash`.
-/// - `Keychain`: signs the raw `sig_hash` (keychain recovery uses `key_id()`).
-fn effective_signing_hash(
-    sig_hash: alloy::primitives::B256,
-    _mode: &TempoSigningMode,
-) -> alloy::primitives::B256 {
-    sig_hash
-}
-
 /// Build the [`TempoSignature`] for a given inner signature and signing mode.
 fn build_tempo_signature(
     inner_signature: alloy::signers::Signature,
@@ -99,9 +88,8 @@ pub fn sign_and_encode(
     use alloy::eips::Encodable2718;
 
     let sig_hash = tx.signature_hash();
-    let hash_to_sign = effective_signing_hash(sig_hash, mode);
     let inner_signature = signer
-        .sign_hash_sync(&hash_to_sign)
+        .sign_hash_sync(&sig_hash)
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
     let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
@@ -143,9 +131,8 @@ pub fn sign_and_encode_fee_payer_envelope(
     }
 
     let sig_hash = tx.signature_hash();
-    let hash_to_sign = effective_signing_hash(sig_hash, mode);
     let inner_signature = signer
-        .sign_hash_sync(&hash_to_sign)
+        .sign_hash_sync(&sig_hash)
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
     let signature = build_tempo_signature(inner_signature, mode);
     Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
@@ -160,9 +147,8 @@ pub async fn sign_and_encode_async(
     use alloy::eips::Encodable2718;
 
     let sig_hash = tx.signature_hash();
-    let hash_to_sign = effective_signing_hash(sig_hash, mode);
     let inner_signature = signer
-        .sign_hash(&hash_to_sign)
+        .sign_hash(&sig_hash)
         .await
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
 
@@ -202,9 +188,8 @@ pub async fn sign_and_encode_fee_payer_envelope_async(
     }
 
     let sig_hash = tx.signature_hash();
-    let hash_to_sign = effective_signing_hash(sig_hash, mode);
     let inner_signature = signer
-        .sign_hash(&hash_to_sign)
+        .sign_hash(&sig_hash)
         .await
         .map_err(|e| MppError::Http(format!("failed to sign transaction: {}", e)))?;
     let signature = build_tempo_signature(inner_signature, mode);
@@ -366,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_and_encode_fee_payer_envelope_v2() {
+    fn test_sign_and_encode_fee_payer_envelope_keychain() {
         let signer = test_signer();
 
         let mut tx = test_tx();
@@ -379,32 +364,19 @@ mod tests {
             false,
         ));
 
-        let v1_mode = TempoSigningMode::Keychain {
-            wallet: Address::repeat_byte(0xAB),
-            key_authorization: None,
-        };
-        let v2_mode = TempoSigningMode::Keychain {
+        let mode = TempoSigningMode::Keychain {
             wallet: Address::repeat_byte(0xAB),
             key_authorization: None,
         };
 
-        let v1_bytes = sign_and_encode_fee_payer_envelope(tx.clone(), &signer, &v1_mode).unwrap();
-        let v2_bytes = sign_and_encode_fee_payer_envelope(tx, &signer, &v2_mode).unwrap();
+        let bytes = sign_and_encode_fee_payer_envelope(tx, &signer, &mode).unwrap();
 
-        // Both should be valid fee payer envelopes with same sender
         assert_eq!(
-            v1_bytes[0],
+            bytes[0],
             crate::protocol::methods::tempo::TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID
         );
-        assert_eq!(
-            v2_bytes[0],
-            crate::protocol::methods::tempo::TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID
-        );
-        let v2_env = FeePayerEnvelope78::decode_envelope(&v2_bytes).unwrap();
-        assert_eq!(v2_env.sender, Address::repeat_byte(0xAB));
-
-        // V1 and V2 should produce different signatures
-        assert_ne!(v1_bytes, v2_bytes, "fee payer V1 and V2 should differ");
+        let env = FeePayerEnvelope78::decode_envelope(&bytes).unwrap();
+        assert_eq!(env.sender, Address::repeat_byte(0xAB));
     }
 
     #[test]
