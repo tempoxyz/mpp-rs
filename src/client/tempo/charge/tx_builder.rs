@@ -102,13 +102,12 @@ pub async fn estimate_gas(
         .estimate_gas(req)
         .await
         .map(|gas| gas.saturating_add(GAS_ESTIMATE_BUFFER))
-        .map_err(|e| {
-            let msg = format!("gas estimation failed: {}", e);
-            match crate::client::tempo::TempoClientError::classify_rpc_error(&msg) {
+        .map_err(
+            |e| match crate::client::tempo::TempoClientError::from_transport_error(&e) {
                 Some(tempo_err) => MppError::from(tempo_err),
-                None => MppError::Http(msg),
-            }
-        })
+                None => MppError::Http(format!("gas estimation failed: {e}")),
+            },
+        )
 }
 
 /// Build a [`PaymentCredential`] from a signed Tempo transaction.
