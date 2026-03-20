@@ -74,10 +74,11 @@ impl TempoClientError {
                 .as_decoded_error::<IAccountKeychain::SpendingLimitExceeded>()
                 .is_some()
             {
+                let msg = e.to_string();
                 return Some(Self::SpendingLimitExceeded {
-                    token: String::new(),
-                    limit: String::new(),
-                    required: String::new(),
+                    token: extract_field(&msg, "token").unwrap_or_default(),
+                    limit: extract_field(&msg, "limit").unwrap_or_default(),
+                    required: extract_field(&msg, "required").unwrap_or(msg),
                 });
             }
         }
@@ -98,21 +99,10 @@ impl TempoClientError {
         }
 
         if lower.contains("spendinglimitexceeded") || lower.contains("spending limit") {
-            if let (Some(token), Some(limit), Some(required)) = (
-                extract_field(&msg, "token"),
-                extract_field(&msg, "limit"),
-                extract_field(&msg, "required"),
-            ) {
-                return Some(Self::SpendingLimitExceeded {
-                    token,
-                    limit,
-                    required,
-                });
-            }
             return Some(Self::SpendingLimitExceeded {
-                token: String::new(),
-                limit: String::new(),
-                required: msg,
+                token: extract_field(&msg, "token").unwrap_or_default(),
+                limit: extract_field(&msg, "limit").unwrap_or_default(),
+                required: extract_field(&msg, "required").unwrap_or(msg),
             });
         }
 
@@ -120,21 +110,10 @@ impl TempoClientError {
             || lower.contains("transfer amount exceeds balance")
             || (lower.contains("insufficient") && lower.contains("balance"))
         {
-            if let (Some(token), Some(available), Some(required)) = (
-                extract_field(&msg, "token"),
-                extract_field(&msg, "available"),
-                extract_field(&msg, "required"),
-            ) {
-                return Some(Self::InsufficientBalance {
-                    token,
-                    available,
-                    required,
-                });
-            }
             return Some(Self::InsufficientBalance {
-                token: String::new(),
-                available: String::new(),
-                required: msg,
+                token: extract_field(&msg, "token").unwrap_or_default(),
+                available: extract_field(&msg, "available").unwrap_or_default(),
+                required: extract_field(&msg, "required").unwrap_or(msg),
             });
         }
 
