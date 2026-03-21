@@ -62,10 +62,6 @@ async-stream = { version = "0.3", optional = true }
 alloy = { version = "1.7", features = ["full"], optional = true }
 
 # Tempo dependencies (optional)
-# Note: tempo feature requires git dependency - add to your Cargo.toml:
-#   [patch.crates-io]
-#   tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
-#   tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
 tempo-alloy = { version = "1", optional = true }
 tempo-primitives = { version = "1", optional = true }
 
@@ -90,6 +86,3 @@ axum = { version = "0.8" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
 
-# [patch.crates-io]
-# tempo-alloy = { git = "https://github.com/tempoxyz/tempo" }
-# tempo-primitives = { git = "https://github.com/tempoxyz/tempo" }
