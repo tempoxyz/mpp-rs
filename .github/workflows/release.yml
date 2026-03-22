@@ -22,7 +22,6 @@ jobs:
         uses: wevm/changelogs-rs@6da79bce8604f650b0a59697ec434a23c168b9de # changelogs@0.6.0
         with:
           conventional-commit: true
-          publish: cargo publish
+          crate-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
