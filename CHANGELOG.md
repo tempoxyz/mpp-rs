@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 (2026-03-22)
+
+### Minor Changes
+
+- Migrated tempo dependencies (`tempo-alloy`, `tempo-primitives`) from git dependencies to crates.io versioned dependencies, and added `cargo publish` to the release workflow with registry token support. (by @BrendanRyan, [#142](https://github.com/tempoxyz/mpp-rs/pull/142))
+
+### Patch Changes
+
+- Fixed core problem type base URI to use the canonical `https://paymentauth.org/problems` domain instead of the temporary GitHub Pages URL. (by @BrendanRyan, [#142](https://github.com/tempoxyz/mpp-rs/pull/142))
+
 ## `mpp@0.5.0`
 
 ### Minor Changes
