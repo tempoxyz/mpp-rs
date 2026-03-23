@@ -83,6 +83,7 @@ let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 
 ```rust
 use mpp::client::{Fetch, StripeProvider};
+use mpp::protocol::methods::stripe::CreateTokenResult;
 
 let provider = StripeProvider::new(|params| {
     Box::pin(async move {
@@ -91,7 +92,7 @@ let provider = StripeProvider::new(|params| {
             .post("https://my-server.com/api/create-spt")
             .json(&params)
             .send().await?.json::<serde_json::Value>().await?;
-        Ok(resp["spt"].as_str().unwrap().to_string())
+        Ok(CreateTokenResult::from(resp["spt"].as_str().unwrap().to_string()))
     })
 });
 

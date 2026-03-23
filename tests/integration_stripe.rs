@@ -502,17 +502,12 @@ async fn test_stripe_requires_action_rejected() {
         .send_with_payment(&provider)
         .await;
 
-    match resp {
-        Ok(r) => {
-            assert_eq!(
-                r.status(),
-                402,
-                "should get 402 when Stripe requires action"
-            );
-        }
-        Err(_) => {
-            // Also acceptable — client may error out after failed retry
-        }
+    if let Ok(r) = resp {
+        assert_eq!(
+            r.status(),
+            402,
+            "should get 402 when Stripe requires action"
+        );
     }
 
     handle.abort();
@@ -674,9 +669,8 @@ async fn test_stripe_error_body_parsing() {
         .await;
 
     // Should get 402 back (server verification failed, re-issues challenge)
-    match resp {
-        Ok(r) => assert_eq!(r.status(), 402, "should get 402 when Stripe returns error"),
-        Err(_) => {} // client error also acceptable
+    if let Ok(r) = resp {
+        assert_eq!(r.status(), 402, "should get 402 when Stripe returns error");
     }
 
     handle.abort();

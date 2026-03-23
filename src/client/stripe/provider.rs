@@ -57,16 +57,15 @@ pub struct CreateTokenParams {
 ///     })
 /// });
 /// ```
+type CreateTokenFn = dyn Fn(
+        CreateTokenParams,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateTokenResult, MppError>> + Send>>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
 pub struct StripeProvider {
-    create_token: Arc<
-        dyn Fn(
-                CreateTokenParams,
-            )
-                -> Pin<Box<dyn Future<Output = Result<CreateTokenResult, MppError>> + Send>>
-            + Send
-            + Sync,
-    >,
+    create_token: Arc<CreateTokenFn>,
 }
 
 impl StripeProvider {
