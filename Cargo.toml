@@ -26,10 +26,22 @@ tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
 utils = ["hex", "rand"]
 
 # Middleware support (requires client)
-middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
+middleware = [
+    "client",
+    "reqwest-middleware",
+    "async-trait",
+    "anyhow",
+    "http-types",
+]
 
 # Tower middleware support (server-side)
-tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", "server"]
+tower = [
+    "dep:tower-layer",
+    "dep:tower-service",
+    "http-types",
+    "dep:http-body",
+    "server",
+]
 
 # Axum middleware support (server-side convenience)
 axum = ["dep:axum-core", "server", "http-types"]
@@ -56,17 +68,26 @@ hex = { version = "0.4", optional = true }
 base64 = "0.22"
 rand = { version = "0.9", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
+tokio = { version = "1", features = [
+    "rt",
+    "sync",
+    "time",
+    "macros",
+], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca", features = ["full"], optional = true }
+alloy = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca", features = [
+    "full",
+], optional = true }
 
 # Tempo dependencies (optional)
 tempo-alloy = { git = "https://github.com/tempoxyz/tempo", branch = "alloy-2.0", default-features = false, optional = true }
 tempo-primitives = { git = "https://github.com/tempoxyz/tempo", branch = "alloy-2.0", default-features = false, optional = true }
 
 # HTTP client dependencies (optional)
-reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+], optional = true }
 reqwest-middleware = { version = "0.5", optional = true }
 async-trait = { version = "0.1", optional = true }
 anyhow = { version = "1", optional = true }
@@ -83,7 +104,10 @@ axum-core = { version = "0.5", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 axum = { version = "0.8" }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+] }
 hex = "0.4"
 
 [patch.crates-io]
@@ -91,22 +115,20 @@ hex = "0.4"
 # umbrella crate. Without these, transitive dependencies from `tempo-primitives`
 # (via reth) resolve alloy sub-crates from crates.io (1.x), causing duplicate
 # alloy/reqwest trees when consumed as a git dependency.
-alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-contract = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-eips = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-genesis = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-json-rpc = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-network = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-network-primitives = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-provider = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-rpc-client = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-rpc-types = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-rpc-types-engine = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-rpc-types-eth = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-serde = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-signer = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-signer-local = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-transport = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-alloy-transport-http = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca" }
-
-
+alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-contract = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-eips = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-genesis = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-json-rpc = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-network = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-network-primitives = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-provider = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-rpc-client = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-rpc-types = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-rpc-types-engine = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-rpc-types-eth = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-serde = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-signer = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-signer-local = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-transport = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
+alloy-transport-http = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17" }
