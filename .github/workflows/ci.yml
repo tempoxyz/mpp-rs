@@ -51,7 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo update -p native-tls
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo test --features tempo,server,client,axum,middleware,tower,utils
+      - run: cargo test --features tempo,stripe,server,client,axum,middleware,tower,utils,integration-stripe
       - run: cargo hack check --each-feature --no-dev-deps --skip integration
       - name: Check examples
         run: find examples -name Cargo.toml -exec cargo check --manifest-path {} \;
