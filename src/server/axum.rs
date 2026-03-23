@@ -298,6 +298,48 @@ where
     }
 }
 
+#[cfg(feature = "stripe")]
+impl<S> ChargeChallenger for super::Mpp<super::StripeChargeMethod, S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    fn challenge(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<PaymentChallenge, String> {
+        self.stripe_charge_with_options(
+            amount,
+            super::StripeChargeOptions {
+                description: options.description,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn verify_payment(
+        &self,
+        credential_str: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+        let mpp = self.clone();
+        Box::pin(async move {
+            super::Mpp::verify_credential(&mpp, &credential)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
 impl<S, C> FromRequestParts<S> for MppCharge<C>
 where
     Arc<dyn ChargeChallenger>: FromRef<S>,

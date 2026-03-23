@@ -123,9 +123,15 @@ impl ChargeMethod {
             })?;
 
         if !response.status().is_success() {
-            return Err(VerificationError::new(
-                "Stripe PaymentIntent creation failed",
-            ));
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let message = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(VerificationError::new(format!(
+                "Stripe PaymentIntent creation failed: {message}"
+            )));
         }
 
         let body: serde_json::Value = response

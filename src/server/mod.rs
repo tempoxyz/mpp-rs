@@ -201,6 +201,20 @@ pub struct ChargeOptions<'a> {
     pub fee_payer: bool,
 }
 
+/// Options for [`Mpp::stripe_charge_with_options()`].
+#[cfg(feature = "stripe")]
+#[derive(Debug, Default)]
+pub struct StripeChargeOptions<'a> {
+    /// Human-readable description.
+    pub description: Option<&'a str>,
+    /// Merchant reference ID.
+    pub external_id: Option<&'a str>,
+    /// Custom expiration (ISO 8601). Default: now + 5 minutes.
+    pub expires: Option<&'a str>,
+    /// Optional metadata key-value pairs.
+    pub metadata: Option<&'a std::collections::HashMap<String, String>>,
+}
+
 /// Builder returned by [`stripe()`] for configuring a Stripe payment method.
 #[cfg(feature = "stripe")]
 pub struct StripeBuilder {
