@@ -35,6 +35,9 @@ pub enum TempoSigningMode {
         /// Optional signed key authorization to provision the key on-chain
         /// atomically with the first transaction.
         key_authorization: Option<Box<SignedKeyAuthorization>>,
+        /// Keychain signature version. V1 signs `sig_hash` directly (legacy,
+        /// deprecated at T1C). V2 signs `keccak256(0x04 || sig_hash || user_address)`.
+        version: KeychainVersion,
     },
 }
 
