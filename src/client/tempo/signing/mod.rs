@@ -61,6 +61,27 @@ impl TempoSigningMode {
     }
 }
 
+/// Compute the hash that the signer should sign, given the tx sig_hash and mode.
+///
+/// - `Direct` / `Keychain` V1: signs the raw `sig_hash`.
+/// - `Keychain` V2: signs `keccak256(0x04 || sig_hash || user_address)`.
+fn effective_signing_hash(
+    sig_hash: alloy::primitives::B256,
+    mode: &TempoSigningMode,
+) -> alloy::primitives::B256 {
+    use tempo_primitives::transaction::KeychainSignature;
+
+    match mode {
+        TempoSigningMode::Direct => sig_hash,
+        TempoSigningMode::Keychain {
+            wallet, version, ..
+        } => match version {
+            KeychainVersion::V1 => sig_hash,
+            KeychainVersion::V2 => KeychainSignature::signing_hash(sig_hash, *wallet),
+        },
+    }
+}
+
 /// Build the [`TempoSignature`] for a given inner signature and signing mode.
 fn build_tempo_signature(
     inner_signature: alloy::signers::Signature,
@@ -72,9 +93,15 @@ fn build_tempo_signature(
         TempoSigningMode::Direct => {
             TempoSignature::Primitive(PrimitiveSignature::Secp256k1(inner_signature))
         }
-        TempoSigningMode::Keychain { wallet, .. } => {
+        TempoSigningMode::Keychain {
+            wallet, version, ..
+        } => {
             let primitive = PrimitiveSignature::Secp256k1(inner_signature);
-            TempoSignature::Keychain(KeychainSignature::new(*wallet, primitive))
+            let keychain_sig = match version {
+                KeychainVersion::V1 => KeychainSignature::new_v1(*wallet, primitive),
+                KeychainVersion::V2 => KeychainSignature::new(*wallet, primitive),
+            };
+            TempoSignature::Keychain(keychain_sig)
         }
     }
 }
