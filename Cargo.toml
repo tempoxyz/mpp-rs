@@ -42,6 +42,7 @@ reqwest-rustls-tls = ["reqwest?/rustls-tls"]
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
 integration-stripe = ["stripe", "server", "client", "axum"]
+integration-stripe-live = ["stripe", "server", "client"]
 
 [dependencies]
 # Core dependencies (always included)

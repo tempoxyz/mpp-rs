@@ -52,7 +52,12 @@ jobs:
       - run: cargo update -p native-tls
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo test --features tempo,stripe,server,client,axum,middleware,tower,utils,integration-stripe
-      - run: cargo hack check --each-feature --no-dev-deps --skip integration
+      - name: Live Stripe integration tests
+        if: env.STRIPE_SECRET_KEY != ''
+        run: cargo test --features integration-stripe-live --test integration_stripe_live
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      - run: cargo hack check --each-feature --no-dev-deps --skip integration,integration-stripe-live
       - name: Check examples
         run: find examples -name Cargo.toml -exec cargo check --manifest-path {} \;
 
