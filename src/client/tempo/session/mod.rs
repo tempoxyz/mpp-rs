@@ -17,7 +17,7 @@ use self::channel_ops::{
     resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry, OpenPayloadOptions,
 };
 use crate::client::PaymentProvider;
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::session::TempoSessionExt;
@@ -77,10 +77,7 @@ impl TempoSessionProvider {
         signer: alloy::signers::local::PrivateKeySigner,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
-        let url = rpc_url
-            .as_ref()
-            .parse()
-            .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?;
+        let url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
         Ok(Self {
             signer,
             rpc_url: url,
@@ -162,12 +159,7 @@ impl TempoSessionProvider {
     }
 
     fn channel_key(payee: &Address, currency: &Address, escrow: &Address) -> String {
-        format!(
-            "{}:{}:{}",
-            format!("{}", payee).to_lowercase(),
-            format!("{}", currency).to_lowercase(),
-            format!("{}", escrow).to_lowercase()
-        )
+        format!("{:#x}:{:#x}:{:#x}", payee, currency, escrow)
     }
 
     /// Get the cumulative voucher amount for the first active channel.
@@ -246,7 +238,7 @@ impl TempoSessionProvider {
             .header("Authorization", auth_header)
             .send()
             .await
-            .map_err(|e| MppError::Http(format!("voucher POST failed: {}", e)))?;
+            .mpp_http("voucher POST failed")?;
 
         if !resp.status().is_success() {
             return Err(MppError::Http(format!(
@@ -315,7 +307,7 @@ impl TempoSessionProvider {
             .header("Authorization", auth_header)
             .send()
             .await
-            .map_err(|e| MppError::Http(format!("close request failed: {}", e)))?;
+            .mpp_http("close request failed")?;
 
         let status = resp.status();
         let receipt_header = resp
@@ -361,7 +353,8 @@ impl TempoSessionProvider {
 
 impl PaymentProvider for TempoSessionProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "tempo" && intent == "session"
+        method == crate::protocol::methods::tempo::METHOD_NAME
+            && intent == crate::protocol::methods::tempo::INTENT_SESSION
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -373,9 +366,10 @@ impl PaymentProvider for TempoSessionProvider {
         let chain_id = resolve_chain_id(challenge);
         let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;
 
-        let session_req: SessionRequest = challenge.request.decode().map_err(|e| {
-            MppError::InvalidConfig(format!("failed to decode session request: {}", e))
-        })?;
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
 
         let payee: Address = session_req
             .recipient
@@ -445,7 +439,7 @@ impl PaymentProvider for TempoSessionProvider {
                     self.channel_id_to_key
                         .lock()
                         .unwrap()
-                        .insert(format!("{}", recovered.channel_id), key.clone());
+                        .insert(recovered.channel_id.to_string(), key.clone());
                     self.channels.lock().unwrap().insert(key, recovered.clone());
                     self.notify_update(&recovered);
 
@@ -481,7 +475,7 @@ impl PaymentProvider for TempoSessionProvider {
         self.channel_id_to_key
             .lock()
             .unwrap()
-            .insert(format!("{}", entry.channel_id), key.clone());
+            .insert(entry.channel_id.to_string(), key.clone());
         self.channels.lock().unwrap().insert(key, entry.clone());
         self.notify_update(&entry);
 

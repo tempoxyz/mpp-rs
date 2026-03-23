@@ -5,33 +5,11 @@
 //! from a `SignedKeyAuthorization`.
 
 use alloy::primitives::{Address, U256};
-use alloy::sol;
+use tempo_alloy::contracts::precompiles::{IAccountKeychain, ACCOUNT_KEYCHAIN_ADDRESS};
 use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::client::tempo::TempoClientError;
-use crate::error::MppError;
-
-sol! {
-    #[sol(rpc)]
-    interface IAccountKeychain {
-        struct KeyInfo {
-            uint8 signatureType;
-            address keyId;
-            uint64 expiry;
-            bool enforceLimits;
-            bool isRevoked;
-        }
-
-        function getKey(address account, address keyId) external view returns (KeyInfo memory);
-        function getRemainingLimit(address account, address keyId, address token) external view returns (uint256);
-    }
-}
-
-/// IAccountKeychain precompile address on Tempo networks.
-pub const KEYCHAIN_ADDRESS: Address = Address::new([
-    0xAA, 0xAA, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00,
-]);
+use crate::error::{MppError, ResultExt};
 
 /// Validate key info returned from the keychain precompile.
 ///
@@ -67,7 +45,7 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
     key_address: Address,
     token: Address,
 ) -> Result<Option<U256>, MppError> {
-    let keychain = IAccountKeychain::new(KEYCHAIN_ADDRESS, provider);
+    let keychain = IAccountKeychain::new(ACCOUNT_KEYCHAIN_ADDRESS, provider);
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -78,7 +56,7 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
         .getKey(wallet_address, key_address)
         .call()
         .await
-        .map_err(|e| MppError::Http(format!("Failed to query key info: {}", e)))?;
+        .mpp_http("failed to query key info")?;
 
     let enforces_limits = validate_key_info(&key_info, now_secs)?;
     if !enforces_limits {
@@ -89,7 +67,7 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
         .getRemainingLimit(wallet_address, key_address, token)
         .call()
         .await
-        .map_err(|e| MppError::Http(format!("Failed to query remaining limit: {}", e)))?;
+        .mpp_http("failed to query remaining limit")?;
 
     Ok(Some(result))
 }
@@ -275,7 +253,7 @@ mod tests {
     #[test]
     fn test_keychain_address() {
         assert_eq!(
-            format!("{:#x}", KEYCHAIN_ADDRESS),
+            format!("{:#x}", ACCOUNT_KEYCHAIN_ADDRESS),
             "0xaaaaaaaa00000000000000000000000000000000"
         );
     }
@@ -288,7 +266,7 @@ mod tests {
         enforce_limits: bool,
     ) -> IAccountKeychain::KeyInfo {
         IAccountKeychain::KeyInfo {
-            signatureType: 0,
+            signatureType: IAccountKeychain::SignatureType::Secp256k1,
             keyId: Address::ZERO,
             expiry,
             enforceLimits: enforce_limits,

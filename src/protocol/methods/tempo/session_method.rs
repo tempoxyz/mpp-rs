@@ -356,7 +356,7 @@ where
                 tx_receipt.transaction_hash()
             )));
         }
-        let open_tx_hash = format!("{}", tx_receipt.transaction_hash());
+        let open_tx_hash = tx_receipt.transaction_hash().to_string();
 
         let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
 
@@ -742,7 +742,7 @@ where
                 .await
                 .map_err(|e| VerificationError::network_error(format!("close tx failed: {}", e)))?;
 
-            Some(format!("{}", receipt.transaction_hash))
+            Some(receipt.transaction_hash.to_string())
         } else {
             None
         };
@@ -1654,7 +1654,7 @@ mod tests {
         let mut forged_envelope = vec![0x03u8];
         forged_envelope.extend_from_slice(signer.address().as_slice());
         forged_envelope.extend_from_slice(&[0xBB; 65]);
-        let forged_sig = format!("0x{}", hex::encode(&forged_envelope));
+        let forged_sig = alloy::hex::encode_prefixed(&forged_envelope);
 
         let result = method
             .verify_and_accept_voucher(

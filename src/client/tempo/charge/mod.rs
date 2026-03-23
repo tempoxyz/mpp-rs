@@ -34,22 +34,50 @@ use alloy::primitives::{Address, TxKind, U256};
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
-use crate::client::tempo::abi::encode_transfer;
 use crate::client::tempo::signing::{
     sign_and_encode_async, sign_and_encode_fee_payer_envelope_async, TempoSigningMode,
 };
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::methods::tempo::charge::{parse_memo_bytes, TempoChargeExt};
 use crate::protocol::methods::tempo::network::TempoNetwork;
 use crate::protocol::methods::tempo::CHAIN_ID;
+use alloy::sol_types::SolCall;
+use tempo_alloy::contracts::precompiles::ITIP20;
+use tempo_alloy::rpc::TempoTransactionRequest;
 
 /// Nonce key for expiring nonce transactions (fee payer mode).
 const EXPIRING_NONCE_KEY: U256 = U256::MAX;
 
 /// Validity window (in seconds) for fee payer transactions.
 const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+
+/// Encode a TIP-20 token transfer call, optionally with memo.
+fn encode_transfer(
+    recipient: Address,
+    amount: U256,
+    memo: Option<[u8; 32]>,
+) -> alloy::primitives::Bytes {
+    if let Some(memo_bytes) = memo {
+        alloy::primitives::Bytes::from(
+            ITIP20::transferWithMemoCall {
+                to: recipient,
+                amount,
+                memo: memo_bytes.into(),
+            }
+            .abi_encode(),
+        )
+    } else {
+        alloy::primitives::Bytes::from(
+            ITIP20::transferCall {
+                to: recipient,
+                amount,
+            }
+            .abi_encode(),
+        )
+    }
+}
 
 /// A parsed, validated Tempo charge ready to be signed.
 ///
@@ -140,8 +168,7 @@ impl TempoCharge {
     /// The swap and transfer then execute atomically in a single AA transaction.
     pub fn with_prepended_call(mut self, call: Call) -> Self {
         let calls = self.calls.get_or_insert_with(|| {
-            let transfer_data =
-                crate::client::tempo::abi::encode_transfer(self.recipient, self.amount, self.memo);
+            let transfer_data = encode_transfer(self.recipient, self.amount, self.memo);
             vec![Call {
                 to: TxKind::Call(self.currency),
                 value: U256::ZERO,
@@ -183,9 +210,7 @@ impl TempoCharge {
 
         // Resolve RPC provider + build calls
         let rpc_url = match options.rpc_url {
-            Some(url) => url
-                .parse()
-                .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?,
+            Some(url) => url.parse().mpp_config("invalid RPC URL")?,
             None => {
                 let network = TempoNetwork::from_chain_id(self.chain_id).ok_or_else(|| {
                     MppError::InvalidConfig(format!(
@@ -196,7 +221,7 @@ impl TempoCharge {
                 network
                     .default_rpc_url()
                     .parse()
-                    .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?
+                    .mpp_config("invalid RPC URL")?
             }
         };
         let provider =
@@ -245,20 +270,26 @@ impl TempoCharge {
                 .key_authorization
                 .as_deref()
                 .or_else(|| signing_mode.key_authorization());
-            estimate_gas(
-                &provider,
-                from,
-                self.chain_id,
-                nonce,
-                fee_token,
-                &calls,
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-                key_auth,
-                nonce_key,
-                valid_before,
-            )
-            .await?
+
+            let mut req = TempoTransactionRequest {
+                calls: calls.clone(),
+                key_authorization: key_auth.cloned(),
+                ..Default::default()
+            }
+            .with_fee_token(fee_token)
+            .with_nonce_key(nonce_key);
+
+            if let Some(vb) = valid_before {
+                req = req.with_valid_before(vb);
+            }
+
+            req.inner.from = Some(from);
+            req.inner.chain_id = Some(self.chain_id);
+            req.inner.nonce = Some(nonce);
+            req.inner.max_fee_per_gas = Some(max_fee_per_gas);
+            req.inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
+
+            estimate_gas(&provider, req).await?
         };
 
         // Build the key_authorization for the transaction

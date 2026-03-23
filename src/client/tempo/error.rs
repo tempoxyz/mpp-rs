@@ -5,6 +5,8 @@
 //! They are scoped under `client::tempo` to make clear they belong to a
 //! single payment method, not the protocol layer.
 
+use alloy::transports::TransportError;
+use tempo_alloy::contracts::precompiles::{IAccountKeychain, ITIP20};
 use thiserror::Error;
 
 /// Errors specific to Tempo client-side payment operations.
@@ -57,13 +59,38 @@ fn extract_field(raw: &str, key: &str) -> Option<String> {
 }
 
 impl TempoClientError {
-    /// Classify an RPC or on-chain error message into a typed error.
+    /// Classify a transport error by first trying ABI-decoded revert data,
+    /// then falling back to string-based classification.
+    pub fn from_transport_error(e: &TransportError) -> Option<Self> {
+        if let Some(payload) = e.as_error_resp() {
+            if let Some(err) = payload.as_decoded_error::<ITIP20::InsufficientBalance>() {
+                return Some(Self::InsufficientBalance {
+                    token: err.token.to_string(),
+                    available: err.available.to_string(),
+                    required: err.required.to_string(),
+                });
+            }
+            if payload
+                .as_decoded_error::<IAccountKeychain::SpendingLimitExceeded>()
+                .is_some()
+            {
+                let msg = e.to_string();
+                return Some(Self::SpendingLimitExceeded {
+                    token: extract_field(&msg, "token").unwrap_or_default(),
+                    limit: extract_field(&msg, "limit").unwrap_or_default(),
+                    required: extract_field(&msg, "required").unwrap_or(msg),
+                });
+            }
+        }
+
+        Self::classify_rpc_error(e.to_string())
+    }
+
+    /// Fallback: classify an error from its display string.
     ///
-    /// Detects common Tempo revert reasons from gas estimation or transaction
-    /// broadcast and returns structured variants. Falls back to
-    /// `TransactionReverted` for recognized reverts, or returns `None` if the
-    /// message doesn't look Tempo-specific.
-    pub fn classify_rpc_error(msg: impl Into<String>) -> Option<Self> {
+    /// Detects common Tempo revert reasons via substring matching.
+    /// Returns `None` if the message doesn't look Tempo-specific.
+    fn classify_rpc_error(msg: impl Into<String>) -> Option<Self> {
         let msg = msg.into();
         let lower = msg.to_lowercase();
 
@@ -72,21 +99,10 @@ impl TempoClientError {
         }
 
         if lower.contains("spendinglimitexceeded") || lower.contains("spending limit") {
-            if let (Some(token), Some(limit), Some(required)) = (
-                extract_field(&msg, "token"),
-                extract_field(&msg, "limit"),
-                extract_field(&msg, "required"),
-            ) {
-                return Some(Self::SpendingLimitExceeded {
-                    token,
-                    limit,
-                    required,
-                });
-            }
             return Some(Self::SpendingLimitExceeded {
-                token: String::new(),
-                limit: String::new(),
-                required: msg,
+                token: extract_field(&msg, "token").unwrap_or_default(),
+                limit: extract_field(&msg, "limit").unwrap_or_default(),
+                required: extract_field(&msg, "required").unwrap_or(msg),
             });
         }
 
@@ -94,21 +110,10 @@ impl TempoClientError {
             || lower.contains("transfer amount exceeds balance")
             || (lower.contains("insufficient") && lower.contains("balance"))
         {
-            if let (Some(token), Some(available), Some(required)) = (
-                extract_field(&msg, "token"),
-                extract_field(&msg, "available"),
-                extract_field(&msg, "required"),
-            ) {
-                return Some(Self::InsufficientBalance {
-                    token,
-                    available,
-                    required,
-                });
-            }
             return Some(Self::InsufficientBalance {
-                token: String::new(),
-                available: String::new(),
-                required: msg,
+                token: extract_field(&msg, "token").unwrap_or_default(),
+                available: extract_field(&msg, "available").unwrap_or_default(),
+                required: extract_field(&msg, "required").unwrap_or(msg),
             });
         }
 

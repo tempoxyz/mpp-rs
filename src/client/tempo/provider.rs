@@ -1,6 +1,6 @@
 //! Tempo charge payment provider.
 
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
 use super::autoswap::AutoswapConfig;
@@ -54,10 +54,7 @@ impl TempoProvider {
         signer: alloy::signers::local::PrivateKeySigner,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
-        let url = rpc_url
-            .as_ref()
-            .parse()
-            .map_err(|e| MppError::InvalidConfig(format!("invalid RPC URL: {}", e)))?;
+        let url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
         Ok(Self {
             signer,
             rpc_url: url,
@@ -123,7 +120,8 @@ impl TempoProvider {
 
 impl PaymentProvider for TempoProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
-        method == "tempo" && intent == "charge"
+        method == crate::protocol::methods::tempo::METHOD_NAME
+            && intent == crate::protocol::methods::tempo::INTENT_CHARGE
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {

@@ -25,11 +25,13 @@
 //! ```
 
 use alloy::primitives::{Address, Bytes, TxKind, U256};
-use alloy::sol_types::{SolCall, SolType};
+use alloy::sol_types::SolCall;
+use tempo_alloy::contracts::precompiles::{
+    IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS as DEX_ADDRESS,
+};
 use tempo_primitives::transaction::Call;
 
-use super::abi::{self, IStablecoinDEX, ITIP20};
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 
 /// Maximum allowed slippage in basis points (50% = 5000 bps).
 const MAX_SLIPPAGE_BPS: u16 = 5_000;
@@ -66,21 +68,13 @@ pub async fn check_balance_deficit<P: alloy::providers::Provider<tempo_alloy::Te
     currency: Address,
     amount: U256,
 ) -> Result<Option<U256>, MppError> {
-    let balance_call = ITIP20::balanceOfCall { account: owner }.abi_encode();
-    let result = provider
-        .call(
-            alloy::rpc::types::TransactionRequest::default()
-                .to(currency)
-                .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
-                    balance_call,
-                )))
-                .into(),
-        )
+    let tip20 = ITIP20::new(currency, provider);
+    let balance = tip20
+        .balanceOf(owner)
+        .call()
         .await
-        .map_err(|e| MppError::Http(format!("failed to query balance: {e}")))?;
+        .mpp_http("failed to query balance")?;
 
-    let balance = <alloy::sol_types::sol_data::Uint<256>>::abi_decode(&result)
-        .map_err(|e| MppError::Http(format!("failed to decode balance: {e}")))?;
     if balance >= amount {
         Ok(None)
     } else {
@@ -95,27 +89,13 @@ pub async fn quote_swap<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>
     token_out: Address,
     amount_out: u128,
 ) -> Result<u128, MppError> {
-    let quote_call = IStablecoinDEX::quoteSwapExactAmountOutCall {
-        tokenIn: token_in,
-        tokenOut: token_out,
-        amountOut: amount_out,
-    }
-    .abi_encode();
-
-    let result = provider
-        .call(
-            alloy::rpc::types::TransactionRequest::default()
-                .to(abi::DEX_ADDRESS)
-                .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
-                    quote_call,
-                )))
-                .into(),
-        )
+    let dex = IStablecoinDEX::new(DEX_ADDRESS, provider);
+    let amount_in = dex
+        .quoteSwapExactAmountOut(token_in, token_out, amount_out)
+        .call()
         .await
-        .map_err(|e| MppError::Http(format!("DEX quote failed: {e}")))?;
+        .mpp_http("DEX quote failed")?;
 
-    let amount_in = <alloy::sol_types::sol_data::Uint<128>>::abi_decode(&result)
-        .map_err(|e| MppError::Http(format!("failed to decode DEX quote: {e}")))?;
     Ok(amount_in)
 }
 
@@ -132,11 +112,18 @@ pub fn build_swap_call(
     // max_amount_in = quoted_amount_in * (10000 + slippage_bps) / 10000
     let max_amount_in = quoted_amount_in.saturating_mul(10_000 + slippage_bps as u128) / 10_000;
 
-    let swap_data =
-        abi::encode_swap_exact_amount_out(token_in, token_out, amount_out, max_amount_in);
+    let swap_data = Bytes::from(
+        IStablecoinDEX::swapExactAmountOutCall {
+            tokenIn: token_in,
+            tokenOut: token_out,
+            amountOut: amount_out,
+            maxAmountIn: max_amount_in,
+        }
+        .abi_encode(),
+    );
 
     Call {
-        to: TxKind::Call(abi::DEX_ADDRESS),
+        to: TxKind::Call(DEX_ADDRESS),
         value: U256::ZERO,
         input: swap_data,
     }
@@ -188,9 +175,9 @@ pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNe
     if token_in_balance.is_some() {
         return Err(MppError::from(
             crate::client::tempo::TempoClientError::InsufficientBalance {
-                token: format!("{}", config.token_in),
+                token: config.token_in.to_string(),
                 available: String::new(),
-                required: format!("{}", max_amount_in),
+                required: max_amount_in.to_string(),
             },
         ));
     }
@@ -225,7 +212,7 @@ mod tests {
         let call = build_swap_call(token_in, token_out, 1_000_000, 1_000_000, 100);
 
         // max_amount_in = 1_000_000 * 10100 / 10000 = 1_010_000
-        assert_eq!(call.to, TxKind::Call(abi::DEX_ADDRESS));
+        assert_eq!(call.to, TxKind::Call(DEX_ADDRESS));
         assert_eq!(call.value, U256::ZERO);
 
         // Verify the encoded call data decodes correctly.

@@ -280,8 +280,7 @@ impl PaymentLayer<ChargeVerifier> {
         let expected_request: crate::protocol::intents::ChargeRequest =
             expected_challenge.request.decode().map_err(|e| {
                 crate::error::MppError::InvalidConfig(format!(
-                    "Failed to decode route charge request: {}",
-                    e
+                    "Failed to decode route charge request: {e}"
                 ))
             })?;
 
@@ -290,9 +289,9 @@ impl PaymentLayer<ChargeVerifier> {
         let challenge_fn = Box::new(move || {
             let challenge = mpp_for_challenge
                 .charge(&charge_amount)
-                .map_err(|e| format!("Failed to generate challenge: {}", e))?;
+                .map_err(|e| format!("Failed to generate challenge: {e}"))?;
             format_www_authenticate(&challenge)
-                .map_err(|e| format!("Failed to format challenge: {}", e))
+                .map_err(|e| format!("Failed to format challenge: {e}"))
         });
 
         let mpp_for_verify = mpp.clone();
@@ -301,14 +300,14 @@ impl PaymentLayer<ChargeVerifier> {
             let expected_request = expected_request.clone();
             Box::pin(async move {
                 let credential = parse_authorization(&credential_str)
-                    .map_err(|e| format!("Invalid credential: {}", e))?;
+                    .map_err(|e| format!("Invalid credential: {e}"))?;
 
                 let receipt = mpp
                     .verify_credential_with_expected_request(&credential, &expected_request)
                     .await
-                    .map_err(|e| format!("{}", e))?;
+                    .map_err(|e| e.to_string())?;
 
-                format_receipt(&receipt).map_err(|e| format!("Failed to format receipt: {}", e))
+                format_receipt(&receipt).map_err(|e| format!("Failed to format receipt: {e}"))
             })
         });
 

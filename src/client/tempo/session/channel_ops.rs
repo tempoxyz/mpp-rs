@@ -12,7 +12,7 @@ use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::TempoNetwork;
 
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSessionExt};
@@ -98,7 +98,7 @@ pub fn build_credential(
     signer_address: Address,
 ) -> PaymentCredential {
     let echo = challenge.to_echo();
-    let source = format!("did:pkh:eip155:{}:{}", chain_id, signer_address);
+    let source = PaymentCredential::evm_did(chain_id, &signer_address.to_string());
     PaymentCredential::with_source(echo, source, payload)
 }
 
@@ -120,9 +120,9 @@ pub async fn create_voucher_payload(
     .await?;
 
     Ok(SessionCredentialPayload::Voucher {
-        channel_id: format!("{}", channel_id),
+        channel_id: channel_id.to_string(),
         cumulative_amount: cumulative_amount.to_string(),
-        signature: format!("0x{}", hex::encode(&sig)),
+        signature: alloy::hex::encode_prefixed(&sig),
     })
 }
 
@@ -144,9 +144,9 @@ pub async fn create_close_payload(
     .await?;
 
     Ok(SessionCredentialPayload::Close {
-        channel_id: format!("{}", channel_id),
+        channel_id: channel_id.to_string(),
         cumulative_amount: cumulative_amount.to_string(),
-        signature: format!("0x{}", hex::encode(&sig)),
+        signature: alloy::hex::encode_prefixed(&sig),
     })
 }
 
@@ -204,7 +204,7 @@ where
     );
 
     // Build approve calldata
-    use crate::client::tempo::abi::ITIP20;
+    use tempo_alloy::contracts::precompiles::ITIP20;
 
     sol! {
         interface IEscrow {
@@ -248,12 +248,12 @@ where
     let nonce = provider
         .get_transaction_count(payer)
         .await
-        .map_err(|e| MppError::Http(format!("failed to get nonce: {}", e)))?;
+        .mpp_http("failed to get nonce")?;
 
     let gas_price = provider
         .get_gas_price()
         .await
-        .map_err(|e| MppError::Http(format!("failed to get gas price: {}", e)))?;
+        .mpp_http("failed to get gas price")?;
 
     let tempo_tx = crate::client::tempo::charge::tx_builder::build_tempo_tx(
         crate::client::tempo::charge::tx_builder::TempoTxOptions {
@@ -274,7 +274,7 @@ where
     let tx_bytes =
         crate::client::tempo::signing::sign_and_encode_async(tempo_tx, signer, signing_mode)
             .await?;
-    let signed_tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+    let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
     // Sign the initial voucher
     let voucher_sig = sign_voucher(
@@ -297,11 +297,11 @@ where
 
     let payload = SessionCredentialPayload::Open {
         payload_type: "transaction".to_string(),
-        channel_id: format!("{}", channel_id),
+        channel_id: channel_id.to_string(),
         transaction: signed_tx_hex,
-        authorized_signer: Some(format!("{}", authorized_signer)),
+        authorized_signer: Some(authorized_signer.to_string()),
         cumulative_amount: options.initial_amount.to_string(),
-        signature: format!("0x{}", hex::encode(&voucher_sig)),
+        signature: alloy::hex::encode_prefixed(&voucher_sig),
     };
 
     Ok((entry, payload))
@@ -359,11 +359,11 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     let result = provider
         .call(tx_req)
         .await
-        .map_err(|e| MppError::Http(format!("failed to read channel: {}", e)))?;
+        .mpp_http("failed to read channel")?;
 
     let decoded =
         <(bool, u64, Address, Address, Address, Address, u128, u128)>::abi_decode(&result)
-            .map_err(|e| MppError::Http(format!("failed to decode channel data: {}", e)))?;
+            .mpp_http("failed to decode channel data")?;
 
     Ok(OnChainChannel {
         finalized: decoded.0,
