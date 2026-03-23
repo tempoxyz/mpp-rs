@@ -34,7 +34,7 @@ cargo add mpp
 
 ## Quick Start
 
-### Server
+### Server (Tempo)
 
 ```rust
 use mpp::server::{Mpp, tempo, TempoConfig};
@@ -47,7 +47,24 @@ let challenge = mpp.charge("1")?;
 let receipt = mpp.verify_credential(&credential).await?;
 ```
 
-### Client
+### Server (Stripe)
+
+```rust
+use mpp::server::{Mpp, stripe, StripeConfig};
+
+let mpp = Mpp::create_stripe(stripe(StripeConfig {
+    secret_key: "sk_test_...",
+    network_id: "internal",
+    payment_method_types: &["card"],
+    currency: "usd",
+    decimals: 2,
+}))?;
+
+let challenge = mpp.stripe_charge("1")?;
+let receipt = mpp.verify_credential(&credential).await?;
+```
+
+### Client (Tempo)
 
 ```rust
 use mpp::client::{PaymentMiddleware, TempoProvider};
@@ -62,6 +79,29 @@ let client = ClientBuilder::new(reqwest::Client::new())
 let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 ```
 
+### Client (Stripe)
+
+```rust
+use mpp::client::{Fetch, StripeProvider};
+use mpp::protocol::methods::stripe::CreateTokenResult;
+
+let provider = StripeProvider::new(|params| {
+    Box::pin(async move {
+        // Proxy SPT creation through your backend (requires Stripe secret key)
+        let resp = reqwest::Client::new()
+            .post("https://my-server.com/api/create-spt")
+            .json(&params)
+            .send().await?.json::<serde_json::Value>().await?;
+        Ok(CreateTokenResult::from(resp["spt"].as_str().unwrap().to_string()))
+    })
+});
+
+let resp = reqwest::Client::new()
+    .get("https://api.example.com/paid")
+    .send_with_payment(&provider)
+    .await?;
+```
+
 ## Feature Flags
 
 | Feature | Description |
@@ -69,6 +109,7 @@ let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 | `client` | Client-side payment providers (`PaymentProvider` trait, `Fetch` extension) |
 | `server` | Server-side payment verification (`ChargeMethod` trait) |
 | `tempo` | [Tempo](https://tempo.xyz) blockchain support (includes `evm`) |
+| `stripe` | [Stripe](https://stripe.com) payment support via SPTs |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
 | `middleware` | reqwest-middleware support with `PaymentMiddleware` (implies `client`) |
 | `tower` | Tower middleware for server-side integration |
@@ -77,7 +118,7 @@ let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 
 ## Payment Methods
 
-MPP supports multiple [payment methods](https://mpp.dev/payment-methods/) through one protocol — [Tempo](https://mpp.dev/payment-methods/tempo/), [Stripe](https://mpp.dev/payment-methods/stripe/), [Lightning](https://mpp.dev/payment-methods/lightning/), [Card](https://mpp.dev/payment-methods/card/), and [custom methods](https://mpp.dev/payment-methods/custom). The server advertises which methods it accepts, and the client chooses which one to pay with. This SDK currently implements Tempo (charge and session intents).
+MPP supports multiple [payment methods](https://mpp.dev/payment-methods/) through one protocol — [Tempo](https://mpp.dev/payment-methods/tempo/), [Stripe](https://mpp.dev/payment-methods/stripe/), [Lightning](https://mpp.dev/payment-methods/lightning/), [Card](https://mpp.dev/payment-methods/card/), and [custom methods](https://mpp.dev/payment-methods/custom). The server advertises which methods it accepts, and the client chooses which one to pay with. This SDK implements Tempo (charge and session intents) and Stripe (charge intent via Shared Payment Tokens).
 
 ## Protocol
 

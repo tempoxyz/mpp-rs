@@ -31,6 +31,12 @@ pub mod payment_request;
 pub mod session;
 
 pub use charge::ChargeRequest;
+
+/// Intent identifier for one-time payments.
+pub const INTENT_CHARGE: &str = "charge";
+
+/// Intent identifier for pay-as-you-go sessions.
+pub const INTENT_SESSION: &str = "session";
 pub use payment_request::{
     deserialize as deserialize_request, deserialize_typed as deserialize_request_typed,
     from_challenge as request_from_challenge, from_challenge_typed as request_from_challenge_typed,

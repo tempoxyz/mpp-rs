@@ -172,11 +172,11 @@ pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
-/// Charge intent name.
-pub const INTENT_CHARGE: &str = "charge";
+/// Charge intent name (re-exported from [`crate::protocol::intents`]).
+pub use crate::protocol::intents::INTENT_CHARGE;
 
-/// Session intent name.
-pub const INTENT_SESSION: &str = "session";
+/// Session intent name (re-exported from [`crate::protocol::intents`]).
+pub use crate::protocol::intents::INTENT_SESSION;
 
 /// Create a Tempo charge challenge with minimal parameters.
 ///
