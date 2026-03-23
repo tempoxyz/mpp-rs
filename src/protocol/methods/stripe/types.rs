@@ -2,22 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Stripe-specific charge request fields.
+/// Stripe-specific method details nested under `methodDetails` in the challenge request.
 ///
-/// These fields are included in the challenge's `request` object
-/// alongside the standard `amount`, `currency`, and `recipient` fields
-/// from [`ChargeRequest`](crate::protocol::intents::ChargeRequest).
+/// Matches the mppx wire format where `networkId`, `paymentMethodTypes`, and `metadata`
+/// are nested inside the `methodDetails` field of the `ChargeRequest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StripeChargeRequest {
-    /// Payment amount in smallest currency unit.
-    pub amount: String,
-
-    /// Three-letter ISO currency code (e.g., "usd").
-    pub currency: String,
-
-    /// Token decimals for amount conversion.
-    pub decimals: u8,
-
+pub struct StripeMethodDetails {
     /// Stripe Business Network profile ID.
     #[serde(rename = "networkId")]
     pub network_id: String,
@@ -26,27 +16,12 @@ pub struct StripeChargeRequest {
     #[serde(rename = "paymentMethodTypes")]
     pub payment_method_types: Vec<String>,
 
-    /// Human-readable description.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-
-    /// Merchant reference ID.
-    #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
-    pub external_id: Option<String>,
-
     /// Optional metadata key-value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
-
-    /// Recipient address.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recipient: Option<String>,
 }
 
 /// Client credential payload for Stripe charge.
-///
-/// The client sends this after creating an SPT via the server-proxied
-/// Stripe API endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StripeCredentialPayload {
     /// Shared Payment Token from Stripe.
@@ -55,6 +30,24 @@ pub struct StripeCredentialPayload {
     /// Optional external reference ID.
     #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+}
+
+/// Result returned by the `create_token` callback.
+#[derive(Debug, Clone)]
+pub struct CreateTokenResult {
+    /// Shared Payment Token from Stripe.
+    pub spt: String,
+    /// Optional per-payment external reference ID.
+    pub external_id: Option<String>,
+}
+
+impl From<String> for CreateTokenResult {
+    fn from(spt: String) -> Self {
+        Self {
+            spt,
+            external_id: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -67,11 +60,9 @@ mod tests {
             spt: "spt_test_abc123".to_string(),
             external_id: Some("order-42".to_string()),
         };
-
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("\"spt\":\"spt_test_abc123\""));
         assert!(json.contains("\"externalId\":\"order-42\""));
-
         let parsed: StripeCredentialPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.spt, "spt_test_abc123");
         assert_eq!(parsed.external_id.as_deref(), Some("order-42"));
@@ -83,31 +74,41 @@ mod tests {
             spt: "spt_test_xyz".to_string(),
             external_id: None,
         };
-
         let json = serde_json::to_string(&payload).unwrap();
         assert!(!json.contains("externalId"));
     }
 
     #[test]
-    fn test_stripe_charge_request_serde() {
-        let req = StripeChargeRequest {
-            amount: "1000".to_string(),
-            currency: "usd".to_string(),
-            decimals: 2,
+    fn test_stripe_method_details_serde() {
+        let details = StripeMethodDetails {
             network_id: "internal".to_string(),
             payment_method_types: vec!["card".to_string()],
-            description: Some("Test charge".to_string()),
-            external_id: None,
             metadata: None,
-            recipient: None,
         };
-
-        let json = serde_json::to_string(&req).unwrap();
+        let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("\"networkId\":\"internal\""));
         assert!(json.contains("\"paymentMethodTypes\":[\"card\"]"));
-
-        let parsed: StripeChargeRequest = serde_json::from_str(&json).unwrap();
+        let parsed: StripeMethodDetails = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.network_id, "internal");
-        assert_eq!(parsed.payment_method_types, vec!["card"]);
+    }
+
+    #[test]
+    fn test_stripe_method_details_with_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("order_id".to_string(), "12345".to_string());
+        let details = StripeMethodDetails {
+            network_id: "internal".to_string(),
+            payment_method_types: vec!["card".to_string()],
+            metadata: Some(metadata),
+        };
+        let json = serde_json::to_string(&details).unwrap();
+        assert!(json.contains("\"order_id\":\"12345\""));
+    }
+
+    #[test]
+    fn test_create_token_result_from_string() {
+        let result: CreateTokenResult = "spt_123".to_string().into();
+        assert_eq!(result.spt, "spt_123");
+        assert!(result.external_id.is_none());
     }
 }

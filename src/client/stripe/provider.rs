@@ -1,7 +1,4 @@
 //! Stripe payment provider for client-side credential creation.
-//!
-//! The provider handles the `method="stripe"`, `intent="charge"` flow by
-//! delegating SPT creation to a user-provided async callback.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -10,9 +7,12 @@ use std::sync::Arc;
 use crate::client::PaymentProvider;
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::methods::stripe::types::CreateTokenResult;
 use crate::protocol::methods::stripe::{StripeCredentialPayload, METHOD_NAME};
 
 /// Parameters passed to the `create_token` callback.
+///
+/// Matches the mppx `OnChallengeParameters` shape.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CreateTokenParams {
     /// Payment amount in smallest currency unit.
@@ -23,24 +23,12 @@ pub struct CreateTokenParams {
     pub network_id: String,
     /// SPT expiration as Unix timestamp (seconds).
     pub expires_at: u64,
-    /// Optional metadata.
+    /// Optional metadata from the challenge's methodDetails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
-}
-
-/// Trait alias for the SPT creation callback.
-pub trait CreateTokenFn:
-    Fn(CreateTokenParams) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>>
-    + Send
-    + Sync
-{
-}
-
-impl<F> CreateTokenFn for F where
-    F: Fn(CreateTokenParams) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>>
-        + Send
-        + Sync
-{
+    /// The full challenge as JSON, for advanced use cases.
+    #[serde(skip)]
+    pub challenge: serde_json::Value,
 }
 
 /// Client-side Stripe payment provider.
@@ -52,43 +40,53 @@ impl<F> CreateTokenFn for F where
 ///
 /// ```ignore
 /// use mpp::client::stripe::StripeProvider;
+/// use mpp::protocol::methods::stripe::CreateTokenResult;
 ///
 /// let provider = StripeProvider::new(|params| {
 ///     Box::pin(async move {
 ///         let resp = reqwest::Client::new()
 ///             .post("https://my-server.com/api/create-spt")
 ///             .json(&params)
-///             .send().await?
-///             .json::<serde_json::Value>().await?;
-///         Ok(resp["spt"].as_str().unwrap().to_string())
+///             .send().await.map_err(|e| mpp::MppError::Http(e.to_string()))?
+///             .json::<serde_json::Value>().await
+///             .map_err(|e| mpp::MppError::Http(e.to_string()))?;
+///         Ok(CreateTokenResult {
+///             spt: resp["spt"].as_str().unwrap().to_string(),
+///             external_id: None,
+///         })
 ///     })
 /// });
 /// ```
 #[derive(Clone)]
 pub struct StripeProvider {
-    create_token: Arc<dyn CreateTokenFn>,
-    external_id: Option<String>,
+    create_token: Arc<
+        dyn Fn(
+                CreateTokenParams,
+            )
+                -> Pin<Box<dyn Future<Output = Result<CreateTokenResult, MppError>> + Send>>
+            + Send
+            + Sync,
+    >,
 }
 
 impl StripeProvider {
     /// Create a new Stripe provider with the given SPT creation callback.
+    ///
+    /// The callback receives [`CreateTokenParams`] and should return a
+    /// [`CreateTokenResult`] containing the SPT and optional external ID.
     pub fn new<F>(create_token: F) -> Self
     where
-        F: Fn(CreateTokenParams) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>>
+        F: Fn(
+                CreateTokenParams,
+            )
+                -> Pin<Box<dyn Future<Output = Result<CreateTokenResult, MppError>> + Send>>
             + Send
             + Sync
             + 'static,
     {
         Self {
             create_token: Arc::new(create_token),
-            external_id: None,
         }
-    }
-
-    /// Set an external reference ID to include in credential payloads.
-    pub fn with_external_id(mut self, id: impl Into<String>) -> Self {
-        self.external_id = Some(id.into());
-        self
     }
 }
 
@@ -122,13 +120,17 @@ impl PaymentProvider for StripeProvider {
             })?
             .to_string();
 
-        let network_id = request
-            .get("methodDetails")
+        let method_details = request.get("methodDetails");
+
+        let network_id = method_details
             .and_then(|md| md.get("networkId"))
-            .or_else(|| request.get("networkId"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        let metadata: Option<std::collections::HashMap<String, String>> = method_details
+            .and_then(|md| md.get("metadata"))
+            .and_then(|m| serde_json::from_value(m.clone()).ok());
 
         let expires_at = challenge
             .expires
@@ -145,19 +147,22 @@ impl PaymentProvider for StripeProvider {
                     + 3600
             });
 
+        let challenge_json = serde_json::to_value(challenge).unwrap_or_default();
+
         let params = CreateTokenParams {
             amount,
             currency,
             network_id,
             expires_at,
-            metadata: None,
+            metadata,
+            challenge: challenge_json,
         };
 
-        let spt = (self.create_token)(params).await?;
+        let result = (self.create_token)(params).await?;
 
         let payload = StripeCredentialPayload {
-            spt,
-            external_id: self.external_id.clone(),
+            spt: result.spt,
+            external_id: result.external_id,
         };
 
         let echo = challenge.to_echo();
@@ -171,7 +176,9 @@ mod tests {
 
     #[test]
     fn test_supports() {
-        let provider = StripeProvider::new(|_| Box::pin(async { Ok("spt_test".to_string()) }));
+        let provider = StripeProvider::new(|_| {
+            Box::pin(async { Ok(CreateTokenResult::from("spt_test".to_string())) })
+        });
 
         assert!(provider.supports("stripe", "charge"));
         assert!(!provider.supports("tempo", "charge"));

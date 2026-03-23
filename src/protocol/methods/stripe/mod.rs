@@ -26,7 +26,7 @@ pub mod types;
 #[cfg(feature = "server")]
 pub mod method;
 
-pub use types::{StripeChargeRequest, StripeCredentialPayload};
+pub use types::{CreateTokenResult, StripeCredentialPayload, StripeMethodDetails};
 
 /// Payment method name for Stripe.
 pub const METHOD_NAME: &str = "stripe";

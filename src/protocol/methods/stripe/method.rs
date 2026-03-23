@@ -13,6 +13,7 @@
 //! let receipt = method.verify(&credential, &request).await?;
 //! ```
 
+use std::collections::HashMap;
 use std::future::Future;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -75,7 +76,7 @@ impl ChargeMethod {
         amount: &str,
         currency: &str,
         idempotency_key: &str,
-        metadata: Option<&std::collections::HashMap<String, String>>,
+        metadata: &HashMap<String, String>,
     ) -> Result<(String, String), VerificationError> {
         let url = format!("{}/v1/payment_intents", self.api_base);
 
@@ -94,10 +95,8 @@ impl ChargeMethod {
             ("shared_payment_granted_token".to_string(), spt.to_string()),
         ];
 
-        if let Some(meta) = metadata {
-            for (key, value) in meta {
-                params.push((format!("metadata[{key}]"), value.clone()));
-            }
+        for (key, value) in metadata {
+            params.push((format!("metadata[{key}]"), value.clone()));
         }
 
         let client = reqwest::Client::new();
@@ -150,6 +149,21 @@ impl ChargeMethod {
 
         Ok((id, status))
     }
+
+    /// Build analytics metadata matching mppx's buildAnalytics().
+    fn build_analytics(credential: &PaymentCredential) -> HashMap<String, String> {
+        let challenge = &credential.challenge;
+        let mut meta = HashMap::new();
+        meta.insert("mpp_version".into(), "1".into());
+        meta.insert("mpp_is_mpp".into(), "true".into());
+        meta.insert("mpp_intent".into(), challenge.intent.as_str().to_string());
+        meta.insert("mpp_challenge_id".into(), challenge.id.clone());
+        meta.insert("mpp_server_id".into(), challenge.realm.clone());
+        if let Some(ref source) = credential.source {
+            meta.insert("mpp_client_id".into(), source.clone());
+        }
+        meta
+    }
 }
 
 impl ChargeMethodTrait for ChargeMethod {
@@ -195,6 +209,18 @@ impl ChargeMethodTrait for ChargeMethod {
                 VerificationError::new(format!("Failed to decode challenge request: {e}"))
             })?;
 
+            // Build metadata: analytics + user metadata from methodDetails
+            let mut metadata = Self::build_analytics(&credential);
+            if let Some(ref md) = charge_request.method_details {
+                if let Some(user_meta) = md.get("metadata").and_then(|m| m.as_object()) {
+                    for (k, v) in user_meta {
+                        if let Some(s) = v.as_str() {
+                            metadata.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+            }
+
             let idempotency_key = format!("mppx_{}_{}", challenge.id, payload.spt);
 
             let (pi_id, status) = this
@@ -203,7 +229,7 @@ impl ChargeMethodTrait for ChargeMethod {
                     &charge_request.amount,
                     &charge_request.currency,
                     &idempotency_key,
-                    None,
+                    &metadata,
                 )
                 .await?;
 

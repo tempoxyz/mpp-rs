@@ -18,6 +18,7 @@ use std::sync::Arc;
 use axum::extract::Form;
 use axum::{routing::get, Json, Router};
 use mpp::client::{Fetch, StripeProvider};
+use mpp::protocol::methods::stripe::CreateTokenResult;
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
 use mpp::server::{stripe, Mpp, StripeChargeOptions, StripeConfig};
 use reqwest::Client;
@@ -333,7 +334,11 @@ async fn test_e2e_stripe_charge() {
 
     // Create client provider with a mock createToken callback
     let provider = StripeProvider::new(|_params| {
-        Box::pin(async move { Ok("spt_mock_test_token_123".to_string()) })
+        Box::pin(async move {
+            Ok(CreateTokenResult::from(
+                "spt_mock_test_token_123".to_string(),
+            ))
+        })
     });
 
     let resp = Client::new()
@@ -482,7 +487,11 @@ async fn test_stripe_requires_action_rejected() {
     let (url, handle) = start_server(mpp).await;
 
     let provider = StripeProvider::new(|_params| {
-        Box::pin(async move { Ok("spt_will_require_action".to_string()) })
+        Box::pin(async move {
+            Ok(CreateTokenResult::from(
+                "spt_will_require_action".to_string(),
+            ))
+        })
     });
 
     // The client will get a 402, create a credential, but the server
@@ -617,8 +626,9 @@ async fn test_e2e_stripe_charge_with_description() {
     assert_eq!(request["externalId"], "premium-001");
 
     // Also verify full e2e with payment
-    let provider =
-        StripeProvider::new(|_params| Box::pin(async move { Ok("spt_premium_token".to_string()) }));
+    let provider = StripeProvider::new(|_params| {
+        Box::pin(async move { Ok(CreateTokenResult::from("spt_premium_token".to_string())) })
+    });
 
     let resp = Client::new()
         .get(format!("{url}/paid-premium"))
@@ -654,8 +664,9 @@ async fn test_stripe_error_body_parsing() {
     let mpp = Arc::new(mpp);
     let (url, handle) = start_server(mpp).await;
 
-    let provider =
-        StripeProvider::new(|_| Box::pin(async move { Ok("spt_bad_token".to_string()) }));
+    let provider = StripeProvider::new(|_| {
+        Box::pin(async move { Ok(CreateTokenResult::from("spt_bad_token".to_string())) })
+    });
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
@@ -713,7 +724,7 @@ async fn test_stripe_charge_via_mpp_charge_extractor() {
 
     // With payment → expect 200
     let provider = StripeProvider::new(|_params| {
-        Box::pin(async move { Ok("spt_extractor_token".to_string()) })
+        Box::pin(async move { Ok(CreateTokenResult::from("spt_extractor_token".to_string())) })
     });
 
     let resp = Client::new()

@@ -58,7 +58,7 @@ pub use crate::protocol::methods::tempo::session_method::{
 pub use crate::protocol::methods::stripe::method::ChargeMethod as StripeChargeMethod;
 
 #[cfg(feature = "stripe")]
-pub use crate::protocol::methods::stripe::{StripeChargeRequest, StripeCredentialPayload};
+pub use crate::protocol::methods::stripe::{StripeCredentialPayload, StripeMethodDetails};
 
 // ==================== Simple API ====================
 
