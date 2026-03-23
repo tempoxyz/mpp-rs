@@ -76,7 +76,7 @@ tokio = { version = "1", features = [
 ], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { git = "https://github.com/alloy-rs/alloy", rev = "100a3325ac4d624f3eb0bd404125750e76edf8ca", features = [
+alloy = { git = "https://github.com/alloy-rs/alloy", rev = "4031dad6949b84d68dd13e9c4add5365f6993a17", features = [
     "full",
 ], optional = true }
 
