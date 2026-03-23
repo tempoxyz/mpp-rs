@@ -5,10 +5,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::client::PaymentProvider;
-use crate::error::MppError;
+use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::intents::ChargeRequest;
 use crate::protocol::methods::stripe::types::CreateTokenResult;
-use crate::protocol::methods::stripe::{StripeCredentialPayload, INTENT_CHARGE, METHOD_NAME};
+use crate::protocol::methods::stripe::{
+    StripeCredentialPayload, StripeMethodDetails, INTENT_CHARGE, METHOD_NAME,
+};
 
 /// Parameters passed to the `create_token` callback.
 ///
@@ -95,41 +98,18 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        let request: serde_json::Value =
-            challenge
-                .request
-                .decode_value()
-                .map_err(|e| MppError::InvalidChallenge {
-                    id: None,
-                    reason: Some(format!("Failed to decode challenge request: {e}")),
-                })?;
+        let request: ChargeRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode challenge request")?;
 
-        let amount = request["amount"]
-            .as_str()
-            .ok_or_else(|| MppError::InvalidChallenge {
-                id: None,
-                reason: Some("Missing amount in challenge".into()),
-            })?
-            .to_string();
-        let currency = request["currency"]
-            .as_str()
-            .ok_or_else(|| MppError::InvalidChallenge {
-                id: None,
-                reason: Some("Missing currency in challenge".into()),
-            })?
-            .to_string();
-
-        let method_details = request.get("methodDetails");
-
-        let network_id = method_details
-            .and_then(|md| md.get("networkId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let metadata: Option<std::collections::HashMap<String, String>> = method_details
-            .and_then(|md| md.get("metadata"))
-            .and_then(|m| serde_json::from_value(m.clone()).ok());
+        let details: StripeMethodDetails = request
+            .method_details
+            .as_ref()
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .mpp_config("invalid methodDetails")?
+            .unwrap_or_default();
 
         let expires_at = challenge
             .expires
@@ -139,22 +119,20 @@ impl PaymentProvider for StripeProvider {
             })
             .map(|dt| dt.unix_timestamp() as u64)
             .unwrap_or_else(|| {
-                (std::time::SystemTime::now()
+                std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_secs())
+                    .as_secs()
                     + 3600
             });
 
-        let challenge_json = serde_json::to_value(challenge).unwrap_or_default();
-
         let params = CreateTokenParams {
-            amount,
-            currency,
-            network_id,
+            amount: request.amount,
+            currency: request.currency,
+            network_id: details.network_id,
             expires_at,
-            metadata,
-            challenge: challenge_json,
+            metadata: details.metadata,
+            challenge: serde_json::to_value(challenge).unwrap_or_default(),
         };
 
         let result = (self.create_token)(params).await?;
@@ -164,8 +142,7 @@ impl PaymentProvider for StripeProvider {
             external_id: result.external_id,
         };
 
-        let echo = challenge.to_echo();
-        Ok(PaymentCredential::new(echo, payload))
+        Ok(PaymentCredential::new(challenge.to_echo(), payload))
     }
 }
 

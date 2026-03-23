@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Matches the mppx wire format where `networkId`, `paymentMethodTypes`, and `metadata`
 /// are nested inside the `methodDetails` field of the `ChargeRequest`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StripeMethodDetails {
     /// Stripe Business Network profile ID.
     #[serde(rename = "networkId")]

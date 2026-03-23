@@ -20,8 +20,15 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 
-use super::types::StripeCredentialPayload;
+use super::types::{StripeCredentialPayload, StripeMethodDetails};
 use super::{DEFAULT_STRIPE_API_BASE, METHOD_NAME};
+
+/// Minimal Stripe PaymentIntent response fields.
+#[derive(serde::Deserialize)]
+struct PaymentIntentResponse {
+    id: String,
+    status: String,
+}
 
 /// Stripe charge method for one-time payment verification via SPTs.
 #[derive(Clone)]
@@ -133,21 +140,12 @@ impl ChargeMethod {
             )));
         }
 
-        let body: serde_json::Value = response
+        let pi: PaymentIntentResponse = response
             .json()
             .await
             .map_err(|e| VerificationError::new(format!("Failed to parse Stripe response: {e}")))?;
 
-        let id = body["id"]
-            .as_str()
-            .ok_or_else(|| VerificationError::new("Missing id in Stripe response"))?
-            .to_string();
-        let status = body["status"]
-            .as_str()
-            .ok_or_else(|| VerificationError::new("Missing status in Stripe response"))?
-            .to_string();
-
-        Ok((id, status))
+        Ok((pi.id, pi.status))
     }
 
     /// Build analytics metadata matching mppx's buildAnalytics().
@@ -190,19 +188,8 @@ impl ChargeMethodTrait for ChargeMethod {
 
             let challenge = &credential.challenge;
 
-            // Check expiry
-            if let Some(ref expires) = challenge.expires {
-                if let Ok(expires_at) = time::OffsetDateTime::parse(
-                    expires,
-                    &time::format_description::well_known::Rfc3339,
-                ) {
-                    if expires_at <= time::OffsetDateTime::now_utc() {
-                        return Err(VerificationError::expired(format!(
-                            "Challenge expired at {expires}"
-                        )));
-                    }
-                }
-            }
+            // Note: expiry is already checked by Mpp::verify_hmac_and_expiry()
+            // before this method is called.
 
             // Decode the challenge request to get amount/currency
             let charge_request: ChargeRequest = challenge.request.decode().map_err(|e| {
@@ -211,14 +198,15 @@ impl ChargeMethodTrait for ChargeMethod {
 
             // Build metadata: analytics + user metadata from methodDetails
             let mut metadata = Self::build_analytics(&credential);
-            if let Some(ref md) = charge_request.method_details {
-                if let Some(user_meta) = md.get("metadata").and_then(|m| m.as_object()) {
-                    for (k, v) in user_meta {
-                        if let Some(s) = v.as_str() {
-                            metadata.insert(k.clone(), s.to_string());
-                        }
-                    }
-                }
+            let details: StripeMethodDetails = charge_request
+                .method_details
+                .as_ref()
+                .map(|v| serde_json::from_value(v.clone()))
+                .transpose()
+                .map_err(|e| VerificationError::new(format!("Invalid methodDetails: {e}")))?
+                .unwrap_or_default();
+            if let Some(user_meta) = details.metadata {
+                metadata.extend(user_meta);
             }
 
             let idempotency_key = format!("mppx_{}_{}", challenge.id, payload.spt);

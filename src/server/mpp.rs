@@ -685,28 +685,27 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         use crate::protocol::core::Base64UrlJson;
         use time::{Duration, OffsetDateTime};
 
+        use crate::protocol::methods::stripe::StripeMethodDetails;
+
         let base_units = super::parse_dollar_amount(amount, self.decimals)?;
         let currency = self.currency.as_deref().unwrap_or("usd");
 
-        let mut details = serde_json::Map::new();
-        details.insert(
-            "networkId".into(),
-            serde_json::json!(self.method.network_id()),
-        );
-        details.insert(
-            "paymentMethodTypes".into(),
-            serde_json::json!(self.method.payment_method_types()),
-        );
-        if let Some(metadata) = options.metadata {
-            details.insert("metadata".into(), serde_json::json!(metadata));
-        }
+        let details = StripeMethodDetails {
+            network_id: self.method.network_id().to_string(),
+            payment_method_types: self.method.payment_method_types().to_vec(),
+            metadata: options.metadata.cloned(),
+        };
 
         let request = ChargeRequest {
             amount: base_units,
             currency: currency.to_string(),
             description: options.description.map(|s| s.to_string()),
             external_id: options.external_id.map(|s| s.to_string()),
-            method_details: Some(serde_json::Value::Object(details)),
+            method_details: Some(serde_json::to_value(&details).map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "failed to serialize methodDetails: {e}"
+                ))
+            })?),
             ..Default::default()
         };
 
