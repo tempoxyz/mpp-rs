@@ -36,7 +36,7 @@ async fn create_test_spt(
     network_id: Option<&str>,
     expires_at: u64,
 ) -> Result<String, String> {
-    let mut params = vec![
+    let base_params = vec![
         ("payment_method".to_string(), "pm_card_visa".to_string()),
         ("usage_limits[currency]".to_string(), currency.to_string()),
         ("usage_limits[max_amount]".to_string(), amount.to_string()),
@@ -46,27 +46,49 @@ async fn create_test_spt(
         ),
     ];
 
+    let mut params = base_params.clone();
     if let Some(nid) = network_id {
         params.push(("seller_details[network_id]".to_string(), nid.to_string()));
     }
 
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.stripe.com/v1/test_helpers/shared_payment/granted_tokens")
-        .header(
-            "Authorization",
-            format!(
-                "Basic {}",
-                base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    format!("{secret_key}:")
-                )
-            ),
+    let auth = format!(
+        "Basic {}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{secret_key}:")
         )
+    );
+
+    let client = reqwest::Client::new();
+    let url = "https://api.stripe.com/v1/test_helpers/shared_payment/granted_tokens";
+
+    let response = client
+        .post(url)
+        .header("Authorization", &auth)
         .form(&params)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
+
+    // Fallback: if Stripe rejects seller_details/metadata (not all accounts
+    // have these params enabled), retry with base params only.
+    // Matches mppx's fallback behavior in Charge.integration.test.ts.
+    let response = if !response.status().is_success() && network_id.is_some() {
+        let body = response.text().await.unwrap_or_default();
+        if body.contains("Received unknown parameter") {
+            client
+                .post(url)
+                .header("Authorization", &auth)
+                .form(&base_params)
+                .send()
+                .await
+                .map_err(|e| format!("fallback request failed: {e}"))?
+        } else {
+            return Err(format!("Stripe SPT creation failed: {body}"));
+        }
+    } else {
+        response
+    };
 
     if !response.status().is_success() {
         let body = response.text().await.unwrap_or_default();
