@@ -8,7 +8,7 @@ use crate::client::PaymentProvider;
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::methods::stripe::types::CreateTokenResult;
-use crate::protocol::methods::stripe::{StripeCredentialPayload, METHOD_NAME};
+use crate::protocol::methods::stripe::{StripeCredentialPayload, INTENT_CHARGE, METHOD_NAME};
 
 /// Parameters passed to the `create_token` callback.
 ///
@@ -91,7 +91,7 @@ impl StripeProvider {
 
 impl PaymentProvider for StripeProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
-        method == METHOD_NAME && intent == "charge"
+        method == METHOD_NAME && intent == INTENT_CHARGE
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {

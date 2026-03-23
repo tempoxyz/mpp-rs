@@ -31,8 +31,8 @@ pub use types::{CreateTokenResult, StripeCredentialPayload, StripeMethodDetails}
 /// Payment method name for Stripe.
 pub const METHOD_NAME: &str = "stripe";
 
-/// Charge intent name.
-pub const INTENT_CHARGE: &str = "charge";
+/// Charge intent name (re-exported from [`crate::protocol::intents`]).
+pub use crate::protocol::intents::INTENT_CHARGE;
 
 /// Default Stripe API base URL.
 pub const DEFAULT_STRIPE_API_BASE: &str = "https://api.stripe.com";
