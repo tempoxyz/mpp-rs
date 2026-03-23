@@ -21,6 +21,7 @@ server = ["tokio", "futures-core", "async-stream"]
 # Method implementations
 evm = ["alloy", "hex", "rand"]
 tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
+stripe = ["dep:reqwest"]
 
 # Utilities
 utils = ["hex", "rand"]
@@ -40,6 +41,7 @@ reqwest-rustls-tls = ["reqwest?/rustls-tls"]
 
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
+integration-stripe = ["stripe", "server", "client", "axum"]
 
 [dependencies]
 # Core dependencies (always included)

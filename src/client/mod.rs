@@ -45,3 +45,9 @@ pub use tempo::session::{channel_ops, TempoSessionProvider};
 pub use tempo::{AutoswapConfig, TempoClientError, TempoProvider};
 #[cfg(feature = "tempo")]
 pub use tempo_alloy::TempoNetwork;
+
+// Re-export Stripe types at client level for convenience
+#[cfg(feature = "stripe")]
+pub mod stripe;
+#[cfg(feature = "stripe")]
+pub use stripe::StripeProvider;

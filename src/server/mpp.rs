@@ -15,9 +15,9 @@
 //! let challenge = mpp.charge("0.10")?;
 //! ```
 
-#[cfg(feature = "tempo")]
+#[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::error::Result;
-#[cfg(feature = "tempo")]
+#[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::protocol::core::PaymentChallenge;
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
@@ -658,6 +658,119 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
             chain_id: builder.chain_id,
+        })
+    }
+}
+
+// ==================== Stripe charge helpers ====================
+
+#[cfg(feature = "stripe")]
+impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
+    /// Generate a Stripe charge challenge for a dollar amount.
+    ///
+    /// Creates a `method=stripe`, `intent=charge` challenge with HMAC-bound ID.
+    pub fn stripe_charge(&self, amount: &str) -> Result<PaymentChallenge> {
+        use crate::protocol::core::Base64UrlJson;
+        use time::{Duration, OffsetDateTime};
+
+        let base_units = super::parse_dollar_amount(amount, self.decimals)?;
+        let currency = self.currency.as_deref().unwrap_or("usd");
+
+        let request = ChargeRequest {
+            amount: base_units,
+            currency: currency.to_string(),
+            ..Default::default()
+        };
+
+        let encoded_request = Base64UrlJson::from_typed(&request)?;
+
+        let expiry_time = OffsetDateTime::now_utc() + Duration::minutes(5);
+        let expires = expiry_time
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!("failed to format expires: {e}"))
+            })?;
+
+        let id = crate::protocol::core::compute_challenge_id(
+            &self.secret_key,
+            &self.realm,
+            crate::protocol::methods::stripe::METHOD_NAME,
+            crate::protocol::methods::stripe::INTENT_CHARGE,
+            encoded_request.raw(),
+            Some(&expires),
+            None,
+            None,
+        );
+
+        Ok(PaymentChallenge {
+            id,
+            realm: self.realm.clone(),
+            method: crate::protocol::methods::stripe::METHOD_NAME.into(),
+            intent: crate::protocol::methods::stripe::INTENT_CHARGE.into(),
+            request: encoded_request,
+            expires: Some(expires),
+            description: None,
+            digest: None,
+            opaque: None,
+        })
+    }
+}
+
+#[cfg(feature = "stripe")]
+impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
+    /// Create a Stripe payment handler from a [`StripeBuilder`](super::StripeBuilder).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use mpp::server::{Mpp, stripe, StripeConfig};
+    ///
+    /// let mpp = Mpp::create_stripe(stripe(StripeConfig {
+    ///     secret_key: "sk_test_...",
+    ///     network_id: "internal",
+    ///     payment_method_types: &["card"],
+    ///     currency: "usd",
+    ///     decimals: 2,
+    /// })
+    /// .secret_key("my-hmac-secret"))?;
+    /// ```
+    pub fn create_stripe(builder: super::StripeBuilder) -> Result<Self> {
+        let secret_key = builder
+            .hmac_secret_key
+            .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            })
+            .ok_or_else(|| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "Missing secret key. Set {} environment variable or pass .secret_key(...).",
+                    SECRET_KEY_ENV_VAR
+                ))
+            })?;
+
+        let mut method = crate::protocol::methods::stripe::method::ChargeMethod::new(
+            &builder.secret_key,
+            &builder.network_id,
+            builder.payment_method_types.clone(),
+        );
+        if let Some(api_base) = builder.stripe_api_base {
+            method = method.with_api_base(api_base);
+        }
+
+        Ok(Self {
+            method,
+            session_method: None,
+            realm: builder.realm,
+            secret_key,
+            currency: Some(builder.currency),
+            recipient: None,
+            decimals: builder.decimals as u32,
+            fee_payer: false,
+            chain_id: None,
         })
     }
 }

@@ -54,6 +54,12 @@ pub use crate::protocol::methods::tempo::session_method::{
     SessionMethodConfig,
 };
 
+#[cfg(feature = "stripe")]
+pub use crate::protocol::methods::stripe::method::ChargeMethod as StripeChargeMethod;
+
+#[cfg(feature = "stripe")]
+pub use crate::protocol::methods::stripe::{StripeChargeRequest, StripeCredentialPayload};
+
 // ==================== Simple API ====================
 
 /// Configuration for the Tempo payment method.
@@ -150,6 +156,23 @@ impl TempoBuilder {
     }
 }
 
+/// Configuration for the Stripe payment method.
+///
+/// All fields are required for Stripe payment verification.
+#[cfg(feature = "stripe")]
+pub struct StripeConfig<'a> {
+    /// Stripe secret API key (e.g., `sk_test_...`).
+    pub secret_key: &'a str,
+    /// Stripe Business Network profile ID.
+    pub network_id: &'a str,
+    /// Accepted payment method types (e.g., `&["card"]`).
+    pub payment_method_types: &'a [&'a str],
+    /// Three-letter ISO currency code (e.g., "usd").
+    pub currency: &'a str,
+    /// Token decimals for amount conversion (e.g., 2 for USD cents).
+    pub decimals: u8,
+}
+
 /// Options for [`Mpp::session_challenge_with_details()`].
 #[derive(Debug, Default)]
 pub struct SessionChallengeOptions<'a> {
@@ -176,6 +199,40 @@ pub struct ChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Enable fee sponsorship.
     pub fee_payer: bool,
+}
+
+/// Builder returned by [`stripe()`] for configuring a Stripe payment method.
+#[cfg(feature = "stripe")]
+pub struct StripeBuilder {
+    pub(crate) secret_key: String,
+    pub(crate) network_id: String,
+    pub(crate) payment_method_types: Vec<String>,
+    pub(crate) currency: String,
+    pub(crate) decimals: u8,
+    pub(crate) realm: String,
+    pub(crate) hmac_secret_key: Option<String>,
+    pub(crate) stripe_api_base: Option<String>,
+}
+
+#[cfg(feature = "stripe")]
+impl StripeBuilder {
+    /// Override the realm (default: auto-detected from environment variables).
+    pub fn realm(mut self, realm: &str) -> Self {
+        self.realm = realm.to_string();
+        self
+    }
+
+    /// Override the HMAC secret key (default: reads `MPP_SECRET_KEY` env var).
+    pub fn secret_key(mut self, key: &str) -> Self {
+        self.hmac_secret_key = Some(key.to_string());
+        self
+    }
+
+    /// Override the Stripe API base URL (for testing with a mock server).
+    pub fn stripe_api_base(mut self, url: &str) -> Self {
+        self.stripe_api_base = Some(url.to_string());
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -242,6 +299,44 @@ fn chain_id_from_rpc_url(url: &str) -> u64 {
         crate::protocol::methods::tempo::MODERATO_CHAIN_ID
     } else {
         crate::protocol::methods::tempo::CHAIN_ID
+    }
+}
+
+/// Create a Stripe payment method configuration.
+///
+/// Returns a [`StripeBuilder`] that can be passed to [`Mpp::create()`].
+///
+/// # Example
+///
+/// ```ignore
+/// use mpp::server::{Mpp, stripe, StripeConfig};
+///
+/// let mpp = Mpp::create(
+///     stripe(StripeConfig {
+///         secret_key: "sk_test_...",
+///         network_id: "internal",
+///         payment_method_types: &["card"],
+///         currency: "usd",
+///         decimals: 2,
+///     })
+///     .secret_key("my-hmac-secret"),
+/// )?;
+/// ```
+#[cfg(feature = "stripe")]
+pub fn stripe(config: StripeConfig<'_>) -> StripeBuilder {
+    StripeBuilder {
+        secret_key: config.secret_key.to_string(),
+        network_id: config.network_id.to_string(),
+        payment_method_types: config
+            .payment_method_types
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        currency: config.currency.to_string(),
+        decimals: config.decimals,
+        realm: mpp::detect_realm(),
+        hmac_secret_key: None,
+        stripe_api_base: None,
     }
 }
 
