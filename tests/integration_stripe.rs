@@ -18,7 +18,8 @@ use std::sync::Arc;
 use axum::extract::Form;
 use axum::{routing::get, Json, Router};
 use mpp::client::{Fetch, StripeProvider};
-use mpp::protocol::methods::stripe::CreateTokenResult;
+use mpp::protocol::core::PaymentCredential;
+use mpp::protocol::methods::stripe::{CreateTokenResult, StripeCredentialPayload};
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
 use mpp::server::{stripe, Mpp, StripeChargeOptions, StripeConfig};
 use reqwest::Client;
@@ -734,4 +735,172 @@ async fn test_stripe_charge_via_mpp_charge_extractor() {
 
     handle.abort();
     stripe_handle.abort();
+}
+
+// ==================== Live Stripe API Tests ====================
+//
+// These tests call the real Stripe test-mode API. Skipped at runtime
+// when STRIPE_SECRET_KEY is not set (same pattern as mppx).
+
+fn stripe_secret_key() -> Option<String> {
+    std::env::var("STRIPE_SECRET_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Create a test SPT via Stripe's test helper endpoint.
+async fn create_test_spt(
+    secret_key: &str,
+    amount: &str,
+    currency: &str,
+    network_id: Option<&str>,
+    expires_at: u64,
+) -> Result<String, String> {
+    let base_params = vec![
+        ("payment_method".to_string(), "pm_card_visa".to_string()),
+        ("usage_limits[currency]".to_string(), currency.to_string()),
+        ("usage_limits[max_amount]".to_string(), amount.to_string()),
+        (
+            "usage_limits[expires_at]".to_string(),
+            expires_at.to_string(),
+        ),
+    ];
+
+    let mut params = base_params.clone();
+    if let Some(nid) = network_id {
+        params.push(("seller_details[network_id]".to_string(), nid.to_string()));
+    }
+
+    let auth = format!(
+        "Basic {}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{secret_key}:")
+        )
+    );
+
+    let client = Client::new();
+    let url = "https://api.stripe.com/v1/test_helpers/shared_payment/granted_tokens";
+
+    let response = client
+        .post(url)
+        .header("Authorization", &auth)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    // Fallback: retry without seller_details if Stripe rejects it
+    // (matches mppx's fallback in Charge.integration.test.ts).
+    let response = if !response.status().is_success() && network_id.is_some() {
+        let body = response.text().await.unwrap_or_default();
+        if body.contains("Received unknown parameter") {
+            client
+                .post(url)
+                .header("Authorization", &auth)
+                .form(&base_params)
+                .send()
+                .await
+                .map_err(|e| format!("fallback request failed: {e}"))?
+        } else {
+            return Err(format!("Stripe SPT creation failed: {body}"));
+        }
+    } else {
+        response
+    };
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Stripe SPT creation failed: {body}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("parse error: {e}"))?;
+
+    body["id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "missing id in SPT response".to_string())
+}
+
+fn create_live_mpp(secret_key: &str) -> Mpp<mpp::protocol::methods::stripe::method::ChargeMethod> {
+    Mpp::create_stripe(
+        stripe(StripeConfig {
+            secret_key,
+            network_id: "internal",
+            payment_method_types: &["card"],
+            currency: "usd",
+            decimals: 2,
+        })
+        .secret_key("live-test-hmac-secret"),
+    )
+    .expect("failed to create Mpp")
+}
+
+/// Live: create a real SPT, build credential, verify against Stripe.
+#[tokio::test]
+async fn test_live_stripe_charge_success() {
+    let Some(sk) = stripe_secret_key() else {
+        eprintln!("STRIPE_SECRET_KEY not set, skipping");
+        return;
+    };
+
+    let mpp = create_live_mpp(&sk);
+    let challenge = mpp.stripe_charge("0.50").expect("challenge creation");
+
+    let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+    let amount = request["amount"].as_str().expect("amount");
+    assert_eq!(amount, "50");
+
+    let expires_at = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs())
+        + 3600;
+
+    let spt = create_test_spt(&sk, amount, "usd", Some("internal"), expires_at)
+        .await
+        .expect("SPT creation failed");
+    assert!(spt.starts_with("spt_"), "got: {spt}");
+
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        StripeCredentialPayload {
+            spt,
+            external_id: None,
+        },
+    );
+
+    let receipt = mpp
+        .verify_credential(&credential)
+        .await
+        .expect("verification failed");
+    assert!(receipt.is_success());
+    assert_eq!(receipt.method.as_str(), "stripe");
+    assert!(receipt.reference.starts_with("pi_"));
+}
+
+/// Live: invalid SPT should be rejected by Stripe.
+#[tokio::test]
+async fn test_live_stripe_invalid_spt_rejected() {
+    let Some(sk) = stripe_secret_key() else {
+        eprintln!("STRIPE_SECRET_KEY not set, skipping");
+        return;
+    };
+
+    let mpp = create_live_mpp(&sk);
+    let challenge = mpp.stripe_charge("0.10").expect("challenge creation");
+
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        StripeCredentialPayload {
+            spt: "spt_invalid_does_not_exist".to_string(),
+            external_id: None,
+        },
+    );
+
+    let result = mpp.verify_credential(&credential).await;
+    assert!(result.is_err(), "invalid SPT should fail verification");
 }

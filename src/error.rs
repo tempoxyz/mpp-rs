@@ -289,7 +289,6 @@ pub enum MppError {
 // ==================== Result Extension Trait ====================
 
 /// Extension trait for mapping errors into [`MppError`] with a contextual message.
-#[allow(dead_code)]
 pub(crate) trait ResultExt<T> {
     /// Map the error into [`MppError::Http`] with the given context prefix.
     fn mpp_http(self, context: &str) -> std::result::Result<T, MppError>;
