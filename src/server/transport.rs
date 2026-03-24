@@ -120,10 +120,10 @@ impl Transport for HttpTransport {
             None => return Ok(None),
         };
 
-        let credential = crate::protocol::core::parse_authorization(&format!("Payment {payment}"))
-            .map_err(|e| {
-                MppError::MalformedCredential(Some(format!("failed to parse credential: {e}")))
-            })?;
+        // extract_payment_scheme returns the full "Payment ..." fragment
+        let credential = crate::protocol::core::parse_authorization(payment).map_err(|e| {
+            MppError::MalformedCredential(Some(format!("failed to parse credential: {e}")))
+        })?;
 
         Ok(Some(credential))
     }
@@ -197,6 +197,39 @@ mod tests {
             .unwrap();
         let result = transport.get_credential(&req).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_http_get_credential_valid_payment() {
+        let transport = http();
+
+        // Build a valid Payment authorization header
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let credential = crate::protocol::core::PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xdeadbeef"),
+        );
+        let auth_header = crate::protocol::core::format_authorization(&credential).unwrap();
+
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .header("Authorization", &auth_header)
+            .body(())
+            .unwrap();
+
+        let result = transport.get_credential(&req).unwrap();
+        assert!(result.is_some(), "should parse valid Payment credential");
+        let parsed = result.unwrap();
+        assert_eq!(parsed.challenge.id, "test-id");
     }
 
     #[test]

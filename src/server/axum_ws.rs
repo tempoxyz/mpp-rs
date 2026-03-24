@@ -136,10 +136,39 @@ async fn handle_ws_session<F, Fut, I>(
 
         match ws_msg {
             super::ws::WsMessage::Credential { credential } => {
+                // Verify the credential's challenge ID matches the one we issued
+                let parsed = match crate::protocol::core::parse_authorization(&credential) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        let _ = sender
+                            .send(Message::Text(
+                                WsResponse::Error {
+                                    error: "Malformed credential".to_string(),
+                                }
+                                .to_text()
+                                .into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+
+                if parsed.challenge.id != challenge.id {
+                    let _ = sender
+                        .send(Message::Text(
+                            WsResponse::Error {
+                                error: "Credential challenge ID mismatch".to_string(),
+                            }
+                            .to_text()
+                            .into(),
+                        ))
+                        .await;
+                    continue;
+                }
+
                 match challenger.verify_payment(&credential).await {
                     Ok(receipt) => break receipt,
                     Err(e) => {
-                        // Re-issue challenge on failure
                         let challenge_resp = WsResponse::Challenge {
                             challenge: serde_json::to_value(&challenge).unwrap_or_default(),
                             error: Some(e),

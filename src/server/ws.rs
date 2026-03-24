@@ -14,7 +14,7 @@
 //! **Server → Client:**
 //! - `{ "type": "challenge", "challenge": { ... } }` — payment challenge
 //! - `{ "type": "message", "data": "..." }` — application data
-//! - `{ "type": "need-voucher", ... }` — balance exhausted, send new voucher
+//! - `{ "type": "needVoucher", ... }` — balance exhausted, send new voucher
 //! - `{ "type": "receipt", "receipt": { ... } }` — final payment receipt
 //! - `{ "type": "error", "error": "..." }` — error message
 //!
