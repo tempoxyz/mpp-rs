@@ -33,7 +33,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::MppError;
-use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+use crate::protocol::core::PaymentCredential;
 
 use super::transport::{ChallengeContext, ReceiptContext, Transport};
 
