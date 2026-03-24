@@ -33,7 +33,15 @@
 
 use std::sync::Arc;
 
-use super::ws::WsResponse;
+use futures_util::{SinkExt, StreamExt};
+use time::format_description::well_known::Iso8601;
+use time::OffsetDateTime;
+
+use super::ws::{WsMessage, WsResponse};
+use crate::protocol::core::parse_authorization;
+use crate::protocol::methods::tempo::session_method::deduct_from_channel;
+use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
+use crate::protocol::traits::{ChargeMethod, SessionMethod};
 
 /// Options for [`ws_session`].
 pub struct WsSessionOptions<G> {
@@ -63,9 +71,6 @@ where
     G: futures_core::Stream<Item = String> + Send + Unpin + 'static,
     S: futures_util::Sink<String, Error = Box<dyn std::error::Error + Send + Sync>> + Send + Unpin,
 {
-    use crate::protocol::methods::tempo::session_method::deduct_from_channel;
-    use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
-
     let WsSessionOptions {
         store,
         channel_id,
@@ -77,7 +82,7 @@ where
 
     let mut stream = std::pin::pin!(generate);
 
-    while let Some(value) = next_item(&mut stream).await {
+    while let Some(value) = stream.next().await {
         // Deduct, waiting for voucher top-up if insufficient
         loop {
             match deduct_from_channel(&*store, &channel_id, tick_cost).await {
@@ -91,7 +96,7 @@ where
                             accepted_cumulative: ch.highest_voucher_amount.to_string(),
                             deposit: ch.deposit.to_string(),
                         };
-                        let _ = futures_util::SinkExt::send(&mut *sender, msg.to_text()).await;
+                        let _ = sender.send(msg.to_text()).await;
                     }
 
                     // Wait for channel update (voucher from receiver) or poll
@@ -105,18 +110,19 @@ where
 
         // Send data frame
         let msg = WsResponse::Data { data: value };
-        if futures_util::SinkExt::send(&mut *sender, msg.to_text())
-            .await
-            .is_err()
-        {
+        if sender.send(msg.to_text()).await.is_err() {
             break;
         }
     }
 
     // Emit final session receipt
     if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
+        let timestamp = OffsetDateTime::now_utc()
+            .format(&Iso8601::DEFAULT)
+            .expect("ISO 8601 formatting cannot fail");
+
         let mut receipt = SessionReceipt::new(
-            now_iso8601(),
+            timestamp,
             &challenge_id,
             &channel_id,
             ch.highest_voucher_amount.to_string(),
@@ -128,7 +134,7 @@ where
             receipt: serde_json::to_value(&receipt)
                 .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
         };
-        let _ = futures_util::SinkExt::send(&mut *sender, msg.to_text()).await;
+        let _ = sender.send(msg.to_text()).await;
     }
 }
 
@@ -140,15 +146,12 @@ where
 /// sender's `wait_for_update`.
 pub async fn process_incoming_vouchers<M, S, R>(receiver: &mut R, mpp: &crate::server::Mpp<M, S>)
 where
-    M: crate::protocol::traits::ChargeMethod,
-    S: crate::protocol::traits::SessionMethod,
+    M: ChargeMethod,
+    S: SessionMethod,
     R: futures_util::Stream<Item = Result<String, Box<dyn std::error::Error + Send + Sync>>>
         + Send
         + Unpin,
 {
-    use super::ws::WsMessage;
-    use futures_util::StreamExt;
-
     while let Some(Ok(text)) = receiver.next().await {
         let ws_msg: WsMessage = match serde_json::from_str(&text) {
             Ok(m) => m,
@@ -156,41 +159,21 @@ where
         };
 
         if let WsMessage::Credential { credential } = ws_msg {
-            if let Ok(parsed) = crate::protocol::core::parse_authorization(&credential) {
-                // verify_session updates the channel store, which wakes the sender
+            if let Ok(parsed) = parse_authorization(&credential) {
                 let _ = mpp.verify_session(&parsed).await;
             }
         }
     }
 }
 
-fn now_iso8601() -> String {
-    use time::format_description::well_known::Iso8601;
-    use time::OffsetDateTime;
-
-    OffsetDateTime::now_utc()
-        .format(&Iso8601::DEFAULT)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
-async fn next_item<S: futures_core::Stream + Unpin>(
-    stream: &mut std::pin::Pin<&mut S>,
-) -> Option<S::Item> {
-    use std::future::poll_fn;
-    use std::pin::Pin;
-
-    poll_fn(|cx| Pin::new(&mut **stream).poll_next(cx)).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
 
     #[test]
     fn test_ws_session_options_fields() {
-        // Verify WsSessionOptions can be constructed
-        let store =
-            Arc::new(crate::protocol::methods::tempo::session_method::InMemoryChannelStore::new());
+        let store = Arc::new(InMemoryChannelStore::new());
         let _opts = WsSessionOptions {
             store,
             channel_id: "0xabc".to_string(),
