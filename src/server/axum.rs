@@ -70,8 +70,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{FromRef, FromRequestParts};
-use axum::response::IntoResponse;
+use axum_core::extract::{FromRef, FromRequestParts};
+use axum_core::response::IntoResponse;
 use http_types::{header, HeaderValue, StatusCode};
 
 use crate::protocol::core::headers::{
@@ -99,7 +99,7 @@ use crate::protocol::core::{PaymentChallenge, Receipt};
 pub struct PaymentRequired(pub PaymentChallenge);
 
 impl IntoResponse for PaymentRequired {
-    fn into_response(self) -> axum::response::Response {
+    fn into_response(self) -> axum_core::response::Response {
         match format_www_authenticate(&self.0) {
             Ok(www_auth) => {
                 let mut resp = (
@@ -222,7 +222,7 @@ pub enum MppChargeRejection {
 }
 
 impl IntoResponse for MppChargeRejection {
-    fn into_response(self) -> axum::response::Response {
+    fn into_response(self) -> axum_core::response::Response {
         match self {
             MppChargeRejection::Challenge(pr) => pr.into_response(),
             MppChargeRejection::VerificationFailed(pr) => pr.into_response(),
@@ -383,7 +383,7 @@ pub struct WithReceipt<T> {
 }
 
 impl<T: IntoResponse> IntoResponse for WithReceipt<T> {
-    fn into_response(self) -> axum::response::Response {
+    fn into_response(self) -> axum_core::response::Response {
         let mut resp = self.body.into_response();
         if let Ok(header_val) = format_receipt(&self.receipt) {
             if let Ok(val) = HeaderValue::from_str(&header_val) {

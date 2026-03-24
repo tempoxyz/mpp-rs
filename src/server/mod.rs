@@ -37,9 +37,6 @@ pub mod ws;
 #[cfg(feature = "ws")]
 pub mod ws_session;
 
-#[cfg(all(feature = "ws", feature = "axum"))]
-pub mod axum_ws;
-
 #[cfg(feature = "tower")]
 pub mod middleware;
 
