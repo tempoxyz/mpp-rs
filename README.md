@@ -62,6 +62,39 @@ let client = ClientBuilder::new(reqwest::Client::new())
 let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 ```
 
+### WebSocket
+
+```rust
+use mpp::server::ws::{WsMessage, WsResponse};
+
+// Server: parse incoming WS message, send challenge/receipt
+let msg: WsMessage = serde_json::from_str(&text)?;
+if let WsMessage::Credential { credential } = msg {
+    let parsed = mpp::parse_authorization(&credential)?;
+    let receipt = mpp.verify_credential(&parsed).await?;
+    let resp = WsResponse::Receipt {
+        receipt: serde_json::to_value(&receipt)?,
+    };
+    socket.send(resp.to_text()).await;
+}
+
+// Client: detect challenge, send credential
+let msg: mpp::client::ws::WsServerMessage = serde_json::from_str(&text)?;
+if let WsServerMessage::Challenge { challenge, .. } = msg {
+    let cred_msg = serde_json::json!({
+        "type": "credential",
+        "credential": auth_string,
+    });
+    ws.send(cred_msg.to_string()).await;
+}
+```
+
+WSS (WebSocket Secure) is handled at the connection layer — the transport itself is protocol-agnostic. On the server, terminate TLS via a reverse proxy (nginx, Cloudflare) or use `axum-server` with rustls. On the client, `tokio-tungstenite` supports `wss://` URLs via its `native-tls` or `rustls` features:
+
+```toml
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+```
+
 ## Feature Flags
 
 | Feature | Description |
@@ -73,6 +106,7 @@ let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 | `middleware` | reqwest-middleware support with `PaymentMiddleware` (implies `client`) |
 | `tower` | Tower middleware for server-side integration |
 | `axum` | Axum extractor support for server-side convenience |
+| `ws` | WebSocket transport for bidirectional session payments |
 | `utils` | Hex/random utilities for development and testing |
 
 ## Payment Methods
