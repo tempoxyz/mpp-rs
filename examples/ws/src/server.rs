@@ -10,10 +10,16 @@
 //!
 //! The server listens on `ws://localhost:3000/ws`.
 
-use axum::{extract::ws::WebSocketUpgrade, routing::get, Router};
-use mpp::server::ws::{WsMessage, WsResponse};
-use mpp::server::{tempo, Mpp, TempoConfig};
+use std::future::Future;
 use std::sync::Arc;
+
+use axum::{extract::ws::WebSocketUpgrade, routing::get, Router};
+use mpp::protocol::core::Receipt;
+use mpp::protocol::intents::ChargeRequest;
+use mpp::protocol::traits::{ChargeMethod, VerificationError};
+use mpp::server::ws::{WsMessage, WsResponse};
+use mpp::server::Mpp;
+use mpp::PaymentCredential;
 
 const FORTUNES: &[&str] = &[
     "A beautiful day awaits you.",
@@ -23,24 +29,34 @@ const FORTUNES: &[&str] = &[
     "Fortune favors the persistent.",
 ];
 
-type Payment = Mpp<mpp::server::TempoChargeMethod<mpp::server::TempoProvider>>;
+/// Mock charge method that accepts any credential — for demo purposes only.
+#[derive(Clone)]
+struct MockMethod;
+
+#[allow(clippy::manual_async_fn)]
+impl ChargeMethod for MockMethod {
+    fn method(&self) -> &str {
+        "mock"
+    }
+
+    fn verify(
+        &self,
+        _credential: &PaymentCredential,
+        _request: &ChargeRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        async { Ok(Receipt::success("mock", "mock-ws-receipt")) }
+    }
+}
+
+type Payment = Mpp<MockMethod>;
 
 #[tokio::main]
 async fn main() {
-    let mpp = Mpp::create(
-        tempo(TempoConfig {
-            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
-        })
-        .rpc_url("https://rpc.moderato.tempo.xyz")
-        .secret_key("ws-example-secret"),
-    )
-    .expect("failed to create Mpp");
+    let mpp = Mpp::new(MockMethod, "ws-example.local", "ws-example-secret");
 
     let mpp = Arc::new(mpp);
 
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(mpp);
+    let app = Router::new().route("/ws", get(ws_handler)).with_state(mpp);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
@@ -57,13 +73,17 @@ async fn ws_handler(
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
 
-        // 1. Send challenge
-        let challenge = match mpp.charge("0.01") {
+        // 1. Send challenge (use charge_challenge with explicit params for mock setup)
+        let challenge = match mpp.charge_challenge("10000", "0x0", "0x0") {
             Ok(c) => c,
             Err(e) => {
                 let _ = socket
                     .send(Message::Text(
-                        WsResponse::Error { error: e.to_string() }.to_text().into(),
+                        WsResponse::Error {
+                            error: e.to_string(),
+                        }
+                        .to_text()
+                        .into(),
                     ))
                     .await;
                 return;
@@ -114,7 +134,11 @@ async fn ws_handler(
                         Err(e) => {
                             let _ = socket
                                 .send(Message::Text(
-                                    WsResponse::Error { error: e.to_string() }.to_text().into(),
+                                    WsResponse::Error {
+                                        error: e.to_string(),
+                                    }
+                                    .to_text()
+                                    .into(),
                                 ))
                                 .await;
                             continue;

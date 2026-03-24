@@ -65,7 +65,9 @@ async fn main() {
                 // Create a mock credential (in real use, sign a transaction)
                 let credential = mpp::PaymentCredential::new(
                     parsed.to_echo(),
-                    PaymentPayload::hash("0xdeadbeef"),
+                    PaymentPayload::hash(
+                        "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                    ),
                 );
                 let auth_str = format_authorization(&credential).unwrap();
 
