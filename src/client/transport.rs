@@ -61,16 +61,13 @@ pub trait Transport: Send + Sync {
 /// - Sends credentials via `Authorization` header
 ///
 /// This is the default transport, matching mppx's `Transport.http()`.
-#[cfg(feature = "client")]
 pub struct HttpTransport;
 
 /// Create an HTTP transport instance.
-#[cfg(feature = "client")]
 pub fn http() -> HttpTransport {
     HttpTransport
 }
 
-#[cfg(feature = "client")]
 impl Transport for HttpTransport {
     type Request = reqwest::RequestBuilder;
     type Response = reqwest::Response;
@@ -101,7 +98,7 @@ impl Transport for HttpTransport {
     }
 }
 
-#[cfg(all(test, feature = "client"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
