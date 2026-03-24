@@ -125,20 +125,15 @@ impl Transport for WsTransport {
     }
 
     fn get_challenge(&self, response: &Self::Response) -> Result<PaymentChallenge, MppError> {
-        match response {
-            WsServerMessage::Challenge { challenge, .. } => {
-                let parsed: PaymentChallenge =
-                    serde_json::from_value(challenge.clone()).map_err(|e| {
-                        MppError::MalformedCredential(Some(format!(
-                            "failed to parse WS challenge: {e}"
-                        )))
-                    })?;
-                Ok(parsed)
-            }
-            _ => Err(MppError::MissingHeader(
+        let WsServerMessage::Challenge { challenge, .. } = response else {
+            return Err(MppError::MissingHeader(
                 "no challenge in WS message".to_string(),
-            )),
-        }
+            ));
+        };
+
+        serde_json::from_value(challenge.clone()).map_err(|e| {
+            MppError::MalformedCredential(Some(format!("failed to parse WS challenge: {e}")))
+        })
     }
 
     fn set_credential(&self, _request: Self::Request, credential: &str) -> Self::Request {

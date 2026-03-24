@@ -153,16 +153,13 @@ where
         + Unpin,
 {
     while let Some(Ok(text)) = receiver.next().await {
-        let ws_msg: WsMessage = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
+            continue;
         };
-
-        if let WsMessage::Credential { credential } = ws_msg {
-            if let Ok(parsed) = parse_authorization(&credential) {
-                let _ = mpp.verify_session(&parsed).await;
-            }
-        }
+        let Ok(parsed) = parse_authorization(&credential) else {
+            continue;
+        };
+        let _ = mpp.verify_session(&parsed).await;
     }
 }
 

@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use axum::extract::ws::{Message, WebSocket};
 use axum::{extract::ws::WebSocketUpgrade, routing::get, Router};
 use mpp::protocol::core::Receipt;
 use mpp::protocol::intents::ChargeRequest;
@@ -56,7 +57,9 @@ async fn main() {
 
     let mpp = Arc::new(mpp);
 
-    let app = Router::new().route("/ws", get(ws_handler)).with_state(mpp);
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(mpp);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
@@ -71,23 +74,10 @@ async fn ws_handler(
     axum::extract::State(mpp): axum::extract::State<Arc<Payment>>,
 ) -> impl axum::response::IntoResponse {
     ws.on_upgrade(move |mut socket| async move {
-        use axum::extract::ws::Message;
-
-        // 1. Send challenge (use charge_challenge with explicit params for mock setup)
-        let challenge = match mpp.charge_challenge("10000", "0x0", "0x0") {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = socket
-                    .send(Message::Text(
-                        WsResponse::Error {
-                            error: e.to_string(),
-                        }
-                        .to_text()
-                        .into(),
-                    ))
-                    .await;
-                return;
-            }
+        // 1. Send challenge
+        let Ok(challenge) = mpp.charge_challenge("10000", "0x0", "0x0") else {
+            let _ = send_error(&mut socket, "Failed to create challenge").await;
+            return;
         };
 
         println!("Sending challenge...");
@@ -105,74 +95,27 @@ async fn ws_handler(
 
         // 2. Wait for credential
         let receipt = loop {
-            let msg = match socket.recv().await {
-                Some(Ok(Message::Text(text))) => text,
-                Some(Ok(Message::Close(_))) | None => return,
-                _ => continue,
+            let Some(Ok(Message::Text(msg))) = socket.recv().await else {
+                return;
             };
 
-            let ws_msg: WsMessage = match serde_json::from_str(&msg) {
-                Ok(m) => m,
-                Err(_) => {
-                    let _ = socket
-                        .send(Message::Text(
-                            WsResponse::Error {
-                                error: "Invalid message format".into(),
-                            }
-                            .to_text()
-                            .into(),
-                        ))
-                        .await;
-                    continue;
-                }
+            let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&msg) else {
+                let _ = send_error(&mut socket, "Expected credential message").await;
+                continue;
             };
 
-            match ws_msg {
-                WsMessage::Credential { credential } => {
-                    let parsed = match mpp::parse_authorization(&credential) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = socket
-                                .send(Message::Text(
-                                    WsResponse::Error {
-                                        error: e.to_string(),
-                                    }
-                                    .to_text()
-                                    .into(),
-                                ))
-                                .await;
-                            continue;
-                        }
-                    };
+            let Ok(parsed) = mpp::parse_authorization(&credential) else {
+                let _ = send_error(&mut socket, "Malformed credential").await;
+                continue;
+            };
 
-                    match mpp.verify_credential(&parsed).await {
-                        Ok(receipt) => {
-                            println!("Payment verified: {}", receipt.reference);
-                            break receipt;
-                        }
-                        Err(e) => {
-                            let _ = socket
-                                .send(Message::Text(
-                                    WsResponse::Error {
-                                        error: e.message.clone(),
-                                    }
-                                    .to_text()
-                                    .into(),
-                                ))
-                                .await;
-                        }
-                    }
+            match mpp.verify_credential(&parsed).await {
+                Ok(receipt) => {
+                    println!("Payment verified: {}", receipt.reference);
+                    break receipt;
                 }
-                _ => {
-                    let _ = socket
-                        .send(Message::Text(
-                            WsResponse::Error {
-                                error: "Send credential first".into(),
-                            }
-                            .to_text()
-                            .into(),
-                        ))
-                        .await;
+                Err(e) => {
+                    let _ = send_error(&mut socket, &e.message).await;
                 }
             }
         };
@@ -202,4 +145,11 @@ async fn ws_handler(
             .await;
         println!("Session complete");
     })
+}
+
+async fn send_error(socket: &mut WebSocket, error: &str) {
+    let msg = WsResponse::Error {
+        error: error.to_string(),
+    };
+    let _ = socket.send(Message::Text(msg.to_text().into())).await;
 }

@@ -105,19 +105,16 @@ impl Transport for HttpTransport {
     }
 
     fn get_credential(&self, input: &Self::Input) -> Result<Option<PaymentCredential>, MppError> {
-        let header = match input.headers().get(http_types::header::AUTHORIZATION) {
-            Some(v) => v,
-            None => return Ok(None),
+        let Some(header) = input.headers().get(http_types::header::AUTHORIZATION) else {
+            return Ok(None);
         };
 
         let header_str = header
             .to_str()
             .map_err(|e| MppError::MalformedCredential(Some(format!("invalid header: {e}"))))?;
 
-        let payment = crate::protocol::core::extract_payment_scheme(header_str);
-        let payment = match payment {
-            Some(p) => p,
-            None => return Ok(None),
+        let Some(payment) = crate::protocol::core::extract_payment_scheme(header_str) else {
+            return Ok(None);
         };
 
         // extract_payment_scheme returns the full "Payment ..." fragment

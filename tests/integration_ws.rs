@@ -51,45 +51,35 @@ async fn start_ws_server() -> (String, tokio::task::JoinHandle<()>) {
                             .await;
 
                         // Wait for credential
-                        while let Some(Ok(msg)) = socket.recv().await {
-                            if let Message::Text(text) = msg {
-                                let ws_msg: WsMessage = match serde_json::from_str(&text) {
-                                    Ok(m) => m,
-                                    Err(_) => continue,
-                                };
+                        while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                            let Ok(WsMessage::Credential { credential }) =
+                                serde_json::from_str(&text)
+                            else {
+                                continue;
+                            };
 
-                                if let WsMessage::Credential { credential } = ws_msg {
-                                    match mpp
-                                        .verify_credential(
-                                            &mpp::parse_authorization(&credential).unwrap(),
-                                        )
-                                        .await
-                                    {
-                                        Ok(receipt) => {
-                                            // Send data
-                                            let data = WsResponse::Data {
-                                                data: "hello from ws".into(),
-                                            };
-                                            let _ = socket
-                                                .send(Message::Text(data.to_text().into()))
-                                                .await;
+                            let Ok(parsed) = mpp::parse_authorization(&credential) else {
+                                continue;
+                            };
 
-                                            // Send receipt
-                                            let receipt_msg = WsResponse::Receipt {
-                                                receipt: serde_json::to_value(&receipt).unwrap(),
-                                            };
-                                            let _ = socket
-                                                .send(Message::Text(receipt_msg.to_text().into()))
-                                                .await;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            let err = WsResponse::Error { error: e.message };
-                                            let _ = socket
-                                                .send(Message::Text(err.to_text().into()))
-                                                .await;
-                                        }
-                                    }
+                            match mpp.verify_credential(&parsed).await {
+                                Ok(receipt) => {
+                                    let data = WsResponse::Data {
+                                        data: "hello from ws".into(),
+                                    };
+                                    let _ = socket.send(Message::Text(data.to_text().into())).await;
+
+                                    let receipt_msg = WsResponse::Receipt {
+                                        receipt: serde_json::to_value(&receipt).unwrap(),
+                                    };
+                                    let _ = socket
+                                        .send(Message::Text(receipt_msg.to_text().into()))
+                                        .await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    let err = WsResponse::Error { error: e.message };
+                                    let _ = socket.send(Message::Text(err.to_text().into())).await;
                                 }
                             }
                         }
@@ -126,14 +116,11 @@ async fn test_ws_e2e_challenge_credential_flow() {
     let text = msg.into_text().unwrap();
     let server_msg: WsResponse = serde_json::from_str(&text).unwrap();
 
-    let challenge = match server_msg {
-        WsResponse::Challenge { challenge, .. } => {
-            let parsed: mpp::PaymentChallenge =
-                serde_json::from_value(challenge).expect("parse challenge");
-            parsed
-        }
-        other => panic!("expected Challenge, got: {other:?}"),
+    let WsResponse::Challenge { challenge, .. } = server_msg else {
+        panic!("expected Challenge, got: {server_msg:?}");
     };
+    let challenge: mpp::PaymentChallenge =
+        serde_json::from_value(challenge).expect("parse challenge");
 
     assert_eq!(challenge.method.as_str(), "tempo");
     assert_eq!(challenge.intent.as_str(), "charge");
@@ -219,11 +206,8 @@ async fn test_ws_challenge_id_mismatch_rejected() {
     let msg = ws.next().await.unwrap().unwrap();
     let text = msg.into_text().unwrap();
     let server_msg: WsResponse = serde_json::from_str(&text).unwrap();
-    let _challenge = match server_msg {
-        WsResponse::Challenge { challenge, .. } => {
-            serde_json::from_value::<mpp::PaymentChallenge>(challenge).unwrap()
-        }
-        other => panic!("expected Challenge, got: {other:?}"),
+    let WsResponse::Challenge { .. } = server_msg else {
+        panic!("expected Challenge, got: {server_msg:?}");
     };
 
     // Send credential with a DIFFERENT challenge ID (forged echo)
