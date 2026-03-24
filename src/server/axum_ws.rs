@@ -79,22 +79,13 @@ async fn handle_ws_session<F, Fut, I>(
     let (mut sender, mut receiver) = socket.split();
 
     // Send initial challenge
-    let challenge =
-        match challenger.challenge(amount, super::axum::ChallengeOptions { description: None }) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = sender
-                    .send(Message::Text(
-                        WsResponse::Error {
-                            error: format!("Failed to create challenge: {e}"),
-                        }
-                        .to_text()
-                        .into(),
-                    ))
-                    .await;
-                return;
-            }
-        };
+    let challenge = match challenger.challenge(amount, super::axum::ChallengeOptions::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = send_error(&mut sender, format!("Failed to create challenge: {e}")).await;
+            return;
+        }
+    };
 
     let challenge_msg = WsResponse::Challenge {
         challenge: serde_json::to_value(&challenge)
@@ -121,48 +112,23 @@ async fn handle_ws_session<F, Fut, I>(
         let ws_msg: super::ws::WsMessage = match serde_json::from_str(&msg) {
             Ok(m) => m,
             Err(_) => {
-                let _ = sender
-                    .send(Message::Text(
-                        WsResponse::Error {
-                            error: "Invalid message format".to_string(),
-                        }
-                        .to_text()
-                        .into(),
-                    ))
-                    .await;
+                send_error(&mut sender, "Invalid message format").await;
                 continue;
             }
         };
 
         match ws_msg {
             super::ws::WsMessage::Credential { credential } => {
-                // Verify the credential's challenge ID matches the one we issued
                 let parsed = match crate::protocol::core::parse_authorization(&credential) {
                     Ok(c) => c,
                     Err(_) => {
-                        let _ = sender
-                            .send(Message::Text(
-                                WsResponse::Error {
-                                    error: "Malformed credential".to_string(),
-                                }
-                                .to_text()
-                                .into(),
-                            ))
-                            .await;
+                        send_error(&mut sender, "Malformed credential").await;
                         continue;
                     }
                 };
 
                 if parsed.challenge.id != challenge.id {
-                    let _ = sender
-                        .send(Message::Text(
-                            WsResponse::Error {
-                                error: "Credential challenge ID mismatch".to_string(),
-                            }
-                            .to_text()
-                            .into(),
-                        ))
-                        .await;
+                    send_error(&mut sender, "Credential challenge ID mismatch").await;
                     continue;
                 }
 
@@ -181,15 +147,7 @@ async fn handle_ws_session<F, Fut, I>(
                 }
             }
             _ => {
-                let _ = sender
-                    .send(Message::Text(
-                        WsResponse::Error {
-                            error: "Expected credential message".to_string(),
-                        }
-                        .to_text()
-                        .into(),
-                    ))
-                    .await;
+                send_error(&mut sender, "Expected credential message").await;
                 continue;
             }
         }
@@ -216,4 +174,15 @@ async fn handle_ws_session<F, Fut, I>(
     let _ = sender
         .send(Message::Text(receipt_msg.to_text().into()))
         .await;
+}
+
+/// Send a JSON error frame to the client.
+async fn send_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    error: impl Into<String>,
+) {
+    let msg = WsResponse::Error {
+        error: error.into(),
+    };
+    let _ = sender.send(Message::Text(msg.to_text().into())).await;
 }
