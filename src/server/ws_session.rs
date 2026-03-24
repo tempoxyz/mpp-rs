@@ -31,14 +31,11 @@
 //! }).await;
 //! ```
 
-#[cfg(feature = "tempo")]
 use std::sync::Arc;
 
-#[cfg(feature = "tempo")]
 use super::ws::WsResponse;
 
 /// Options for [`ws_session`].
-#[cfg(feature = "tempo")]
 pub struct WsSessionOptions<G> {
     /// Channel store for balance tracking.
     pub store: Arc<dyn crate::protocol::methods::tempo::session_method::ChannelStore>,
@@ -61,7 +58,6 @@ pub struct WsSessionOptions<G> {
 ///
 /// This is the WebSocket equivalent of [`sse::serve`](super::sse::serve), with the
 /// key advantage that vouchers arrive on the same connection (no separate HTTP POST).
-#[cfg(feature = "tempo")]
 pub async fn ws_session<G, S>(sender: &mut S, options: WsSessionOptions<G>)
 where
     G: futures_core::Stream<Item = String> + Send + Unpin + 'static,
@@ -142,7 +138,6 @@ where
 /// split WebSocket. When a voucher credential arrives, it's verified via
 /// the session method, which updates the channel store and unblocks the
 /// sender's `wait_for_update`.
-#[cfg(feature = "tempo")]
 pub async fn process_incoming_vouchers<M, S, R>(receiver: &mut R, mpp: &crate::server::Mpp<M, S>)
 where
     M: crate::protocol::traits::ChargeMethod,
@@ -169,7 +164,6 @@ where
     }
 }
 
-#[cfg(feature = "tempo")]
 fn now_iso8601() -> String {
     use time::format_description::well_known::Iso8601;
     use time::OffsetDateTime;
@@ -179,8 +173,6 @@ fn now_iso8601() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-/// Poll the next item from a stream.
-#[cfg(feature = "tempo")]
 async fn next_item<S: futures_core::Stream + Unpin>(
     stream: &mut std::pin::Pin<&mut S>,
 ) -> Option<S::Item> {
@@ -191,7 +183,6 @@ async fn next_item<S: futures_core::Stream + Unpin>(
 }
 
 #[cfg(test)]
-#[cfg(feature = "tempo")]
 mod tests {
     use super::*;
 

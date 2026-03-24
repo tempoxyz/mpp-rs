@@ -34,7 +34,7 @@ pub mod transport;
 #[cfg(feature = "ws")]
 pub mod ws;
 
-#[cfg(feature = "ws")]
+#[cfg(all(feature = "ws", feature = "tempo"))]
 pub mod ws_session;
 
 #[cfg(feature = "tower")]
