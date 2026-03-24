@@ -206,6 +206,131 @@ async fn test_ws_message_types_over_wire() {
     handle.abort();
 }
 
+/// Credential with wrong challenge ID should be rejected.
+#[tokio::test]
+async fn test_ws_challenge_id_mismatch_rejected() {
+    let (url, handle) = start_ws_server().await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{url}/ws"))
+        .await
+        .expect("ws connect failed");
+
+    // Receive challenge
+    let msg = ws.next().await.unwrap().unwrap();
+    let text = msg.into_text().unwrap();
+    let server_msg: WsResponse = serde_json::from_str(&text).unwrap();
+    let _challenge = match server_msg {
+        WsResponse::Challenge { challenge, .. } => {
+            serde_json::from_value::<mpp::PaymentChallenge>(challenge).unwrap()
+        }
+        other => panic!("expected Challenge, got: {other:?}"),
+    };
+
+    // Send credential with a DIFFERENT challenge ID (forged echo)
+    let fake_challenge = mpp::PaymentChallenge::new(
+        "wrong-challenge-id",
+        "test.example.com",
+        "tempo",
+        "charge",
+        mpp::Base64UrlJson::from_value(&serde_json::json!({"amount": "999"})).unwrap(),
+    );
+    let credential =
+        mpp::PaymentCredential::new(fake_challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+    let auth_str = format_authorization(&credential).unwrap();
+    let cred_msg = WsMessage::Credential {
+        credential: auth_str,
+    };
+    ws.send(tungstenite::Message::Text(
+        serde_json::to_string(&cred_msg).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+
+    // Should get error about challenge ID mismatch
+    let msg = ws.next().await.unwrap().unwrap();
+    let text = msg.into_text().unwrap();
+    let response: WsResponse = serde_json::from_str(&text).unwrap();
+
+    // Credential with wrong challenge ID should be rejected (HMAC mismatch
+    // or decode failure — either way it must not succeed)
+    match response {
+        WsResponse::Error { error } => {
+            assert!(!error.is_empty(), "error should not be empty");
+        }
+        WsResponse::Challenge { error: Some(e), .. } => {
+            assert!(!e.is_empty());
+        }
+        WsResponse::Data { .. } | WsResponse::Receipt { .. } => {
+            panic!("credential with wrong challenge ID should not succeed");
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    handle.abort();
+}
+
+/// Server/client wire types are cross-compatible.
+#[test]
+fn test_server_client_wire_type_compat() {
+    use mpp::client::ws::WsServerMessage;
+
+    // Serialize with server types, deserialize with client types
+    let server_challenge = WsResponse::Challenge {
+        challenge: serde_json::json!({"id": "ch-1", "method": "tempo", "intent": "charge", "realm": "test", "request": "eyJ0ZXN0Ijp0cnVlfQ"}),
+        error: None,
+    };
+    let json = server_challenge.to_text();
+    let client_parsed: WsServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(client_parsed, WsServerMessage::Challenge { .. }));
+
+    let server_data = WsResponse::Data {
+        data: "hello".into(),
+    };
+    let json = server_data.to_text();
+    let client_parsed: WsServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(client_parsed, WsServerMessage::Data { .. }));
+
+    let server_nv = WsResponse::NeedVoucher {
+        channel_id: "0xabc".into(),
+        required_cumulative: "2000".into(),
+        accepted_cumulative: "1000".into(),
+        deposit: "5000".into(),
+    };
+    let json = server_nv.to_text();
+    let client_parsed: WsServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(client_parsed, WsServerMessage::NeedVoucher { .. }));
+
+    let server_receipt = WsResponse::Receipt {
+        receipt: serde_json::json!({"status": "success"}),
+    };
+    let json = server_receipt.to_text();
+    let client_parsed: WsServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(client_parsed, WsServerMessage::Receipt { .. }));
+
+    let server_err = WsResponse::Error {
+        error: "bad".into(),
+    };
+    let json = server_err.to_text();
+    let client_parsed: WsServerMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(client_parsed, WsServerMessage::Error { .. }));
+
+    // Serialize with client types, deserialize with server types
+    use mpp::client::ws::WsClientMessage;
+    let client_cred = WsClientMessage::Credential {
+        credential: "Payment id=\"abc\"".into(),
+    };
+    let json = client_cred.to_text();
+    let server_parsed: WsMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(server_parsed, WsMessage::Credential { .. }));
+
+    let client_data = WsClientMessage::Data {
+        data: serde_json::json!({"prompt": "hello"}),
+    };
+    let json = client_data.to_text();
+    let server_parsed: WsMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(server_parsed, WsMessage::Data { .. }));
+}
+
 /// NeedVoucher message serde works over the wire.
 #[test]
 fn test_need_voucher_roundtrip() {
