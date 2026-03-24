@@ -846,6 +846,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_www_authenticate_accepts_standard_base64_request() {
+        // Reproduces real-world interop issue: server sends the `request`
+        // field as standard base64 ('+', '/', '=' padding) instead of
+        // base64url (no padding). The parser should accept both variants,
+        // matching the mppx TypeScript SDK behavior.
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let payload = r#"{"amount":"94","currency":"0x20c000000000000000000000b9537d11c60e8b50","methodDetails":{"chainId":4217},"recipient":"0x8A739f3A6f40194C0128904bC387e63d9C0577A4"}"#;
+        let request_b64 = STANDARD.encode(payload.as_bytes());
+        // Verify it has padding
+        assert!(request_b64.ends_with('='));
+
+        let header = format!(
+            r#"Payment id="test-123", realm="mpp-hosting", method="tempo", intent="charge", request="{request_b64}", description="VPS provisioning", expires="2026-03-24T21:20:34Z""#,
+        );
+        let challenge = parse_www_authenticate(&header).unwrap();
+        assert_eq!(challenge.id, "test-123");
+        assert_eq!(challenge.method.to_string(), "tempo");
+        assert_eq!(challenge.intent.to_string(), "charge");
+
+        let decoded: serde_json::Value = challenge.request.decode().unwrap();
+        assert_eq!(decoded["amount"], "94");
+    }
+
+    #[test]
     fn test_parse_receipt_rejects_non_iso8601_timestamp() {
         // {"method":"tempo","reference":"0xabc","status":"success","timestamp":"Jan 29 2026 12:00"}
         // base64url encoded
