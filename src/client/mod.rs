@@ -19,6 +19,7 @@
 
 mod error;
 mod provider;
+pub mod transport;
 
 #[cfg(feature = "tempo")]
 pub mod tempo;

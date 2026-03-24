@@ -16,7 +16,7 @@ default = ["reqwest-default-tls"]
 
 # Side selection
 client = ["dep:reqwest"]
-server = ["tokio", "futures-core", "async-stream"]
+server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
 evm = ["alloy", "hex", "rand"]
