@@ -34,6 +34,11 @@ pub mod transport;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+// axum_ws uses the dev-dependency `axum` (with ws feature) for WebSocketUpgrade.
+// Gated behind both ws + axum features; only available in test builds for now.
+#[cfg(all(test, feature = "ws", feature = "axum"))]
+pub mod axum_ws;
+
 #[cfg(feature = "tower")]
 pub mod middleware;
 

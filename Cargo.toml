@@ -89,7 +89,7 @@ futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-axum = { version = "0.8" }
+axum = { version = "0.8", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
 

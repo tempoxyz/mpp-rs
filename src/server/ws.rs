@@ -164,7 +164,7 @@ impl Transport for WsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::core::Base64UrlJson;
+    use crate::protocol::core::{Base64UrlJson, PaymentChallenge, Receipt};
 
     #[test]
     fn test_ws_transport_name() {
