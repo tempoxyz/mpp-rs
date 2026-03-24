@@ -31,6 +31,9 @@ mod mpp;
 pub mod sse;
 pub mod transport;
 
+#[cfg(feature = "ws")]
+pub mod ws;
+
 #[cfg(feature = "tower")]
 pub mod middleware;
 

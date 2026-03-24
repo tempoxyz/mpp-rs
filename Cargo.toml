@@ -34,6 +34,9 @@ tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", 
 # Axum middleware support (server-side convenience)
 axum = ["dep:axum-core", "server", "http-types"]
 
+# WebSocket support
+ws = ["server", "client", "dep:tokio-tungstenite", "dep:futures-util"]
+
 reqwest-default-tls = ["reqwest?/default-tls"]
 reqwest-native-tls = ["reqwest?/native-tls"]
 reqwest-rustls-tls = ["reqwest?/rustls-tls"]
@@ -79,6 +82,10 @@ http-body = { version = "1", optional = true }
 
 # Axum dependencies (optional)
 axum-core = { version = "0.5", optional = true }
+
+# WebSocket dependencies (optional)
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
