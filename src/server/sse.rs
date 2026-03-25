@@ -265,6 +265,10 @@ where
             loop {
                 match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                     Ok(_state) => break,
+                    Err(e) if e.code == Some(crate::protocol::traits::ErrorCode::ChannelClosed) => {
+                        // Channel is finalized/closed — terminal, stop streaming
+                        return;
+                    }
                     Err(_) => {
                         // Emit need-voucher event
                         if let Ok(Some(ch)) = store.get_channel(&channel_id).await {

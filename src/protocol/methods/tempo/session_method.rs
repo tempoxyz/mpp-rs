@@ -104,6 +104,11 @@ pub async fn deduct_from_channel(
             Box::new(move |current| {
                 let state = current
                     .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                if state.finalized {
+                    return Err(VerificationError::channel_closed(
+                        "channel is finalized",
+                    ));
+                }
                 let available = state.highest_voucher_amount.saturating_sub(state.spent);
                 if available >= amount {
                     Ok(Some(ChannelState {
@@ -1748,5 +1753,28 @@ mod tests {
         // Available = 7M - 5M = 2M
         let available = result.highest_voucher_amount.saturating_sub(result.spent);
         assert_eq!(available, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_deduct_from_channel_finalized_rejects() {
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let mut state = test_channel_state("0xchannel_fin");
+        state.highest_voucher_amount = 10_000;
+        state.spent = 0;
+        state.finalized = true;
+        store.insert("0xchannel_fin", state);
+
+        let result = deduct_from_channel(&*store, "0xchannel_fin", 1_000).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code,
+            Some(crate::protocol::traits::ErrorCode::ChannelClosed)
+        );
+
+        // Verify state was not mutated
+        let unchanged = store.get_channel("0xchannel_fin").await.unwrap().unwrap();
+        assert_eq!(unchanged.spent, 0);
+        assert_eq!(unchanged.units, 0);
     }
 }
