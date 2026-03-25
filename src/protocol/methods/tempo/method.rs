@@ -545,25 +545,6 @@ where
             .parse::<Bytes>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {}", e)))?;
 
-        // Pre-broadcast dedup: compute hash of serialized tx and check store
-        if let Some(store) = &self.store {
-            let tx_hash_pre = keccak256(&tx_bytes);
-            let dedup_key = format!("mpp:charge:{:#x}", tx_hash_pre);
-            let seen = store
-                .get(&dedup_key)
-                .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
-                return Err(VerificationError::new(
-                    "Transaction has already been submitted.",
-                ));
-            }
-            store
-                .put(&dedup_key, serde_json::Value::Bool(true))
-                .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
-        }
-
         let expected_recipient = charge.recipient_address().map_err(|e| {
             VerificationError::new(format!("Invalid recipient address in request: {}", e))
         })?;
@@ -599,6 +580,27 @@ where
             expected_chain_id,
         )?;
 
+        // Pre-broadcast dedup: hash the final tx bytes (after co-signing/validation)
+        // and check/mark in store before broadcasting. Uses a separate namespace
+        // from the post-broadcast hash-based dedup in verify_hash.
+        if let Some(store) = &self.store {
+            let tx_hash_pre = keccak256(&final_tx_bytes);
+            let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
+            let seen = store
+                .get(&dedup_key)
+                .await
+                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
+            if seen.is_some() {
+                return Err(VerificationError::new(
+                    "Transaction has already been submitted.",
+                ));
+            }
+            store
+                .put(&dedup_key, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+        }
+
         let pending = self
             .provider
             .send_raw_transaction(&final_tx_bytes)
@@ -615,6 +617,24 @@ where
                 "Transaction {} reverted",
                 receipt.transaction_hash()
             )));
+        }
+
+        // Verify the receipt contains the expected TIP-20 transfer
+        self.verify_tip20_transfer(
+            &receipt,
+            currency,
+            expected_recipient,
+            expected_amount,
+            memo.as_deref(),
+        )?;
+
+        // Record the on-chain tx hash for hash-based replay protection
+        if let Some(store) = &self.store {
+            let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
+            store
+                .put(&replay_key, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
         }
 
         Ok(receipt.transaction_hash())
@@ -806,7 +826,10 @@ where
                 this.verify_hash(charge_payload.tx_hash().unwrap(), &request)
                     .await
             } else {
-                // Client sent signed transaction, validate and broadcast it
+                // Client sent signed transaction, validate and broadcast it.
+                // broadcast_transaction already does pre-broadcast dedup and
+                // validates the receipt, so we do NOT call verify_hash here
+                // (which would self-reject since the tx hash is already marked).
                 let tx_hash = this
                     .broadcast_transaction(
                         charge_payload.signed_tx().unwrap(),
@@ -814,7 +837,7 @@ where
                         expected_chain_id,
                     )
                     .await?;
-                this.verify_hash(&format!("{:#x}", tx_hash), &request).await
+                Ok(Receipt::success(METHOD_NAME, &format!("{:#x}", tx_hash)))
             }
         }
     }
