@@ -248,6 +248,14 @@ where
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
 
+        // Extract the transaction sender from the receipt. Used to verify that the
+        // Transfer event's `from` field matches, preventing cross-endpoint replay of
+        // session settlement transactions (where Transfer comes from an escrow contract).
+        let tx_sender = receipt_json
+            .get("from")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Address>().ok());
+
         let logs = receipt_json
             .get("logs")
             .and_then(|v| v.as_array())
@@ -293,6 +301,18 @@ where
             // Check for TransferWithMemo when memo is expected
             if let Some(exp_memo) = expected_memo {
                 if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
+                    // Verify Transfer sender matches transaction sender to prevent
+                    // session settlement tx replay (where from would be the escrow contract)
+                    if let Some(sender) = tx_sender {
+                        let from_address = match topics[1].parse::<B256>() {
+                            Ok(b) => Address::from_slice(&b[12..]),
+                            Err(_) => continue,
+                        };
+                        if from_address != sender {
+                            continue;
+                        }
+                    }
+
                     let to_topic = topics[2];
                     // Skip if to_address topic is unparseable
                     let to_address = match to_topic.parse::<B256>() {
@@ -329,6 +349,18 @@ where
             // Standard Transfer event
             if topic0 != TRANSFER_EVENT_TOPIC || topics.len() < 3 {
                 continue;
+            }
+
+            // Verify Transfer sender matches transaction sender to prevent
+            // session settlement tx replay (where from would be the escrow contract)
+            if let Some(sender) = tx_sender {
+                let from_address = match topics[1].parse::<B256>() {
+                    Ok(b) => Address::from_slice(&b[12..]),
+                    Err(_) => continue,
+                };
+                if from_address != sender {
+                    continue;
+                }
             }
 
             let to_topic = topics[2];
