@@ -202,6 +202,16 @@ where
         self.decimals
     }
 
+    /// Get whether fee sponsorship is enabled.
+    pub fn fee_payer(&self) -> bool {
+        self.fee_payer
+    }
+
+    /// Get the configured chain ID, if set.
+    pub fn chain_id(&self) -> Option<u64> {
+        self.chain_id
+    }
+
     /// Verify the challenge HMAC and reject expired challenges.
     ///
     /// Shared validation used by both charge and session verification paths.
