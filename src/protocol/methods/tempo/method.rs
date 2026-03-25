@@ -24,7 +24,7 @@
 //! ```
 
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{hex, Address, Bytes, TxKind, B256, U256};
+use alloy::primitives::{hex, keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use std::future::Future;
 use std::sync::Arc;
@@ -155,7 +155,7 @@ where
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
-        let replay_key = format!("mpp:charge:{tx_hash}");
+        let replay_key = format!("mpp:charge:{}", tx_hash.to_lowercase());
 
         if let Some(store) = &self.store {
             let seen = store
@@ -248,6 +248,14 @@ where
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
 
+        // Extract the transaction sender from the receipt. Used to verify that the
+        // Transfer event's `from` field matches, preventing cross-endpoint replay of
+        // session settlement transactions (where Transfer comes from an escrow contract).
+        let tx_sender = receipt_json
+            .get("from")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Address>().ok());
+
         let logs = receipt_json
             .get("logs")
             .and_then(|v| v.as_array())
@@ -293,6 +301,18 @@ where
             // Check for TransferWithMemo when memo is expected
             if let Some(exp_memo) = expected_memo {
                 if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
+                    // Verify Transfer sender matches transaction sender to prevent
+                    // session settlement tx replay (where from would be the escrow contract)
+                    if let Some(sender) = tx_sender {
+                        let from_address = match topics[1].parse::<B256>() {
+                            Ok(b) => Address::from_slice(&b[12..]),
+                            Err(_) => continue,
+                        };
+                        if from_address != sender {
+                            continue;
+                        }
+                    }
+
                     let to_topic = topics[2];
                     // Skip if to_address topic is unparseable
                     let to_address = match to_topic.parse::<B256>() {
@@ -329,6 +349,18 @@ where
             // Standard Transfer event
             if topic0 != TRANSFER_EVENT_TOPIC || topics.len() < 3 {
                 continue;
+            }
+
+            // Verify Transfer sender matches transaction sender to prevent
+            // session settlement tx replay (where from would be the escrow contract)
+            if let Some(sender) = tx_sender {
+                let from_address = match topics[1].parse::<B256>() {
+                    Ok(b) => Address::from_slice(&b[12..]),
+                    Err(_) => continue,
+                };
+                if from_address != sender {
+                    continue;
+                }
             }
 
             let to_topic = topics[2];
@@ -512,6 +544,25 @@ where
         let tx_bytes = signed_tx
             .parse::<Bytes>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {}", e)))?;
+
+        // Pre-broadcast dedup: compute hash of serialized tx and check store
+        if let Some(store) = &self.store {
+            let tx_hash_pre = keccak256(&tx_bytes);
+            let dedup_key = format!("mpp:charge:{:#x}", tx_hash_pre);
+            let seen = store
+                .get(&dedup_key)
+                .await
+                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
+            if seen.is_some() {
+                return Err(VerificationError::new(
+                    "Transaction has already been submitted.",
+                ));
+            }
+            store
+                .put(&dedup_key, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+        }
 
         let expected_recipient = charge.recipient_address().map_err(|e| {
             VerificationError::new(format!("Invalid recipient address in request: {}", e))
@@ -1228,6 +1279,28 @@ mod tests {
         let key = "mpp:charge:0xnever_seen";
         let seen = store.get(key).await.unwrap();
         assert!(seen.is_none(), "unseen hash should not be in store");
+    }
+
+    #[tokio::test]
+    async fn test_store_dedup_case_insensitive() {
+        use crate::store::{MemoryStore, Store};
+
+        let store = Arc::new(MemoryStore::new());
+
+        // Record hash with mixed case
+        let key_upper = format!("mpp:charge:{}", "0xABCdef123".to_lowercase());
+        store
+            .put(&key_upper, serde_json::Value::Bool(true))
+            .await
+            .unwrap();
+
+        // Same hash with different case should match
+        let key_lower = format!("mpp:charge:{}", "0xabcDEF123".to_lowercase());
+        let seen = store.get(&key_lower).await.unwrap();
+        assert!(
+            seen.is_some(),
+            "same hash with different case should be detected as replay"
+        );
     }
 
     #[tokio::test]
