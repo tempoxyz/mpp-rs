@@ -155,7 +155,7 @@ where
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
-        let replay_key = format!("mpp:charge:{}", tx_hash.to_lowercase());
+        let replay_key = format!("mpp:charge:{:#x}", hash);
 
         if let Some(store) = &self.store {
             let seen = store
@@ -1287,20 +1287,31 @@ mod tests {
 
         let store = Arc::new(MemoryStore::new());
 
-        // Record hash with mixed case
-        let key_upper = format!("mpp:charge:{}", "0xABCdef123".to_lowercase());
+        // Simulate the canonical key construction used by verify_hash:
+        // parse to B256, then format with {:#x} for canonical lowercase 0x-prefixed output.
+        let mixed_case = "0xABCdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash = mixed_case.parse::<B256>().unwrap();
+        let key1 = format!("mpp:charge:{:#x}", hash);
         store
-            .put(&key_upper, serde_json::Value::Bool(true))
+            .put(&key1, serde_json::Value::Bool(true))
             .await
             .unwrap();
 
-        // Same hash with different case should match
-        let key_lower = format!("mpp:charge:{}", "0xabcDEF123".to_lowercase());
-        let seen = store.get(&key_lower).await.unwrap();
+        // Same hash submitted with different casing produces same canonical key
+        let lower_case = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash2 = lower_case.parse::<B256>().unwrap();
+        let key2 = format!("mpp:charge:{:#x}", hash2);
+        let seen = store.get(&key2).await.unwrap();
         assert!(
             seen.is_some(),
             "same hash with different case should be detected as replay"
         );
+
+        // Without 0x prefix should also parse to the same canonical key
+        let no_prefix = "ABCdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash3 = no_prefix.parse::<B256>().unwrap();
+        let key3 = format!("mpp:charge:{:#x}", hash3);
+        assert_eq!(key1, key3, "0x-prefixed and unprefixed should produce same key");
     }
 
     #[tokio::test]
