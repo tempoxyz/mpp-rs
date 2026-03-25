@@ -423,10 +423,16 @@ where
                 &channel_id_for_key,
                 Box::new(move |existing| {
                     if let Some(existing) = existing {
+                        let settled_on_chain =
+                            std::cmp::max(on_chain.settled, existing.settled_on_chain);
+                        let spent = std::cmp::max(settled_on_chain, existing.spent);
+
                         // Channel already exists — update if higher.
                         if cumulative_amount > existing.highest_voucher_amount {
                             Ok(Some(ChannelState {
                                 deposit: on_chain.deposit,
+                                settled_on_chain,
+                                spent,
                                 highest_voucher_amount: cumulative_amount,
                                 highest_voucher_signature: Some(sig_bytes),
                                 authorized_signer,
@@ -435,6 +441,8 @@ where
                         } else {
                             Ok(Some(ChannelState {
                                 deposit: on_chain.deposit,
+                                settled_on_chain,
+                                spent,
                                 authorized_signer,
                                 ..existing
                             }))
@@ -1699,5 +1707,46 @@ mod tests {
 
         assert_eq!(r1.unwrap().spent, 3_000);
         assert_eq!(r2.unwrap().spent, 5_000);
+    }
+
+    #[tokio::test]
+    async fn test_reopen_bumps_spent_to_settled_on_chain() {
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let mut state = test_channel_state("0xchannel_reopen");
+        state.highest_voucher_amount = 5_000_000;
+        state.spent = 0;
+        state.settled_on_chain = 0;
+        state.deposit = 10_000_000;
+        store.insert("0xchannel_reopen", state);
+
+        // Simulate what handle_open does when reopening:
+        // on_chain.settled has increased to 5_000_000
+        let on_chain_settled: u128 = 5_000_000;
+        let result = store
+            .update_channel(
+                "0xchannel_reopen",
+                Box::new(move |existing| {
+                    let existing = existing.unwrap();
+                    let settled_on_chain =
+                        std::cmp::max(on_chain_settled, existing.settled_on_chain);
+                    let spent = std::cmp::max(settled_on_chain, existing.spent);
+                    Ok(Some(ChannelState {
+                        settled_on_chain,
+                        spent,
+                        highest_voucher_amount: 7_000_000,
+                        ..existing
+                    }))
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.settled_on_chain, 5_000_000);
+        assert_eq!(result.spent, 5_000_000);
+        assert_eq!(result.highest_voucher_amount, 7_000_000);
+        // Available = 7M - 5M = 2M
+        let available = result.highest_voucher_amount.saturating_sub(result.spent);
+        assert_eq!(available, 2_000_000);
     }
 }
