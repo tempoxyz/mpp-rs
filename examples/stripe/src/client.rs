@@ -90,7 +90,7 @@ async fn main() {
 
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
         if let Some(fortune) = json.get("fortune").and_then(|v| v.as_str()) {
-            println!("\n🥠 {fortune}");
+            println!("\nFortune: {fortune}");
         } else {
             println!("\nResponse: {json}");
         }
