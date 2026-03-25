@@ -210,7 +210,6 @@ pub struct SessionMethod<P> {
     /// Optional signer for submitting on-chain close transactions.
     ///
     /// Accepts any EVM signer (local key, KMS, hardware wallet, etc.).
-    // TODO: abstract signer for Solana sessions
     close_signer: Option<Arc<dyn alloy::signers::Signer + Send + Sync>>,
 }
 
