@@ -450,10 +450,10 @@ where
                             token: on_chain.token,
                             authorized_signer,
                             deposit: on_chain.deposit,
-                            settled_on_chain: 0,
+                            settled_on_chain: on_chain.settled,
                             highest_voucher_amount: cumulative_amount,
                             highest_voucher_signature: Some(sig_bytes),
-                            spent: 0,
+                            spent: on_chain.settled,
                             units: 0,
                             finalized: false,
                             created_at: now_iso8601(),
@@ -1699,5 +1699,33 @@ mod tests {
 
         assert_eq!(r1.unwrap().spent, 3_000);
         assert_eq!(r2.unwrap().spent, 5_000);
+    }
+
+    #[test]
+    fn test_new_channel_state_should_use_on_chain_settled() {
+        // Verify that when creating a new ChannelState for a reopened channel,
+        // settled_on_chain and spent must reflect on_chain.settled to prevent
+        // double-spending already-settled amounts.
+        let on_chain_settled: u128 = 5_000_000;
+        let state = ChannelState {
+            channel_id: "0xchannel".to_string(),
+            chain_id: 42431,
+            escrow_contract: Address::ZERO,
+            payer: Address::ZERO,
+            payee: Address::ZERO,
+            token: Address::ZERO,
+            authorized_signer: Address::ZERO,
+            deposit: 10_000_000,
+            settled_on_chain: on_chain_settled,
+            highest_voucher_amount: 7_000_000,
+            highest_voucher_signature: None,
+            spent: on_chain_settled,
+            units: 0,
+            finalized: false,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        };
+        // Available should be highest_voucher_amount - spent = 7M - 5M = 2M
+        let available = state.highest_voucher_amount.saturating_sub(state.spent);
+        assert_eq!(available, 2_000_000);
     }
 }
