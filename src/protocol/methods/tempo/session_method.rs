@@ -1701,31 +1701,78 @@ mod tests {
         assert_eq!(r2.unwrap().spent, 5_000);
     }
 
-    #[test]
-    fn test_new_channel_state_should_use_on_chain_settled() {
-        // Verify that when creating a new ChannelState for a reopened channel,
-        // settled_on_chain and spent must reflect on_chain.settled to prevent
-        // double-spending already-settled amounts.
+    #[tokio::test]
+    async fn test_new_channel_state_should_use_on_chain_settled() {
+        // Exercises the real update_channel closure from handle_open's "new channel"
+        // branch. When no existing state is present, settled_on_chain and spent must
+        // be set to on_chain.settled to prevent double-spending already-settled amounts.
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_reopened";
+
         let on_chain_settled: u128 = 5_000_000;
-        let state = ChannelState {
-            channel_id: "0xchannel".to_string(),
-            chain_id: 42431,
-            escrow_contract: Address::ZERO,
-            payer: Address::ZERO,
-            payee: Address::ZERO,
-            token: Address::ZERO,
-            authorized_signer: Address::ZERO,
-            deposit: 10_000_000,
-            settled_on_chain: on_chain_settled,
-            highest_voucher_amount: 7_000_000,
-            highest_voucher_signature: None,
-            spent: on_chain_settled,
-            units: 0,
-            finalized: false,
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-        };
-        // Available should be highest_voucher_amount - spent = 7M - 5M = 2M
+        let on_chain_deposit: u128 = 10_000_000;
+        let cumulative_amount: u128 = 7_000_000;
+        let sig_bytes = vec![0xAA; 65];
+        let authorized_signer: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let chain_id: u64 = 42431;
+
+        // Replicate the closure from handle_open's else (new channel) branch
+        let sig_bytes_clone = sig_bytes.clone();
+        let result = store
+            .update_channel(
+                channel_id,
+                Box::new(move |existing| {
+                    assert!(existing.is_none(), "should be new channel");
+                    Ok(Some(ChannelState {
+                        channel_id: channel_id.to_string(),
+                        chain_id,
+                        escrow_contract: escrow,
+                        payer,
+                        payee,
+                        token,
+                        authorized_signer,
+                        deposit: on_chain_deposit,
+                        settled_on_chain: on_chain_settled,
+                        highest_voucher_amount: cumulative_amount,
+                        highest_voucher_signature: Some(sig_bytes_clone),
+                        spent: on_chain_settled,
+                        units: 0,
+                        finalized: false,
+                        created_at: "2025-01-01T00:00:00Z".to_string(),
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
+
+        let state = result.unwrap();
+        assert_eq!(state.settled_on_chain, on_chain_settled);
+        assert_eq!(state.spent, on_chain_settled);
+        assert_eq!(state.highest_voucher_amount, cumulative_amount);
+        assert_eq!(state.deposit, on_chain_deposit);
+
+        // Verify available balance reflects settled amount
         let available = state.highest_voucher_amount.saturating_sub(state.spent);
-        assert_eq!(available, 2_000_000);
+        assert_eq!(available, 2_000_000); // 7M - 5M
+
+        // Verify deduct_from_channel also sees correct available balance
+        let after_deduct = deduct_from_channel(&*store, channel_id, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(after_deduct.spent, on_chain_settled + 1_000_000); // 6M
     }
 }
