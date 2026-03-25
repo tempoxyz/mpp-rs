@@ -540,7 +540,7 @@ where
                 )
             })?;
 
-            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer, currency)
+            self.cosign_fee_payer_transaction(&tx_bytes, &**fee_payer_signer, currency)
                 .await?
         } else {
             tx_bytes.to_vec()
@@ -590,7 +590,6 @@ where
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::eips::Encodable2718;
-        use alloy::signers::Signer as _;
         use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
         if tx_bytes.is_empty() {
@@ -983,8 +982,8 @@ mod tests {
 
     /// Round-trip: sign 0x78 envelope → cosign_fee_payer_transaction
     /// succeeds and produces a valid co-signed 0x76 transaction.
-    #[test]
-    fn test_fee_payer_round_trip_0x78_envelope() {
+    #[tokio::test]
+    async fn test_fee_payer_round_trip_0x78_envelope() {
         use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::eips::Decodable2718;
         use alloy::signers::SignerSync;
@@ -1014,11 +1013,13 @@ mod tests {
 
         let result = method.cosign_fee_payer_transaction(
             &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
+            &**method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let co_signed = result.expect("cosign should succeed for valid 0x78 envelope");
+        let co_signed = result
+            .await
+            .expect("cosign should succeed for valid 0x78 envelope");
 
         // Result should be a valid 0x76 transaction
         assert_eq!(
@@ -1040,8 +1041,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects txs with wrong nonce_key.
-    #[test]
-    fn test_cosign_rejects_wrong_nonce_key() {
+    #[tokio::test]
+    async fn test_cosign_rejects_wrong_nonce_key() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
@@ -1061,11 +1062,11 @@ mod tests {
 
         let result = method.cosign_fee_payer_transaction(
             &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
+            &**method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let err = result.expect_err("should reject wrong nonce_key");
+        let err = result.await.expect_err("should reject wrong nonce_key");
         assert!(
             err.to_string().contains("expiring nonce key"),
             "error should mention expiring nonce key, got: {err}"
@@ -1073,8 +1074,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects txs without valid_before.
-    #[test]
-    fn test_cosign_rejects_missing_valid_before() {
+    #[tokio::test]
+    async fn test_cosign_rejects_missing_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
@@ -1094,11 +1095,13 @@ mod tests {
 
         let result = method.cosign_fee_payer_transaction(
             &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
+            &**method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let err = result.expect_err("should reject missing valid_before");
+        let err = result
+            .await
+            .expect_err("should reject missing valid_before");
         assert!(
             err.to_string().contains("must include valid_before"),
             "error should mention valid_before, got: {err}"
@@ -1106,8 +1109,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects txs with expired valid_before.
-    #[test]
-    fn test_cosign_rejects_expired_valid_before() {
+    #[tokio::test]
+    async fn test_cosign_rejects_expired_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
@@ -1134,11 +1137,13 @@ mod tests {
 
         let result = method.cosign_fee_payer_transaction(
             &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
+            &**method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let err = result.expect_err("should reject expired valid_before");
+        let err = result
+            .await
+            .expect_err("should reject expired valid_before");
         assert!(
             err.to_string().contains("expired"),
             "error should mention expiration, got: {err}"
@@ -1146,8 +1151,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects empty input.
-    #[test]
-    fn test_cosign_rejects_empty_input() {
+    #[tokio::test]
+    async fn test_cosign_rejects_empty_input() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
@@ -1161,11 +1166,11 @@ mod tests {
 
         let result = method.cosign_fee_payer_transaction(
             &[],
-            method.fee_payer_signer.as_ref().unwrap(),
+            &**method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let err = result.expect_err("should reject empty input");
+        let err = result.await.expect_err("should reject empty input");
         assert!(
             err.to_string().contains("Empty transaction bytes"),
             "error should mention empty, got: {err}"
@@ -1173,8 +1178,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects non-0x78 type byte.
-    #[test]
-    fn test_cosign_rejects_wrong_type_byte() {
+    #[tokio::test]
+    async fn test_cosign_rejects_wrong_type_byte() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
             .parse()
@@ -1188,11 +1193,11 @@ mod tests {
 
         let result = method.cosign_fee_payer_transaction(
             &[0x79, 0xc0], // wrong type byte
-            method.fee_payer_signer.as_ref().unwrap(),
+            &**method.fee_payer_signer.as_ref().unwrap(),
             fee_token,
         );
 
-        let err = result.expect_err("should reject wrong type");
+        let err = result.await.expect_err("should reject wrong type");
         assert!(
             err.to_string()
                 .contains("Expected fee payer envelope (0x78)"),

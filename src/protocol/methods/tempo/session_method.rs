@@ -689,7 +689,6 @@ where
         let close_tx_hash = if let Some(ref signer) = self.close_signer {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
-            use alloy::signers::Signer as _;
             use alloy::sol_types::SolCall;
             use tempo_primitives::transaction::Call;
             use tempo_primitives::TempoTransaction;
