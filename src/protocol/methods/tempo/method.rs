@@ -103,7 +103,7 @@ fn parse_b256_hex(s: &str) -> Option<B256> {
 #[derive(Clone)]
 pub struct ChargeMethod<P> {
     provider: Arc<P>,
-    fee_payer_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    fee_payer_signer: Option<Arc<dyn alloy::signers::Signer + Send + Sync>>,
     store: Option<Arc<dyn Store>>,
 }
 
@@ -136,7 +136,13 @@ where
     ///
     /// When set, requests with `feePayer: true` will be accepted and
     /// broadcast. Without a fee payer signer, such requests are rejected.
-    pub fn with_fee_payer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
+    ///
+    /// Accepts any type implementing alloy's [`Signer`](alloy::signers::Signer)
+    /// trait — local private keys, KMS-backed signers, hardware wallets, etc.
+    pub fn with_fee_payer(
+        mut self,
+        signer: impl alloy::signers::Signer + Send + Sync + 'static,
+    ) -> Self {
         self.fee_payer_signer = Some(Arc::new(signer));
         self
     }
@@ -534,7 +540,8 @@ where
                 )
             })?;
 
-            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer, currency)?
+            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer, currency)
+                .await?
         } else {
             tx_bytes.to_vec()
         };
@@ -574,16 +581,16 @@ where
     /// Accepts a `0x78` fee payer envelope, recovers the sender via
     /// ecrecover, validates fee-payer invariants, then co-signs and
     /// returns a complete `0x76` transaction ready for broadcast.
-    fn cosign_fee_payer_transaction(
+    async fn cosign_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
-        fee_payer_signer: &alloy::signers::local::PrivateKeySigner,
+        fee_payer_signer: &(dyn alloy::signers::Signer + Send + Sync),
         fee_token: Address,
     ) -> Result<Vec<u8>, VerificationError> {
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::eips::Encodable2718;
-        use alloy::signers::SignerSync;
+        use alloy::signers::Signer as _;
         use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
         if tx_bytes.is_empty() {
@@ -660,7 +667,8 @@ where
         // Compute the fee payer signature hash and co-sign
         let fp_hash = tx.fee_payer_signature_hash(sender);
         let fp_sig = fee_payer_signer
-            .sign_hash_sync(&fp_hash)
+            .sign_hash(&fp_hash)
+            .await
             .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {e}")))?;
 
         tx.fee_payer_signature = Some(fp_sig);
