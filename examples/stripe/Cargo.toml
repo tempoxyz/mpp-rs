@@ -1,0 +1,23 @@
+[package]
+name = "stripe-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "stripe-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "stripe-client"
+path = "src/client.rs"
+
+[dependencies]
+mpp = { path = "../..", features = ["server", "client", "stripe"] }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+rand = "0.9"
+base64 = "0.22"

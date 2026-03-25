@@ -15,9 +15,9 @@
 //! let challenge = mpp.charge("0.10")?;
 //! ```
 
-#[cfg(feature = "tempo")]
+#[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::error::Result;
-#[cfg(feature = "tempo")]
+#[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::protocol::core::PaymentChallenge;
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
@@ -658,6 +658,150 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
             chain_id: builder.chain_id,
+        })
+    }
+}
+
+// ==================== Stripe charge helpers ====================
+
+#[cfg(feature = "stripe")]
+impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
+    /// Generate a Stripe charge challenge for a dollar amount.
+    ///
+    /// Creates a `method=stripe`, `intent=charge` challenge with HMAC-bound ID.
+    pub fn stripe_charge(&self, amount: &str) -> Result<PaymentChallenge> {
+        self.stripe_charge_with_options(amount, super::StripeChargeOptions::default())
+    }
+
+    /// Generate a Stripe charge challenge with additional options.
+    ///
+    /// Accepts [`StripeChargeOptions`](super::StripeChargeOptions) for description,
+    /// external ID, expiration, and metadata.
+    pub fn stripe_charge_with_options(
+        &self,
+        amount: &str,
+        options: super::StripeChargeOptions<'_>,
+    ) -> Result<PaymentChallenge> {
+        use crate::protocol::core::Base64UrlJson;
+        use time::{Duration, OffsetDateTime};
+
+        use crate::protocol::methods::stripe::StripeMethodDetails;
+
+        let base_units = super::parse_dollar_amount(amount, self.decimals)?;
+        let currency = self.currency.as_deref().unwrap_or("usd");
+
+        let details = StripeMethodDetails {
+            network_id: self.method.network_id().to_string(),
+            payment_method_types: self.method.payment_method_types().to_vec(),
+            metadata: options.metadata.cloned(),
+        };
+
+        let request = ChargeRequest {
+            amount: base_units,
+            currency: currency.to_string(),
+            description: options.description.map(|s| s.to_string()),
+            external_id: options.external_id.map(|s| s.to_string()),
+            method_details: Some(serde_json::to_value(&details).map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "failed to serialize methodDetails: {e}"
+                ))
+            })?),
+            ..Default::default()
+        };
+
+        let encoded_request = Base64UrlJson::from_typed(&request)?;
+
+        let expires = if let Some(exp) = options.expires {
+            exp.to_string()
+        } else {
+            let expiry_time = OffsetDateTime::now_utc() + Duration::minutes(5);
+            expiry_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| {
+                    crate::error::MppError::InvalidConfig(format!("failed to format expires: {e}"))
+                })?
+        };
+
+        let id = crate::protocol::core::compute_challenge_id(
+            &self.secret_key,
+            &self.realm,
+            crate::protocol::methods::stripe::METHOD_NAME,
+            crate::protocol::methods::stripe::INTENT_CHARGE,
+            encoded_request.raw(),
+            Some(&expires),
+            None,
+            None,
+        );
+
+        Ok(PaymentChallenge {
+            id,
+            realm: self.realm.clone(),
+            method: crate::protocol::methods::stripe::METHOD_NAME.into(),
+            intent: crate::protocol::methods::stripe::INTENT_CHARGE.into(),
+            request: encoded_request,
+            expires: Some(expires),
+            description: options.description.map(|s| s.to_string()),
+            digest: None,
+            opaque: None,
+        })
+    }
+}
+
+#[cfg(feature = "stripe")]
+impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
+    /// Create a Stripe payment handler from a [`StripeBuilder`](super::StripeBuilder).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use mpp::server::{Mpp, stripe, StripeConfig};
+    ///
+    /// let mpp = Mpp::create_stripe(stripe(StripeConfig {
+    ///     secret_key: "sk_test_...",
+    ///     network_id: "internal",
+    ///     payment_method_types: &["card"],
+    ///     currency: "usd",
+    ///     decimals: 2,
+    /// })
+    /// .secret_key("my-hmac-secret"))?;
+    /// ```
+    pub fn create_stripe(builder: super::StripeBuilder) -> Result<Self> {
+        let secret_key = builder
+            .hmac_secret_key
+            .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            })
+            .ok_or_else(|| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "Missing secret key. Set {} environment variable or pass .secret_key(...).",
+                    SECRET_KEY_ENV_VAR
+                ))
+            })?;
+
+        let mut method = crate::protocol::methods::stripe::method::ChargeMethod::new(
+            &builder.secret_key,
+            &builder.network_id,
+            builder.payment_method_types.clone(),
+        );
+        if let Some(api_base) = builder.stripe_api_base {
+            method = method.with_api_base(api_base);
+        }
+
+        Ok(Self {
+            method,
+            session_method: None,
+            realm: builder.realm,
+            secret_key,
+            currency: Some(builder.currency),
+            recipient: None,
+            decimals: builder.decimals as u32,
+            fee_payer: false,
+            chain_id: None,
         })
     }
 }
@@ -1724,5 +1868,132 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code, Some(ErrorCode::Expired));
+    }
+
+    // ==================== Stripe tests ====================
+
+    #[cfg(feature = "stripe")]
+    fn test_stripe_mpp() -> Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
+        use crate::server::{stripe, StripeConfig};
+
+        Mpp::create_stripe(
+            stripe(StripeConfig {
+                secret_key: "sk_test_mock",
+                network_id: "test-net",
+                payment_method_types: &["card"],
+                currency: "usd",
+                decimals: 2,
+            })
+            .secret_key("test-hmac-secret"),
+        )
+        .expect("failed to create stripe mpp")
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_challenge_has_method_details() {
+        let mpp = test_stripe_mpp();
+        let challenge = mpp.stripe_charge("1.00").unwrap();
+
+        let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+        let details = &request["methodDetails"];
+        assert_eq!(details["networkId"], "test-net");
+        assert_eq!(details["paymentMethodTypes"], serde_json::json!(["card"]));
+        assert_eq!(challenge.method.as_str(), "stripe");
+        assert_eq!(challenge.intent.as_str(), "charge");
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_with_options_description() {
+        use crate::server::StripeChargeOptions;
+
+        let mpp = test_stripe_mpp();
+        let challenge = mpp
+            .stripe_charge_with_options(
+                "0.50",
+                StripeChargeOptions {
+                    description: Some("test desc"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(challenge.description, Some("test desc".to_string()));
+        let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+        assert_eq!(request["description"], "test desc");
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_with_options_external_id() {
+        use crate::server::StripeChargeOptions;
+
+        let mpp = test_stripe_mpp();
+        let challenge = mpp
+            .stripe_charge_with_options(
+                "0.50",
+                StripeChargeOptions {
+                    external_id: Some("order-42"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+        assert_eq!(request["externalId"], "order-42");
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_with_options_metadata() {
+        use crate::server::StripeChargeOptions;
+
+        let mpp = test_stripe_mpp();
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("key1".to_string(), "val1".to_string());
+
+        let challenge = mpp
+            .stripe_charge_with_options(
+                "0.50",
+                StripeChargeOptions {
+                    metadata: Some(&metadata),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+        assert_eq!(request["methodDetails"]["metadata"]["key1"], "val1");
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_with_options_custom_expires() {
+        use crate::server::StripeChargeOptions;
+
+        let mpp = test_stripe_mpp();
+        let challenge = mpp
+            .stripe_charge_with_options(
+                "0.50",
+                StripeChargeOptions {
+                    expires: Some("2099-01-01T00:00:00Z"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(challenge.expires, Some("2099-01-01T00:00:00Z".to_string()));
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_delegates_to_with_options() {
+        let mpp = test_stripe_mpp();
+        let challenge = mpp.stripe_charge("0.10").unwrap();
+
+        let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+        assert!(request["methodDetails"].is_object());
+        assert!(challenge.description.is_none());
     }
 }

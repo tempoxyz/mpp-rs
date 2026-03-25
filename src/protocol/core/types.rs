@@ -245,10 +245,27 @@ pub fn base64url_encode(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Decode a base64url string (no padding) to bytes.
+/// Decode a base64url string to bytes.
+///
+/// Accepts both URL-safe (`-`, `_`) and standard (`+`, `/`) alphabets,
+/// with or without `=` padding. This follows Postel's law — be strict in
+/// what you produce (see [`base64url_encode`]) but lenient in what you
+/// accept — and aligns with the mppx TypeScript SDK which also accepts
+/// both variants.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
+    // Normalize standard base64 to URL-safe alphabet and strip padding.
+    let normalized: String = input
+        .chars()
+        .filter(|c| *c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            other => other,
+        })
+        .collect();
+
     URL_SAFE_NO_PAD
-        .decode(input)
+        .decode(&normalized)
         .map_err(|e| MppError::InvalidBase64Url(format!("Invalid base64url: {}", e)))
 }
 
@@ -419,6 +436,35 @@ mod tests {
     fn test_base64url_decode_rejects_invalid_characters() {
         let noisy = "YW!JjZA";
         assert!(base64url_decode(noisy).is_err());
+    }
+
+    #[test]
+    fn test_base64url_decode_accepts_standard_base64_with_padding() {
+        // Standard base64 ('+', '/') with '=' padding — as produced by
+        // some servers that use RFC 4648 §4 instead of §5.
+        let data = b"hello world";
+        let standard = base64::engine::general_purpose::STANDARD.encode(data);
+        assert!(standard.contains('=') || standard.contains('+') || standard.contains('/'));
+        let decoded = base64url_decode(&standard).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_base64url_decode_accepts_url_safe_without_padding() {
+        let data = b"hello world";
+        let encoded = base64url_encode(data);
+        let decoded = base64url_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_base64url_decode_accepts_standard_alphabet_no_padding() {
+        // Standard alphabet but padding stripped — another common variant.
+        let data = b"test data with special chars: <>?";
+        let standard = base64::engine::general_purpose::STANDARD.encode(data);
+        let no_pad = standard.trim_end_matches('=');
+        let decoded = base64url_decode(no_pad).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]
