@@ -251,10 +251,7 @@ where
         // Extract the transaction sender from the receipt. Used to verify that the
         // Transfer event's `from` field matches, preventing cross-endpoint replay of
         // session settlement transactions (where Transfer comes from an escrow contract).
-        let tx_sender = receipt_json
-            .get("from")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<Address>().ok());
+        let tx_sender = receipt.from();
 
         let logs = receipt_json
             .get("logs")
@@ -303,14 +300,12 @@ where
                 if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
                     // Verify Transfer sender matches transaction sender to prevent
                     // session settlement tx replay (where from would be the escrow contract)
-                    if let Some(sender) = tx_sender {
-                        let from_address = match topics[1].parse::<B256>() {
-                            Ok(b) => Address::from_slice(&b[12..]),
-                            Err(_) => continue,
-                        };
-                        if from_address != sender {
-                            continue;
-                        }
+                    let from_address = match topics[1].parse::<B256>() {
+                        Ok(b) => Address::from_slice(&b[12..]),
+                        Err(_) => continue,
+                    };
+                    if from_address != tx_sender {
+                        continue;
                     }
 
                     let to_topic = topics[2];
@@ -353,14 +348,12 @@ where
 
             // Verify Transfer sender matches transaction sender to prevent
             // session settlement tx replay (where from would be the escrow contract)
-            if let Some(sender) = tx_sender {
-                let from_address = match topics[1].parse::<B256>() {
-                    Ok(b) => Address::from_slice(&b[12..]),
-                    Err(_) => continue,
-                };
-                if from_address != sender {
-                    continue;
-                }
+            let from_address = match topics[1].parse::<B256>() {
+                Ok(b) => Address::from_slice(&b[12..]),
+                Err(_) => continue,
+            };
+            if from_address != tx_sender {
+                continue;
             }
 
             let to_topic = topics[2];
