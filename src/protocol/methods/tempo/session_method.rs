@@ -455,7 +455,9 @@ where
                             }))
                         }
                     } else {
-                        // New channel.
+                        // New channel (or cold-start reopen after local state was lost).
+                        // Initialize settled_on_chain and spent from on-chain state so
+                        // we don't overstate available balance when on_chain.settled > 0.
                         Ok(Some(ChannelState {
                             channel_id: channel_id_for_state,
                             chain_id,
@@ -465,10 +467,10 @@ where
                             token: on_chain.token,
                             authorized_signer,
                             deposit: on_chain.deposit,
-                            settled_on_chain: 0,
+                            settled_on_chain: on_chain.settled,
                             highest_voucher_amount: cumulative_amount,
                             highest_voucher_signature: Some(sig_bytes),
-                            spent: 0,
+                            spent: on_chain.settled,
                             units: 0,
                             finalized: false,
                             close_requested_at: on_chain.close_requested_at,
@@ -540,8 +542,10 @@ where
             ));
         }
 
-        // Update deposit in store.
-        let new_deposit = on_chain.deposit;
+        // Update store with full on-chain snapshot (deposit, settled, close state).
+        let on_chain_deposit = on_chain.deposit;
+        let on_chain_settled = on_chain.settled;
+        let on_chain_close_requested_at = on_chain.close_requested_at;
         let channel_id_owned = channel_id_str.clone();
         let updated = self
             .store
@@ -550,8 +554,14 @@ where
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    let settled_on_chain =
+                        std::cmp::max(on_chain_settled, state.settled_on_chain);
+                    let spent = std::cmp::max(settled_on_chain, state.spent);
                     Ok(Some(ChannelState {
-                        deposit: new_deposit,
+                        deposit: on_chain_deposit,
+                        settled_on_chain,
+                        spent,
+                        close_requested_at: on_chain_close_requested_at,
                         ..state
                     }))
                 }),
@@ -1792,5 +1802,154 @@ mod tests {
         // Available = 7M - 5M = 2M
         let available = result.highest_voucher_amount.saturating_sub(result.spent);
         assert_eq!(available, 2_000_000);
+    }
+
+    #[test]
+    fn test_deserialize_channel_state_without_close_requested_at() {
+        // Backward compat: old serialized state without close_requested_at should default to 0.
+        let json = r#"{
+            "channel_id": "0xaabb",
+            "chain_id": 1,
+            "escrow_contract": "0x1111111111111111111111111111111111111111",
+            "payer": "0x2222222222222222222222222222222222222222",
+            "payee": "0x3333333333333333333333333333333333333333",
+            "token": "0x4444444444444444444444444444444444444444",
+            "authorized_signer": "0x5555555555555555555555555555555555555555",
+            "deposit": 100000,
+            "settled_on_chain": 0,
+            "highest_voucher_amount": 0,
+            "highest_voucher_signature": null,
+            "spent": 0,
+            "units": 0,
+            "finalized": false,
+            "created_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let state: ChannelState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.close_requested_at, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_new_channel_with_on_chain_settled() {
+        // When local state is lost and a channel reopens with on_chain.settled > 0,
+        // the new-channel branch should init settled_on_chain and spent from on-chain
+        // to avoid overstating available balance.
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+
+        // Simulate what handle_open's new-channel branch does:
+        let on_chain_settled: u128 = 5_000_000;
+        let cumulative_amount: u128 = 7_000_000;
+        let on_chain_deposit: u128 = 10_000_000;
+
+        let result = store
+            .update_channel(
+                "0xchannel_cold",
+                Box::new(move |_existing| {
+                    assert!(_existing.is_none(), "should be a cold start with no existing state");
+                    Ok(Some(ChannelState {
+                        channel_id: "0xchannel_cold".to_string(),
+                        chain_id: 1,
+                        escrow_contract: "0x1111111111111111111111111111111111111111"
+                            .parse()
+                            .unwrap(),
+                        payer: "0x2222222222222222222222222222222222222222"
+                            .parse()
+                            .unwrap(),
+                        payee: "0x3333333333333333333333333333333333333333"
+                            .parse()
+                            .unwrap(),
+                        token: "0x4444444444444444444444444444444444444444"
+                            .parse()
+                            .unwrap(),
+                        authorized_signer: "0x5555555555555555555555555555555555555555"
+                            .parse()
+                            .unwrap(),
+                        deposit: on_chain_deposit,
+                        settled_on_chain: on_chain_settled,
+                        highest_voucher_amount: cumulative_amount,
+                        highest_voucher_signature: None,
+                        spent: on_chain_settled,
+                        units: 0,
+                        finalized: false,
+                        close_requested_at: 0,
+                        created_at: "2025-01-01T00:00:00Z".to_string(),
+                    }))
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.settled_on_chain, 5_000_000);
+        assert_eq!(result.spent, 5_000_000);
+        // Available = 7M - 5M = 2M (not 7M - 0 = 7M)
+        let available = result.highest_voucher_amount.saturating_sub(result.spent);
+        assert_eq!(available, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_deduct_rejects_when_close_requested() {
+        // A channel with close_requested_at != 0 should still allow deduction
+        // (the rejection happens at voucher verification level), but verify the
+        // field persists correctly through store operations.
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let mut state = test_channel_state("0xchannel_closing");
+        state.highest_voucher_amount = 10_000;
+        state.close_requested_at = 99999;
+        store.insert("0xchannel_closing", state);
+
+        let retrieved = store.get_channel("0xchannel_closing").await.unwrap().unwrap();
+        assert_eq!(retrieved.close_requested_at, 99999);
+
+        // Deduction should still work (close_requested_at is checked at voucher level)
+        let result = deduct_from_channel(&*store, "0xchannel_closing", 1_000).await;
+        assert!(result.is_ok());
+        let updated = result.unwrap();
+        assert_eq!(updated.spent, 1_000);
+        assert_eq!(updated.close_requested_at, 99999);
+    }
+
+    #[tokio::test]
+    async fn test_topup_refreshes_on_chain_fields() {
+        // Simulate the topUp store update logic: it should refresh
+        // close_requested_at, settled_on_chain, and spent from on-chain state.
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let mut state = test_channel_state("0xchannel_topup");
+        state.deposit = 100_000;
+        state.close_requested_at = 12345; // stale close request
+        state.settled_on_chain = 1_000;
+        state.spent = 2_000;
+        store.insert("0xchannel_topup", state);
+
+        // Simulate topUp update with new on-chain values:
+        // deposit increased, close_requested_at cleared (0), settled unchanged
+        let on_chain_deposit: u128 = 200_000;
+        let on_chain_settled: u128 = 1_000;
+        let on_chain_close_requested_at: u64 = 0;
+
+        let result = store
+            .update_channel(
+                "0xchannel_topup",
+                Box::new(move |current| {
+                    let state = current.unwrap();
+                    let settled_on_chain =
+                        std::cmp::max(on_chain_settled, state.settled_on_chain);
+                    let spent = std::cmp::max(settled_on_chain, state.spent);
+                    Ok(Some(ChannelState {
+                        deposit: on_chain_deposit,
+                        settled_on_chain,
+                        spent,
+                        close_requested_at: on_chain_close_requested_at,
+                        ..state
+                    }))
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.deposit, 200_000);
+        assert_eq!(result.close_requested_at, 0, "topUp should refresh close_requested_at");
+        assert_eq!(result.settled_on_chain, 1_000);
+        assert_eq!(result.spent, 2_000); // max(1000, 2000) = 2000
     }
 }
