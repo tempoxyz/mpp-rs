@@ -292,7 +292,7 @@ fn match_route_path_only<'a>(routes: &'a [Route], path: &str) -> Option<&'a Rout
 fn match_route_path_only_paid<'a>(routes: &'a [Route], path: &str) -> Option<&'a Route> {
     routes
         .iter()
-        .find(|r| !matches!(r.endpoint, Endpoint::Free) && path_matches(&r.path, path))
+        .find(|r| matches!(r.endpoint, Endpoint::Paid(_)) && path_matches(&r.path, path))
 }
 
 // ---------------------------------------------------------------------------
