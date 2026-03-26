@@ -64,6 +64,38 @@ impl TempoProvider {
         })
     }
 
+    /// Create a Tempo provider from an OWS wallet.
+    ///
+    /// Decrypts the EVM signing key from the OWS vault and creates a
+    /// provider ready for signing. The key is only in memory during the
+    /// lifetime of the provider.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let provider = TempoProvider::from_ows("my-wallet", "https://rpc.tempo.xyz")?;
+    /// let resp = client.get(url).send_with_payment(&provider).await?;
+    /// ```
+    #[cfg(feature = "ows")]
+    pub fn from_ows(
+        wallet_name_or_id: &str,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
+        let key_bytes = ows_lib::decrypt_signing_key(
+            wallet_name_or_id,
+            ows_core::ChainType::Evm,
+            "",
+            None,
+            None,
+        )
+        .map_err(|e| MppError::InvalidConfig(format!("OWS decrypt: {e}")))?;
+
+        let signer = alloy::signers::local::PrivateKeySigner::from_slice(key_bytes.expose())
+            .map_err(|e| MppError::InvalidConfig(format!("invalid OWS key: {e}")))?;
+
+        Self::new(signer, rpc_url)
+    }
+
     /// Set an optional client identifier for attribution memos.
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
