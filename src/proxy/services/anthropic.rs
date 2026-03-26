@@ -13,7 +13,9 @@ use crate::proxy::service::{Service, ServiceBuilder};
 /// let svc = anthropic::service("sk-ant-...", |r| {
 ///     r.route("POST /v1/messages", Endpoint::Paid(PaidEndpoint {
 ///         intent: "charge".into(),
-///         amount: "0.03".into(),
+///         amount: "30000".into(),
+///         decimals: Some(6),
+///         currency: None,
 ///         unit_type: None,
 ///         description: Some("Message".into()),
 ///     }))

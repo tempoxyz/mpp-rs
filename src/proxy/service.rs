@@ -12,6 +12,10 @@ pub struct Service {
     pub routes: Vec<Route>,
     /// Headers to inject on upstream requests.
     pub headers: HashMap<String, String>,
+    /// Human-readable title.
+    pub title: Option<String>,
+    /// Human-readable description.
+    pub description: Option<String>,
 }
 
 /// A route definition mapping a pattern to payment requirements.
@@ -41,8 +45,13 @@ pub enum Endpoint {
 pub struct PaidEndpoint {
     /// Payment intent (e.g., "charge", "session").
     pub intent: String,
-    /// Amount in human-readable units (e.g., "0.05").
+    /// Amount in atomic units (e.g., "50000").
     pub amount: String,
+    /// Number of decimal places for human-readable conversion (e.g., 6 means
+    /// 50000 atomic units = 0.05).
+    pub decimals: Option<u8>,
+    /// Currency identifier (e.g., a contract address).
+    pub currency: Option<String>,
     /// Unit type for session payments (e.g., "token", "request").
     pub unit_type: Option<String>,
     /// Description.
@@ -58,6 +67,8 @@ impl Service {
             base_url: base_url.into(),
             routes: Vec::new(),
             headers: HashMap::new(),
+            title: None,
+            description: None,
         }
     }
 }
@@ -69,6 +80,8 @@ pub struct ServiceBuilder {
     base_url: String,
     routes: Vec<Route>,
     headers: HashMap<String, String>,
+    title: Option<String>,
+    description: Option<String>,
 }
 
 impl ServiceBuilder {
@@ -84,6 +97,18 @@ impl ServiceBuilder {
     /// Inject a custom header on upstream requests.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Set a human-readable title for the service.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set a human-readable description for the service.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -106,6 +131,8 @@ impl ServiceBuilder {
             base_url: self.base_url,
             routes: self.routes,
             headers: self.headers,
+            title: self.title,
+            description: self.description,
         }
     }
 }
@@ -155,6 +182,10 @@ pub struct ProxyConfig {
     pub base_path: Option<String>,
     /// Services to proxy.
     pub services: Vec<Service>,
+    /// Human-readable title for llms.txt / discovery.
+    pub title: Option<String>,
+    /// Human-readable description for llms.txt / discovery.
+    pub description: Option<String>,
 }
 
 /// Result of parsing a request path into service + upstream path.
@@ -298,6 +329,8 @@ fn match_route_path_only_paid<'a>(routes: &'a [Route], path: &str) -> Option<&'a
 pub fn serialize_service(s: &Service) -> Value {
     json!({
         "id": s.id,
+        "title": s.title,
+        "description": s.description,
         "baseUrl": s.base_url,
         "routes": s.routes.iter().map(|r| {
             json!({
@@ -322,6 +355,12 @@ fn serialize_payment(endpoint: &Endpoint) -> Value {
             let mut m = serde_json::Map::new();
             m.insert("intent".to_string(), json!(p.intent));
             m.insert("amount".to_string(), json!(p.amount));
+            if let Some(decimals) = p.decimals {
+                m.insert("decimals".to_string(), json!(decimals));
+            }
+            if let Some(ref currency) = p.currency {
+                m.insert("currency".to_string(), json!(currency));
+            }
             if let Some(ref ut) = p.unit_type {
                 m.insert("unitType".to_string(), json!(ut));
             }
@@ -417,13 +456,24 @@ mod tests {
                 "POST /v1/chat/completions",
                 Endpoint::Paid(PaidEndpoint {
                     intent: "charge".into(),
-                    amount: "0.05".into(),
+                    amount: "50000".into(),
+                    decimals: Some(6),
+                    currency: Some("0x20c0000000000000000000000000000000000001".into()),
                     unit_type: None,
                     description: Some("Chat completion".into()),
                 }),
             )
             .route("GET /v1/models", Endpoint::Free)
             .build()
+    }
+
+    fn test_config() -> ProxyConfig {
+        ProxyConfig {
+            base_path: None,
+            services: vec![test_service()],
+            title: None,
+            description: None,
+        }
     }
 
     #[test]
@@ -474,10 +524,7 @@ mod tests {
 
     #[test]
     fn test_match_route() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         let m = config.match_route("POST", "/openai/v1/chat/completions");
         assert!(m.is_some());
@@ -492,6 +539,8 @@ mod tests {
         let config = ProxyConfig {
             base_path: Some("/api/proxy".to_string()),
             services: vec![test_service()],
+            title: None,
+            description: None,
         };
 
         let m = config.match_route("POST", "/api/proxy/openai/v1/chat/completions");
@@ -503,10 +552,7 @@ mod tests {
 
     #[test]
     fn test_match_route_not_found() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         assert!(config.match_route("POST", "/openai/v1/unknown").is_none());
         assert!(config.match_route("GET", "/unknown/v1/models").is_none());
@@ -515,10 +561,7 @@ mod tests {
 
     #[test]
     fn test_match_route_method_fallback_skips_free() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         // POST to a free GET route should NOT match via fallback
         // (prevents bypassing payment on free routes)
@@ -534,6 +577,8 @@ mod tests {
                 Endpoint::Paid(PaidEndpoint {
                     intent: "charge".into(),
                     amount: "0.05".into(),
+                    decimals: None,
+                    currency: None,
                     unit_type: None,
                     description: None,
                 }),
@@ -543,6 +588,8 @@ mod tests {
         let config = ProxyConfig {
             base_path: None,
             services: vec![svc],
+            title: None,
+            description: None,
         };
 
         // POST to a paid GET route should match via fallback
@@ -552,10 +599,7 @@ mod tests {
 
     #[test]
     fn test_discovery_services() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         let resp = config.handle_discovery("GET", "/services");
         assert!(resp.is_some());
@@ -568,10 +612,7 @@ mod tests {
 
     #[test]
     fn test_discovery_single_service() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         let resp = config.handle_discovery("GET", "/services/openai");
         assert!(resp.is_some());
@@ -586,10 +627,7 @@ mod tests {
 
     #[test]
     fn test_discovery_llms_txt() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         let resp = config.handle_discovery("GET", "/llms.txt");
         assert!(resp.is_some());
@@ -604,10 +642,7 @@ mod tests {
 
     #[test]
     fn test_discovery_not_get() {
-        let config = ProxyConfig {
-            base_path: None,
-            services: vec![test_service()],
-        };
+        let config = test_config();
 
         assert!(config.handle_discovery("POST", "/services").is_none());
     }
@@ -617,11 +652,19 @@ mod tests {
         let svc = test_service();
         let v = serialize_service(&svc);
         assert_eq!(v["id"], "openai");
+        assert!(v["title"].is_null());
+        assert!(v["description"].is_null());
         let routes = v["routes"].as_array().unwrap();
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0]["pattern"], "POST /v1/chat/completions");
         assert!(routes[0]["payment"].is_object());
         assert_eq!(routes[0]["payment"]["intent"], "charge");
+        assert_eq!(routes[0]["payment"]["amount"], "50000");
+        assert_eq!(routes[0]["payment"]["decimals"], 6);
+        assert_eq!(
+            routes[0]["payment"]["currency"],
+            "0x20c0000000000000000000000000000000000001"
+        );
         assert_eq!(routes[1]["pattern"], "GET /v1/models");
         assert!(routes[1]["payment"].is_null());
     }
@@ -641,6 +684,7 @@ mod tests {
         assert!(txt.contains("- [openai](https://api.openai.com): 1 paid, 1 free"));
         assert!(txt.contains("## openai"));
         assert!(txt.contains("`POST /v1/chat/completions`: charge"));
+        assert!(txt.contains("50000 units"));
         assert!(txt.contains("`GET /v1/models`: Free"));
     }
 
@@ -654,6 +698,8 @@ mod tests {
         let config = ProxyConfig {
             base_path: None,
             services: vec![svc],
+            title: None,
+            description: None,
         };
 
         let m = config.match_route("GET", "/stripe/v1/customers/cus_123");
@@ -666,11 +712,27 @@ mod tests {
         let config = ProxyConfig {
             base_path: Some("/api/proxy".to_string()),
             services: vec![test_service()],
+            title: None,
+            description: None,
         };
 
         assert!(config
             .handle_discovery("GET", "/api/proxy/services")
             .is_some());
         assert!(config.handle_discovery("GET", "/services").is_none());
+    }
+
+    #[test]
+    fn test_service_builder_title_description() {
+        let svc = Service::new("test", "https://example.com")
+            .title("Test Service")
+            .description("A test service")
+            .build();
+        assert_eq!(svc.title.as_deref(), Some("Test Service"));
+        assert_eq!(svc.description.as_deref(), Some("A test service"));
+
+        let v = serialize_service(&svc);
+        assert_eq!(v["title"], "Test Service");
+        assert_eq!(v["description"], "A test service");
     }
 }
