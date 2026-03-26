@@ -14,8 +14,8 @@ path = "src/client.rs"
 
 [dependencies]
 mpp = { path = "../../..", features = ["server", "client", "tempo"] }
-alloy = { version = "1.2", features = ["provider-http", "sol-types", "contract"] }
-tempo-alloy = "1"
+alloy = { version = "1.8", features = ["provider-http", "sol-types", "contract"] }
+tempo-alloy = "1.5"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -23,4 +23,3 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 rand = "0.9"
-
