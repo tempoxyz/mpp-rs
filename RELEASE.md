@@ -5,19 +5,19 @@ This project uses [changelogs-rs](https://github.com/wevm/changelogs-rs) for aut
 ## How It Works
 
 ```
-PR opened → changelog added → PR merged → RC PR created → RC merged → published to crates.io
+PR opened/updated → changelog suggested → PR merged → RC PR created → RC merged → published to crates.io
 ```
 
 ### During Development
 
 1. **Make changes** and open a PR
-2. **Changelog auto-generated** - CI automatically creates a `.changelog/*.md` file and commits it to your PR branch (using AI to summarize your changes)
-3. **Review the changelog** - check the generated file; edit if needed
-4. **Merge the PR** - changelog files are staged in `.changelog/`
+2. **Changelog suggested** - CI comments on the PR with changelog status and, if missing, an AI-generated changelog suggestion you can add with one click
+3. **Review the changelog** - check the suggestion or existing file; edit if needed
+4. **Merge the PR** - changelog files live in `.changelog/`
 
 ### Creating Changelogs Manually
 
-If CI doesn't generate one (e.g., for infra-only changes you want to document), create manually:
+If CI doesn't suggest one or you want to write it yourself, create it manually:
 
 ```bash
 # Interactive prompt
@@ -112,7 +112,7 @@ See [config.toml](./config.toml) for changelog settings:
 
 | Workflow | Trigger | Action |
 |----------|---------|--------|
-| `changelog.yml` | PR opened/updated | Auto-generates changelog via AI |
+| `changelog.yml` | PR opened/updated | Comments on PR with changelog status and AI-generated add link |
 | `release.yml` | Push to main | Creates RC PR or publishes packages |
 
 ## Required Secrets
