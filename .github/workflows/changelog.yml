@@ -2,10 +2,11 @@ name: Changelog
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize]
 
 jobs:
   changelog:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -14,41 +15,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.head_ref }}
-      - name: Install changelogs
-        run: curl -sSL https://changelogs.sh | sh
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: Install Claude CLI
         run: npm install -g @anthropic-ai/claude-code
-      - name: Generate changelog
+      - name: Check changelog
+        uses: tempoxyz/changelogs/check@master
+        with:
+          ai: "claude -p"
+          ecosystem: rust
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          # Skip if only infra/config files changed (no code changes requiring changelog)
-          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
-          CODE_CHANGES=$(echo "$CHANGED" | grep -vE '^(\.changelog/|\.github/|\.gitignore|README\.md|AGENTS\.md|RELEASE\.md)' || true)
-          if [ -z "$CODE_CHANGES" ]; then
-            echo "No code changes requiring changelog, skipping"
-            exit 0
-          fi
-          ~/.local/bin/changelogs add --ecosystem rust --ai "claude -p" --ref origin/${{ github.base_ref }}
-      - name: Commit changelog
-        id: commit
-        run: |
-          if [ -n "$(git status --porcelain .changelog/)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add .changelog/
-            git commit -m "chore: add changelog"
-            git push
-            echo "pushed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  ci:
-    needs: changelog
-    if: always()
-    permissions:
-      contents: read
-      pull-requests: write
-    uses: ./.github/workflows/ci.yml
-    with:
-      ref: ${{ github.head_ref }}

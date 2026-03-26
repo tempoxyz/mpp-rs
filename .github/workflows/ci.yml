@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -37,7 +36,7 @@ jobs:
         with:
           language: rust
           path: "."
-          post-comment: true
+          post-comment: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
   test:
@@ -70,4 +69,3 @@ jobs:
             echo "One or more required jobs failed or were cancelled"
             exit 1
           fi
-
