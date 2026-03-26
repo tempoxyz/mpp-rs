@@ -265,6 +265,21 @@ where
             loop {
                 match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                     Ok(_state) => break,
+                    Err(e) if e.code == Some(crate::protocol::traits::ErrorCode::ChannelClosed) => {
+                        // Channel is finalized/closed — emit final receipt, then stop
+                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
+                            let mut receipt = SessionReceipt::new(
+                                now_iso8601(),
+                                &challenge_id,
+                                &channel_id,
+                                ch.highest_voucher_amount.to_string(),
+                                ch.spent.to_string(),
+                            );
+                            receipt.units = Some(ch.units);
+                            yield format_receipt_event(&receipt);
+                        }
+                        return;
+                    }
                     Err(_) => {
                         // Emit need-voucher event
                         if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
@@ -560,6 +575,7 @@ mod tests {
             spent: 0,
             units: 0,
             finalized: false,
+            close_requested_at: 0,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
     }
@@ -814,6 +830,87 @@ mod tests {
             assert_eq!(r.accepted_cumulative, "10000");
         } else {
             panic!("last event should be a receipt");
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_finalized_channel_emits_receipt() {
+        use crate::protocol::methods::tempo::session_method::{
+            ChannelState, ChannelStore, InMemoryChannelStore,
+        };
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_finalized";
+        // Enough balance for several ticks, but channel starts un-finalized
+        store.insert(channel_id, test_channel_state(channel_id, 1000, 5000));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10);
+        let gen = Box::pin(async_stream::stream! {
+            while let Some(val) = rx.recv().await {
+                yield val;
+            }
+        });
+
+        let store2 = store.clone();
+        let cid = channel_id.to_string();
+        let handle = tokio::spawn(async move {
+            let stream = serve(ServeOptions {
+                store: store2,
+                channel_id: cid,
+                challenge_id: "ch-fin".to_string(),
+                tick_cost: 100,
+                generate: gen,
+                poll_interval_ms: 10,
+            });
+            collect_stream(stream).await
+        });
+
+        // Send 2 items that succeed
+        tx.send("a".to_string()).await.unwrap();
+        tx.send("b".to_string()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Finalize the channel
+        store
+            .update_channel(
+                channel_id,
+                Box::new(|current: Option<ChannelState>| {
+                    let state = current.unwrap();
+                    Ok(Some(ChannelState {
+                        finalized: true,
+                        ..state
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Send another item — deduction should hit ChannelClosed
+        tx.send("c".to_string()).await.unwrap();
+        // Give the stream time to process and terminate
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        drop(tx);
+
+        let events = handle.await.unwrap();
+
+        // Should have: msg(a), msg(b), receipt (stream stops before emitting "c")
+        let message_count = events
+            .iter()
+            .filter(|e| matches!(parse_event(e), Some(SseEvent::Message(_))))
+            .count();
+        assert_eq!(message_count, 2, "only 2 messages before finalization");
+
+        // Last event must be a receipt
+        let last = events.last().expect("should have at least one event");
+        match parse_event(last) {
+            Some(SseEvent::PaymentReceipt(r)) => {
+                assert_eq!(r.challenge_id, "ch-fin");
+                assert_eq!(r.channel_id, channel_id);
+                assert_eq!(r.spent, "200"); // 2 × 100
+                assert_eq!(r.units, Some(2));
+            }
+            other => panic!("last event should be a receipt, got: {other:?}"),
         }
     }
 

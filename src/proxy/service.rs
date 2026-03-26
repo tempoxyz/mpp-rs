@@ -196,7 +196,7 @@ impl ProxyConfig {
                 // (management POSTs like session close may target a route
                 // registered for a different HTTP method).
                 if method.eq_ignore_ascii_case("POST") {
-                    match_route_path_only(&service.routes, &upstream_path)?
+                    match_route_path_only_paid(&service.routes, &upstream_path)?
                 } else {
                     return None;
                 }
@@ -280,9 +280,14 @@ fn match_route<'a>(routes: &'a [Route], method: &str, path: &str) -> Option<&'a 
     })
 }
 
-/// Match a request against routes by path only (ignoring method).
-fn match_route_path_only<'a>(routes: &'a [Route], path: &str) -> Option<&'a Route> {
-    routes.iter().find(|r| path_matches(&r.path, path))
+/// Match a request against routes by path only (ignoring method), excluding Free routes.
+///
+/// This prevents a POST to a free GET endpoint from bypassing payment requirements
+/// via the method-mismatch fallback path.
+fn match_route_path_only_paid<'a>(routes: &'a [Route], path: &str) -> Option<&'a Route> {
+    routes
+        .iter()
+        .find(|r| matches!(r.endpoint, Endpoint::Paid(_)) && path_matches(&r.path, path))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,14 +514,39 @@ mod tests {
     }
 
     #[test]
-    fn test_match_route_method_fallback() {
+    fn test_match_route_method_fallback_skips_free() {
         let config = ProxyConfig {
             base_path: None,
             services: vec![test_service()],
         };
 
-        // POST to a GET route should match via path-only fallback
+        // POST to a free GET route should NOT match via fallback
+        // (prevents bypassing payment on free routes)
         let m = config.match_route("POST", "/openai/v1/models");
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn test_match_route_method_fallback_matches_paid() {
+        let svc = Service::new("api", "https://api.example.com")
+            .route(
+                "GET /v1/stream",
+                Endpoint::Paid(PaidEndpoint {
+                    intent: "charge".into(),
+                    amount: "0.05".into(),
+                    unit_type: None,
+                    description: None,
+                }),
+            )
+            .build();
+
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+        };
+
+        // POST to a paid GET route should match via fallback
+        let m = config.match_route("POST", "/api/v1/stream");
         assert!(m.is_some());
     }
 

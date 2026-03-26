@@ -24,7 +24,7 @@
 //! ```
 
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{hex, Address, Bytes, TxKind, B256, U256};
+use alloy::primitives::{hex, keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use std::future::Future;
 use std::sync::Arc;
@@ -155,7 +155,7 @@ where
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
-        let replay_key = format!("mpp:charge:{tx_hash}");
+        let replay_key = format!("mpp:charge:{:#x}", hash);
 
         if let Some(store) = &self.store {
             let seen = store
@@ -248,6 +248,11 @@ where
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
 
+        // Extract the transaction sender from the receipt. Used to verify that the
+        // Transfer event's `from` field matches, preventing cross-endpoint replay of
+        // session settlement transactions (where Transfer comes from an escrow contract).
+        let tx_sender = receipt.from();
+
         let logs = receipt_json
             .get("logs")
             .and_then(|v| v.as_array())
@@ -293,6 +298,16 @@ where
             // Check for TransferWithMemo when memo is expected
             if let Some(exp_memo) = expected_memo {
                 if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
+                    // Verify Transfer sender matches transaction sender to prevent
+                    // session settlement tx replay (where from would be the escrow contract)
+                    let from_address = match topics[1].parse::<B256>() {
+                        Ok(b) => Address::from_slice(&b[12..]),
+                        Err(_) => continue,
+                    };
+                    if from_address != tx_sender {
+                        continue;
+                    }
+
                     let to_topic = topics[2];
                     // Skip if to_address topic is unparseable
                     let to_address = match to_topic.parse::<B256>() {
@@ -328,6 +343,16 @@ where
 
             // Standard Transfer event
             if topic0 != TRANSFER_EVENT_TOPIC || topics.len() < 3 {
+                continue;
+            }
+
+            // Verify Transfer sender matches transaction sender to prevent
+            // session settlement tx replay (where from would be the escrow contract)
+            let from_address = match topics[1].parse::<B256>() {
+                Ok(b) => Address::from_slice(&b[12..]),
+                Err(_) => continue,
+            };
+            if from_address != tx_sender {
                 continue;
             }
 
@@ -548,6 +573,27 @@ where
             expected_chain_id,
         )?;
 
+        // Pre-broadcast dedup: hash the final tx bytes (after co-signing/validation)
+        // and check/mark in store before broadcasting. Uses a separate namespace
+        // from the post-broadcast hash-based dedup in verify_hash.
+        if let Some(store) = &self.store {
+            let tx_hash_pre = keccak256(&final_tx_bytes);
+            let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
+            let seen = store
+                .get(&dedup_key)
+                .await
+                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
+            if seen.is_some() {
+                return Err(VerificationError::new(
+                    "Transaction has already been submitted.",
+                ));
+            }
+            store
+                .put(&dedup_key, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+        }
+
         let pending = self
             .provider
             .send_raw_transaction(&final_tx_bytes)
@@ -564,6 +610,24 @@ where
                 "Transaction {} reverted",
                 receipt.transaction_hash()
             )));
+        }
+
+        // Verify the receipt contains the expected TIP-20 transfer
+        self.verify_tip20_transfer(
+            &receipt,
+            currency,
+            expected_recipient,
+            expected_amount,
+            memo.as_deref(),
+        )?;
+
+        // Record the on-chain tx hash for hash-based replay protection
+        if let Some(store) = &self.store {
+            let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
+            store
+                .put(&replay_key, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
         }
 
         Ok(receipt.transaction_hash())
@@ -755,7 +819,10 @@ where
                 this.verify_hash(charge_payload.tx_hash().unwrap(), &request)
                     .await
             } else {
-                // Client sent signed transaction, validate and broadcast it
+                // Client sent signed transaction, validate and broadcast it.
+                // broadcast_transaction already does pre-broadcast dedup and
+                // validates the receipt, so we do NOT call verify_hash here
+                // (which would self-reject since the tx hash is already marked).
                 let tx_hash = this
                     .broadcast_transaction(
                         charge_payload.signed_tx().unwrap(),
@@ -763,7 +830,7 @@ where
                         expected_chain_id,
                     )
                     .await?;
-                this.verify_hash(&format!("{:#x}", tx_hash), &request).await
+                Ok(Receipt::success(METHOD_NAME, format!("{:#x}", tx_hash)))
             }
         }
     }
@@ -1228,6 +1295,42 @@ mod tests {
         let key = "mpp:charge:0xnever_seen";
         let seen = store.get(key).await.unwrap();
         assert!(seen.is_none(), "unseen hash should not be in store");
+    }
+
+    #[tokio::test]
+    async fn test_store_dedup_case_insensitive() {
+        use crate::store::{MemoryStore, Store};
+
+        let store = Arc::new(MemoryStore::new());
+
+        // Simulate the canonical key construction used by verify_hash:
+        // parse to B256, then format with {:#x} for canonical lowercase 0x-prefixed output.
+        let mixed_case = "0xABCdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash = mixed_case.parse::<B256>().unwrap();
+        let key1 = format!("mpp:charge:{:#x}", hash);
+        store
+            .put(&key1, serde_json::Value::Bool(true))
+            .await
+            .unwrap();
+
+        // Same hash submitted with different casing produces same canonical key
+        let lower_case = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash2 = lower_case.parse::<B256>().unwrap();
+        let key2 = format!("mpp:charge:{:#x}", hash2);
+        let seen = store.get(&key2).await.unwrap();
+        assert!(
+            seen.is_some(),
+            "same hash with different case should be detected as replay"
+        );
+
+        // Without 0x prefix should also parse to the same canonical key
+        let no_prefix = "ABCdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let hash3 = no_prefix.parse::<B256>().unwrap();
+        let key3 = format!("mpp:charge:{:#x}", hash3);
+        assert_eq!(
+            key1, key3,
+            "0x-prefixed and unprefixed should produce same key"
+        );
     }
 
     #[tokio::test]
