@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0 (2026-03-26)
+
+### Minor Changes
+
+- Added a Stripe Shared Payment Token (SPT) example demonstrating the full 402 → challenge → credential → retry flow using Stripe's payment method. Includes a server with SPT proxy endpoint and a headless client using a test card. (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+- Added `fee_payer()` and `chain_id()` getters to `Mpp`. (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+- Added Stripe payment method support (`method="stripe"`, `intent="charge"`) with client-side `StripeProvider` for SPT creation, server-side `ChargeMethod` for PaymentIntent verification, and `Mpp::create_stripe()` builder integration. Added `stripe` and `integration-stripe` feature flags backed by `reqwest`. (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+
+### Patch Changes
+
+- Fixed multiple payment bypass and griefing vulnerabilities (GHSA-fxc9-7j2w-vx54). (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+- Bumped `alloy` dependency from 1.7 to 1.8 and `tempo-alloy`/`tempo-primitives` from 1 to 1.5 across the main crate and all examples. (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+- Disabled tempo lint PR comments while keeping the lint CI check enforced. (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+- Fixed `base64url_decode` to accept standard base64 (`+`, `/`, `=` padding) in addition to URL-safe base64, following Postel's law and aligning with the mppx TypeScript SDK behavior. Added tests covering standard base64 with padding, URL-safe without padding, and standard alphabet without padding in both `types.rs` and `headers.rs`. (by @BrendanRyan, [#172](https://github.com/tempoxyz/mpp-rs/pull/172))
+
 ## 0.7.0 (2026-03-23)
 
 ### Minor Changes

@@ -135,6 +135,35 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Mock Stripe API that returns a replayed idempotent response.
+async fn start_mock_stripe_replayed() -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new().route(
+        "/v1/payment_intents",
+        axum::routing::post(|| async {
+            (
+                [(
+                    axum::http::header::HeaderName::from_static("idempotent-replayed"),
+                    axum::http::header::HeaderValue::from_static("true"),
+                )],
+                Json(serde_json::json!({
+                    "id": "pi_replayed",
+                    "status": "succeeded",
+                })),
+            )
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, handle)
+}
+
 /// Mock Stripe API that returns a 400 error response.
 async fn start_mock_stripe_error() -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
@@ -672,6 +701,49 @@ async fn test_stripe_error_body_parsing() {
     // Should get 402 back (server verification failed, re-issues challenge)
     if let Ok(r) = resp {
         assert_eq!(r.status(), 402, "should get 402 when Stripe returns error");
+    }
+
+    handle.abort();
+    stripe_handle.abort();
+}
+
+/// Replayed idempotent Stripe responses should be rejected.
+#[tokio::test]
+async fn test_stripe_rejects_replayed_credential() {
+    let (stripe_url, stripe_handle) = start_mock_stripe_replayed().await;
+
+    let mpp = Mpp::create_stripe(
+        stripe(StripeConfig {
+            secret_key: "sk_test_mock",
+            network_id: "internal",
+            payment_method_types: &["card"],
+            currency: "usd",
+            decimals: 2,
+        })
+        .stripe_api_base(&stripe_url)
+        .secret_key("test-secret"),
+    )
+    .expect("create mpp");
+
+    let mpp = Arc::new(mpp);
+    let (url, handle) = start_server(mpp).await;
+
+    let provider = StripeProvider::new(|_| {
+        Box::pin(async move { Ok(CreateTokenResult::from("spt_replayed_token".to_string())) })
+    });
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await;
+
+    // Should get 402 back (server rejects replayed credential, re-issues challenge)
+    if let Ok(r) = resp {
+        assert_eq!(
+            r.status(),
+            402,
+            "should get 402 when Stripe returns idempotent-replayed"
+        );
     }
 
     handle.abort();

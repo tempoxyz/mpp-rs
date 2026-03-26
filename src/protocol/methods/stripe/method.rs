@@ -140,6 +140,18 @@ impl ChargeMethod {
             )));
         }
 
+        // https://docs.stripe.com/error-low-level#idempotency
+        let replayed = response
+            .headers()
+            .get("idempotent-replayed")
+            .and_then(|v| v.to_str().ok())
+            == Some("true");
+        if replayed {
+            return Err(VerificationError::new(
+                "Payment has already been processed.",
+            ));
+        }
+
         let pi: PaymentIntentResponse = response
             .json()
             .await

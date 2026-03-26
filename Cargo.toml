@@ -1,6 +1,6 @@
 [package]
 name = "mpp"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Rust SDK for the Machine Payments Protocol (MPP)"
 license = "MIT OR Apache-2.0"
@@ -61,11 +61,11 @@ uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { version = "1.7", features = ["full"], optional = true }
+alloy = { version = "1.8", features = ["full"], optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { version = "1", optional = true }
-tempo-primitives = { version = "1", optional = true }
+tempo-alloy = { version = "1.5", optional = true }
+tempo-primitives = { version = "1.5", optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.12", default-features = false, features = ["json"], optional = true }
@@ -87,4 +87,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 axum = { version = "0.8" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
-
