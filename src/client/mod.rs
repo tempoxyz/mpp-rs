@@ -7,6 +7,7 @@
 //! - [`PaymentProvider`]: Trait for payment providers
 //! - [`Fetch`]: Extension trait for reqwest with `.send_with_payment()` method
 //! - [`TempoProvider`]: Tempo blockchain provider (requires `tempo`)
+//! - [`TempoSessionProvider`]: Tempo session/channel provider (requires `tempo`)
 //!
 //! # Example
 //!
@@ -39,6 +40,8 @@ pub use fetch::PaymentExt as Fetch;
 pub use middleware::PaymentMiddleware;
 
 // Re-export Tempo types at client level for convenience
+#[cfg(feature = "tempo")]
+pub use tempo::session::{channel_ops, TempoSessionProvider};
 #[cfg(feature = "tempo")]
 pub use tempo::{AutoswapConfig, TempoClientError, TempoProvider};
 #[cfg(feature = "tempo")]
