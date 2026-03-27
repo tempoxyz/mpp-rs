@@ -5,7 +5,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
@@ -25,15 +24,13 @@ use crate::protocol::core::{
 /// 3. Retries the request with the credential in the `Authorization` header
 #[derive(Clone)]
 pub struct PaymentClientLayer<P> {
-    provider: Arc<P>,
+    provider: P,
 }
 
 impl<P> PaymentClientLayer<P> {
     /// Create a new payment client layer with the given provider.
     pub fn new(provider: P) -> Self {
-        Self {
-            provider: Arc::new(provider),
-        }
+        Self { provider }
     }
 }
 
@@ -43,7 +40,7 @@ impl<S, P: PaymentProvider> tower_layer::Layer<S> for PaymentClientLayer<P> {
     fn layer(&self, inner: S) -> Self::Service {
         PaymentClientService {
             inner,
-            provider: Arc::clone(&self.provider),
+            provider: self.provider.clone(),
         }
     }
 }
@@ -53,7 +50,7 @@ impl<S, P: PaymentProvider> tower_layer::Layer<S> for PaymentClientLayer<P> {
 #[derive(Clone)]
 pub struct PaymentClientService<S, P> {
     inner: S,
-    provider: Arc<P>,
+    provider: P,
 }
 
 impl<S, P, B, ResBody> tower_service::Service<Request<B>> for PaymentClientService<S, P>
@@ -79,12 +76,16 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let provider = Arc::clone(&self.provider);
+        let provider = self.provider.clone();
 
+        // Keep a clone in `self` for future poll_ready cycles and call the
+        // currently-ready service instance moved out of `self`.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
+            // Buffer the body upfront so we can reconstruct the request
+            // for a retry if the server responds with 402.
             let (parts, body) = req.into_parts();
             let body_bytes = collect_body(body).await?;
 
@@ -140,8 +141,8 @@ where
     let mut buf = Vec::new();
     while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
         let frame = frame.map_err(Into::into)?;
-        if let Some(data) = frame.data_ref() {
-            buf.extend_from_slice(data.chunk());
+        if let Ok(mut data) = frame.into_data() {
+            buf.extend_from_slice(&data.copy_to_bytes(data.remaining()));
         }
     }
     Ok(Bytes::from(buf))
