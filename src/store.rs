@@ -194,11 +194,19 @@ impl Store for FileStore {
 
 /// Adapter that implements `ChannelStore` using a generic `Store` backend.
 ///
-/// This allows using any persistent store (file, Redis, etc.) for channel state.
+/// This adapter serializes `update_channel` calls for the same channel within a
+/// single Rust process so it can satisfy `ChannelStore`'s atomic
+/// read-modify-write contract over the weaker `Store` trait.
+///
+/// It does not provide distributed locking. If multiple processes share the
+/// same backend, use a store implementation with native compare-and-swap or
+/// transactional update semantics instead of relying on this adapter alone.
 #[cfg(all(feature = "server", feature = "tempo"))]
 pub struct ChannelStoreAdapter {
     store: std::sync::Arc<dyn Store>,
     prefix: String,
+    channel_locks:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[cfg(all(feature = "server", feature = "tempo"))]
@@ -208,11 +216,21 @@ impl ChannelStoreAdapter {
         Self {
             store,
             prefix: prefix.into(),
+            channel_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     fn channel_key(&self, channel_id: &str) -> String {
         format!("{}{}", self.prefix, channel_id)
+    }
+
+    fn channel_lock(&self, key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.channel_locks
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -277,7 +295,9 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
         >,
     > {
         let key = self.channel_key(channel_id);
+        let channel_lock = self.channel_lock(&key);
         Box::pin(async move {
+            let _guard = channel_lock.lock().await;
             let current_value = self
                 .store
                 .get(&key)
@@ -406,9 +426,65 @@ mod tests {
 #[cfg(all(test, feature = "server", feature = "tempo"))]
 mod adapter_tests {
     use super::*;
+    use crate::protocol::methods::tempo::session_method::deduct_from_channel;
     use crate::protocol::methods::tempo::session_method::{ChannelState, ChannelStore};
     use alloy::primitives::Address;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SlowMemoryStore {
+        inner: MemoryStore,
+        delay: Duration,
+    }
+
+    impl SlowMemoryStore {
+        fn new(delay: Duration) -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                delay,
+            }
+        }
+    }
+
+    impl Store for SlowMemoryStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
+        {
+            let key = key.to_string();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                self.inner.get(&key).await
+            })
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            let key = key.to_string();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                self.inner.put(&key, value).await
+            })
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            let key = key.to_string();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                self.inner.delete(&key).await
+            })
+        }
+    }
 
     fn test_channel_state(channel_id: &str) -> ChannelState {
         ChannelState {
@@ -477,5 +553,120 @@ mod adapter_tests {
             .unwrap();
         assert!(result.is_none());
         assert!(adapter.get_channel("ch1").await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_store_adapter_repro_same_channel_deduction_race() {
+        let store = Arc::new(SlowMemoryStore::new(Duration::from_millis(25)));
+        let adapter = Arc::new(ChannelStoreAdapter::new(store, "channels:"));
+
+        let mut state = test_channel_state("ch1");
+        state.highest_voucher_amount = 10_000;
+        adapter
+            .update_channel("ch1", Box::new(move |_| Ok(Some(state))))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let adapter1 = adapter.clone();
+        let start1 = start.clone();
+        let task1 = tokio::spawn(async move {
+            start1.wait().await;
+            deduct_from_channel(&*adapter1, "ch1", 7_000).await
+        });
+
+        let adapter2 = adapter.clone();
+        let start2 = start.clone();
+        let task2 = tokio::spawn(async move {
+            start2.wait().await;
+            deduct_from_channel(&*adapter2, "ch1", 7_000).await
+        });
+
+        // This is the original repro path: two concurrent deductions against the
+        // same adapter-backed channel. Before the fix, both calls could report
+        // success even though only one update was persisted.
+        start.wait().await;
+
+        let result1 = task1.await.unwrap();
+        let result2 = task2.await.unwrap();
+        let successes = [result1.is_ok(), result2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "the repro must not allow both concurrent deductions to succeed"
+        );
+
+        let error = result1.err().or_else(|| result2.err()).unwrap();
+        assert!(
+            error.to_string().contains("available 3000"),
+            "expected insufficient balance after the first deduction, got: {error}"
+        );
+
+        let stored = adapter.get_channel("ch1").await.unwrap().unwrap();
+        assert_eq!(stored.spent, 7_000);
+        assert_eq!(stored.units, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_store_adapter_serializes_same_channel_update_channel_calls() {
+        let store = Arc::new(SlowMemoryStore::new(Duration::from_millis(25)));
+        let adapter = Arc::new(ChannelStoreAdapter::new(store, "channels:"));
+
+        let state = test_channel_state("ch1");
+        adapter
+            .update_channel("ch1", Box::new(move |_| Ok(Some(state))))
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let adapter1 = adapter.clone();
+        let start1 = start.clone();
+        let task1 = tokio::spawn(async move {
+            start1.wait().await;
+            adapter1
+                .update_channel(
+                    "ch1",
+                    Box::new(|current| {
+                        let mut state = current.unwrap();
+                        state.spent += 1;
+                        state.units += 1;
+                        Ok(Some(state))
+                    }),
+                )
+                .await
+        });
+
+        let adapter2 = adapter.clone();
+        let start2 = start.clone();
+        let task2 = tokio::spawn(async move {
+            start2.wait().await;
+            adapter2
+                .update_channel(
+                    "ch1",
+                    Box::new(|current| {
+                        let mut state = current.unwrap();
+                        state.spent += 1;
+                        state.units += 1;
+                        Ok(Some(state))
+                    }),
+                )
+                .await
+        });
+
+        start.wait().await;
+
+        let result1 = task1.await.unwrap().unwrap().unwrap();
+        let result2 = task2.await.unwrap().unwrap().unwrap();
+        let mut returned_spent = [result1.spent, result2.spent];
+        returned_spent.sort_unstable();
+        assert_eq!(returned_spent, [1, 2]);
+
+        let stored = adapter.get_channel("ch1").await.unwrap().unwrap();
+        assert_eq!(stored.spent, 2);
+        assert_eq!(stored.units, 2);
     }
 }
