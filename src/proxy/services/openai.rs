@@ -13,7 +13,9 @@ use crate::proxy::service::{Service, ServiceBuilder};
 /// let svc = openai::service("sk-...", |r| {
 ///     r.route("POST /v1/chat/completions", Endpoint::Paid(PaidEndpoint {
 ///         intent: "charge".into(),
-///         amount: "0.05".into(),
+///         amount: "50000".into(),
+///         decimals: Some(6),
+///         currency: None,
 ///         unit_type: None,
 ///         description: Some("Chat completion".into()),
 ///     }))

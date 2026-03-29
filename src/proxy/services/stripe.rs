@@ -14,7 +14,9 @@ use base64::Engine;
 /// let svc = stripe::service("sk_test_123", |r| {
 ///     r.route("POST /v1/charges", Endpoint::Paid(mpp::proxy::service::PaidEndpoint {
 ///         intent: "charge".into(),
-///         amount: "1".into(),
+///         amount: "100".into(),
+///         decimals: Some(2),
+///         currency: None,
 ///         unit_type: None,
 ///         description: None,
 ///     }))
