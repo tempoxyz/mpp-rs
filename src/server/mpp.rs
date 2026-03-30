@@ -237,21 +237,22 @@ where
             ));
         }
 
-        if let Some(ref expires) = credential.challenge.expires {
-            if let Ok(expires_at) =
-                time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
-            {
-                if expires_at <= time::OffsetDateTime::now_utc() {
-                    return Err(VerificationError::expired(format!(
-                        "Challenge expired at {}",
-                        expires
-                    )));
-                }
-            } else {
-                return Err(VerificationError::new(
-                    "Invalid expires timestamp in challenge",
-                ));
-            }
+        let expires = credential.challenge.expires.as_deref().ok_or_else(|| {
+            VerificationError::with_code(
+                "Challenge missing required expires field",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            )
+        })?;
+
+        let expires_at =
+            time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| VerificationError::new("Invalid expires timestamp in challenge"))?;
+
+        if expires_at <= time::OffsetDateTime::now_utc() {
+            return Err(VerificationError::expired(format!(
+                "Challenge expired at {}",
+                expires
+            )));
         }
 
         Ok(())
@@ -485,6 +486,7 @@ where
         recipient: &str,
     ) -> crate::error::Result<PaymentChallenge> {
         use crate::protocol::intents::SessionRequest;
+        use time::{Duration, OffsetDateTime};
 
         let request = SessionRequest {
             amount: amount.to_string(),
@@ -494,13 +496,25 @@ where
         };
         let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
 
+        let expires = {
+            let expiry_time = OffsetDateTime::now_utc()
+                + Duration::minutes(
+                    crate::protocol::methods::tempo::DEFAULT_EXPIRES_MINUTES as i64,
+                );
+            expiry_time
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| {
+                    crate::error::MppError::InvalidConfig(format!("failed to format expires: {e}"))
+                })?
+        };
+
         let id = crate::protocol::methods::tempo::generate_challenge_id(
             &self.secret_key,
             &self.realm,
             "tempo",
             "session",
             encoded.raw(),
-            None,
+            Some(&expires),
             None,
             None,
         );
@@ -511,7 +525,7 @@ where
             method: "tempo".into(),
             intent: "session".into(),
             request: encoded,
-            expires: None,
+            expires: Some(expires),
             description: None,
             digest: None,
             opaque: None,
@@ -549,6 +563,7 @@ where
         options: super::SessionChallengeOptions<'_>,
     ) -> crate::error::Result<PaymentChallenge> {
         use crate::protocol::intents::SessionRequest;
+        use time::{Duration, OffsetDateTime};
 
         let session = self.session_method.as_ref();
 
@@ -572,13 +587,32 @@ where
         };
         let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
 
+        let default_expires;
+        let expires = match options.expires {
+            Some(e) => Some(e),
+            None => {
+                let expiry_time = OffsetDateTime::now_utc()
+                    + Duration::minutes(
+                        crate::protocol::methods::tempo::DEFAULT_EXPIRES_MINUTES as i64,
+                    );
+                default_expires = expiry_time
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|e| {
+                        crate::error::MppError::InvalidConfig(format!(
+                            "failed to format expires: {e}"
+                        ))
+                    })?;
+                Some(default_expires.as_str())
+            }
+        };
+
         let id = crate::protocol::methods::tempo::generate_challenge_id(
             &self.secret_key,
             &self.realm,
             "tempo",
             "session",
             encoded.raw(),
-            options.expires,
+            expires,
             None,
             None,
         );
@@ -589,7 +623,7 @@ where
             method: "tempo".into(),
             intent: "session".into(),
             request: encoded,
-            expires: options.expires.map(|s| s.to_string()),
+            expires: expires.map(|s| s.to_string()),
             description: options.description.map(|s| s.to_string()),
             digest: None,
             opaque: None,
@@ -937,6 +971,9 @@ mod tests {
 
     fn test_credential(secret_key: &str) -> PaymentCredential {
         let request = "eyJ0ZXN0IjoidmFsdWUifQ";
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         let id = {
             #[cfg(feature = "tempo")]
             {
@@ -946,7 +983,7 @@ mod tests {
                     "mock",
                     "charge",
                     request,
-                    None,
+                    Some(&expires),
                     None,
                     None,
                 )
@@ -963,7 +1000,7 @@ mod tests {
             method: "mock".into(),
             intent: "charge".into(),
             request: crate::protocol::core::Base64UrlJson::from_raw(request),
-            expires: None,
+            expires: Some(expires),
             digest: None,
             opaque: None,
         };
@@ -1174,6 +1211,9 @@ mod tests {
         let raw = encoded.raw().to_string();
 
         let secret = "test-secret";
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         let id = {
             #[cfg(feature = "tempo")]
             {
@@ -1183,7 +1223,7 @@ mod tests {
                     "mock",
                     "charge",
                     &raw,
-                    None,
+                    Some(&expires),
                     None,
                     None,
                 )
@@ -1200,7 +1240,7 @@ mod tests {
             method: "mock".into(),
             intent: "charge".into(),
             request: crate::protocol::core::Base64UrlJson::from_raw(raw),
-            expires: None,
+            expires: Some(expires),
             digest: None,
             opaque: None,
         };
@@ -1525,6 +1565,10 @@ mod tests {
         assert_eq!(challenge.method.as_str(), "tempo");
         assert_eq!(challenge.intent.as_str(), "session");
         assert!(!challenge.id.is_empty());
+        assert!(
+            challenge.expires.is_some(),
+            "session challenge should have default expires"
+        );
     }
 
     #[cfg(feature = "tempo")]
@@ -1816,6 +1860,53 @@ mod tests {
         assert!(
             result.unwrap_err().message.contains("Invalid expires"),
             "expected invalid expires error"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_missing_expires_rejected() {
+        let mpp = create_hmac_test_mpp();
+
+        // Manually create a credential without expires — HMAC computed without expires
+        let request = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let id = crate::protocol::methods::tempo::generate_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            encoded.raw(),
+            None,
+            None,
+            None,
+        );
+
+        let echo = ChallengeEcho {
+            id,
+            realm: "MPP Payment".into(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: encoded,
+            expires: None,
+            digest: None,
+            opaque: None,
+        };
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("missing required expires"),
+            "expected missing expires error, got: {}",
+            err.message
         );
     }
 
