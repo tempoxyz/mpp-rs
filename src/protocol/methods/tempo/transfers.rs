@@ -67,10 +67,7 @@ pub fn get_transfers(
 
     for split in splits {
         let amount = parse_amount(&split.amount).map_err(|_| {
-            MppError::invalid_challenge_reason(format!(
-                "Invalid split amount: {}",
-                split.amount
-            ))
+            MppError::invalid_challenge_reason(format!("Invalid split amount: {}", split.amount))
         })?;
 
         if amount.is_zero() {
@@ -123,8 +120,7 @@ mod tests {
 
     #[test]
     fn test_no_splits_returns_single_transfer() {
-        let transfers =
-            get_transfers(U256::from(1_000_000u64), addr(0x01), None, None).unwrap();
+        let transfers = get_transfers(U256::from(1_000_000u64), addr(0x01), None, None).unwrap();
 
         assert_eq!(transfers.len(), 1);
         assert_eq!(transfers[0].amount, U256::from(1_000_000u64));
@@ -241,7 +237,10 @@ mod tests {
 
         let result = get_transfers(U256::from(1_000_000u64), addr(0x01), None, Some(&splits));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be less than"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be less than"));
     }
 
     #[test]

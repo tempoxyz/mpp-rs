@@ -174,8 +174,12 @@ impl TempoCharge {
 
     /// Build the transfer calls from the charge fields (primary + splits).
     fn build_transfer_calls(&self) -> Result<Vec<Call>, MppError> {
-        let transfers =
-            get_transfers(self.amount, self.recipient, self.memo, self.splits.as_deref())?;
+        let transfers = get_transfers(
+            self.amount,
+            self.recipient,
+            self.memo,
+            self.splits.as_deref(),
+        )?;
 
         Ok(transfers
             .into_iter()

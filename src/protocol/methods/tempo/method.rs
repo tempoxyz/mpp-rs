@@ -170,9 +170,8 @@ where
 
         let splits = charge.splits();
 
-        get_transfers(amount, recipient, memo, splits.as_deref()).map_err(|e| {
-            VerificationError::new(format!("Invalid splits in charge request: {}", e))
-        })
+        get_transfers(amount, recipient, memo, splits.as_deref())
+            .map_err(|e| VerificationError::new(format!("Invalid splits in charge request: {}", e)))
     }
 
     async fn verify_hash(
@@ -270,8 +269,7 @@ where
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
         // Sort expected transfers: memo-bearing first for greedy-safe matching
-        let mut sorted_expected: Vec<(usize, &Transfer)> =
-            expected.iter().enumerate().collect();
+        let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
         sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
         let mut used_logs: Vec<bool> = vec![false; logs.len()];
@@ -606,8 +604,7 @@ where
         }
 
         // Sort expected transfers: memo-bearing first for greedy-safe matching
-        let mut sorted_expected: Vec<(usize, &Transfer)> =
-            expected.iter().enumerate().collect();
+        let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
         sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
         let mut used_calls: Vec<bool> = vec![false; tx.calls.len()];

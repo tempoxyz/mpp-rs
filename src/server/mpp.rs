@@ -457,7 +457,7 @@ where
             .as_ref()
             .and_then(|v| v.get("splits"))
             .and_then(|v| {
-                if v.as_array().map_or(false, |a| a.is_empty()) {
+                if v.as_array().is_some_and(|a| a.is_empty()) {
                     None
                 } else {
                     Some(v)
@@ -468,7 +468,7 @@ where
             .as_ref()
             .and_then(|v| v.get("splits"))
             .and_then(|v| {
-                if v.as_array().map_or(false, |a| a.is_empty()) {
+                if v.as_array().is_some_and(|a| a.is_empty()) {
                     None
                 } else {
                     Some(v)
