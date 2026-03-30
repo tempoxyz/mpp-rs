@@ -102,6 +102,7 @@ pub mod network;
 pub mod session;
 pub mod session_receipt;
 pub mod transaction;
+pub mod transfers;
 pub mod types;
 pub mod voucher;
 
@@ -127,7 +128,8 @@ pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
 };
-pub use types::TempoMethodDetails;
+pub use transfers::{get_transfers, Transfer};
+pub use types::{Split, TempoMethodDetails};
 #[cfg(feature = "evm")]
 pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 

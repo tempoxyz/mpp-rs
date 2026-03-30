@@ -429,6 +429,40 @@ where
             ));
         }
 
+        // Scope binding: compare methodDetails fields that affect transfer routing
+        // to prevent cross-route credential replay with different memo/splits
+        let req_memo = request
+            .method_details
+            .as_ref()
+            .and_then(|v| v.get("memo"))
+            .and_then(|v| v.as_str());
+        let exp_memo = expected
+            .method_details
+            .as_ref()
+            .and_then(|v| v.get("memo"))
+            .and_then(|v| v.as_str());
+        if req_memo != exp_memo {
+            return Err(VerificationError::with_code(
+                "Memo mismatch: credential was issued with a different memo",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        let req_splits = request
+            .method_details
+            .as_ref()
+            .and_then(|v| v.get("splits"));
+        let exp_splits = expected
+            .method_details
+            .as_ref()
+            .and_then(|v| v.get("splits"));
+        if req_splits != exp_splits {
+            return Err(VerificationError::with_code(
+                "Splits mismatch: credential was issued with different splits",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
         self.verify(credential, &request).await
     }
 

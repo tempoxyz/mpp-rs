@@ -2,7 +2,7 @@
 //!
 //! Provides Tempo-specific accessors for ChargeRequest.
 
-use super::types::TempoMethodDetails;
+use super::types::{Split, TempoMethodDetails};
 use crate::error::{MppError, Result};
 use crate::evm::{parse_address, parse_amount, Address, U256};
 use crate::protocol::intents::ChargeRequest;
@@ -45,6 +45,9 @@ pub trait TempoChargeExt {
 
     /// Check if this request is for Tempo Moderato network.
     fn is_tempo_moderato(&self) -> bool;
+
+    /// Get the splits from methodDetails, if present.
+    fn splits(&self) -> Option<Vec<Split>>;
 
     /// Get the Tempo network from chain ID, if recognized.
     fn network(&self) -> Option<super::network::TempoNetwork>;
@@ -100,6 +103,13 @@ impl TempoChargeExt for ChargeRequest {
 
     fn is_tempo_moderato(&self) -> bool {
         self.chain_id() == Some(super::MODERATO_CHAIN_ID)
+    }
+
+    fn splits(&self) -> Option<Vec<Split>> {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("splits"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
     fn network(&self) -> Option<super::network::TempoNetwork> {
@@ -243,5 +253,41 @@ mod tests {
     fn test_parse_memo_bytes_invalid_hex() {
         let memo = Some("0xnotvalidhex".to_string());
         assert!(parse_memo_bytes(memo).is_none());
+    }
+
+    #[test]
+    fn test_splits() {
+        let req = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "0x123".to_string(),
+            method_details: Some(serde_json::json!({
+                "splits": [
+                    {"amount": "300000", "recipient": "0x111", "memo": "0xabcd"},
+                    {"amount": "200000", "recipient": "0x222"}
+                ]
+            })),
+            ..Default::default()
+        };
+
+        let splits = req.splits().unwrap();
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0].amount, "300000");
+        assert_eq!(splits[1].recipient, "0x222");
+    }
+
+    #[test]
+    fn test_splits_none() {
+        let req = test_charge_request();
+        assert!(req.splits().is_none());
+    }
+
+    #[test]
+    fn test_splits_empty() {
+        let req = ChargeRequest {
+            method_details: Some(serde_json::json!({"splits": []})),
+            ..test_charge_request()
+        };
+        let splits = req.splits().unwrap();
+        assert!(splits.is_empty());
     }
 }

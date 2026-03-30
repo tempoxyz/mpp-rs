@@ -35,6 +35,7 @@ use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
 
+use super::transfers::{get_transfers, Transfer};
 use super::{TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
 
 /// TIP-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
@@ -146,6 +147,34 @@ where
         &self.provider
     }
 
+    /// Compute the expected transfers from a charge request (primary + splits).
+    fn expected_transfers(charge: &ChargeRequest) -> Result<Vec<Transfer>, VerificationError> {
+        let recipient = charge.recipient_address().map_err(|e| {
+            VerificationError::new(format!("Invalid recipient address in request: {}", e))
+        })?;
+        let amount = charge
+            .amount_u256()
+            .map_err(|e| VerificationError::new(format!("Invalid amount in request: {}", e)))?;
+
+        let memo = charge.memo().and_then(|m| {
+            let hex_str = m.strip_prefix("0x").unwrap_or(&m);
+            let bytes = hex::decode(hex_str).ok()?;
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+
+        let splits = charge.splits();
+
+        get_transfers(amount, recipient, memo, splits.as_deref()).map_err(|e| {
+            VerificationError::new(format!("Invalid splits in charge request: {}", e))
+        })
+    }
+
     async fn verify_hash(
         &self,
         tx_hash: &str,
@@ -190,25 +219,13 @@ where
             )));
         }
 
-        let expected_recipient = charge.recipient_address().map_err(|e| {
-            VerificationError::new(format!("Invalid recipient address in request: {}", e))
-        })?;
-        let expected_amount = charge
-            .amount_u256()
-            .map_err(|e| VerificationError::new(format!("Invalid amount in request: {}", e)))?;
         let currency = charge.currency_address().map_err(|e| {
             VerificationError::new(format!("Invalid currency address in request: {}", e))
         })?;
-        let memo = charge.memo();
+        let expected = Self::expected_transfers(charge)?;
 
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
-        self.verify_tip20_transfer(
-            &receipt,
-            currency,
-            expected_recipient,
-            expected_amount,
-            memo.as_deref(),
-        )?;
+        self.verify_tip20_transfers(&receipt, currency, &expected)?;
 
         if let Some(store) = &self.store {
             store
@@ -220,13 +237,173 @@ where
         Ok(Receipt::success(METHOD_NAME, tx_hash))
     }
 
+    /// Verify that all expected transfers are present in the receipt logs.
+    ///
+    /// Uses order-insensitive matching: sorts expected transfers by memo-specificity
+    /// (transfers with memos matched first) and uses a `used` set to prevent
+    /// double-matching.
+    fn verify_tip20_transfers(
+        &self,
+        receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
+        currency: Address,
+        expected: &[Transfer],
+    ) -> Result<(), VerificationError> {
+        if expected.len() == 1 {
+            let t = &expected[0];
+            return self.verify_tip20_transfer(
+                receipt,
+                currency,
+                t.recipient,
+                t.amount,
+                t.memo.as_ref(),
+            );
+        }
+
+        let receipt_json = serde_json::to_value(receipt)
+            .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
+
+        let tx_sender = receipt.from();
+
+        let logs = receipt_json
+            .get("logs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
+
+        // Sort expected transfers: memo-bearing first for greedy-safe matching
+        let mut sorted_expected: Vec<(usize, &Transfer)> =
+            expected.iter().enumerate().collect();
+        sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
+
+        let mut used_logs: Vec<bool> = vec![false; logs.len()];
+
+        for (_, transfer) in &sorted_expected {
+            if transfer.amount.is_zero() {
+                return Err(VerificationError::new(
+                    "Invalid amount: expected_amount must be greater than zero".to_string(),
+                ));
+            }
+            if transfer.recipient.is_zero() {
+                return Err(VerificationError::new(
+                    "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
+                ));
+            }
+
+            let mut found = false;
+            for (log_idx, log) in logs.iter().enumerate() {
+                if used_logs[log_idx] {
+                    continue;
+                }
+
+                let log_address = log
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Address>().ok());
+                if log_address != Some(currency) {
+                    continue;
+                }
+
+                let topics: Vec<&str> = log
+                    .get("topics")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                if topics.is_empty() {
+                    continue;
+                }
+
+                let topic0 = match topics[0].parse::<B256>() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                if let Some(exp_memo) = &transfer.memo {
+                    let exp_memo = B256::from(*exp_memo);
+                    if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC && topics.len() >= 3 {
+                        let from_address = match topics[1].parse::<B256>() {
+                            Ok(b) => Address::from_slice(&b[12..]),
+                            Err(_) => continue,
+                        };
+                        if from_address != tx_sender {
+                            continue;
+                        }
+                        let to_address = match topics[2].parse::<B256>() {
+                            Ok(b) => Address::from_slice(&b[12..]),
+                            Err(_) => continue,
+                        };
+                        if to_address != transfer.recipient {
+                            continue;
+                        }
+                        let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
+                        if data.len() >= 130 {
+                            let amount = match U256::from_str_radix(&data[2..66], 16) {
+                                Ok(a) => a,
+                                Err(_) => continue,
+                            };
+                            let memo_bytes = match parse_b256_hex(&data[66..130]) {
+                                Some(m) => m,
+                                None => continue,
+                            };
+                            if amount == transfer.amount && memo_bytes == exp_memo {
+                                used_logs[log_idx] = true;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                } else if topic0 == TRANSFER_EVENT_TOPIC && topics.len() >= 3 {
+                    let from_address = match topics[1].parse::<B256>() {
+                        Ok(b) => Address::from_slice(&b[12..]),
+                        Err(_) => continue,
+                    };
+                    if from_address != tx_sender {
+                        continue;
+                    }
+                    let to_address = match topics[2].parse::<B256>() {
+                        Ok(b) => Address::from_slice(&b[12..]),
+                        Err(_) => continue,
+                    };
+                    if to_address != transfer.recipient {
+                        continue;
+                    }
+                    let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
+                    if data.len() >= 66 {
+                        let amount = match U256::from_str_radix(&data[2..], 16) {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+                        if amount == transfer.amount {
+                            used_logs[log_idx] = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !found {
+                return Err(VerificationError::new(format!(
+                    "No matching transfer event found for {} to {}{}",
+                    transfer.amount,
+                    transfer.recipient,
+                    if transfer.memo.is_some() {
+                        " with memo"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     fn verify_tip20_transfer(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
         currency: Address,
         expected_recipient: Address,
         expected_amount: U256,
-        memo: Option<&str>,
+        memo: Option<&[u8; 32]>,
     ) -> Result<(), VerificationError> {
         // Security guards: reject zero values that could match parse failures
         if expected_amount.is_zero() {
@@ -258,16 +435,7 @@ where
             .and_then(|v| v.as_array())
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
-        // Parse expected memo if present - fail if memo is present but invalid
-        let expected_memo = match memo {
-            Some(m) => Some(parse_b256_hex(m).ok_or_else(|| {
-                VerificationError::new(format!(
-                    "Invalid memo: must be 32-byte hex string, got: {}",
-                    m
-                ))
-            })?),
-            None => None,
-        };
+        let expected_memo = memo.map(|m| B256::from(*m));
 
         for log in logs {
             let log_address = log
@@ -395,31 +563,16 @@ where
         }
     }
 
-    /// Validate that a transaction contains the expected payment call.
+    /// Validate that a transaction contains all expected payment calls (supports splits).
     ///
-    /// This performs pre-broadcast validation by deserializing the transaction
-    /// and checking that it contains a transfer/transferWithMemo call with the
-    /// expected recipient, amount, and (optionally) memo.
-    fn validate_transaction(
+    /// Uses order-insensitive matching with memo-specificity sorting.
+    fn validate_transaction_transfers(
         &self,
         tx_bytes: &[u8],
         currency: Address,
-        expected_recipient: Address,
-        expected_amount: U256,
-        memo: Option<&str>,
+        expected: &[Transfer],
         expected_chain_id: u64,
     ) -> Result<(), VerificationError> {
-        // Security guards: reject zero values that could match parse failures
-        if expected_amount.is_zero() {
-            return Err(VerificationError::new(
-                "Invalid amount: expected_amount must be greater than zero".to_string(),
-            ));
-        }
-        if expected_recipient.is_zero() {
-            return Err(VerificationError::new(
-                "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
-            ));
-        }
         if currency.is_zero() {
             return Err(VerificationError::new(
                 "Invalid currency: currency cannot be the zero address".to_string(),
@@ -435,12 +588,10 @@ where
             tx_bytes
         };
 
-        // Decode the signed Tempo transaction (AASigned = tx fields + signature).
         let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
         let tx = signed.tx();
 
-        // Validate chain_id to prevent cross-chain replay attacks
         if tx.chain_id != expected_chain_id {
             return Err(VerificationError::new(format!(
                 "Transaction chain_id mismatch: expected {}, got {}",
@@ -448,84 +599,102 @@ where
             )));
         }
 
-        // Parse expected memo if present - fail if memo is present but invalid
-        let expected_memo = match memo {
-            Some(m) => Some(parse_b256_hex(m).ok_or_else(|| {
-                VerificationError::new(format!(
-                    "Invalid memo: must be 32-byte hex string, got: {}",
-                    m
-                ))
-            })?),
-            None => None,
-        };
+        // Sort expected transfers: memo-bearing first for greedy-safe matching
+        let mut sorted_expected: Vec<(usize, &Transfer)> =
+            expected.iter().enumerate().collect();
+        sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
-        // Search for matching call in transaction
-        for call in &tx.calls {
-            // Check if this call targets the currency contract
-            let call_to = match &call.to {
-                TxKind::Call(addr) => addr,
-                TxKind::Create => continue,
-            };
+        let mut used_calls: Vec<bool> = vec![false; tx.calls.len()];
 
-            if call_to != &currency {
-                continue;
+        for (_, transfer) in &sorted_expected {
+            if transfer.amount.is_zero() {
+                return Err(VerificationError::new(
+                    "Invalid amount: expected_amount must be greater than zero".to_string(),
+                ));
+            }
+            if transfer.recipient.is_zero() {
+                return Err(VerificationError::new(
+                    "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
+                ));
             }
 
-            let data = &call.input;
-            if data.len() < 4 {
-                continue;
+            let mut found = false;
+
+            for (call_idx, call) in tx.calls.iter().enumerate() {
+                if used_calls[call_idx] {
+                    continue;
+                }
+
+                let call_to = match &call.to {
+                    TxKind::Call(addr) => addr,
+                    TxKind::Create => continue,
+                };
+                if call_to != &currency {
+                    continue;
+                }
+
+                let data = &call.input;
+                if data.len() < 4 {
+                    continue;
+                }
+
+                let selector: [u8; 4] = data[..4].try_into().unwrap_or([0; 4]);
+
+                if let Some(exp_memo) = &transfer.memo {
+                    if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
+                        let to = Address::from_slice(&data[16..36]);
+                        let amount = U256::from_be_slice(&data[36..68]);
+                        let memo_bytes = B256::from_slice(&data[68..100]);
+
+                        if to == transfer.recipient
+                            && amount == transfer.amount
+                            && memo_bytes == B256::from(*exp_memo)
+                        {
+                            used_calls[call_idx] = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                } else {
+                    // No memo — accept transfer or transferWithMemo
+                    if selector == TRANSFER_SELECTOR && data.len() == 68 {
+                        let to = Address::from_slice(&data[16..36]);
+                        let amount = U256::from_be_slice(&data[36..68]);
+
+                        if to == transfer.recipient && amount == transfer.amount {
+                            used_calls[call_idx] = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found && selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
+                        let to = Address::from_slice(&data[16..36]);
+                        let amount = U256::from_be_slice(&data[36..68]);
+
+                        if to == transfer.recipient && amount == transfer.amount {
+                            used_calls[call_idx] = true;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
             }
 
-            let selector: [u8; 4] = data[..4].try_into().unwrap_or([0; 4]);
-
-            if let Some(exp_memo) = expected_memo {
-                // Look for transferWithMemo(address,uint256,bytes32)
-                // Exact length: 4 (selector) + 32 (address) + 32 (amount) + 32 (memo) = 100 bytes
-                if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
-                    let to = Address::from_slice(&data[16..36]);
-                    let amount = U256::from_be_slice(&data[36..68]);
-                    let memo_bytes = B256::from_slice(&data[68..100]);
-
-                    if to == expected_recipient
-                        && amount == expected_amount
-                        && memo_bytes == exp_memo
-                    {
-                        return Ok(());
+            if !found {
+                return Err(VerificationError::new(format!(
+                    "Invalid transaction: no matching transfer call found for {} to {}{}",
+                    transfer.amount,
+                    transfer.recipient,
+                    if transfer.memo.is_some() {
+                        " with memo"
+                    } else {
+                        ""
                     }
-                }
-            } else {
-                // No memo specified — accept either transfer or transferWithMemo
-                // (clients may attach attribution memos even when the request doesn't require one)
-                if selector == TRANSFER_SELECTOR && data.len() == 68 {
-                    let to = Address::from_slice(&data[16..36]);
-                    let amount = U256::from_be_slice(&data[36..68]);
-
-                    if to == expected_recipient && amount == expected_amount {
-                        return Ok(());
-                    }
-                }
-                if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
-                    let to = Address::from_slice(&data[16..36]);
-                    let amount = U256::from_be_slice(&data[36..68]);
-
-                    if to == expected_recipient && amount == expected_amount {
-                        return Ok(());
-                    }
-                }
+                )));
             }
         }
 
-        if memo.is_some() {
-            Err(VerificationError::new(format!(
-                "Invalid transaction: no matching transferWithMemo call found for {} {} to {}",
-                expected_amount, currency, expected_recipient
-            )))
-        } else {
-            Err(VerificationError::new(format!(
-                "Invalid transaction: no matching transfer call found for {} {} to {}",
-                expected_amount, currency, expected_recipient
-            )))
-        }
+        Ok(())
     }
 
     async fn broadcast_transaction(
@@ -538,16 +707,10 @@ where
             .parse::<Bytes>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {}", e)))?;
 
-        let expected_recipient = charge.recipient_address().map_err(|e| {
-            VerificationError::new(format!("Invalid recipient address in request: {}", e))
-        })?;
-        let expected_amount = charge
-            .amount_u256()
-            .map_err(|e| VerificationError::new(format!("Invalid amount in request: {}", e)))?;
         let currency = charge.currency_address().map_err(|e| {
             VerificationError::new(format!("Invalid currency address in request: {}", e))
         })?;
-        let memo = charge.memo();
+        let expected = Self::expected_transfers(charge)?;
 
         // Fee payer co-signing replaces the placeholder fee_payer_signature
         // with a real co-signature and sets the fee_token.
@@ -564,12 +727,10 @@ where
             tx_bytes.to_vec()
         };
 
-        self.validate_transaction(
+        self.validate_transaction_transfers(
             &final_tx_bytes,
             currency,
-            expected_recipient,
-            expected_amount,
-            memo.as_deref(),
+            &expected,
             expected_chain_id,
         )?;
 
@@ -612,14 +773,8 @@ where
             )));
         }
 
-        // Verify the receipt contains the expected TIP-20 transfer
-        self.verify_tip20_transfer(
-            &receipt,
-            currency,
-            expected_recipient,
-            expected_amount,
-            memo.as_deref(),
-        )?;
+        // Verify the receipt contains the expected TIP-20 transfer(s)
+        self.verify_tip20_transfers(&receipt, currency, &expected)?;
 
         // Record the on-chain tx hash for hash-based replay protection
         if let Some(store) = &self.store {
