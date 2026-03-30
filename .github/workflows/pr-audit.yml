@@ -5,6 +5,36 @@ on:
     types: [labeled]
 
 jobs:
-  pr-audit:
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@main
-    secrets: inherit
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event.action == 'labeled' && github.event.label.name == 'cyclops'
+    steps:
+      - name: Check admin permission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.sender.login }}/permission --jq '.permission')
+          if [[ "$PERM" != "admin" ]]; then
+            echo "::error::Only admins can trigger pr-audit (got: $PERM)"
+            exit 1
+          fi
+
+      - name: Publish event
+        run: |
+          set -euo pipefail
+
+          echo "${{ secrets.EVENTS_KEY }}" > "${{ runner.temp }}/key"
+          echo "${{ secrets.EVENTS_CERT }}" > "${{ runner.temp }}/cert"
+
+          curl -sf -o /dev/null -X POST ${{ secrets.EVENTS_ARGS }} \
+            -H "Content-Type: application/json" \
+            --key "${{ runner.temp }}/key" \
+            --cert "${{ runner.temp }}/cert" \
+            -d '{
+              "repository": "${{ github.repository }}",
+              "event": "pr_audit",
+              "data": {
+                "pr_number": ${{ github.event.pull_request.number }},
+                "sha": "${{ github.event.pull_request.head.sha }}"
+              }
+            }'
