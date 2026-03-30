@@ -230,7 +230,7 @@ where
             credential.challenge.opaque.as_ref().map(|o| o.raw()),
         );
 
-        if credential.challenge.id != expected_id {
+        if !crate::protocol::core::constant_time_eq(&credential.challenge.id, &expected_id) {
             return Err(VerificationError::with_code(
                 "Challenge ID mismatch - not issued by this server",
                 crate::protocol::traits::ErrorCode::CredentialMismatch,

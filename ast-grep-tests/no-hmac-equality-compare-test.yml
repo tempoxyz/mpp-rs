@@ -1,0 +1,32 @@
+id: no-hmac-equality-compare
+valid:
+  - |
+    if !constant_time_eq(&credential.challenge.id, &expected_id) {
+        return Err("mismatch");
+    }
+  - |
+    constant_time_eq(&self.id, &expected_id)
+  - |
+    let expected_id = compute_challenge_id(secret, realm, method, intent, request, None, None, None);
+  - |
+    let is_valid = hmac_verify(&id, &expected_id);
+
+invalid:
+  - |
+    if credential.challenge.id != expected_id {
+        return Err("mismatch");
+    }
+  - |
+    if credential.challenge.id == expected_id {
+        return Ok(());
+    }
+  - |
+    if expected_id != credential.challenge.id {
+        return Err("mismatch");
+    }
+  - |
+    if expected_id == credential.challenge.id {
+        return Ok(());
+    }
+  - |
+    let matches = self.id == expected_id;

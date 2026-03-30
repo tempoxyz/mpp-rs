@@ -75,6 +75,7 @@ pub use challenge::{
     compute_challenge_id, extract_tx_hash, ChallengeEcho, PaymentChallenge, PaymentCredential,
     PaymentPayload, Receipt,
 };
+pub(crate) use challenge::constant_time_eq;
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
     format_www_authenticate_many, parse_authorization, parse_receipt, parse_www_authenticate,

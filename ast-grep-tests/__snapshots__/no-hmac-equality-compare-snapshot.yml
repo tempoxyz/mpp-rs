@@ -1,0 +1,45 @@
+id: no-hmac-equality-compare
+snapshots:
+  ? |
+    if credential.challenge.id != expected_id {
+        return Err("mismatch");
+    }
+  : labels:
+    - source: credential.challenge.id != expected_id
+      style: primary
+      start: 3
+      end: 41
+  ? |
+    if credential.challenge.id == expected_id {
+        return Ok(());
+    }
+  : labels:
+    - source: credential.challenge.id == expected_id
+      style: primary
+      start: 3
+      end: 41
+  ? |
+    if expected_id != credential.challenge.id {
+        return Err("mismatch");
+    }
+  : labels:
+    - source: expected_id != credential.challenge.id
+      style: primary
+      start: 3
+      end: 41
+  ? |
+    if expected_id == credential.challenge.id {
+        return Ok(());
+    }
+  : labels:
+    - source: expected_id == credential.challenge.id
+      style: primary
+      start: 3
+      end: 41
+  ? |
+    let matches = self.id == expected_id;
+  : labels:
+    - source: self.id == expected_id
+      style: primary
+      start: 14
+      end: 36

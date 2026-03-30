@@ -38,6 +38,17 @@ jobs:
           path: "."
           post-comment: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install ast-grep
+        uses: jaxxstorm/action-install-gh-release@v1
+        with:
+          repo: ast-grep/ast-grep
+          tag: "0.37.0"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run ast-grep lint
+        run: sg scan -c sgconfig.yml src/
+      - name: Run ast-grep tests
+        run: sg test -c sgconfig.yml
 
   test:
     name: Test

@@ -1,0 +1,22 @@
+id: no-hmac-equality-compare
+message: "Use constant_time_eq() for HMAC comparison, not == or !=. Non-constant-time comparison leaks timing information."
+severity: error
+language: rust
+note: |
+  HMAC challenge IDs must be compared using constant_time_eq() to prevent
+  timing side-channel attacks. Using == or != leaks information about how
+  many leading bytes match, which can allow an attacker to forge valid HMACs.
+
+  Replace:
+    if credential.challenge.id != expected_id { ... }
+  With:
+    if !constant_time_eq(&credential.challenge.id, &expected_id) { ... }
+
+  To disable this rule:
+  - Line: add `// ast-grep-ignore: no-hmac-equality-compare` with justification
+rule:
+  any:
+    - pattern: $A == expected_id
+    - pattern: $A != expected_id
+    - pattern: expected_id == $A
+    - pattern: expected_id != $A
