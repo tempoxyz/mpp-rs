@@ -2114,6 +2114,114 @@ mod tests {
         assert_eq!(err.code, Some(ErrorCode::Expired));
     }
 
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_session_missing_expires_rejected() {
+        let mpp = create_session_test_mpp();
+
+        let request = crate::protocol::intents::SessionRequest {
+            amount: "1000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let id = crate::protocol::methods::tempo::generate_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "session",
+            encoded.raw(),
+            None,
+            None,
+            None,
+        );
+
+        let echo = ChallengeEcho {
+            id,
+            realm: "MPP Payment".into(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: encoded,
+            expires: None,
+            digest: None,
+            opaque: None,
+        };
+        let credential = PaymentCredential::new(
+            echo,
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": "0xabc",
+                "cumulativeAmount": "5000",
+                "signature": "0xdef"
+            }),
+        );
+
+        let result = mpp.verify_session(&credential).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("missing required expires"),
+            "expected missing expires error, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_session_default_expires_accepted() {
+        let mpp = create_session_test_mpp();
+
+        let challenge = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+        assert!(
+            challenge.expires.is_some(),
+            "session_challenge should set default expires"
+        );
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(
+            echo,
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": "0xabc",
+                "cumulativeAmount": "5000",
+                "signature": "0xdef"
+            }),
+        );
+
+        let result = mpp.verify_session(&credential).await;
+        assert!(
+            result.is_ok(),
+            "session with default expires should be accepted"
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_session_challenge_with_details_default_expires() {
+        let mpp = create_session_test_mpp();
+
+        let challenge = mpp
+            .session_challenge_with_details(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                Default::default(),
+            )
+            .unwrap();
+        assert!(
+            challenge.expires.is_some(),
+            "session_challenge_with_details with default options should set default expires"
+        );
+    }
+
     // ==================== Stripe tests ====================
 
     #[cfg(feature = "stripe")]
