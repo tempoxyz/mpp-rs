@@ -560,7 +560,7 @@ mod adapter_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn channel_store_adapter_repro_same_channel_deduction_race() {
+    async fn channel_store_adapter_same_channel_deduction_race() {
         let store = Arc::new(SlowMemoryStore::new(Duration::from_millis(25)));
         let adapter = Arc::new(ChannelStoreAdapter::new(store, "channels:"));
 
