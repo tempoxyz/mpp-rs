@@ -40,7 +40,7 @@ pub enum ChallengeAction {
 /// let gate = |_challenge| async { ChallengeAction::Approve };
 /// let resp = client
 ///     .get("https://api.example.com/paid")
-///     .send_with_payment_opts(&provider, &gate)
+///     .send_with_payment_opts(&provider, gate)
 ///     .await?;
 /// ```
 pub trait OnChallenge: Send + Sync {
@@ -121,7 +121,7 @@ pub trait PaymentExt {
     fn send_with_payment_opts<P: PaymentProvider, H: OnChallenge>(
         self,
         provider: &P,
-        on_challenge: &H,
+        on_challenge: H,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 }
 
@@ -130,14 +130,14 @@ impl PaymentExt for RequestBuilder {
         self,
         provider: &P,
     ) -> Result<Response, HttpError> {
-        self.send_with_payment_opts(provider, &ApproveChallenge)
+        self.send_with_payment_opts(provider, ApproveChallenge)
             .await
     }
 
     async fn send_with_payment_opts<P: PaymentProvider, H: OnChallenge>(
         self,
         provider: &P,
-        on_challenge: &H,
+        on_challenge: H,
     ) -> Result<Response, HttpError> {
         let retry_builder = self.try_clone().ok_or(HttpError::CloneFailed)?;
 
@@ -695,7 +695,7 @@ mod tests {
 
             let resp = reqwest::Client::new()
                 .get(format!("{}/paid", base_url))
-                .send_with_payment_opts(&provider, &approve)
+                .send_with_payment_opts(&provider, approve)
                 .await
                 .unwrap();
 
@@ -721,7 +721,7 @@ mod tests {
 
             let resp = reqwest::Client::new()
                 .get(format!("{}/paid", base_url))
-                .send_with_payment_opts(&provider, &on_challenge)
+                .send_with_payment_opts(&provider, on_challenge)
                 .await
                 .unwrap();
 
@@ -740,7 +740,7 @@ mod tests {
 
             let err = reqwest::Client::new()
                 .get(format!("{}/paid", base_url))
-                .send_with_payment_opts(&provider, &decline)
+                .send_with_payment_opts(&provider, decline)
                 .await
                 .unwrap_err();
 
