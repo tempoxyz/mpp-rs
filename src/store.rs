@@ -333,6 +333,10 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
                     self.store.delete(&key).await.map_err(|e| {
                         crate::protocol::traits::VerificationError::new(e.to_string())
                     })?;
+                    // Evict the per-channel lock so the map doesn't grow unboundedly.
+                    if let Ok(mut locks) = self.channel_locks.lock() {
+                        locks.remove(&key);
+                    }
                 }
             }
 
@@ -668,5 +672,34 @@ mod adapter_tests {
         let stored = adapter.get_channel("ch1").await.unwrap().unwrap();
         assert_eq!(stored.spent, 2);
         assert_eq!(stored.units, 2);
+    }
+
+    #[tokio::test]
+    async fn channel_store_adapter_evicts_lock_on_channel_delete() {
+        let store = Arc::new(MemoryStore::new());
+        let adapter = ChannelStoreAdapter::new(store, "channels:");
+
+        // Create channels
+        for id in ["ch1", "ch2", "ch3"] {
+            let state = test_channel_state(id);
+            adapter
+                .update_channel(id, Box::new(move |_| Ok(Some(state))))
+                .await
+                .unwrap();
+        }
+        assert_eq!(adapter.channel_locks.lock().unwrap().len(), 3);
+
+        // Delete ch2 via update returning None
+        adapter
+            .update_channel("ch2", Box::new(|_| Ok(None)))
+            .await
+            .unwrap();
+
+        // Lock entry for ch2 should be evicted
+        let locks = adapter.channel_locks.lock().unwrap();
+        assert_eq!(locks.len(), 2);
+        assert!(!locks.contains_key("channels:ch2"));
+        assert!(locks.contains_key("channels:ch1"));
+        assert!(locks.contains_key("channels:ch3"));
     }
 }
