@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1 (2026-03-30)
+
+### Patch Changes
+
+- Fixed a race condition in `ChannelStoreAdapter` where concurrent `update_channel` calls for the same channel could overwrite each other. Added per-channel async mutex locking to serialize read-modify-write operations within a single process, along with tests reproducing the original race. (by @BrendanRyan, [#177](https://github.com/tempoxyz/mpp-rs/pull/177))
+
 ## 0.8.0 (2026-03-26)
 
 ### Minor Changes
