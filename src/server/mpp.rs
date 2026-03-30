@@ -431,16 +431,19 @@ where
 
         // Scope binding: compare methodDetails fields that affect transfer routing
         // to prevent cross-route credential replay with different memo/splits
+        // Canonicalize memo comparison to be case-insensitive for hex strings
         let req_memo = request
             .method_details
             .as_ref()
             .and_then(|v| v.get("memo"))
-            .and_then(|v| v.as_str());
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
         let exp_memo = expected
             .method_details
             .as_ref()
             .and_then(|v| v.get("memo"))
-            .and_then(|v| v.as_str());
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
         if req_memo != exp_memo {
             return Err(VerificationError::with_code(
                 "Memo mismatch: credential was issued with a different memo",
@@ -448,14 +451,29 @@ where
             ));
         }
 
+        // Canonicalize splits: treat empty array as equivalent to no splits
         let req_splits = request
             .method_details
             .as_ref()
-            .and_then(|v| v.get("splits"));
+            .and_then(|v| v.get("splits"))
+            .and_then(|v| {
+                if v.as_array().map_or(false, |a| a.is_empty()) {
+                    None
+                } else {
+                    Some(v)
+                }
+            });
         let exp_splits = expected
             .method_details
             .as_ref()
-            .and_then(|v| v.get("splits"));
+            .and_then(|v| v.get("splits"))
+            .and_then(|v| {
+                if v.as_array().map_or(false, |a| a.is_empty()) {
+                    None
+                } else {
+                    Some(v)
+                }
+            });
         if req_splits != exp_splits {
             return Err(VerificationError::with_code(
                 "Splits mismatch: credential was issued with different splits",

@@ -350,7 +350,13 @@ where
                             }
                         }
                     }
-                } else if topic0 == TRANSFER_EVENT_TOPIC && topics.len() >= 3 {
+                } else if (topic0 == TRANSFER_EVENT_TOPIC
+                    || topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC)
+                    && topics.len() >= 3
+                {
+                    // No memo expected — accept both Transfer and TransferWithMemo events,
+                    // matching only by recipient and amount (consistent with
+                    // validate_transaction_transfers).
                     let from_address = match topics[1].parse::<B256>() {
                         Ok(b) => Address::from_slice(&b[12..]),
                         Err(_) => continue,
@@ -367,7 +373,7 @@ where
                     }
                     let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
                     if data.len() >= 66 {
-                        let amount = match U256::from_str_radix(&data[2..], 16) {
+                        let amount = match U256::from_str_radix(&data[2..66], 16) {
                             Ok(a) => a,
                             Err(_) => continue,
                         };
