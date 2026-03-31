@@ -925,7 +925,8 @@ mod tests {
     #[test]
     fn test_split_payment_challenges() {
         // single challenge
-        let single = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
+        let single =
+            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
         assert_eq!(split_payment_challenges(single).len(), 1);
 
         // two challenges, normal spacing
