@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.3 (2026-03-31)
+
+### Patch Changes
+
+- Added split payments support to Tempo charge verification and transaction building. Extended `TempoCharge` and `TempoChargeExt` to parse and propagate split recipients from `methodDetails`, and refactored transfer call construction and verification to handle multiple transfers using order-insensitive matching. (by @BrendanRyan, [#187](https://github.com/tempoxyz/mpp-rs/pull/187))
+
 ## 0.8.2 (2026-03-31)
 
 ### Patch Changes
