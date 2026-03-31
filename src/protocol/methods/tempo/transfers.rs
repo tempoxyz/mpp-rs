@@ -56,7 +56,7 @@ pub fn get_transfers(
     splits: Option<&[Split]>,
 ) -> Result<Vec<Transfer>, MppError> {
     let splits = match splits {
-        Some(s) if s.is_empty() => {
+        Some([]) => {
             return Err(MppError::invalid_challenge_reason(
                 "Splits must not be empty".to_string(),
             ));
