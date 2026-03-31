@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.3 (2026-03-31)
+
+### Minor Changes
+
+- Added support for multi-challenge `WWW-Authenticate` headers. `parse_www_authenticate_all` now correctly splits and parses headers containing multiple `Payment` challenges. Added `find_tempo_challenge` helper to extract the first Tempo challenge from multi-challenge headers. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
+
+### Patch Changes
+
+- Moved `find_tempo_challenge` from `protocol::core` to `protocol::methods::tempo` where it belongs. The function is still re-exported from `protocol::core` for backward compatibility. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
+
 ## 0.8.2 (2026-03-31)
 
 ### Patch Changes
