@@ -329,38 +329,6 @@ fn split_payment_challenges(header: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Find the first `tempo` method challenge from one or more WWW-Authenticate
-/// header values.
-///
-/// This is a convenience wrapper around [`parse_www_authenticate_all`] that
-/// filters for `method="tempo"` and returns the first match.
-///
-/// # Examples
-///
-/// ```
-/// use mpp::protocol::core::find_tempo_challenge;
-///
-/// let header = concat!(
-///     r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", "#,
-///     r#"Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#,
-/// );
-/// let challenge = find_tempo_challenge(vec![header]).unwrap();
-/// assert_eq!(challenge.id, "a");
-/// assert_eq!(challenge.method.as_str(), "tempo");
-/// ```
-pub fn find_tempo_challenge<'a>(
-    headers: impl IntoIterator<Item = &'a str>,
-) -> Result<PaymentChallenge> {
-    parse_www_authenticate_all(headers)
-        .into_iter()
-        .find(|r| r.as_ref().is_ok_and(|c| c.method.as_str() == "tempo"))
-        .unwrap_or_else(|| {
-            Err(MppError::invalid_challenge_reason(
-                "No Payment challenge with method=\"tempo\" found",
-            ))
-        })
-}
-
 /// Format a PaymentChallenge as a WWW-Authenticate header value.
 ///
 /// Format: `Payment id="<id>", realm="<realm>", method="<method>", intent="<intent>", request="<base64url-json>"`
@@ -993,19 +961,4 @@ mod tests {
         assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
     }
 
-    #[test]
-    fn test_find_tempo_challenge() {
-        let header = concat!(
-            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30", "#,
-            r#"Payment id="t1", realm="r", method="tempo", intent="charge", request="e30""#,
-        );
-        let c = find_tempo_challenge(vec![header]).unwrap();
-        assert_eq!(c.id, "t1");
-        assert_eq!(c.method.as_str(), "tempo");
-
-        // no tempo challenge → error
-        let other =
-            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30""#;
-        assert!(find_tempo_challenge(vec![other]).is_err());
-    }
 }
