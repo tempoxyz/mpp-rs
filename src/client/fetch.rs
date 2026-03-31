@@ -344,5 +344,240 @@ mod tests {
 
             assert!(matches!(err, HttpError::Payment(_)));
         }
+
+        /// Provider that only supports specific method/intent pairs.
+        #[derive(Clone)]
+        struct SelectiveProvider {
+            supported: Vec<(&'static str, &'static str)>,
+            pay_count: Arc<AtomicU32>,
+        }
+
+        impl SelectiveProvider {
+            fn new(supported: Vec<(&'static str, &'static str)>) -> Self {
+                Self {
+                    supported,
+                    pay_count: Arc::new(AtomicU32::new(0)),
+                }
+            }
+
+            fn call_count(&self) -> u32 {
+                self.pay_count.load(Ordering::SeqCst)
+            }
+        }
+
+        impl super::PaymentProvider for SelectiveProvider {
+            fn supports(&self, method: &str, intent: &str) -> bool {
+                self.supported.iter().any(|(m, i)| *m == method && *i == intent)
+            }
+
+            async fn pay(
+                &self,
+                challenge: &PaymentChallenge,
+            ) -> Result<PaymentCredential, MppError> {
+                self.pay_count.fetch_add(1, Ordering::SeqCst);
+                let echo = challenge.to_echo();
+                Ok(PaymentCredential::new(
+                    echo,
+                    PaymentPayload::hash("0xmockhash"),
+                ))
+            }
+        }
+
+        /// Build a challenge header for a specific method and intent.
+        fn challenge_header(id: &str, method: &str, intent: &str) -> String {
+            let request =
+                Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+            let challenge = PaymentChallenge::new(id, "test.example.com", method, intent, request);
+            format_www_authenticate(&challenge).unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_multi_challenge_selects_supported_method() {
+            // Server offers both stripe and tempo; provider only supports tempo.
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+            let tempo_header = challenge_header("t1", "tempo", "charge");
+            let combined = format!("{}, {}", stripe_header, tempo_header);
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let combined = combined.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, combined)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge")]);
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_multi_challenge_picks_first_supported() {
+            // Server offers tempo then stripe; provider supports both.
+            // Should pick tempo (first match).
+            let tempo_header = challenge_header("t1", "tempo", "charge");
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+            let combined = format!("{}, {}", tempo_header, stripe_header);
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let combined = combined.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, combined)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge"), ("stripe", "charge")]);
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_no_supported_challenge_error() {
+            // Server offers stripe only; provider only supports tempo.
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let stripe_header = stripe_header.clone();
+                    async move {
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, stripe_header)],
+                        )
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge")]);
+            let client = reqwest::Client::new();
+
+            let err = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, HttpError::NoSupportedChallenge(_)));
+        }
+
+        #[tokio::test]
+        async fn test_multiple_www_authenticate_headers() {
+            // Challenges split across separate WWW-Authenticate header instances.
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+            let tempo_header = challenge_header("t1", "tempo", "charge");
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let stripe_header = stripe_header.clone();
+                    let tempo_header = tempo_header.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            let mut resp = (AxumStatusCode::PAYMENT_REQUIRED, "pay up")
+                                .into_response();
+                            let headers = resp.headers_mut();
+                            headers.append(
+                                WWW_AUTH_NAME,
+                                stripe_header.parse().unwrap(),
+                            );
+                            headers.append(
+                                WWW_AUTH_NAME,
+                                tempo_header.parse().unwrap(),
+                            );
+                            resp
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge")]);
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_intent_matching() {
+            // Server offers tempo/session; provider only supports tempo/charge.
+            let session_header = challenge_header("t1", "tempo", "session");
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let session_header = session_header.clone();
+                    async move {
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, session_header)],
+                        )
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge")]);
+            let client = reqwest::Client::new();
+
+            let err = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, HttpError::NoSupportedChallenge(_)));
+        }
     }
 }
