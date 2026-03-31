@@ -85,7 +85,7 @@ pub use headers::{
 };
 
 /// Re-export from [`crate::protocol::methods::tempo`] for backward compatibility.
-#[cfg(any(feature = "server", feature = "tempo"))]
+#[cfg(feature = "tempo")]
 pub use crate::protocol::methods::tempo::find_tempo_challenge;
 pub use types::{
     base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName, PayloadType,
