@@ -26,8 +26,10 @@
 use alloy::network::ReceiptResponse;
 use alloy::primitives::{hex, keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolCall;
 use std::future::Future;
 use std::sync::Arc;
+use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
 use tempo_alloy::TempoNetwork;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -54,6 +56,125 @@ const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 
 /// TIP-20 transferWithMemo function selector: bytes4(keccak256("transferWithMemo(address,uint256,bytes32)"))
 const TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = [0x95, 0x77, 0x7d, 0x59];
+
+fn no_matching_payment_call_error() -> VerificationError {
+    VerificationError::new("Invalid transaction: no matching payment call found".to_string())
+}
+
+fn disallowed_fee_payer_call_pattern_error() -> VerificationError {
+    VerificationError::new("Fee-sponsored transaction contains disallowed call pattern".to_string())
+}
+
+fn call_selector(data: &Bytes) -> Option<[u8; 4]> {
+    if data.len() < 4 {
+        None
+    } else {
+        data[..4].try_into().ok()
+    }
+}
+
+fn decode_approve_spender(call: &tempo_primitives::transaction::Call) -> Option<Address> {
+    if call_selector(&call.input) != Some(ITIP20::approveCall::SELECTOR) || call.input.len() != 68 {
+        return None;
+    }
+
+    Some(Address::from_slice(&call.input[16..36]))
+}
+
+fn transfer_call_offset(
+    calls: &[tempo_primitives::transaction::Call],
+) -> Result<usize, VerificationError> {
+    let first_selector = calls.first().and_then(|call| call_selector(&call.input));
+
+    if first_selector == Some(ITIP20::approveCall::SELECTOR) {
+        let second_selector = calls.get(1).and_then(|call| call_selector(&call.input));
+        if second_selector != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
+            return Err(no_matching_payment_call_error());
+        }
+        Ok(2)
+    } else if first_selector == Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
+        Err(no_matching_payment_call_error())
+    } else {
+        Ok(0)
+    }
+}
+
+fn get_transfer_calls<'a>(
+    calls: &'a [tempo_primitives::transaction::Call],
+) -> Result<&'a [tempo_primitives::transaction::Call], VerificationError> {
+    let offset = transfer_call_offset(calls)?;
+    let transfer_calls = &calls[offset..];
+
+    if transfer_calls.is_empty()
+        || transfer_calls.iter().any(|call| {
+            !matches!(
+                call_selector(&call.input),
+                Some(TRANSFER_SELECTOR) | Some(TRANSFER_WITH_MEMO_SELECTOR)
+            )
+        })
+    {
+        return Err(no_matching_payment_call_error());
+    }
+
+    Ok(transfer_calls)
+}
+
+fn validate_fee_payer_calls(
+    calls: &[tempo_primitives::transaction::Call],
+) -> Result<(), VerificationError> {
+    if calls.is_empty() {
+        return Err(disallowed_fee_payer_call_pattern_error());
+    }
+
+    let has_swap_prefix = calls.first().and_then(|call| call_selector(&call.input))
+        == Some(ITIP20::approveCall::SELECTOR);
+
+    if has_swap_prefix {
+        if calls.get(1).and_then(|call| call_selector(&call.input))
+            != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR)
+        {
+            return Err(disallowed_fee_payer_call_pattern_error());
+        }
+    } else if calls.first().and_then(|call| call_selector(&call.input))
+        == Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR)
+    {
+        return Err(disallowed_fee_payer_call_pattern_error());
+    }
+
+    let transfer_calls = &calls[if has_swap_prefix { 2 } else { 0 }..];
+    if transfer_calls.is_empty()
+        || transfer_calls.len() > 11
+        || transfer_calls.iter().any(|call| {
+            !matches!(
+                call_selector(&call.input),
+                Some(TRANSFER_SELECTOR) | Some(TRANSFER_WITH_MEMO_SELECTOR)
+            )
+        })
+    {
+        return Err(disallowed_fee_payer_call_pattern_error());
+    }
+
+    if has_swap_prefix {
+        let approve_spender = decode_approve_spender(&calls[0])
+            .ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        if approve_spender != STABLECOIN_DEX_ADDRESS {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction approve spender is not the DEX".to_string(),
+            ));
+        }
+
+        match &calls[1].to {
+            TxKind::Call(address) if *address == STABLECOIN_DEX_ADDRESS => {}
+            _ => {
+                return Err(VerificationError::new(
+                    "Fee-sponsored transaction swap target is not the DEX".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Parse a hex string (with or without 0x prefix) into a B256.
 fn parse_b256_hex(s: &str) -> Option<B256> {
@@ -581,11 +702,25 @@ where
             )));
         }
 
+        let transfer_calls = get_transfer_calls(&tx.calls)?;
+
+        if require_exact_calls {
+            validate_fee_payer_calls(&tx.calls)?;
+        }
+
         // Sort expected transfers: memo-bearing first for greedy-safe matching
         let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
         sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
-        let mut used_calls: Vec<bool> = vec![false; tx.calls.len()];
+        let mut used_calls: Vec<bool> = vec![false; transfer_calls.len()];
+
+        if require_exact_calls && transfer_calls.len() != expected.len() {
+            return Err(VerificationError::new(format!(
+                "Invalid transaction: no matching payment call found (expected {} transfer calls, got {})",
+                expected.len(),
+                transfer_calls.len()
+            )));
+        }
 
         for (_, transfer) in &sorted_expected {
             if transfer.amount.is_zero() {
@@ -601,7 +736,7 @@ where
 
             let mut found = false;
 
-            for (call_idx, call) in tx.calls.iter().enumerate() {
+            for (call_idx, call) in transfer_calls.iter().enumerate() {
                 if used_calls[call_idx] {
                     continue;
                 }
@@ -1178,6 +1313,22 @@ mod tests {
         Bytes::from(data)
     }
 
+    fn make_approve_input(spender: Address, amount: U256) -> Bytes {
+        Bytes::from(ITIP20::approveCall { spender, amount }.abi_encode())
+    }
+
+    fn make_swap_input(token_in: Address, token_out: Address, amount_out: u128) -> Bytes {
+        Bytes::from(
+            IStablecoinDEX::swapExactAmountOutCall {
+                tokenIn: token_in,
+                tokenOut: token_out,
+                amountOut: amount_out,
+                maxAmountIn: amount_out,
+            }
+            .abi_encode(),
+        )
+    }
+
     fn encode_signed_tx(
         calls: Vec<tempo_primitives::transaction::Call>,
         gas_limit: u64,
@@ -1319,7 +1470,94 @@ mod tests {
             .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
             .unwrap_err();
 
-        assert!(error.to_string().contains("unexpected calls"));
+        assert!(
+            error.to_string().contains("disallowed call pattern")
+                || error.to_string().contains("no matching payment call")
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_accepts_fee_payer_approve_swap_prefix() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(token_in),
+                    value: U256::ZERO,
+                    input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                    value: U256::ZERO,
+                    input: make_swap_input(token_in, currency, 100),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(recipient, U256::from(100u64)),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_swap_without_approve() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                    value: U256::ZERO,
+                    input: make_swap_input(token_in, currency, 100),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(recipient, U256::from(100u64)),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        let error = method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("disallowed call pattern")
+                || error.to_string().contains("no matching payment call")
+        );
     }
 
     #[test]
