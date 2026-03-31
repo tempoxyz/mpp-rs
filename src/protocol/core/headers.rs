@@ -960,4 +960,26 @@ mod tests {
         assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
         assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
     }
+
+    #[test]
+    fn test_parse_www_authenticate_all_ignores_non_payment_schemes() {
+        // Bearer and other non-Payment schemes should be silently ignored
+        let headers = vec![
+            "Bearer token123",
+            r#"Payment id="t1", realm="r", method="tempo", intent="charge", request="e30""#,
+            "Basic dXNlcjpwYXNz",
+        ];
+        let results = parse_www_authenticate_all(headers);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
+
+        // Mixed in a single header value: Bearer prefix followed by Payment challenge
+        let mixed = concat!(
+            "Bearer token123, ",
+            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30""#,
+        );
+        let results = parse_www_authenticate_all(vec![mixed]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().method.as_str(), "stripe");
+    }
 }
