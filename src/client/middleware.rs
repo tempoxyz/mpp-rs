@@ -9,7 +9,9 @@ use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
 use crate::client::provider::PaymentProvider;
-use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHORIZATION_HEADER};
+use crate::protocol::core::{
+    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+};
 
 /// Middleware that automatically handles 402 Payment Required responses.
 ///
@@ -66,22 +68,33 @@ where
             .context("request could not be cloned for payment retry")
             .map_err(reqwest_middleware::Error::Middleware)?;
 
-        let www_auth = resp
+        let www_auth_values: Vec<&str> = resp
             .headers()
-            .get(WWW_AUTHENTICATE)
-            .context("402 response missing WWW-Authenticate header")
-            .map_err(reqwest_middleware::Error::Middleware)?
-            .to_str()
-            .context("invalid WWW-Authenticate header")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
 
-        let challenge = parse_www_authenticate(www_auth)
-            .context("invalid challenge")
+        if www_auth_values.is_empty() {
+            return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                "402 response missing WWW-Authenticate header"
+            )));
+        }
+
+        let challenges: Vec<_> = parse_www_authenticate_all(www_auth_values)
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let challenge = challenges
+            .iter()
+            .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
+            .context("no challenge matches provider's supported methods")
             .map_err(reqwest_middleware::Error::Middleware)?;
 
         let credential = self
             .provider
-            .pay(&challenge)
+            .pay(challenge)
             .await
             .context("payment failed")
             .map_err(reqwest_middleware::Error::Middleware)?;

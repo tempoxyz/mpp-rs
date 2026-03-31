@@ -7,7 +7,9 @@ use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::error::HttpError;
 use super::provider::PaymentProvider;
-use crate::protocol::core::{format_authorization, parse_www_authenticate, AUTHORIZATION_HEADER};
+use crate::protocol::core::{
+    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+};
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -63,17 +65,37 @@ impl PaymentExt for RequestBuilder {
             return Ok(resp);
         }
 
-        let www_auth = resp
+        let www_auth_values: Vec<&str> = resp
             .headers()
-            .get(WWW_AUTHENTICATE)
-            .ok_or(HttpError::MissingChallenge)?
-            .to_str()
-            .map_err(|e| HttpError::InvalidChallenge(e.to_string()))?;
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
 
-        let challenge = parse_www_authenticate(www_auth)
-            .map_err(|e| HttpError::InvalidChallenge(e.to_string()))?;
+        if www_auth_values.is_empty() {
+            return Err(HttpError::MissingChallenge);
+        }
 
-        let credential = provider.pay(&challenge).await?;
+        let challenges: Vec<_> = parse_www_authenticate_all(www_auth_values)
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let challenge = challenges
+            .iter()
+            .find(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
+            .ok_or_else(|| {
+                let offered: Vec<_> = challenges
+                    .iter()
+                    .map(|c| format!("{}.{}", c.method, c.intent))
+                    .collect();
+                HttpError::NoSupportedChallenge(format!(
+                    "server offered [{}], but provider does not support any",
+                    offered.join(", ")
+                ))
+            })?;
+
+        let credential = provider.pay(challenge).await?;
 
         let auth_header = format_authorization(&credential)
             .map_err(|e| HttpError::InvalidCredential(e.to_string()))?;
@@ -290,7 +312,7 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(matches!(err, HttpError::InvalidChallenge(_)));
+            assert!(matches!(err, HttpError::NoSupportedChallenge(_)));
         }
 
         #[tokio::test]

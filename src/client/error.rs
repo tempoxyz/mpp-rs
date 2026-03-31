@@ -9,6 +9,9 @@ pub enum HttpError {
     /// Missing WWW-Authenticate header on 402 response
     MissingChallenge,
 
+    /// No challenge in the 402 response matches the provider's supported methods
+    NoSupportedChallenge(String),
+
     /// Failed to parse challenge from WWW-Authenticate header
     InvalidChallenge(String),
 
@@ -31,6 +34,9 @@ impl fmt::Display for HttpError {
         match self {
             Self::MissingChallenge => {
                 write!(f, "402 response missing WWW-Authenticate header")
+            }
+            Self::NoSupportedChallenge(msg) => {
+                write!(f, "no supported challenge: {}", msg)
             }
             Self::InvalidChallenge(msg) => write!(f, "invalid challenge: {}", msg),
             Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),

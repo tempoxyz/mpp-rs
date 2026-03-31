@@ -172,39 +172,6 @@ pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
-/// Find the first `tempo` method challenge from one or more WWW-Authenticate
-/// header values.
-///
-/// This is a convenience wrapper around
-/// [`parse_www_authenticate_all`](crate::protocol::core::parse_www_authenticate_all)
-/// that filters for `method="tempo"` and returns the first match.
-///
-/// # Examples
-///
-/// ```
-/// use mpp::protocol::methods::tempo::find_tempo_challenge;
-///
-/// let header = concat!(
-///     r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", "#,
-///     r#"Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#,
-/// );
-/// let challenge = find_tempo_challenge(vec![header]).unwrap();
-/// assert_eq!(challenge.id, "a");
-/// assert_eq!(challenge.method.as_str(), "tempo");
-/// ```
-pub fn find_tempo_challenge<'a>(
-    headers: impl IntoIterator<Item = &'a str>,
-) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
-    crate::protocol::core::parse_www_authenticate_all(headers)
-        .into_iter()
-        .find(|r| r.as_ref().is_ok_and(|c| c.method.as_str() == "tempo"))
-        .unwrap_or_else(|| {
-            Err(crate::error::MppError::invalid_challenge_reason(
-                "No Payment challenge with method=\"tempo\" found",
-            ))
-        })
-}
-
 /// Charge intent name (re-exported from [`crate::protocol::intents`]).
 pub use crate::protocol::intents::INTENT_CHARGE;
 
@@ -808,21 +775,5 @@ mod tests {
 
             assert_eq!(id, "BdPQxVJ56pvRJnM-r7wh_ppka5hOJH_6XpRK4gM9paI");
         }
-    }
-
-    #[test]
-    fn test_find_tempo_challenge() {
-        let header = concat!(
-            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30", "#,
-            r#"Payment id="t1", realm="r", method="tempo", intent="charge", request="e30""#,
-        );
-        let c = find_tempo_challenge(vec![header]).unwrap();
-        assert_eq!(c.id, "t1");
-        assert_eq!(c.method.as_str(), "tempo");
-
-        // no tempo challenge → error
-        let other =
-            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30""#;
-        assert!(find_tempo_challenge(vec![other]).is_err());
     }
 }
