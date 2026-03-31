@@ -253,7 +253,14 @@ impl ProxyConfig {
         let stripped = self.strip_base(path)?;
 
         if stripped == "/llms.txt" {
-            return Some(DiscoveryResponse::LlmsTxt(to_llms_txt(&self.services)));
+            let options = LlmsTxtOptions {
+                title: self.title.as_deref(),
+                description: self.description.as_deref(),
+            };
+            return Some(DiscoveryResponse::LlmsTxt(to_llms_txt_with(
+                &self.services,
+                Some(&options),
+            )));
         }
 
         if stripped == "/services" || stripped == "/services/" {
@@ -283,6 +290,8 @@ pub enum DiscoveryResponse {
     Json(Value),
     /// Plain-text llms.txt content.
     LlmsTxt(String),
+    /// Markdown content (for content-negotiated service discovery).
+    Markdown(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -372,13 +381,30 @@ fn serialize_payment(endpoint: &Endpoint) -> Value {
     }
 }
 
+/// Options for customizing llms.txt output.
+pub struct LlmsTxtOptions<'a> {
+    /// Override the default title.
+    pub title: Option<&'a str>,
+    /// Override the default description.
+    pub description: Option<&'a str>,
+}
+
 /// Generate llms.txt content for LLM-friendly service discovery.
 pub fn to_llms_txt(services: &[Service]) -> String {
+    to_llms_txt_with(services, None)
+}
+
+/// Generate llms.txt content with optional title/description overrides.
+pub fn to_llms_txt_with(services: &[Service], options: Option<&LlmsTxtOptions<'_>>) -> String {
+    let title = options.and_then(|o| o.title).unwrap_or("API Proxy");
+    let description = options
+        .and_then(|o| o.description)
+        .unwrap_or("Paid API proxy powered by [Machine Payments Protocol](https://mpp.tempo.xyz).");
+
     let mut lines = vec![
-        "# API Proxy".to_string(),
+        format!("# {title}"),
         String::new(),
-        "> Paid API proxy powered by [Machine Payments Protocol](https://mpp.tempo.xyz)."
-            .to_string(),
+        format!("> {description}"),
         String::new(),
         "For machine-readable service data, use `GET /services` (JSON).".to_string(),
         String::new(),
@@ -391,6 +417,7 @@ pub fn to_llms_txt(services: &[Service]) -> String {
     lines.push("## Services".to_string());
     lines.push(String::new());
     for s in services {
+        let label = s.title.as_deref().unwrap_or(&s.id);
         let free = s
             .routes
             .iter()
@@ -406,15 +433,16 @@ pub fn to_llms_txt(services: &[Service]) -> String {
         }
         lines.push(format!(
             "- [{}]({}): {}",
-            s.id,
+            label,
             s.base_url,
             parts.join(", ")
         ));
     }
 
     for s in services {
+        let label = s.title.as_deref().unwrap_or(&s.id);
         lines.push(String::new());
-        lines.push(format!("## {}", s.id));
+        lines.push(format!("## {label}"));
         lines.push(String::new());
         for route in &s.routes {
             match &route.endpoint {
@@ -436,6 +464,96 @@ pub fn to_llms_txt(services: &[Service]) -> String {
                 }
             }
         }
+    }
+
+    lines.join("\n")
+}
+
+/// Returns `true` if the `Accept` header value indicates a preference for markdown.
+pub fn wants_markdown(accept: Option<&str>) -> bool {
+    match accept {
+        None => false,
+        Some(accept) => accept.split(',').any(|t| {
+            matches!(
+                t.trim().split(';').next(),
+                Some("text/markdown" | "text/plain")
+            )
+        }),
+    }
+}
+
+/// Render route details as markdown sub-bullets into `lines`.
+fn push_routes(lines: &mut Vec<String>, service: &Service, heading: &str) {
+    lines.push(format!("{heading} Routes"));
+    lines.push(String::new());
+    for route in &service.routes {
+        match &route.endpoint {
+            Endpoint::Free => {
+                lines.push(format!("- `{}`", route.pattern));
+                lines.push("  - Type: free".to_string());
+            }
+            Endpoint::Paid(p) => {
+                let desc_suffix = match &p.description {
+                    Some(desc) => format!(": {desc}"),
+                    None => String::new(),
+                };
+                lines.push(format!("- `{}`{desc_suffix}", route.pattern));
+                lines.push(format!("  - Type: {}", p.intent));
+                if let (Some(decimals), Ok(amount_val)) = (p.decimals, p.amount.parse::<f64>()) {
+                    let price = amount_val / 10_f64.powi(decimals as i32);
+                    let per_unit = p
+                        .unit_type
+                        .as_deref()
+                        .map_or(String::new(), |ut| format!("/{ut}"));
+                    lines.push(format!(
+                        "  - Price: {price}{per_unit} ({} units, {decimals} decimals)",
+                        p.amount
+                    ));
+                } else if !p.amount.is_empty() {
+                    let per_unit = p
+                        .unit_type
+                        .as_deref()
+                        .map_or(String::new(), |ut| format!("/{ut}"));
+                    lines.push(format!("  - Units: {}{per_unit}", p.amount));
+                }
+                if let Some(ref currency) = p.currency {
+                    lines.push(format!("  - Currency: {currency}"));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+}
+
+/// Render a single service as detailed markdown.
+pub fn to_service_markdown(service: &Service) -> String {
+    let label = service.title.as_deref().unwrap_or(&service.id);
+    let mut lines = vec![format!("# {label}"), String::new()];
+    if let Some(ref desc) = service.description {
+        lines.push(desc.clone());
+        lines.push(String::new());
+    }
+    push_routes(&mut lines, service, "##");
+    lines.join("\n")
+}
+
+/// Render all services as a combined markdown document.
+pub fn to_services_markdown(services: &[Service]) -> String {
+    let mut lines = vec!["# Services".to_string(), String::new()];
+
+    if services.is_empty() {
+        return lines.join("\n");
+    }
+
+    for s in services {
+        let label = s.title.as_deref().unwrap_or(&s.id);
+        lines.push(format!("## [{label}](/services/{id})", id = s.id));
+        lines.push(String::new());
+        if let Some(ref desc) = s.description {
+            lines.push(desc.clone());
+            lines.push(String::new());
+        }
+        push_routes(&mut lines, s, "###");
     }
 
     lines.join("\n")
@@ -734,5 +852,106 @@ mod tests {
         let v = serialize_service(&svc);
         assert_eq!(v["title"], "Test Service");
         assert_eq!(v["description"], "A test service");
+    }
+
+    #[test]
+    fn test_wants_markdown() {
+        assert!(!wants_markdown(None));
+        assert!(!wants_markdown(Some("application/json")));
+        assert!(wants_markdown(Some("text/plain")));
+        assert!(wants_markdown(Some("text/markdown")));
+        assert!(wants_markdown(Some("text/markdown, application/json")));
+        assert!(wants_markdown(Some("application/json, text/plain")));
+        assert!(wants_markdown(Some("text/markdown;q=0.9")));
+        assert!(!wants_markdown(Some("text/plain-evil")));
+    }
+
+    #[test]
+    fn test_to_llms_txt_with_custom_title_description() {
+        let svc = Service::new("openai", "https://api.openai.com")
+            .title("OpenAI")
+            .route("GET /v1/models", Endpoint::Free)
+            .build();
+        let options = LlmsTxtOptions {
+            title: Some("My AI Gateway"),
+            description: Some("A paid proxy for LLM and AI services."),
+        };
+        let txt = to_llms_txt_with(std::slice::from_ref(&svc), Some(&options));
+        assert!(txt.contains("# My AI Gateway"));
+        assert!(txt.contains("> A paid proxy for LLM and AI services."));
+        assert!(!txt.contains("# API Proxy"));
+        // title fallback: service title used over id
+        let txt = to_llms_txt(&[svc]);
+        assert!(txt.contains("- [OpenAI](https://api.openai.com)"));
+        assert!(txt.contains("## OpenAI"));
+    }
+
+    #[test]
+    fn test_to_service_markdown_with_title_description() {
+        let svc = Service::new("openai", "https://api.openai.com")
+            .title("OpenAI")
+            .description("Chat completions and embeddings.")
+            .route("GET /v1/models", Endpoint::Free)
+            .build();
+        let md = to_service_markdown(&svc);
+        assert!(md.contains("# OpenAI"));
+        assert!(md.contains("Chat completions and embeddings."));
+    }
+
+    #[test]
+    fn test_to_services_markdown() {
+        let services = vec![test_service()];
+        let md = to_services_markdown(&services);
+        assert!(md.contains("# Services"));
+        assert!(md.contains("## [openai](/services/openai)"));
+        assert!(md.contains("### Routes"));
+        assert!(md.contains("- `POST /v1/chat/completions`: Chat completion"));
+        assert!(md.contains("  - Type: charge"));
+        assert!(md.contains("  - Price: 0.05 (50000 units, 6 decimals)"));
+        assert!(md.contains("- `GET /v1/models`"));
+        assert!(md.contains("  - Type: free"));
+    }
+
+    #[test]
+    fn test_to_services_markdown_empty() {
+        let md = to_services_markdown(&[]);
+        assert_eq!(md, "# Services\n");
+    }
+
+    #[test]
+    fn test_push_routes_units_without_decimals() {
+        let svc = Service::new("api", "https://example.com")
+            .route(
+                "POST /v1/run",
+                Endpoint::Paid(PaidEndpoint {
+                    intent: "charge".into(),
+                    amount: "100".into(),
+                    decimals: None,
+                    currency: None,
+                    unit_type: Some("request".into()),
+                    description: None,
+                }),
+            )
+            .build();
+        let md = to_service_markdown(&svc);
+        assert!(md.contains("  - Units: 100/request"));
+        assert!(!md.contains("Price:"));
+    }
+
+    #[test]
+    fn test_discovery_llms_txt_custom_title() {
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![test_service()],
+            title: Some("My Gateway".to_string()),
+            description: Some("Custom description.".to_string()),
+        };
+        let resp = config.handle_discovery("GET", "/llms.txt");
+        if let Some(DiscoveryResponse::LlmsTxt(txt)) = resp {
+            assert!(txt.contains("# My Gateway"));
+            assert!(txt.contains("> Custom description."));
+        } else {
+            panic!("expected LlmsTxt");
+        }
     }
 }
