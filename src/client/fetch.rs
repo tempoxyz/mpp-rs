@@ -367,7 +367,9 @@ mod tests {
 
         impl super::PaymentProvider for SelectiveProvider {
             fn supports(&self, method: &str, intent: &str) -> bool {
-                self.supported.iter().any(|(m, i)| *m == method && *i == intent)
+                self.supported
+                    .iter()
+                    .any(|(m, i)| *m == method && *i == intent)
             }
 
             async fn pay(
@@ -518,17 +520,11 @@ mod tests {
                         if req.headers().get("authorization").is_some() {
                             (AxumStatusCode::OK, "ok").into_response()
                         } else {
-                            let mut resp = (AxumStatusCode::PAYMENT_REQUIRED, "pay up")
-                                .into_response();
+                            let mut resp =
+                                (AxumStatusCode::PAYMENT_REQUIRED, "pay up").into_response();
                             let headers = resp.headers_mut();
-                            headers.append(
-                                WWW_AUTH_NAME,
-                                stripe_header.parse().unwrap(),
-                            );
-                            headers.append(
-                                WWW_AUTH_NAME,
-                                tempo_header.parse().unwrap(),
-                            );
+                            headers.append(WWW_AUTH_NAME, stripe_header.parse().unwrap());
+                            headers.append(WWW_AUTH_NAME, tempo_header.parse().unwrap());
                             resp
                         }
                     }
