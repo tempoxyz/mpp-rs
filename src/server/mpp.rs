@@ -19,7 +19,6 @@
 use crate::error::Result;
 #[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::protocol::core::PaymentChallenge;
-use crate::protocol::core::challenge::constant_time_eq;
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, VerificationError};
@@ -231,7 +230,7 @@ where
             credential.challenge.opaque.as_ref().map(|o| o.raw()),
         );
 
-        if !constant_time_eq(&credential.challenge.id, &expected_id) {
+        if !crate::protocol::core::constant_time_eq(&credential.challenge.id, &expected_id) {
             return Err(VerificationError::with_code(
                 "Challenge ID mismatch - not issued by this server",
                 crate::protocol::traits::ErrorCode::CredentialMismatch,

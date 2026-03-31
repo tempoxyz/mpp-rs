@@ -1519,6 +1519,61 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_transaction_transfers_accepts_fee_payer_approve_swap_prefix_with_splits() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let primary_recipient = Address::repeat_byte(0x33);
+        let split_recipient = Address::repeat_byte(0x34);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![
+            Transfer {
+                amount: U256::from(90u64),
+                recipient: primary_recipient,
+                memo: None,
+            },
+            Transfer {
+                amount: U256::from(10u64),
+                recipient: split_recipient,
+                memo: None,
+            },
+        ];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(token_in),
+                    value: U256::ZERO,
+                    input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                    value: U256::ZERO,
+                    input: make_swap_input(token_in, currency, 100),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(primary_recipient, U256::from(90u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(split_recipient, U256::from(10u64)),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap();
+    }
+
+    #[test]
     fn test_validate_transaction_transfers_rejects_fee_payer_swap_without_approve() {
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -1558,6 +1613,94 @@ mod tests {
             error.to_string().contains("disallowed call pattern")
                 || error.to_string().contains("no matching payment call")
         );
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_wrong_approve_spender() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(token_in),
+                    value: U256::ZERO,
+                    input: make_approve_input(Address::repeat_byte(0x99), U256::from(100u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                    value: U256::ZERO,
+                    input: make_swap_input(token_in, currency, 100),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(recipient, U256::from(100u64)),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        let error = method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("approve spender is not the DEX"));
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_wrong_swap_target() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(token_in),
+                    value: U256::ZERO,
+                    input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(Address::repeat_byte(0x98)),
+                    value: U256::ZERO,
+                    input: make_swap_input(token_in, currency, 100),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(recipient, U256::from(100u64)),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        let error = method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("swap target is not the DEX"));
     }
 
     #[test]
