@@ -35,8 +35,10 @@ use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
 
-use super::transfers::{get_transfers, Transfer};
+use super::transfers::{get_request_transfers, Transfer};
 use super::{TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
+
+const MAX_FEE_PAYER_GAS_LIMIT: u64 = 1_000_000;
 
 /// TIP-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
 /// TIP-20 is Tempo's token standard (compatible with ERC-20 Transfer events).
@@ -149,29 +151,8 @@ where
 
     /// Compute the expected transfers from a charge request (primary + splits).
     fn expected_transfers(charge: &ChargeRequest) -> Result<Vec<Transfer>, VerificationError> {
-        let recipient = charge.recipient_address().map_err(|e| {
-            VerificationError::new(format!("Invalid recipient address in request: {}", e))
-        })?;
-        let amount = charge
-            .amount_u256()
-            .map_err(|e| VerificationError::new(format!("Invalid amount in request: {}", e)))?;
-
-        let memo = charge.memo().and_then(|m| {
-            let hex_str = m.strip_prefix("0x").unwrap_or(&m);
-            let bytes = hex::decode(hex_str).ok()?;
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Some(arr)
-            } else {
-                None
-            }
-        });
-
-        let splits = charge.splits();
-
-        get_transfers(amount, recipient, memo, splits.as_deref())
-            .map_err(|e| VerificationError::new(format!("Invalid splits in charge request: {}", e)))
+        get_request_transfers(charge)
+            .map_err(|e| VerificationError::new(format!("Invalid charge request: {e}")))
     }
 
     async fn verify_hash(
@@ -247,17 +228,6 @@ where
         currency: Address,
         expected: &[Transfer],
     ) -> Result<(), VerificationError> {
-        if expected.len() == 1 {
-            let t = &expected[0];
-            return self.verify_tip20_transfer(
-                receipt,
-                currency,
-                t.recipient,
-                t.amount,
-                t.memo.as_ref(),
-            );
-        }
-
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
 
@@ -576,6 +546,7 @@ where
         currency: Address,
         expected: &[Transfer],
         expected_chain_id: u64,
+        require_exact_calls: bool,
     ) -> Result<(), VerificationError> {
         if currency.is_zero() {
             return Err(VerificationError::new(
@@ -600,6 +571,13 @@ where
             return Err(VerificationError::new(format!(
                 "Transaction chain_id mismatch: expected {}, got {}",
                 expected_chain_id, tx.chain_id
+            )));
+        }
+
+        if require_exact_calls && tx.gas_limit > MAX_FEE_PAYER_GAS_LIMIT {
+            return Err(VerificationError::new(format!(
+                "Fee-sponsored transaction gas limit {} exceeds maximum {}",
+                tx.gas_limit, MAX_FEE_PAYER_GAS_LIMIT
             )));
         }
 
@@ -697,6 +675,12 @@ where
             }
         }
 
+        if require_exact_calls && !used_calls.iter().all(|used| *used) {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction contains unexpected calls".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -735,6 +719,7 @@ where
             currency,
             &expected,
             expected_chain_id,
+            charge.fee_payer(),
         )?;
 
         // Pre-broadcast dedup: hash the final tx bytes (after co-signing/validation)
@@ -1181,6 +1166,49 @@ mod tests {
         }
     }
 
+    fn make_transfer_input(recipient: Address, amount: U256) -> Bytes {
+        let mut data = Vec::with_capacity(68);
+        data.extend_from_slice(&TRANSFER_SELECTOR);
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(recipient.as_slice());
+
+        let mut amount_bytes = [0u8; 32];
+        amount.to_be_bytes::<32>().clone_into(&mut amount_bytes);
+        data.extend_from_slice(&amount_bytes);
+        Bytes::from(data)
+    }
+
+    fn encode_signed_tx(
+        calls: Vec<tempo_primitives::transaction::Call>,
+        gas_limit: u64,
+    ) -> Vec<u8> {
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let tx = tempo_primitives::TempoTransaction {
+            chain_id: CHAIN_ID,
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            fee_token: Some(Address::repeat_byte(0x20)),
+            fee_payer_signature: None,
+            valid_before: None,
+            valid_after: None,
+            calls,
+            access_list: Default::default(),
+            tempo_authorization_list: vec![],
+            key_authorization: None,
+        };
+
+        let signature: tempo_primitives::transaction::TempoSignature =
+            signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
+
+        tx.into_signed(signature).encoded_2718()
+    }
+
     /// Helper: sign a tx and encode as a 0x78 fee payer envelope.
     fn sign_and_encode_0x78(
         tx: tempo_primitives::TempoTransaction,
@@ -1254,6 +1282,75 @@ mod tests {
         assert_eq!(decoded_tx.fee_token, Some(fee_token));
         assert!(decoded_tx.fee_payer_signature.is_some());
         assert!(decoded_tx.valid_before.is_some());
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_unexpected_fee_payer_calls() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(recipient, U256::from(100u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(Address::repeat_byte(0x44)),
+                    value: U256::ZERO,
+                    input: Bytes::from(vec![0u8; 4]),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        let error = method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unexpected calls"));
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_gas_limit_above_max() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![tempo_primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_input(recipient, U256::from(100u64)),
+            }],
+            MAX_FEE_PAYER_GAS_LIMIT + 1,
+        );
+
+        let error = method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exceeds maximum"));
     }
 
     /// cosign_fee_payer_transaction rejects txs with wrong nonce_key.

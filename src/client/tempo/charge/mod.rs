@@ -40,7 +40,7 @@ use crate::client::tempo::signing::{
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::methods::tempo::charge::{parse_memo_bytes, TempoChargeExt};
+use crate::protocol::methods::tempo::charge::{parse_memo_bytes_checked, TempoChargeExt};
 use crate::protocol::methods::tempo::network::TempoNetwork;
 use crate::protocol::methods::tempo::transfers::get_transfers;
 use crate::protocol::methods::tempo::types::Split;
@@ -109,14 +109,17 @@ impl TempoCharge {
         challenge.validate_for_charge("tempo")?;
 
         let charge_req: ChargeRequest = challenge.request.decode()?;
+        let details = charge_req.tempo_method_details()?;
 
         let recipient = charge_req.recipient_address()?;
         let currency = charge_req.currency_address()?;
         let amount = charge_req.amount_u256()?;
-        let memo = parse_memo_bytes(charge_req.memo());
-        let chain_id = charge_req.chain_id().unwrap_or(CHAIN_ID);
-        let fee_payer = charge_req.fee_payer();
-        let splits = charge_req.splits();
+        let memo = parse_memo_bytes_checked(details.memo.as_deref())?;
+        let chain_id = details.chain_id.unwrap_or(CHAIN_ID);
+        let fee_payer = details.fee_payer();
+        let splits = details.splits;
+
+        get_transfers(amount, recipient, memo, splits.as_deref())?;
 
         Ok(Self {
             challenge: challenge.clone(),
@@ -195,36 +198,12 @@ impl TempoCharge {
     ///
     /// Used by autoswap to insert a DEX swap call before the transfer call.
     /// The swap and transfer then execute atomically in a single AA transaction.
-    pub fn with_prepended_call(mut self, call: Call) -> Self {
+    pub fn with_prepended_call(mut self, call: Call) -> Result<Self, MppError> {
         if self.calls.is_none() {
-            let transfer_calls = get_transfers(
-                self.amount,
-                self.recipient,
-                self.memo,
-                self.splits.as_deref(),
-            )
-            .map(|transfers| {
-                transfers
-                    .into_iter()
-                    .map(|t| Call {
-                        to: TxKind::Call(self.currency),
-                        value: U256::ZERO,
-                        input: encode_transfer(t.recipient, t.amount, t.memo),
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|_| {
-                let transfer_data = encode_transfer(self.recipient, self.amount, self.memo);
-                vec![Call {
-                    to: TxKind::Call(self.currency),
-                    value: U256::ZERO,
-                    input: transfer_data,
-                }]
-            });
-            self.calls = Some(transfer_calls);
+            self.calls = Some(self.build_transfer_calls()?);
         }
         self.calls.as_mut().unwrap().insert(0, call);
-        self
+        Ok(self)
     }
 
     /// Sign the charge with default options.

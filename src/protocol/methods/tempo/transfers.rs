@@ -5,10 +5,11 @@
 
 use alloy::primitives::{Address, U256};
 
-use super::charge::parse_memo_bytes;
+use super::charge::{parse_memo_bytes_checked, parse_split_memo_bytes, TempoChargeExt};
 use super::types::Split;
 use crate::error::MppError;
 use crate::evm::{parse_address, parse_amount};
+use crate::protocol::intents::ChargeRequest;
 
 /// Maximum number of splits allowed (primary + splits ≤ 11 calls).
 pub const MAX_SPLITS: usize = 10;
@@ -22,6 +23,16 @@ pub struct Transfer {
     pub recipient: Address,
     /// Optional 32-byte memo.
     pub memo: Option<[u8; 32]>,
+}
+
+/// Compute the validated transfer plan for a charge request.
+pub fn get_request_transfers(charge: &ChargeRequest) -> Result<Vec<Transfer>, MppError> {
+    let recipient = charge.recipient_address()?;
+    let amount = charge.amount_u256()?;
+    let details = charge.tempo_method_details()?;
+    let memo = parse_memo_bytes_checked(details.memo.as_deref())?;
+
+    get_transfers(amount, recipient, memo, details.splits.as_deref())
 }
 
 /// Compute the ordered list of transfers for a charge.
@@ -77,7 +88,7 @@ pub fn get_transfers(
         }
 
         let recipient = parse_address(&split.recipient)?;
-        let memo = parse_memo_bytes(split.memo.clone());
+        let memo = parse_split_memo_bytes(split.memo.as_deref())?;
 
         split_sum = split_sum.checked_add(amount).ok_or_else(|| {
             MppError::invalid_challenge_reason("Split amounts overflow".to_string())
@@ -195,6 +206,19 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_invalid_split_memo() {
+        let splits = vec![Split {
+            amount: "100000".to_string(),
+            recipient: format!("{:#x}", addr(0x02)),
+            memo: Some("0x1234".to_string()),
+        }];
+
+        let error =
+            get_transfers(U256::from(1_000_000u64), addr(0x01), None, Some(&splits)).unwrap_err();
+        assert!(error.to_string().contains("Invalid split memo"));
+    }
+
+    #[test]
     fn test_multiple_splits_preserve_order() {
         let splits = vec![
             Split {
@@ -301,5 +325,21 @@ mod tests {
         assert_eq!(transfers.len(), 11);
         // Primary gets 1_000_000 - 10*1000 = 990_000
         assert_eq!(transfers[0].amount, U256::from(990_000u64));
+    }
+
+    #[test]
+    fn test_get_request_transfers_rejects_invalid_top_level_memo() {
+        let request = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: format!("{:#x}", addr(0x20)),
+            recipient: Some(format!("{:#x}", addr(0x01))),
+            method_details: Some(serde_json::json!({
+                "memo": "0x1234",
+            })),
+            ..Default::default()
+        };
+
+        let error = get_request_transfers(&request).unwrap_err();
+        assert!(error.to_string().contains("Invalid memo"));
     }
 }

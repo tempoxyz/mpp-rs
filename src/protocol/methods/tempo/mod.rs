@@ -277,10 +277,12 @@ pub fn charge_challenge_with_options(
     description: Option<&str>,
 ) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+    use crate::protocol::methods::tempo::transfers::get_request_transfers;
     use time::{Duration, OffsetDateTime};
 
     // Apply decimals transform if present (matches TS SDK's parseUnits behavior).
     let request = request.clone().with_base_units()?;
+    get_request_transfers(&request)?;
 
     let encoded_request = Base64UrlJson::from_typed(&request)?;
 
