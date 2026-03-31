@@ -925,13 +925,13 @@ mod tests {
     #[test]
     fn test_split_payment_challenges() {
         // single challenge
-        let single = r#"Payment id="a", realm="r", method="tempo", intent="charge", request="e30""#;
+        let single = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
         assert_eq!(split_payment_challenges(single).len(), 1);
 
         // two challenges, normal spacing
         let two = concat!(
-            r#"Payment id="a", realm="r", method="tempo", intent="charge", request="e30", "#,
-            r#"Payment id="b", realm="r", method="stripe", intent="charge", request="e30""#,
+            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", "#,
+            r#"Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#,
         );
         let parts = split_payment_challenges(two);
         assert_eq!(parts.len(), 2);
@@ -940,8 +940,8 @@ mod tests {
 
         // no whitespace after comma, mixed case scheme
         let compact = concat!(
-            r#"PAYMENT id="a", realm="r", method="tempo", intent="charge", request="e30","#,
-            r#"payment id="b", realm="r", method="stripe", intent="charge", request="e30""#,
+            r#"PAYMENT id="a", realm="api", method="tempo", intent="charge", request="e30","#,
+            r#"payment id="b", realm="api", method="stripe", intent="charge", request="e30""#,
         );
         assert_eq!(split_payment_challenges(compact).len(), 2);
 
@@ -952,8 +952,8 @@ mod tests {
     #[test]
     fn test_parse_www_authenticate_all_multi_challenge() {
         let header = concat!(
-            r#"Payment id="t1", realm="r", method="tempo", intent="charge", request="e30", "#,
-            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30""#,
+            r#"Payment id="t1", realm="api", method="tempo", intent="charge", request="e30", "#,
+            r#"Payment id="s1", realm="api", method="stripe", intent="charge", request="e30""#,
         );
         let results = parse_www_authenticate_all(vec![header]);
         assert_eq!(results.len(), 2);
@@ -966,7 +966,7 @@ mod tests {
         // Bearer and other non-Payment schemes should be silently ignored
         let headers = vec![
             "Bearer token123",
-            r#"Payment id="t1", realm="r", method="tempo", intent="charge", request="e30""#,
+            r#"Payment id="t1", realm="api", method="tempo", intent="charge", request="e30""#,
             "Basic dXNlcjpwYXNz",
         ];
         let results = parse_www_authenticate_all(headers);
@@ -976,7 +976,7 @@ mod tests {
         // Mixed in a single header value: Bearer prefix followed by Payment challenge
         let mixed = concat!(
             "Bearer token123, ",
-            r#"Payment id="s1", realm="r", method="stripe", intent="charge", request="e30""#,
+            r#"Payment id="s1", realm="api", method="stripe", intent="charge", request="e30""#,
         );
         let results = parse_www_authenticate_all(vec![mixed]);
         assert_eq!(results.len(), 1);
