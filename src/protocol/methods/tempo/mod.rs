@@ -525,6 +525,32 @@ mod tests {
     }
 
     #[test]
+    fn test_charge_challenge_with_options_rejects_empty_splits() {
+        use crate::protocol::intents::ChargeRequest;
+
+        let request = ChargeRequest {
+            amount: "1000000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            method_details: Some(serde_json::json!({
+                "splits": []
+            })),
+            ..Default::default()
+        };
+
+        let error = charge_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Splits must not be empty"));
+    }
+
+    #[test]
     fn test_challenge_id_differs_for_different_realm() {
         let challenge1 = charge_challenge(
             TEST_SECRET,

@@ -44,6 +44,7 @@ pub fn get_request_transfers(charge: &ChargeRequest) -> Result<Vec<Transfer>, Mp
 /// # Errors
 ///
 /// Returns an error if:
+/// - `splits` is present but empty
 /// - More than [`MAX_SPLITS`] splits are provided
 /// - Any split has a zero or invalid amount
 /// - Any split has an invalid recipient address
@@ -55,8 +56,13 @@ pub fn get_transfers(
     splits: Option<&[Split]>,
 ) -> Result<Vec<Transfer>, MppError> {
     let splits = match splits {
-        Some(s) if !s.is_empty() => s,
-        _ => {
+        Some(s) if s.is_empty() => {
+            return Err(MppError::invalid_challenge_reason(
+                "Splits must not be empty".to_string(),
+            ));
+        }
+        Some(s) => s,
+        None => {
             return Ok(vec![Transfer {
                 amount: total_amount,
                 recipient: primary_recipient,
@@ -140,11 +146,11 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_splits_returns_single_transfer() {
-        let transfers =
-            get_transfers(U256::from(1_000_000u64), addr(0x01), None, Some(&[])).unwrap();
+    fn test_empty_splits_rejected() {
+        let error =
+            get_transfers(U256::from(1_000_000u64), addr(0x01), None, Some(&[])).unwrap_err();
 
-        assert_eq!(transfers.len(), 1);
+        assert!(error.to_string().contains("Splits must not be empty"));
     }
 
     #[test]
@@ -341,5 +347,21 @@ mod tests {
 
         let error = get_request_transfers(&request).unwrap_err();
         assert!(error.to_string().contains("Invalid memo"));
+    }
+
+    #[test]
+    fn test_get_request_transfers_rejects_empty_splits() {
+        let request = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: format!("{:#x}", addr(0x20)),
+            recipient: Some(format!("{:#x}", addr(0x01))),
+            method_details: Some(serde_json::json!({
+                "splits": [],
+            })),
+            ..Default::default()
+        };
+
+        let error = get_request_transfers(&request).unwrap_err();
+        assert!(error.to_string().contains("Splits must not be empty"));
     }
 }
