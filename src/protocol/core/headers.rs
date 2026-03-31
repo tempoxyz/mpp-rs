@@ -960,5 +960,4 @@ mod tests {
         assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
         assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
     }
-
 }
