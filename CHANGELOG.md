@@ -4,11 +4,13 @@
 
 ### Minor Changes
 
-- Added support for multi-challenge `WWW-Authenticate` headers. `parse_www_authenticate_all` now correctly splits and parses headers containing multiple `Payment` challenges. Added `find_tempo_challenge` helper to extract the first Tempo challenge from multi-challenge headers. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
+- Added support for multi-challenge `WWW-Authenticate` headers. `parse_www_authenticate_all` now correctly splits and parses headers containing multiple `Payment` challenges. Non-Payment schemes (e.g. `Bearer`) are silently ignored. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
+- Client now matches challenges by `provider.supports(method, intent)` instead of assuming a single challenge, mirroring the mppx TypeScript SDK. Both `PaymentExt` (fetch) and `PaymentMiddleware` parse all challenges and select the first one the provider supports. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
+- Added `HttpError::NoSupportedChallenge` variant for when a 402 response contains no challenge matching the provider's supported methods. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
 
-### Patch Changes
+### Breaking Changes
 
-- Moved `find_tempo_challenge` from `protocol::core` to `protocol::methods::tempo` where it belongs. The function is still re-exported from `protocol::core` for backward compatibility. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
+- Removed `find_tempo_challenge`. Use `parse_www_authenticate_all` with `provider.supports()` matching instead, or filter challenges manually. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
 
 ## 0.8.2 (2026-03-31)
 
