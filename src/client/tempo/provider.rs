@@ -2,6 +2,7 @@
 
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::methods::tempo::proof::sign_proof;
 
 use super::autoswap::AutoswapConfig;
 use super::charge::SignOptions;
@@ -127,6 +128,18 @@ impl PaymentProvider for TempoProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
 
+        if charge.amount().is_zero() {
+            let signature = sign_proof(&self.signer, charge.chain_id(), &challenge.id).await?;
+            let source =
+                PaymentCredential::evm_did(charge.chain_id(), &self.signer.address().to_string());
+
+            return Ok(PaymentCredential::with_source(
+                challenge.to_echo(),
+                source,
+                crate::protocol::core::PaymentPayload::proof(signature),
+            ));
+        }
+
         // Auto-generate an attribution memo when the server doesn't provide one,
         // so MPP transactions are identifiable on-chain via `TransferWithMemo` events.
         if charge.memo().is_none() {
@@ -242,6 +255,41 @@ mod tests {
         let memo =
             crate::tempo::attribution::encode("challenge-123", "api.example.com", Some("my-app"));
         assert!(crate::tempo::attribution::is_mpp_memo(&memo));
+    }
+
+    #[tokio::test]
+    async fn test_zero_amount_challenge_returns_proof_credential() {
+        use crate::protocol::core::Base64UrlJson;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 42431 }
+        }))
+        .unwrap();
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+        let payload = credential.charge_payload().unwrap();
+
+        assert!(payload.is_proof());
+        assert!(payload.proof_signature().is_some());
+        assert_eq!(
+            credential.source,
+            Some(PaymentCredential::evm_did(
+                42431,
+                &signer.address().to_string()
+            ))
+        );
     }
 
     #[test]

@@ -38,10 +38,11 @@ use crate::client::tempo::signing::{
     sign_and_encode_async, sign_and_encode_fee_payer_envelope_async, TempoSigningMode,
 };
 use crate::error::{MppError, ResultExt};
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::methods::tempo::charge::{parse_memo_bytes_checked, TempoChargeExt};
 use crate::protocol::methods::tempo::network::TempoNetwork;
+use crate::protocol::methods::tempo::proof;
 use crate::protocol::methods::tempo::transfers::get_transfers;
 use crate::protocol::methods::tempo::types::Split;
 use crate::protocol::methods::tempo::CHAIN_ID;
@@ -232,6 +233,26 @@ impl TempoCharge {
         signer: &(impl alloy::signers::Signer + Clone),
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
+        if self.amount.is_zero() {
+            // Proof credentials are raw typed-data signatures, so they bind to
+            // the actual signing key rather than a keychain-wrapped wallet address.
+            let from = signer.address();
+            let credential = PaymentCredential::with_source(
+                self.challenge.to_echo(),
+                proof::proof_source(from, self.chain_id),
+                PaymentPayload::proof(
+                    proof::sign_proof(signer, self.chain_id, &self.challenge.id).await?,
+                ),
+            );
+
+            return Ok(SignedTempoCharge {
+                credential,
+                tx_bytes: None,
+                chain_id: self.chain_id,
+                from,
+            });
+        }
+
         let signing_mode = options.signing_mode.unwrap_or_default();
         let from = signing_mode.from_address(signer.address());
 
@@ -344,9 +365,11 @@ impl TempoCharge {
             sign_and_encode_async(tx, signer, &signing_mode).await?
         };
 
+        let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
+
         Ok(SignedTempoCharge {
-            challenge: self.challenge,
-            tx_bytes,
+            credential,
+            tx_bytes: Some(tx_bytes),
             chain_id: self.chain_id,
             from,
         })
@@ -385,8 +408,8 @@ pub struct SignOptions {
 /// A signed Tempo charge, ready to be converted into a [`PaymentCredential`].
 #[derive(Debug)]
 pub struct SignedTempoCharge {
-    challenge: PaymentChallenge,
-    tx_bytes: Vec<u8>,
+    credential: PaymentCredential,
+    tx_bytes: Option<Vec<u8>>,
     chain_id: u64,
     from: Address,
 }
@@ -394,12 +417,12 @@ pub struct SignedTempoCharge {
 impl SignedTempoCharge {
     /// Convert the signed charge into a [`PaymentCredential`].
     pub fn into_credential(self) -> PaymentCredential {
-        build_charge_credential(&self.challenge, &self.tx_bytes, self.chain_id, self.from)
+        self.credential
     }
 
     /// Get the raw signed transaction bytes.
     pub fn tx_bytes(&self) -> &[u8] {
-        &self.tx_bytes
+        self.tx_bytes.as_deref().unwrap_or(&[])
     }
 
     /// Get the chain ID.
@@ -541,9 +564,10 @@ mod tests {
         let from: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"
             .parse()
             .unwrap();
+        let credential = build_charge_credential(&challenge, &[0x76, 0xab, 0xcd], 42431, from);
         let signed = SignedTempoCharge {
-            challenge,
-            tx_bytes: vec![0x76, 0xab, 0xcd],
+            credential,
+            tx_bytes: Some(vec![0x76, 0xab, 0xcd]),
             chain_id: 42431,
             from,
         };
@@ -564,9 +588,10 @@ mod tests {
     fn test_signed_charge_accessors() {
         let challenge = test_challenge();
         let from = Address::repeat_byte(0x11);
+        let credential = build_charge_credential(&challenge, &[0x76], 4217, from);
         let signed = SignedTempoCharge {
-            challenge,
-            tx_bytes: vec![0x76],
+            credential,
+            tx_bytes: Some(vec![0x76]),
             chain_id: 4217,
             from,
         };
@@ -639,5 +664,37 @@ mod tests {
 
         let calls = charge.build_transfer_calls().unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_zero_amount_sign_returns_proof_credential() {
+        let request_json = serde_json::json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {
+                "chainId": 42431
+            }
+        });
+        let request = Base64UrlJson::from_value(&request_json).unwrap();
+        let challenge =
+            PaymentChallenge::new("proof-id", "api.example.com", "tempo", "charge", request);
+        let signer: alloy::signers::local::PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+
+        let charge = TempoCharge::from_challenge(&challenge).unwrap();
+        let signed = charge
+            .sign_with_options(&signer, SignOptions::default())
+            .await
+            .unwrap();
+        let credential = signed.into_credential();
+        let payload: PaymentPayload = credential.payload_as().unwrap();
+        let expected_did = PaymentCredential::evm_did(42431, &signer.address().to_string());
+
+        assert!(payload.is_proof());
+        assert!(payload.proof_signature().unwrap().starts_with("0x"));
+        assert_eq!(credential.source.as_deref(), Some(expected_did.as_str()));
     }
 }

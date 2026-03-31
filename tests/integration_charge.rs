@@ -23,7 +23,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use alloy::sol_types::SolCall;
 use axum::{routing::get, Json, Router};
-use mpp::client::{Fetch, TempoProvider};
+use mpp::client::{Fetch, PaymentProvider, TempoProvider};
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};
 use mpp::server::{tempo, Mpp, TempoConfig};
 use reqwest::Client;
@@ -289,6 +289,13 @@ impl ChargeConfig for OneDollar {
     }
 }
 
+struct ZeroDollar;
+impl ChargeConfig for ZeroDollar {
+    fn amount() -> &'static str {
+        "0"
+    }
+}
+
 // ==================== Server helpers ====================
 
 /// Start an axum server on port 0 and return (url, JoinHandle).
@@ -299,6 +306,7 @@ async fn start_server(
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/identity", get(identity))
         .route("/paid", get(paid))
         .route("/premium", get(premium))
         .with_state(state);
@@ -331,6 +339,13 @@ async fn premium(charge: MppCharge<OneDollar>) -> WithReceipt<Json<serde_json::V
     WithReceipt {
         receipt: charge.receipt,
         body: Json(serde_json::json!({ "message": "premium content", "tier": "gold" })),
+    }
+}
+
+async fn identity(charge: MppCharge<ZeroDollar>) -> WithReceipt<Json<serde_json::Value>> {
+    WithReceipt {
+        receipt: charge.receipt,
+        body: Json(serde_json::json!({ "message": "identity verified" })),
     }
 }
 
@@ -474,6 +489,83 @@ async fn test_e2e_charge_round_trip() {
     // Verify the response body.
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["message"], "paid content");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Zero-amount auth flows should use a signed proof instead of a transaction.
+#[tokio::test]
+async fn test_zero_amount_identity_flow_uses_proof_credential() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("identity-test-secret"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    let first = Client::new()
+        .get(format!("{url}/identity"))
+        .send()
+        .await
+        .expect("identity request failed");
+    assert_eq!(first.status(), 402);
+
+    let www_auth = first
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate header")
+        .to_str()
+        .unwrap();
+    let challenge = mpp::parse_www_authenticate(www_auth).expect("failed to parse challenge");
+
+    let credential = provider
+        .pay(&challenge)
+        .await
+        .expect("failed to create proof credential");
+    let payload = credential
+        .charge_payload()
+        .expect("expected charge payload");
+    assert!(
+        payload.is_proof(),
+        "zero-amount flow should use proof payloads"
+    );
+
+    let auth_header = mpp::format_authorization(&credential).expect("failed to format credential");
+    let response = Client::new()
+        .get(format!("{url}/identity"))
+        .header("authorization", auth_header)
+        .send()
+        .await
+        .expect("identity auth request failed");
+
+    assert_eq!(response.status(), 200);
+
+    let receipt_hdr = response
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    assert_eq!(receipt.status, mpp::ReceiptStatus::Success);
+    assert_eq!(receipt.reference, challenge.id);
+
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["message"], "identity verified");
 
     handle.abort();
     let _ = handle.await;

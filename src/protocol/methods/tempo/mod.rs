@@ -99,6 +99,7 @@
 pub mod charge;
 pub mod fee_payer_envelope;
 pub mod network;
+pub(crate) mod proof;
 pub mod session;
 pub mod session_receipt;
 pub mod transaction;

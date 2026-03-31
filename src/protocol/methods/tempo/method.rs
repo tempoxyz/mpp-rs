@@ -39,7 +39,7 @@ use crate::store::Store;
 use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
-use super::{TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
+use super::{proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 1_000_000;
 
@@ -1017,6 +1017,17 @@ where
                 )
             })?;
 
+            let is_zero_amount = request
+                .amount_u256()
+                .map_err(|e| VerificationError::new(format!("Invalid amount in request: {}", e)))?
+                .is_zero();
+
+            if is_zero_amount && !charge_payload.is_proof() {
+                return Err(VerificationError::new(
+                    "Zero-amount challenges require a proof credential.",
+                ));
+            }
+
             if charge_payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
                 this.verify_hash(
@@ -1026,6 +1037,37 @@ where
                     &credential.challenge.realm,
                 )
                 .await
+            } else if charge_payload.is_proof() {
+                if !is_zero_amount {
+                    return Err(VerificationError::new(
+                        "Proof credentials are only valid for zero-amount challenges.",
+                    ));
+                }
+
+                let source = credential.source.as_deref().ok_or_else(|| {
+                    VerificationError::new("Proof credential must include a source.")
+                })?;
+                let parsed_source = proof::parse_proof_source(source)
+                    .map_err(|_| VerificationError::new("Proof credential source is invalid."))?;
+
+                if parsed_source.chain_id != expected_chain_id {
+                    return Err(VerificationError::new(
+                        "Proof credential source is invalid.",
+                    ));
+                }
+
+                if !proof::verify_proof(
+                    expected_chain_id,
+                    &credential.challenge.id,
+                    charge_payload.proof_signature().unwrap(),
+                    parsed_source.address,
+                ) {
+                    return Err(VerificationError::new(
+                        "Proof signature does not match source.",
+                    ));
+                }
+
+                Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
             } else {
                 // Client sent signed transaction, validate and broadcast it.
                 // broadcast_transaction already does pre-broadcast dedup and
@@ -1049,6 +1091,27 @@ mod tests {
     use alloy::primitives::hex;
 
     use super::{super::MODERATO_CHAIN_ID, *};
+    use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+    fn test_charge_request_with_amount(amount: &str) -> ChargeRequest {
+        ChargeRequest {
+            amount: amount.to_string(),
+            currency: "0x20c0000000000000000000000000000000000000".to_string(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string()),
+            method_details: Some(serde_json::json!({ "chainId": 42431 })),
+            ..Default::default()
+        }
+    }
+
+    fn test_proof_challenge(request: &ChargeRequest) -> PaymentChallenge {
+        PaymentChallenge::new(
+            "proof-challenge-id",
+            "api.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_typed(request).unwrap(),
+        )
+    }
 
     #[test]
     fn test_transfer_selector() {
@@ -1147,6 +1210,68 @@ mod tests {
         assert!(error
             .to_string()
             .contains("fee sponsorship is not configured"));
+    }
+
+    #[tokio::test]
+    async fn test_zero_amount_proof_accepted() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let receipt = method.verify(&credential, &request).await.unwrap_err();
+        assert!(receipt.to_string().contains("Failed to fetch chain ID") || receipt.retryable);
+    }
+
+    #[tokio::test]
+    async fn test_verify_proof_rejects_wrong_signer() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&other, 42431, &challenge.id)
+            .await
+            .unwrap();
+        let payload = crate::protocol::core::PaymentPayload::proof(signature);
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            payload.clone(),
+        );
+
+        let source = credential.source.as_deref().unwrap();
+        let parsed = proof::parse_proof_source(source).unwrap();
+        assert!(!proof::verify_proof(
+            42431,
+            &credential.challenge.id,
+            payload.proof_signature().unwrap(),
+            parsed.address,
+        ));
+    }
+
+    #[test]
+    fn test_verify_zero_amount_requires_proof_payload() {
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::transaction("0xdeadbeef"),
+        );
+        let payload = credential.charge_payload().unwrap();
+        assert!(!payload.is_proof());
+        assert!(request.amount_u256().unwrap().is_zero());
     }
 
     // ==================== Fee payer co-sign unit tests ====================

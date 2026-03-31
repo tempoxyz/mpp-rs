@@ -528,19 +528,21 @@ pub struct ChallengeEcho {
 
 /// Payment payload in credential.
 ///
-/// Contains the signed transaction or transaction hash.
+/// Contains the signed transaction, typed proof, or transaction hash.
 ///
 /// Per IETF spec (Tempo §5.1-5.2):
 /// - `type="transaction"` uses field `signature` containing the signed transaction
+/// - `type="proof"` uses field `signature` containing the signed typed proof
 /// - `type="hash"` uses field `hash` containing the transaction hash
 #[derive(Debug, Clone)]
 pub struct PaymentPayload {
-    /// Payload type: "transaction" or "hash"
+    /// Payload type: "transaction", "proof", or "hash"
     pub payload_type: PayloadType,
 
     /// Hex-encoded signed data.
     ///
     /// For `type="transaction"`: the RLP-encoded signed transaction to broadcast.
+    /// For `type="proof"`: the EIP-712 signature for the challenge proof.
     /// For `type="hash"`: the transaction hash (0x-prefixed) of an already-broadcast tx.
     data: String,
 }
@@ -556,7 +558,9 @@ impl serde::Serialize for PaymentPayload {
         state.serialize_field("type", &self.payload_type)?;
 
         match self.payload_type {
-            PayloadType::Transaction => state.serialize_field("signature", &self.data)?,
+            PayloadType::Transaction | PayloadType::Proof => {
+                state.serialize_field("signature", &self.data)?
+            }
             PayloadType::Hash => state.serialize_field("hash", &self.data)?,
         }
 
@@ -580,8 +584,11 @@ impl<'de> serde::Deserialize<'de> for PaymentPayload {
         let raw = RawPayload::deserialize(deserializer)?;
 
         let data = match raw.payload_type {
-            PayloadType::Transaction => raw.signature.ok_or_else(|| {
-                serde::de::Error::custom("transaction payload requires 'signature' field")
+            PayloadType::Transaction | PayloadType::Proof => raw.signature.ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "{} payload requires 'signature' field",
+                    raw.payload_type
+                ))
             })?,
             PayloadType::Hash => raw
                 .hash
@@ -612,6 +619,14 @@ impl PaymentPayload {
         }
     }
 
+    /// Create a new proof payload.
+    pub fn proof(signature: impl Into<String>) -> Self {
+        Self {
+            payload_type: PayloadType::Proof,
+            data: signature.into(),
+        }
+    }
+
     /// Get the payload type.
     pub fn payload_type(&self) -> PayloadType {
         self.payload_type.clone()
@@ -620,9 +635,10 @@ impl PaymentPayload {
     /// Get the underlying data (works for both transaction and hash payloads).
     ///
     /// For transaction payloads, this is the signed transaction bytes.
+    /// For proof payloads, this is the proof signature.
     /// For hash payloads, this is the transaction hash.
     ///
-    /// Prefer using `tx_hash()` or `signed_tx()` for type-safe access.
+    /// Prefer using `tx_hash()`, `signed_tx()`, or `proof_signature()` for type-safe access.
     pub fn data(&self) -> &str {
         &self.data
     }
@@ -649,6 +665,17 @@ impl PaymentPayload {
         }
     }
 
+    /// Get the proof signature (for proof payloads).
+    ///
+    /// Returns the proof signature if this is a proof payload, None otherwise.
+    pub fn proof_signature(&self) -> Option<&str> {
+        if self.payload_type == PayloadType::Proof {
+            Some(&self.data)
+        } else {
+            None
+        }
+    }
+
     /// Check if this is a transaction payload.
     pub fn is_transaction(&self) -> bool {
         self.payload_type == PayloadType::Transaction
@@ -657,6 +684,11 @@ impl PaymentPayload {
     /// Check if this is a hash payload.
     pub fn is_hash(&self) -> bool {
         self.payload_type == PayloadType::Hash
+    }
+
+    /// Check if this is a proof payload.
+    pub fn is_proof(&self) -> bool {
+        self.payload_type == PayloadType::Proof
     }
 
     /// Get the transaction reference (hash or signature data).
@@ -888,6 +920,14 @@ mod tests {
         assert_eq!(hash.tx_hash(), Some("0xdef"));
         assert_eq!(hash.data(), "0xdef");
         assert_eq!(hash.signed_tx(), None);
+
+        let proof = PaymentPayload::proof("0x123");
+        assert_eq!(proof.payload_type(), PayloadType::Proof);
+        assert!(proof.is_proof());
+        assert_eq!(proof.proof_signature(), Some("0x123"));
+        assert_eq!(proof.data(), "0x123");
+        assert_eq!(proof.signed_tx(), None);
+        assert_eq!(proof.tx_hash(), None);
     }
 
     #[test]
@@ -905,6 +945,12 @@ mod tests {
         assert!(json.contains("\"hash\":\"0xdef\""));
         assert!(json.contains("\"type\":\"hash\""));
         assert!(!json.contains("\"signature\""));
+
+        let proof = PaymentPayload::proof("0x123");
+        let json = serde_json::to_string(&proof).unwrap();
+        assert!(json.contains("\"signature\":\"0x123\""));
+        assert!(json.contains("\"type\":\"proof\""));
+        assert!(!json.contains("\"hash\""));
     }
 
     #[test]
@@ -920,6 +966,11 @@ mod tests {
         let payload: PaymentPayload = serde_json::from_str(tx_json).unwrap();
         assert!(payload.is_transaction());
         assert_eq!(payload.signed_tx(), Some("0xabc456"));
+
+        let proof_json = r#"{"type":"proof","signature":"0x123456"}"#;
+        let payload: PaymentPayload = serde_json::from_str(proof_json).unwrap();
+        assert!(payload.is_proof());
+        assert_eq!(payload.proof_signature(), Some("0x123456"));
     }
 
     #[test]
@@ -933,6 +984,11 @@ mod tests {
         // transaction payload with "hash" field should fail
         let bad_tx = r#"{"type":"transaction","hash":"0xabc456"}"#;
         let result: Result<PaymentPayload, _> = serde_json::from_str(bad_tx);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("signature"));
+
+        let bad_proof = r#"{"type":"proof","hash":"0x123456"}"#;
+        let result: Result<PaymentPayload, _> = serde_json::from_str(bad_proof);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("signature"));
     }

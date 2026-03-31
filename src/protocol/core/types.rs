@@ -333,6 +333,7 @@ impl fmt::Display for PaymentProtocol {
 /// Indicates what kind of data is in the payload. Per spec:
 /// - `transaction`: Signed blockchain transaction (to be broadcast by server)
 /// - `hash`: Transaction hash (already broadcast by client)
+/// - `proof`: Signed typed proof for zero-amount identity flows
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PayloadType {
@@ -340,6 +341,8 @@ pub enum PayloadType {
     Transaction,
     /// Transaction hash (already broadcast by client)
     Hash,
+    /// Signed typed proof for zero-amount identity flows
+    Proof,
 }
 
 impl fmt::Display for PayloadType {
@@ -347,6 +350,7 @@ impl fmt::Display for PayloadType {
         match self {
             Self::Transaction => write!(f, "transaction"),
             Self::Hash => write!(f, "hash"),
+            Self::Proof => write!(f, "proof"),
         }
     }
 }
@@ -528,6 +532,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PayloadType::Hash).unwrap(),
             "\"hash\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PayloadType::Proof).unwrap(),
+            "\"proof\""
         );
     }
 

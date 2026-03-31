@@ -135,9 +135,8 @@ pub fn parse_dollar_amount(
         .and_then(|v| v.checked_add(frac_val.checked_mul(frac_scale)?))
         .ok_or(AmountError::Overflow)?;
 
-    if base_units == 0 {
-        return Err(AmountError::ZeroOrNegative);
-    }
+    // Zero-amount charges are valid for identity/proof flows.
+    // Negative amounts are caught by the leading '-' check above.
 
     Ok(base_units.to_string())
 }
@@ -177,12 +176,9 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_rejected() {
-        let err = parse_dollar_amount("0", 6).unwrap_err();
-        assert!(matches!(err, AmountError::ZeroOrNegative));
-
-        let err = parse_dollar_amount("0.000000", 6).unwrap_err();
-        assert!(matches!(err, AmountError::ZeroOrNegative));
+    fn test_zero_allowed() {
+        assert_eq!(parse_dollar_amount("0", 6).unwrap(), "0");
+        assert_eq!(parse_dollar_amount("0.000000", 6).unwrap(), "0");
     }
 
     #[test]
