@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2 (2026-03-31)
+
+### Patch Changes
+
+- Fixed a timing side-channel in HMAC challenge ID verification by replacing non-constant-time string comparison with `constant_time_eq`. Added an `ast-grep` lint rule to prevent future regressions. (by @BrendanRyan, [#175](https://github.com/tempoxyz/mpp-rs/pull/175))
+
 ## 0.8.1 (2026-03-30)
 
 ### Patch Changes
