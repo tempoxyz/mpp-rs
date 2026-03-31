@@ -40,8 +40,10 @@ use crate::client::tempo::signing::{
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::methods::tempo::charge::{parse_memo_bytes, TempoChargeExt};
+use crate::protocol::methods::tempo::charge::{parse_memo_bytes_checked, TempoChargeExt};
 use crate::protocol::methods::tempo::network::TempoNetwork;
+use crate::protocol::methods::tempo::transfers::get_transfers;
+use crate::protocol::methods::tempo::types::Split;
 use crate::protocol::methods::tempo::CHAIN_ID;
 use alloy::sol_types::SolCall;
 use tempo_alloy::contracts::precompiles::ITIP20;
@@ -94,6 +96,7 @@ pub struct TempoCharge {
     memo: Option<[u8; 32]>,
     chain_id: u64,
     fee_payer: bool,
+    splits: Option<Vec<Split>>,
     calls: Option<Vec<Call>>,
 }
 
@@ -106,13 +109,17 @@ impl TempoCharge {
         challenge.validate_for_charge("tempo")?;
 
         let charge_req: ChargeRequest = challenge.request.decode()?;
+        let details = charge_req.tempo_method_details()?;
 
         let recipient = charge_req.recipient_address()?;
         let currency = charge_req.currency_address()?;
         let amount = charge_req.amount_u256()?;
-        let memo = parse_memo_bytes(charge_req.memo());
-        let chain_id = charge_req.chain_id().unwrap_or(CHAIN_ID);
-        let fee_payer = charge_req.fee_payer();
+        let memo = parse_memo_bytes_checked(details.memo.as_deref())?;
+        let chain_id = details.chain_id.unwrap_or(CHAIN_ID);
+        let fee_payer = details.fee_payer();
+        let splits = details.splits;
+
+        get_transfers(amount, recipient, memo, splits.as_deref())?;
 
         Ok(Self {
             challenge: challenge.clone(),
@@ -122,6 +129,7 @@ impl TempoCharge {
             memo,
             chain_id,
             fee_payer,
+            splits,
             calls: None,
         })
     }
@@ -162,21 +170,40 @@ impl TempoCharge {
         self.fee_payer
     }
 
+    /// Get the splits, if present.
+    pub fn splits(&self) -> Option<&[Split]> {
+        self.splits.as_deref()
+    }
+
+    /// Build the transfer calls from the charge fields (primary + splits).
+    fn build_transfer_calls(&self) -> Result<Vec<Call>, MppError> {
+        let transfers = get_transfers(
+            self.amount,
+            self.recipient,
+            self.memo,
+            self.splits.as_deref(),
+        )?;
+
+        Ok(transfers
+            .into_iter()
+            .map(|t| Call {
+                to: TxKind::Call(self.currency),
+                value: U256::ZERO,
+                input: encode_transfer(t.recipient, t.amount, t.memo),
+            })
+            .collect())
+    }
+
     /// Prepend a call to the transaction's call list.
     ///
     /// Used by autoswap to insert a DEX swap call before the transfer call.
     /// The swap and transfer then execute atomically in a single AA transaction.
-    pub fn with_prepended_call(mut self, call: Call) -> Self {
-        let calls = self.calls.get_or_insert_with(|| {
-            let transfer_data = encode_transfer(self.recipient, self.amount, self.memo);
-            vec![Call {
-                to: TxKind::Call(self.currency),
-                value: U256::ZERO,
-                input: transfer_data,
-            }]
-        });
-        calls.insert(0, call);
-        self
+    pub fn with_prepended_call(mut self, call: Call) -> Result<Self, MppError> {
+        if self.calls.is_none() {
+            self.calls = Some(self.build_transfer_calls()?);
+        }
+        self.calls.as_mut().unwrap().insert(0, call);
+        Ok(self)
     }
 
     /// Sign the charge with default options.
@@ -227,14 +254,10 @@ impl TempoCharge {
         let provider =
             alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
 
-        let calls = self.calls.unwrap_or_else(|| {
-            let transfer_data = encode_transfer(self.recipient, self.amount, self.memo);
-            vec![Call {
-                to: TxKind::Call(self.currency),
-                value: U256::ZERO,
-                input: transfer_data,
-            }]
-        });
+        let calls = match self.calls {
+            Some(c) => c,
+            None => self.build_transfer_calls()?,
+        };
 
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
@@ -551,5 +574,70 @@ mod tests {
         assert_eq!(signed.tx_bytes(), &[0x76]);
         assert_eq!(signed.chain_id(), 4217);
         assert_eq!(signed.from_address(), from);
+    }
+
+    #[test]
+    fn test_from_challenge_with_splits() {
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {
+                "chainId": 42431,
+                "splits": [
+                    {
+                        "amount": "300000",
+                        "recipient": "0x1111111111111111111111111111111111111111"
+                    },
+                    {
+                        "amount": "200000",
+                        "recipient": "0x2222222222222222222222222222222222222222",
+                        "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                    }
+                ]
+            }
+        });
+        let request = Base64UrlJson::from_value(&request_json).unwrap();
+        let challenge =
+            PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+        let charge = TempoCharge::from_challenge(&challenge).unwrap();
+
+        assert!(charge.splits().is_some());
+        assert_eq!(charge.splits().unwrap().len(), 2);
+        assert_eq!(charge.amount(), U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn test_build_transfer_calls_with_splits() {
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {
+                "chainId": 42431,
+                "splits": [
+                    {
+                        "amount": "300000",
+                        "recipient": "0x1111111111111111111111111111111111111111"
+                    }
+                ]
+            }
+        });
+        let request = Base64UrlJson::from_value(&request_json).unwrap();
+        let challenge =
+            PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+        let charge = TempoCharge::from_challenge(&challenge).unwrap();
+
+        let calls = charge.build_transfer_calls().unwrap();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn test_build_transfer_calls_no_splits() {
+        let challenge = test_challenge();
+        let charge = TempoCharge::from_challenge(&challenge).unwrap();
+
+        let calls = charge.build_transfer_calls().unwrap();
+        assert_eq!(calls.len(), 1);
     }
 }

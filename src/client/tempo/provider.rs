@@ -151,7 +151,7 @@ impl PaymentProvider for TempoProvider {
             )
             .await?
             {
-                charge = charge.with_prepended_call(swap_call);
+                charge = charge.with_prepended_call(swap_call)?;
             }
         }
 

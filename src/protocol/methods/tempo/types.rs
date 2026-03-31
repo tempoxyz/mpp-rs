@@ -4,9 +4,33 @@ use serde::{Deserialize, Serialize};
 
 use super::MODERATO_CHAIN_ID;
 
+/// A single split in a split payment.
+///
+/// Each split directs a portion of the total charge amount to a different recipient.
+/// The primary recipient receives `total - sum(splits)` and inherits the top-level memo.
+///
+/// # Invariants
+///
+/// - `amount` must be a positive integer string (> 0)
+/// - `recipient` must be a valid EVM address
+/// - `memo` must be a 32-byte hex string if present
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Split {
+    /// Amount in base units (atomic units, e.g. "100000" for 0.10 pathUSD).
+    pub amount: String,
+
+    /// Optional memo for this split's `transferWithMemo` call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+
+    /// Recipient address for this split.
+    pub recipient: String,
+}
+
 /// Tempo method-specific details in payment requests.
 ///
-/// Per the IETF spec, Tempo methodDetails contains only `chainId` and `feePayer`.
+/// Per the IETF spec, Tempo methodDetails contains `chainId`, `feePayer`,
+/// and optionally `memo` and `splits` for split payments.
 ///
 /// # Fee Sponsorship Flow
 ///
@@ -17,6 +41,12 @@ use super::MODERATO_CHAIN_ID;
 ///    signs it, and returns it as a `transaction` credential
 /// 3. **Server** adds fee payer signature and broadcasts the transaction
 ///
+/// # Split Payments
+///
+/// When `splits` is present, the charge is split across multiple recipients.
+/// The primary recipient gets `total - sum(splits)` and inherits the top-level memo.
+/// Each split has its own amount, recipient, and optional memo.
+///
 /// # Examples
 ///
 /// ```
@@ -26,6 +56,7 @@ use super::MODERATO_CHAIN_ID;
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     memo: None,
+///     splits: None,
 /// };
 /// assert!(details.fee_payer());
 /// ```
@@ -48,6 +79,14 @@ pub struct TempoMethodDetails {
     /// Must be a 32-byte hex string (with or without 0x prefix).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
+
+    /// Optional split payments.
+    ///
+    /// When present, the charge is split across multiple recipients.
+    /// The primary recipient receives `total - sum(splits)` and inherits the top-level memo.
+    /// Maximum 10 splits (11 total transfer calls including primary).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub splits: Option<Vec<Split>>,
 }
 
 impl TempoMethodDetails {
@@ -77,6 +116,7 @@ mod tests {
             chain_id: Some(42431),
             fee_payer: Some(true),
             memo: None,
+            splits: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
@@ -133,6 +173,7 @@ mod tests {
             chain_id: Some(42431),
             fee_payer: Some(true),
             memo: Some("0xabcdef".to_string()),
+            splits: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();

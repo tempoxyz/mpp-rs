@@ -7,6 +7,10 @@
 - Client now matches challenges by `provider.supports(method, intent)` instead of assuming a single challenge, mirroring the mppx TypeScript SDK. Both `PaymentExt` (fetch) and `PaymentMiddleware` parse all challenges and select the first one the provider supports. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
 - Added `HttpError::NoSupportedChallenge` variant for when a 402 response contains no challenge matching the provider's supported methods. (by @grandizzy, [#185](https://github.com/tempoxyz/mpp-rs/pull/185))
 
+### Patch Changes
+
+- Added split payments support to Tempo charge verification and transaction building. Extended `TempoCharge` and `TempoChargeExt` to parse and propagate split recipients from `methodDetails`, and refactored transfer call construction and verification to handle multiple transfers using order-insensitive matching. (by @BrendanRyan, [#187](https://github.com/tempoxyz/mpp-rs/pull/187))
+
 ## 0.8.2 (2026-03-31)
 
 ### Patch Changes

@@ -102,6 +102,7 @@ pub mod network;
 pub mod session;
 pub mod session_receipt;
 pub mod transaction;
+pub mod transfers;
 pub mod types;
 pub mod voucher;
 
@@ -127,7 +128,8 @@ pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,
 };
-pub use types::TempoMethodDetails;
+pub use transfers::{get_transfers, Transfer};
+pub use types::{Split, TempoMethodDetails};
 #[cfg(feature = "evm")]
 pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
@@ -275,10 +277,12 @@ pub fn charge_challenge_with_options(
     description: Option<&str>,
 ) -> crate::error::Result<crate::protocol::core::PaymentChallenge> {
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+    use crate::protocol::methods::tempo::transfers::get_request_transfers;
     use time::{Duration, OffsetDateTime};
 
     // Apply decimals transform if present (matches TS SDK's parseUnits behavior).
     let request = request.clone().with_base_units()?;
+    get_request_transfers(&request)?;
 
     let encoded_request = Base64UrlJson::from_typed(&request)?;
 
@@ -518,6 +522,32 @@ mod tests {
             challenge1.id, challenge2.id,
             "Different parameters should produce different challenge IDs"
         );
+    }
+
+    #[test]
+    fn test_charge_challenge_with_options_rejects_empty_splits() {
+        use crate::protocol::intents::ChargeRequest;
+
+        let request = ChargeRequest {
+            amount: "1000000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            method_details: Some(serde_json::json!({
+                "splits": []
+            })),
+            ..Default::default()
+        };
+
+        let error = charge_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("2026-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Splits must not be empty"));
     }
 
     #[test]

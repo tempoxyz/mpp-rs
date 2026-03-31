@@ -429,6 +429,33 @@ where
             ));
         }
 
+        #[cfg(feature = "tempo")]
+        if credential.challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME {
+            let req_transfers =
+                crate::protocol::methods::tempo::transfers::get_request_transfers(&request)
+                    .map_err(|e| {
+                        VerificationError::with_code(
+                            format!("Invalid Tempo request in credential: {e}"),
+                            crate::protocol::traits::ErrorCode::InvalidCredential,
+                        )
+                    })?;
+            let expected_transfers =
+                crate::protocol::methods::tempo::transfers::get_request_transfers(expected)
+                    .map_err(|e| {
+                        VerificationError::with_code(
+                            format!("Invalid expected Tempo request: {e}"),
+                            crate::protocol::traits::ErrorCode::InvalidCredential,
+                        )
+                    })?;
+
+            if req_transfers != expected_transfers {
+                return Err(VerificationError::with_code(
+                    "Tempo transfer routing mismatch: credential was issued with different memo or splits",
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
         self.verify(credential, &request).await
     }
 
@@ -1840,6 +1867,97 @@ mod tests {
         assert!(
             err.message.contains("Recipient mismatch"),
             "expected recipient mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_credential_with_split_routing_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+
+        let challenge = mpp
+            .charge_challenge_with_options(
+                &ChargeRequest {
+                    amount: "100000".into(),
+                    currency: "0x20c0000000000000000000000000000000000000".into(),
+                    recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+                    method_details: Some(serde_json::json!({
+                        "splits": [{
+                            "amount": "10000",
+                            "recipient": "0x0000000000000000000000000000000000000003"
+                        }]
+                    })),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let no_splits_request = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+
+        let result = mpp
+            .verify_credential_with_expected_request(&credential, &no_splits_request)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("Tempo transfer routing mismatch"),
+            "expected split routing mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_credential_with_memo_routing_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+
+        let challenge = mpp
+            .charge_challenge_with_options(
+                &ChargeRequest {
+                    amount: "100000".into(),
+                    currency: "0x20c0000000000000000000000000000000000000".into(),
+                    recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+                    method_details: Some(serde_json::json!({
+                        "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                    })),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+
+        let request_without_memo = ChargeRequest {
+            amount: "100000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+
+        let result = mpp
+            .verify_credential_with_expected_request(&credential, &request_without_memo)
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("Tempo transfer routing mismatch"),
+            "expected memo routing mismatch error, got: {}",
             err.message
         );
     }

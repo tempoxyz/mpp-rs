@@ -2,7 +2,7 @@
 //!
 //! Provides Tempo-specific accessors for ChargeRequest.
 
-use super::types::TempoMethodDetails;
+use super::types::{Split, TempoMethodDetails};
 use crate::error::{MppError, Result};
 use crate::evm::{parse_address, parse_amount, Address, U256};
 use crate::protocol::intents::ChargeRequest;
@@ -45,6 +45,9 @@ pub trait TempoChargeExt {
 
     /// Check if this request is for Tempo Moderato network.
     fn is_tempo_moderato(&self) -> bool;
+
+    /// Get the splits from methodDetails, if present.
+    fn splits(&self) -> Result<Option<Vec<Split>>>;
 
     /// Get the Tempo network from chain ID, if recognized.
     fn network(&self) -> Option<super::network::TempoNetwork>;
@@ -102,27 +105,50 @@ impl TempoChargeExt for ChargeRequest {
         self.chain_id() == Some(super::MODERATO_CHAIN_ID)
     }
 
+    fn splits(&self) -> Result<Option<Vec<Split>>> {
+        Ok(self.tempo_method_details()?.splits)
+    }
+
     fn network(&self) -> Option<super::network::TempoNetwork> {
         self.chain_id()
             .and_then(super::network::TempoNetwork::from_chain_id)
     }
 }
 
+fn parse_memo_bytes_in_context(memo: Option<&str>, context: &str) -> Result<Option<[u8; 32]>> {
+    let Some(memo) = memo else {
+        return Ok(None);
+    };
+
+    let hex_str = memo.strip_prefix("0x").unwrap_or(memo);
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| MppError::invalid_challenge_reason(format!("Invalid {context}: {e}")))?;
+
+    if bytes.len() != 32 {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid {context}: expected 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(Some(arr))
+}
+
 /// Parse a hex-encoded memo string to a 32-byte array.
 ///
 /// Returns `None` if the input is `None`, not valid hex, or not exactly 32 bytes.
 pub fn parse_memo_bytes(memo: Option<String>) -> Option<[u8; 32]> {
-    memo.and_then(|s| {
-        let hex_str = s.strip_prefix("0x").unwrap_or(&s);
-        let bytes = hex::decode(hex_str).ok()?;
-        if bytes.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            Some(arr)
-        } else {
-            None
-        }
-    })
+    parse_memo_bytes_checked(memo.as_deref()).ok().flatten()
+}
+
+pub(crate) fn parse_memo_bytes_checked(memo: Option<&str>) -> Result<Option<[u8; 32]>> {
+    parse_memo_bytes_in_context(memo, "memo")
+}
+
+pub(crate) fn parse_split_memo_bytes(memo: Option<&str>) -> Result<Option<[u8; 32]>> {
+    parse_memo_bytes_in_context(memo, "split memo")
 }
 
 #[cfg(test)]
@@ -243,5 +269,66 @@ mod tests {
     fn test_parse_memo_bytes_invalid_hex() {
         let memo = Some("0xnotvalidhex".to_string());
         assert!(parse_memo_bytes(memo).is_none());
+    }
+
+    #[test]
+    fn test_splits() {
+        let req = ChargeRequest {
+            amount: "1000000".to_string(),
+            currency: "0x123".to_string(),
+            method_details: Some(serde_json::json!({
+                "splits": [
+                    {"amount": "300000", "recipient": "0x111", "memo": "0xabcd"},
+                    {"amount": "200000", "recipient": "0x222"}
+                ]
+            })),
+            ..Default::default()
+        };
+
+        let splits = req.splits().unwrap().unwrap();
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0].amount, "300000");
+        assert_eq!(splits[1].recipient, "0x222");
+    }
+
+    #[test]
+    fn test_splits_none() {
+        let req = test_charge_request();
+        assert!(req.splits().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_splits_empty() {
+        let req = ChargeRequest {
+            method_details: Some(serde_json::json!({"splits": []})),
+            ..test_charge_request()
+        };
+        let splits = req.splits().unwrap().unwrap();
+        assert!(splits.is_empty());
+    }
+
+    #[test]
+    fn test_splits_rejects_malformed_json() {
+        let req = ChargeRequest {
+            method_details: Some(serde_json::json!({
+                "splits": [{"amount": 1, "recipient": "0x111"}]
+            })),
+            ..test_charge_request()
+        };
+
+        let error = req.splits().unwrap_err();
+        assert!(error.to_string().contains("Invalid Tempo method details"));
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_checked_invalid_hex() {
+        let error = parse_memo_bytes_checked(Some("0xnotvalidhex")).unwrap_err();
+        assert!(error.to_string().contains("Invalid memo"));
+    }
+
+    #[test]
+    fn test_parse_split_memo_bytes_wrong_length() {
+        let error = parse_split_memo_bytes(Some("0x1234")).unwrap_err();
+        assert!(error.to_string().contains("Invalid split memo"));
     }
 }
