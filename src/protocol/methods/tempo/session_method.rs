@@ -305,12 +305,105 @@ where
             .unwrap_or(self.config.min_voucher_delta)
     }
 
+    /// Verify that the open transaction's derived channel ID matches the claimed channelId.
+    fn verify_open_channel_id_binding(
+        tx_bytes: &[u8],
+        claimed_channel_id: B256,
+        escrow: Address,
+        chain_id: u64,
+        expected_payee: Address,
+        expected_token: Address,
+    ) -> Result<(), VerificationError> {
+        use alloy::consensus::transaction::SignerRecoverable;
+        use alloy::sol_types::SolCall;
+
+        alloy::sol! {
+            interface IEscrowOpen {
+                function open(address payee, address token, uint128 deposit, bytes32 salt, address authorizedSigner) external;
+            }
+        }
+
+        // Strip type byte (0x76) if present.
+        let tx_data = if !tx_bytes.is_empty()
+            && tx_bytes[0] == tempo_primitives::transaction::TEMPO_TX_TYPE_ID
+        {
+            &tx_bytes[1..]
+        } else {
+            tx_bytes
+        };
+
+        let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]).map_err(|e| {
+            VerificationError::invalid_payload(format!("failed to decode open transaction: {e}"))
+        })?;
+
+        let sender = signed
+            .recover_signer()
+            .map_err(|e| VerificationError::new(format!("failed to recover sender: {e}")))?;
+
+        let tx = signed.tx();
+
+        // Find the escrow.open(...) call.
+        let open_selector = <IEscrowOpen::openCall as SolCall>::SELECTOR;
+        let open_call = tx
+            .calls
+            .iter()
+            .find(|call| {
+                let targets_escrow = match &call.to {
+                    alloy::primitives::TxKind::Call(addr) => *addr == escrow,
+                    _ => false,
+                };
+                targets_escrow && call.input.len() >= 4 && call.input[..4] == open_selector
+            })
+            .ok_or_else(|| {
+                VerificationError::invalid_payload(
+                    "open transaction does not contain an escrow.open() call",
+                )
+            })?;
+
+        let decoded = IEscrowOpen::openCall::abi_decode(&open_call.input).map_err(|e| {
+            VerificationError::invalid_payload(format!(
+                "failed to decode escrow.open() calldata: {e}"
+            ))
+        })?;
+
+        if decoded.payee != expected_payee {
+            return Err(VerificationError::credential_mismatch(
+                "open transaction payee does not match session recipient",
+            ));
+        }
+        if decoded.token != expected_token {
+            return Err(VerificationError::credential_mismatch(
+                "open transaction token does not match session currency",
+            ));
+        }
+
+        let derived = super::voucher::compute_channel_id(
+            sender,
+            decoded.payee,
+            decoded.token,
+            decoded.salt,
+            decoded.authorizedSigner,
+            escrow,
+            chain_id,
+        );
+
+        if derived != claimed_channel_id {
+            return Err(VerificationError::new(
+                "open transaction does not match claimed channelId",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Handle 'open' action.
     async fn handle_open(
         &self,
         _credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
+        expected_payee: Address,
+        expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
         let (
             channel_id_str,
@@ -344,6 +437,17 @@ where
         let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
             VerificationError::invalid_payload(format!("invalid open transaction hex: {}", e))
         })?;
+
+        // Verify the open transaction's derived channel ID matches the claimed channelId
+        Self::verify_open_channel_id_binding(
+            &tx_bytes,
+            channel_id_b256,
+            escrow,
+            chain_id,
+            expected_payee,
+            expected_token,
+        )?;
+
         let pending = self
             .provider
             .send_raw_transaction(&tx_bytes)
@@ -364,6 +468,17 @@ where
         let open_tx_hash = tx_receipt.transaction_hash().to_string();
 
         let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+
+        if on_chain.payee != expected_payee {
+            return Err(VerificationError::credential_mismatch(
+                "channel payee does not match session recipient",
+            ));
+        }
+        if on_chain.token != expected_token {
+            return Err(VerificationError::credential_mismatch(
+                "channel token does not match session currency",
+            ));
+        }
 
         // Validate on-chain state.
         if on_chain.deposit == 0 {
@@ -492,6 +607,8 @@ where
         _credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
+        expected_payee: Address,
+        expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
         let (channel_id_str, _additional_deposit_str, transaction_str) = match payload {
             SessionCredentialPayload::TopUp {
@@ -508,6 +625,17 @@ where
             .get_channel(channel_id_str)
             .await?
             .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
+        if channel.payee != expected_payee {
+            return Err(VerificationError::credential_mismatch(
+                "channel payee does not match session recipient",
+            ));
+        }
+        if channel.token != expected_token {
+            return Err(VerificationError::credential_mismatch(
+                "channel token does not match session currency",
+            ));
+        }
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
@@ -577,6 +705,8 @@ where
         _credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
+        expected_payee: Address,
+        expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
         let (channel_id_str, cumulative_amount_str, signature_str) = match payload {
             SessionCredentialPayload::Voucher {
@@ -593,6 +723,17 @@ where
             .await?
             .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
 
+        if channel.payee != expected_payee {
+            return Err(VerificationError::credential_mismatch(
+                "channel payee does not match session recipient",
+            ));
+        }
+        if channel.token != expected_token {
+            return Err(VerificationError::credential_mismatch(
+                "channel token does not match session currency",
+            ));
+        }
+
         if channel.finalized {
             return Err(VerificationError::channel_closed("channel is finalized"));
         }
@@ -603,6 +744,17 @@ where
 
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
+
+        if channel.chain_id != chain_id {
+            return Err(VerificationError::credential_mismatch(
+                "channel chain_id does not match session chain_id",
+            ));
+        }
+        if channel.escrow_contract != escrow {
+            return Err(VerificationError::credential_mismatch(
+                "channel escrow does not match session escrow",
+            ));
+        }
         let min_delta = self.resolve_min_delta(details);
 
         // Use cached channel state (verified during open/topUp) instead of
@@ -630,6 +782,8 @@ where
         _credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
+        expected_payee: Address,
+        expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
         let (channel_id_str, cumulative_amount_str, signature_str) = match payload {
             SessionCredentialPayload::Close {
@@ -645,6 +799,17 @@ where
             .get_channel(channel_id_str)
             .await?
             .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
+        if channel.payee != expected_payee {
+            return Err(VerificationError::credential_mismatch(
+                "channel payee does not match session recipient",
+            ));
+        }
+        if channel.token != expected_token {
+            return Err(VerificationError::credential_mismatch(
+                "channel token does not match session currency",
+            ));
+        }
 
         if channel.finalized {
             return Err(VerificationError::channel_closed(
@@ -995,22 +1160,59 @@ where
 
             let details = this.resolve_method_details(&request)?;
 
+            let expected_payee = request
+                .recipient
+                .as_deref()
+                .ok_or_else(|| {
+                    VerificationError::invalid_payload("session challenge missing recipient")
+                })
+                .and_then(Self::parse_address)?;
+            let expected_token = Self::parse_address(&request.currency)?;
+
             let payload: SessionCredentialPayload = credential.payload_as().map_err(|e| {
                 VerificationError::invalid_payload(format!("Expected session payload: {}", e))
             })?;
 
             match &payload {
                 SessionCredentialPayload::Open { .. } => {
-                    this.handle_open(&credential, &payload, &details).await
+                    this.handle_open(
+                        &credential,
+                        &payload,
+                        &details,
+                        expected_payee,
+                        expected_token,
+                    )
+                    .await
                 }
                 SessionCredentialPayload::TopUp { .. } => {
-                    this.handle_top_up(&credential, &payload, &details).await
+                    this.handle_top_up(
+                        &credential,
+                        &payload,
+                        &details,
+                        expected_payee,
+                        expected_token,
+                    )
+                    .await
                 }
                 SessionCredentialPayload::Voucher { .. } => {
-                    this.handle_voucher(&credential, &payload, &details).await
+                    this.handle_voucher(
+                        &credential,
+                        &payload,
+                        &details,
+                        expected_payee,
+                        expected_token,
+                    )
+                    .await
                 }
                 SessionCredentialPayload::Close { .. } => {
-                    this.handle_close(&credential, &payload, &details).await
+                    this.handle_close(
+                        &credential,
+                        &payload,
+                        &details,
+                        expected_payee,
+                        expected_token,
+                    )
+                    .await
                 }
             }
         }
@@ -1128,6 +1330,7 @@ impl ChannelStore for InMemoryChannelStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::methods::tempo::voucher;
     use crate::protocol::traits::ErrorCode;
 
     fn test_channel_state(channel_id: &str) -> ChannelState {
@@ -2172,5 +2375,398 @@ mod tests {
         let unchanged = store.get_channel("0xchannel_fin").await.unwrap().unwrap();
         assert_eq!(unchanged.spent, 0);
         assert_eq!(unchanged.units, 0);
+    }
+
+    #[test]
+    fn test_open_channel_id_binding_rejects_mismatch() {
+        use alloy::eips::Encodable2718;
+        use alloy::primitives::Bytes;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+        use alloy::sol_types::SolCall;
+        use tempo_primitives::transaction::Call;
+        use tempo_primitives::TempoTransaction;
+
+        alloy::sol! {
+            interface IEscrowOpen {
+                function open(address payee, address token, uint128 deposit, bytes32 salt, address authorizedSigner) external;
+            }
+        }
+
+        let signer = PrivateKeySigner::random();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let salt = B256::from([0xABu8; 32]);
+        let chain_id: u64 = 42431;
+
+        let open_data =
+            IEscrowOpen::openCall::new((payee, token, 1_000_000u128, salt, signer.address()))
+                .abi_encode();
+
+        let tx = TempoTransaction {
+            chain_id,
+            nonce: 0,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            calls: vec![Call {
+                to: alloy::primitives::TxKind::Call(escrow),
+                value: alloy::primitives::U256::ZERO,
+                input: Bytes::from(open_data),
+            }],
+            ..Default::default()
+        };
+
+        let sig_hash = tx.signature_hash();
+        let signature = signer.sign_hash_sync(&sig_hash).unwrap();
+        let signed_tx = tx.into_signed(signature.into());
+        let tx_bytes = signed_tx.encoded_2718();
+
+        // Compute the correct channel ID.
+        let correct_id = voucher::compute_channel_id(
+            signer.address(),
+            payee,
+            token,
+            salt,
+            signer.address(), // authorizedSigner == sender in this test
+            escrow,
+            chain_id,
+        );
+
+        // Should pass with correct channel ID.
+        assert!(
+            SessionMethod::<alloy::providers::RootProvider<TempoNetwork>>::verify_open_channel_id_binding(
+                &tx_bytes,
+                correct_id,
+                escrow,
+                chain_id,
+                payee,
+                token,
+            )
+            .is_ok()
+        );
+
+        // Should fail with a different channel ID.
+        let fake_id = B256::from([0x01u8; 32]);
+        let err = SessionMethod::<alloy::providers::RootProvider<TempoNetwork>>::verify_open_channel_id_binding(
+            &tx_bytes,
+            fake_id,
+            escrow,
+            chain_id,
+            payee,
+            token,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("does not match claimed channelId"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_open_channel_id_binding_rejects_wrong_payee_or_token() {
+        use alloy::eips::Encodable2718;
+        use alloy::primitives::Bytes;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+        use alloy::sol_types::SolCall;
+        use tempo_primitives::transaction::Call;
+        use tempo_primitives::TempoTransaction;
+
+        alloy::sol! {
+            interface IEscrowOpen {
+                function open(address payee, address token, uint128 deposit, bytes32 salt, address authorizedSigner) external;
+            }
+        }
+
+        let signer = PrivateKeySigner::random();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let wrong: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+        let salt = B256::from([0xABu8; 32]);
+        let chain_id: u64 = 42431;
+
+        let open_data =
+            IEscrowOpen::openCall::new((payee, token, 1_000_000u128, salt, signer.address()))
+                .abi_encode();
+
+        let tx = TempoTransaction {
+            chain_id,
+            nonce: 0,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            calls: vec![Call {
+                to: alloy::primitives::TxKind::Call(escrow),
+                value: alloy::primitives::U256::ZERO,
+                input: Bytes::from(open_data),
+            }],
+            ..Default::default()
+        };
+
+        let sig_hash = tx.signature_hash();
+        let signature = signer.sign_hash_sync(&sig_hash).unwrap();
+        let signed_tx = tx.into_signed(signature.into());
+        let tx_bytes = signed_tx.encoded_2718();
+
+        let correct_id = voucher::compute_channel_id(
+            signer.address(),
+            payee,
+            token,
+            salt,
+            signer.address(),
+            escrow,
+            chain_id,
+        );
+
+        let payee_err = SessionMethod::<alloy::providers::RootProvider<TempoNetwork>>::verify_open_channel_id_binding(
+            &tx_bytes,
+            correct_id,
+            escrow,
+            chain_id,
+            wrong,
+            token,
+        )
+        .unwrap_err();
+        assert!(payee_err.message.contains("payee"));
+
+        let token_err = SessionMethod::<alloy::providers::RootProvider<TempoNetwork>>::verify_open_channel_id_binding(
+            &tx_bytes,
+            correct_id,
+            escrow,
+            chain_id,
+            payee,
+            wrong,
+        )
+        .unwrap_err();
+        assert!(token_err.message.contains("token"));
+    }
+
+    /// Helper to build a SessionRequest, PaymentChallenge, and PaymentCredential
+    /// for verify_session tests. Uses the given recipient/currency in the
+    /// challenge and the given payload in the credential.
+    fn build_session_credential(
+        recipient: Option<&str>,
+        currency: &str,
+        payload: SessionCredentialPayload,
+    ) -> (
+        crate::protocol::intents::SessionRequest,
+        crate::protocol::core::PaymentCredential,
+    ) {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge, PaymentCredential};
+        use crate::protocol::intents::SessionRequest;
+
+        let request = SessionRequest {
+            amount: "1000".to_string(),
+            currency: currency.to_string(),
+            recipient: recipient.map(|s| s.to_string()),
+            method_details: Some(serde_json::json!({
+                "escrowContract": "0x5555555555555555555555555555555555555555",
+                "chainId": 42431,
+            })),
+            ..Default::default()
+        };
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "api.example.com",
+            METHOD_NAME,
+            INTENT_SESSION,
+            Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        let credential = PaymentCredential::new(challenge.to_echo(), payload);
+        (request, credential)
+    }
+
+    #[tokio::test]
+    async fn test_verify_session_rejects_missing_recipient() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let method = test_session_method(store);
+
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let (request, credential) = build_session_credential(
+            None, // missing recipient
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                cumulative_amount: "1000".to_string(),
+                signature: format!("0x{}", "aa".repeat(65)),
+            },
+        );
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("recipient"),
+            "expected missing recipient error, got: {}",
+            err.message
+        );
+    }
+
+    /// A voucher referencing a channel opened for a different payee must
+    /// be rejected to prevent cross-session channel reuse.
+    #[tokio::test]
+    async fn test_voucher_rejects_channel_with_wrong_payee() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+
+        // Store a channel whose payee is 0x2222...
+        let mut state = test_channel_state(&channel_id);
+        state.highest_voucher_amount = 500;
+        state.deposit = 100_000;
+        store.insert(&channel_id, state);
+
+        let method = test_session_method(store);
+
+        // Challenge expects recipient 0x9999... (different from stored 0x2222...)
+        let (request, credential) = build_session_credential(
+            Some("0x9999999999999999999999999999999999999999"),
+            "0x3333333333333333333333333333333333333333", // matches stored token
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                cumulative_amount: "1000".to_string(),
+                signature: format!("0x{}", "aa".repeat(65)),
+            },
+        );
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("payee"),
+            "expected payee mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    /// A voucher referencing a channel opened for a different
+    /// token/currency must be rejected to prevent cross-session channel reuse.
+    #[tokio::test]
+    async fn test_voucher_rejects_channel_with_wrong_token() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+
+        // Store a channel whose token is 0x3333...
+        let mut state = test_channel_state(&channel_id);
+        state.highest_voucher_amount = 500;
+        state.deposit = 100_000;
+        store.insert(&channel_id, state);
+
+        let method = test_session_method(store);
+
+        // Challenge expects currency 0x9999... (different from stored 0x3333...)
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"), // matches stored payee
+            "0x9999999999999999999999999999999999999999",       // wrong token
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                cumulative_amount: "1000".to_string(),
+                signature: format!("0x{}", "aa".repeat(65)),
+            },
+        );
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("token"),
+            "expected token mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    /// A close referencing a channel with a mismatched payee must be
+    /// rejected to prevent cross-session channel reuse.
+    #[tokio::test]
+    async fn test_close_rejects_channel_with_wrong_payee() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+
+        let mut state = test_channel_state(&channel_id);
+        state.highest_voucher_amount = 500;
+        state.deposit = 100_000;
+        store.insert(&channel_id, state);
+
+        let method = test_session_method(store);
+
+        let (request, credential) = build_session_credential(
+            Some("0x9999999999999999999999999999999999999999"), // wrong payee
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Close {
+                channel_id,
+                cumulative_amount: "1000".to_string(),
+                signature: format!("0x{}", "aa".repeat(65)),
+            },
+        );
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("payee"),
+            "expected payee mismatch error, got: {}",
+            err.message
+        );
+    }
+
+    /// A topUp referencing a channel with a mismatched token must be
+    /// rejected before the transaction is broadcast.
+    #[tokio::test]
+    async fn test_top_up_rejects_channel_with_wrong_token() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+
+        let mut state = test_channel_state(&channel_id);
+        state.highest_voucher_amount = 500;
+        state.deposit = 100_000;
+        store.insert(&channel_id, state);
+
+        let method = test_session_method(store);
+
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x9999999999999999999999999999999999999999", // wrong token
+            SessionCredentialPayload::TopUp {
+                payload_type: "transaction".to_string(),
+                channel_id,
+                additional_deposit: "5000".to_string(),
+                transaction: format!("0x{}", "bb".repeat(32)),
+            },
+        );
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert!(
+            err.message.contains("token"),
+            "expected token mismatch error, got: {}",
+            err.message
+        );
     }
 }

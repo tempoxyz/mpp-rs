@@ -421,8 +421,18 @@ impl PaymentProvider for TempoSessionProvider {
                 let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
                     .connect_http(self.rpc_url.clone());
 
-                if let Some(mut recovered) =
-                    try_recover_channel(&provider, escrow_contract, cid, chain_id).await
+                let expected_authorized_signer = self.authorized_signer.unwrap_or(payer);
+                if let Some(mut recovered) = try_recover_channel(
+                    &provider,
+                    escrow_contract,
+                    cid,
+                    chain_id,
+                    payer,
+                    payee,
+                    currency,
+                    expected_authorized_signer,
+                )
+                .await
                 {
                     // Start from recovered settled amount + request amount
                     recovered.cumulative_amount += amount;

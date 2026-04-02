@@ -615,6 +615,31 @@ where
                 ))
             })?;
 
+        if let Some(bound) = &self.currency {
+            if !request.currency.eq_ignore_ascii_case(bound) {
+                return Err(VerificationError::with_code(
+                    format!(
+                        "Currency mismatch: credential has {} but server expects {}",
+                        request.currency, bound
+                    ),
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        if let Some(bound) = &self.recipient {
+            let echoed = request.recipient.as_deref().unwrap_or("");
+            if !echoed.eq_ignore_ascii_case(bound) {
+                return Err(VerificationError::with_code(
+                    format!(
+                        "Recipient mismatch: credential has {} but server expects {}",
+                        echoed, bound
+                    ),
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
         let receipt = session.verify_session(credential, &request).await?;
 
         // Call respond hook — management actions (open, topUp, close) may

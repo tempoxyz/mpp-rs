@@ -379,23 +379,43 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
 
 /// Attempt to recover an existing on-chain channel.
 ///
-/// If the channel has a positive deposit and is not finalized, returns a
-/// [`ChannelEntry`] with `cumulative_amount` set to the on-chain settled
-/// amount (the safe starting point for new vouchers).
+/// If the channel has a positive deposit, is not finalized, is not pending
+/// close, matches the expected payer, payee, token, and authorized signer,
+/// returns a [`ChannelEntry`] with `cumulative_amount` set to the on-chain
+/// settled amount (the safe starting point for new vouchers).
 ///
 /// Returns `None` if the channel doesn't exist, has zero deposit,
-/// or is already finalized.
+/// is already finalized, is pending close, or doesn't match the expected
+/// payer/payee/token/authorized signer.
+#[allow(clippy::too_many_arguments)]
 pub async fn try_recover_channel<P: Provider<TempoNetwork>>(
     provider: &P,
     escrow_contract: Address,
     channel_id: B256,
     chain_id: u64,
+    expected_payer: Address,
+    expected_payee: Address,
+    expected_token: Address,
+    expected_authorized_signer: Address,
 ) -> Option<ChannelEntry> {
     let on_chain = get_on_chain_channel(provider, escrow_contract, channel_id)
         .await
         .ok()?;
 
-    if on_chain.deposit > 0 && !on_chain.finalized {
+    let actual_authorized_signer = if on_chain.authorized_signer == Address::ZERO {
+        on_chain.payer
+    } else {
+        on_chain.authorized_signer
+    };
+
+    if on_chain.deposit > 0
+        && !on_chain.finalized
+        && on_chain.close_requested_at == 0
+        && on_chain.payer == expected_payer
+        && on_chain.payee == expected_payee
+        && on_chain.token == expected_token
+        && actual_authorized_signer == expected_authorized_signer
+    {
         Some(ChannelEntry {
             channel_id,
             salt: B256::ZERO,
@@ -956,6 +976,230 @@ mod tests {
             result,
             escrow_addr.parse::<Address>().unwrap(),
             "challenge escrow should take priority over override"
+        );
+    }
+
+    /// `try_recover_channel` must reject a channel whose on-chain payer,
+    /// payee, token, or authorized signer doesn't match the expected values,
+    /// or that is pending close.
+    ///
+    /// Since `try_recover_channel` calls `get_on_chain_channel` (which does
+    /// an RPC call we can't mock here), we test the validation predicate
+    /// directly against `OnChainChannel` values — the same struct and field
+    /// comparisons used in the real function.
+
+    /// Helper: evaluates the same predicate used by `try_recover_channel`.
+    fn recovery_accepts(
+        on_chain: &OnChainChannel,
+        expected_payer: Address,
+        expected_payee: Address,
+        expected_token: Address,
+        expected_authorized_signer: Address,
+    ) -> bool {
+        let actual_authorized_signer = if on_chain.authorized_signer == Address::ZERO {
+            on_chain.payer
+        } else {
+            on_chain.authorized_signer
+        };
+        on_chain.deposit > 0
+            && !on_chain.finalized
+            && on_chain.close_requested_at == 0
+            && on_chain.payer == expected_payer
+            && on_chain.payee == expected_payee
+            && on_chain.token == expected_token
+            && actual_authorized_signer == expected_authorized_signer
+    }
+
+    #[test]
+    fn test_recovery_rejects_wrong_payer() {
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let wrong_payer: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+
+        let on_chain = OnChainChannel {
+            payer,
+            payee,
+            token,
+            authorized_signer: Address::ZERO,
+            deposit: 1_000,
+            settled: 0,
+            close_requested_at: 0,
+            finalized: false,
+        };
+
+        assert!(
+            recovery_accepts(&on_chain, payer, payee, token, payer),
+            "should accept when all fields match"
+        );
+        assert!(
+            !recovery_accepts(&on_chain, wrong_payer, payee, token, payer),
+            "should reject wrong payer"
+        );
+    }
+
+    #[test]
+    fn test_recovery_rejects_wrong_payee() {
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let wrong_payee: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+
+        let on_chain = OnChainChannel {
+            payer,
+            payee,
+            token,
+            authorized_signer: Address::ZERO,
+            deposit: 1_000,
+            settled: 0,
+            close_requested_at: 0,
+            finalized: false,
+        };
+
+        assert!(
+            !recovery_accepts(&on_chain, payer, wrong_payee, token, payer),
+            "should reject wrong payee"
+        );
+    }
+
+    #[test]
+    fn test_recovery_rejects_wrong_token() {
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let wrong_token: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+
+        let on_chain = OnChainChannel {
+            payer,
+            payee,
+            token,
+            authorized_signer: Address::ZERO,
+            deposit: 1_000,
+            settled: 0,
+            close_requested_at: 0,
+            finalized: false,
+        };
+
+        assert!(
+            !recovery_accepts(&on_chain, payer, payee, wrong_token, payer),
+            "should reject wrong token"
+        );
+    }
+
+    #[test]
+    fn test_recovery_rejects_wrong_authorized_signer() {
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let client_signer: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        let wrong_signer: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+
+        let on_chain = OnChainChannel {
+            payer,
+            payee,
+            token,
+            authorized_signer: wrong_signer,
+            deposit: 1_000,
+            settled: 0,
+            close_requested_at: 0,
+            finalized: false,
+        };
+
+        assert!(
+            !recovery_accepts(&on_chain, payer, payee, token, client_signer),
+            "should reject channel with wrong authorized_signer"
+        );
+    }
+
+    #[test]
+    fn test_recovery_accepts_zero_authorized_signer_when_payer_matches() {
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+
+        let on_chain = OnChainChannel {
+            payer,
+            payee,
+            token,
+            authorized_signer: Address::ZERO,
+            deposit: 1_000,
+            settled: 0,
+            close_requested_at: 0,
+            finalized: false,
+        };
+
+        assert!(
+            recovery_accepts(&on_chain, payer, payee, token, payer),
+            "Address::ZERO authorized_signer should normalize to payer"
+        );
+    }
+
+    #[test]
+    fn test_recovery_rejects_pending_close() {
+        let payer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let payee: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let token: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+
+        let on_chain = OnChainChannel {
+            payer,
+            payee,
+            token,
+            authorized_signer: Address::ZERO,
+            deposit: 1_000,
+            settled: 0,
+            close_requested_at: 1_700_000_000,
+            finalized: false,
+        };
+
+        assert!(
+            !recovery_accepts(&on_chain, payer, payee, token, payer),
+            "should reject channel pending close"
         );
     }
 }
