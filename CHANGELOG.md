@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.4 (2026-04-02)
+
+### Patch Changes
+
+- Bind payee and currency validation to all session actions (open, voucher, close, topUp). (by @horsefacts, [#188](https://github.com/tempoxyz/mpp-rs/pull/188))
+
 ## 0.8.3 (2026-03-31)
 
 ### Minor Changes
