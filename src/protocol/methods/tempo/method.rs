@@ -24,7 +24,7 @@
 //! ```
 
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{hex, keccak256, Address, Bytes, TxKind, B256, U256};
+use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use std::future::Future;
@@ -176,19 +176,6 @@ fn validate_fee_payer_calls(
 
     Ok(())
 }
-
-/// Parse a hex string (with or without 0x prefix) into a B256.
-fn parse_b256_hex(s: &str) -> Option<B256> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(s).ok().and_then(|bytes| {
-        if bytes.len() == 32 {
-            Some(B256::from_slice(&bytes))
-        } else {
-            None
-        }
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchedTransferLog {
     Transfer,
@@ -1059,6 +1046,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::hex;
+
     use super::{super::MODERATO_CHAIN_ID, *};
 
     #[test]
@@ -1071,40 +1060,6 @@ mod tests {
     fn test_transfer_with_memo_selector() {
         // transferWithMemo(address,uint256,bytes32) = 0x95777d59
         assert_eq!(TRANSFER_WITH_MEMO_SELECTOR, [0x95, 0x77, 0x7d, 0x59]);
-    }
-
-    #[test]
-    fn test_parse_b256_hex_valid() {
-        let valid = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let result = parse_b256_hex(valid);
-        assert!(result.is_some());
-
-        // Without 0x prefix
-        let valid_no_prefix = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let result = parse_b256_hex(valid_no_prefix);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_parse_b256_hex_invalid_length() {
-        // Too short (only 3 bytes)
-        let too_short = "0xabcdef";
-        assert!(parse_b256_hex(too_short).is_none());
-
-        // Too long (33 bytes)
-        let too_long = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef00";
-        assert!(parse_b256_hex(too_long).is_none());
-
-        // Empty
-        assert!(parse_b256_hex("").is_none());
-        assert!(parse_b256_hex("0x").is_none());
-    }
-
-    #[test]
-    fn test_parse_b256_hex_invalid_chars() {
-        // Invalid hex characters
-        let invalid = "0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
-        assert!(parse_b256_hex(invalid).is_none());
     }
 
     #[test]
@@ -1125,21 +1080,6 @@ mod tests {
                 "57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0"
             )
         );
-    }
-
-    #[test]
-    fn test_parse_b256_hex_case_insensitive() {
-        // Test case insensitivity - both should parse to the same value
-        let lower = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let upper = "0xABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890";
-        let mixed = "0xAbCdEf1234567890AbCdEf1234567890AbCdEf1234567890AbCdEf1234567890";
-
-        let lower_result = parse_b256_hex(lower).unwrap();
-        let upper_result = parse_b256_hex(upper).unwrap();
-        let mixed_result = parse_b256_hex(mixed).unwrap();
-
-        assert_eq!(lower_result, upper_result);
-        assert_eq!(lower_result, mixed_result);
     }
 
     #[test]
