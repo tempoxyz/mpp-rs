@@ -187,6 +187,35 @@ async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     })
 }
 
+/// Validate the close voucher amount against spent, on-chain settled, and deposit.
+/// Matches mppx handleClose:
+/// https://github.com/wevm/mppx/blob/c526ea6/src/tempo/server/Session.ts#L837-L846
+fn validate_close_amount(
+    cumulative_amount: u128,
+    spent: u128,
+    on_chain_settled: u128,
+    on_chain_deposit: u128,
+) -> Result<(), VerificationError> {
+    if cumulative_amount < spent {
+        return Err(VerificationError::new(format!(
+            "close voucher amount must be >= {} (spent)",
+            spent,
+        )));
+    }
+    if cumulative_amount <= on_chain_settled {
+        return Err(VerificationError::new(format!(
+            "close voucher amount must be > {} (on-chain settled)",
+            on_chain_settled,
+        )));
+    }
+    if cumulative_amount > on_chain_deposit {
+        return Err(VerificationError::amount_exceeds_deposit(
+            "close voucher amount exceeds on-chain deposit",
+        ));
+    }
+    Ok(())
+}
+
 // ==================== TempoSessionMethod ====================
 
 /// Configuration for the Tempo session method.
@@ -821,12 +850,6 @@ where
             .parse()
             .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
 
-        if cumulative_amount < channel.highest_voucher_amount {
-            return Err(VerificationError::new(
-                "close voucher amount must be >= highest accepted voucher",
-            ));
-        }
-
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
@@ -839,16 +862,13 @@ where
                 "channel is finalized on-chain",
             ));
         }
-        if cumulative_amount < on_chain.settled {
-            return Err(VerificationError::new(
-                "close voucher cumulativeAmount is below on-chain settled amount",
-            ));
-        }
-        if cumulative_amount > on_chain.deposit {
-            return Err(VerificationError::amount_exceeds_deposit(
-                "close voucher amount exceeds on-chain deposit",
-            ));
-        }
+
+        validate_close_amount(
+            cumulative_amount,
+            channel.spent,
+            on_chain.settled,
+            on_chain.deposit,
+        )?;
 
         let sig_bytes = Self::parse_signature(signature_str)?;
         let is_valid = verify_voucher(
@@ -948,10 +968,19 @@ where
                         Some(s) => s,
                         None => return Ok(None),
                     };
+                    let update_voucher = cumulative_amount > state.highest_voucher_amount;
                     Ok(Some(ChannelState {
                         deposit: on_chain.deposit,
-                        highest_voucher_amount: cumulative_amount,
-                        highest_voucher_signature: Some(sig_bytes),
+                        highest_voucher_amount: if update_voucher {
+                            cumulative_amount
+                        } else {
+                            state.highest_voucher_amount
+                        },
+                        highest_voucher_signature: if update_voucher {
+                            Some(sig_bytes)
+                        } else {
+                            state.highest_voucher_signature
+                        },
                         finalized: true,
                         ..state
                     }))
@@ -2817,5 +2846,118 @@ mod tests {
 
         // Should timeout. The default must not return immediately
         assert!(result.is_err());
+    }
+
+    // ==================== validate_close_amount tests ====================
+    // Mirror the mppx Session.test.ts close tests:
+    // https://github.com/wevm/mppx/blob/c526ea6/src/tempo/server/Session.test.ts#L1105-L1315
+
+    #[test]
+    fn test_close_accepts_voucher_at_spent_amount() {
+        // spent=500, settled=0, deposit=10_000_000
+        // close at 500 (== spent) should succeed
+        assert!(validate_close_amount(500, 500, 0, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_close_accepts_voucher_above_spent() {
+        // spent=500, settled=0, deposit=10_000_000
+        // close at 5_000_000 (well above spent) should succeed
+        assert!(validate_close_amount(5_000_000, 500, 0, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_close_accepts_voucher_above_settled() {
+        // spent=0, settled=1_000, deposit=10_000_000
+        // close at 1_001 (above settled) should succeed
+        assert!(validate_close_amount(1_001, 0, 1_000, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_close_rejects_voucher_below_spent() {
+        // spent=500_000, settled=0, deposit=10_000_000
+        // close at 100_000 (below spent) should fail
+        let err = validate_close_amount(100_000, 500_000, 0, 10_000_000).unwrap_err();
+        assert!(
+            err.message
+                .contains("close voucher amount must be >= 500000 (spent)"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_rejects_voucher_equal_to_settled() {
+        // spent=0, settled=1_000_000, deposit=10_000_000
+        // close at 1_000_000 (== settled) should fail (strict >)
+        let err = validate_close_amount(1_000_000, 0, 1_000_000, 10_000_000).unwrap_err();
+        assert!(
+            err.message
+                .contains("close voucher amount must be > 1000000 (on-chain settled)"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_rejects_voucher_below_settled() {
+        // spent=0, settled=1_000_000, deposit=10_000_000
+        // close at 500_000 (below settled) should fail
+        let err = validate_close_amount(500_000, 0, 1_000_000, 10_000_000).unwrap_err();
+        assert!(
+            err.message
+                .contains("close voucher amount must be > 1000000 (on-chain settled)"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_rejects_voucher_exceeding_deposit() {
+        // spent=0, settled=0, deposit=10_000_000
+        // close at 99_999_999 (above deposit) should fail
+        let err = validate_close_amount(99_999_999, 0, 0, 10_000_000).unwrap_err();
+        assert!(
+            err.message
+                .contains("close voucher amount exceeds on-chain deposit"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_spent_check_takes_priority_over_settled() {
+        // When both spent and settled would reject, spent error comes first
+        // spent=500_000, settled=1_000_000, deposit=10_000_000
+        // close at 100 (below both) should fail with spent error
+        let err = validate_close_amount(100, 500_000, 1_000_000, 10_000_000).unwrap_err();
+        assert!(
+            err.message.contains("(spent)"),
+            "expected spent error first, got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_at_zero_spent_zero_settled() {
+        // Edge case: nothing spent, nothing settled, close at 1 should succeed
+        assert!(validate_close_amount(1, 0, 0, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_close_at_zero_rejects_when_zero_settled() {
+        // close at 0 with settled=0: 0 <= 0 is true, so rejected
+        let err = validate_close_amount(0, 0, 0, 10_000_000).unwrap_err();
+        assert!(
+            err.message.contains("on-chain settled"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_at_exact_deposit() {
+        // close at deposit boundary should succeed
+        assert!(validate_close_amount(10_000_000, 0, 0, 10_000_000).is_ok());
     }
 }
