@@ -98,6 +98,7 @@ impl TempoChargeExt for ChargeRequest {
             .as_ref()
             .and_then(|v| v.get("memo"))
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
 
@@ -119,6 +120,9 @@ fn parse_memo_bytes_in_context(memo: Option<&str>, context: &str) -> Result<Opti
     let Some(memo) = memo else {
         return Ok(None);
     };
+    if memo.is_empty() {
+        return Ok(None);
+    }
 
     let hex_str = memo.strip_prefix("0x").unwrap_or(memo);
     let bytes = hex::decode(hex_str)
@@ -218,6 +222,20 @@ mod tests {
             req_with_memo.memo(),
             Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string())
         );
+
+        let req_with_empty_memo = ChargeRequest {
+            method_details: Some(serde_json::json!({
+                "chainId": 42431,
+                "memo": ""
+            })),
+            ..test_charge_request()
+        };
+        assert!(req_with_empty_memo.memo().is_none());
+    }
+
+    #[test]
+    fn test_parse_memo_bytes_checked_treats_empty_as_none() {
+        assert!(parse_memo_bytes_checked(Some("")).unwrap().is_none());
     }
 
     #[test]

@@ -292,12 +292,12 @@ fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferL
     }
 
     if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC {
-        if data.len() < 130 {
+        if topics.len() < 4 || data.len() < 66 {
             return None;
         }
 
         let amount = U256::from_str_radix(&data[2..66], 16).ok()?;
-        let memo = parse_b256_hex(&data[66..130]).map(|bytes| bytes.0)?;
+        let memo = topics[3].parse::<B256>().ok().map(|bytes| bytes.0)?;
         return Some(ParsedTransferLog::Memo {
             address,
             amount,
@@ -1343,8 +1343,9 @@ mod tests {
                 format!("{:#x}", TRANSFER_WITH_MEMO_EVENT_TOPIC),
                 address_topic(from),
                 address_topic(to),
+                format!("0x{}", hex::encode(memo)),
             ],
-            "data": format!("0x{}{}", amount_data(amount), hex::encode(memo)),
+            "data": format!("0x{}", amount_data(amount)),
         })
     }
 

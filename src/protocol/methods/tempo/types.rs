@@ -102,7 +102,7 @@ impl TempoMethodDetails {
 
     /// Get the memo as a reference, if present.
     pub fn memo(&self) -> Option<&str> {
-        self.memo.as_deref()
+        self.memo.as_deref().filter(|memo| !memo.is_empty())
     }
 }
 
@@ -165,6 +165,12 @@ mod tests {
             details_with_memo.memo(),
             Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
         );
+
+        let details_with_empty_memo = TempoMethodDetails {
+            memo: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(details_with_empty_memo.memo().is_none());
     }
 
     #[test]
