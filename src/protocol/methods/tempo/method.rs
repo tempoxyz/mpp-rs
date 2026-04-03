@@ -336,7 +336,7 @@ fn match_receipt_transfer_logs(
             ));
         }
 
-        let mut find_match = |prefer_memo: bool| {
+        let find_match = |prefer_memo: bool| {
             for (log_idx, parsed) in parsed_logs.iter().enumerate() {
                 if used_logs[log_idx] {
                     continue;
