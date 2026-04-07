@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 (2026-04-07)
+
+### Minor Changes
+
+- Added zero-amount proof credential support for identity flows. Introduced a new `PayloadType::Proof` variant with EIP-712 signing via a new `proof` module, enabling clients to authenticate without sending a blockchain transaction. Updated `TempoCharge`, `TempoProvider`, and server-side verification to handle zero-amount challenges with signed proofs. (by @BrendanRyan, [#182](https://github.com/tempoxyz/mpp-rs/pull/182))
+
 ## 0.8.4 (2026-04-02)
 
 ### Patch Changes
