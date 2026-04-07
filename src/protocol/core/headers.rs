@@ -315,7 +315,9 @@ pub fn parse_www_authenticate_all<'a>(
 /// returns the individual challenge strings.
 fn split_payment_challenges(header: &str) -> Vec<&str> {
     fn is_valid_start(header: &str, pos: usize) -> bool {
-        pos == 0 || header[..pos].bytes().rfind(|b| !b.is_ascii_whitespace()) == Some(b',')
+        pos == 0
+            || header[..pos].bytes().all(|b| b.is_ascii_whitespace())
+            || header[..pos].bytes().rfind(|b| !b.is_ascii_whitespace()) == Some(b',')
     }
 
     let lower = header.to_ascii_lowercase();
@@ -615,7 +617,7 @@ mod tests {
     fn test_split_payment_schemes_ignores_quoted() {
         // "Payment" inside a quoted value should NOT be treated as a boundary
         let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", description="Payment required""#;
-        let schemes = split_payment_schemes(header);
+        let schemes = split_payment_challenges(header);
         assert_eq!(schemes.len(), 1);
     }
 
@@ -624,7 +626,7 @@ mod tests {
         // Headers with leading whitespace must still be recognized
         let header =
             r#"  Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
-        let schemes = split_payment_schemes(header);
+        let schemes = split_payment_challenges(header);
         assert_eq!(schemes.len(), 1);
         let challenge = parse_www_authenticate(schemes[0]).unwrap();
         assert_eq!(challenge.id, "a");
