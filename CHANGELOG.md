@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.1 (2026-04-07)
+
+### Patch Changes
+
+- Enforced fail-closed behavior for the `expires` field in `verify_hmac_and_expiry`. Credentials missing the `expires` field are now rejected with a `CredentialMismatch` error instead of being silently accepted. Session challenges now include a default expiry. (by @EvanChipman, [#194](https://github.com/tempoxyz/mpp-rs/pull/194))
+- Fixed busy loop in `serve()` caused by default `wait_for_update()` returning immediately instead of pending. (by @EvanChipman, [#194](https://github.com/tempoxyz/mpp-rs/pull/194))
+
 ## 0.9.0 (2026-04-07)
 
 ### Minor Changes
