@@ -21,6 +21,7 @@
 
 - Enforced fail-closed behavior for the `expires` field in `verify_hmac_and_expiry`. Credentials missing the `expires` field are now rejected with a `CredentialMismatch` error instead of being silently accepted. Session challenges now include a default expiry. (by @EvanChipman, [#194](https://github.com/tempoxyz/mpp-rs/pull/194))
 - Fixed busy loop in `serve()` caused by default `wait_for_update()` returning immediately instead of pending. (by @EvanChipman, [#194](https://github.com/tempoxyz/mpp-rs/pull/194))
+- Fixed `split_payment_challenges` to handle leading whitespace in header values. Added tests for merged comma-separated challenges and quoted `"Payment"` boundaries. (by @stevencartavia, [#170](https://github.com/tempoxyz/mpp-rs/pull/170))
 
 ## 0.9.0 (2026-04-07)
 
