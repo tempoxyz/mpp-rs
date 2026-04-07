@@ -88,7 +88,7 @@ pub trait ChannelStore: Send + Sync {
         &self,
         _channel_id: &str,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
+        Box::pin(std::future::pending())
     }
 }
 
@@ -2768,5 +2768,54 @@ mod tests {
             "expected token mismatch error, got: {}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn test_default_wait_for_update_does_not_complete_immediately() {
+        use std::time::Duration;
+        // A minimal ChannelStore that only implements required methods,
+        // relying on the default wait_for_update
+        struct PollOnlyStore;
+        impl ChannelStore for PollOnlyStore {
+            fn get_channel(
+                &self,
+                _channel_id: &str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ChannelState>, VerificationError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                unimplemented!()
+            }
+
+            fn update_channel(
+                &self,
+                _channel_id: &str,
+                _updater: Box<
+                    dyn FnOnce(
+                            Option<ChannelState>,
+                        )
+                            -> Result<Option<ChannelState>, VerificationError>
+                        + Send,
+                >,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ChannelState>, VerificationError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                unimplemented!()
+            }
+        }
+
+        let store = PollOnlyStore;
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), store.wait_for_update("any")).await;
+
+        // Should timeout. The default must not return immediately
+        assert!(result.is_err());
     }
 }
