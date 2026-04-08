@@ -13,6 +13,8 @@
 //!
 //! The server listens on `http://localhost:3000`.
 
+use alloy::primitives::B256;
+use alloy::providers::{Provider, ProviderBuilder};
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -20,8 +22,6 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use alloy::primitives::B256;
-use alloy::providers::{Provider, ProviderBuilder};
 use mpp::server::{tempo, Mpp, TempoChargeMethod, TempoConfig};
 use mpp::{format_www_authenticate, parse_authorization, PrivateKeySigner};
 use rand::seq::IndexedRandom;
@@ -49,12 +49,12 @@ async fn main() {
     let recipient = format!("{}", signer.address());
     println!("Server recipient: {recipient}");
 
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string());
+    let rpc_url =
+        std::env::var("RPC_URL").unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string());
 
     // Fund the server account via testnet faucet.
-    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(rpc_url.parse().unwrap());
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc_url.parse().unwrap());
     let _: Vec<B256> = provider
         .raw_request("tempo_fundAddress".into(), (signer.address(),))
         .await
@@ -96,10 +96,7 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn ping(
-    State(payment): State<Arc<Payment>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn ping(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Ok(credential) = parse_authorization(auth_str) {
@@ -144,10 +141,7 @@ async fn ping(
     }
 }
 
-async fn fortune(
-    State(payment): State<Arc<Payment>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn fortune(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl IntoResponse {
     // Check for payment credential in Authorization header
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {

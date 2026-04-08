@@ -35,21 +35,20 @@ async fn main() {
         }
     };
 
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string());
+    let rpc_url =
+        std::env::var("RPC_URL").unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string());
 
     // Fund via testnet faucet.
     println!("Funding account via faucet...");
-    let rpc_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(rpc_url.parse().unwrap());
+    let rpc_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc_url.parse().unwrap());
     let _: Vec<B256> = rpc_provider
         .raw_request("tempo_fundAddress".into(), (signer.address(),))
         .await
         .expect("faucet funding failed");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let provider =
-        TempoProvider::new(signer, &rpc_url).expect("failed to create payment provider");
+    let provider = TempoProvider::new(signer, &rpc_url).expect("failed to create payment provider");
 
     let base_url =
         std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());

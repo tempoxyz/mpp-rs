@@ -9,6 +9,8 @@
 //! cargo run --bin session-server
 //! ```
 
+use alloy::primitives::B256;
+use alloy::providers::{Provider, ProviderBuilder};
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -16,12 +18,10 @@ use axum::{
     routing::get,
     Router,
 };
-use alloy::primitives::B256;
-use alloy::providers::{Provider, ProviderBuilder};
 use mpp::client::channel_ops::default_escrow_contract;
 use mpp::server::{
-    Mpp, SessionChallengeOptions, SessionChannelStore, SessionMethodConfig,
-    TempoChargeMethod, TempoSessionMethod, tempo, TempoConfig,
+    tempo, Mpp, SessionChallengeOptions, SessionChannelStore, SessionMethodConfig,
+    TempoChargeMethod, TempoConfig, TempoSessionMethod,
 };
 use mpp::{parse_authorization, PaymentCredential, PrivateKeySigner};
 use std::sync::Arc;
@@ -50,8 +50,8 @@ async fn main() {
     println!("Server recipient: {recipient}");
 
     // Fund the server account via testnet faucet.
-    let faucet_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(RPC_URL.parse().unwrap());
+    let faucet_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(RPC_URL.parse().unwrap());
     let _: Vec<B256> = faucet_provider
         .raw_request("tempo_fundAddress".into(), (signer.address(),))
         .await

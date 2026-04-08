@@ -51,8 +51,7 @@ struct AppState {
 async fn main() {
     let secret_key =
         std::env::var("STRIPE_SECRET_KEY").expect("STRIPE_SECRET_KEY env var required");
-    let network_id =
-        std::env::var("STRIPE_NETWORK_ID").unwrap_or_else(|_| "internal".to_string());
+    let network_id = std::env::var("STRIPE_NETWORK_ID").unwrap_or_else(|_| "internal".to_string());
 
     let payment = Mpp::create_stripe(
         stripe(StripeConfig {
@@ -109,8 +108,10 @@ async fn create_spt(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateSptRequest>,
 ) -> impl IntoResponse {
-    let auth_value =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{}:", state.stripe_secret_key));
+    let auth_value = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("{}:", state.stripe_secret_key),
+    );
 
     let params = [
         ("payment_method", body.payment_method),
@@ -151,10 +152,7 @@ async fn create_spt(
     }
 }
 
-async fn fortune(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn fortune(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     // Check for payment credential in Authorization header
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {

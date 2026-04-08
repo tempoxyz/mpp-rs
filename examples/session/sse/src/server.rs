@@ -9,6 +9,8 @@
 //! cargo run --bin sse-server
 //! ```
 
+use alloy::primitives::B256;
+use alloy::providers::{Provider, ProviderBuilder};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -18,13 +20,11 @@ use axum::{
     Router,
 };
 use futures::stream;
-use mpp::server::{
-    Mpp, SessionChannelStore, SessionChallengeOptions, TempoChargeMethod, TempoSessionMethod,
-    tempo, TempoConfig, SessionMethodConfig,
-};
-use alloy::primitives::B256;
-use alloy::providers::{Provider, ProviderBuilder};
 use mpp::client::channel_ops::default_escrow_contract;
+use mpp::server::{
+    tempo, Mpp, SessionChallengeOptions, SessionChannelStore, SessionMethodConfig,
+    TempoChargeMethod, TempoConfig, TempoSessionMethod,
+};
 use mpp::{parse_authorization, PaymentCredential, PrivateKeySigner};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -63,8 +63,8 @@ async fn main() {
     println!("Server recipient: {}", recipient);
 
     // Fund the server account via testnet faucet.
-    let faucet_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(RPC_URL.parse().unwrap());
+    let faucet_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(RPC_URL.parse().unwrap());
     let _: Vec<B256> = faucet_provider
         .raw_request("tempo_fundAddress".into(), (signer.address(),))
         .await
@@ -159,23 +159,22 @@ async fn chat(
         Ok(r) => r,
         Err(e) => {
             eprintln!("[server] session verification failed: {}", e);
-            return (StatusCode::BAD_REQUEST, format!("Verification failed: {}", e))
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Verification failed: {}", e),
+            )
                 .into_response();
         }
     };
 
     // If management response (open/close/topUp), return it directly.
     if let Some(mgmt) = result.management_response {
-        let receipt_header = result
-            .receipt
-            .to_header()
-            .unwrap_or_else(|_| String::new());
+        let receipt_header = result.receipt.to_header().unwrap_or_else(|_| String::new());
         let body = serde_json::to_string(&mgmt).unwrap_or_else(|_| "{}".to_string());
         let mut response = (StatusCode::OK, body).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        );
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         response.headers_mut().insert(
             axum::http::HeaderName::from_static("payment-receipt"),
             axum::http::HeaderValue::from_str(&receipt_header).unwrap(),

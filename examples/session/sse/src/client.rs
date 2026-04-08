@@ -48,8 +48,8 @@ async fn main() {
 
     // Fund the client account via testnet faucet.
     println!("Funding account via faucet...");
-    let faucet_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(RPC_URL.parse().unwrap());
+    let faucet_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(RPC_URL.parse().unwrap());
     let _: Vec<B256> = faucet_provider
         .raw_request("tempo_fundAddress".into(), (signer_address,))
         .await
@@ -67,7 +67,10 @@ async fn main() {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         balance_before = erc20.balanceOf(signer_address).call().await.unwrap();
     }
-    println!("Balance: {} pathUSD", balance_before.to::<u128>() as f64 / 1e6);
+    println!(
+        "Balance: {} pathUSD",
+        balance_before.to::<u128>() as f64 / 1e6
+    );
 
     // Create a session provider with max deposit of 1 pathUSD (1_000_000 base units).
     let provider = TempoSessionProvider::new(signer, RPC_URL)
@@ -109,11 +112,16 @@ async fn main() {
         }
     };
 
-    if let Some(r) = open_resp.headers().get("payment-receipt")
+    if let Some(r) = open_resp
+        .headers()
+        .get("payment-receipt")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| parse_receipt(s).ok())
     {
-        println!("Open channel tx: https://explore.moderato.tempo.xyz/tx/{}", r.reference);
+        println!(
+            "Open channel tx: https://explore.moderato.tempo.xyz/tx/{}",
+            r.reference
+        );
     }
     let open_status = open_resp.status();
     if !open_status.is_success() {
@@ -204,7 +212,10 @@ async fn main() {
     let close_url = format!("{}/api/chat", base_url);
     match provider.close(&client, &close_url).await {
         Ok(Some(receipt)) => {
-            println!("  Channel settled: https://explore.moderato.tempo.xyz/tx/{}", receipt.reference);
+            println!(
+                "  Channel settled: https://explore.moderato.tempo.xyz/tx/{}",
+                receipt.reference
+            );
         }
         Ok(None) => {
             println!("  Close sent (no receipt returned)");
@@ -220,8 +231,10 @@ async fn main() {
     let balance_after = erc20.balanceOf(signer_address).call().await.unwrap();
     let balance_before_f64 = balance_before.to::<u128>() as f64 / 1e6;
     let balance_after_f64 = balance_after.to::<u128>() as f64 / 1e6;
-    let total_spent =
-        balance_before.to::<u128>().saturating_sub(balance_after.to::<u128>()) as f64 / 1e6;
+    let total_spent = balance_before
+        .to::<u128>()
+        .saturating_sub(balance_after.to::<u128>()) as f64
+        / 1e6;
     println!("\n--- Summary ---");
     println!("  Tokens streamed: {token_count}");
     println!("  Voucher total:   {cumulative:.6} pathUSD");

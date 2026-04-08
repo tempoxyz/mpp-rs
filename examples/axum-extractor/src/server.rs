@@ -14,9 +14,9 @@
 //!
 //! The server listens on `http://localhost:3000`.
 
-use axum::{routing::get, Json, Router};
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder};
+use axum::{routing::get, Json, Router};
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};
 use mpp::server::{tempo, Mpp, TempoConfig};
 use mpp::PrivateKeySigner;
@@ -70,12 +70,12 @@ async fn main() {
     let recipient = format!("{}", signer.address());
     println!("Server recipient: {recipient}");
 
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string());
+    let rpc_url =
+        std::env::var("RPC_URL").unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string());
 
     // Fund the server account via testnet faucet.
-    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(rpc_url.parse().unwrap());
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc_url.parse().unwrap());
     let _: Vec<B256> = provider
         .raw_request("tempo_fundAddress".into(), (signer.address(),))
         .await
@@ -126,9 +126,7 @@ async fn fortune(charge: MppCharge<OneCent>) -> WithReceipt<Json<serde_json::Val
     }
 }
 
-async fn premium_fortune(
-    charge: MppCharge<OneDollar>,
-) -> WithReceipt<Json<serde_json::Value>> {
+async fn premium_fortune(charge: MppCharge<OneDollar>) -> WithReceipt<Json<serde_json::Value>> {
     let fortune = PREMIUM_FORTUNES
         .choose(&mut rand::rng())
         .unwrap_or(&"The stars are silent.");

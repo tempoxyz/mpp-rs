@@ -51,8 +51,8 @@ async fn main() {
 
     // Fund the client account via testnet faucet.
     println!("Funding account via faucet...");
-    let faucet_provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-        .connect_http(RPC_URL.parse().unwrap());
+    let faucet_provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(RPC_URL.parse().unwrap());
     let _: Vec<B256> = faucet_provider
         .raw_request("tempo_fundAddress".into(), (signer_address,))
         .await
@@ -94,23 +94,29 @@ async fn main() {
         let url = format!("https://example.com/page/{i}");
         let request_url = format!("{base_url}/api/scrape?url={}", urlencoding(&url));
 
-        let response = client
-            .get(&request_url)
-            .send_with_payment(&session)
-            .await;
+        let response = client.get(&request_url).send_with_payment(&session).await;
 
         match response {
             Ok(resp) => {
                 if !resp.status().is_success() {
-                    eprintln!("Error: {} — {}", resp.status(), resp.text().await.unwrap_or_default());
+                    eprintln!(
+                        "Error: {} — {}",
+                        resp.status(),
+                        resp.text().await.unwrap_or_default()
+                    );
                     return;
                 }
                 if i == 1 {
-                    if let Some(r) = resp.headers().get("payment-receipt")
+                    if let Some(r) = resp
+                        .headers()
+                        .get("payment-receipt")
                         .and_then(|h| h.to_str().ok())
                         .and_then(|s| parse_receipt(s).ok())
                     {
-                        println!("  Open channel tx: https://explore.moderato.tempo.xyz/tx/{}", r.reference);
+                        println!(
+                            "  Open channel tx: https://explore.moderato.tempo.xyz/tx/{}",
+                            r.reference
+                        );
                     }
                 }
                 let _body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -134,7 +140,10 @@ async fn main() {
     let close_url = format!("{base_url}/api/scrape");
     match session.close(&client, &close_url).await {
         Ok(Some(receipt)) => {
-            println!("  Channel settled: https://explore.moderato.tempo.xyz/tx/{}", receipt.reference);
+            println!(
+                "  Channel settled: https://explore.moderato.tempo.xyz/tx/{}",
+                receipt.reference
+            );
         }
         Ok(None) => {
             println!("  No active channel to close");
@@ -149,8 +158,10 @@ async fn main() {
 
     let balance_after = erc20.balanceOf(signer_address).call().await.unwrap();
     let balance_after_f64 = balance_after.to::<u128>() as f64 / 1e6;
-    let total_spent =
-        balance_before.to::<u128>().saturating_sub(balance_after.to::<u128>()) as f64 / 1e6;
+    let total_spent = balance_before
+        .to::<u128>()
+        .saturating_sub(balance_after.to::<u128>()) as f64
+        / 1e6;
     println!("\n--- Summary ---");
     println!("  Pages scraped:   {PAGE_COUNT}");
     println!("  Voucher total:   {cumulative:.2} pathUSD");
