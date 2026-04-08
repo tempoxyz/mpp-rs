@@ -359,7 +359,9 @@ mod tests {
             limits: Some(vec![TokenLimit {
                 token: Address::repeat_byte(0x33),
                 limit: U256::from(1_000_000u64),
+                period: 0,
             }]),
+            allowed_calls: None,
         };
         let inner_sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         auth.into_signed(PrimitiveSignature::Secp256k1(inner_sig))

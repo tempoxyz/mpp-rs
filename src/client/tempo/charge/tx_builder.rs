@@ -302,6 +302,7 @@ mod tests {
             key_id: signer.address(),
             expiry: Some(9999999999),
             limits: None,
+            allowed_calls: None,
         };
         let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         let signed_auth = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
