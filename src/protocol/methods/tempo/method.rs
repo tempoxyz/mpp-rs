@@ -2168,4 +2168,139 @@ mod tests {
         let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
         assert!(seen.is_some(), "original hash should still be recorded");
     }
+
+    // ==================== sendRawTransactionSync tests ====================
+
+    #[test]
+    fn test_raw_hex_encoding_format() {
+        // broadcast_transaction encodes tx bytes as "0x" + hex for the
+        // eth_sendRawTransactionSync RPC call. Verify the format matches
+        // what Tempo nodes expect.
+        let tx_bytes: Vec<u8> = vec![0x76, 0xab, 0xcd, 0xef];
+        let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&tx_bytes));
+        assert_eq!(raw_hex, "0x76abcdef");
+        assert!(raw_hex.starts_with("0x"), "must have 0x prefix");
+    }
+
+    #[test]
+    fn test_raw_hex_encoding_empty_bytes() {
+        let tx_bytes: Vec<u8> = vec![];
+        let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&tx_bytes));
+        assert_eq!(raw_hex, "0x");
+    }
+
+    #[test]
+    fn test_raw_hex_encoding_roundtrip() {
+        // Verify that hex encoding of arbitrary tx bytes can be decoded back
+        let original: Vec<u8> = (0..=255).collect();
+        let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&original));
+        let decoded = alloy::primitives::hex::decode(&raw_hex[2..]).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_tempo_transaction_receipt_deserializes_from_rpc_json() {
+        // eth_sendRawTransactionSync returns a full receipt JSON object.
+        // Verify that TempoTransactionReceipt can deserialize a typical
+        // Tempo receipt (matching the format Tempo nodes return).
+        use tempo_alloy::rpc::TempoTransactionReceipt;
+
+        let receipt_json = serde_json::json!({
+            "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "blockNumber": "0x1",
+            "contractAddress": null,
+            "cumulativeGasUsed": "0x5208",
+            "effectiveGasPrice": "0x3b9aca00",
+            "from": "0x742d35cc6634c0532925a3b844bc9e7595f1b0f2",
+            "gasUsed": "0x5208",
+            "logs": [],
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "status": "0x1",
+            "to": "0x20c0000000000000000000000000000000000000",
+            "transactionHash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "transactionIndex": "0x0",
+            "type": "0x76",
+            "feePayer": "0x742d35cc6634c0532925a3b844bc9e7595f1b0f2"
+        });
+
+        let receipt: TempoTransactionReceipt =
+            serde_json::from_value(receipt_json).expect("receipt should deserialize");
+
+        use alloy::network::ReceiptResponse;
+        assert!(receipt.status(), "receipt should indicate success");
+        assert_eq!(
+            format!("{:#x}", receipt.transaction_hash()),
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+        assert_eq!(receipt.gas_used(), 0x5208);
+    }
+
+    #[test]
+    fn test_tempo_transaction_receipt_reverted_status() {
+        use tempo_alloy::rpc::TempoTransactionReceipt;
+
+        let receipt_json = serde_json::json!({
+            "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "blockNumber": "0x1",
+            "contractAddress": null,
+            "cumulativeGasUsed": "0x5208",
+            "effectiveGasPrice": "0x3b9aca00",
+            "from": "0x742d35cc6634c0532925a3b844bc9e7595f1b0f2",
+            "gasUsed": "0x5208",
+            "logs": [],
+            "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "status": "0x0",
+            "to": "0x20c0000000000000000000000000000000000000",
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "transactionIndex": "0x0",
+            "type": "0x76",
+            "feePayer": "0x742d35cc6634c0532925a3b844bc9e7595f1b0f2"
+        });
+
+        let receipt: TempoTransactionReceipt =
+            serde_json::from_value(receipt_json).expect("receipt should deserialize");
+
+        use alloy::network::ReceiptResponse;
+        assert!(
+            !receipt.status(),
+            "reverted receipt should indicate failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_transaction_uses_sync_rpc() {
+        // Verify that broadcast_transaction fails with a network error
+        // (not a type/deserialization error) when the RPC is unreachable,
+        // confirming it attempts the raw_request call correctly.
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let request = test_charge_request_with_amount("10000");
+        let signed_tx = encode_signed_tx(
+            vec![tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x20)),
+                value: U256::ZERO,
+                input: make_transfer_input(
+                    "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"
+                        .parse()
+                        .unwrap(),
+                    U256::from(10000u64),
+                ),
+            }],
+            100_000,
+        );
+        let hex_tx = format!("0x{}", hex::encode(&signed_tx));
+
+        let result = method
+            .broadcast_transaction(&hex_tx, &request, CHAIN_ID)
+            .await;
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to broadcast"),
+            "should fail with broadcast error, got: {}",
+            err
+        );
+    }
 }
