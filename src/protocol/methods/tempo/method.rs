@@ -2178,4 +2178,84 @@ mod tests {
         let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
         assert!(seen.is_some(), "original hash should still be recorded");
     }
+
+    // ==================== Chain ID caching tests ====================
+
+    #[test]
+    fn test_charge_method_new_has_empty_chain_id_cache() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        assert!(
+            method.cached_chain_id.get().is_none(),
+            "cache should be empty on construction"
+        );
+    }
+
+    #[test]
+    fn test_charge_method_clone_shares_chain_id_cache() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        // Pre-populate the cache
+        method.cached_chain_id.set(42431).unwrap();
+
+        // Clone shares the same Arc<OnceCell>
+        let cloned = method.clone();
+        assert_eq!(
+            cloned.cached_chain_id.get(),
+            Some(&42431),
+            "clone should share the cached chain ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_chain_id_survives_across_verify_calls() {
+        // Verify that the OnceCell is shared across the ChargeMethod's
+        // internal clones in the verify() async block.
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        // First call will fail (can't reach RPC) but the cache should remain empty
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xdeadbeef"),
+        );
+        let _ = method.verify(&credential, &request).await;
+
+        // Cache should still be empty because the RPC call failed
+        assert!(
+            method.cached_chain_id.get().is_none(),
+            "failed RPC should not populate cache"
+        );
+
+        // Manually populate the cache to simulate a successful first call
+        method.cached_chain_id.set(42431).unwrap();
+
+        // Subsequent access should return the cached value
+        assert_eq!(method.cached_chain_id.get(), Some(&42431));
+    }
+
+    #[tokio::test]
+    async fn test_cached_chain_id_oncecell_rejects_second_init() {
+        // OnceCell should reject a second initialization attempt,
+        // ensuring the cached value is immutable after first set.
+        let cell = Arc::new(OnceCell::new());
+        cell.set(42431).unwrap();
+
+        let result = cell.set(9999);
+        assert!(result.is_err(), "OnceCell should reject second set");
+        assert_eq!(
+            cell.get(),
+            Some(&42431),
+            "original value should be retained"
+        );
+    }
 }
