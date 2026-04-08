@@ -803,16 +803,18 @@ where
                 .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
         }
 
-        let pending = self
+        // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
+        // receipt. The Tempo node holds the connection open until the transaction
+        // is mined/pre-confirmed and returns the full receipt, avoiding the
+        // client-side polling loop of send_raw_transaction + get_receipt.
+        let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&final_tx_bytes));
+        let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
             .provider
-            .send_raw_transaction(&final_tx_bytes)
+            .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
             .await
-            .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
-
-        // Wait for transaction to be mined
-        let receipt = pending.get_receipt().await.map_err(|e| {
-            VerificationError::network_error(format!("Failed to get receipt: {}", e))
-        })?;
+            .map_err(|e| {
+                VerificationError::network_error(format!("Failed to broadcast: {}", e))
+            })?;
 
         if !receipt.status() {
             return Err(VerificationError::transaction_failed(format!(
