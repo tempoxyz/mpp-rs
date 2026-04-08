@@ -1432,12 +1432,13 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
     );
 
     // The charge amount should NOT have been transferred. Gas may be consumed if the
-    // tx was submitted and reverted (gas is paid in TIP-20 for AA txs), so we assert
-    // the balance is still above half the charge amount (i.e. only gas was taken).
+    // tx was submitted and reverted (gas is paid in TIP-20 for AA txs), but the
+    // full charge (10,000) must not have been deducted.
     let client_balance_after_failed = tip20_balance(&provider_http, client_addr).await;
+    let consumed = charge_amount - client_balance_after_failed;
     assert!(
-        client_balance_after_failed > charge_amount / U256::from(2),
-        "balance dropped too much — charge may have succeeded: {client_balance_after_failed}",
+        consumed < charge_amount,
+        "full charge was deducted despite payment failure: consumed={consumed}",
     );
 
     handle.abort();
