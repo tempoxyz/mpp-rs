@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.2 (2026-04-08)
+
+### Patch Changes
+
+- Cache chain ID in `ChargeMethod` to avoid a redundant `eth_getChainId` RPC call (~270ms) on every `verify()` invocation. The chain ID is fetched once on the first call and reused for all subsequent verifications. (by @BrendanRyan, [#198](https://github.com/tempoxyz/mpp-rs/pull/198))
+- Use `eth_sendRawTransactionSync` (EIP-7966) instead of `eth_sendRawTransaction` + polling for receipt. The Tempo node returns the full receipt in a single blocking call, eliminating the client-side polling loop and reducing broadcast latency from 0.5–7.5s to ~500ms. (by @BrendanRyan, [#198](https://github.com/tempoxyz/mpp-rs/pull/198))
+
 ## 0.9.1 (2026-04-07)
 
 ### Patch Changes
