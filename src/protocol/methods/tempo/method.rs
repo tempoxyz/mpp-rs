@@ -31,6 +31,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
 use tempo_alloy::TempoNetwork;
+use tokio::sync::OnceCell;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
@@ -444,6 +445,7 @@ pub struct ChargeMethod<P> {
     provider: Arc<P>,
     fee_payer_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
     store: Option<Arc<dyn Store>>,
+    cached_chain_id: Arc<OnceCell<u64>>,
 }
 
 impl<P> ChargeMethod<P>
@@ -459,6 +461,7 @@ where
             provider: Arc::new(provider),
             fee_payer_signer: None,
             store: None,
+            cached_chain_id: Arc::new(OnceCell::new()),
         }
     }
 
@@ -977,12 +980,14 @@ where
         let provider = Arc::clone(&self.provider);
         let fee_payer_signer = self.fee_payer_signer.clone();
         let store = self.store.clone();
+        let cached_chain_id = Arc::clone(&self.cached_chain_id);
 
         async move {
             let this = ChargeMethod {
                 provider,
                 fee_payer_signer,
                 store,
+                cached_chain_id,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -999,9 +1004,17 @@ where
             }
 
             let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
-            let actual_chain_id = this.provider.get_chain_id().await.map_err(|e| {
-                VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
-            })?;
+            let actual_chain_id = *this
+                .cached_chain_id
+                .get_or_try_init(|| async {
+                    this.provider.get_chain_id().await.map_err(|e| {
+                        VerificationError::network_error(format!(
+                            "Failed to fetch chain ID: {}",
+                            e
+                        ))
+                    })
+                })
+                .await?;
 
             if actual_chain_id != expected_chain_id {
                 return Err(VerificationError::chain_id_mismatch(format!(
