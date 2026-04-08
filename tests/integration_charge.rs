@@ -1443,6 +1443,13 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
     handle.abort();
     let _ = handle.await;
 
+    // Re-fund the client: Case 1 may have consumed gas (TIP-20), leaving the
+    // balance below the charge amount.
+    let shortfall = charge_amount.saturating_sub(tip20_balance(&provider_http, client_addr).await);
+    if shortfall > U256::ZERO {
+        fund_account_amount(&rpc, client_addr, shortfall).await;
+    }
+
     // --- Case 2: Fee payer enabled → should succeed.
     let mpp_fp = Mpp::create(
         tempo(TempoConfig {
