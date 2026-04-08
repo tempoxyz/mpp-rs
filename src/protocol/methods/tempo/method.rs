@@ -812,9 +812,7 @@ where
             .provider
             .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
             .await
-            .map_err(|e| {
-                VerificationError::network_error(format!("Failed to broadcast: {}", e))
-            })?;
+            .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
 
         if !receipt.status() {
             return Err(VerificationError::transaction_failed(format!(
