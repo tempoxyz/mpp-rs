@@ -14,6 +14,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions: {}
+
 jobs:
   lint:
     name: Lint
@@ -21,25 +23,25 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.ref || '' }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo update -p native-tls
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-features -- -D warnings
       - name: Run Tempo Lints
-        uses: tempoxyz/lints@main
+        uses: tempoxyz/lints@8af5001866a36967523ece2b8cdc33ba719aad84 # main
         with:
           language: rust
           path: "."
           post-comment: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install ast-grep
-        uses: jaxxstorm/action-install-gh-release@v1
+        uses: jaxxstorm/action-install-gh-release@cd6b2b78ad38bdd294341cda064ec0692b06215b # v1
         with:
           repo: ast-grep/ast-grep
           tag: "0.37.0"
@@ -54,13 +56,13 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs.ref || '' }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo update -p native-tls
-      - uses: taiki-e/install-action@cargo-hack
+      - uses: taiki-e/install-action@dffee21ba64c128096855f01c56682d6f8a2bd29 # cargo-hack
       - name: Tests
         run: cargo test --features tempo,stripe,server,client,axum,middleware,tower,utils,integration-stripe
         env:

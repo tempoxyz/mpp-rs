@@ -12,14 +12,14 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Install Claude CLI
-        run: npm install -g @anthropic-ai/claude-code
+        run: npm install -g @anthropic-ai/claude-code@2.1.96
       - name: Check changelog
-        uses: tempoxyz/changelogs/check@master
+        uses: tempoxyz/changelogs/check@04ccca87f4785039ced6da0fff27ba29c0dd9f5c # master
         with:
           ai: "claude -p"
           ecosystem: rust
