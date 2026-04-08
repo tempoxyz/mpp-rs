@@ -1008,10 +1008,7 @@ where
                 .cached_chain_id
                 .get_or_try_init(|| async {
                     this.provider.get_chain_id().await.map_err(|e| {
-                        VerificationError::network_error(format!(
-                            "Failed to fetch chain ID: {}",
-                            e
-                        ))
+                        VerificationError::network_error(format!("Failed to fetch chain ID: {}", e))
                     })
                 })
                 .await?;
