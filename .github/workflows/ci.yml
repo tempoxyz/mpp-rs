@@ -69,7 +69,7 @@ jobs:
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
       - run: cargo hack check --each-feature --no-dev-deps --skip integration
       - name: Check examples
-        run: find examples -name Cargo.toml -exec cargo check --manifest-path {} \;
+        run: cargo check --workspace --exclude mpp
 
   ci-gate:
     name: CI Gate

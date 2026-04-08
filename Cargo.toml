@@ -11,6 +11,19 @@ readme = "README.md"
 keywords = ["http", "payments", "402", "authentication"]
 categories = ["web-programming", "authentication", "cryptography"]
 
+[workspace]
+members = [
+  ".",
+  "examples/axum-extractor",
+  "examples/basic",
+  "examples/session/multi-fetch",
+  "examples/session/sse",
+  "examples/stripe",
+]
+default-members = ["."]
+exclude = ["fuzz"]
+resolver = "2"
+
 [features]
 default = ["reqwest-default-tls"]
 
