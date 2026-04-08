@@ -135,7 +135,14 @@ mod tests {
         let token = Address::repeat_byte(0x01);
         let limit = U256::from(1_000_000u64);
 
-        let signed = make_signed_auth(&signer, Some(vec![TokenLimit { token, limit, period: 0 }]));
+        let signed = make_signed_auth(
+            &signer,
+            Some(vec![TokenLimit {
+                token,
+                limit,
+                period: 0,
+            }]),
+        );
         assert_eq!(local_key_spending_limit(&signed, token), Some(limit));
     }
 
@@ -148,9 +155,9 @@ mod tests {
         let signed = make_signed_auth(
             &signer,
             Some(vec![TokenLimit {
-               token: allowed_token,
-               limit: U256::from(1_000_000u64),
-               period: 0,
+                token: allowed_token,
+                limit: U256::from(1_000_000u64),
+                period: 0,
             }]),
         );
         assert_eq!(
@@ -235,9 +242,9 @@ mod tests {
         let signed = make_signed_auth(
             &signer,
             Some(vec![TokenLimit {
-               token,
-               limit: large_limit,
-               period: 0,
+                token,
+                limit: large_limit,
+                period: 0,
             }]),
         );
         assert_eq!(local_key_spending_limit(&signed, token), Some(large_limit));
@@ -251,9 +258,9 @@ mod tests {
         let signed = make_signed_auth(
             &signer,
             Some(vec![TokenLimit {
-               token,
-               limit: U256::ZERO,
-               period: 0,
+                token,
+                limit: U256::ZERO,
+                period: 0,
             }]),
         );
         assert_eq!(local_key_spending_limit(&signed, token), Some(U256::ZERO));
