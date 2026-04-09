@@ -34,10 +34,6 @@ jobs:
       - run: cargo update -p native-tls
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-features -- -D warnings
-      - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@44db170f6a7d12a6e90340e9e0fca1f650d34b14 # v2.0.15
-        with:
-          command: check advisories sources bans licenses
       - name: Run Tempo Lints
         uses: tempoxyz/lints@8af5001866a36967523ece2b8cdc33ba719aad84 # main
         with:
@@ -77,10 +73,15 @@ jobs:
       - name: Check examples
         run: find examples -name Cargo.toml -exec cargo check --manifest-path {} \;
 
+  deny:
+    uses: tempoxyz/ci/.github/workflows/deny.yml@main
+    permissions:
+      contents: read
+
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test]
+    needs: [lint, test, deny]
     runs-on: ubuntu-latest
     steps:
       - run: |
