@@ -20,7 +20,7 @@ jobs:
       - name: Install Claude CLI
         run: npm install -g @anthropic-ai/claude-code@2.1.96
       - name: Check changelog
-        uses: tempoxyz/changelogs/check@04ccca87f4785039ced6da0fff27ba29c0dd9f5c # master
+        uses: tempoxyz/changelogs/check@b0179e7300997dfa5a631a6a7a2de248bf63310f # master
         with:
           ai: "claude -p"
           ecosystem: rust
