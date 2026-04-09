@@ -16,6 +16,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
       - name: Install Claude CLI
         run: npm install -g @anthropic-ai/claude-code@2.1.96
       - name: Check changelog

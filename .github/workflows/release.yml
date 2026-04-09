@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Changelogs
         uses: tempoxyz/changelogs@04ccca87f4785039ced6da0fff27ba29c0dd9f5c # master
