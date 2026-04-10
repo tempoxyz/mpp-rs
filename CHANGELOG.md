@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 (2026-04-10)
+
+## 0.9.3 (2026-04-10)
+
+### Patch Changes
+
+- Fixed `credential.source` DID mismatch between $0 proofs and paid charges in Keychain signing mode. The proof path now uses the wallet address (matching mppx and the paid charge path). Server-side `verify_proof` falls back to an on-chain keychain lookup when the recovered signer differs from the source address. (by @BrendanRyan, [#209](https://github.com/tempoxyz/mpp-rs/pull/209))
+
 ## 0.9.2 (2026-04-08)
 
 ### Patch Changes
