@@ -116,6 +116,25 @@ pub fn verify_proof(
     }
 }
 
+/// Recover the signer address from a zero-amount charge proof.
+///
+/// Returns `Ok(address)` on success, or `Err` if the signature is malformed.
+#[cfg(feature = "evm")]
+pub fn recover_proof_signer(
+    chain_id: u64,
+    challenge_id: &str,
+    signature_hex: &str,
+) -> Result<Address, crate::error::MppError> {
+    let signature_bytes: alloy::primitives::Bytes = signature_hex
+        .parse()
+        .map_err(|_| crate::error::MppError::invalid_payload("invalid proof signature hex"))?;
+    let signature = alloy::signers::Signature::try_from(signature_bytes.as_ref())
+        .map_err(|_| crate::error::MppError::invalid_payload("invalid proof signature"))?;
+    signature
+        .recover_address_from_prehash(&signing_hash(chain_id, challenge_id))
+        .map_err(|_| crate::error::MppError::invalid_payload("proof signature recovery failed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

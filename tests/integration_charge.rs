@@ -1499,13 +1499,12 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
 }
 
 /// Regression: when using Keychain signing mode (access key acting on behalf of
-/// a wallet), the `credential.source` DID must be the same wallet address for
-/// both $0 identity proofs and paid charges.
+/// a wallet), the `credential.source` DID must use the wallet address for both
+/// $0 identity proofs and paid charges (matching mppx behavior).
 ///
-/// Previously the zero-amount proof path used the raw access key address while
-/// paid charges correctly used the wallet address, causing servers that link
-/// user identity via the source DID to see two different "users" for the same
-/// wallet.
+/// Previously the proof path used the access key address while the paid charge
+/// path used the wallet address, causing servers that link user identity via the
+/// source DID to see two different "users" for the same wallet.
 #[tokio::test]
 async fn test_keychain_source_did_consistent_across_proof_and_paid() {
     use mpp::client::tempo::signing::{KeychainVersion, TempoSigningMode};
@@ -1600,11 +1599,12 @@ async fn test_keychain_source_did_consistent_across_proof_and_paid() {
          proof={identity_source}, paid={paid_source}"
     );
 
-    // Both must use the wallet address, not the access key address.
+    // Both must use the wallet address, matching mppx behavior.
+    // Server-side verify_proof handles keychain keys via on-chain lookup.
     let expected_did = format!("did:pkh:eip155:{}:{}", chain_id, wallet_signer.address());
     assert_eq!(
         identity_source, expected_did,
-        "source DID should use the wallet address, not the access key address"
+        "source DID should use the wallet address"
     );
 
     // Sanity: the wallet and access key addresses are different.

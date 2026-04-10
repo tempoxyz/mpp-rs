@@ -292,15 +292,11 @@ mod tests {
         );
     }
 
-    /// Regression test: zero-amount proof source DID must use the wallet
-    /// address in Keychain mode, not the raw access key address.
-    ///
-    /// Previously the proof path always used `signer.address()`, causing the
-    /// source DID to differ between $0 proofs (access key) and paid charges
-    /// (wallet). Servers that link identity via the source DID during a $0
-    /// proof would then fail to recognize the same user on a paid request.
+    /// Regression: in Keychain mode, the proof source DID must use the wallet
+    /// address (matching mppx and the paid charge path), not the access key.
+    /// Server-side verify_proof handles keychain keys via on-chain lookup.
     #[tokio::test]
-    async fn test_zero_amount_proof_uses_wallet_address_in_keychain_mode() {
+    async fn test_keychain_proof_source_uses_wallet_address() {
         use crate::client::tempo::signing::KeychainVersion;
         use crate::protocol::core::Base64UrlJson;
 
@@ -335,11 +331,11 @@ mod tests {
 
         let credential = provider.pay(&challenge).await.unwrap();
 
-        // Source DID must use the wallet address, NOT the access key address
+        // Source DID must use the wallet address, NOT the access key address.
         let expected_did = PaymentCredential::evm_did(42431, &wallet_address.to_string());
         assert_eq!(credential.source, Some(expected_did));
 
-        // Sanity: the wallet address is NOT the access key address
+        // Sanity: wallet and access key are different addresses.
         assert_ne!(wallet_address, access_key.address());
     }
 

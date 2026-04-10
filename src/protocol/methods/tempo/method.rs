@@ -29,7 +29,9 @@ use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
 use std::future::Future;
 use std::sync::Arc;
-use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
+use tempo_alloy::contracts::precompiles::{
+    IAccountKeychain, IStablecoinDEX, ACCOUNT_KEYCHAIN_ADDRESS, ITIP20, STABLECOIN_DEX_ADDRESS,
+};
 use tempo_alloy::TempoNetwork;
 use tokio::sync::OnceCell;
 
@@ -1066,15 +1068,43 @@ where
                     ));
                 }
 
+                let sig_hex = charge_payload.proof_signature().unwrap();
+
+                // Fast path: signer IS the source address (Direct mode).
                 if !proof::verify_proof(
                     expected_chain_id,
                     &credential.challenge.id,
-                    charge_payload.proof_signature().unwrap(),
+                    sig_hex,
                     parsed_source.address,
                 ) {
-                    return Err(VerificationError::new(
-                        "Proof signature does not match source.",
-                    ));
+                    // Keychain fallback: signer may be an access key authorized
+                    // for the source wallet. Recover the signer and check on-chain.
+                    let recovered = proof::recover_proof_signer(
+                        expected_chain_id,
+                        &credential.challenge.id,
+                        sig_hex,
+                    )
+                    .map_err(|_| {
+                        VerificationError::new("Proof signature does not match source.")
+                    })?;
+
+                    let keychain = IAccountKeychain::new(ACCOUNT_KEYCHAIN_ADDRESS, &*this.provider);
+                    let key_info = keychain
+                        .getKey(parsed_source.address, recovered)
+                        .call()
+                        .await
+                        .map_err(|_| {
+                            VerificationError::new("Proof signature does not match source.")
+                        })?;
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if key_info.expiry == 0 || key_info.isRevoked || key_info.expiry <= now_secs {
+                        return Err(VerificationError::new(
+                            "Proof signature does not match source.",
+                        ));
+                    }
                 }
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
