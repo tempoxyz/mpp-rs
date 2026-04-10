@@ -1498,6 +1498,122 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
     let _ = handle.await;
 }
 
+/// Regression: when using Keychain signing mode (access key acting on behalf of
+/// a wallet), the `credential.source` DID must use the wallet address for both
+/// $0 identity proofs and paid charges (matching mppx behavior).
+///
+/// Previously the proof path used the access key address while the paid charge
+/// path used the wallet address, causing servers that link user identity via the
+/// source DID to see two different "users" for the same wallet.
+#[tokio::test]
+async fn test_keychain_source_did_consistent_across_proof_and_paid() {
+    use mpp::client::tempo::signing::{KeychainVersion, TempoSigningMode};
+
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let wallet_signer = PrivateKeySigner::random();
+    let access_key_signer = PrivateKeySigner::random();
+
+    // Fund the wallet address (access key signs on its behalf).
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, wallet_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("keychain-did-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(access_key_signer.clone(), &rpc)
+        .expect("failed to create TempoProvider")
+        .with_signing_mode(TempoSigningMode::Keychain {
+            wallet: wallet_signer.address(),
+            key_authorization: None,
+            version: KeychainVersion::V2,
+        });
+
+    // ---- $0 identity proof ----
+    let identity_resp = Client::new()
+        .get(format!("{url}/identity"))
+        .send()
+        .await
+        .expect("identity request failed");
+    assert_eq!(identity_resp.status(), 402);
+
+    let www_auth = identity_resp
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let identity_challenge =
+        mpp::parse_www_authenticate(www_auth).expect("failed to parse identity challenge");
+
+    let identity_credential = provider
+        .pay(&identity_challenge)
+        .await
+        .expect("failed to create proof credential");
+    let identity_source = identity_credential
+        .source
+        .as_deref()
+        .expect("proof credential must have a source DID");
+
+    // ---- Paid charge ----
+    let paid_resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .expect("paid request failed");
+    assert_eq!(paid_resp.status(), 402);
+
+    let www_auth = paid_resp
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let paid_challenge =
+        mpp::parse_www_authenticate(www_auth).expect("failed to parse paid challenge");
+
+    let paid_credential = provider
+        .pay(&paid_challenge)
+        .await
+        .expect("failed to create paid credential");
+    let paid_source = paid_credential
+        .source
+        .as_deref()
+        .expect("paid credential must have a source DID");
+
+    // ---- Core assertion: source DIDs must match ----
+    assert_eq!(
+        identity_source, paid_source,
+        "source DID mismatch between $0 proof and paid charge: \
+         proof={identity_source}, paid={paid_source}"
+    );
+
+    // Both must use the wallet address, matching mppx behavior.
+    // Server-side verify_proof handles keychain keys via on-chain lookup.
+    let expected_did = format!("did:pkh:eip155:{}:{}", chain_id, wallet_signer.address());
+    assert_eq!(
+        identity_source, expected_did,
+        "source DID should use the wallet address"
+    );
+
+    // Sanity: the wallet and access key addresses are different.
+    assert_ne!(wallet_signer.address(), access_key_signer.address());
+
+    handle.abort();
+    let _ = handle.await;
+}
+
 /// Fee-payer-enabled server handles premium ($1) charges correctly.
 #[tokio::test]
 async fn test_e2e_fee_payer_premium_charge() {

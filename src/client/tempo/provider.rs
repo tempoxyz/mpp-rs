@@ -130,8 +130,8 @@ impl PaymentProvider for TempoProvider {
 
         if charge.amount().is_zero() {
             let signature = sign_proof(&self.signer, charge.chain_id(), &challenge.id).await?;
-            let source =
-                PaymentCredential::evm_did(charge.chain_id(), &self.signer.address().to_string());
+            let from = self.signing_mode.from_address(self.signer.address());
+            let source = PaymentCredential::evm_did(charge.chain_id(), &from.to_string());
 
             return Ok(PaymentCredential::with_source(
                 challenge.to_echo(),
@@ -290,6 +290,53 @@ mod tests {
                 &signer.address().to_string()
             ))
         );
+    }
+
+    /// Regression: in Keychain mode, the proof source DID must use the wallet
+    /// address (matching mppx and the paid charge path), not the access key.
+    /// Server-side verify_proof handles keychain keys via on-chain lookup.
+    #[tokio::test]
+    async fn test_keychain_proof_source_uses_wallet_address() {
+        use crate::client::tempo::signing::KeychainVersion;
+        use crate::protocol::core::Base64UrlJson;
+
+        let access_key = alloy::signers::local::PrivateKeySigner::random();
+        let wallet_address: alloy::primitives::Address =
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+                .parse()
+                .unwrap();
+
+        let provider = TempoProvider::new(access_key.clone(), "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: wallet_address,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            });
+
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 42431 }
+        }))
+        .unwrap();
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        // Source DID must use the wallet address, NOT the access key address.
+        let expected_did = PaymentCredential::evm_did(42431, &wallet_address.to_string());
+        assert_eq!(credential.source, Some(expected_did));
+
+        // Sanity: wallet and access key are different addresses.
+        assert_ne!(wallet_address, access_key.address());
     }
 
     #[test]
