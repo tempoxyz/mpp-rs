@@ -74,7 +74,7 @@ uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { version = "1.8", features = ["full"], optional = true }
+alloy = { version = "2.0", features = ["full"], optional = true }
 
 # Tempo dependencies (optional)
 tempo-alloy = { version = "1.5", optional = true }

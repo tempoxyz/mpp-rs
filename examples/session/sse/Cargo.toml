@@ -14,7 +14,7 @@ path = "src/client.rs"
 
 [dependencies]
 mpp = { path = "../../..", features = ["server", "client", "tempo"] }
-alloy = { version = "1.8", features = ["provider-http"] }
+alloy = { version = "2.0", features = ["provider-http"] }
 tempo-alloy = "1.5"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
