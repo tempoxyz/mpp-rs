@@ -16,10 +16,8 @@ ignore = [
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`
 wildcards = "deny"
-# Allow wildcard for git deps (no version field in Cargo.toml)
-allow-wildcard-paths = [
-    "https://github.com/tempoxyz/tempo",
-]
+# Allow wildcard versions for path/git dependencies in private crates
+allow-wildcard-paths = true
 highlight = "all"
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = []
