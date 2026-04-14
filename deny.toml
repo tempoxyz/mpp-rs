@@ -15,7 +15,9 @@ ignore = [
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`
-wildcards = "deny"
+# Temporarily set to warn while tempo-alloy/tempo-primitives use git deps
+# (git deps are wildcards by nature, revert to deny once crates.io versions are published)
+wildcards = "warn"
 # Allow wildcard versions for path/git dependencies in private crates
 allow-wildcard-paths = true
 highlight = "all"
