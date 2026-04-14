@@ -4,8 +4,6 @@
 [advisories]
 yanked = "warn"
 ignore = [
-    # https://rustsec.org/advisories/RUSTSEC-2024-0388 derivative is unmaintained (transitive dep)
-    "RUSTSEC-2024-0388",
     # https://rustsec.org/advisories/RUSTSEC-2024-0436 paste! is unmaintained (transitive dep)
     "RUSTSEC-2024-0436",
 ]
@@ -18,6 +16,10 @@ ignore = [
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`
 wildcards = "deny"
+# Allow wildcard for git deps (no version field in Cargo.toml)
+allow-wildcard-paths = [
+    "https://github.com/tempoxyz/tempo",
+]
 highlight = "all"
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = []
@@ -73,4 +75,7 @@ unknown-registry = "deny"
 # Lint level for what to happen when a crate from a git repository that is not
 # in the allow list is encountered
 unknown-git = "deny"
-allow-git = []
+allow-git = [
+    "https://github.com/tempoxyz/tempo",
+    "https://github.com/paradigmxyz/reth",
+]
