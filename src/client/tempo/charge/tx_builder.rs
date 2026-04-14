@@ -5,6 +5,7 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
+use core::num::NonZeroU64;
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization, TempoTransaction};
@@ -34,7 +35,7 @@ pub struct TempoTxOptions {
     /// Whether the server pays fees (fee payer / fee sponsorship mode).
     pub fee_payer: bool,
     /// Optional validity window upper bound (unix timestamp).
-    pub valid_before: Option<u64>,
+    pub valid_before: Option<NonZeroU64>,
     /// Optional key authorization to include in the transaction.
     pub key_authorization: Option<SignedKeyAuthorization>,
 }

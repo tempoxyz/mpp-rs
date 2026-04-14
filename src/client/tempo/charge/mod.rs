@@ -31,6 +31,7 @@
 pub mod tx_builder;
 
 use alloy::primitives::{Address, TxKind, U256};
+use core::num::NonZeroU64;
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
@@ -299,7 +300,7 @@ impl TempoCharge {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            Some(now + FEE_PAYER_VALID_BEFORE_SECS)
+            NonZeroU64::new(now + FEE_PAYER_VALID_BEFORE_SECS)
         });
 
         let gas_limit = if let Some(gas) = options.gas_limit {
@@ -402,7 +403,7 @@ pub struct SignOptions {
     /// Provide a key authorization to include in the transaction.
     pub key_authorization: Option<Box<SignedKeyAuthorization>>,
     /// Optional validity window upper bound (unix timestamp) for fee payer mode.
-    pub valid_before: Option<u64>,
+    pub valid_before: Option<NonZeroU64>,
 }
 
 /// A signed Tempo charge, ready to be converted into a [`PaymentCredential`].

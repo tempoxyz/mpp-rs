@@ -18,6 +18,7 @@
 use alloy::eips::eip2930::AccessList;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rlp::{Buf, BufMut, Decodable, Encodable, Error as RlpError, Header, EMPTY_STRING_CODE};
+use core::num::NonZeroU64;
 
 use tempo_primitives::transaction::{
     Call, SignedKeyAuthorization, TempoSignature, TempoSignedAuthorization,
@@ -45,8 +46,8 @@ pub struct FeePayerEnvelope78 {
     pub access_list: AccessList,
     pub nonce_key: U256,
     pub nonce: u64,
-    pub valid_before: Option<u64>,
-    pub valid_after: Option<u64>,
+    pub valid_before: Option<NonZeroU64>,
+    pub valid_after: Option<NonZeroU64>,
     pub fee_token: Option<Address>,
     pub sender: Address,
     pub tempo_authorization_list: Vec<TempoSignedAuthorization>,
@@ -251,8 +252,10 @@ impl Decodable for FeePayerEnvelope78 {
         let nonce_key: U256 = Decodable::decode(&mut fields_buf)?;
         let nonce: u64 = Decodable::decode(&mut fields_buf)?;
 
-        let valid_before: Option<u64> = Self::decode_optional(&mut fields_buf)?;
-        let valid_after: Option<u64> = Self::decode_optional(&mut fields_buf)?;
+        let valid_before: Option<NonZeroU64> =
+            Self::decode_optional::<u64>(&mut fields_buf)?.and_then(NonZeroU64::new);
+        let valid_after: Option<NonZeroU64> =
+            Self::decode_optional::<u64>(&mut fields_buf)?.and_then(NonZeroU64::new);
         let fee_token: Option<Address> = Self::decode_optional(&mut fields_buf)?;
 
         let sender: Address = Decodable::decode(&mut fields_buf)?;
@@ -336,7 +339,7 @@ mod tests {
                 U256::ZERO,
                 false,
             )),
-            valid_before: Some(9999999999),
+            valid_before: NonZeroU64::new(9999999999),
             valid_after: None,
             tempo_authorization_list: vec![],
         }
@@ -355,7 +358,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: NonZeroU64::new(9999999999),
             limits: Some(vec![TokenLimit {
                 token: Address::repeat_byte(0x33),
                 limit: U256::from(1_000_000u64),
@@ -411,7 +414,7 @@ mod tests {
     fn roundtrip_with_valid_before_and_after() {
         let signer = test_signer();
         let mut tx = base_fee_payer_tx();
-        tx.valid_after = Some(1000);
+        tx.valid_after = NonZeroU64::new(1000);
 
         let env = sign_envelope(tx, &signer);
         assert!(env.valid_before.is_some());
@@ -434,7 +437,7 @@ mod tests {
     fn roundtrip_all_optionals_set() {
         let signer = test_signer();
         let mut tx = base_fee_payer_tx();
-        tx.valid_after = Some(500);
+        tx.valid_after = NonZeroU64::new(500);
         tx.fee_token = Some(Address::repeat_byte(0x55));
 
         let env = sign_envelope(tx, &signer);
@@ -459,7 +462,7 @@ mod tests {
     fn roundtrip_with_key_authorization_and_all_optionals() {
         let signer = test_signer();
         let mut tx = base_fee_payer_tx();
-        tx.valid_after = Some(42);
+        tx.valid_after = NonZeroU64::new(42);
         tx.fee_token = Some(Address::repeat_byte(0x66));
         tx.key_authorization = Some(make_signed_key_auth(&signer));
 
