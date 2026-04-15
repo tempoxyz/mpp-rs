@@ -15,11 +15,7 @@ ignore = [
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`
-# Temporarily set to warn while tempo-alloy/tempo-primitives use git deps
-# (git deps are wildcards by nature, revert to deny once crates.io versions are published)
-wildcards = "warn"
-# Allow wildcard versions for path/git dependencies in private crates
-allow-wildcard-paths = true
+wildcards = "deny"
 highlight = "all"
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = []
@@ -75,7 +71,4 @@ unknown-registry = "deny"
 # Lint level for what to happen when a crate from a git repository that is not
 # in the allow list is encountered
 unknown-git = "deny"
-allow-git = [
-    "https://github.com/tempoxyz/tempo",
-    "https://github.com/paradigmxyz/reth",
-]
+allow-git = []
