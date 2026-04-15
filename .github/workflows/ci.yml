@@ -35,7 +35,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-features -- -D warnings
       - name: Run Tempo Lints
-        uses: tempoxyz/lints@8af5001866a36967523ece2b8cdc33ba719aad84 # main
+        uses: tempoxyz/lints@0dbe62767b6e15963a652f5476bc0b8ae111d6fc # main
         with:
           language: rust
           path: "."

@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@b0179e7300997dfa5a631a6a7a2de248bf63310f # master
+        uses: tempoxyz/changelogs@54f693643e1bd8469293bdfcbfb647bceb559490 # master
         with:
           conventional-commit: true
           crate-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
