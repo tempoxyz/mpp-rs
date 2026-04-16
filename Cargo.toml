@@ -35,7 +35,7 @@ server = ["tokio", "futures-core", "async-stream", "http-types"]
 # Method implementations
 evm = ["alloy", "hex", "rand"]
 tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
-stripe = ["dep:reqwest"]
+stripe = ["dep:reqwest", "reqwest?/form"]
 
 # Utilities
 utils = ["hex", "rand"]
@@ -54,7 +54,7 @@ ws = ["server", "client", "dep:tokio-tungstenite", "dep:futures-util"]
 
 reqwest-default-tls = ["reqwest?/default-tls"]
 reqwest-native-tls = ["reqwest?/native-tls"]
-reqwest-rustls-tls = ["reqwest?/rustls-tls"]
+reqwest-rustls-tls = ["reqwest?/rustls"]
 
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
@@ -107,7 +107,7 @@ futures-util = { version = "0.3", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 axum = { version = "0.8", features = ["ws"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 hex = "0.4"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"

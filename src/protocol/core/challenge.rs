@@ -453,7 +453,7 @@ pub fn compute_challenge_id(
     digest: Option<&str>,
     opaque: Option<&str>,
 ) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
