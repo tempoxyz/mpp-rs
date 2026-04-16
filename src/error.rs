@@ -235,6 +235,14 @@ pub enum MppError {
     #[error("{}", format_bad_request(.0))]
     BadRequest(Option<String>),
 
+    /// Payment requires additional action (e.g., 3D Secure confirmation).
+    #[error("{}", format_payment_action_required(.0))]
+    PaymentActionRequired(Option<String>),
+
+    /// Payment amount is insufficient for the requested resource.
+    #[error("{}", format_payment_insufficient(.0))]
+    PaymentInsufficient(Option<String>),
+
     // ==================== Session/Channel Errors ====================
     /// Insufficient balance in payment channel.
     #[error("{}", format_insufficient_balance(.0))]
@@ -365,6 +373,20 @@ fn format_bad_request(reason: &Option<String>) -> String {
     match reason {
         Some(r) => format!("Bad request: {}.", r),
         None => "Bad request.".to_string(),
+    }
+}
+
+fn format_payment_action_required(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Payment requires action: {}.", r),
+        None => "Payment requires action.".to_string(),
+    }
+}
+
+fn format_payment_insufficient(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Payment insufficient: {}.", r),
+        None => "Payment amount is insufficient.".to_string(),
     }
 }
 
@@ -539,6 +561,26 @@ impl MppError {
         Self::BadRequest(None)
     }
 
+    /// Create a payment action required error.
+    pub fn payment_action_required(reason: impl Into<String>) -> Self {
+        Self::PaymentActionRequired(Some(reason.into()))
+    }
+
+    /// Create a payment action required error without a reason.
+    pub fn payment_action_required_default() -> Self {
+        Self::PaymentActionRequired(None)
+    }
+
+    /// Create a payment insufficient error.
+    pub fn payment_insufficient(reason: impl Into<String>) -> Self {
+        Self::PaymentInsufficient(Some(reason.into()))
+    }
+
+    /// Create a payment insufficient error without a reason.
+    pub fn payment_insufficient_default() -> Self {
+        Self::PaymentInsufficient(None)
+    }
+
     /// Returns the RFC 9457 problem type suffix if this is a payment problem.
     pub fn problem_type_suffix(&self) -> Option<&'static str> {
         match self {
@@ -550,6 +592,8 @@ impl MppError {
             Self::InvalidPayload(_) => Some("invalid-payload"),
             Self::BadRequest(_) => Some("bad-request"),
             Self::UnsupportedPaymentMethod(_) => Some("method-unsupported"),
+            Self::PaymentActionRequired(_) => Some("payment-action-required"),
+            Self::PaymentInsufficient(_) => Some("payment-insufficient"),
             Self::InsufficientBalance(_) => Some("session/insufficient-balance"),
             Self::InvalidSignature(_) => Some("session/invalid-signature"),
             Self::SignerMismatch(_) => Some("session/signer-mismatch"),
@@ -595,6 +639,12 @@ impl PaymentError for MppError {
             Self::UnsupportedPaymentMethod(_) => PaymentErrorDetails::core("method-unsupported")
                 .with_title("PaymentMethodUnsupportedError")
                 .with_status(400),
+            Self::PaymentActionRequired(_) => PaymentErrorDetails::core("payment-action-required")
+                .with_title("PaymentActionRequiredError")
+                .with_status(402),
+            Self::PaymentInsufficient(_) => PaymentErrorDetails::core("payment-insufficient")
+                .with_title("PaymentInsufficientError")
+                .with_status(402),
             // Session/channel errors
             Self::InsufficientBalance(_) => PaymentErrorDetails::session("insufficient-balance")
                 .with_title("InsufficientBalanceError")
@@ -903,6 +953,43 @@ mod tests {
         );
         assert_eq!(problem.title, "PaymentMethodUnsupportedError");
         assert_eq!(problem.status, 400);
+    }
+
+    #[test]
+    fn test_payment_action_required_error() {
+        let err = MppError::payment_action_required_default();
+        assert_eq!(err.to_string(), "Payment requires action.");
+
+        let err = MppError::payment_action_required("requires_action");
+        assert_eq!(err.to_string(), "Payment requires action: requires_action.");
+
+        let problem = err.to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/payment-action-required"
+        );
+        assert_eq!(problem.title, "PaymentActionRequiredError");
+        assert_eq!(problem.status, 402);
+    }
+
+    #[test]
+    fn test_payment_insufficient_error() {
+        let err = MppError::payment_insufficient_default();
+        assert_eq!(err.to_string(), "Payment amount is insufficient.");
+
+        let err = MppError::payment_insufficient("expected 1000, received 500");
+        assert_eq!(
+            err.to_string(),
+            "Payment insufficient: expected 1000, received 500."
+        );
+
+        let problem = err.to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/payment-insufficient"
+        );
+        assert_eq!(problem.title, "PaymentInsufficientError");
+        assert_eq!(problem.status, 402);
     }
 
     #[test]
