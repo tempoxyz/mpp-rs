@@ -83,6 +83,9 @@ pub use store::{FileStore, MemoryStore, Store, StoreError};
 #[cfg(all(feature = "server", feature = "tempo"))]
 pub use store::ChannelStoreAdapter;
 
+pub mod channel_db;
+pub use channel_db::{Channel, ChannelDb};
+
 // Intent types
 pub use protocol::intents::{
     deserialize_request, deserialize_request_typed, parse_units, request_from_challenge,
