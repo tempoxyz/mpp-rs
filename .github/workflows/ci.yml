@@ -73,6 +73,56 @@ jobs:
       - name: Check examples
         run: cargo check --workspace --exclude mpp
 
+  integration:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      TEMPO_TAG: latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo update -p native-tls
+
+      - name: Resolve Tempo image digest
+        id: tempo-digest
+        run: |
+          digest=$(docker buildx imagetools inspect ghcr.io/tempoxyz/tempo:${TEMPO_TAG} --raw | sha256sum | cut -d' ' -f1)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Tempo Docker image
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: docker-cache
+        with:
+          path: /tmp/tempo-image.tar
+          key: tempo-image-${{ steps.tempo-digest.outputs.digest }}
+
+      - name: Load cached Tempo image
+        if: steps.docker-cache.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/tempo-image.tar
+
+      - name: Pull and cache Tempo image
+        if: steps.docker-cache.outputs.cache-hit != 'true'
+        run: |
+          docker pull ghcr.io/tempoxyz/tempo:${TEMPO_TAG}
+          docker save ghcr.io/tempoxyz/tempo:${TEMPO_TAG} -o /tmp/tempo-image.tar
+
+      - name: Start Tempo devnet
+        run: docker compose up -d --wait
+
+      - name: Run integration tests
+        run: cargo test --features integration --test integration_charge -- --nocapture
+
+      - name: Stop Tempo devnet
+        if: always()
+        run: docker compose down
+
   deny:
     uses: tempoxyz/ci/.github/workflows/deny.yml@main
     permissions:
@@ -81,7 +131,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test, deny]
+    needs: [lint, test, integration, deny]
     runs-on: ubuntu-latest
     steps:
       - run: |
