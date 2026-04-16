@@ -4,8 +4,6 @@
 [advisories]
 yanked = "warn"
 ignore = [
-    # https://rustsec.org/advisories/RUSTSEC-2024-0388 derivative is unmaintained (transitive dep)
-    "RUSTSEC-2024-0388",
     # https://rustsec.org/advisories/RUSTSEC-2024-0436 paste! is unmaintained (transitive dep)
     "RUSTSEC-2024-0436",
 ]

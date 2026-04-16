@@ -634,6 +634,7 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc123".to_string(),
+            external_id: None,
         };
 
         let header = format_receipt(&receipt).unwrap();

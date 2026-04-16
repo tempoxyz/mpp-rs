@@ -13,6 +13,7 @@
 
 #![cfg(feature = "integration")]
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use alloy::eips::Encodable2718;
@@ -1226,7 +1227,7 @@ async fn test_fee_payer_wrong_recipient_rejected() {
             U256::ZERO,
             false,
         )),
-        valid_before: Some(now + 25),
+        valid_before: NonZeroU64::new(now + 25),
         valid_after: None,
         calls: vec![Call {
             to: TxKind::Call(currency),

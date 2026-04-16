@@ -93,6 +93,8 @@ pub fn local_key_spending_limit(auth: &SignedKeyAuthorization, token: Address) -
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use alloy::signers::{local::PrivateKeySigner, SignerSync};
     use tempo_primitives::transaction::{
@@ -113,7 +115,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: NonZeroU64::new(9999999999),
             limits,
             allowed_calls: None,
         };

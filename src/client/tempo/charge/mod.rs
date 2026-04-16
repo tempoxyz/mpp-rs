@@ -30,6 +30,8 @@
 
 pub mod tx_builder;
 
+use std::num::NonZeroU64;
+
 use alloy::primitives::{Address, TxKind, U256};
 use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
 
@@ -299,7 +301,7 @@ impl TempoCharge {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            Some(now + FEE_PAYER_VALID_BEFORE_SECS)
+            Some(now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS))
         });
 
         let gas_limit = if let Some(gas) = options.gas_limit {
@@ -323,7 +325,7 @@ impl TempoCharge {
             .with_fee_token(fee_token)
             .with_nonce_key(nonce_key);
 
-            if let Some(vb) = valid_before {
+            if let Some(vb) = valid_before.and_then(NonZeroU64::new) {
                 req = req.with_valid_before(vb);
             }
 

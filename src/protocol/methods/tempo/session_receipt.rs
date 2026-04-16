@@ -104,6 +104,7 @@ impl SessionReceipt {
             method: MethodName::new(&self.method),
             timestamp: self.timestamp.clone(),
             reference: self.reference.clone(),
+            external_id: None,
         }
     }
 }

@@ -235,6 +235,8 @@ pub async fn sign_and_encode_fee_payer_envelope_async(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
     use alloy::primitives::{Bytes, TxKind, U256};
     use alloy::signers::local::PrivateKeySigner;
@@ -324,7 +326,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
         };
@@ -368,7 +370,7 @@ mod tests {
         let mut tx = test_tx();
         tx.fee_token = None;
         tx.nonce_key = alloy::primitives::U256::MAX;
-        tx.valid_before = Some(9999999999);
+        tx.valid_before = NonZeroU64::new(9999999999);
         tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
             alloy::primitives::U256::ZERO,
             alloy::primitives::U256::ZERO,
@@ -399,7 +401,7 @@ mod tests {
         let mut tx = test_tx();
         tx.fee_token = None;
         tx.nonce_key = alloy::primitives::U256::MAX;
-        tx.valid_before = Some(9999999999);
+        tx.valid_before = NonZeroU64::new(9999999999);
         tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
             alloy::primitives::U256::ZERO,
             alloy::primitives::U256::ZERO,
@@ -576,7 +578,7 @@ mod tests {
             chain_id: 42431,
             key_type: SignatureType::Secp256k1,
             key_id: signer.address(),
-            expiry: Some(9999999999),
+            expiry: NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
         };

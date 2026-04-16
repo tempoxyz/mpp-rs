@@ -803,6 +803,10 @@ pub struct Receipt {
 
     /// Transaction hash or reference
     pub reference: String,
+
+    /// Merchant correlation reference, echoed from the credential payload.
+    #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 impl Receipt {
@@ -814,7 +818,15 @@ impl Receipt {
             method: method.into(),
             timestamp: now_iso8601(),
             reference: reference.into(),
+            external_id: None,
         }
+    }
+
+    /// Set the merchant correlation reference.
+    #[must_use]
+    pub fn with_external_id(mut self, external_id: impl Into<String>) -> Self {
+        self.external_id = Some(external_id.into());
+        self
     }
 
     /// Check if the payment was successful.
@@ -1059,8 +1071,26 @@ mod tests {
             method: "tempo".into(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc".to_string(),
+            external_id: None,
         };
         assert!(success.is_success());
+        assert!(success.external_id.is_none());
+    }
+
+    #[test]
+    fn test_receipt_with_external_id() {
+        let receipt = Receipt::success("tempo", "0xabc").with_external_id("order-123");
+        assert_eq!(receipt.external_id.as_deref(), Some("order-123"));
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert!(json.contains("\"externalId\":\"order-123\""));
+
+        let parsed: Receipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.external_id.as_deref(), Some("order-123"));
+
+        let bare = Receipt::success("tempo", "0xabc");
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("externalId"));
     }
 
     #[test]
