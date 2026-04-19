@@ -2039,13 +2039,14 @@ mod tests {
             memo: None,
         }];
 
-        let calls = vec![tempo_primitives::transaction::Call {
-            to: TxKind::Call(currency),
-            value: U256::ZERO,
-            input: make_transfer_input(recipient, U256::from(100u64)),
-        }];
-
-        let tx_bytes = encode_signed_tx(calls.clone(), MAX_FEE_PAYER_GAS_LIMIT + 1);
+        let tx_bytes = encode_signed_tx(
+            vec![tempo_primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_input(recipient, U256::from(100u64)),
+            }],
+            MAX_FEE_PAYER_GAS_LIMIT + 1,
+        );
 
         let error = method
             .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
@@ -2442,9 +2443,7 @@ mod tests {
     fn make_cosign_method(
         fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     ) -> (
-        ChargeMethod<
-            impl alloy::providers::Provider<TempoNetwork> + Clone + Send + Sync + 'static,
-        >,
+        ChargeMethod<impl alloy::providers::Provider<TempoNetwork> + Clone + Send + Sync + 'static>,
         alloy::signers::local::PrivateKeySigner,
         Address,
     ) {
@@ -2465,12 +2464,11 @@ mod tests {
     /// cosign_fee_payer_transaction rejects tx with max_fee_per_gas above policy.
     #[test]
     fn test_cosign_rejects_excessive_max_fee_per_gas() {
-        let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let overrides = FeePayerPolicyOverride {
             max_fee_per_gas: Some(500_000_000), // 0.5 gwei ceiling
             ..Default::default()
         };
-        let (method, _, fee_token) = make_cosign_method(Some(overrides));
+        let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
         let mut tx = make_fee_payer_tx(60);
         tx.max_fee_per_gas = 600_000_000; // above 0.5 gwei ceiling
@@ -2483,21 +2481,17 @@ mod tests {
                 fee_token,
             )
             .expect_err("should reject excessive max_fee_per_gas");
-        assert!(
-            err.to_string().contains("max_fee_per_gas"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("max_fee_per_gas"), "got: {err}");
     }
 
     /// cosign_fee_payer_transaction rejects tx with max_priority_fee_per_gas above policy.
     #[test]
     fn test_cosign_rejects_excessive_max_priority_fee_per_gas() {
-        let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let overrides = FeePayerPolicyOverride {
             max_priority_fee_per_gas: Some(100_000_000), // 0.1 gwei ceiling
             ..Default::default()
         };
-        let (method, _, fee_token) = make_cosign_method(Some(overrides));
+        let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
         let mut tx = make_fee_payer_tx(60);
         tx.max_priority_fee_per_gas = 200_000_000; // above 0.1 gwei ceiling
@@ -2519,15 +2513,14 @@ mod tests {
     /// cosign_fee_payer_transaction rejects tx whose total fee exceeds the policy cap.
     #[test]
     fn test_cosign_rejects_excessive_total_fee() {
-        let client_signer = alloy::signers::local::PrivateKeySigner::random();
         // Set a 0.5 gwei max_fee_per_gas ceiling and default gas limit of 1M →
-        // total_fee ceiling = 500_000_000_000_000.  Build a tx that hits exactly
+        // total_fee ceiling = 500_000_000_000_000. Build a tx that hits exactly
         // the total_fee limit by using a large gas_limit.
         let overrides = FeePayerPolicyOverride {
             max_total_fee: Some(500_000_000_000_000), // ceiling
             ..Default::default()
         };
-        let (method, _, fee_token) = make_cosign_method(Some(overrides));
+        let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
         let mut tx = make_fee_payer_tx(60);
         // gas_limit=1_000_000, max_fee_per_gas=1_000_000_000 →
@@ -2543,21 +2536,17 @@ mod tests {
                 fee_token,
             )
             .expect_err("should reject excessive total fee");
-        assert!(
-            err.to_string().contains("Total fee"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("Total fee"), "got: {err}");
     }
 
     /// cosign_fee_payer_transaction rejects tx with valid_before window beyond policy max.
     #[test]
     fn test_cosign_rejects_excessive_validity_window() {
-        let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let overrides = FeePayerPolicyOverride {
             max_validity_window_seconds: Some(30), // 30-second ceiling
             ..Default::default()
         };
-        let (method, _, fee_token) = make_cosign_method(Some(overrides));
+        let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
         // valid_before = now + 120s → window of 120s > 30s ceiling
         let tx = make_fee_payer_tx(120);
@@ -2579,7 +2568,6 @@ mod tests {
     /// All five policy override fields are respected when set together.
     #[test]
     fn test_policy_override_all_fields_applied() {
-        let client_signer = alloy::signers::local::PrivateKeySigner::random();
         // Generous overrides — tx should pass all checks.
         let overrides = FeePayerPolicyOverride {
             max_gas: Some(2_000_000),
@@ -2588,7 +2576,7 @@ mod tests {
             max_total_fee: Some(40_000_000_000_000_000),
             max_validity_window_seconds: Some(600),
         };
-        let (method, _, fee_token) = make_cosign_method(Some(overrides));
+        let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
         let mut tx = make_fee_payer_tx(60);
         tx.gas_limit = 1_500_000; // within 2M override
