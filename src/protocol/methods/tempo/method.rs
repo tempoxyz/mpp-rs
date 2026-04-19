@@ -39,15 +39,16 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
-use crate::tempo::attribution;
+use crate::tempo::{attribution, MODERATO_CHAIN_ID};
 
 use super::transfers::{get_request_transfers, Transfer};
 use super::{proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
 
-const MAX_FEE_PAYER_GAS_LIMIT: u64 = 1_000_000;
-const MAX_FEE_PER_GAS_DEFAULT: u128 = 10_000_000_000; // 10 gwei
-const MAX_PRIORITY_FEE_PER_GAS_DEFAULT: u128 = 1_000_000_000; // 1 gwei
-const MAX_VALIDITY_WINDOW_SECS_DEFAULT: u64 = 300; // 5 minutes
+const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
+const MAX_FEE_PER_GAS_DEFAULT: u128 = 100_000_000_000;
+const MAX_PRIORITY_FEE_PER_GAS_DEFAULT: u128 = 10_000_000_000;
+const MAX_VALIDITY_WINDOW_SECS_DEFAULT: u64 = 15 * 60;
+const MAX_TOTAL_FEE_DEFAULT: u128 = 50_000_000_000_000_000; // 0.05 ETH — lower than max_gas * max_fee_per_gas
 
 /// TIP-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
 /// TIP-20 is Tempo's token standard (compatible with ERC-20 Transfer events).
@@ -478,7 +479,7 @@ impl Default for FeePayerPolicy {
             max_gas: MAX_FEE_PAYER_GAS_LIMIT,
             max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
             max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
-            max_total_fee: MAX_FEE_PAYER_GAS_LIMIT as u128 * MAX_FEE_PER_GAS_DEFAULT,
+            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
             max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
         }
     }
@@ -487,8 +488,7 @@ impl Default for FeePayerPolicy {
 impl FeePayerPolicy {
     /// Merge overrides onto the per-chain default.
     pub fn resolve(chain_id: u64, overrides: Option<&FeePayerPolicyOverride>) -> Self {
-        let _ = chain_id; // reserved for per-chain defaults
-        let base = Self::default();
+        let base = Self::get_by_chain_id(chain_id);
         let Some(o) = overrides else { return base };
         Self {
             max_gas: o.max_gas.unwrap_or(base.max_gas),
@@ -500,6 +500,17 @@ impl FeePayerPolicy {
             max_validity_window_seconds: o
                 .max_validity_window_seconds
                 .unwrap_or(base.max_validity_window_seconds),
+        }
+    }
+
+    fn get_by_chain_id(chain_id: u64) -> Self {
+        match chain_id {
+            // Moderato regularly needs a higher priority fee than mainnet.
+            MODERATO_CHAIN_ID => Self {
+                max_priority_fee_per_gas: 50_000_000_000,
+                ..Self::default()
+            },
+            _ => Self::default(),
         }
     }
 }
@@ -522,7 +533,11 @@ where
         }
     }
 
-    // Configure fee payer
+    /// Override the fee-sponsor policy applied to fee-payer envelopes.
+    ///
+    /// Each unset field falls back to the per-chain default. Use to raise or
+    /// lower `max_gas`, `max_fee_per_gas`, `max_priority_fee_per_gas`,
+    /// `max_total_fee`, or `max_validity_window_seconds` per server.
     pub fn with_fee_payer_policy_override(mut self, overrides: FeePayerPolicyOverride) -> Self {
         self.fee_payer_policy_override = Some(overrides);
         self
@@ -998,18 +1013,28 @@ where
             )));
         }
 
-        if tx.max_priority_fee_per_gas > policy.max_priority_fee_per_gas {
-            return Err(VerificationError::new(format!(
-                "max_priority_fee_per_gas {} exceeds policy maximum {}",
-                tx.max_priority_fee_per_gas, policy.max_priority_fee_per_gas
-            )));
-        }
-
         let total_fee = (tx.gas_limit as u128).saturating_mul(tx.max_fee_per_gas);
         if total_fee > policy.max_total_fee {
             return Err(VerificationError::new(format!(
                 "Total fee {} (gas_limit * max_fee_per_gas) exceeds policy maximum {}",
                 total_fee, policy.max_total_fee
+            )));
+        }
+
+        // Priority fee above the per-gas ceiling is a client bug — EIP-1559 would
+        // silently clip it to `max_fee_per_gas - base_fee`, so reject early for a
+        // clearer error.
+        if tx.max_priority_fee_per_gas > tx.max_fee_per_gas {
+            return Err(VerificationError::new(format!(
+                "max_priority_fee_per_gas {} exceeds max_fee_per_gas {}",
+                tx.max_priority_fee_per_gas, tx.max_fee_per_gas
+            )));
+        }
+
+        if tx.max_priority_fee_per_gas > policy.max_priority_fee_per_gas {
+            return Err(VerificationError::new(format!(
+                "max_priority_fee_per_gas {} exceeds policy maximum {}",
+                tx.max_priority_fee_per_gas, policy.max_priority_fee_per_gas
             )));
         }
 
@@ -2057,11 +2082,6 @@ mod tests {
 
     #[test]
     fn test_policy_override_adjusts_fee_payer_gas_limit() {
-        let provider =
-            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
-                .connect_http("http://127.0.0.1:1".parse().unwrap());
-        let method = ChargeMethod::new(provider);
-
         let currency = Address::repeat_byte(0x20);
         let recipient = Address::repeat_byte(0x33);
         let expected = vec![Transfer {
@@ -2069,39 +2089,51 @@ mod tests {
             recipient,
             memo: None,
         }];
-
         let calls = vec![tempo_primitives::transaction::Call {
             to: TxKind::Call(currency),
             value: U256::ZERO,
             input: make_transfer_input(recipient, U256::from(100u64)),
         }];
 
-        // with custom gas limit lower than default
-        let max_gas = 500_000;
-        let tx_bytes = encode_signed_tx(calls.clone(), max_gas + 1);
-        let overrides = FeePayerPolicyOverride {
-            max_gas: Some(max_gas),
-            ..Default::default()
+        let build_method = || {
+            let provider =
+                alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                    .connect_http("http://127.0.0.1:1".parse().unwrap());
+            ChargeMethod::new(provider)
         };
-        let method = method.with_fee_payer_policy_override(overrides);
-        let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+
+        // Lower ceiling: default (2M) would accept 2.5M, override (500k) rejects.
+        let lowered = build_method().with_fee_payer_policy_override(FeePayerPolicyOverride {
+            max_gas: Some(500_000),
+            ..Default::default()
+        });
+        let tx_under_default_over_override = encode_signed_tx(calls.clone(), 500_001);
+        let error = lowered
+            .validate_transaction_transfers(
+                &tx_under_default_over_override,
+                currency,
+                &expected,
+                CHAIN_ID,
+                true,
+            )
             .unwrap_err();
+        assert!(error.to_string().contains("exceeds maximum 500000"));
 
-        assert!(error
-            .to_string()
-            .contains(&format!("exceeds maximum {}", max_gas)));
-
-        // Override raises ceiling; tx between default (1M) and override (2M) should now pass.
-        let tx_bytes = encode_signed_tx(calls, 1_500_000);
-        let overrides = FeePayerPolicyOverride {
-            max_gas: Some(2_000_000),
+        // Raise ceiling: default (2M) would reject 2.5M, override (3M) accepts.
+        let raised = build_method().with_fee_payer_policy_override(FeePayerPolicyOverride {
+            max_gas: Some(3_000_000),
             ..Default::default()
-        };
-        let result = method
-            .with_fee_payer_policy_override(overrides)
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true);
-        assert!(result.is_ok());
+        });
+        let tx_over_default_under_override = encode_signed_tx(calls, 2_500_000);
+        raised
+            .validate_transaction_transfers(
+                &tx_over_default_under_override,
+                currency,
+                &expected,
+                CHAIN_ID,
+                true,
+            )
+            .expect("override should raise ceiling above default");
     }
 
     /// cosign_fee_payer_transaction rejects txs with wrong nonce_key.
@@ -2443,7 +2475,7 @@ mod tests {
     fn make_cosign_method(
         fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     ) -> (
-        ChargeMethod<impl alloy::providers::Provider<TempoNetwork> + Clone + Send + Sync + 'static>,
+        ChargeMethod<impl alloy::providers::Provider<TempoNetwork> + Clone + 'static>,
         alloy::signers::local::PrivateKeySigner,
         Address,
     ) {
@@ -2539,6 +2571,27 @@ mod tests {
         assert!(err.to_string().contains("Total fee"), "got: {err}");
     }
 
+    #[test]
+    fn test_cosign_rejects_excessive_total_fee_under_gas_limit_and_fee_per_gas() {
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+
+        let mut tx = make_fee_payer_tx(60);
+        // gas_limit=1_999_999, max_fee_per_gas=99_000_000_000 →
+        // total = 197_999_901_000_000_000 > 50_000_000_000_000_000 MAX_TOTAL_FEE_DEFAULT
+        tx.gas_limit = 1_999_999;
+        tx.max_fee_per_gas = 99_000_000_000;
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect_err("should reject excessive total fee");
+        assert!(err.to_string().contains("Total fee"), "got: {err}");
+    }
+
     /// cosign_fee_payer_transaction rejects tx with valid_before window beyond policy max.
     #[test]
     fn test_cosign_rejects_excessive_validity_window() {
@@ -2591,5 +2644,48 @@ mod tests {
                 fee_token,
             )
             .expect("cosign should succeed when all fields within override limits");
+    }
+
+    /// EIP-1559 invariant: priority fee cannot exceed max fee per gas.
+    #[test]
+    fn test_cosign_rejects_priority_fee_above_max_fee() {
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+
+        let mut tx = make_fee_payer_tx(60);
+        // Both within policy ceilings, but priority > max_fee violates EIP-1559.
+        tx.max_fee_per_gas = 1_000_000_000; // 1 gwei
+        tx.max_priority_fee_per_gas = 2_000_000_000; // 2 gwei > max_fee_per_gas
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect_err("priority fee above max fee must be rejected");
+        assert!(
+            err.to_string()
+                .contains("max_priority_fee_per_gas 2000000000 exceeds max_fee_per_gas"),
+            "got: {err}"
+        );
+    }
+
+    /// Moderato chain default raises `max_priority_fee_per_gas` to 50 gwei.
+    #[test]
+    fn test_policy_moderato_default_raises_priority_fee() {
+        let tempo_mainnet = FeePayerPolicy::resolve(CHAIN_ID, None);
+        let moderato = FeePayerPolicy::resolve(MODERATO_CHAIN_ID, None);
+
+        assert_eq!(tempo_mainnet.max_priority_fee_per_gas, 10_000_000_000);
+        assert_eq!(moderato.max_priority_fee_per_gas, 50_000_000_000);
+        // All other fields should equal the mainnet default.
+        assert_eq!(moderato.max_gas, tempo_mainnet.max_gas);
+        assert_eq!(moderato.max_fee_per_gas, tempo_mainnet.max_fee_per_gas);
+        assert_eq!(moderato.max_total_fee, tempo_mainnet.max_total_fee);
+        assert_eq!(
+            moderato.max_validity_window_seconds,
+            tempo_mainnet.max_validity_window_seconds
+        );
     }
 }
