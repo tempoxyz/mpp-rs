@@ -29,6 +29,9 @@ mod fetch;
 #[cfg(feature = "middleware")]
 mod middleware;
 
+#[cfg(feature = "tower-client")]
+mod tower;
+
 pub use error::HttpError;
 pub use provider::{MultiProvider, PaymentProvider};
 
@@ -37,6 +40,9 @@ pub use fetch::PaymentExt as Fetch;
 
 #[cfg(feature = "middleware")]
 pub use middleware::PaymentMiddleware;
+
+#[cfg(feature = "tower-client")]
+pub use tower::PaymentClientLayer;
 
 // Re-export Tempo types at client level for convenience
 #[cfg(feature = "tempo")]

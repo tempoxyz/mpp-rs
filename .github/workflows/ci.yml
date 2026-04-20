@@ -66,7 +66,7 @@ jobs:
       - run: cargo update -p native-tls
       - uses: taiki-e/install-action@dffee21ba64c128096855f01c56682d6f8a2bd29 # cargo-hack
       - name: Tests
-        run: cargo test --features tempo,stripe,server,client,axum,middleware,tower,utils,integration-stripe
+        run: cargo test --features tempo,stripe,server,client,axum,middleware,tower,tower-client,utils,integration-stripe
         env:
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
       - run: cargo hack check --each-feature --no-dev-deps --skip integration
