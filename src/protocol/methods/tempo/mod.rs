@@ -135,7 +135,7 @@ pub use types::{Split, TempoMethodDetails};
 pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
 #[cfg(feature = "server")]
-pub use method::ChargeMethod;
+pub use method::{ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride};
 #[cfg(feature = "server")]
 pub use session_method::{
     ChannelState, ChannelStore, InMemoryChannelStore, SessionMethod, SessionMethodConfig,
