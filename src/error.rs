@@ -549,6 +549,7 @@ impl MppError {
             Self::PaymentRequired { .. } => Some("payment-required"),
             Self::InvalidPayload(_) => Some("invalid-payload"),
             Self::BadRequest(_) => Some("bad-request"),
+            Self::UnsupportedPaymentMethod(_) => Some("method-unsupported"),
             Self::InsufficientBalance(_) => Some("session/insufficient-balance"),
             Self::InvalidSignature(_) => Some("session/invalid-signature"),
             Self::SignerMismatch(_) => Some("session/signer-mismatch"),
@@ -590,6 +591,9 @@ impl PaymentError for MppError {
                 .with_status(402),
             Self::BadRequest(_) => PaymentErrorDetails::core("bad-request")
                 .with_title("BadRequestError")
+                .with_status(400),
+            Self::UnsupportedPaymentMethod(_) => PaymentErrorDetails::core("method-unsupported")
+                .with_title("PaymentMethodUnsupportedError")
                 .with_status(400),
             // Session/channel errors
             Self::InsufficientBalance(_) => PaymentErrorDetails::session("insufficient-balance")
@@ -886,6 +890,18 @@ mod tests {
             "https://paymentauth.org/problems/bad-request"
         );
         assert_eq!(problem.title, "BadRequestError");
+        assert_eq!(problem.status, 400);
+    }
+
+    #[test]
+    fn test_unsupported_payment_method_problem_details() {
+        let err = MppError::unsupported_method(&"lightning");
+        let problem = err.to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/method-unsupported"
+        );
+        assert_eq!(problem.title, "PaymentMethodUnsupportedError");
         assert_eq!(problem.status, 400);
     }
 
