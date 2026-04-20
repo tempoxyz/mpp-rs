@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0 (2026-04-20)
+
+### Minor Changes
+
+- Added `ChargeMethod::with_fee_payer_policy_override()` for per-server tuning of the fee-sponsor policy (`max_gas`, `max_fee_per_gas`, `max_priority_fee_per_gas`, `max_total_fee`, `max_validity_window_seconds`), with per-chain defaults matching mppx#342. (by @stevencartavia, [#211](https://github.com/tempoxyz/mpp-rs/pull/211))
+
+## 0.2.0 (2026-04-20)
+
 ## 0.1.1 (2026-04-10)
 
 ## 0.9.3 (2026-04-10)
