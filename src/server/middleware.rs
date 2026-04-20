@@ -190,6 +190,8 @@ where
                         HeaderValue::from_str(&challenge)
                             .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
                     );
+                    resp.headers_mut()
+                        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
                     return Ok(resp);
                 }
             };
@@ -433,6 +435,10 @@ mod tests {
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 
     /// Test: valid auth → 200 with receipt.

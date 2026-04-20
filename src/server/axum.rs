@@ -116,6 +116,8 @@ impl IntoResponse for PaymentRequired {
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
                 );
+                resp.headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
                 resp
             }
             Err(e) => (
@@ -505,6 +507,10 @@ mod tests {
         let resp = PaymentRequired(test_challenge()).into_response();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
         assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 
     #[test]
