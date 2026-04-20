@@ -15,6 +15,7 @@
 //!
 //! - [`extract_credential`]: Extract a payment credential from MCP request `_meta`
 //! - [`payment_required_error`]: Create an MCP payment-required error
+//! - [`payment_required_error_with_problem`]: Create an MCP payment-required error with RFC 9457 problem details
 //! - [`attach_receipt`]: Attach a receipt to an MCP result's `_meta`
 //!
 //! # Client-side
@@ -113,6 +114,26 @@ pub fn payment_required_error(challenge: &PaymentChallenge) -> McpPaymentError {
             http_status: 402,
             challenges: vec![challenge.clone()],
             problem: None,
+        }),
+    }
+}
+
+/// Create an MCP payment-required error with RFC 9457 problem details.
+///
+/// Use when a credential was rejected. Sets `message` to `problem.detail`
+/// and automatically binds `problem.challenge_id` to the challenge ID.
+pub fn payment_required_error_with_problem(
+    challenge: &PaymentChallenge,
+    mut problem: crate::error::PaymentErrorDetails,
+) -> McpPaymentError {
+    problem.challenge_id = Some(challenge.id.clone());
+    McpPaymentError {
+        code: PAYMENT_REQUIRED_CODE,
+        message: problem.detail.clone(),
+        data: Some(McpPaymentErrorData {
+            http_status: 402,
+            challenges: vec![challenge.clone()],
+            problem: Some(problem),
         }),
     }
 }
@@ -248,6 +269,43 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         let parsed: McpPaymentError = serde_json::from_str(&json).unwrap();
         assert!(parsed.data.is_none());
+    }
+
+    #[test]
+    fn test_mcp_payment_error_with_problem() {
+        use crate::error::PaymentErrorDetails;
+
+        let challenge = test_challenge();
+        // Caller does NOT set challenge_id — the function binds it automatically.
+        let problem = PaymentErrorDetails::core("verification-failed")
+            .with_title("VerificationFailedError")
+            .with_status(402)
+            .with_detail("Payment verification failed: bad signature.");
+
+        let error = payment_required_error_with_problem(&challenge, problem);
+
+        // Top-level: code is -32042, message mirrors problem.detail.
+        assert_eq!(error.code, PAYMENT_REQUIRED_CODE);
+        assert_eq!(error.message, "Payment verification failed: bad signature.");
+
+        // Survives JSON round-trip (matches mppx McpError wire format).
+        let json = serde_json::to_string(&error).unwrap();
+        let parsed: McpPaymentError = serde_json::from_str(&json).unwrap();
+        let data = parsed.data.unwrap();
+
+        // Challenge is present in data.challenges.
+        assert_eq!(data.challenges[0].id, "ch_test_123");
+
+        // Problem details: type URI, title, status, detail, and auto-bound challengeId.
+        let p = data.problem.unwrap();
+        assert_eq!(
+            p.problem_type,
+            "https://paymentauth.org/problems/verification-failed"
+        );
+        assert_eq!(p.title, "VerificationFailedError");
+        assert_eq!(p.status, 402);
+        assert_eq!(p.detail, "Payment verification failed: bad signature.");
+        assert_eq!(p.challenge_id.as_deref(), Some("ch_test_123"));
     }
 
     // ---- extract_credential ----
