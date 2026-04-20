@@ -278,6 +278,13 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 /// ];
 /// let challenges = parse_www_authenticate_all(headers);
 /// assert_eq!(challenges.len(), 2);
+///
+/// // Merged into a single header value
+/// let merged = vec![
+///     "Payment id=\"abc\", realm=\"api\", method=\"tempo\", intent=\"charge\", request=\"e30\", Payment id=\"def\", realm=\"api\", method=\"base\", intent=\"charge\", request=\"e30\"",
+/// ];
+/// let challenges = parse_www_authenticate_all(merged);
+/// assert_eq!(challenges.len(), 2);
 /// ```
 ///
 /// ```
@@ -308,7 +315,9 @@ pub fn parse_www_authenticate_all<'a>(
 /// returns the individual challenge strings.
 fn split_payment_challenges(header: &str) -> Vec<&str> {
     fn is_valid_start(header: &str, pos: usize) -> bool {
-        pos == 0 || header[..pos].bytes().rfind(|b| !b.is_ascii_whitespace()) == Some(b',')
+        pos == 0
+            || header[..pos].bytes().all(|b| b.is_ascii_whitespace())
+            || header[..pos].bytes().rfind(|b| !b.is_ascii_whitespace()) == Some(b',')
     }
 
     let lower = header.to_ascii_lowercase();
@@ -590,6 +599,37 @@ mod tests {
 
         let second = results[1].as_ref().unwrap();
         assert_eq!(second.id, "b");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_merged() {
+        // Two Payment schemes in a single comma-separated header value
+        let merged = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#;
+        let results = parse_www_authenticate_all(vec![merged]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().id, "a");
+        assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
+        assert_eq!(results[1].as_ref().unwrap().id, "b");
+        assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
+    }
+
+    #[test]
+    fn test_split_payment_schemes_ignores_quoted() {
+        // "Payment" inside a quoted value should NOT be treated as a boundary
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", description="Payment required""#;
+        let schemes = split_payment_challenges(header);
+        assert_eq!(schemes.len(), 1);
+    }
+
+    #[test]
+    fn test_split_payment_schemes_leading_whitespace() {
+        // Headers with leading whitespace must still be recognized
+        let header =
+            r#"  Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
+        let schemes = split_payment_challenges(header);
+        assert_eq!(schemes.len(), 1);
+        let challenge = parse_www_authenticate(schemes[0]).unwrap();
+        assert_eq!(challenge.id, "a");
     }
 
     #[test]
