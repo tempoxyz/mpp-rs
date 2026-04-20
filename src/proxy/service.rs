@@ -252,6 +252,10 @@ impl ProxyConfig {
 
         let stripped = self.strip_base(path)?;
 
+        if stripped == "/openapi.json" || stripped == "/openapi.json/" {
+            return Some(DiscoveryResponse::Json(generate_openapi(self)));
+        }
+
         if stripped == "/llms.txt" {
             let open_api_path = match &self.base_path {
                 Some(base) => format!("{}/openapi.json", base.trim_end_matches('/')),
@@ -432,6 +436,73 @@ pub fn to_llms_txt_with(services: &[Service], options: Option<&LlmsTxtOptions<'_
     lines.push(format!("[OpenAPI discovery]({open_api_path})"));
 
     lines.join("\n")
+}
+
+/// Generate an OpenAPI 3.1.0 discovery document from the proxy configuration.
+pub fn generate_openapi(config: &ProxyConfig) -> Value {
+    let title = config.title.as_deref().unwrap_or("API Proxy");
+
+    let mut paths = serde_json::Map::new();
+    for service in &config.services {
+        for route in &service.routes {
+            let path_key = format!("/{}{}", service.id, route.path);
+            let method_key = route.method.as_deref().unwrap_or("GET").to_lowercase();
+
+            let mut responses = serde_json::Map::new();
+            if let Endpoint::Paid(p) = &route.endpoint {
+                responses.insert(
+                    "402".to_string(),
+                    json!({ "description": "Payment Required" }),
+                );
+
+                let mut operation = serde_json::Map::new();
+                operation.insert("intent".to_string(), json!(p.intent));
+                operation.insert("amount".to_string(), json!(p.amount));
+                if let Some(decimals) = p.decimals {
+                    operation.insert("decimals".to_string(), json!(decimals));
+                }
+                if let Some(ref currency) = p.currency {
+                    operation.insert("currency".to_string(), json!(currency));
+                }
+                if let Some(ref ut) = p.unit_type {
+                    operation.insert("unitType".to_string(), json!(ut));
+                }
+                if let Some(ref desc) = p.description {
+                    operation.insert("description".to_string(), json!(desc));
+                }
+
+                responses.insert(
+                    "200".to_string(),
+                    json!({ "description": "Successful response" }),
+                );
+
+                let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
+                path_entry[&method_key] = json!({
+                    "responses": Value::Object(responses),
+                    "x-payment-info": Value::Object(operation),
+                });
+            } else {
+                responses.insert(
+                    "200".to_string(),
+                    json!({ "description": "Successful response" }),
+                );
+
+                let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
+                path_entry[&method_key] = json!({
+                    "responses": Value::Object(responses),
+                });
+            }
+        }
+    }
+
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": title,
+            "version": "1.0.0",
+        },
+        "paths": Value::Object(paths),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -775,5 +846,71 @@ mod tests {
         } else {
             panic!("expected LlmsTxt");
         }
+    }
+
+    #[test]
+    fn test_generate_openapi() {
+        let config = test_config();
+        let doc = generate_openapi(&config);
+
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert_eq!(doc["info"]["title"], "API Proxy");
+        assert_eq!(doc["info"]["version"], "1.0.0");
+
+        let paths = doc["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 2);
+
+        // Paid route
+        let paid = &paths["/openai/v1/chat/completions"]["post"];
+        assert!(paid["responses"]["402"].is_object());
+        assert!(paid["responses"]["200"].is_object());
+        assert_eq!(paid["x-payment-info"]["intent"], "charge");
+        assert_eq!(paid["x-payment-info"]["amount"], "50000");
+        assert_eq!(paid["x-payment-info"]["decimals"], 6);
+        assert_eq!(
+            paid["x-payment-info"]["currency"],
+            "0x20c0000000000000000000000000000000000001"
+        );
+        assert_eq!(paid["x-payment-info"]["description"], "Chat completion");
+
+        // Free route
+        let free = &paths["/openai/v1/models"]["get"];
+        assert!(free["responses"]["200"].is_object());
+        assert!(free["responses"]["402"].is_null());
+        assert!(free["x-payment-info"].is_null());
+
+        // Empty config
+        let empty = ProxyConfig {
+            base_path: None,
+            services: vec![],
+            title: Some("Custom".to_string()),
+            description: None,
+        };
+        let doc = generate_openapi(&empty);
+        assert_eq!(doc["info"]["title"], "Custom");
+        assert!(doc["paths"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_discovery_openapi_json() {
+        let config = test_config();
+
+        let resp = config.handle_discovery("GET", "/openapi.json");
+        assert!(resp.is_some());
+        if let Some(DiscoveryResponse::Json(v)) = resp {
+            assert_eq!(v["openapi"], "3.1.0");
+            assert!(v["paths"]
+                .as_object()
+                .unwrap()
+                .contains_key("/openai/v1/chat/completions"));
+        } else {
+            panic!("expected Json");
+        }
+
+        // trailing slash
+        assert!(config.handle_discovery("GET", "/openapi.json/").is_some());
+
+        // POST should not match
+        assert!(config.handle_discovery("POST", "/openapi.json").is_none());
     }
 }
