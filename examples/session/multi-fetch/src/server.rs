@@ -29,7 +29,6 @@ use tempo_alloy::TempoNetwork;
 
 const RPC_URL: &str = "https://rpc.moderato.tempo.xyz";
 const CHAIN_ID: u64 = 42431;
-const CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
 /// 0.01 pathUSD in base units (6 decimals).
 const AMOUNT_PER_REQUEST: &str = "10000";
 
