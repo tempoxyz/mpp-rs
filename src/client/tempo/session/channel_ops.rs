@@ -987,7 +987,7 @@ mod tests {
     /// an RPC call we can't mock here), we test the validation predicate
     /// directly against `OnChainChannel` values — the same struct and field
     /// comparisons used in the real function.
-
+    ///
     /// Helper: evaluates the same predicate used by `try_recover_channel`.
     fn recovery_accepts(
         on_chain: &OnChainChannel,
