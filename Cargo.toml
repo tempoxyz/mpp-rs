@@ -19,6 +19,7 @@ members = [
   "examples/session/multi-fetch",
   "examples/session/sse",
   "examples/stripe",
+  "examples/ws",
 ]
 default-members = ["."]
 exclude = ["fuzz"]
@@ -29,7 +30,7 @@ default = ["reqwest-default-tls"]
 
 # Side selection
 client = ["dep:reqwest"]
-server = ["tokio", "futures-core", "async-stream"]
+server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
 evm = ["alloy", "hex", "rand"]
@@ -48,12 +49,16 @@ tower = ["dep:tower-layer", "dep:tower-service", "http-types", "dep:http-body", 
 # Axum middleware support (server-side convenience)
 axum = ["dep:axum-core", "server", "http-types"]
 
+# WebSocket support
+ws = ["server", "client", "dep:tokio-tungstenite", "dep:futures-util"]
+
 reqwest-default-tls = ["reqwest?/default-tls"]
 reqwest-native-tls = ["reqwest?/native-tls"]
 reqwest-rustls-tls = ["reqwest?/rustls-tls"]
 
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
+integration-ws = ["ws", "tempo", "server", "client", "axum"]
 integration-stripe = ["stripe", "server", "client", "axum"]
 
 [dependencies]
@@ -95,8 +100,14 @@ http-body = { version = "1", optional = true }
 # Axum dependencies (optional)
 axum-core = { version = "0.5", optional = true }
 
+# WebSocket dependencies (optional)
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-axum = { version = "0.8" }
+axum = { version = "0.8", features = ["ws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hex = "0.4"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"

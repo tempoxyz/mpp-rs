@@ -29,6 +29,13 @@
 mod amount;
 mod mpp;
 pub mod sse;
+pub mod transport;
+
+#[cfg(feature = "ws")]
+pub mod ws;
+
+#[cfg(all(feature = "ws", feature = "tempo"))]
+pub mod ws_session;
 
 #[cfg(feature = "tower")]
 pub mod middleware;
