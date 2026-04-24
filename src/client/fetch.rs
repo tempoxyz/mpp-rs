@@ -7,8 +7,9 @@ use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::error::HttpError;
 use super::provider::PaymentProvider;
+use crate::protocol::core::accept_payment::{self, HasMethodIntent, ACCEPT_PAYMENT_HEADER};
 use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+    format_authorization, parse_www_authenticate_all, PaymentChallenge, AUTHORIZATION_HEADER,
 };
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
@@ -52,6 +53,16 @@ pub trait PaymentExt {
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 }
 
+impl HasMethodIntent for PaymentChallenge {
+    fn method(&self) -> &str {
+        self.method.as_str()
+    }
+
+    fn intent(&self) -> &str {
+        self.intent.as_str()
+    }
+}
+
 impl PaymentExt for RequestBuilder {
     async fn send_with_payment<P: PaymentProvider>(
         self,
@@ -59,7 +70,15 @@ impl PaymentExt for RequestBuilder {
     ) -> Result<Response, HttpError> {
         let retry_builder = self.try_clone().ok_or(HttpError::CloneFailed)?;
 
-        let resp = self.send().await?;
+        // Inject Accept-Payment header from provider's supported methods
+        let accept_header = provider.accept_payment_header();
+        let this = if let Some(ref header) = accept_header {
+            self.header(ACCEPT_PAYMENT_HEADER, header)
+        } else {
+            self
+        };
+
+        let resp = this.send().await?;
 
         if resp.status() != StatusCode::PAYMENT_REQUIRED {
             return Ok(resp);
@@ -81,19 +100,36 @@ impl PaymentExt for RequestBuilder {
             .filter_map(|r| r.ok())
             .collect();
 
-        let challenge = challenges
-            .iter()
-            .find(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
-            .ok_or_else(|| {
-                let offered: Vec<_> = challenges
+        // Use Accept-Payment ranking when preferences are available,
+        // otherwise fall back to first supported challenge.
+        let challenge = if let Some(ref header) = accept_header {
+            if let Ok(prefs) = accept_payment::parse(header) {
+                // Filter to supported, then rank by preference
+                let supported: Vec<_> = challenges
                     .iter()
-                    .map(|c| format!("{}.{}", c.method, c.intent))
+                    .filter(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
                     .collect();
-                HttpError::NoSupportedChallenge(format!(
-                    "server offered [{}], but provider does not support any",
-                    offered.join(", ")
-                ))
-            })?;
+                accept_payment::select(&supported, &prefs).copied()
+            } else {
+                challenges
+                    .iter()
+                    .find(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
+            }
+        } else {
+            challenges
+                .iter()
+                .find(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
+        }
+        .ok_or_else(|| {
+            let offered: Vec<_> = challenges
+                .iter()
+                .map(|c| format!("{}.{}", c.method, c.intent))
+                .collect();
+            HttpError::NoSupportedChallenge(format!(
+                "server offered [{}], but provider does not support any",
+                offered.join(", ")
+            ))
+        })?;
 
         let credential = provider.pay(challenge).await?;
 

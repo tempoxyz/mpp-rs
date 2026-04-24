@@ -9,6 +9,7 @@ use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
 use crate::client::provider::PaymentProvider;
+use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
 use crate::protocol::core::{
     format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
 };
@@ -53,10 +54,18 @@ where
 {
     async fn handle(
         &self,
-        req: Request,
+        mut req: Request,
         extensions: &mut http_types::Extensions,
         next: Next<'_>,
     ) -> reqwest_middleware::Result<Response> {
+        // Inject Accept-Payment header if the provider advertises methods
+        let accept_header = self.provider.accept_payment_header();
+        if let Some(ref header) = accept_header {
+            if let Ok(val) = header.parse() {
+                req.headers_mut().insert(ACCEPT_PAYMENT_HEADER, val);
+            }
+        }
+
         let retry_req = req.try_clone();
         let resp = next.clone().run(req, extensions).await?;
 
@@ -86,11 +95,26 @@ where
             .filter_map(|r| r.ok())
             .collect();
 
-        let challenge = challenges
-            .iter()
-            .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
-            .context("no challenge matches provider's supported methods")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+        // Use Accept-Payment ranking when preferences are available
+        let challenge = if let Some(ref header) = accept_header {
+            if let Ok(prefs) = accept_payment::parse(header) {
+                let supported: Vec<_> = challenges
+                    .iter()
+                    .filter(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
+                    .collect();
+                accept_payment::select(&supported, &prefs).copied()
+            } else {
+                challenges
+                    .iter()
+                    .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
+            }
+        } else {
+            challenges
+                .iter()
+                .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
+        }
+        .context("no challenge matches provider's supported methods")
+        .map_err(reqwest_middleware::Error::Middleware)?;
 
         let credential = self
             .provider
