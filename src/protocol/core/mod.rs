@@ -66,6 +66,7 @@
 //! let auth_header = format_authorization(&credential).unwrap();
 //! ```
 
+pub mod accept_payment;
 pub mod challenge;
 pub mod headers;
 pub mod types;

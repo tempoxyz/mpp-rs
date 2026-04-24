@@ -64,6 +64,15 @@ pub trait PaymentProvider: Clone + Send + Sync {
         &self,
         challenge: &PaymentChallenge,
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
+
+    /// Build an `Accept-Payment` header value from this provider's supported methods.
+    ///
+    /// Returns `None` if the provider does not advertise specific methods.
+    /// The default implementation returns `None`; providers that know their
+    /// supported `(method, intent)` pairs should override this.
+    fn accept_payment_header(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A provider that wraps multiple payment providers and picks the right one.
@@ -141,6 +150,20 @@ impl PaymentProvider for MultiProvider {
             method, intent
         )))
     }
+
+    fn accept_payment_header(&self) -> Option<String> {
+        let headers: Vec<String> = self
+            .providers
+            .iter()
+            .filter_map(|p| p.dyn_accept_payment_header())
+            .collect();
+
+        if headers.is_empty() {
+            None
+        } else {
+            Some(headers.join(", "))
+        }
+    }
 }
 
 /// Object-safe version of PaymentProvider for use in MultiProvider.
@@ -150,6 +173,7 @@ trait DynPaymentProvider: Send + Sync {
         &'a self,
         challenge: &'a PaymentChallenge,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
+    fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
 
@@ -164,6 +188,10 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
     {
         Box::pin(PaymentProvider::pay(self, challenge))
+    }
+
+    fn dyn_accept_payment_header(&self) -> Option<String> {
+        PaymentProvider::accept_payment_header(self)
     }
 
     fn clone_box(&self) -> Box<dyn DynPaymentProvider> {

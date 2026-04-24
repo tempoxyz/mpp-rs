@@ -77,6 +77,9 @@ pub use protocol::core::{
     WWW_AUTHENTICATE_HEADER,
 };
 
+// Accept-Payment header
+pub use protocol::core::accept_payment;
+
 // Store types
 pub use store::{FileStore, MemoryStore, Store, StoreError};
 
