@@ -129,15 +129,9 @@ where
             chain_id: None,
         }
     }
-}
 
-impl<M> Mpp<M, ()>
-where
-    M: ChargeMethod,
-{
-    /// Create a payment handler with bound currency/recipient for testing.
-    #[cfg(test)]
-    pub(crate) fn new_with_config(
+    /// Create a new payment handler with pre-configured currency and recipient (advanced API).
+    pub fn new_with_config(
         method: M,
         realm: impl Into<String>,
         secret_key: impl Into<String>,
