@@ -22,11 +22,11 @@ jobs:
           persist-credentials: false
 
       - name: Authenticate with crates.io
-        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@54f693643e1bd8469293bdfcbfb647bceb559490 # master
+        uses: tempoxyz/changelogs@bddf29852a5c9b8e1d84f1cc19b5023916d0d0db # master
         with:
           conventional-commit: true
           crate-token: ${{ steps.auth.outputs.token }}
