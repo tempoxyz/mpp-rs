@@ -212,6 +212,96 @@ where
         self.chain_id
     }
 
+    /// Tier-2 pinned field verification.
+    ///
+    /// After the HMAC check (Tier 1) confirms the echoed challenge was issued
+    /// by this server, this check compares economically-significant fields
+    /// from the credential against the server's current configuration to
+    /// prevent cross-route credential replay attacks.
+    fn verify_pinned_fields(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> std::result::Result<(), VerificationError> {
+        // Challenge-level fields: method, intent, realm
+        if credential.challenge.method.as_str() != self.method.method() {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential method '{}' does not match this route's requirements (expected '{}')",
+                    credential.challenge.method, self.method.method()
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if !credential.challenge.intent.is_charge() {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential intent '{}' does not match this route's requirements (expected 'charge')",
+                    credential.challenge.intent
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if credential.challenge.realm != self.realm {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential realm '{}' does not match this route's requirements (expected '{}')",
+                    credential.challenge.realm, self.realm
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        // Request-level core fields: currency, recipient
+        if let Some(ref expected_currency) = self.currency {
+            if request.currency != *expected_currency {
+                return Err(VerificationError::with_code(
+                    format!(
+                        "credential currency '{}' does not match this route's requirements",
+                        request.currency
+                    ),
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        if let Some(ref expected_recipient) = self.recipient {
+            if request.recipient.as_deref() != Some(expected_recipient.as_str()) {
+                return Err(VerificationError::with_code(
+                    "credential recipient does not match this route's requirements",
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        // Request-level method fields: chainId (fail-closed when expected but missing)
+        if let Some(expected_chain_id) = self.chain_id {
+            let actual_chain_id = request
+                .method_details
+                .as_ref()
+                .and_then(|md| md.get("chainId"))
+                .and_then(|v| match v {
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+
+            if actual_chain_id.as_deref() != Some(&*expected_chain_id.to_string()) {
+                return Err(VerificationError::with_code(
+                    format!(
+                        "credential chainId {:?} does not match this route's requirements (expected '{}')",
+                        actual_chain_id, expected_chain_id
+                    ),
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Verify the challenge HMAC and reject expired challenges.
     ///
     /// Shared validation used by both charge and session verification paths.
@@ -466,7 +556,10 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
+        // Tier 1: HMAC provenance + expiry
         self.verify_hmac_and_expiry(credential)?;
+        // Tier 2: Pinned field safety net
+        self.verify_pinned_fields(credential, request)?;
         let receipt = self.method.verify(credential, request).await?;
         Ok(receipt)
     }
@@ -1352,11 +1445,9 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[tokio::test]
-    async fn test_hmac_tampered_realm_ignored() {
-        // The server recomputes the HMAC using its own realm (self.realm),
-        // not the echoed realm from the credential. So tampering the echoed
-        // realm has no effect on HMAC verification — the server is the
-        // authority on its own realm. This is correct security behavior.
+    async fn test_hmac_tampered_realm_rejected() {
+        // HMAC (Tier 1) passes because the server recomputes using its own
+        // realm, but Tier-2 pinned field verification catches the mismatch.
         let mpp = create_hmac_test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
 
@@ -1365,11 +1456,10 @@ mod tests {
 
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
         let result = mpp.verify_credential(&credential).await;
-        // Verification succeeds because the server uses its own realm for
-        // HMAC recomputation, not the echoed one.
+        assert!(result.is_err());
         assert!(
-            result.is_ok(),
-            "echoed realm is ignored by server HMAC check"
+            result.unwrap_err().message.contains("realm"),
+            "expected realm mismatch error"
         );
     }
 
