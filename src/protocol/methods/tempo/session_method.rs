@@ -242,7 +242,9 @@ pub struct SessionMethod<P> {
     store: Arc<dyn ChannelStore>,
     config: SessionMethodConfig,
     /// Optional signer for submitting on-chain close transactions.
-    close_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    ///
+    /// Accepts any EVM signer (local key, KMS, hardware wallet, etc.).
+    close_signer: Option<Arc<dyn alloy::signers::Signer + Send + Sync>>,
 }
 
 impl<P> SessionMethod<P> {
@@ -283,7 +285,13 @@ where
     }
 
     /// Set the signer used for submitting on-chain close transactions.
-    pub fn with_close_signer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
+    ///
+    /// Accepts any type implementing alloy's [`Signer`](alloy::signers::Signer)
+    /// trait — local private keys, KMS-backed signers, hardware wallets, etc.
+    pub fn with_close_signer(
+        mut self,
+        signer: impl alloy::signers::Signer + Send + Sync + 'static,
+    ) -> Self {
         self.close_signer = Some(Arc::new(signer));
         self
     }
@@ -890,7 +898,6 @@ where
         let close_tx_hash = if let Some(ref signer) = self.close_signer {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
-            use alloy::signers::SignerSync;
             use alloy::sol_types::SolCall;
             use tempo_primitives::transaction::Call;
             use tempo_primitives::TempoTransaction;
@@ -934,7 +941,7 @@ where
             };
 
             let sig_hash = tempo_tx.signature_hash();
-            let signature = signer.sign_hash_sync(&sig_hash).map_err(|e| {
+            let signature = signer.sign_hash(&sig_hash).await.map_err(|e| {
                 VerificationError::network_error(format!("failed to sign close tx: {}", e))
             })?;
             let signed_tx = tempo_tx.into_signed(signature.into());
