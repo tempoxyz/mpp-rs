@@ -74,9 +74,11 @@ use axum_core::extract::{FromRef, FromRequestParts};
 use axum_core::response::IntoResponse;
 use http_types::{header, HeaderValue, StatusCode};
 
+#[cfg(any(feature = "stripe", feature = "tempo"))]
+use crate::protocol::core::headers::parse_authorization;
 use crate::protocol::core::headers::{
-    extract_payment_scheme, format_receipt, format_www_authenticate, parse_authorization,
-    PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
+    extract_payment_scheme, format_receipt, format_www_authenticate, PAYMENT_RECEIPT_HEADER,
+    WWW_AUTHENTICATE_HEADER,
 };
 use crate::protocol::core::{PaymentChallenge, Receipt};
 
@@ -255,6 +257,19 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         &self,
         credential_str: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>;
+
+    /// Verify a credential string against the route's expected dollar amount.
+    ///
+    /// High-level integrations should prefer this method so verification can
+    /// compare the echoed credential challenge against the route's expected
+    /// charge request, rather than trusting the echoed request alone.
+    fn verify_payment_for_amount(
+        &self,
+        credential_str: &str,
+        _amount: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        self.verify_payment(credential_str)
+    }
 }
 
 #[cfg(feature = "tempo")]
@@ -296,6 +311,53 @@ where
             super::Mpp::verify_credential(&mpp, &credential)
                 .await
                 .map_err(|e| e.to_string())
+        })
+    }
+
+    fn verify_payment_for_amount(
+        &self,
+        credential_str: &str,
+        amount: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.charge(amount) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request(
+                &mpp,
+                &credential,
+                &expected_request,
+            )
+            .await
+            .map_err(|e| e.to_string())
         })
     }
 }
@@ -340,6 +402,53 @@ where
                 .map_err(|e| e.to_string())
         })
     }
+
+    fn verify_payment_for_amount(
+        &self,
+        credential_str: &str,
+        amount: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.stripe_charge(amount) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request(
+                &mpp,
+                &credential,
+                &expected_request,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
 }
 
 impl<S, C> FromRequestParts<S> for MppCharge<C>
@@ -377,7 +486,10 @@ where
                 }
             };
 
-            let receipt = match challenger.verify_payment(&credential_str).await {
+            let receipt = match challenger
+                .verify_payment_for_amount(&credential_str, C::amount())
+                .await
+            {
                 Ok(r) => r,
                 Err(_) => {
                     let challenge = challenger
@@ -623,7 +735,7 @@ mod tests {
     }
 
     async fn run_extractor<C: ChargeConfig>(
-        challenger: MockChallenger,
+        challenger: impl ChargeChallenger,
         auth_header: Option<&str>,
     ) -> Result<MppCharge<C>, MppChargeRejection> {
         let state: Arc<dyn ChargeChallenger> = Arc::new(challenger);
@@ -737,5 +849,67 @@ mod tests {
         assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn test_extractor_uses_route_aware_verification_path() {
+        struct RouteAwareChallenger {
+            seen_amount: Arc<std::sync::Mutex<Option<String>>>,
+        }
+
+        impl ChargeChallenger for RouteAwareChallenger {
+            fn challenge(
+                &self,
+                amount: &str,
+                _options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                Ok(PaymentChallenge::new(
+                    "mock-id",
+                    "mock-realm",
+                    "tempo",
+                    "charge",
+                    Base64UrlJson::from_value(&serde_json::json!({"amount": amount})).unwrap(),
+                ))
+            }
+
+            fn verify_payment(
+                &self,
+                _credential_str: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+            {
+                Box::pin(std::future::ready(Err(
+                    "legacy verifier should not be called".into(),
+                )))
+            }
+
+            fn verify_payment_for_amount(
+                &self,
+                _credential_str: &str,
+                amount: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+            {
+                *self.seen_amount.lock().unwrap() = Some(amount.to_string());
+                Box::pin(std::future::ready(Ok(Receipt {
+                    status: crate::protocol::core::ReceiptStatus::Success,
+                    method: crate::protocol::core::MethodName::new("tempo"),
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    reference: "0xroute-aware".into(),
+                    external_id: None,
+                })))
+            }
+        }
+
+        let seen_amount = Arc::new(std::sync::Mutex::new(None));
+        let result = run_extractor::<OneCent>(
+            RouteAwareChallenger {
+                seen_amount: seen_amount.clone(),
+            },
+            Some("Payment eyJmYWtlIjp0cnVlfQ"),
+        )
+        .await;
+
+        let charge = result.unwrap();
+        assert_eq!(charge.receipt.reference, "0xroute-aware");
+        assert_eq!(seen_amount.lock().unwrap().as_deref(), Some("0.01"));
     }
 }
