@@ -21,6 +21,9 @@ pub enum HttpError {
     /// Request could not be cloned (required for retry)
     CloneFailed,
 
+    /// Payment was declined by the on_challenge callback
+    PaymentDeclined,
+
     /// Payment provider error
     Payment(MppError),
 
@@ -41,6 +44,7 @@ impl fmt::Display for HttpError {
             Self::InvalidChallenge(msg) => write!(f, "invalid challenge: {}", msg),
             Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),
             Self::CloneFailed => write!(f, "request could not be cloned for retry"),
+            Self::PaymentDeclined => write!(f, "payment declined by on_challenge callback"),
             Self::Payment(e) => write!(f, "payment failed: {}", e),
             #[cfg(feature = "client")]
             Self::Request(e) => write!(f, "HTTP request failed: {}", e),

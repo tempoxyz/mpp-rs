@@ -37,7 +37,7 @@ pub use error::HttpError;
 pub use provider::{MultiProvider, PaymentProvider};
 
 #[cfg(feature = "client")]
-pub use fetch::PaymentExt as Fetch;
+pub use fetch::{ApproveChallenge, ChallengeAction, OnChallenge, PaymentExt as Fetch};
 
 #[cfg(feature = "middleware")]
 pub use middleware::PaymentMiddleware;
