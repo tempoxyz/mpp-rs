@@ -26,7 +26,7 @@ jobs:
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@bddf29852a5c9b8e1d84f1cc19b5023916d0d0db # master
+        uses: tempoxyz/changelogs@689183aaceed9bcbbccd0440001247e59ba2fd0a # master
         with:
           conventional-commit: true
           crate-token: ${{ steps.auth.outputs.token }}
