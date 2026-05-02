@@ -239,6 +239,15 @@ pub fn from_methods(methods: &[(&str, &str)]) -> String {
     serialize(&entries)
 }
 
+impl HasMethodIntent for super::PaymentChallenge {
+    fn method(&self) -> &str {
+        self.method.as_str()
+    }
+    fn intent(&self) -> &str {
+        self.intent.as_str()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ranking
 // ---------------------------------------------------------------------------

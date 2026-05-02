@@ -7,9 +7,9 @@ use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::error::HttpError;
 use super::provider::PaymentProvider;
-use crate::protocol::core::accept_payment::{self, HasMethodIntent, ACCEPT_PAYMENT_HEADER};
+use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
 use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, PaymentChallenge, AUTHORIZATION_HEADER,
+    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
 };
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
@@ -51,16 +51,6 @@ pub trait PaymentExt {
         self,
         provider: &P,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
-}
-
-impl HasMethodIntent for PaymentChallenge {
-    fn method(&self) -> &str {
-        self.method.as_str()
-    }
-
-    fn intent(&self) -> &str {
-        self.intent.as_str()
-    }
 }
 
 impl PaymentExt for RequestBuilder {
