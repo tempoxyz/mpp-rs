@@ -1938,8 +1938,8 @@ async fn test_proof_credential_replay_rejected() {
         credential1.source.clone().unwrap_or_default(),
         credential1.payload.clone(),
     );
-    let replayed_auth =
-        mpp::format_authorization(&replayed_credential).expect("failed to format replayed credential");
+    let replayed_auth = mpp::format_authorization(&replayed_credential)
+        .expect("failed to format replayed credential");
 
     let resp3 = Client::new()
         .get(format!("{url}/identity"))

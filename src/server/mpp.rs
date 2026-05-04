@@ -903,7 +903,10 @@ mod tests {
     use crate::protocol::traits::ErrorCode;
     #[cfg(feature = "tempo")]
     use crate::server::{tempo, ChargeOptions, TempoConfig};
-    use std::future::Future;
+    use std::{
+        future::Future,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Clone)]
     struct MockMethod;
@@ -920,6 +923,31 @@ mod tests {
             _request: &ChargeRequest,
         ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
             async { Ok(Receipt::success("mock", "mock_ref")) }
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingMethod {
+        seen_request: Arc<Mutex<Option<ChargeRequest>>>,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl ChargeMethod for RecordingMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            let seen_request = self.seen_request.clone();
+            let request = request.clone();
+            async move {
+                *seen_request.lock().unwrap() = Some(request);
+                Ok(Receipt::success("mock", "0xabc123"))
+            }
         }
     }
 
@@ -1038,6 +1066,73 @@ mod tests {
         let mpp_err: MppError = err.into();
         let problem = mpp_err.to_problem_details(None);
         assert_eq!(problem.status, 402);
+    }
+
+    #[tokio::test]
+    async fn test_verify_returns_receipt_for_success() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let credential = test_credential("secret");
+        let request = test_request();
+
+        let receipt = payment.verify(&credential, &request).await.unwrap();
+
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "mock_ref");
+    }
+
+    #[tokio::test]
+    async fn test_verify_credential_decodes_request() {
+        let request = ChargeRequest {
+            amount: "500000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let secret = "test-secret";
+        let id = crate::protocol::core::compute_challenge_id(
+            secret,
+            "api.example.com",
+            "mock",
+            "charge",
+            encoded.raw(),
+            Some(&expires),
+            None,
+            None,
+        );
+        let credential = PaymentCredential::new(
+            ChallengeEcho {
+                id,
+                realm: "api.example.com".into(),
+                method: "mock".into(),
+                intent: "charge".into(),
+                request: encoded,
+                expires: Some(expires),
+                digest: None,
+                opaque: None,
+            },
+            PaymentPayload::hash("0x123"),
+        );
+        let seen_request = Arc::new(Mutex::new(None));
+        let payment = Mpp::new(
+            RecordingMethod {
+                seen_request: seen_request.clone(),
+            },
+            "api.example.com",
+            secret,
+        );
+
+        let receipt = payment.verify_credential(&credential).await.unwrap();
+
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "0xabc123");
+        let seen = seen_request.lock().unwrap().clone().unwrap();
+        assert_eq!(seen.amount, request.amount);
+        assert_eq!(seen.currency, request.currency);
+        assert_eq!(seen.recipient, request.recipient);
     }
 
     #[cfg(feature = "tempo")]
