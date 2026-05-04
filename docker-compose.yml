@@ -22,7 +22,11 @@ services:
     ports:
       - "8545:8545"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8545", "-X", "POST", "-H", "Content-Type: application/json", "-d", "{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}"]
+      test:
+        [
+          "CMD-SHELL",
+          "bash -lc 'body=\"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"method\\\":\\\"eth_chainId\\\",\\\"params\\\":[],\\\"id\\\":1}\"; exec 3<>/dev/tcp/127.0.0.1/8545; printf \"POST / HTTP/1.1\\r\\nHost: localhost\\r\\nContent-Type: application/json\\r\\nContent-Length: $${#body}\\r\\nConnection: close\\r\\n\\r\\n%s\" \"$$body\" >&3; timeout 2 grep -q \"result\" <&3'",
+        ]
       interval: 2s
       timeout: 5s
       retries: 15

@@ -1667,3 +1667,293 @@ async fn test_e2e_fee_payer_premium_charge() {
     handle.abort();
     let _ = handle.await;
 }
+
+// ==================== Replay protection tests ====================
+
+/// Transaction credential replay protection: the same tx hash used for a second
+/// challenge should be rejected because the memo is bound to the first challenge ID.
+#[tokio::test]
+async fn test_tx_hash_replay_rejected() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key("replay-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    // First payment — should succeed.
+    let resp1 = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("first payment failed");
+    assert_eq!(resp1.status(), 200);
+
+    let receipt_hdr = resp1
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    let tx_hash = &receipt.reference;
+
+    // Get a fresh challenge.
+    let resp2 = Client::new()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .expect("challenge request failed");
+    assert_eq!(resp2.status(), 402);
+
+    let www_auth = resp2
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let challenge = mpp::parse_www_authenticate(www_auth).expect("failed to parse challenge");
+
+    // Build a credential reusing the old tx hash with the new challenge.
+    let echo = challenge.to_echo();
+    let credential = mpp::PaymentCredential::new(echo, mpp::PaymentPayload::hash(tx_hash));
+    let auth_header =
+        mpp::format_authorization(&credential).expect("failed to format authorization");
+
+    // Submit — should be rejected (memo bound to old challenge, not this one).
+    let resp3 = Client::new()
+        .get(format!("{url}/paid"))
+        .header("authorization", &auth_header)
+        .send()
+        .await
+        .expect("replay request failed");
+
+    assert_eq!(
+        resp3.status(),
+        402,
+        "replayed tx hash with different challenge should be rejected"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Hash credential with extra transfer logs: a transaction that has additional
+/// transfers (plain transfer without challenge-bound memo) should be rejected.
+#[tokio::test]
+async fn test_hash_credential_with_extra_transfer_rejected() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let extra_recipient = PrivateKeySigner::random();
+
+    fund_account(&rpc, server_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("extra-transfer-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    // Step 1: Get the 402 challenge.
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 402);
+
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let challenge = mpp::parse_www_authenticate(www_auth).expect("failed to parse challenge");
+
+    // Step 2: Send a transaction with TWO transfers in a single multicall:
+    // one to the correct recipient, one to an extra recipient.
+    let charge: mpp::ChargeRequest = challenge.request.decode().unwrap();
+    let amount: U256 = charge.amount.parse().unwrap();
+    let currency: Address = charge.currency.parse().unwrap();
+
+    let transfer_correct =
+        ITIP20::transferCall::new((server_signer.address(), amount)).abi_encode();
+    let transfer_extra =
+        ITIP20::transferCall::new((extra_recipient.address(), amount)).abi_encode();
+
+    let tx_hash = dev_send(
+        &rpc,
+        vec![
+            Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: Bytes::from(transfer_correct),
+            },
+            Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: Bytes::from(transfer_extra),
+            },
+        ],
+    )
+    .await;
+
+    // Step 3: Build a credential with the tx hash.
+    let echo = challenge.to_echo();
+    let credential =
+        mpp::PaymentCredential::new(echo, mpp::PaymentPayload::hash(format!("{tx_hash:#x}")));
+    let auth_header =
+        mpp::format_authorization(&credential).expect("failed to format authorization");
+
+    // Step 4: Submit — should be rejected because the memo in the correct
+    // transfer won't be challenge-bound (plain transfer, not transferWithMemo).
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .header("authorization", &auth_header)
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        402,
+        "transaction with extra transfers (and no challenge-bound memo) should be rejected"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Proof credential replay protection: a $0 proof credential for one challenge
+/// cannot be replayed against a different challenge.
+#[tokio::test]
+async fn test_proof_credential_replay_rejected() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .secret_key("proof-replay-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+
+    // Step 1: Get a $0 challenge and create a proof credential.
+    let resp1 = Client::new()
+        .get(format!("{url}/identity"))
+        .send()
+        .await
+        .expect("identity request failed");
+    assert_eq!(resp1.status(), 402);
+
+    let www_auth1 = resp1
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let challenge1 = mpp::parse_www_authenticate(www_auth1).expect("failed to parse challenge");
+
+    let credential1 = provider
+        .pay(&challenge1)
+        .await
+        .expect("failed to create proof credential");
+
+    let auth_header1 =
+        mpp::format_authorization(&credential1).expect("failed to format credential");
+
+    // Verify the first proof works.
+    let resp_ok = Client::new()
+        .get(format!("{url}/identity"))
+        .header("authorization", &auth_header1)
+        .send()
+        .await
+        .expect("identity auth request failed");
+    assert_eq!(resp_ok.status(), 200);
+
+    // Step 2: Get a SECOND challenge (different challenge ID).
+    let resp2 = Client::new()
+        .get(format!("{url}/identity"))
+        .send()
+        .await
+        .expect("second identity request failed");
+    assert_eq!(resp2.status(), 402);
+
+    let www_auth2 = resp2
+        .headers()
+        .get("www-authenticate")
+        .expect("missing WWW-Authenticate")
+        .to_str()
+        .unwrap();
+    let challenge2 = mpp::parse_www_authenticate(www_auth2).expect("failed to parse challenge");
+
+    // Sanity: the two challenges have different IDs.
+    assert_ne!(
+        challenge1.id, challenge2.id,
+        "two challenges should have distinct IDs"
+    );
+
+    // Step 3: Try to use the FIRST proof credential against the SECOND challenge.
+    // Build a credential with the second challenge's echo but the first
+    // credential's payload (signature bound to challenge1.id).
+    let echo2 = challenge2.to_echo();
+    let replayed_credential = mpp::PaymentCredential::with_source(
+        echo2,
+        credential1.source.clone().unwrap_or_default(),
+        credential1.payload.clone(),
+    );
+    let replayed_auth = mpp::format_authorization(&replayed_credential)
+        .expect("failed to format replayed credential");
+
+    let resp3 = Client::new()
+        .get(format!("{url}/identity"))
+        .header("authorization", &replayed_auth)
+        .send()
+        .await
+        .expect("replay request failed");
+
+    assert_eq!(
+        resp3.status(),
+        402,
+        "proof credential replayed against different challenge should be rejected"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
