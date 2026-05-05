@@ -206,6 +206,96 @@ where
         self.chain_id
     }
 
+    /// Tier-2 pinned field verification.
+    ///
+    /// After the HMAC check (Tier 1) confirms the echoed challenge was issued
+    /// by this server, this check compares economically-significant fields
+    /// from the credential against the server's current configuration to
+    /// prevent cross-route credential replay attacks.
+    fn verify_pinned_fields(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> std::result::Result<(), VerificationError> {
+        // Challenge-level fields: method, intent, realm
+        if credential.challenge.method.as_str() != self.method.method() {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential method '{}' does not match this route's requirements (expected '{}')",
+                    credential.challenge.method, self.method.method()
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if !credential.challenge.intent.is_charge() {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential intent '{}' does not match this route's requirements (expected 'charge')",
+                    credential.challenge.intent
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if credential.challenge.realm != self.realm {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential realm '{}' does not match this route's requirements (expected '{}')",
+                    credential.challenge.realm, self.realm
+                ),
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        // Request-level core fields: currency, recipient
+        if let Some(ref expected_currency) = self.currency {
+            if request.currency != *expected_currency {
+                return Err(VerificationError::with_code(
+                    format!(
+                        "credential currency '{}' does not match this route's requirements",
+                        request.currency
+                    ),
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        if let Some(ref expected_recipient) = self.recipient {
+            if request.recipient.as_deref() != Some(expected_recipient.as_str()) {
+                return Err(VerificationError::with_code(
+                    "credential recipient does not match this route's requirements",
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        // Request-level method fields: chainId (fail-closed when expected but missing)
+        if let Some(expected_chain_id) = self.chain_id {
+            let actual_chain_id = request
+                .method_details
+                .as_ref()
+                .and_then(|md| md.get("chainId"))
+                .and_then(|v| match v {
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+
+            if actual_chain_id.as_deref() != Some(&*expected_chain_id.to_string()) {
+                return Err(VerificationError::with_code(
+                    format!(
+                        "credential chainId {:?} does not match this route's requirements (expected '{}')",
+                        actual_chain_id, expected_chain_id
+                    ),
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Verify the challenge HMAC and reject expired challenges.
     ///
     /// Shared validation used by both charge and session verification paths.
@@ -460,7 +550,10 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
+        // Tier 1: HMAC provenance + expiry
         self.verify_hmac_and_expiry(credential)?;
+        // Tier 2: Pinned field safety net
+        self.verify_pinned_fields(credential, request)?;
         let receipt = self.method.verify(credential, request).await?;
         Ok(receipt)
     }
@@ -1356,11 +1449,9 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[tokio::test]
-    async fn test_hmac_tampered_realm_ignored() {
-        // The server recomputes the HMAC using its own realm (self.realm),
-        // not the echoed realm from the credential. So tampering the echoed
-        // realm has no effect on HMAC verification — the server is the
-        // authority on its own realm. This is correct security behavior.
+    async fn test_hmac_tampered_realm_rejected() {
+        // HMAC (Tier 1) passes because the server recomputes using its own
+        // realm, but Tier-2 pinned field verification catches the mismatch.
         let mpp = create_hmac_test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
 
@@ -1369,11 +1460,10 @@ mod tests {
 
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
         let result = mpp.verify_credential(&credential).await;
-        // Verification succeeds because the server uses its own realm for
-        // HMAC recomputation, not the echoed one.
+        assert!(result.is_err());
         assert!(
-            result.is_ok(),
-            "echoed realm is ignored by server HMAC check"
+            result.unwrap_err().message.contains("realm"),
+            "expected realm mismatch error"
         );
     }
 
@@ -1411,6 +1501,196 @@ mod tests {
             result.unwrap_err().message.contains("mismatch"),
             "expected HMAC mismatch error"
         );
+    }
+
+    // ── Tier-2 pinned field verification tests ──────────────────────
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_currency_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let mut request: ChargeRequest = challenge.request.decode().unwrap();
+        request.currency = "0xDEAD000000000000000000000000000000000000".into();
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.request = encoded;
+        // Re-sign with server secret so HMAC passes
+        let id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        echo.id = id;
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("currency"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_recipient_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+        let mut request: ChargeRequest = challenge.request.decode().unwrap();
+        request.recipient = Some("0xDEAD000000000000000000000000000000000000".into());
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.request = encoded;
+        let id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        echo.id = id;
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("recipient"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_chain_id_mismatch_rejected() {
+        let mut mpp = create_hmac_test_mpp();
+        mpp.chain_id = Some(42431);
+        let challenge = mpp.charge("0.10").unwrap();
+
+        // Tamper chainId in the request, re-sign HMAC
+        let mut request: ChargeRequest = challenge.request.decode().unwrap();
+        let md = request.method_details.get_or_insert(serde_json::json!({}));
+        md["chainId"] = serde_json::json!(9999);
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.request = encoded;
+        let id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        echo.id = id;
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("chainId"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_chain_id_missing_rejected() {
+        // Server expects chainId but credential omits it entirely (fail-closed)
+        let mut mpp = create_hmac_test_mpp();
+        mpp.chain_id = Some(42431);
+        let challenge = mpp.charge("0.10").unwrap();
+
+        // Strip chainId from request, re-sign
+        let mut request: ChargeRequest = challenge.request.decode().unwrap();
+        if let Some(md) = request.method_details.as_mut() {
+            md.as_object_mut().unwrap().remove("chainId");
+        }
+        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.request = encoded;
+        let id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        echo.id = id;
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("chainId"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_intent_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        // Tamper intent to "session", re-sign so HMAC passes
+        let mut echo = challenge.to_echo();
+        echo.intent = "session".into();
+        let id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "session",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        echo.id = id;
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("intent"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_method_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        // Tamper method to "stripe", re-sign so HMAC passes
+        let mut echo = challenge.to_echo();
+        echo.method = "stripe".into();
+        let id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "stripe",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        echo.id = id;
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("method"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_fields_pass_when_matching() {
+        // Happy path: all pinned fields match → verification succeeds
+        let mut mpp = create_hmac_test_mpp();
+        mpp.chain_id = Some(42431);
+        let challenge = mpp.charge("0.10").unwrap();
+        let echo = challenge.to_echo();
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let receipt = mpp.verify_credential(&credential).await.unwrap();
+        assert!(receipt.is_success());
     }
 
     #[cfg(feature = "tempo")]
