@@ -12,19 +12,21 @@ use mpp::{
     client::PaymentProvider, protocol::core::Base64UrlJson, MppError, PaymentChallenge,
     PaymentCredential, PaymentPayload, Receipt,
 };
+use serde_json::{from_str as json_from_str, json, to_value as json_to_value, Value};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Notify,
+    spawn,
+    sync::{broadcast::Receiver as BroadcastReceiver, oneshot, Notify},
     time::{sleep, timeout},
 };
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -62,7 +64,7 @@ fn test_challenge() -> PaymentChallenge {
         "alloy-test",
         "tempo",
         "charge",
-        Base64UrlJson::from_value(&serde_json::json!({"amount":"1000","currency":"USD"})).unwrap(),
+        Base64UrlJson::from_value(&json!({"amount":"1000","currency":"USD"})).unwrap(),
     )
 }
 
@@ -74,37 +76,37 @@ where
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
+    spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
         script(ws).await;
     });
     format!("ws://127.0.0.1:{port}")
 }
 
-async fn send_text(ws: &mut ServerStream, value: serde_json::Value) {
+async fn send_text(ws: &mut ServerStream, value: Value) {
     ws.send(Message::Text(value.to_string().into()))
         .await
         .unwrap();
 }
 
-async fn recv_value(ws: &mut ServerStream) -> serde_json::Value {
+async fn recv_value(ws: &mut ServerStream) -> Value {
     let msg = ws.next().await.unwrap().unwrap();
     let text = msg.into_text().unwrap();
-    serde_json::from_str(&text).unwrap()
+    json_from_str(&text).unwrap()
 }
 
-fn challenge_frame() -> serde_json::Value {
-    serde_json::json!({
+fn challenge_frame() -> Value {
+    json!({
         "type": "challenge",
-        "challenge": serde_json::to_value(test_challenge()).unwrap(),
+        "challenge": json_to_value(test_challenge()).unwrap(),
         "error": null,
     })
 }
 
-fn receipt_frame() -> serde_json::Value {
+fn receipt_frame() -> Value {
     let receipt = Receipt::success("tempo", "0xreference");
-    serde_json::json!({ "type": "receipt", "receipt": receipt })
+    json!({ "type": "receipt", "receipt": receipt })
 }
 
 #[tokio::test]
@@ -169,7 +171,7 @@ async fn json_rpc_round_trips_through_mpp_message_envelope() {
             let id = inner["id"].clone();
 
             // Echo back a wrapped JSON-RPC response.
-            let response = serde_json::json!({
+            let response = json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": "0x1234",
@@ -177,7 +179,7 @@ async fn json_rpc_round_trips_through_mpp_message_envelope() {
             // mpp-rs's WsServerMessage::Data has data: String (JSON-encoded).
             send_text(
                 &mut ws,
-                serde_json::json!({ "type": "message", "data": response.to_string() }),
+                json!({ "type": "message", "data": response.to_string() }),
             )
             .await;
             sleep(Duration::from_millis(100)).await;
@@ -205,7 +207,7 @@ async fn need_voucher_with_provider_emits_voucher_credential() {
             let _ = recv_value(&mut ws).await;
             send_text(
                 &mut ws,
-                serde_json::json!({
+                json!({
                     "type": "needVoucher",
                     "channelId": "0xchannel",
                     "requiredCumulative": "2000",
@@ -245,7 +247,7 @@ async fn need_voucher_without_provider_surfaces_error_event() {
             let _ = recv_value(&mut ws).await;
             send_text(
                 &mut ws,
-                serde_json::json!({
+                json!({
                     "type": "needVoucher",
                     "channelId": "0xchannel",
                     "requiredCumulative": "2000",
@@ -361,7 +363,7 @@ async fn duplicate_need_voucher_closes_connection() {
         }
     }
 
-    let voucher_frame = serde_json::json!({
+    let voucher_frame = json!({
         "type": "needVoucher",
         "channelId": "0xchannel",
         "requiredCumulative": "2000",
@@ -470,7 +472,7 @@ async fn voucher_provider_error_surfaces_event_and_closes() {
             let _ = recv_value(&mut ws).await;
             send_text(
                 &mut ws,
-                serde_json::json!({
+                json!({
                     "type": "needVoucher",
                     "channelId": "0xchannel",
                     "requiredCumulative": "2000",
@@ -514,14 +516,14 @@ async fn multiple_json_rpc_requests_round_trip_in_session() {
                 assert_eq!(outbound["type"], "message");
                 let inner = &outbound["data"];
                 let id = inner["id"].clone();
-                let response = serde_json::json!({
+                let response = json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": format!("0x{}", id),
                 });
                 send_text(
                     &mut ws,
-                    serde_json::json!({ "type": "message", "data": response.to_string() }),
+                    json!({ "type": "message", "data": response.to_string() }),
                 )
                 .await;
             }
@@ -566,14 +568,14 @@ async fn request_buffered_until_handshake_completes() {
             let second = recv_value(&mut ws).await;
             assert_eq!(second["type"], "message");
             let id = second["data"]["id"].clone();
-            let response = serde_json::json!({
+            let response = json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": "0xqueued",
             });
             send_text(
                 &mut ws,
-                serde_json::json!({ "type": "message", "data": response.to_string() }),
+                json!({ "type": "message", "data": response.to_string() }),
             )
             .await;
             sleep(Duration::from_millis(50)).await;
@@ -704,7 +706,7 @@ async fn malformed_challenge_closes_connection() {
         Box::pin(async move {
             send_text(
                 &mut ws,
-                serde_json::json!({
+                json!({
                     "type": "challenge",
                     "challenge": "not-an-object",
                     "error": null,
@@ -745,7 +747,7 @@ async fn malformed_data_payload_closes_connection() {
             let _ = recv_value(&mut ws).await;
             send_text(
                 &mut ws,
-                serde_json::json!({ "type": "message", "data": "not json at all" }),
+                json!({ "type": "message", "data": "not json at all" }),
             )
             .await;
             let _ = ws.next().await;
@@ -781,7 +783,7 @@ async fn multiple_receipts_update_watch_channel() {
             // Two distinct receipts back-to-back.
             send_text(
                 &mut ws,
-                serde_json::json!({
+                json!({
                     "type": "receipt",
                     "receipt": Receipt::success("tempo", "0xfirst"),
                 }),
@@ -789,7 +791,7 @@ async fn multiple_receipts_update_watch_channel() {
             .await;
             send_text(
                 &mut ws,
-                serde_json::json!({
+                json!({
                     "type": "receipt",
                     "receipt": Receipt::success("tempo", "0xsecond"),
                 }),
@@ -857,7 +859,7 @@ async fn multiple_event_subscribers_each_receive_handshake() {
     let mut h2 = connect.mpp_handle();
     let _conn = connect.connect().await.unwrap();
 
-    async fn drain_until_receipt(rx: &mut tokio::sync::broadcast::Receiver<MppEvent>) -> bool {
+    async fn drain_until_receipt(rx: &mut BroadcastReceiver<MppEvent>) -> bool {
         let mut saw_challenge = false;
         let mut saw_credential = false;
         let mut saw_receipt = false;
@@ -883,11 +885,7 @@ async fn multiple_event_subscribers_each_receive_handshake() {
 async fn server_error_frame_surfaces_event_and_closes() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {
-            send_text(
-                &mut ws,
-                serde_json::json!({ "type": "error", "error": "bad request" }),
-            )
-            .await;
+            send_text(&mut ws, json!({ "type": "error", "error": "bad request" })).await;
             sleep(Duration::from_millis(50)).await;
         })
     })
@@ -998,15 +996,15 @@ async fn fatal_provider_error_does_not_re_invoke_pay() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let accepts_srv = accepts.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
             accepts_srv.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(async move {
-                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+            spawn(async move {
+                if let Ok(mut ws) = accept_async(stream).await {
                     send_text(&mut ws, challenge_frame()).await;
                     let _ = timeout(Duration::from_millis(200), ws.next()).await;
                 }
@@ -1056,7 +1054,7 @@ async fn shutdown_during_in_flight_payment_breaks_promptly() {
     }
 
     // Server signals once the client closes the WS.
-    let (client_gone_tx, client_gone_rx) = tokio::sync::oneshot::channel::<()>();
+    let (client_gone_tx, client_gone_rx) = oneshot::channel::<()>();
     let url = spawn_server(move |mut ws| {
         Box::pin(async move {
             send_text(&mut ws, challenge_frame()).await;
@@ -1083,7 +1081,7 @@ async fn shutdown_during_in_flight_payment_breaks_promptly() {
         .unwrap();
     assert!(matches!(ev, MppEvent::Challenge(_)));
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     drop(conn);
 
     timeout(Duration::from_secs(2), client_gone_rx)

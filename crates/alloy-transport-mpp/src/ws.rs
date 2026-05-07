@@ -14,6 +14,8 @@ use alloy_transport::{
 use alloy_transport_ws::WebSocketConfig;
 use futures::{SinkExt, StreamExt};
 use http::{header::AUTHORIZATION, HeaderValue, Request as HttpRequest};
+#[cfg(test)]
+use mpp::PaymentPayload;
 use mpp::{
     client::{
         ws::{WsClientMessage, WsServerMessage},
@@ -21,11 +23,14 @@ use mpp::{
     },
     format_authorization, MppError, PaymentChallenge, PaymentCredential, Receipt,
 };
-use serde_json::value::RawValue;
+use serde_json::{
+    from_str as json_from_str, from_value as json_from_value, value::RawValue, Value,
+};
 use std::{
     collections::VecDeque,
     fmt,
-    future::Future,
+    future::{ready, Future},
+    io::Error as IoError,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -34,6 +39,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
+    pin, select, spawn,
     sync::{
         broadcast::{self, Receiver as BroadcastReceiver},
         watch::{self, Receiver as WatchReceiver},
@@ -42,6 +48,7 @@ use tokio::{
     time::{sleep, Instant},
 };
 use tokio_tungstenite::{
+    connect_async_with_config,
     tungstenite::{self, client::IntoClientRequest, Message},
     MaybeTlsStream, WebSocketStream,
 };
@@ -353,7 +360,7 @@ where
             .clone()
             .into_client_request()
             .map_err(TransportErrorKind::custom)?;
-        let (socket, _) = tokio_tungstenite::connect_async_with_config(request, self.config, false)
+        let (socket, _) = connect_async_with_config(request, self.config, false)
             .await
             .map_err(TransportErrorKind::custom)?;
 
@@ -400,12 +407,12 @@ async fn run_translator<P, V>(
     // so application traffic never races the initial challenge.
     let mut handshake_complete = false;
     let keepalive = sleep(keepalive_interval);
-    tokio::pin!(keepalive);
+    pin!(keepalive);
 
     // Bounds time spent waiting for a challenge or a pay()/next_voucher()
     // task to complete.
     let handshake_deadline = sleep(handshake_timeout);
-    tokio::pin!(handshake_deadline);
+    pin!(handshake_deadline);
 
     // Off-loop tasks: spawning `pay`/`next_voucher` keeps the keepalive arm
     // responsive while signing/broadcasting takes place.
@@ -421,13 +428,13 @@ async fn run_translator<P, V>(
         let frontend_open = handshake_complete && !payment_in_flight;
         let can_flush = frontend_open && !pending_outbound.is_empty();
 
-        tokio::select! {
+        select! {
             biased;
 
             // 1. Flush one buffered RPC when handshake is done and no
             //    credential exchange is in flight. The ready future keeps
             //    other arms reachable between sends.
-            _ = std::future::ready(()), if can_flush => {
+            _ = ready(()), if can_flush => {
                 let rpc = pending_outbound.pop_front().expect("guarded by can_flush");
                 keepalive.as_mut().reset(Instant::now() + keepalive_interval);
                 if let Err(err) = send_jsonrpc(&mut socket, rpc).await {
@@ -614,9 +621,9 @@ async fn poll_join<T>(pending: &mut Option<JoinHandle<T>>) -> Result<T, JoinErro
 
 async fn send_jsonrpc(socket: &mut WsStream, rpc: Box<RawValue>) -> Result<(), tungstenite::Error> {
     // Parse the JSON-RPC envelope so it serializes back as a structured object
-    // (matching mpp-rs's `WsClientMessage::Data { data: serde_json::Value }`).
-    let data: serde_json::Value = serde_json::from_str(rpc.get())
-        .map_err(|e| tungstenite::Error::Io(std::io::Error::other(e)))?;
+    // (matching mpp-rs's `WsClientMessage::Data { data: Value }`).
+    let data: Value =
+        json_from_str(rpc.get()).map_err(|e| tungstenite::Error::Io(IoError::other(e)))?;
     let frame = WsClientMessage::Data { data };
     socket.send(Message::Text(frame.to_text().into())).await
 }
@@ -700,7 +707,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     pending_pay: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
 ) -> Result<(), TerminationReason> {
-    let server_msg: WsServerMessage = match serde_json::from_str(text) {
+    let server_msg: WsServerMessage = match json_from_str(text) {
         Ok(m) => m,
         Err(err) => {
             error!(%err, %text, "failed to deserialize MPP frame");
@@ -725,7 +732,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             if let Some(err) = error {
                 warn!(%err, "MPP challenge carried error message");
             }
-            let parsed: PaymentChallenge = match serde_json::from_value(challenge) {
+            let parsed: PaymentChallenge = match json_from_value(challenge) {
                 Ok(c) => c,
                 Err(err) => {
                     error!(%err, "failed to deserialize PaymentChallenge");
@@ -751,12 +758,12 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             // Spawn `pay()` so the main loop stays responsive (keepalive,
             // socket reads) while the provider signs/broadcasts.
             let provider = payment_provider.clone();
-            *pending_pay = Some(tokio::spawn(async move { provider.pay(&parsed).await }));
+            *pending_pay = Some(spawn(async move { provider.pay(&parsed).await }));
             Ok(())
         }
         WsServerMessage::Data { data } => {
             // mpp-rs encodes the inner payload as a JSON-encoded string.
-            let item: PubSubItem = match serde_json::from_str(&data) {
+            let item: PubSubItem = match json_from_str(&data) {
                 Ok(i) => i,
                 Err(err) => {
                     error!(%err, %data, "failed to deserialize JSON-RPC payload from MPP data frame");
@@ -796,13 +803,11 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             let _ = events_tx.send(MppEvent::NeedVoucher(req.clone()));
 
             let provider = voucher_provider.clone();
-            *pending_voucher = Some(tokio::spawn(
-                async move { provider.next_voucher(&req).await },
-            ));
+            *pending_voucher = Some(spawn(async move { provider.next_voucher(&req).await }));
             Ok(())
         }
         WsServerMessage::Receipt { receipt } => {
-            let parsed: Receipt = match serde_json::from_value(receipt) {
+            let parsed: Receipt = match json_from_value(receipt) {
                 Ok(r) => r,
                 Err(err) => {
                     error!(%err, "failed to deserialize Receipt");
@@ -840,7 +845,6 @@ fn install_default_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mpp::PaymentPayload;
 
     #[derive(Clone)]
     struct DummyProvider;
