@@ -1,0 +1,56 @@
+[package]
+name = "alloy-transport-mpp"
+description = "Machine Payments Protocol (MPP) transport layer over WebSocket for alloy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/tempoxyz/mpp-rs"
+repository = "https://github.com/tempoxyz/mpp-rs"
+keywords = ["alloy", "mpp", "payments", "websocket", "ethereum"]
+categories = ["web-programming", "authentication", "cryptography"]
+readme = "README.md"
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "-Zunstable-options",
+    "--generate-link-to-definition",
+    "--show-type-layout",
+]
+
+[dependencies]
+alloy-json-rpc = { version = "2.0", default-features = false }
+alloy-pubsub = { version = "2.0", default-features = false }
+alloy-transport = { version = "2.0", default-features = false }
+alloy-transport-ws = { version = "2.0", default-features = false }
+
+mpp = { path = "../..", default-features = false, features = ["ws"] }
+
+futures = "0.3"
+serde_json = "1"
+tracing = "0.1"
+url = "2"
+
+# non-WASM only
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+http = "1"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+# Pinned to match the version used by alloy-transport-ws 2.0.x.
+tokio-tungstenite = "0.28"
+rustls = { version = "0.23", default-features = false, optional = true }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+# Pinned to match the version used by alloy-transport-ws 2.0.x so the
+# WebSocketConfig types align between the integration tests and the crate.
+tokio-tungstenite = "0.28"
+
+[features]
+default = ["aws-lc-rs"]
+aws-lc-rs = ["alloy-transport-ws/aws-lc-rs", "dep:rustls", "rustls?/aws-lc-rs"]
+ring = ["alloy-transport-ws/ring", "dep:rustls", "rustls?/ring"]
+native-tls = ["alloy-transport-ws/native-tls"]
+rustls-tls = ["alloy-transport-ws/rustls-tls"]
