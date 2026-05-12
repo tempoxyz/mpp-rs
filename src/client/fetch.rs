@@ -5,6 +5,7 @@
 use reqwest::header::WWW_AUTHENTICATE;
 use reqwest::{RequestBuilder, Response, StatusCode};
 
+use super::accept_payment_policy::AcceptPaymentPolicy;
 use super::error::HttpError;
 use super::provider::PaymentProvider;
 use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
@@ -31,42 +32,64 @@ use crate::protocol::core::{
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
-pub trait PaymentExt {
+pub trait PaymentExt: Sized {
     /// Send the request, automatically handling 402 Payment Required responses.
     ///
-    /// If the initial request returns 402:
-    /// 1. Parse the challenge from the `WWW-Authenticate` header
-    /// 2. Call `provider.pay()` to execute the payment
-    /// 3. Retry the request with the credential in the `Authorization` header
-    ///
-    /// # Errors
-    ///
-    /// Returns `HttpError` if:
-    /// - The request cannot be cloned (required for retry)
-    /// - The 402 response is missing the `WWW-Authenticate` header
-    /// - The challenge cannot be parsed
-    /// - The payment fails
-    /// - The retry request fails
+    /// Equivalent to [`send_with_payment_policy`](Self::send_with_payment_policy)
+    /// with [`AcceptPaymentPolicy::Always`].
     fn send_with_payment<P: PaymentProvider>(
         self,
         provider: &P,
+    ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send {
+        self.send_with_payment_policy(provider, &AcceptPaymentPolicy::Always)
+    }
+
+    /// Like [`send_with_payment`](Self::send_with_payment) but only injects
+    /// `Accept-Payment` when `policy` permits the request URL. The 402-retry
+    /// path is unaffected.
+    fn send_with_payment_policy<P: PaymentProvider>(
+        self,
+        provider: &P,
+        policy: &AcceptPaymentPolicy,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 }
 
 impl PaymentExt for RequestBuilder {
-    async fn send_with_payment<P: PaymentProvider>(
+    async fn send_with_payment_policy<P: PaymentProvider>(
         self,
         provider: &P,
+        policy: &AcceptPaymentPolicy,
     ) -> Result<Response, HttpError> {
         let retry_builder = self.try_clone().ok_or(HttpError::CloneFailed)?;
 
-        // Inject Accept-Payment header from provider's supported methods
-        let accept_header = provider.accept_payment_header();
-        let this = if let Some(ref header) = accept_header {
-            self.header(ACCEPT_PAYMENT_HEADER, header)
+        // Peek the built request to inspect caller-set headers and URL
+        // before injecting our own.
+        let peek = retry_builder.try_clone().and_then(|b| b.build().ok());
+        let url = peek.as_ref().map(|r| r.url().clone());
+        let caller_accept = peek.as_ref().and_then(|r| {
+            r.headers()
+                .get(ACCEPT_PAYMENT_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        });
+        let provider_accept = provider.accept_payment_header();
+
+        // Inject only if the caller didn't set their own header AND the
+        // policy permits it. Caller-set headers are never overwritten.
+        let inject = caller_accept.is_none() && url.as_ref().is_some_and(|u| policy.allows(u));
+
+        let this = if inject {
+            if let Some(ref header) = provider_accept {
+                self.header(ACCEPT_PAYMENT_HEADER, header)
+            } else {
+                self
+            }
         } else {
             self
         };
+
+        // Caller's header (if any) wins for retry-time ranking.
+        let ranking_accept = caller_accept.or(provider_accept);
 
         let resp = this.send().await?;
 
@@ -90,11 +113,10 @@ impl PaymentExt for RequestBuilder {
             .filter_map(|r| r.ok())
             .collect();
 
-        // Use Accept-Payment ranking when preferences are available,
-        // otherwise fall back to first supported challenge.
-        let challenge = if let Some(ref header) = accept_header {
+        // Rank challenges by the caller's preferences (if set) or the
+        // provider's. Falls back to first-supported on parse failure.
+        let challenge = if let Some(ref header) = ranking_accept {
             if let Ok(prefs) = accept_payment::parse(header) {
-                // Filter to supported, then rank by preference
                 let supported: Vec<_> = challenges
                     .iter()
                     .filter(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
@@ -600,6 +622,150 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(err, HttpError::NoSupportedChallenge(_)));
+        }
+
+        /// Provider that exposes a known Accept-Payment header value so the
+        /// test can observe whether it was injected.
+        #[derive(Clone)]
+        struct AdvertisingProvider;
+
+        impl super::PaymentProvider for AdvertisingProvider {
+            fn supports(&self, _method: &str, _intent: &str) -> bool {
+                true
+            }
+            async fn pay(
+                &self,
+                _challenge: &PaymentChallenge,
+            ) -> Result<PaymentCredential, MppError> {
+                unimplemented!("not used in policy test")
+            }
+            fn accept_payment_header(&self) -> Option<String> {
+                Some("tempo/charge".to_string())
+            }
+        }
+
+        async fn spawn_header_capture() -> (String, Arc<std::sync::Mutex<Option<String>>>) {
+            let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(Default::default());
+            let captured_clone = captured.clone();
+            let app = Router::new().route(
+                "/probe",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let captured = captured_clone.clone();
+                    async move {
+                        let v = req
+                            .headers()
+                            .get("accept-payment")
+                            .and_then(|h| h.to_str().ok())
+                            .map(|s| s.to_string());
+                        *captured.lock().unwrap() = v;
+                        AxumStatusCode::OK
+                    }
+                }),
+            );
+            let url = spawn_server(app).await;
+            (url, captured)
+        }
+
+        #[tokio::test]
+        async fn test_send_with_payment_default_injects() {
+            let (base_url, captured) = spawn_header_capture().await;
+            reqwest::Client::new()
+                .get(format!("{}/probe", base_url))
+                .send_with_payment(&AdvertisingProvider)
+                .await
+                .unwrap();
+            assert_eq!(captured.lock().unwrap().as_deref(), Some("tempo/charge"));
+        }
+
+        #[tokio::test]
+        async fn test_send_with_payment_policy_never_blocks() {
+            let (base_url, captured) = spawn_header_capture().await;
+            reqwest::Client::new()
+                .get(format!("{}/probe", base_url))
+                .send_with_payment_policy(&AdvertisingProvider, &AcceptPaymentPolicy::Never)
+                .await
+                .unwrap();
+            assert_eq!(captured.lock().unwrap().as_deref(), None);
+        }
+
+        #[tokio::test]
+        async fn test_caller_header_not_overwritten() {
+            // Caller sets Accept-Payment: stripe/charge → must not be replaced.
+            let (base_url, captured) = spawn_header_capture().await;
+            reqwest::Client::new()
+                .get(format!("{}/probe", base_url))
+                .header("Accept-Payment", "stripe/charge")
+                .send_with_payment(&AdvertisingProvider)
+                .await
+                .unwrap();
+            assert_eq!(captured.lock().unwrap().as_deref(), Some("stripe/charge"));
+        }
+
+        #[tokio::test]
+        async fn test_caller_header_drives_ranking() {
+            // Server offers tempo/charge AND stripe/charge.
+            // Provider supports both. Caller header prefers stripe;
+            // retry must select the stripe challenge.
+            let tempo_header = challenge_header("t1", "tempo", "charge");
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+            let combined = format!("{}, {}", tempo_header, stripe_header);
+
+            let picked: Arc<std::sync::Mutex<Option<String>>> = Arc::new(Default::default());
+            let picked_clone = picked.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let combined = combined.clone();
+                    let picked = picked_clone.clone();
+                    async move {
+                        if let Some(auth) = req.headers().get("authorization") {
+                            let v = auth.to_str().unwrap_or("").to_string();
+                            // Capture which challenge id was used (s1 vs t1).
+                            *picked.lock().unwrap() = Some(v);
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, combined)],
+                                "pay",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge"), ("stripe", "charge")]);
+            reqwest::Client::new()
+                .get(format!("{}/paid", base_url))
+                .header("Accept-Payment", "stripe/charge, tempo/charge;q=0.1")
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+            let used = picked.lock().unwrap().clone().unwrap_or_default();
+            let cred = crate::protocol::core::parse_authorization(&used).unwrap();
+            assert_eq!(
+                cred.challenge.id, "s1",
+                "expected stripe challenge (id s1) to be picked, got id: {}",
+                cred.challenge.id
+            );
+        }
+
+        #[tokio::test]
+        async fn test_send_with_payment_policy_same_origin_mismatch() {
+            let (base_url, captured) = spawn_header_capture().await;
+            reqwest::Client::new()
+                .get(format!("{}/probe", base_url))
+                .send_with_payment_policy(
+                    &AdvertisingProvider,
+                    &AcceptPaymentPolicy::SameOrigin {
+                        same_origin: "https://app.example.com".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(captured.lock().unwrap().as_deref(), None);
         }
     }
 }
