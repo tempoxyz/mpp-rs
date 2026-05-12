@@ -17,6 +17,8 @@
 //! let resp = client.get(url).send_with_payment(&provider).await?;
 //! ```
 
+#[cfg(feature = "client")]
+mod accept_payment_policy;
 mod error;
 mod provider;
 pub mod transport;
@@ -35,6 +37,9 @@ mod middleware;
 
 pub use error::HttpError;
 pub use provider::{MultiProvider, PaymentProvider};
+
+#[cfg(feature = "client")]
+pub use accept_payment_policy::AcceptPaymentPolicy;
 
 #[cfg(feature = "client")]
 pub use fetch::PaymentExt as Fetch;
