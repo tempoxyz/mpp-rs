@@ -46,6 +46,8 @@ pub struct ChannelState {
     pub units: u64,
     pub finalized: bool,
     #[serde(default)]
+    pub closing: bool,
+    #[serde(default)]
     pub close_requested_at: u64,
     pub created_at: String,
 }
@@ -108,6 +110,9 @@ pub async fn deduct_from_channel(
                     .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
                 if state.finalized {
                     return Err(VerificationError::channel_closed("channel is finalized"));
+                }
+                if state.closing {
+                    return Err(VerificationError::channel_closed("channel is closing"));
                 }
                 let available = state.highest_voucher_amount.saturating_sub(state.spent);
                 if available >= amount {
@@ -617,6 +622,7 @@ where
                             spent: on_chain.settled,
                             units: 0,
                             finalized: false,
+                            closing: false,
                             close_requested_at: on_chain.close_requested_at,
                             created_at: now_iso8601(),
                         }))
@@ -766,6 +772,9 @@ where
         if channel.finalized {
             return Err(VerificationError::channel_closed("channel is finalized"));
         }
+        if channel.closing {
+            return Err(VerificationError::channel_closed("channel is closing"));
+        }
 
         let cumulative_amount: u128 = cumulative_amount_str
             .parse()
@@ -886,8 +895,31 @@ where
             ));
         }
 
+        let channel_id_for_lock = channel_id_str.clone();
+        self.store
+            .update_channel(
+                &channel_id_for_lock,
+                Box::new(|current| {
+                    let state = current
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    if state.finalized {
+                        return Err(VerificationError::channel_closed("channel is finalized"));
+                    }
+                    if state.closing {
+                        return Err(VerificationError::channel_closed("channel is closing"));
+                    }
+                    Ok(Some(ChannelState {
+                        closing: true,
+                        ..state
+                    }))
+                }),
+            )
+            .await?;
+
         // Submit close transaction on-chain if we have a signer.
-        let close_tx_hash = if let Some(ref signer) = self.close_signer {
+        let close_tx_result: Result<Option<String>, VerificationError> = if let Some(ref signer) =
+            self.close_signer
+        {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
             use alloy::signers::SignerSync;
@@ -952,9 +984,34 @@ where
                 .await
                 .map_err(|e| VerificationError::network_error(format!("close tx failed: {}", e)))?;
 
-            Some(receipt.transaction_hash.to_string())
+            Ok(Some(receipt.transaction_hash.to_string()))
         } else {
-            None
+            Ok(None)
+        };
+
+        let close_tx_hash = match close_tx_result {
+            Ok(hash) => hash,
+            Err(err) => {
+                let _ = self
+                    .store
+                    .update_channel(
+                        &channel_id_for_lock,
+                        Box::new(|current| {
+                            let Some(state) = current else {
+                                return Ok(None);
+                            };
+                            if state.finalized {
+                                return Ok(Some(state));
+                            }
+                            Ok(Some(ChannelState {
+                                closing: false,
+                                ..state
+                            }))
+                        }),
+                    )
+                    .await;
+                return Err(err);
+            }
         };
 
         // Finalize in store.
@@ -982,6 +1039,7 @@ where
                             state.highest_voucher_signature
                         },
                         finalized: true,
+                        closing: false,
                         ..state
                     }))
                 }),
@@ -1388,6 +1446,7 @@ mod tests {
             spent: 0,
             units: 0,
             finalized: false,
+            closing: false,
             close_requested_at: 0,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
@@ -1695,6 +1754,23 @@ mod tests {
         assert!(
             err.to_string().contains("finalized"),
             "error should mention finalized, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deduct_from_closing_channel_rejects() {
+        let store = InMemoryChannelStore::new();
+        let mut state = test_channel_state("0xchannel1");
+        state.highest_voucher_amount = 10_000;
+        state.closing = true;
+        store.insert("0xchannel1", state);
+
+        let result = deduct_from_channel(&store, "0xchannel1", 1_000).await;
+        assert!(result.is_err(), "closing channel should reject deduction");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("closing"),
+            "error should mention closing, got: {err}"
         );
     }
 
@@ -2136,6 +2212,7 @@ mod tests {
                         spent: on_chain_settled,
                         units: 0,
                         finalized: false,
+                        closing: false,
                         close_requested_at: 0,
                         created_at: "2025-01-01T00:00:00Z".to_string(),
                     }))
@@ -2302,6 +2379,7 @@ mod tests {
                         spent: on_chain_settled,
                         units: 0,
                         finalized: false,
+                        closing: false,
                         close_requested_at: 0,
                         created_at: "2025-01-01T00:00:00Z".to_string(),
                     }))
