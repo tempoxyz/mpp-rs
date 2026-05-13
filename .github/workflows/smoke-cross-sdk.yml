@@ -30,7 +30,7 @@ jobs:
           node-version: 22
 
       - name: Install mppx CLI
-        run: npm i -g mppx@0.2.2
+        run: npm i -g mppx@0.6.20
 
       - name: Start Tempo node
         run: docker compose up -d
