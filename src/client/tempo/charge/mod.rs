@@ -236,14 +236,13 @@ impl TempoCharge {
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
         if self.amount.is_zero() {
-            // Proof credentials are raw typed-data signatures, so they bind to
-            // the actual signing key rather than a keychain-wrapped wallet address.
-            let from = signer.address();
+            let signing_mode = options.signing_mode.unwrap_or_default();
+            let from = signing_mode.from_address(signer.address());
             let credential = PaymentCredential::with_source(
                 self.challenge.to_echo(),
                 proof::proof_source(from, self.chain_id),
                 PaymentPayload::proof(
-                    proof::sign_proof(signer, self.chain_id, &self.challenge.id).await?,
+                    proof::sign_proof(signer, self.chain_id, &self.challenge.id, from).await?,
                 ),
             );
 
