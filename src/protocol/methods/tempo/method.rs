@@ -833,6 +833,8 @@ where
         signed_tx: &str,
         charge: &ChargeRequest,
         expected_chain_id: u64,
+        challenge_id: &str,
+        realm: &str,
     ) -> Result<B256, VerificationError> {
         let tx_bytes = signed_tx
             .parse::<Bytes>()
@@ -906,7 +908,10 @@ where
         }
 
         // Verify the receipt contains the expected TIP-20 transfer(s)
-        self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        let matched_logs = self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        if charge.memo().is_none() {
+            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
+        }
 
         // Record the on-chain tx hash for hash-based replay protection
         if let Some(store) = &self.store {
@@ -1243,6 +1248,8 @@ where
                         charge_payload.signed_tx().unwrap(),
                         &request,
                         expected_chain_id,
+                        &credential.challenge.id,
+                        &credential.challenge.realm,
                     )
                     .await?;
                 Ok(Receipt::success(METHOD_NAME, format!("{:#x}", tx_hash)))
