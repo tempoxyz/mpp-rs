@@ -317,6 +317,13 @@ impl TempoSessionProvider {
             None => return Ok(None),
         };
 
+        {
+            let channels = self.channels.lock().unwrap();
+            if !channels.values().any(|entry| entry.opened) {
+                return Ok(None);
+            }
+        }
+
         let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
         let entry = {
             let channels = self.channels.lock().unwrap();
