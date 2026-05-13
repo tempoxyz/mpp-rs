@@ -49,7 +49,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{self, client::IntoClientRequest, Message},
+    tungstenite::{self, client::IntoClientRequest, protocol::frame::coding::CloseCode, Message},
     MaybeTlsStream, WebSocketStream,
 };
 use url::Url;
@@ -406,6 +406,7 @@ async fn run_translator<P, V>(
     // `false` until the first credential has been sent; gates outbound JSON-RPC
     // so application traffic never races the initial challenge.
     let mut handshake_complete = false;
+    let mut credential_awaiting_receipt = false;
     let keepalive = sleep(keepalive_interval);
     pin!(keepalive);
 
@@ -463,6 +464,7 @@ async fn run_translator<P, V>(
                             break;
                         }
                         handshake_complete = true;
+                        credential_awaiting_receipt = true;
                     }
                     Ok(Err(err)) => {
                         error!(?err, "MPP payment provider failed");
@@ -493,6 +495,7 @@ async fn run_translator<P, V>(
                             break;
                         }
                         handshake_complete = true;
+                        credential_awaiting_receipt = true;
                     }
                     Ok(Err(err)) => {
                         error!(?err, "MPP voucher provider failed");
@@ -557,6 +560,7 @@ async fn run_translator<P, V>(
                             &events_tx,
                             &mut pending_pay,
                             &mut pending_voucher,
+                            &mut credential_awaiting_receipt,
                         ).await {
                             Ok(()) => {
                                 // Reset the handshake deadline when a new
@@ -578,12 +582,20 @@ async fn run_translator<P, V>(
                     }
                     Some(Err(err)) => {
                         error!(%err, "WS connection error");
-                        termination = Some(TerminationReason::Transient);
+                        termination = Some(if credential_awaiting_receipt {
+                            TerminationReason::Fatal
+                        } else {
+                            TerminationReason::Transient
+                        });
                         break;
                     }
                     None => {
                         error!("WS server has gone away");
-                        termination = Some(TerminationReason::Transient);
+                        termination = Some(if credential_awaiting_receipt {
+                            TerminationReason::Fatal
+                        } else {
+                            TerminationReason::Transient
+                        });
                         break;
                     }
                 }
@@ -669,6 +681,7 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
     events_tx: &broadcast::Sender<MppEvent>,
     pending_pay: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
+    credential_awaiting_receipt: &mut bool,
 ) -> Result<(), TerminationReason> {
     match msg {
         Message::Text(text) => {
@@ -681,12 +694,17 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
                 events_tx,
                 pending_pay,
                 pending_voucher,
+                credential_awaiting_receipt,
             )
             .await
         }
         Message::Close(frame) => {
             error!(?frame, "Received WS close frame");
-            Err(TerminationReason::Transient)
+            if *credential_awaiting_receipt || is_fatal_close(frame.as_ref().map(|f| f.code)) {
+                Err(TerminationReason::Fatal)
+            } else {
+                Err(TerminationReason::Transient)
+            }
         }
         Message::Binary(_) => {
             error!("Received binary WS frame; expected text");
@@ -694,6 +712,10 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
         }
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(()),
     }
+}
+
+fn is_fatal_close(code: Option<CloseCode>) -> bool {
+    !matches!(code, Some(CloseCode::Restart) | Some(CloseCode::Again))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -706,6 +728,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     events_tx: &broadcast::Sender<MppEvent>,
     pending_pay: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
+    credential_awaiting_receipt: &mut bool,
 ) -> Result<(), TerminationReason> {
     let server_msg: WsServerMessage = match json_from_str(text) {
         Ok(m) => m,
@@ -820,6 +843,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             debug!(?parsed, "MPP receipt received");
             let _ = receipt_tx.send(Some(parsed.clone()));
             let _ = events_tx.send(MppEvent::Receipt(parsed));
+            *credential_awaiting_receipt = false;
             Ok(())
         }
         WsServerMessage::Error { error } => {
