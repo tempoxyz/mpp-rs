@@ -1035,6 +1035,65 @@ async fn fatal_provider_error_does_not_re_invoke_pay() {
 }
 
 #[tokio::test]
+async fn close_after_credential_does_not_re_invoke_pay() {
+    #[derive(Clone, Default)]
+    struct CountingProvider(Arc<AtomicUsize>);
+    impl PaymentProvider for CountingProvider {
+        fn supports(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        async fn pay(&self, ch: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PaymentCredential::new(
+                ch.to_echo(),
+                PaymentPayload::hash("0xdeadbeef"),
+            ))
+        }
+    }
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts_srv = accepts.clone();
+    spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            accepts_srv.fetch_add(1, Ordering::SeqCst);
+            spawn(async move {
+                if let Ok(mut ws) = accept_async(stream).await {
+                    send_text(&mut ws, challenge_frame()).await;
+                    let _ = timeout(Duration::from_millis(500), ws.next()).await;
+                    let _ = ws.send(Message::Close(None)).await;
+                }
+            });
+        }
+    });
+    let url = format!("ws://127.0.0.1:{port}");
+
+    let pay_calls = Arc::new(AtomicUsize::new(0));
+    let connect = MppWsConnect::new(url, CountingProvider(pay_calls.clone()))
+        .with_max_retries(5)
+        .with_retry_interval(Duration::from_millis(10));
+    let _frontend = connect.into_service().await.unwrap();
+
+    sleep(Duration::from_millis(800)).await;
+
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "close after credential must not trigger reconnects"
+    );
+    assert_eq!(
+        pay_calls.load(Ordering::SeqCst),
+        1,
+        "pay() must not be re-invoked after credential was sent"
+    );
+}
+
+#[tokio::test]
 async fn shutdown_during_in_flight_payment_breaks_promptly() {
     // Dropping the handle while pay() is parked must close the socket
     // without waiting for the keepalive interval or handshake timeout.
