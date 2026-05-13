@@ -1128,10 +1128,9 @@ where
             ));
         }
 
-        // If voucher is not higher than what we already have, accept idempotently
-        // but still verify the signature to prevent channel hijacking via stale
-        // vouchers with forged signatures. Skip ecrecover only for exact replays
-        // of the already-verified highest voucher.
+        // If voucher is not higher than what we already have, verify the
+        // signature and reject it as a replay. A successful voucher must add new
+        // funds for the current metered request.
         if cumulative_amount <= channel.highest_voucher_amount {
             let sig_bytes = Self::parse_signature(signature_str)?;
             let is_exact_replay =
@@ -1158,7 +1157,9 @@ where
                     ));
                 }
             }
-            return Ok(Receipt::success(METHOD_NAME, &channel.channel_id));
+            return Err(VerificationError::delta_too_small(
+                "voucher does not add new funds",
+            ));
         }
 
         let delta = cumulative_amount - channel.highest_voucher_amount;
@@ -1954,7 +1955,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exact_replay_of_highest_voucher_allowed() {
+    async fn test_exact_replay_of_highest_voucher_rejected() {
         use crate::protocol::methods::tempo::voucher::sign_voucher;
         use alloy::signers::local::PrivateKeySigner;
 
@@ -1980,7 +1981,7 @@ mod tests {
 
         let method = test_session_method(store);
 
-        // Exact replay: same amount AND same signature — should be accepted (idempotent)
+        // Exact replay: same amount and same signature does not add new funds.
         let result = method
             .verify_and_accept_voucher(
                 &channel_id_hex,
@@ -1997,7 +1998,8 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, Some(ErrorCode::DeltaTooSmall));
     }
 
     #[tokio::test]
