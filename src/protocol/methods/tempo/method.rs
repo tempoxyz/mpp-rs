@@ -89,6 +89,16 @@ fn decode_approve_spender(call: &tempo_primitives::transaction::Call) -> Option<
     Some(Address::from_slice(&call.input[16..36]))
 }
 
+fn decode_swap_token_in(call: &tempo_primitives::transaction::Call) -> Option<Address> {
+    if call_selector(&call.input) != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
+        return None;
+    }
+
+    IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..])
+        .ok()
+        .map(|decoded| decoded.tokenIn)
+}
+
 fn transfer_call_offset(
     calls: &[tempo_primitives::transaction::Call],
 ) -> Result<usize, VerificationError> {
@@ -163,6 +173,18 @@ fn validate_fee_payer_calls(
     }
 
     if has_swap_prefix {
+        let approve_target = match &calls[0].to {
+            TxKind::Call(address) => *address,
+            _ => return Err(disallowed_fee_payer_call_pattern_error()),
+        };
+        let swap_token_in =
+            decode_swap_token_in(&calls[1]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        if approve_target != swap_token_in {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction approve target is not the swap input token".to_string(),
+            ));
+        }
+
         let approve_spender = decode_approve_spender(&calls[0])
             .ok_or_else(disallowed_fee_payer_call_pattern_error)?;
         if approve_spender != STABLECOIN_DEX_ADDRESS {
@@ -2003,6 +2025,52 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("approve spender is not the DEX"));
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_wrong_approve_target() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient,
+            memo: None,
+        }];
+
+        let tx_bytes = encode_signed_tx(
+            vec![
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(Address::repeat_byte(0x99)),
+                    value: U256::ZERO,
+                    input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                    value: U256::ZERO,
+                    input: make_swap_input(token_in, currency, 100),
+                },
+                tempo_primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_input(recipient, U256::from(100u64)),
+                },
+            ],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+
+        let error = method
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("approve target is not the swap input token"));
     }
 
     #[test]
