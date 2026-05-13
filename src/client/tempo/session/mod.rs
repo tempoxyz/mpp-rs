@@ -162,6 +162,35 @@ impl TempoSessionProvider {
         format!("{:#x}:{:#x}:{:#x}", payee, currency, escrow)
     }
 
+    fn expected_channel_key(
+        &self,
+        challenge: &PaymentChallenge,
+    ) -> Result<(String, u64), MppError> {
+        let chain_id = resolve_chain_id(challenge);
+        let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
+        let payee: Address = session_req
+            .recipient
+            .as_deref()
+            .ok_or_else(|| {
+                MppError::InvalidConfig("session challenge missing recipient".to_string())
+            })?
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid recipient address".to_string()))?;
+        let currency: Address = session_req
+            .currency
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
+
+        Ok((
+            Self::channel_key(&payee, &currency, &escrow_contract),
+            chain_id,
+        ))
+    }
+
     /// Get the cumulative voucher amount for the first active channel.
     ///
     /// Returns the total cumulative amount across all vouchers sent for the
@@ -204,12 +233,23 @@ impl TempoSessionProvider {
         let key = key.ok_or_else(|| {
             MppError::InvalidConfig(format!("no channel found for id {}", channel_id_hex))
         })?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        if key != expected_key {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
 
         let mut entry = {
             let channels = self.channels.lock().unwrap();
             channels.get(&key).cloned()
         }
         .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        if entry.chain_id != expected_chain_id || entry.channel_id.to_string() != channel_id_hex {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
 
         // Update cumulative to at least the required amount
         if required_cumulative > entry.cumulative_amount {
@@ -277,15 +317,28 @@ impl TempoSessionProvider {
             None => return Ok(None),
         };
 
+        {
+            let channels = self.channels.lock().unwrap();
+            if !channels.values().any(|entry| entry.opened) {
+                return Ok(None);
+            }
+        }
+
+        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
         let entry = {
             let channels = self.channels.lock().unwrap();
-            channels.values().find(|e| e.opened).cloned()
+            channels.get(&expected_key).filter(|e| e.opened).cloned()
         };
 
         let entry = match entry {
             Some(e) => e,
             None => return Ok(None),
         };
+        if entry.chain_id != expected_chain_id {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
 
         let payer = self.signer.address();
 
@@ -897,6 +950,29 @@ mod tests {
         )
     }
 
+    fn make_scoped_challenge(
+        payee: Address,
+        currency: Address,
+        escrow: Address,
+    ) -> PaymentChallenge {
+        PaymentChallenge::new(
+            "test-id",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": format!("{:#x}", currency),
+                "recipient": format!("{:#x}", payee),
+                "methodDetails": {
+                    "escrowContract": format!("{:#x}", escrow),
+                    "chainId": 42431
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
     // --- send_voucher error paths ---
 
     #[tokio::test]
@@ -932,6 +1008,48 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_send_voucher_rejects_channel_from_different_session() {
+        let provider = make_test_provider();
+        let expected_payee = Address::repeat_byte(0x11);
+        let other_payee = Address::repeat_byte(0x22);
+        let currency = Address::repeat_byte(0x33);
+        let escrow = Address::repeat_byte(0x44);
+        let channel_id = B256::repeat_byte(0x55).to_string();
+
+        *provider.last_challenge.lock().unwrap() =
+            Some(make_scoped_challenge(expected_payee, currency, escrow));
+
+        let other_key = TempoSessionProvider::channel_key(&other_payee, &currency, &escrow);
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.clone(), other_key.clone());
+        provider.channels.lock().unwrap().insert(
+            other_key,
+            ChannelEntry {
+                channel_id: B256::repeat_byte(0x55),
+                salt: B256::ZERO,
+                cumulative_amount: 1000,
+                escrow_contract: escrow,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
+
+        let client = reqwest::Client::new();
+        let err = provider
+            .send_voucher(&client, "https://example.com/pay", &channel_id, 2000)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MppError::InvalidConfig(ref msg) if msg.contains("active session")
+        ));
+    }
+
     // --- close early-return paths ---
 
     #[tokio::test]
@@ -949,6 +1067,37 @@ mod tests {
     async fn test_close_no_open_channel_returns_none() {
         let provider = make_test_provider();
         *provider.last_challenge.lock().unwrap() = Some(make_test_challenge());
+
+        let client = reqwest::Client::new();
+        let result = provider.close(&client, "https://example.com/pay").await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_close_ignores_unrelated_open_channel() {
+        let provider = make_test_provider();
+        let expected_payee = Address::repeat_byte(0x11);
+        let other_payee = Address::repeat_byte(0x22);
+        let currency = Address::repeat_byte(0x33);
+        let escrow = Address::repeat_byte(0x44);
+
+        *provider.last_challenge.lock().unwrap() =
+            Some(make_scoped_challenge(expected_payee, currency, escrow));
+
+        let other_key = TempoSessionProvider::channel_key(&other_payee, &currency, &escrow);
+        provider.channels.lock().unwrap().insert(
+            other_key,
+            ChannelEntry {
+                channel_id: B256::repeat_byte(0x66),
+                salt: B256::ZERO,
+                cumulative_amount: 1000,
+                escrow_contract: escrow,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
 
         let client = reqwest::Client::new();
         let result = provider.close(&client, "https://example.com/pay").await;
