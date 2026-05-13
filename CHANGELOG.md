@@ -2,6 +2,8 @@
 
 ### Patch Changes
 
+- Stopped WebSocket reconnect retries after a payment credential is sent without a receipt. (by @BrendanRyan, [#254](https://github.com/tempoxyz/mpp-rs/pull/254))
+
 - Made the `axum` extractor use route-aware expected-request verification by default. High-level `MppCharge` extraction now forwards the route amount into verification so built-in Tempo and Stripe challengers compare incoming credentials against the route's expected charge request instead of trusting the echoed request alone. (by @BrendanRyan, [#213](https://github.com/tempoxyz/mpp-rs/pull/213))
 
 ## 0.10.0 (2026-04-20)
