@@ -2,6 +2,8 @@
 
 ### Patch Changes
 
+- Bound zero-amount Tempo proof signatures to the wallet being authenticated. (by @BrendanRyan, [#253](https://github.com/tempoxyz/mpp-rs/pull/253))
+
 - Made the `axum` extractor use route-aware expected-request verification by default. High-level `MppCharge` extraction now forwards the route amount into verification so built-in Tempo and Stripe challengers compare incoming credentials against the route's expected charge request instead of trusting the echoed request alone. (by @BrendanRyan, [#213](https://github.com/tempoxyz/mpp-rs/pull/213))
 
 ## 0.10.0 (2026-04-20)
