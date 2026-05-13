@@ -794,22 +794,59 @@ where
             ));
         }
         let min_delta = self.resolve_min_delta(details);
+        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
 
-        // Use cached channel state (verified during open/topUp) instead of
-        // reading on-chain for every voucher. This avoids an RPC round-trip
-        // per voucher, critical for high-frequency sessions.
+        if on_chain.payee != expected_payee {
+            return Err(VerificationError::credential_mismatch(
+                "on-chain channel payee does not match session recipient",
+            ));
+        }
+        if on_chain.token != expected_token {
+            return Err(VerificationError::credential_mismatch(
+                "on-chain channel token does not match session currency",
+            ));
+        }
+
+        let on_chain_deposit = on_chain.deposit;
+        let on_chain_settled = on_chain.settled;
+        let on_chain_close_requested_at = on_chain.close_requested_at;
+        let on_chain_finalized = on_chain.finalized;
+        let channel_id_owned = channel_id_str.clone();
+        let refreshed = self
+            .store
+            .update_channel(
+                &channel_id_owned,
+                Box::new(move |current| {
+                    let state = current
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    let settled_on_chain = std::cmp::max(on_chain_settled, state.settled_on_chain);
+                    let spent = std::cmp::max(settled_on_chain, state.spent);
+                    Ok(Some(ChannelState {
+                        deposit: on_chain_deposit,
+                        settled_on_chain,
+                        spent,
+                        finalized: on_chain_finalized,
+                        close_requested_at: on_chain_close_requested_at,
+                        ..state
+                    }))
+                }),
+            )
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
         self.verify_and_accept_voucher(
             channel_id_str,
-            &channel,
+            &refreshed,
             cumulative_amount,
             signature_str,
             escrow,
             chain_id,
             min_delta,
-            channel.deposit,
-            channel.settled_on_chain,
-            false, // not finalized (checked above)
-            channel.close_requested_at,
+            refreshed.deposit,
+            refreshed.settled_on_chain,
+            refreshed.finalized,
+            refreshed.close_requested_at,
         )
         .await
     }
