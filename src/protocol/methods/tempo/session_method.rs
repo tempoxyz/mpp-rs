@@ -1105,7 +1105,6 @@ where
                         Ok(Some(ChannelState {
                             highest_voucher_amount: cumulative_amount,
                             highest_voucher_signature: Some(sig_bytes),
-                            deposit,
                             ..state
                         }))
                     } else {
@@ -1886,6 +1885,56 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_accept_voucher_preserves_concurrent_deposit_update() {
+        use crate::protocol::methods::tempo::voucher::sign_voucher;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id_hex = format!("0x{}", "ab".repeat(32));
+        let channel_id_b256 = channel_id_hex.parse::<alloy::primitives::B256>().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+
+        let sig = sign_voucher(&signer, channel_id_b256, 2_000u128, escrow, 42431)
+            .await
+            .unwrap();
+        let sig_hex = format!("0x{}", alloy::primitives::hex::encode(&sig));
+
+        let mut stale_state = test_channel_state(&channel_id_hex);
+        stale_state.authorized_signer = signer.address();
+        stale_state.highest_voucher_amount = 1_000;
+        stale_state.deposit = 10_000;
+
+        let mut current_state = stale_state.clone();
+        current_state.deposit = 20_000;
+        store.insert(&channel_id_hex, current_state);
+
+        let method = test_session_method(store.clone());
+        method
+            .verify_and_accept_voucher(
+                &channel_id_hex,
+                &stale_state,
+                2_000,
+                &sig_hex,
+                escrow,
+                42431,
+                0,
+                stale_state.deposit,
+                0,
+                false,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let updated = store.get_channel(&channel_id_hex).await.unwrap().unwrap();
+        assert_eq!(updated.highest_voucher_amount, 2_000);
+        assert_eq!(updated.deposit, 20_000);
     }
 
     #[tokio::test]
