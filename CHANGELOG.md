@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2 (2026-05-13)
+
+## 0.10.2 (2026-05-13)
+
+### Patch Changes
+
+- Scoped Tempo session voucher and close operations to the active challenge's channel so client-managed channels cannot be mixed across sessions. (by @github-actions[bot], [#255](https://github.com/tempoxyz/mpp-rs/pull/255))
+
+## 0.2.2 (2026-05-13)
+
 ## 0.1.1 (2026-05-13)
 
 ## 0.10.1 (2026-05-13)

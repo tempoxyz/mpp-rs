@@ -1,7 +1,7 @@
 [package]
 name = "alloy-transport-mpp"
 description = "Machine Payments Protocol (MPP) transport layer over WebSocket for alloy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
