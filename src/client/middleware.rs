@@ -9,6 +9,10 @@ use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
 use crate::client::accept_payment_policy::AcceptPaymentPolicy;
+use crate::client::events::{
+    ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
+    CredentialCreatedContext, PaymentFailedContext, PaymentResponseContext,
+};
 use crate::client::provider::PaymentProvider;
 use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
 use crate::protocol::core::{
@@ -40,6 +44,7 @@ use crate::protocol::core::{
 pub struct PaymentMiddleware<P> {
     provider: P,
     accept_payment_policy: AcceptPaymentPolicy,
+    events: ClientEvents,
 }
 
 impl<P> PaymentMiddleware<P> {
@@ -49,6 +54,7 @@ impl<P> PaymentMiddleware<P> {
         Self {
             provider,
             accept_payment_policy: AcceptPaymentPolicy::default(),
+            events: ClientEvents::default(),
         }
     }
 
@@ -57,6 +63,55 @@ impl<P> PaymentMiddleware<P> {
     pub fn with_accept_payment_policy(mut self, policy: AcceptPaymentPolicy) -> Self {
         self.accept_payment_policy = policy;
         self
+    }
+
+    /// Use an existing event registry for payment callbacks.
+    pub fn with_events(mut self, events: ClientEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Get the event registry used by this middleware.
+    pub fn events(&self) -> ClientEvents {
+        self.events.clone()
+    }
+
+    /// Register a `challenge.received` callback.
+    pub fn on_challenge_received<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(ChallengeReceivedContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<crate::protocol::core::PaymentCredential>>
+            + Send
+            + 'static,
+    {
+        self.events.on_challenge_received(handler)
+    }
+
+    /// Register a `credential.created` observer.
+    pub fn on_credential_created<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(CredentialCreatedContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.events.on_credential_created(handler)
+    }
+
+    /// Register a `payment.response` observer.
+    pub fn on_payment_response<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(PaymentResponseContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.events.on_payment_response(handler)
+    }
+
+    /// Register a `payment.failed` observer.
+    pub fn on_payment_failed<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(PaymentFailedContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.events.on_payment_failed(handler)
     }
 }
 
@@ -112,6 +167,12 @@ where
             .collect();
 
         if www_auth_values.is_empty() {
+            self.events
+                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                    challenge: None,
+                    error: "402 response missing WWW-Authenticate header".to_string(),
+                }))
+                .await;
             return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                 "402 response missing WWW-Authenticate header"
             )));
@@ -141,30 +202,106 @@ where
                 .iter()
                 .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
         }
-        .context("no challenge matches provider's supported methods")
-        .map_err(reqwest_middleware::Error::Middleware)?;
+        .context("no challenge matches provider's supported methods");
 
-        let credential = self
-            .provider
-            .pay(challenge)
-            .await
-            .context("payment failed")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+        let challenge = match challenge {
+            Ok(challenge) => challenge.clone(),
+            Err(err) => {
+                self.events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: None,
+                        error: err.to_string(),
+                    }))
+                    .await;
+                return Err(reqwest_middleware::Error::Middleware(err));
+            }
+        };
 
-        let auth_header = format_authorization(&credential)
-            .context("failed to format credential")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+        let override_credential = self
+            .events
+            .emit_challenge_received(ChallengeReceivedContext {
+                challenge: challenge.clone(),
+                challenges: challenges.clone(),
+            })
+            .await;
+
+        let credential = match override_credential {
+            Some(credential) => credential,
+            None => match self.provider.pay(&challenge).await {
+                Ok(credential) => credential,
+                Err(err) => {
+                    let err = anyhow::anyhow!(err).context("payment failed");
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: err.to_string(),
+                        }))
+                        .await;
+                    return Err(reqwest_middleware::Error::Middleware(err));
+                }
+            },
+        };
+
+        self.events
+            .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
+                challenge: challenge.clone(),
+                credential: credential.clone(),
+            }))
+            .await;
+
+        let auth_header =
+            match format_authorization(&credential).context("failed to format credential") {
+                Ok(auth_header) => auth_header,
+                Err(err) => {
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: err.to_string(),
+                        }))
+                        .await;
+                    return Err(reqwest_middleware::Error::Middleware(err));
+                }
+            };
 
         let mut retry_req = retry_req;
-        retry_req.headers_mut().insert(
-            AUTHORIZATION_HEADER,
-            auth_header
-                .parse()
-                .context("invalid authorization header")
-                .map_err(reqwest_middleware::Error::Middleware)?,
-        );
+        let auth_header_value = match auth_header.parse().context("invalid authorization header") {
+            Ok(value) => value,
+            Err(err) => {
+                self.events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: Some(challenge),
+                        error: err.to_string(),
+                    }))
+                    .await;
+                return Err(reqwest_middleware::Error::Middleware(err));
+            }
+        };
+        retry_req
+            .headers_mut()
+            .insert(AUTHORIZATION_HEADER, auth_header_value);
 
-        next.run(retry_req, extensions).await
+        let retry_resp = next.run(retry_req, extensions).await;
+        match retry_resp {
+            Ok(resp) => {
+                self.events
+                    .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
+                        challenge,
+                        credential,
+                        status: resp.status(),
+                    }))
+                    .await;
+                Ok(resp)
+            }
+            Err(err) => {
+                self.events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: Some(challenge),
+                        error: err.to_string(),
+                    }))
+                    .await;
+                Err(err)
+            }
+        }
     }
 }
 
@@ -196,6 +333,7 @@ mod tests {
     #[cfg(all(feature = "client", feature = "middleware", feature = "utils"))]
     mod integration {
         use super::*;
+        use crate::client::ClientEventKind;
         use crate::error::MppError;
         use crate::protocol::core::{
             format_www_authenticate, Base64UrlJson, PaymentChallenge, PaymentCredential,
@@ -323,6 +461,131 @@ mod tests {
             assert_eq!(resp.status(), reqwest::StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
             assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_payment_events_fire_on_success() {
+            let (_, www_auth) = test_challenge();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+            let events = ClientEvents::default();
+            let challenge_count = Arc::new(AtomicU32::new(0));
+            let credential_count = Arc::new(AtomicU32::new(0));
+            let response_count = Arc::new(AtomicU32::new(0));
+
+            let _challenge_sub = events.on_challenge_received({
+                let challenge_count = challenge_count.clone();
+                move |ctx| {
+                    challenge_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(ctx.challenge.method.as_str(), "tempo");
+                        None
+                    }
+                }
+            });
+            let _credential_sub = events.on_credential_created({
+                let credential_count = credential_count.clone();
+                move |ctx| {
+                    credential_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(ctx.credential.challenge.method.as_str(), "tempo");
+                    }
+                }
+            });
+            let _response_sub = events.on_payment_response({
+                let response_count = response_count.clone();
+                move |ctx| {
+                    response_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(ctx.status, reqwest::StatusCode::OK);
+                    }
+                }
+            });
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+                .build();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(challenge_count.load(Ordering::SeqCst), 1);
+            assert_eq!(credential_count.load(Ordering::SeqCst), 1);
+            assert_eq!(response_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_challenge_received_can_override_credential() {
+            let (_, www_auth) = test_challenge();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+            let events = ClientEvents::default();
+            let _sub = events.on(ClientEventKind::ChallengeReceived, |event| async move {
+                match event {
+                    ClientEvent::ChallengeReceived(ctx) => Some(PaymentCredential::new(
+                        ctx.challenge.to_echo(),
+                        PaymentPayload::hash("0xoverride"),
+                    )),
+                    _ => None,
+                }
+            });
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+                .build();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(provider.call_count(), 0);
         }
 
         #[tokio::test]

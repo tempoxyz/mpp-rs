@@ -20,6 +20,7 @@
 #[cfg(feature = "client")]
 mod accept_payment_policy;
 mod error;
+mod events;
 mod provider;
 pub mod transport;
 
@@ -40,6 +41,12 @@ pub use provider::{MultiProvider, PaymentProvider};
 
 #[cfg(feature = "client")]
 pub use accept_payment_policy::AcceptPaymentPolicy;
+
+#[cfg(feature = "client")]
+pub use events::{
+    ChallengeReceivedContext, ClientEvent, ClientEventKind, ClientEventSubscription, ClientEvents,
+    CredentialCreatedContext, PaymentFailedContext, PaymentResponseContext,
+};
 
 #[cfg(feature = "client")]
 pub use fetch::PaymentExt as Fetch;
