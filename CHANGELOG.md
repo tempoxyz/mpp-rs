@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.3 (2026-05-18)
+
+## 0.10.3 (2026-05-18)
+
+### Patch Changes
+
+- Added payment event lifecycle hooks (by @BrendanRyan, [#257](https://github.com/tempoxyz/mpp-rs/pull/257))
+
+## 0.2.3 (2026-05-18)
+
 ## 0.1.2 (2026-05-13)
 
 ## 0.10.2 (2026-05-13)
