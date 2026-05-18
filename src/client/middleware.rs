@@ -155,9 +155,19 @@ where
             return Ok(resp);
         }
 
-        let retry_req = retry_req
-            .context("request could not be cloned for payment retry")
-            .map_err(reqwest_middleware::Error::Middleware)?;
+        let retry_req = match retry_req {
+            Some(req) => req,
+            None => {
+                let err = anyhow::anyhow!("request could not be cloned for payment retry");
+                self.events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: None,
+                        error: err.to_string(),
+                    }))
+                    .await;
+                return Err(reqwest_middleware::Error::Middleware(err));
+            }
+        };
 
         let www_auth_values: Vec<&str> = resp
             .headers()
@@ -283,13 +293,23 @@ where
         let retry_resp = next.run(retry_req, extensions).await;
         match retry_resp {
             Ok(resp) => {
-                self.events
-                    .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
-                        challenge,
-                        credential,
-                        status: resp.status(),
-                    }))
-                    .await;
+                let status = resp.status();
+                if status.is_success() {
+                    self.events
+                        .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
+                            challenge,
+                            credential,
+                            status,
+                        }))
+                        .await;
+                } else {
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: format!("payment retry returned unsuccessful status: {status}"),
+                        }))
+                        .await;
+                }
                 Ok(resp)
             }
             Err(err) => {
@@ -537,6 +557,68 @@ mod tests {
             assert_eq!(challenge_count.load(Ordering::SeqCst), 1);
             assert_eq!(credential_count.load(Ordering::SeqCst), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_unsuccessful_paid_retry_emits_payment_failed() {
+            let (_, www_auth) = test_challenge();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            AxumStatusCode::PAYMENT_REQUIRED.into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+            let events = ClientEvents::default();
+            let response_count = Arc::new(AtomicU32::new(0));
+            let failed_count = Arc::new(AtomicU32::new(0));
+
+            let _response_sub = events.on_payment_response({
+                let response_count = response_count.clone();
+                move |_| {
+                    response_count.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                }
+            });
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_some());
+                        assert!(ctx.error.contains("402 Payment Required"));
+                    }
+                }
+            });
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+                .build();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(response_count.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]

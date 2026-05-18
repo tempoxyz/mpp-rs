@@ -251,13 +251,23 @@ impl PaymentExt for RequestBuilder {
             }
         };
 
-        events
-            .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
-                challenge,
-                credential,
-                status: retry_resp.status(),
-            }))
-            .await;
+        let status = retry_resp.status();
+        if status.is_success() {
+            events
+                .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
+                    challenge,
+                    credential,
+                    status,
+                }))
+                .await;
+        } else {
+            events
+                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                    challenge: Some(challenge),
+                    error: format!("payment retry returned unsuccessful status: {status}"),
+                }))
+                .await;
+        }
 
         Ok(retry_resp)
     }
@@ -478,6 +488,66 @@ mod tests {
             assert_eq!(challenge_count.load(Ordering::SeqCst), 1);
             assert_eq!(credential_count.load(Ordering::SeqCst), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_unsuccessful_paid_retry_emits_payment_failed() {
+            let (_, www_auth) = test_challenge();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            AxumStatusCode::PAYMENT_REQUIRED.into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+            let events = ClientEvents::default();
+            let response_count = Arc::new(AtomicU32::new(0));
+            let failed_count = Arc::new(AtomicU32::new(0));
+
+            let _response_sub = events.on_payment_response({
+                let response_count = response_count.clone();
+                move |_| {
+                    response_count.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                }
+            });
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_some());
+                        assert!(ctx.error.contains("402 Payment Required"));
+                    }
+                }
+            });
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(response_count.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]

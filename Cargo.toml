@@ -34,8 +34,8 @@ client = ["dep:reqwest"]
 server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
-evm = ["alloy", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives", "uuid"]
+evm = ["alloy", "dep:alloy-sol-type-parser", "dep:alloy-sol-types", "hex", "rand"]
+tempo = ["evm", "tempo-alloy", "tempo-primitives", "dep:tempo-contracts", "uuid"]
 stripe = ["dep:reqwest", "reqwest?/form"]
 
 # Utilities
@@ -81,10 +81,13 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional =
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
 alloy = { version = "2.0", features = ["full"], optional = true }
+alloy-sol-type-parser = { version = "=1.5.7", optional = true }
+alloy-sol-types = { version = "=1.5.7", optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { version = "1.6.0", optional = true }
-tempo-primitives = { version = "1.6.0", optional = true }
+tempo-alloy = { version = "=1.6.0", optional = true }
+tempo-primitives = { version = "=1.6.0", optional = true }
+tempo-contracts = { version = "=1.6.0", optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }

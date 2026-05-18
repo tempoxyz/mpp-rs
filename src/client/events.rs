@@ -288,12 +288,9 @@ impl ClientEvents {
         &self,
         context: ChallengeReceivedContext,
     ) -> Option<PaymentCredential> {
-        if let Some(credential) = self
+        let mut override_credential = self
             .emit(ClientEvent::ChallengeReceived(context.clone()))
-            .await
-        {
-            return Some(credential);
-        }
+            .await;
 
         let handlers: Vec<_> = self
             .inner
@@ -305,13 +302,12 @@ impl ClientEvents {
             .collect();
 
         for handler in handlers {
-            if let Some(credential) =
-                run_challenge_received_handler(&handler, context.clone()).await
-            {
-                return Some(credential);
+            let result = run_challenge_received_handler(&handler, context.clone()).await;
+            if override_credential.is_none() {
+                override_credential = result;
             }
         }
-        None
+        override_credential
     }
 
     pub(crate) async fn emit(&self, event: ClientEvent) -> Option<PaymentCredential> {
@@ -325,13 +321,14 @@ impl ClientEvents {
             .map(|(_, _, handler)| handler.clone())
             .collect();
 
+        let mut override_credential = None;
         for handler in handlers {
             let result = run_event_handler(&handler, event.clone()).await;
-            if event.kind() == ClientEventKind::ChallengeReceived && result.is_some() {
-                return result;
+            if event.kind() == ClientEventKind::ChallengeReceived && override_credential.is_none() {
+                override_credential = result;
             }
         }
-        None
+        override_credential
     }
 
     fn push_event_handler<F, Fut, R>(
@@ -416,5 +413,64 @@ where
             Ok(Poll::Pending) => Poll::Pending,
             Err(panic) => Poll::Ready(Err(panic)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::core::{Base64UrlJson, PaymentPayload};
+    use std::sync::{Arc, Mutex};
+
+    fn test_challenge() -> PaymentChallenge {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        PaymentChallenge::new("test-id", "example.com", "tempo", "charge", request)
+    }
+
+    #[tokio::test]
+    async fn test_challenge_received_runs_all_handlers_after_override() {
+        let events = ClientEvents::default();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        let _first = events.on(ClientEventKind::ChallengeReceived, {
+            let calls = calls.clone();
+            move |event| {
+                calls.lock().unwrap().push("first");
+                async move {
+                    match event {
+                        ClientEvent::ChallengeReceived(ctx) => Some(PaymentCredential::new(
+                            ctx.challenge.to_echo(),
+                            PaymentPayload::hash("0xoverride"),
+                        )),
+                        _ => None,
+                    }
+                }
+            }
+        });
+        let _any = events.on_any({
+            let calls = calls.clone();
+            move |_| {
+                calls.lock().unwrap().push("any");
+                async {}
+            }
+        });
+        let _typed = events.on_challenge_received({
+            let calls = calls.clone();
+            move |_| {
+                calls.lock().unwrap().push("typed");
+                async { None }
+            }
+        });
+
+        let challenge = test_challenge();
+        let credential = events
+            .emit_challenge_received(ChallengeReceivedContext {
+                challenge: challenge.clone(),
+                challenges: vec![challenge],
+            })
+            .await;
+
+        assert!(credential.is_some());
+        assert_eq!(*calls.lock().unwrap(), vec!["first", "any", "typed"]);
     }
 }
