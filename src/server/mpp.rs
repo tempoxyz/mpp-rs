@@ -22,6 +22,9 @@ use crate::protocol::core::PaymentChallenge;
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, VerificationError};
+use crate::server::events::{
+    PaymentSuccessContext, ServerEvent, ServerEventKind, ServerEventSubscription, ServerEvents,
+};
 
 const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;
@@ -107,6 +110,7 @@ pub struct Mpp<M, S = ()> {
     decimals: u32,
     fee_payer: bool,
     chain_id: Option<u64>,
+    events: ServerEvents,
 }
 
 impl<M> Mpp<M, ()>
@@ -127,6 +131,7 @@ where
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         }
     }
 
@@ -148,6 +153,7 @@ where
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         }
     }
 }
@@ -168,7 +174,46 @@ where
             decimals: self.decimals,
             fee_payer: self.fee_payer,
             chain_id: self.chain_id,
+            events: self.events,
         }
+    }
+
+    /// Use an existing event registry for payment callbacks.
+    pub fn with_events(mut self, events: ServerEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Get the event registry used by this payment handler.
+    pub fn events(&self) -> ServerEvents {
+        self.events.clone()
+    }
+
+    /// Register a server event observer.
+    pub fn on<F, Fut>(&self, kind: ServerEventKind, handler: F) -> ServerEventSubscription
+    where
+        F: Fn(ServerEvent) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.events.on(kind, handler)
+    }
+
+    /// Register an observer for every server event.
+    pub fn on_any<F, Fut>(&self, handler: F) -> ServerEventSubscription
+    where
+        F: Fn(ServerEvent) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.events.on_any(handler)
+    }
+
+    /// Register a `payment.success` observer.
+    pub fn on_payment_success<F, Fut>(&self, handler: F) -> ServerEventSubscription
+    where
+        F: Fn(PaymentSuccessContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.events.on_payment_success(handler)
     }
 
     /// Get the realm.
@@ -555,6 +600,16 @@ where
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request)?;
         let receipt = self.method.verify(credential, request).await?;
+        self.events
+            .emit_payment_success(PaymentSuccessContext {
+                credential: credential.clone(),
+                receipt: receipt.clone(),
+                request: serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
+                method: credential.challenge.method.as_str().to_string(),
+                intent: credential.challenge.intent.as_str().to_string(),
+                management_response: false,
+            })
+            .await;
         Ok(receipt)
     }
 }
@@ -766,6 +821,18 @@ where
         // Call respond hook — management actions (open, topUp, close) may
         // return a response body that short-circuits normal request handling.
         let management_response = session.respond(credential, &receipt);
+        let has_management_response = management_response.is_some();
+
+        self.events
+            .emit_payment_success(PaymentSuccessContext {
+                credential: credential.clone(),
+                receipt: receipt.clone(),
+                request: serde_json::to_value(&request).unwrap_or(serde_json::Value::Null),
+                method: credential.challenge.method.as_str().to_string(),
+                intent: credential.challenge.intent.as_str().to_string(),
+                management_response: has_management_response,
+            })
+            .await;
 
         Ok(SessionVerifyResult {
             receipt,
@@ -841,6 +908,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
             chain_id: builder.chain_id,
+            events: ServerEvents::default(),
         })
     }
 }
@@ -985,6 +1053,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             decimals: builder.decimals as u32,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         })
     }
 }
@@ -1071,25 +1140,16 @@ mod tests {
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        let id = {
-            #[cfg(feature = "tempo")]
-            {
-                crate::protocol::methods::tempo::generate_challenge_id(
-                    secret_key,
-                    "api.example.com",
-                    "mock",
-                    "charge",
-                    request,
-                    Some(&expires),
-                    None,
-                    None,
-                )
-            }
-            #[cfg(not(feature = "tempo"))]
-            {
-                "test-id".to_string()
-            }
-        };
+        let id = crate::protocol::core::compute_challenge_id(
+            secret_key,
+            "api.example.com",
+            "mock",
+            "charge",
+            request,
+            Some(&expires),
+            None,
+            None,
+        );
 
         let echo = ChallengeEcho {
             id,
@@ -1166,6 +1226,48 @@ mod tests {
         let payment = Mpp::new(MockMethod, "api.example.com", "secret");
         let credential = test_credential("secret");
         let request = test_request();
+
+        let receipt = payment.verify(&credential, &request).await.unwrap();
+
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "mock_ref");
+    }
+
+    #[tokio::test]
+    async fn test_payment_success_event_fires_after_verify() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let credential = test_credential("secret");
+        let request = test_request();
+        let seen = Arc::new(Mutex::new(None));
+        let _sub = payment.on_payment_success({
+            let seen = seen.clone();
+            move |ctx| {
+                *seen.lock().unwrap() = Some(ctx);
+                async {}
+            }
+        });
+
+        let receipt = payment.verify(&credential, &request).await.unwrap();
+
+        assert!(receipt.is_success());
+        let event = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(event.method, "mock");
+        assert_eq!(event.intent, "charge");
+        assert_eq!(event.receipt.reference, "mock_ref");
+        assert_eq!(event.request["amount"], "1000");
+        assert!(!event.management_response);
+    }
+
+    #[tokio::test]
+    async fn test_payment_success_event_panic_does_not_fail_verify() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let credential = test_credential("secret");
+        let request = test_request();
+        let _sub = payment.on_payment_success(|_| async move {
+            panic!("hook panic should be isolated");
+            #[allow(unreachable_code)]
+            ()
+        });
 
         let receipt = payment.verify(&credential, &request).await.unwrap();
 
@@ -1404,6 +1506,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         }
     }
 
@@ -1817,6 +1920,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         }
     }
 
@@ -1892,6 +1996,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         };
 
         let challenge = mpp
@@ -1934,6 +2039,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         };
 
         let echo = ChallengeEcho {
@@ -2034,6 +2140,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            events: ServerEvents::default(),
         };
 
         let challenge = mpp

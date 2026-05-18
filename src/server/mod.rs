@@ -28,6 +28,7 @@
 
 mod amount;
 mod compose;
+mod events;
 mod mpp;
 pub mod sse;
 pub mod transport;
@@ -53,6 +54,9 @@ mod stripe;
 pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 pub use amount::{parse_dollar_amount, AmountError};
 pub use compose::{compose, compose_verify, ChargeVerifier};
+pub use events::{
+    PaymentSuccessContext, ServerEvent, ServerEventKind, ServerEventSubscription, ServerEvents,
+};
 pub use mpp::{Mpp, SessionVerifyResult};
 
 // Re-export tempo types at server level for backward compatibility
