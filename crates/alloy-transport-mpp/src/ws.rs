@@ -59,6 +59,8 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const DEFAULT_KEEPALIVE_SECS: u64 = 10;
 const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_EVENTS_CAPACITY: usize = 64;
+const FATAL_TERMINATION_MESSAGE: &str =
+    "MPP connection terminated by a fatal error; not reconnecting";
 
 /// Server-issued request for a fresh session voucher.
 ///
@@ -341,15 +343,8 @@ where
     async fn connect(&self) -> TransportResult<ConnectionHandle> {
         // Refuse to reconnect after a fatal MPP failure.
         if self.fatal.load(Ordering::Acquire) {
-            // NOTE: ideally this would be a non-retryable transport error so the
-            // pubsub service short-circuits the reconnect loop. The published
-            // `alloy-transport` (<= 2.0.4) does not yet expose a non-retryable
-            // helper, so we surface a custom error and rely on the latched
-            // `fatal` flag — every retry will hit this branch and return
-            // immediately, so the loop only burns a few wakeups before the
-            // service exhausts its `max_retries` budget.
-            return Err(TransportErrorKind::custom_str(
-                "MPP connection terminated by a fatal error; not reconnecting",
+            return Err(TransportErrorKind::non_retryable_str(
+                FATAL_TERMINATION_MESSAGE,
             ));
         }
 
@@ -616,7 +611,9 @@ async fn run_translator<P, V>(
         Some(TerminationReason::Fatal) => {
             // Latch so subsequent `connect()` calls short-circuit.
             fatal.store(true, Ordering::Release);
-            interface.close_with_error();
+            interface.close_with_transport_error(TransportErrorKind::non_retryable_str(
+                FATAL_TERMINATION_MESSAGE,
+            ));
         }
         None => {}
     }
