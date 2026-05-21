@@ -364,6 +364,7 @@ mod tests {
                 period: 0,
             }]),
             allowed_calls: None,
+            witness: None,
         };
         let inner_sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         auth.into_signed(PrimitiveSignature::Secp256k1(inner_sig))

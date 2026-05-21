@@ -118,6 +118,7 @@ mod tests {
             expiry: NonZeroU64::new(9999999999),
             limits,
             allowed_calls: None,
+            witness: None,
         };
         let inner_sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         auth.into_signed(PrimitiveSignature::Secp256k1(inner_sig))
