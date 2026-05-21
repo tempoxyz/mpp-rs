@@ -21,10 +21,10 @@ rustdoc-args = [
 ]
 
 [dependencies]
-alloy-json-rpc = { version = "2.0", default-features = false }
-alloy-pubsub = { version = "2.0", default-features = false }
-alloy-transport = { version = "2.0", default-features = false }
-alloy-transport-ws = { version = "2.0", default-features = false }
+alloy-json-rpc = { version = "2.0.5", default-features = false }
+alloy-pubsub = { version = "2.0.5", default-features = false }
+alloy-transport = { version = "2.0.5", default-features = false }
+alloy-transport-ws = { version = "2.0.5", default-features = false }
 
 mpp = { path = "../..", default-features = false, features = ["ws"] }
 

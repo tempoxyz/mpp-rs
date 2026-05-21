@@ -329,6 +329,7 @@ mod tests {
             expiry: NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
+            witness: None,
         };
         let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         let signed = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
@@ -581,6 +582,7 @@ mod tests {
             expiry: NonZeroU64::new(9999999999),
             limits: None,
             allowed_calls: None,
+            witness: None,
         };
         let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         let signed_auth = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
