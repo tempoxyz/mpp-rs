@@ -1,0 +1,41 @@
+name: Conformance
+
+on:
+  pull_request:
+    branches: [main]
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  conformance-policy:
+    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance-policy.yml@main
+    with:
+      protocol-paths: |
+        Cargo.toml
+        src/body_digest.rs
+        src/client/**
+        src/error.rs
+        src/expires.rs
+        src/lib.rs
+        src/mcp.rs
+        src/protocol/**
+        src/server/**
+        crates/alloy-transport-mpp/**
+
+  conformance:
+    needs: conformance-policy
+    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance.yml@main
+    with:
+      adapter: rust
+      conformance-ref: ${{ needs.conformance-policy.outputs.conformance_ref }}
