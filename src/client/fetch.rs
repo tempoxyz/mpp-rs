@@ -12,10 +12,21 @@ use super::events::{
     PaymentFailedContext, PaymentResponseContext,
 };
 use super::provider::PaymentProvider;
+use crate::error::MppError;
 use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
 use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+    format_authorization, parse_www_authenticate_all, PaymentChallenge, AUTHORIZATION_HEADER,
 };
+
+fn reject_expired_challenge(challenge: &PaymentChallenge) -> Result<(), HttpError> {
+    if challenge.is_expired() {
+        return Err(HttpError::Payment(MppError::PaymentExpired(
+            challenge.expires.clone(),
+        )));
+    }
+
+    Ok(())
+}
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -188,6 +199,17 @@ impl PaymentExt for RequestBuilder {
             }
         };
 
+        if let Err(err) = reject_expired_challenge(&challenge) {
+            let error = err.to_string();
+            events
+                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                    challenge: Some(challenge),
+                    error,
+                }))
+                .await;
+            return Err(err);
+        }
+
         let override_credential = events
             .emit_challenge_received(ChallengeReceivedContext {
                 challenge: challenge.clone(),
@@ -270,6 +292,48 @@ impl PaymentExt for RequestBuilder {
         }
 
         Ok(retry_resp)
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+    #[test]
+    fn reject_expired_challenge_fails_closed_for_malformed_expiry() {
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+        )
+        .with_expires("not-a-date");
+
+        let err = reject_expired_challenge(&challenge).unwrap_err();
+        assert!(matches!(
+            err,
+            HttpError::Payment(MppError::PaymentExpired(_))
+        ));
+    }
+
+    #[test]
+    fn reject_expired_challenge_rejects_past_expiry() {
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+        )
+        .with_expires("2020-01-01T00:00:00Z");
+
+        let err = reject_expired_challenge(&challenge).unwrap_err();
+        assert!(matches!(
+            err,
+            HttpError::Payment(MppError::PaymentExpired(_))
+        ));
     }
 }
 

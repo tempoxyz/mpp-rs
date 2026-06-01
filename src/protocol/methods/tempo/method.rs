@@ -1004,6 +1004,12 @@ where
             ));
         }
 
+        if !tx.access_list.is_empty() {
+            return Err(VerificationError::new(
+                "Fee payer transaction must not include an access list",
+            ));
+        }
+
         if tx.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
             return Err(VerificationError::new(
                 "Fee payer envelope must use expiring nonce key (U256::MAX)",
@@ -2277,6 +2283,43 @@ mod tests {
         assert!(
             err.to_string().contains("must include valid_before"),
             "error should mention valid_before, got: {err}"
+        );
+    }
+
+    /// cosign_fee_payer_transaction rejects txs with non-empty access lists.
+    #[test]
+    fn test_cosign_rejects_non_empty_access_list() {
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        let mut tx = make_fee_payer_tx(60);
+        tx.access_list =
+            alloy::eips::eip2930::AccessList(vec![alloy::eips::eip2930::AccessListItem {
+                address: Address::repeat_byte(0xaa),
+                storage_keys: vec![],
+            }]);
+
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let result = method.cosign_fee_payer_transaction(
+            &encoded,
+            method.fee_payer_signer.as_ref().unwrap(),
+            fee_token,
+        );
+
+        let err = result.expect_err("should reject access list");
+        assert!(
+            err.to_string().contains("access list"),
+            "error should mention access list, got: {err}"
         );
     }
 

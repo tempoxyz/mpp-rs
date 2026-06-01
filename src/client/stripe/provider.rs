@@ -98,6 +98,8 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        challenge.validate_for_charge(METHOD_NAME)?;
+
         let request: ChargeRequest = challenge
             .request
             .decode()
@@ -149,6 +151,11 @@ impl PaymentProvider for StripeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::core::Base64UrlJson;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     #[test]
     fn test_supports() {
@@ -159,5 +166,39 @@ mod tests {
         assert!(provider.supports("stripe", "charge"));
         assert!(!provider.supports("tempo", "charge"));
         assert!(!provider.supports("stripe", "session"));
+    }
+
+    #[tokio::test]
+    async fn test_pay_rejects_expired_challenge_before_creating_token() {
+        let called = Arc::new(AtomicBool::new(false));
+        let provider = StripeProvider::new({
+            let called = called.clone();
+            move |_| {
+                called.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(CreateTokenResult::from("spt_test".to_string())) })
+            }
+        });
+        let request = ChargeRequest {
+            amount: "1000".to_string(),
+            currency: "usd".to_string(),
+            method_details: Some(serde_json::json!({
+                "networkId": "internal",
+                "paymentMethodTypes": ["card"]
+            })),
+            ..Default::default()
+        };
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "stripe",
+            "charge",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        )
+        .with_expires("2020-01-01T00:00:00Z");
+
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        assert!(matches!(err, MppError::PaymentExpired(_)));
+        assert!(!called.load(Ordering::SeqCst));
     }
 }
