@@ -36,7 +36,7 @@ pub fn compute_json<T: serde::Serialize>(body: &T) -> BodyDigest {
 
 /// Verifies that a digest matches the given body bytes.
 pub fn verify(digest: &str, body: &[u8]) -> bool {
-    compute(body) == digest
+    crate::protocol::core::challenge::constant_time_eq(&compute(body), digest)
 }
 
 #[cfg(test)]

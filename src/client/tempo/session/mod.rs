@@ -414,6 +414,8 @@ impl PaymentProvider for TempoSessionProvider {
         use alloy::providers::ProviderBuilder;
         use tempo_alloy::TempoNetwork;
 
+        challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
+
         *self.last_challenge.lock().unwrap() = Some(challenge.clone());
 
         let chain_id = resolve_chain_id(challenge);
@@ -579,6 +581,18 @@ mod tests {
         assert!(provider.supports("tempo", "session"));
         assert!(!provider.supports("tempo", "charge"));
         assert!(!provider.supports("stripe", "session"));
+    }
+
+    #[tokio::test]
+    async fn test_pay_rejects_expired_challenge_before_state_mutation() {
+        let provider = make_test_provider();
+        let challenge = make_test_challenge().with_expires("2020-01-01T00:00:00Z");
+
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        assert!(matches!(err, MppError::PaymentExpired(_)));
+        assert!(provider.last_challenge.lock().unwrap().is_none());
+        assert!(provider.channels.lock().unwrap().is_empty());
     }
 
     #[test]

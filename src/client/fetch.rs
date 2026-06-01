@@ -12,7 +12,10 @@ use super::events::{
     PaymentFailedContext, PaymentResponseContext,
 };
 use super::provider::PaymentProvider;
-use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
+use crate::client::challenge_selection::{
+    expired_payment_error, select_supported_challenge, ChallengeSelectionError,
+};
+use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
     format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
 };
@@ -145,48 +148,33 @@ impl PaymentExt for RequestBuilder {
             .filter_map(|r| r.ok())
             .collect();
 
-        // Rank challenges by the caller's preferences (if set) or the
-        // provider's. Falls back to first-supported on parse failure.
-        let challenge = if let Some(ref header) = ranking_accept {
-            if let Ok(prefs) = accept_payment::parse(header) {
-                let supported: Vec<_> = challenges
-                    .iter()
-                    .filter(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
-                    .collect();
-                accept_payment::select(&supported, &prefs).copied()
-            } else {
-                challenges
-                    .iter()
-                    .find(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
-            }
-        } else {
-            challenges
-                .iter()
-                .find(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
-        }
-        .ok_or_else(|| {
-            let offered: Vec<_> = challenges
-                .iter()
-                .map(|c| format!("{}.{}", c.method, c.intent))
-                .collect();
-            HttpError::NoSupportedChallenge(format!(
-                "server offered [{}], but provider does not support any",
-                offered.join(", ")
-            ))
-        });
-
-        let challenge = match challenge {
-            Ok(challenge) => challenge.clone(),
-            Err(err) => {
-                events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: None,
-                        error: err.to_string(),
-                    }))
-                    .await;
-                return Err(err);
-            }
-        };
+        let challenge =
+            match select_supported_challenge(&challenges, ranking_accept.as_deref(), |challenge| {
+                provider.supports(challenge.method.as_str(), challenge.intent.as_str())
+            }) {
+                Ok(challenge) => challenge.clone(),
+                Err(ChallengeSelectionError::Expired(challenge)) => {
+                    let err = HttpError::Payment(expired_payment_error(&challenge));
+                    let error = err.to_string();
+                    events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(*challenge),
+                            error,
+                        }))
+                        .await;
+                    return Err(err);
+                }
+                Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
+                    let err = HttpError::NoSupportedChallenge(message);
+                    events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: None,
+                            error: err.to_string(),
+                        }))
+                        .await;
+                    return Err(err);
+                }
+            };
 
         let override_credential = events
             .emit_challenge_received(ChallengeReceivedContext {
@@ -775,9 +763,22 @@ mod tests {
 
         /// Build a challenge header for a specific method and intent.
         fn challenge_header(id: &str, method: &str, intent: &str) -> String {
+            challenge_header_with_expires(id, method, intent, None)
+        }
+
+        fn challenge_header_with_expires(
+            id: &str,
+            method: &str,
+            intent: &str,
+            expires: Option<&str>,
+        ) -> String {
             let request =
                 Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-            let challenge = PaymentChallenge::new(id, "test.example.com", method, intent, request);
+            let mut challenge =
+                PaymentChallenge::new(id, "test.example.com", method, intent, request);
+            if let Some(expires) = expires {
+                challenge = challenge.with_expires(expires);
+            }
             format_www_authenticate(&challenge).unwrap()
         }
 
@@ -860,6 +861,113 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_multi_challenge_skips_expired_preferred_supported() {
+            // Caller prefers tempo, but that challenge is expired; stripe is
+            // still supported and valid, so the request should continue.
+            let tempo_header = challenge_header_with_expires(
+                "t1",
+                "tempo",
+                "charge",
+                Some("2020-01-01T00:00:00Z"),
+            );
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+            let combined = format!("{}, {}", tempo_header, stripe_header);
+
+            let picked: Arc<std::sync::Mutex<Option<String>>> = Arc::new(Default::default());
+            let picked_clone = picked.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let combined = combined.clone();
+                    let picked = picked_clone.clone();
+                    async move {
+                        if let Some(auth) = req.headers().get("authorization") {
+                            *picked.lock().unwrap() =
+                                Some(auth.to_str().unwrap_or_default().to_string());
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, combined)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge"), ("stripe", "charge")]);
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .header("Accept-Payment", "tempo/charge, stripe/charge;q=0.5")
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+            let used = picked.lock().unwrap().clone().unwrap_or_default();
+            let cred = crate::protocol::core::parse_authorization(&used).unwrap();
+            assert_eq!(cred.challenge.id, "s1");
+        }
+
+        #[tokio::test]
+        async fn test_multi_challenge_skips_malformed_expiry_first_supported() {
+            // A bad expires value fails closed for that challenge, but should
+            // not block a later valid challenge for the same method/intent.
+            let bad_header =
+                challenge_header_with_expires("bad", "tempo", "charge", Some("not-a-date"));
+            let valid_header = challenge_header("valid", "tempo", "charge");
+            let combined = format!("{}, {}", bad_header, valid_header);
+
+            let picked: Arc<std::sync::Mutex<Option<String>>> = Arc::new(Default::default());
+            let picked_clone = picked.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let combined = combined.clone();
+                    let picked = picked_clone.clone();
+                    async move {
+                        if let Some(auth) = req.headers().get("authorization") {
+                            *picked.lock().unwrap() =
+                                Some(auth.to_str().unwrap_or_default().to_string());
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, combined)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SelectiveProvider::new(vec![("tempo", "charge")]);
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+            let used = picked.lock().unwrap().clone().unwrap_or_default();
+            let cred = crate::protocol::core::parse_authorization(&used).unwrap();
+            assert_eq!(cred.challenge.id, "valid");
         }
 
         #[tokio::test]

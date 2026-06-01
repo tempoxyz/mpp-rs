@@ -293,6 +293,13 @@ where
             ));
         }
 
+        if credential.challenge.opaque.is_some() {
+            return Err(VerificationError::with_code(
+                "credential opaque data does not match this route's requirements",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
         // Request-level core fields: currency, recipient
         if let Some(ref expected_currency) = self.currency {
             if request.currency != *expected_currency {
@@ -1729,6 +1736,37 @@ mod tests {
         let result = mpp.verify_credential(&credential).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("chainId"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp();
+        let challenge = mpp.charge("0.10").unwrap();
+
+        let mut echo = challenge.to_echo();
+        echo.opaque = Some(
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"route": "other"}),
+            )
+            .unwrap(),
+        );
+        echo.id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
+        let result = mpp.verify_credential(&credential).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("opaque"));
     }
 
     #[cfg(feature = "tempo")]
