@@ -4,7 +4,7 @@ use crate::protocol::core::PaymentChallenge;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ChallengeSelectionError {
-    Expired(PaymentChallenge),
+    Expired(Box<PaymentChallenge>),
     NoSupportedChallenge(String),
 }
 
@@ -33,7 +33,9 @@ pub(crate) fn select_supported_challenge<'a>(
     }
 
     if let Some(challenge) = select_ranked_challenge(&supported, ranking_preferences.as_deref()) {
-        return Err(ChallengeSelectionError::Expired(challenge.clone()));
+        return Err(ChallengeSelectionError::Expired(Box::new(
+            challenge.clone(),
+        )));
     }
 
     let offered: Vec<_> = challenges

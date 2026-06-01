@@ -207,7 +207,7 @@ where
                     let error = mpp_error.to_string();
                     self.events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                            challenge: Some(challenge),
+                            challenge: Some(*challenge),
                             error,
                         }))
                         .await;

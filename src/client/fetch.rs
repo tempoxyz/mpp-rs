@@ -158,7 +158,7 @@ impl PaymentExt for RequestBuilder {
                     let error = err.to_string();
                     events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                            challenge: Some(challenge),
+                            challenge: Some(*challenge),
                             error,
                         }))
                         .await;
