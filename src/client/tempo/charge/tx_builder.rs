@@ -306,6 +306,8 @@ mod tests {
             limits: None,
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         let signed_auth = auth.into_signed(PrimitiveSignature::Secp256k1(sig));
