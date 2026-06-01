@@ -28,6 +28,7 @@ jobs:
       - name: Changelogs
         uses: tempoxyz/changelogs@de0250123a1d70a2b64a458bd5efcf313986df7a # master
         with:
+          ecosystem: rust
           conventional-commit: true
           crate-token: ${{ steps.auth.outputs.token }}
         env:
