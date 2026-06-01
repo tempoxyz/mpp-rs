@@ -12,31 +12,13 @@ use super::events::{
     PaymentFailedContext, PaymentResponseContext,
 };
 use super::provider::PaymentProvider;
-use crate::error::MppError;
-use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
-use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, PaymentChallenge, AUTHORIZATION_HEADER,
+use crate::client::challenge_selection::{
+    expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
-
-fn reject_expired_challenge(challenge: &PaymentChallenge) -> Result<(), HttpError> {
-    if challenge.is_expired() {
-        return Err(HttpError::Payment(MppError::PaymentExpired(
-            challenge.expires.clone(),
-        )));
-    }
-
-    Ok(())
-}
-
-fn select_ranked_challenge<'a>(
-    challenges: &[&'a PaymentChallenge],
-    preferences: Option<&[accept_payment::Entry]>,
-) -> Option<&'a PaymentChallenge> {
-    match preferences {
-        Some(prefs) => accept_payment::select(challenges, prefs).copied(),
-        None => challenges.first().copied(),
-    }
-}
+use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
+use crate::protocol::core::{
+    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+};
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -166,32 +148,13 @@ impl PaymentExt for RequestBuilder {
             .filter_map(|r| r.ok())
             .collect();
 
-        let ranking_preferences = ranking_accept
-            .as_ref()
-            .and_then(|header| accept_payment::parse(header).ok());
-        let supported: Vec<_> = challenges
-            .iter()
-            .filter(|c| provider.supports(c.method.as_str(), c.intent.as_str()))
-            .collect();
-        let payable: Vec<_> = supported
-            .iter()
-            .copied()
-            .filter(|challenge| !challenge.is_expired())
-            .collect();
-
-        // Rank payable challenges by the caller's preferences (if set) or the
-        // provider's. Falls back to first-supported on preference parse failure.
-        let challenge = select_ranked_challenge(&payable, ranking_preferences.as_deref()).cloned();
-
-        let challenge = match challenge {
-            Some(challenge) => challenge,
-            None => {
-                if let Some(expired) =
-                    select_ranked_challenge(&supported, ranking_preferences.as_deref())
-                {
-                    let challenge = expired.clone();
-                    let err = reject_expired_challenge(&challenge)
-                        .expect_err("expired challenge selected after payable filtering");
+        let challenge =
+            match select_supported_challenge(&challenges, ranking_accept.as_deref(), |challenge| {
+                provider.supports(challenge.method.as_str(), challenge.intent.as_str())
+            }) {
+                Ok(challenge) => challenge.clone(),
+                Err(ChallengeSelectionError::Expired(challenge)) => {
+                    let err = HttpError::Payment(expired_payment_error(&challenge));
                     let error = err.to_string();
                     events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
@@ -201,24 +164,17 @@ impl PaymentExt for RequestBuilder {
                         .await;
                     return Err(err);
                 }
-
-                let offered: Vec<_> = challenges
-                    .iter()
-                    .map(|c| format!("{}.{}", c.method, c.intent))
-                    .collect();
-                let err = HttpError::NoSupportedChallenge(format!(
-                    "server offered [{}], but provider does not support any",
-                    offered.join(", ")
-                ));
-                events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: None,
-                        error: err.to_string(),
-                    }))
-                    .await;
-                return Err(err);
-            }
-        };
+                Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
+                    let err = HttpError::NoSupportedChallenge(message);
+                    events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: None,
+                            error: err.to_string(),
+                        }))
+                        .await;
+                    return Err(err);
+                }
+            };
 
         let override_credential = events
             .emit_challenge_received(ChallengeReceivedContext {
@@ -302,48 +258,6 @@ impl PaymentExt for RequestBuilder {
         }
 
         Ok(retry_resp)
-    }
-}
-
-#[cfg(test)]
-mod expiry_tests {
-    use super::*;
-    use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
-
-    #[test]
-    fn reject_expired_challenge_fails_closed_for_malformed_expiry() {
-        let challenge = PaymentChallenge::new(
-            "challenge-123",
-            "api.example.com",
-            "tempo",
-            "charge",
-            Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
-        )
-        .with_expires("not-a-date");
-
-        let err = reject_expired_challenge(&challenge).unwrap_err();
-        assert!(matches!(
-            err,
-            HttpError::Payment(MppError::PaymentExpired(_))
-        ));
-    }
-
-    #[test]
-    fn reject_expired_challenge_rejects_past_expiry() {
-        let challenge = PaymentChallenge::new(
-            "challenge-123",
-            "api.example.com",
-            "tempo",
-            "charge",
-            Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
-        )
-        .with_expires("2020-01-01T00:00:00Z");
-
-        let err = reject_expired_challenge(&challenge).unwrap_err();
-        assert!(matches!(
-            err,
-            HttpError::Payment(MppError::PaymentExpired(_))
-        ));
     }
 }
 

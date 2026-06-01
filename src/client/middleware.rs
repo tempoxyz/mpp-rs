@@ -9,12 +9,15 @@ use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
 use crate::client::accept_payment_policy::AcceptPaymentPolicy;
+use crate::client::challenge_selection::{
+    expired_payment_error, select_supported_challenge, ChallengeSelectionError,
+};
 use crate::client::events::{
     ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
     CredentialCreatedContext, PaymentFailedContext, PaymentResponseContext,
 };
 use crate::client::provider::PaymentProvider;
-use crate::protocol::core::accept_payment::{self, ACCEPT_PAYMENT_HEADER};
+use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
     format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
 };
@@ -193,39 +196,36 @@ where
             .filter_map(|r| r.ok())
             .collect();
 
-        // Rank challenges by the caller's preferences (if set) or the
-        // provider's.
-        let challenge = if let Some(ref header) = ranking_accept {
-            if let Ok(prefs) = accept_payment::parse(header) {
-                let supported: Vec<_> = challenges
-                    .iter()
-                    .filter(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
-                    .collect();
-                accept_payment::select(&supported, &prefs).copied()
-            } else {
-                challenges
-                    .iter()
-                    .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
-            }
-        } else {
-            challenges
-                .iter()
-                .find(|c| self.provider.supports(c.method.as_str(), c.intent.as_str()))
-        }
-        .context("no challenge matches provider's supported methods");
-
-        let challenge = match challenge {
-            Ok(challenge) => challenge.clone(),
-            Err(err) => {
-                self.events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: None,
-                        error: err.to_string(),
-                    }))
-                    .await;
-                return Err(reqwest_middleware::Error::Middleware(err));
-            }
-        };
+        let challenge =
+            match select_supported_challenge(&challenges, ranking_accept.as_deref(), |challenge| {
+                self.provider
+                    .supports(challenge.method.as_str(), challenge.intent.as_str())
+            }) {
+                Ok(challenge) => challenge.clone(),
+                Err(ChallengeSelectionError::Expired(challenge)) => {
+                    let mpp_error = expired_payment_error(&challenge);
+                    let error = mpp_error.to_string();
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error,
+                        }))
+                        .await;
+                    return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                        mpp_error
+                    )));
+                }
+                Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
+                    let err = anyhow::anyhow!(message);
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: None,
+                            error: err.to_string(),
+                        }))
+                        .await;
+                    return Err(reqwest_middleware::Error::Middleware(err));
+                }
+            };
 
         let override_credential = self
             .events
@@ -418,14 +418,21 @@ mod tests {
         }
 
         fn test_challenge() -> (PaymentChallenge, String) {
+            test_challenge_with_expires(None)
+        }
+
+        fn test_challenge_with_expires(expires: Option<&str>) -> (PaymentChallenge, String) {
             let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "500"})).unwrap();
-            let challenge = PaymentChallenge::new(
+            let mut challenge = PaymentChallenge::new(
                 "mw-test-id",
                 "middleware.example.com",
                 "tempo",
                 "charge",
                 request,
             );
+            if let Some(expires) = expires {
+                challenge = challenge.with_expires(expires);
+            }
             let header = format_www_authenticate(&challenge).unwrap();
             (challenge, header)
         }
@@ -714,6 +721,72 @@ mod tests {
                 "expected WWW-Authenticate error, got: {}",
                 err
             );
+        }
+
+        #[tokio::test]
+        async fn test_middleware_rejects_expired_challenge_before_hooks() {
+            let (_, www_auth) = test_challenge_with_expires(Some("2020-01-01T00:00:00Z"));
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+            let events = ClientEvents::default();
+            let challenge_count = Arc::new(AtomicU32::new(0));
+            let failed_count = Arc::new(AtomicU32::new(0));
+
+            let _challenge_sub = events.on_challenge_received({
+                let challenge_count = challenge_count.clone();
+                move |_| {
+                    challenge_count.fetch_add(1, Ordering::SeqCst);
+                    async { None }
+                }
+            });
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_some());
+                        assert!(ctx.error.contains("Payment expired"));
+                    }
+                }
+            });
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+                .build();
+
+            let err = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("Payment expired"),
+                "expected payment expired error, got: {err}"
+            );
+            assert_eq!(provider.call_count(), 0);
+            assert_eq!(challenge_count.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
         }
 
         /// Advertises a known header value so tests can observe injection.
