@@ -1,0 +1,38 @@
+name: Conformance
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  conformance-policy:
+    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance-policy.yml@main
+    with:
+      protocol-paths: |
+        src/**
+        crates/**
+        Cargo.toml
+        Cargo.lock
+
+  conformance:
+    needs: conformance-policy
+    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance.yml@main
+    with:
+      adapter: rust
+      conformance-ref: ${{ needs.conformance-policy.outputs.conformance_ref }}
