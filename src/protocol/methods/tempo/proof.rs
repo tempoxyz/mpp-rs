@@ -9,13 +9,13 @@ use crate::error::{MppError, ResultExt};
 pub const DOMAIN_NAME: &str = "MPP";
 
 /// EIP-712 domain version for zero-amount proof credentials.
-pub const DOMAIN_VERSION: &str = "1";
+pub const DOMAIN_VERSION: &str = "2";
 
 alloy::sol! {
     #[derive(Debug)]
     struct Proof {
         string challengeId;
-        address wallet;
+        string realm;
     }
 }
 
@@ -65,7 +65,7 @@ pub fn parse_proof_source(source: &str) -> crate::error::Result<ProofSource> {
 }
 
 /// Compute the EIP-712 signing hash for a proof credential.
-pub fn signing_hash(chain_id: u64, challenge_id: &str, wallet: Address) -> B256 {
+pub fn signing_hash(chain_id: u64, challenge_id: &str, realm: &str) -> B256 {
     let domain = eip712_domain! {
         name: DOMAIN_NAME,
         version: DOMAIN_VERSION,
@@ -74,21 +74,21 @@ pub fn signing_hash(chain_id: u64, challenge_id: &str, wallet: Address) -> B256 
 
     Proof {
         challengeId: challenge_id.to_string(),
-        wallet,
+        realm: realm.to_string(),
     }
     .eip712_signing_hash(&domain)
 }
 
-/// Sign a zero-amount charge proof for the given challenge ID.
+/// Sign a zero-amount charge proof for the given challenge ID and realm.
 #[cfg(feature = "evm")]
 pub async fn sign_proof(
     signer: &impl alloy::signers::Signer,
     chain_id: u64,
     challenge_id: &str,
-    wallet: Address,
+    realm: &str,
 ) -> crate::error::Result<String> {
     let signature = signer
-        .sign_hash(&signing_hash(chain_id, challenge_id, wallet))
+        .sign_hash(&signing_hash(chain_id, challenge_id, realm))
         .await
         .mpp_http("failed to sign proof")?;
 
@@ -100,8 +100,8 @@ pub async fn sign_proof(
 pub fn verify_proof(
     chain_id: u64,
     challenge_id: &str,
+    realm: &str,
     signature_hex: &str,
-    wallet: Address,
     expected_signer: Address,
 ) -> bool {
     let signature_bytes = match signature_hex.parse::<alloy::primitives::Bytes>() {
@@ -114,7 +114,7 @@ pub fn verify_proof(
         Err(_) => return false,
     };
 
-    match signature.recover_address_from_prehash(&signing_hash(chain_id, challenge_id, wallet)) {
+    match signature.recover_address_from_prehash(&signing_hash(chain_id, challenge_id, realm)) {
         Ok(recovered) => recovered == expected_signer,
         Err(_) => false,
     }
@@ -127,8 +127,8 @@ pub fn verify_proof(
 pub fn recover_proof_signer(
     chain_id: u64,
     challenge_id: &str,
+    realm: &str,
     signature_hex: &str,
-    wallet: Address,
 ) -> Result<Address, crate::error::MppError> {
     let signature_bytes: alloy::primitives::Bytes = signature_hex
         .parse()
@@ -136,7 +136,7 @@ pub fn recover_proof_signer(
     let signature = alloy::signers::Signature::try_from(signature_bytes.as_ref())
         .map_err(|_| crate::error::MppError::invalid_payload("invalid proof signature"))?;
     signature
-        .recover_address_from_prehash(&signing_hash(chain_id, challenge_id, wallet))
+        .recover_address_from_prehash(&signing_hash(chain_id, challenge_id, realm))
         .map_err(|_| crate::error::MppError::invalid_payload("proof signature recovery failed"))
 }
 
@@ -188,15 +188,15 @@ mod tests {
     #[tokio::test]
     async fn test_sign_and_verify_proof_roundtrip() {
         let signer = alloy::signers::local::PrivateKeySigner::random();
-        let signature = sign_proof(&signer, 42431, "challenge-123", signer.address())
+        let signature = sign_proof(&signer, 42431, "challenge-123", "api.example.com")
             .await
             .unwrap();
 
         assert!(verify_proof(
             42431,
             "challenge-123",
+            "api.example.com",
             &signature,
-            signer.address(),
             signer.address(),
         ));
     }
@@ -204,15 +204,31 @@ mod tests {
     #[tokio::test]
     async fn test_verify_proof_rejects_wrong_challenge_id() {
         let signer = alloy::signers::local::PrivateKeySigner::random();
-        let signature = sign_proof(&signer, 42431, "challenge-123", signer.address())
+        let signature = sign_proof(&signer, 42431, "challenge-123", "api.example.com")
             .await
             .unwrap();
 
         assert!(!verify_proof(
             42431,
             "challenge-456",
+            "api.example.com",
             &signature,
             signer.address(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_verify_proof_rejects_wrong_realm() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let signature = sign_proof(&signer, 42431, "challenge-123", "api.example.com")
+            .await
+            .unwrap();
+
+        assert!(!verify_proof(
+            42431,
+            "challenge-123",
+            "payments.example.com",
+            &signature,
             signer.address(),
         ));
     }
@@ -221,50 +237,44 @@ mod tests {
     async fn test_verify_proof_rejects_wrong_signer() {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let other = alloy::signers::local::PrivateKeySigner::random();
-        let signature = sign_proof(&signer, 42431, "challenge-123", signer.address())
+        let signature = sign_proof(&signer, 42431, "challenge-123", "api.example.com")
             .await
             .unwrap();
 
         assert!(!verify_proof(
             42431,
             "challenge-123",
+            "api.example.com",
             &signature,
-            signer.address(),
             other.address(),
         ));
     }
 
     #[tokio::test]
-    async fn test_verify_proof_rejects_wrong_wallet() {
+    async fn test_recover_proof_signer_returns_signer() {
         let signer = alloy::signers::local::PrivateKeySigner::random();
-        let other_wallet = alloy::signers::local::PrivateKeySigner::random();
-        let signature = sign_proof(&signer, 42431, "challenge-123", signer.address())
+        let signature = sign_proof(&signer, 42431, "challenge-123", "api.example.com")
             .await
             .unwrap();
 
-        assert!(!verify_proof(
-            42431,
-            "challenge-123",
-            &signature,
-            other_wallet.address(),
-            signer.address(),
-        ));
+        let recovered =
+            recover_proof_signer(42431, "challenge-123", "api.example.com", &signature).unwrap();
+        assert_eq!(recovered, signer.address());
     }
 
     #[test]
     fn test_signing_hash_depends_on_chain_id() {
-        let wallet = Address::repeat_byte(0x11);
         assert_ne!(
-            signing_hash(1, "challenge-123", wallet),
-            signing_hash(42431, "challenge-123", wallet)
+            signing_hash(1, "challenge-123", "api.example.com"),
+            signing_hash(42431, "challenge-123", "api.example.com")
         );
     }
 
     #[test]
-    fn test_signing_hash_depends_on_wallet() {
+    fn test_signing_hash_depends_on_realm() {
         assert_ne!(
-            signing_hash(42431, "challenge-123", Address::repeat_byte(0x11)),
-            signing_hash(42431, "challenge-123", Address::repeat_byte(0x22))
+            signing_hash(42431, "challenge-123", "api.example.com"),
+            signing_hash(42431, "challenge-123", "payments.example.com")
         );
     }
 }
