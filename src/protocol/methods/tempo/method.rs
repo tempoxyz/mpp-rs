@@ -1232,8 +1232,8 @@ where
                 if !proof::verify_proof(
                     expected_chain_id,
                     &credential.challenge.id,
+                    &credential.challenge.realm,
                     sig_hex,
-                    parsed_source.address,
                     parsed_source.address,
                 ) {
                     // Keychain fallback: signer may be an access key authorized
@@ -1241,8 +1241,8 @@ where
                     let recovered = proof::recover_proof_signer(
                         expected_chain_id,
                         &credential.challenge.id,
+                        &credential.challenge.realm,
                         sig_hex,
-                        parsed_source.address,
                     )
                     .map_err(|_| {
                         VerificationError::new("Proof signature does not match source.")
@@ -1421,7 +1421,7 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, signer.address())
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
             .await
             .unwrap();
         let credential = PaymentCredential::with_source(
@@ -1445,7 +1445,7 @@ mod tests {
         let other = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&other, 42431, &challenge.id, other.address())
+        let signature = proof::sign_proof(&other, 42431, &challenge.id, &challenge.realm)
             .await
             .unwrap();
         let payload = crate::protocol::core::PaymentPayload::proof(signature);
@@ -1460,8 +1460,8 @@ mod tests {
         assert!(!proof::verify_proof(
             42431,
             &credential.challenge.id,
+            &credential.challenge.realm,
             payload.proof_signature().unwrap(),
-            parsed.address,
             parsed.address,
         ));
     }

@@ -130,8 +130,13 @@ impl PaymentProvider for TempoProvider {
 
         if charge.amount().is_zero() {
             let from = self.signing_mode.from_address(self.signer.address());
-            let signature =
-                sign_proof(&self.signer, charge.chain_id(), &challenge.id, from).await?;
+            let signature = sign_proof(
+                &self.signer,
+                charge.chain_id(),
+                &challenge.id,
+                &challenge.realm,
+            )
+            .await?;
             let source = PaymentCredential::evm_did(charge.chain_id(), &from.to_string());
 
             return Ok(PaymentCredential::with_source(

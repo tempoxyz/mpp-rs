@@ -242,7 +242,13 @@ impl TempoCharge {
                 self.challenge.to_echo(),
                 proof::proof_source(from, self.chain_id),
                 PaymentPayload::proof(
-                    proof::sign_proof(signer, self.chain_id, &self.challenge.id, from).await?,
+                    proof::sign_proof(
+                        signer,
+                        self.chain_id,
+                        &self.challenge.id,
+                        &self.challenge.realm,
+                    )
+                    .await?,
                 ),
             );
 
