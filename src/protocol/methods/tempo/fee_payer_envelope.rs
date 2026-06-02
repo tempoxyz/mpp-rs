@@ -365,6 +365,8 @@ mod tests {
             }]),
             allowed_calls: None,
             witness: None,
+            is_admin: false,
+            account: None,
         };
         let inner_sig = signer.sign_hash_sync(&auth.signature_hash()).unwrap();
         auth.into_signed(PrimitiveSignature::Secp256k1(inner_sig))
