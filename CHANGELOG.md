@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.4 (2026-06-02)
+
+## 0.10.4 (2026-06-02)
+
+### Patch Changes
+
+- Bumped Tempo dependencies to v1.8.0 for T5 compatibility. (by @Mablr, [#263](https://github.com/tempoxyz/mpp-rs/pull/263))
+- Hardened payment validation for expired challenges, body digest checks, and Tempo charge verification. (by @Mablr, [#263](https://github.com/tempoxyz/mpp-rs/pull/263))
+
+## 0.2.4 (2026-06-02)
+
 ## 0.1.3 (2026-05-18)
 
 ## 0.10.3 (2026-05-18)
