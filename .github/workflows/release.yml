@@ -31,7 +31,6 @@ jobs:
           ecosystem: rust
           conventional-commit: true
           crate-token: ${{ steps.auth.outputs.token }}
+          pypi-token: unused-for-rust
         env:
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ""
-          ACTIONS_ID_TOKEN_REQUEST_URL: ""
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
