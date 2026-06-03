@@ -16,7 +16,13 @@ format = "root"
 # members = ["sdk-core", "sdk-macros"]
 
 # Packages to ignore
-ignore = []
+ignore = [
+  "alloy-transport-mpp",
+  "axum-extractor-example",
+  "basic-example",
+  "stripe-example",
+  "ws-example",
+]
 
 # AI-assisted changelog generation
 # [ai]
