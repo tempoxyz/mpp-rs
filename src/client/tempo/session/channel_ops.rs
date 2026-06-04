@@ -15,6 +15,7 @@ use tempo_alloy::contracts::precompiles::{ITIP20ChannelReserve, TIP20_CHANNEL_RE
 use tempo_alloy::TempoNetwork;
 use tempo_primitives::transaction::{Call, TempoTransaction};
 
+use crate::client::tempo::charge::tx_builder::{build_tempo_tx, TempoTxOptions};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
@@ -132,6 +133,24 @@ pub async fn create_voucher_payload(
     })
 }
 
+/// Voucher payload for TIP-1034 precompile escrow (EIP-712 domain pinned to
+/// `TIP20_CHANNEL_RESERVE_ADDRESS`).
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload(
+    signer: &impl Signer,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let sig = sign_precompile_voucher(signer, channel_id, cumulative_amount, chain_id).await?;
+
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&sig),
+    })
+}
+
 /// Create a close payload by signing a voucher with close action.
 pub async fn create_close_payload(
     signer: &impl Signer,
@@ -148,6 +167,23 @@ pub async fn create_close_payload(
         chain_id,
     )
     .await?;
+
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&sig),
+    })
+}
+
+/// Close payload for TIP-1034 precompile escrow.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload(
+    signer: &impl Signer,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let sig = sign_precompile_voucher(signer, channel_id, cumulative_amount, chain_id).await?;
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
@@ -261,21 +297,19 @@ where
         .await
         .mpp_http("failed to get gas price")?;
 
-    let tempo_tx = crate::client::tempo::charge::tx_builder::build_tempo_tx(
-        crate::client::tempo::charge::tx_builder::TempoTxOptions {
-            calls,
-            chain_id: options.chain_id,
-            fee_token: options.currency,
-            nonce,
-            nonce_key: U256::ZERO,
-            gas_limit: 2_000_000,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
-            fee_payer: options.fee_payer,
-            valid_before: None,
-            key_authorization: signing_mode.key_authorization().cloned(),
-        },
-    );
+    let tempo_tx = build_tempo_tx(TempoTxOptions {
+        calls,
+        chain_id: options.chain_id,
+        fee_token: options.currency,
+        nonce,
+        nonce_key: U256::ZERO,
+        gas_limit: 2_000_000,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price,
+        fee_payer: options.fee_payer,
+        valid_before: None,
+        key_authorization: signing_mode.key_authorization().cloned(),
+    });
 
     let tx_bytes =
         crate::client::tempo::signing::sign_and_encode_async(tempo_tx, signer, signing_mode)
@@ -405,21 +439,19 @@ where
         .await
         .mpp_http("failed to get gas price")?;
 
-    let unsigned_tx = crate::client::tempo::charge::tx_builder::build_tempo_tx(
-        crate::client::tempo::charge::tx_builder::TempoTxOptions {
-            calls,
-            chain_id: options.chain_id,
-            fee_token: options.currency,
-            nonce,
-            nonce_key: U256::ZERO,
-            gas_limit: 2_000_000,
-            max_fee_per_gas: gas_price,
-            max_priority_fee_per_gas: gas_price,
-            fee_payer: options.fee_payer,
-            valid_before: None,
-            key_authorization: signing_mode.key_authorization().cloned(),
-        },
-    );
+    let unsigned_tx = build_tempo_tx(TempoTxOptions {
+        calls,
+        chain_id: options.chain_id,
+        fee_token: options.currency,
+        nonce,
+        nonce_key: U256::ZERO,
+        gas_limit: 2_000_000,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price,
+        fee_payer: options.fee_payer,
+        valid_before: None,
+        key_authorization: signing_mode.key_authorization().cloned(),
+    });
 
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
@@ -633,21 +665,19 @@ mod tests {
             input: alloy::primitives::Bytes::new(),
         }];
 
-        let tx: TempoTransaction = crate::client::tempo::charge::tx_builder::build_tempo_tx(
-            crate::client::tempo::charge::tx_builder::TempoTxOptions {
-                calls,
-                chain_id: 4217,
-                fee_token: Address::repeat_byte(0x22),
-                nonce: 7,
-                nonce_key: U256::ZERO,
-                gas_limit: 500_000,
-                max_fee_per_gas: 1_000_000_000,
-                max_priority_fee_per_gas: 100_000_000,
-                fee_payer: false,
-                valid_before: None,
-                key_authorization: None,
-            },
-        );
+        let tx: TempoTransaction = build_tempo_tx(TempoTxOptions {
+            calls,
+            chain_id: 4217,
+            fee_token: Address::repeat_byte(0x22),
+            nonce: 7,
+            nonce_key: U256::ZERO,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
+            key_authorization: None,
+        });
 
         let got = compute_expiring_nonce_hash(&tx, payer);
 

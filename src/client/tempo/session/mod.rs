@@ -13,8 +13,10 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, B256};
 
 use self::channel_ops::{
-    build_credential, create_close_payload, create_open_payload, create_voucher_payload,
-    resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry, OpenPayloadOptions,
+    build_credential, create_close_payload, create_open_payload, create_precompile_close_payload,
+    create_precompile_open_payload, create_precompile_voucher_payload, create_voucher_payload,
+    is_precompile_escrow, resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry,
+    OpenPayloadOptions, OpenPrecompilePayloadOptions,
 };
 use crate::client::PaymentProvider;
 use crate::error::{MppError, ResultExt};
@@ -162,6 +164,25 @@ impl TempoSessionProvider {
         format!("{:#x}:{:#x}:{:#x}", payee, currency, escrow)
     }
 
+    /// Parse `methodDetails.operator` from a precompile session request.
+    /// Missing → `Address::ZERO` (payee-only operator).
+    fn parse_operator(session_req: &SessionRequest) -> Result<Address, MppError> {
+        match session_req
+            .method_details
+            .as_ref()
+            .and_then(|v| v.get("operator"))
+        {
+            None => Ok(Address::ZERO),
+            Some(v) => {
+                let s = v.as_str().ok_or_else(|| {
+                    MppError::InvalidConfig("methodDetails.operator must be a string".to_string())
+                })?;
+                s.parse::<Address>()
+                    .map_err(|_| MppError::InvalidConfig(format!("invalid operator address: {s}")))
+            }
+        }
+    }
+
     fn expected_channel_key(
         &self,
         challenge: &PaymentChallenge,
@@ -256,14 +277,24 @@ impl TempoSessionProvider {
             entry.cumulative_amount = required_cumulative;
         }
 
-        let payload = create_voucher_payload(
-            &self.signer,
-            entry.channel_id,
-            entry.cumulative_amount,
-            entry.escrow_contract,
-            entry.chain_id,
-        )
-        .await?;
+        let payload = if is_precompile_escrow(entry.escrow_contract) {
+            create_precompile_voucher_payload(
+                &self.signer,
+                entry.channel_id,
+                entry.cumulative_amount,
+                entry.chain_id,
+            )
+            .await?
+        } else {
+            create_voucher_payload(
+                &self.signer,
+                entry.channel_id,
+                entry.cumulative_amount,
+                entry.escrow_contract,
+                entry.chain_id,
+            )
+            .await?
+        };
 
         // Update the registry
         self.channels.lock().unwrap().insert(key, entry.clone());
@@ -342,14 +373,24 @@ impl TempoSessionProvider {
 
         let payer = self.signer.address();
 
-        let payload = create_close_payload(
-            &self.signer,
-            entry.channel_id,
-            entry.cumulative_amount,
-            entry.escrow_contract,
-            entry.chain_id,
-        )
-        .await?;
+        let payload = if is_precompile_escrow(entry.escrow_contract) {
+            create_precompile_close_payload(
+                &self.signer,
+                entry.channel_id,
+                entry.cumulative_amount,
+                entry.chain_id,
+            )
+            .await?
+        } else {
+            create_close_payload(
+                &self.signer,
+                entry.channel_id,
+                entry.cumulative_amount,
+                entry.escrow_contract,
+                entry.chain_id,
+            )
+            .await?
+        };
 
         let credential = build_credential(&challenge, payload, entry.chain_id, payer);
 
@@ -442,6 +483,7 @@ impl PaymentProvider for TempoSessionProvider {
 
         let amount: u128 = session_req.parse_amount()?;
         let payer = self.signing_mode.from_address(self.signer.address());
+        let precompile = is_precompile_escrow(escrow_contract);
         let key = Self::channel_key(&payee, &currency, &escrow_contract);
 
         // Check if we already have a channel
@@ -452,14 +494,24 @@ impl PaymentProvider for TempoSessionProvider {
                 // Increment cumulative and sign a voucher
                 entry.cumulative_amount += amount;
 
-                let payload = create_voucher_payload(
-                    &self.signer,
-                    entry.channel_id,
-                    entry.cumulative_amount,
-                    escrow_contract,
-                    chain_id,
-                )
-                .await?;
+                let payload = if precompile {
+                    create_precompile_voucher_payload(
+                        &self.signer,
+                        entry.channel_id,
+                        entry.cumulative_amount,
+                        chain_id,
+                    )
+                    .await?
+                } else {
+                    create_voucher_payload(
+                        &self.signer,
+                        entry.channel_id,
+                        entry.cumulative_amount,
+                        escrow_contract,
+                        chain_id,
+                    )
+                    .await?
+                };
 
                 // Update the registry
                 self.channels.lock().unwrap().insert(key, entry.clone());
@@ -469,46 +521,49 @@ impl PaymentProvider for TempoSessionProvider {
             }
         }
 
-        // Try to recover a channel from on-chain state if suggested
-        let suggested_channel_id = session_req.channel_id();
-        if let Some(ref cid_str) = suggested_channel_id {
-            if let Ok(cid) = cid_str.parse::<B256>() {
-                let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
-                    .connect_http(self.rpc_url.clone());
+        // Try to recover a channel from on-chain state if suggested. Precompile
+        // escrow has a different read ABI (TIP-1034); recovery is legacy-only.
+        if !precompile {
+            let suggested_channel_id = session_req.channel_id();
+            if let Some(ref cid_str) = suggested_channel_id {
+                if let Ok(cid) = cid_str.parse::<B256>() {
+                    let provider = ProviderBuilder::new_with_network::<TempoNetwork>()
+                        .connect_http(self.rpc_url.clone());
 
-                let expected_authorized_signer = self.authorized_signer.unwrap_or(payer);
-                if let Some(mut recovered) = try_recover_channel(
-                    &provider,
-                    escrow_contract,
-                    cid,
-                    chain_id,
-                    payer,
-                    payee,
-                    currency,
-                    expected_authorized_signer,
-                )
-                .await
-                {
-                    // Start from recovered settled amount + request amount
-                    recovered.cumulative_amount += amount;
-
-                    let payload = create_voucher_payload(
-                        &self.signer,
-                        recovered.channel_id,
-                        recovered.cumulative_amount,
+                    let expected_authorized_signer = self.authorized_signer.unwrap_or(payer);
+                    if let Some(mut recovered) = try_recover_channel(
+                        &provider,
                         escrow_contract,
+                        cid,
                         chain_id,
+                        payer,
+                        payee,
+                        currency,
+                        expected_authorized_signer,
                     )
-                    .await?;
+                    .await
+                    {
+                        // Start from recovered settled amount + request amount
+                        recovered.cumulative_amount += amount;
 
-                    self.channel_id_to_key
-                        .lock()
-                        .unwrap()
-                        .insert(recovered.channel_id.to_string(), key.clone());
-                    self.channels.lock().unwrap().insert(key, recovered.clone());
-                    self.notify_update(&recovered);
+                        let payload = create_voucher_payload(
+                            &self.signer,
+                            recovered.channel_id,
+                            recovered.cumulative_amount,
+                            escrow_contract,
+                            chain_id,
+                        )
+                        .await?;
 
-                    return Ok(build_credential(challenge, payload, chain_id, payer));
+                        self.channel_id_to_key
+                            .lock()
+                            .unwrap()
+                            .insert(recovered.channel_id.to_string(), key.clone());
+                        self.channels.lock().unwrap().insert(key, recovered.clone());
+                        self.notify_update(&recovered);
+
+                        return Ok(build_credential(challenge, payload, chain_id, payer));
+                    }
                 }
             }
         }
@@ -519,23 +574,43 @@ impl PaymentProvider for TempoSessionProvider {
         let provider =
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
 
-        let (entry, payload) = create_open_payload(
-            &provider,
-            &self.signer,
-            Some(&self.signing_mode),
-            payer,
-            OpenPayloadOptions {
-                authorized_signer: self.authorized_signer,
-                escrow_contract,
-                payee,
-                currency,
-                deposit,
-                initial_amount: amount,
-                chain_id,
-                fee_payer: session_req.fee_payer(),
-            },
-        )
-        .await?;
+        let (entry, payload) = if precompile {
+            create_precompile_open_payload(
+                &provider,
+                &self.signer,
+                Some(&self.signing_mode),
+                payer,
+                OpenPrecompilePayloadOptions {
+                    operator: Self::parse_operator(&session_req)?,
+                    authorized_signer: self.authorized_signer,
+                    payee,
+                    currency,
+                    deposit,
+                    initial_amount: amount,
+                    chain_id,
+                    fee_payer: session_req.fee_payer(),
+                },
+            )
+            .await?
+        } else {
+            create_open_payload(
+                &provider,
+                &self.signer,
+                Some(&self.signing_mode),
+                payer,
+                OpenPayloadOptions {
+                    authorized_signer: self.authorized_signer,
+                    escrow_contract,
+                    payee,
+                    currency,
+                    deposit,
+                    initial_amount: amount,
+                    chain_id,
+                    fee_payer: session_req.fee_payer(),
+                },
+            )
+            .await?
+        };
 
         self.channel_id_to_key
             .lock()
@@ -1205,5 +1280,130 @@ mod tests {
             5000,
             "cumulative should only count the opened channel"
         );
+    }
+
+    #[test]
+    fn parse_operator_handles_missing_present_and_malformed() {
+        // Missing methodDetails → ZERO.
+        let req = SessionRequest::default();
+        assert_eq!(
+            TempoSessionProvider::parse_operator(&req).unwrap(),
+            Address::ZERO
+        );
+
+        // Present → parsed.
+        let op = Address::repeat_byte(0x42);
+        let req = SessionRequest {
+            method_details: Some(serde_json::json!({ "operator": op.to_string() })),
+            ..Default::default()
+        };
+        assert_eq!(TempoSessionProvider::parse_operator(&req).unwrap(), op);
+
+        // Malformed string and non-string → error.
+        for v in [serde_json::json!("not-an-address"), serde_json::json!(42)] {
+            let req = SessionRequest {
+                method_details: Some(serde_json::json!({ "operator": v })),
+                ..Default::default()
+            };
+            assert!(TempoSessionProvider::parse_operator(&req).is_err());
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn pay_branches_to_precompile_voucher_for_existing_precompile_channel() {
+        use alloy::signers::local::PrivateKeySigner;
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::channel_ops::ChannelEntry;
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+        use crate::protocol::methods::tempo::precompile_voucher::{
+            compute_precompile_channel_id, sign_precompile_voucher,
+        };
+
+        let signer = PrivateKeySigner::random();
+        let payer = signer.address();
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let operator = Address::repeat_byte(0x33);
+        let salt = B256::repeat_byte(0xab);
+        let authorized_signer = payer;
+        let chain_id = 42431u64;
+        let expiring_nonce_hash = B256::repeat_byte(0xcd);
+
+        let channel_id = compute_precompile_channel_id(
+            payer,
+            payee,
+            operator,
+            currency,
+            salt,
+            authorized_signer,
+            expiring_nonce_hash,
+            chain_id,
+        );
+
+        let provider =
+            TempoSessionProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
+
+        // Pre-seed an open precompile channel under the registry key.
+        let key =
+            TempoSessionProvider::channel_key(&payee, &currency, &TIP20_CHANNEL_RESERVE_ADDRESS);
+        provider.channels.lock().unwrap().insert(
+            key,
+            ChannelEntry {
+                channel_id,
+                salt,
+                cumulative_amount: 1_000,
+                escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+                chain_id,
+                opened: true,
+            },
+        );
+
+        let req = SessionRequest {
+            amount: "500".to_string(),
+            currency: currency.to_string(),
+            recipient: Some(payee.to_string()),
+            method_details: Some(serde_json::json!({
+                "chainId": chain_id,
+                "escrowContract": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+                "operator": operator.to_string(),
+            })),
+            ..Default::default()
+        };
+        let challenge = PaymentChallenge::new(
+            "test-challenge",
+            "rpc.example.com",
+            crate::protocol::methods::tempo::METHOD_NAME,
+            crate::protocol::methods::tempo::INTENT_SESSION,
+            Base64UrlJson::from_typed(&req).unwrap(),
+        );
+
+        let credential = provider.pay(&challenge).await.expect("pay succeeds");
+
+        // Expected: precompile EIP-712 voucher signed over cumulative 1500.
+        let expected_sig = sign_precompile_voucher(&signer, channel_id, 1_500, chain_id)
+            .await
+            .unwrap();
+        let expected_hex = alloy::hex::encode_prefixed(&expected_sig);
+
+        match credential
+            .payload_as::<crate::protocol::methods::tempo::session::SessionCredentialPayload>()
+            .unwrap()
+        {
+            crate::protocol::methods::tempo::session::SessionCredentialPayload::Voucher {
+                signature,
+                cumulative_amount,
+                channel_id: cid,
+            } => {
+                assert_eq!(cumulative_amount, "1500");
+                assert_eq!(cid, channel_id.to_string());
+                assert_eq!(
+                    signature, expected_hex,
+                    "voucher must use precompile EIP-712 domain"
+                );
+            }
+            other => panic!("expected voucher payload, got {other:?}"),
+        }
     }
 }
