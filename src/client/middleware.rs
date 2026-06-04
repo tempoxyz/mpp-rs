@@ -14,7 +14,7 @@ use crate::client::challenge_selection::{
 };
 use crate::client::events::{
     ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
-    CredentialCreatedContext, PaymentFailedContext, PaymentResponseContext,
+    CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
 use crate::client::provider::PaymentProvider;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
@@ -166,6 +166,7 @@ where
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: None,
                         error: err.to_string(),
+                        reason: None,
                     }))
                     .await;
                 return Err(reqwest_middleware::Error::Middleware(err));
@@ -184,6 +185,7 @@ where
                 .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                     challenge: None,
                     error: "402 response missing WWW-Authenticate header".to_string(),
+                    reason: None,
                 }))
                 .await;
             return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
@@ -205,10 +207,12 @@ where
                 Err(ChallengeSelectionError::Expired(challenge)) => {
                     let mpp_error = expired_payment_error(&challenge);
                     let error = mpp_error.to_string();
+                    let expires = challenge.expires.clone();
                     self.events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(*challenge),
                             error,
+                            reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
                     return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
@@ -221,6 +225,7 @@ where
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: None,
                             error: err.to_string(),
+                            reason: None,
                         }))
                         .await;
                     return Err(reqwest_middleware::Error::Middleware(err));
@@ -245,6 +250,7 @@ where
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),
                             error: err.to_string(),
+                            reason: None,
                         }))
                         .await;
                     return Err(reqwest_middleware::Error::Middleware(err));
@@ -267,6 +273,7 @@ where
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),
                             error: err.to_string(),
+                            reason: None,
                         }))
                         .await;
                     return Err(reqwest_middleware::Error::Middleware(err));
@@ -281,6 +288,7 @@ where
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
                         error: err.to_string(),
+                        reason: None,
                     }))
                     .await;
                 return Err(reqwest_middleware::Error::Middleware(err));
@@ -307,6 +315,7 @@ where
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),
                             error: format!("payment retry returned unsuccessful status: {status}"),
+                            reason: None,
                         }))
                         .await;
                 }
@@ -317,6 +326,7 @@ where
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
                         error: err.to_string(),
+                        reason: None,
                     }))
                     .await;
                 Err(err)
@@ -751,6 +761,8 @@ mod tests {
             let events = ClientEvents::default();
             let challenge_count = Arc::new(AtomicU32::new(0));
             let failed_count = Arc::new(AtomicU32::new(0));
+            let captured_reason: Arc<std::sync::Mutex<Option<PaymentFailureReason>>> =
+                Arc::new(Default::default());
 
             let _challenge_sub = events.on_challenge_received({
                 let challenge_count = challenge_count.clone();
@@ -761,8 +773,10 @@ mod tests {
             });
             let _failed_sub = events.on_payment_failed({
                 let failed_count = failed_count.clone();
+                let captured_reason = captured_reason.clone();
                 move |ctx| {
                     failed_count.fetch_add(1, Ordering::SeqCst);
+                    *captured_reason.lock().unwrap() = ctx.reason.clone();
                     async move {
                         assert!(ctx.challenge.is_some());
                         assert!(ctx.error.contains("Payment expired"));
@@ -787,6 +801,12 @@ mod tests {
             assert_eq!(provider.call_count(), 0);
             assert_eq!(challenge_count.load(Ordering::SeqCst), 0);
             assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                captured_reason.lock().unwrap().clone(),
+                Some(PaymentFailureReason::PreSigningExpired {
+                    expires: Some("2020-01-01T00:00:00Z".to_string()),
+                }),
+            );
         }
 
         /// Advertises a known header value so tests can observe injection.

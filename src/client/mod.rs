@@ -47,7 +47,7 @@ pub use accept_payment_policy::AcceptPaymentPolicy;
 #[cfg(feature = "client")]
 pub use events::{
     ChallengeReceivedContext, ClientEvent, ClientEventKind, ClientEventSubscription, ClientEvents,
-    CredentialCreatedContext, PaymentFailedContext, PaymentResponseContext,
+    CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
 
 #[cfg(feature = "client")]

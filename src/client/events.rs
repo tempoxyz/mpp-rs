@@ -97,6 +97,15 @@ pub struct PaymentResponseContext {
     pub status: StatusCode,
 }
 
+/// Structured reason for a `payment.failed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PaymentFailureReason {
+    /// Client refused before signing because the challenge was expired or had
+    /// an unparseable `expires`. `provider.pay()` was not called.
+    PreSigningExpired { expires: Option<String> },
+}
+
 /// Context for `payment.failed`.
 #[derive(Debug, Clone)]
 pub struct PaymentFailedContext {
@@ -104,6 +113,8 @@ pub struct PaymentFailedContext {
     pub challenge: Option<PaymentChallenge>,
     /// Human-readable failure.
     pub error: String,
+    /// Structured reason, when classified.
+    pub reason: Option<PaymentFailureReason>,
 }
 
 /// Client payment event payload.

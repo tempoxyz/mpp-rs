@@ -9,7 +9,7 @@ use super::accept_payment_policy::AcceptPaymentPolicy;
 use super::error::HttpError;
 use super::events::{
     ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
-    PaymentFailedContext, PaymentResponseContext,
+    PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
 use super::provider::PaymentProvider;
 use crate::client::challenge_selection::{
@@ -138,6 +138,7 @@ impl PaymentExt for RequestBuilder {
                 .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                     challenge: None,
                     error: HttpError::MissingChallenge.to_string(),
+                    reason: None,
                 }))
                 .await;
             return Err(HttpError::MissingChallenge);
@@ -156,10 +157,12 @@ impl PaymentExt for RequestBuilder {
                 Err(ChallengeSelectionError::Expired(challenge)) => {
                     let err = HttpError::Payment(expired_payment_error(&challenge));
                     let error = err.to_string();
+                    let expires = challenge.expires.clone();
                     events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(*challenge),
                             error,
+                            reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
                     return Err(err);
@@ -170,6 +173,7 @@ impl PaymentExt for RequestBuilder {
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: None,
                             error: err.to_string(),
+                            reason: None,
                         }))
                         .await;
                     return Err(err);
@@ -193,6 +197,7 @@ impl PaymentExt for RequestBuilder {
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),
                             error: http_err.to_string(),
+                            reason: None,
                         }))
                         .await;
                     return Err(http_err);
@@ -215,6 +220,7 @@ impl PaymentExt for RequestBuilder {
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
                         error: http_err.to_string(),
+                        reason: None,
                     }))
                     .await;
                 return Err(http_err);
@@ -233,6 +239,7 @@ impl PaymentExt for RequestBuilder {
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
                         error: http_err.to_string(),
+                        reason: None,
                     }))
                     .await;
                 return Err(http_err);
@@ -253,6 +260,7 @@ impl PaymentExt for RequestBuilder {
                 .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                     challenge: Some(challenge),
                     error: format!("payment retry returned unsuccessful status: {status}"),
+                    reason: None,
                 }))
                 .await;
         }
@@ -719,6 +727,65 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(err, HttpError::Payment(_)));
+        }
+
+        #[tokio::test]
+        async fn test_fetch_rejects_expired_challenge_with_pre_signing_reason() {
+            let www_auth = challenge_header_with_expires(
+                "exp",
+                "tempo",
+                "charge",
+                Some("2020-01-01T00:00:00Z"),
+            );
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                        )
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let events = ClientEvents::default();
+            let failed_count = Arc::new(AtomicU32::new(0));
+            let captured_reason: Arc<std::sync::Mutex<Option<PaymentFailureReason>>> =
+                Arc::new(Default::default());
+
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                let captured_reason = captured_reason.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    *captured_reason.lock().unwrap() = ctx.reason.clone();
+                    async {}
+                }
+            });
+
+            let err = reqwest::Client::new()
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                HttpError::Payment(MppError::PaymentExpired(_))
+            ));
+            assert_eq!(provider.call_count(), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                captured_reason.lock().unwrap().clone(),
+                Some(PaymentFailureReason::PreSigningExpired {
+                    expires: Some("2020-01-01T00:00:00Z".to_string()),
+                }),
+            );
         }
 
         /// Provider that only supports specific method/intent pairs.
