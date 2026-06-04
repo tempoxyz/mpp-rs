@@ -62,6 +62,8 @@ impl FeePayerEnvelope78 {
     /// The provided `tx` is expected to be in the “fee payer signing shape”:
     /// - `fee_token == None` (server chooses fee token)
     /// - `fee_payer_signature.is_some()` placeholder (so `signature_hash()` skips fee_token)
+    ///
+    /// Any `tx.access_list` is dropped; see [`Self::to_recoverable_signed`].
     pub fn from_signing_tx(
         tx: tempo_primitives::transaction::TempoTransaction,
         sender: Address,
@@ -73,7 +75,7 @@ impl FeePayerEnvelope78 {
             max_fee_per_gas: tx.max_fee_per_gas,
             gas_limit: tx.gas_limit,
             calls: tx.calls,
-            access_list: tx.access_list,
+            access_list: AccessList::default(),
             nonce_key: tx.nonce_key,
             nonce: tx.nonce,
             valid_before: tx.valid_before.map(|v| v.get()),
@@ -118,6 +120,10 @@ impl FeePayerEnvelope78 {
     ///
     /// This sets the `fee_payer_signature` placeholder so Tempo's signing hash
     /// skips `fee_token` (the user did not commit to a particular fee token).
+    ///
+    /// `access_list` is always reconstructed empty: honest clients sign over
+    /// the empty shape, so a tampered wire access list is structurally
+    /// stripped and a malicious access-list-bound signature fails recovery.
     #[must_use]
     pub fn to_recoverable_signed(&self) -> tempo_primitives::AASigned {
         let tx = tempo_primitives::TempoTransaction {
@@ -129,7 +135,7 @@ impl FeePayerEnvelope78 {
             max_priority_fee_per_gas: self.max_priority_fee_per_gas,
             fee_token: self.fee_token,
             calls: self.calls.clone(),
-            access_list: self.access_list.clone(),
+            access_list: AccessList::default(),
             fee_payer_signature: Some(alloy::primitives::Signature::new(
                 U256::ZERO,
                 U256::ZERO,

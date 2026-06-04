@@ -1004,11 +1004,8 @@ where
             ));
         }
 
-        if !tx.access_list.is_empty() {
-            return Err(VerificationError::new(
-                "Fee payer transaction must not include an access list",
-            ));
-        }
+        // Stripped by `to_recoverable_signed`; guard against regression.
+        debug_assert!(tx.access_list.is_empty());
 
         if tx.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
             return Err(VerificationError::new(
@@ -2286,9 +2283,10 @@ mod tests {
         );
     }
 
-    /// cosign_fee_payer_transaction rejects txs with non-empty access lists.
+    /// A client that signs over a non-empty access list fails recovery
+    /// (sponsor strips before ecrecover → recovered ≠ envelope.sender).
     #[test]
-    fn test_cosign_rejects_non_empty_access_list() {
+    fn test_cosign_rejects_access_list_signed_by_client() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
@@ -2316,10 +2314,10 @@ mod tests {
             fee_token,
         );
 
-        let err = result.expect_err("should reject access list");
+        let err = result.expect_err("malicious access-list signature must not cosign");
         assert!(
-            err.to_string().contains("access list"),
-            "error should mention access list, got: {err}"
+            err.to_string().to_lowercase().contains("sender mismatch"),
+            "expected sender mismatch, got: {err}"
         );
     }
 
@@ -2808,5 +2806,76 @@ mod tests {
             moderato.max_validity_window_seconds,
             tempo_mainnet.max_validity_window_seconds
         );
+    }
+
+    /// Sponsor MUST strip an attacker-injected wire access list: an honest
+    /// client signature over an empty-access-list tx is still cosigned, and
+    /// the broadcast 0x76 carries an empty access list.
+    #[test]
+    fn test_cosign_strips_tampered_access_list() {
+        use alloy::eips::eip2930::{AccessList, AccessListItem};
+        use alloy::eips::Decodable2718;
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+
+        use crate::protocol::methods::tempo::FeePayerEnvelope78;
+
+        let client_signer = PrivateKeySigner::random();
+        let fee_payer_signer = PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        // Honest tx with empty access list, signed by the client.
+        let tx = make_fee_payer_tx(60);
+        let signature: tempo_primitives::transaction::TempoSignature = client_signer
+            .sign_hash_sync(&tx.signature_hash())
+            .unwrap()
+            .into();
+
+        // Build envelope directly (from_signing_tx would strip) and inject
+        // an attacker-controlled access list into the wire field.
+        let envelope = FeePayerEnvelope78 {
+            chain_id: tx.chain_id,
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+            max_fee_per_gas: tx.max_fee_per_gas,
+            gas_limit: tx.gas_limit,
+            calls: tx.calls.clone(),
+            access_list: AccessList(vec![AccessListItem {
+                address: Address::repeat_byte(0xaa),
+                storage_keys: vec![B256::ZERO],
+            }]),
+            nonce_key: tx.nonce_key,
+            nonce: tx.nonce,
+            valid_before: tx.valid_before.map(|v| v.get()),
+            valid_after: tx.valid_after.map(|v| v.get()),
+            fee_token: tx.fee_token,
+            sender: client_signer.address(),
+            tempo_authorization_list: tx.tempo_authorization_list.clone(),
+            key_authorization: tx.key_authorization.clone(),
+            signature,
+        };
+        let envelope_bytes = envelope.encoded_envelope();
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let cosigned = method
+            .cosign_fee_payer_transaction(
+                &envelope_bytes,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("sponsor must cosign tampered envelope");
+
+        let signed = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        assert!(
+            signed.tx().access_list.is_empty(),
+            "broadcast tx must have empty access list"
+        );
+        assert_eq!(signed.tx().fee_token, Some(fee_token));
     }
 }
