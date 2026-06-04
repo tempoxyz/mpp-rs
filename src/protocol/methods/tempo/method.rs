@@ -915,7 +915,7 @@ where
         // receipt. The Tempo node holds the connection open until the transaction
         // is mined/pre-confirmed and returns the full receipt, avoiding the
         // client-side polling loop of send_raw_transaction + get_receipt.
-        let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&final_tx_bytes));
+        let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
         let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
             .provider
             .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
