@@ -97,13 +97,42 @@ pub struct PaymentResponseContext {
     pub status: StatusCode,
 }
 
+/// Structured reason for a `payment.failed` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PaymentFailureReason {
+    /// Client refused before signing because the challenge was expired or had
+    /// an unparseable `expires`. `provider.pay()` was not called.
+    PreSigningExpired { expires: Option<String> },
+}
+
 /// Context for `payment.failed`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PaymentFailedContext {
     /// Selected challenge, when one was available.
     pub challenge: Option<PaymentChallenge>,
     /// Human-readable failure.
     pub error: String,
+    /// Structured reason, when classified.
+    pub reason: Option<PaymentFailureReason>,
+}
+
+impl PaymentFailedContext {
+    /// Create a context with no structured reason.
+    pub fn new(challenge: Option<PaymentChallenge>, error: impl Into<String>) -> Self {
+        Self {
+            challenge,
+            error: error.into(),
+            reason: None,
+        }
+    }
+
+    /// Attach a structured failure reason.
+    pub fn with_reason(mut self, reason: PaymentFailureReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
 }
 
 /// Client payment event payload.
@@ -472,5 +501,19 @@ mod tests {
 
         assert!(credential.is_some());
         assert_eq!(*calls.lock().unwrap(), vec!["first", "any", "typed"]);
+    }
+
+    #[test]
+    fn test_payment_failed_context_constructors() {
+        let ctx = PaymentFailedContext::new(None, "boom");
+        assert_eq!(ctx.error, "boom");
+        assert!(ctx.challenge.is_none());
+        assert_eq!(ctx.reason, None);
+
+        let ctx = ctx.with_reason(PaymentFailureReason::PreSigningExpired { expires: None });
+        assert_eq!(
+            ctx.reason,
+            Some(PaymentFailureReason::PreSigningExpired { expires: None })
+        );
     }
 }
