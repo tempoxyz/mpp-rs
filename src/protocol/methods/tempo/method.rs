@@ -607,18 +607,6 @@ where
 
         let replay_key = format!("mpp:charge:{:#x}", hash);
 
-        if let Some(store) = &self.store {
-            let seen = store
-                .get(&replay_key)
-                .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
-                return Err(VerificationError::new(
-                    "Transaction hash has already been used.",
-                ));
-            }
-        }
-
         let receipt = self
             .provider
             .get_transaction_receipt(hash)
@@ -653,10 +641,15 @@ where
         }
 
         if let Some(store) = &self.store {
-            store
-                .put(&replay_key, serde_json::Value::Bool(true))
+            let claimed = store
+                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+            if !claimed {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
         }
 
         Ok(Receipt::success(METHOD_NAME, tx_hash))
@@ -890,25 +883,20 @@ where
             charge.fee_payer(),
         )?;
 
-        // Pre-broadcast dedup: hash the final tx bytes (after co-signing/validation)
-        // and check/mark in store before broadcasting. Uses a separate namespace
-        // from the post-broadcast hash-based dedup in verify_hash.
+        // Pre-broadcast dedup of the final tx bytes. Separate namespace from
+        // the post-broadcast hash dedup in verify_hash.
         if let Some(store) = &self.store {
             let tx_hash_pre = keccak256(&final_tx_bytes);
             let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
-            let seen = store
-                .get(&dedup_key)
+            let claimed = store
+                .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
+                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+            if !claimed {
                 return Err(VerificationError::new(
                     "Transaction has already been submitted.",
                 ));
             }
-            store
-                .put(&dedup_key, serde_json::Value::Bool(true))
-                .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
         }
 
         // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
@@ -935,13 +923,18 @@ where
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
 
-        // Record the on-chain tx hash for hash-based replay protection
+        // Atomically claim the on-chain tx hash for replay protection.
         if let Some(store) = &self.store {
             let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
-            store
-                .put(&replay_key, serde_json::Value::Bool(true))
+            let claimed = store
+                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+            if !claimed {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
         }
 
         Ok(receipt.transaction_hash())
@@ -2489,6 +2482,41 @@ mod tests {
         assert_eq!(
             key1, key3,
             "0x-prefixed and unprefixed should produce same key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_replay_rejected_via_put_if_absent() {
+        use crate::store::{MemoryStore, Store};
+        use std::sync::Arc;
+
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let key = format!("mpp:charge:{}", hash.parse::<B256>().unwrap());
+
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let key = key.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                store
+                    .put_if_absent(&key, serde_json::Value::Bool(true))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut claims = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                claims += 1;
+            }
+        }
+        assert_eq!(
+            claims, 1,
+            "exactly one concurrent verifier may claim the tx hash"
         );
     }
 
