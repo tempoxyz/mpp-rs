@@ -569,7 +569,7 @@ where
     ///
     /// When set, each verified transaction hash is recorded and subsequent
     /// attempts to replay the same hash are rejected. Zero-amount proof
-    /// credentials are likewise made single-use per challenge.
+    /// credentials are likewise made single-use per credential fingerprint.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
         self
@@ -1212,21 +1212,6 @@ where
                     ));
                 }
 
-                // Replay protection: a proof challenge is single-use. The
-                // challenge id is HMAC-unique per issuance and encodes the realm.
-                let replay_key = format!("mpp:proof:{}", credential.challenge.id);
-                if let Some(store) = &this.store {
-                    let seen = store
-                        .get(&replay_key)
-                        .await
-                        .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-                    if seen.is_some() {
-                        return Err(VerificationError::new(
-                            "Proof credential has already been used.",
-                        ));
-                    }
-                }
-
                 let source = credential.source.as_deref().ok_or_else(|| {
                     VerificationError::new("Proof credential must include a source.")
                 })?;
@@ -1280,13 +1265,24 @@ where
                     }
                 }
 
+                // Single-use: reserve a key fingerprinting the credential
+                // (challenge id + source + signature) atomically after verifying.
                 if let Some(store) = &this.store {
-                    store
-                        .put(&replay_key, serde_json::Value::Bool(true))
+                    let fingerprint = keccak256(
+                        format!("{}|{}|{}", credential.challenge.id, source, sig_hex).as_bytes(),
+                    );
+                    let replay_key = format!("mpp:proof:{:x}", fingerprint);
+                    let reserved = store
+                        .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                         .await
                         .map_err(|e| {
                             VerificationError::new(format!("Failed to record proof: {e}"))
                         })?;
+                    if !reserved {
+                        return Err(VerificationError::new(
+                            "Proof credential has already been used.",
+                        ));
+                    }
                 }
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
@@ -2549,7 +2545,7 @@ mod tests {
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
-            crate::protocol::core::PaymentPayload::proof(signature),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
         );
 
         let provider =
@@ -2561,14 +2557,111 @@ mod tests {
         // verification is purely cryptographic.
         method.cached_chain_id.set(42431).unwrap();
 
-        // First submission succeeds and records the proof under its challenge id.
+        // First submission succeeds and records the proof fingerprint.
         let receipt = method.verify(&credential, &request).await.unwrap();
         assert_eq!(receipt.reference, challenge.id);
-        let key = format!("mpp:proof:{}", challenge.id);
+        let source = proof::proof_source(signer.address(), 42431);
+        let fingerprint =
+            keccak256(format!("{}|{}|{}", challenge.id, source, signature).as_bytes());
+        let key = format!("mpp:proof:{:x}", fingerprint);
         assert!(store.get(&key).await.unwrap().is_some());
 
         // Replaying the identical credential is rejected.
         let err = method.verify(&credential, &request).await.unwrap_err();
+        assert!(err.to_string().contains("already been used"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_proof_submissions_only_one_succeeds() {
+        use crate::store::{MemoryStore, Store, StoreError};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::time::Duration;
+
+        // Delays the claim so both verifiers reach `put_if_absent` together.
+        struct SlowStore {
+            inner: MemoryStore,
+            delay: Duration,
+        }
+        impl Store for SlowStore {
+            fn get(
+                &self,
+                key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                self.inner.get(key)
+            }
+            fn put(
+                &self,
+                key: &str,
+                value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                self.inner.put(key, value)
+            }
+            fn delete(
+                &self,
+                key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                self.inner.delete(key)
+            }
+            fn put_if_absent(
+                &self,
+                key: &str,
+                value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+                let key = key.to_string();
+                let delay = self.delay;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    self.inner.put_if_absent(&key, value).await
+                })
+            }
+        }
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(SlowStore {
+            inner: MemoryStore::new(),
+            delay: Duration::from_millis(50),
+        });
+        let method = ChargeMethod::new(provider).with_store(store);
+        method.cached_chain_id.set(42431).unwrap();
+
+        let m1 = method.clone();
+        let c1 = credential.clone();
+        let r1 = request.clone();
+        let t1 = tokio::spawn(async move { m1.verify(&c1, &r1).await });
+        let m2 = method.clone();
+        let c2 = credential.clone();
+        let r2 = request.clone();
+        let t2 = tokio::spawn(async move { m2.verify(&c2, &r2).await });
+
+        let res1 = t1.await.unwrap();
+        let res2 = t2.await.unwrap();
+
+        let successes = [res1.is_ok(), res2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent proof submission must succeed"
+        );
+        let err = res1.err().or(res2.err()).unwrap();
         assert!(err.to_string().contains("already been used"));
     }
 
