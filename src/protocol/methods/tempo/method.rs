@@ -39,10 +39,13 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
-use crate::tempo::{attribution, MODERATO_CHAIN_ID};
+use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
-use super::{proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
+use super::{
+    network::TempoNetwork as KnownTempoNetwork, proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE,
+    METHOD_NAME,
+};
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
 const MAX_FEE_PER_GAS_DEFAULT: u128 = 100_000_000_000;
@@ -484,6 +487,7 @@ pub struct FeePayerPolicy {
     pub max_priority_fee_per_gas: u128,
     pub max_total_fee: u128,
     pub max_validity_window_seconds: u64,
+    pub allowed_fee_tokens: Vec<Address>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -493,47 +497,61 @@ pub struct FeePayerPolicyOverride {
     pub max_priority_fee_per_gas: Option<u128>,
     pub max_total_fee: Option<u128>,
     pub max_validity_window_seconds: Option<u64>,
+    pub allowed_fee_tokens: Option<Vec<Address>>,
 }
 
 impl Default for FeePayerPolicy {
     fn default() -> FeePayerPolicy {
-        FeePayerPolicy {
-            max_gas: MAX_FEE_PAYER_GAS_LIMIT,
-            max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
-            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
-            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
-            max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
-        }
+        Self::get_by_chain_id(CHAIN_ID)
     }
 }
 
 impl FeePayerPolicy {
     /// Merge overrides onto the per-chain default.
     pub fn resolve(chain_id: u64, overrides: Option<&FeePayerPolicyOverride>) -> Self {
-        let base = Self::get_by_chain_id(chain_id);
-        let Some(o) = overrides else { return base };
-        Self {
-            max_gas: o.max_gas.unwrap_or(base.max_gas),
-            max_fee_per_gas: o.max_fee_per_gas.unwrap_or(base.max_fee_per_gas),
-            max_priority_fee_per_gas: o
+        let mut policy = Self::get_by_chain_id(chain_id);
+        if let Some(o) = overrides {
+            policy.max_gas = o.max_gas.unwrap_or(policy.max_gas);
+            policy.max_fee_per_gas = o.max_fee_per_gas.unwrap_or(policy.max_fee_per_gas);
+            policy.max_priority_fee_per_gas = o
                 .max_priority_fee_per_gas
-                .unwrap_or(base.max_priority_fee_per_gas),
-            max_total_fee: o.max_total_fee.unwrap_or(base.max_total_fee),
-            max_validity_window_seconds: o
+                .unwrap_or(policy.max_priority_fee_per_gas);
+            policy.max_total_fee = o.max_total_fee.unwrap_or(policy.max_total_fee);
+            policy.max_validity_window_seconds = o
                 .max_validity_window_seconds
-                .unwrap_or(base.max_validity_window_seconds),
+                .unwrap_or(policy.max_validity_window_seconds);
+            if let Some(allowed_fee_tokens) = &o.allowed_fee_tokens {
+                policy.allowed_fee_tokens = allowed_fee_tokens.clone();
+            }
         }
+        policy
+    }
+
+    pub fn allows_fee_token(&self, fee_token: Address) -> bool {
+        self.allowed_fee_tokens
+            .iter()
+            .any(|allowed| *allowed == fee_token)
     }
 
     fn get_by_chain_id(chain_id: u64) -> Self {
-        match chain_id {
+        let network =
+            KnownTempoNetwork::from_chain_id(chain_id).unwrap_or(KnownTempoNetwork::Mainnet);
+        let mut policy = Self {
+            max_gas: MAX_FEE_PAYER_GAS_LIMIT,
+            max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
+            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
+            max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
+            allowed_fee_tokens: vec![network
+                .default_currency()
+                .parse()
+                .expect("default Tempo fee token is a valid address")],
+        };
+        if network == KnownTempoNetwork::Moderato {
             // Moderato regularly needs a higher priority fee than mainnet.
-            MODERATO_CHAIN_ID => Self {
-                max_priority_fee_per_gas: 50_000_000_000,
-                ..Self::default()
-            },
-            _ => Self::default(),
+            policy.max_priority_fee_per_gas = 50_000_000_000;
         }
+        policy
     }
 }
 
@@ -559,7 +577,8 @@ where
     ///
     /// Each unset field falls back to the per-chain default. Use to raise or
     /// lower `max_gas`, `max_fee_per_gas`, `max_priority_fee_per_gas`,
-    /// `max_total_fee`, or `max_validity_window_seconds` per server.
+    /// `max_total_fee`, or `max_validity_window_seconds` per server, or to
+    /// replace the sponsor fee-token allowlist.
     pub fn with_fee_payer_policy_override(mut self, overrides: FeePayerPolicyOverride) -> Self {
         self.fee_payer_policy_override = Some(overrides);
         self
@@ -1035,6 +1054,13 @@ where
         };
 
         let policy = FeePayerPolicy::resolve(tx.chain_id, self.fee_payer_policy_override.as_ref());
+
+        if !policy.allows_fee_token(fee_token) {
+            return Err(VerificationError::new(format!(
+                "Fee token {:#x} is not allowed by fee payer policy",
+                fee_token
+            )));
+        }
 
         if tx.max_fee_per_gas > policy.max_fee_per_gas {
             return Err(VerificationError::new(format!(
@@ -1768,8 +1794,9 @@ mod tests {
 
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let tx = make_fee_payer_tx(60);
@@ -2222,8 +2249,9 @@ mod tests {
     fn test_cosign_rejects_wrong_nonce_key() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2255,8 +2283,9 @@ mod tests {
     fn test_cosign_rejects_missing_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2289,8 +2318,9 @@ mod tests {
     fn test_cosign_rejects_access_list_signed_by_client() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2326,8 +2356,9 @@ mod tests {
     fn test_cosign_rejects_expired_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         // Build a tx with valid_before in the past
@@ -2365,8 +2396,9 @@ mod tests {
     #[test]
     fn test_cosign_rejects_empty_input() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let provider =
@@ -2392,8 +2424,9 @@ mod tests {
     #[test]
     fn test_cosign_rejects_wrong_type_byte() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let provider =
@@ -2599,8 +2632,9 @@ mod tests {
         Address,
     ) {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -2747,6 +2781,10 @@ mod tests {
             max_priority_fee_per_gas: Some(2_000_000_000),
             max_total_fee: Some(40_000_000_000_000_000),
             max_validity_window_seconds: Some(600),
+            allowed_fee_tokens: Some(vec![KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()]),
         };
         let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
@@ -2806,6 +2844,61 @@ mod tests {
             moderato.max_validity_window_seconds,
             tempo_mainnet.max_validity_window_seconds
         );
+        assert!(tempo_mainnet.allows_fee_token(
+            KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(!tempo_mainnet.allows_fee_token(
+            KnownTempoNetwork::Moderato
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(moderato.allows_fee_token(
+            KnownTempoNetwork::Moderato
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(!moderato.allows_fee_token(
+            KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_cosign_rejects_non_allowlisted_fee_token() {
+        let overrides = FeePayerPolicyOverride {
+            allowed_fee_tokens: Some(vec![KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()]),
+            ..Default::default()
+        };
+        let (method, client_signer, _) = make_cosign_method(Some(overrides));
+
+        let tx = make_fee_payer_tx(60);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                KnownTempoNetwork::Moderato
+                    .default_currency()
+                    .parse::<Address>()
+                    .unwrap(),
+            )
+            .expect_err("cosign should reject non-allowlisted fee token");
+        assert!(
+            err.to_string()
+                .contains("is not allowed by fee payer policy"),
+            "got: {err}"
+        );
     }
 
     /// Sponsor MUST strip an attacker-injected wire access list: an honest
@@ -2823,8 +2916,9 @@ mod tests {
 
         let client_signer = PrivateKeySigner::random();
         let fee_payer_signer = PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         // Honest tx with empty access list, signed by the client.
