@@ -19,7 +19,7 @@
 use crate::error::Result;
 #[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::protocol::core::PaymentChallenge;
-use crate::protocol::core::{PaymentCredential, Receipt};
+use crate::protocol::core::{Base64UrlJson, PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, VerificationError};
 use crate::server::events::{
@@ -110,6 +110,7 @@ pub struct Mpp<M, S = ()> {
     decimals: u32,
     fee_payer: bool,
     chain_id: Option<u64>,
+    opaque: Option<Base64UrlJson>,
     events: ServerEvents,
 }
 
@@ -131,6 +132,7 @@ where
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -153,6 +155,7 @@ where
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -174,6 +177,7 @@ where
             decimals: self.decimals,
             fee_payer: self.fee_payer,
             chain_id: self.chain_id,
+            opaque: self.opaque,
             events: self.events,
         }
     }
@@ -181,6 +185,14 @@ where
     /// Use an existing event registry for payment callbacks.
     pub fn with_events(mut self, events: ServerEvents) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Pin the expected route-scoped `opaque` for credential verification.
+    /// Verification rejects any credential whose echoed `opaque` does not match
+    /// this value. Note: `charge()` issuance does not emit this automatically.
+    pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
+        self.opaque = Some(opaque);
         self
     }
 
@@ -293,7 +305,9 @@ where
             ));
         }
 
-        if credential.challenge.opaque.is_some() {
+        let configured_opaque = self.opaque.as_ref().map(|o| o.raw());
+        let echoed_opaque = credential.challenge.opaque.as_ref().map(|o| o.raw());
+        if echoed_opaque != configured_opaque {
             return Err(VerificationError::with_code(
                 "credential opaque data does not match this route's requirements",
                 crate::protocol::traits::ErrorCode::CredentialMismatch,
@@ -643,7 +657,7 @@ where
             recipient: Some(recipient.to_string()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
+        let encoded = Base64UrlJson::from_typed(&request)?;
 
         let expires = {
             let expiry_time = OffsetDateTime::now_utc()
@@ -734,7 +748,7 @@ where
             method_details,
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
+        let encoded = Base64UrlJson::from_typed(&request)?;
 
         let default_expires;
         let expires = match options.expires {
@@ -915,6 +929,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
             chain_id: builder.chain_id,
+            opaque: None,
             events: ServerEvents::default(),
         })
     }
@@ -940,7 +955,6 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         amount: &str,
         options: super::StripeChargeOptions<'_>,
     ) -> Result<PaymentChallenge> {
-        use crate::protocol::core::Base64UrlJson;
         use time::{Duration, OffsetDateTime};
 
         use crate::protocol::methods::stripe::StripeMethodDetails;
@@ -1060,6 +1074,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             decimals: builder.decimals as u32,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         })
     }
@@ -1163,7 +1178,7 @@ mod tests {
             realm: "api.example.com".into(),
             method: "mock".into(),
             intent: "charge".into(),
-            request: crate::protocol::core::Base64UrlJson::from_raw(request),
+            request: Base64UrlJson::from_raw(request),
             expires: Some(expires),
             digest: None,
             opaque: None,
@@ -1290,7 +1305,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -1513,6 +1528,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -1545,7 +1561,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered_request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&tampered_request).unwrap();
         echo.request = encoded;
 
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -1622,7 +1638,7 @@ mod tests {
         let challenge = mpp.charge("0.10").unwrap();
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         request.currency = "0xDEAD000000000000000000000000000000000000".into();
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1651,7 +1667,7 @@ mod tests {
         let challenge = mpp.charge("0.10").unwrap();
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         request.recipient = Some("0xDEAD000000000000000000000000000000000000".into());
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1683,7 +1699,7 @@ mod tests {
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         let md = request.method_details.get_or_insert(serde_json::json!({}));
         md["chainId"] = serde_json::json!(9999);
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1717,7 +1733,7 @@ mod tests {
         if let Some(md) = request.method_details.as_mut() {
             md.as_object_mut().unwrap().remove("chainId");
         }
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1745,12 +1761,8 @@ mod tests {
         let challenge = mpp.charge("0.10").unwrap();
 
         let mut echo = challenge.to_echo();
-        echo.opaque = Some(
-            crate::protocol::core::Base64UrlJson::from_value(
-                &serde_json::json!({"route": "other"}),
-            )
-            .unwrap(),
-        );
+        echo.opaque =
+            Some(Base64UrlJson::from_value(&serde_json::json!({"route": "other"})).unwrap());
         echo.id = crate::protocol::core::compute_challenge_id(
             "test-secret",
             "MPP Payment",
@@ -1767,6 +1779,60 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("opaque"));
+    }
+
+    /// Mint a credential whose echoed `opaque` is `opaque`, with a valid HMAC
+    /// recomputed over it (all test handlers share the same realm/secret).
+    #[cfg(feature = "tempo")]
+    fn opaque_credential(opaque: Option<Base64UrlJson>) -> PaymentCredential {
+        let mut echo = create_hmac_test_mpp().charge("0.10").unwrap().to_echo();
+        echo.opaque = opaque;
+        echo.id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"))
+    }
+
+    #[cfg(feature = "tempo")]
+    fn route_opaque() -> Base64UrlJson {
+        Base64UrlJson::from_value(&serde_json::json!({"route": "a"})).unwrap()
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_configured_match_accepted() {
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let credential = opaque_credential(Some(route_opaque()));
+
+        assert!(mpp.verify_credential(&credential).await.is_ok());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_configured_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let other = Base64UrlJson::from_value(&serde_json::json!({"route": "b"})).unwrap();
+        let credential = opaque_credential(Some(other));
+
+        let err = mpp.verify_credential(&credential).await.unwrap_err();
+        assert!(err.message.contains("opaque"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_configured_but_absent_rejected() {
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let credential = opaque_credential(None);
+
+        let err = mpp.verify_credential(&credential).await.unwrap_err();
+        assert!(err.message.contains("opaque"));
     }
 
     #[cfg(feature = "tempo")]
@@ -1958,6 +2024,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -2034,6 +2101,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         };
 
@@ -2077,6 +2145,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         };
 
@@ -2085,7 +2154,7 @@ mod tests {
             realm: "MPP Payment".into(),
             method: "tempo".into(),
             intent: "session".into(),
-            request: crate::protocol::core::Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
+            request: Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
             expires: None,
             digest: None,
             opaque: None,
@@ -2119,7 +2188,7 @@ mod tests {
             currency: "0x20c0000000000000000000000000000000000000".into(),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered).unwrap();
+        let encoded = Base64UrlJson::from_typed(&tampered).unwrap();
         echo.request = encoded;
 
         let payload_json = serde_json::json!({
@@ -2178,6 +2247,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         };
 
@@ -2304,7 +2374,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let id = crate::protocol::methods::tempo::generate_challenge_id(
             "test-secret",
             "MPP Payment",
@@ -2554,7 +2624,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let id = crate::protocol::methods::tempo::generate_challenge_id(
             "test-secret",
             "MPP Payment",
