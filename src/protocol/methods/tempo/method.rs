@@ -565,10 +565,11 @@ where
         self
     }
 
-    /// Configure a store for transaction hash deduplication.
+    /// Configure a store for replay deduplication.
     ///
     /// When set, each verified transaction hash is recorded and subsequent
-    /// attempts to replay the same hash are rejected.
+    /// attempts to replay the same hash are rejected. Zero-amount proof
+    /// credentials are likewise made single-use per challenge.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
         self
@@ -1211,6 +1212,21 @@ where
                     ));
                 }
 
+                // Replay protection: a proof challenge is single-use. The
+                // challenge id is HMAC-unique per issuance and encodes the realm.
+                let replay_key = format!("mpp:proof:{}", credential.challenge.id);
+                if let Some(store) = &this.store {
+                    let seen = store
+                        .get(&replay_key)
+                        .await
+                        .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
+                    if seen.is_some() {
+                        return Err(VerificationError::new(
+                            "Proof credential has already been used.",
+                        ));
+                    }
+                }
+
                 let source = credential.source.as_deref().ok_or_else(|| {
                     VerificationError::new("Proof credential must include a source.")
                 })?;
@@ -1262,6 +1278,15 @@ where
                             "Proof signature does not match source.",
                         ));
                     }
+                }
+
+                if let Some(store) = &this.store {
+                    store
+                        .put(&replay_key, serde_json::Value::Bool(true))
+                        .await
+                        .map_err(|e| {
+                            VerificationError::new(format!("Failed to record proof: {e}"))
+                        })?;
                 }
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
@@ -2509,6 +2534,42 @@ mod tests {
         // Original hash should still be blocked
         let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
         assert!(seen.is_some(), "original hash should still be recorded");
+    }
+
+    #[tokio::test]
+    async fn test_proof_credential_replay_rejected() {
+        use crate::store::MemoryStore;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store.clone());
+        // Pre-cache the chain id so verify() needs no RPC; Direct-mode proof
+        // verification is purely cryptographic.
+        method.cached_chain_id.set(42431).unwrap();
+
+        // First submission succeeds and records the proof under its challenge id.
+        let receipt = method.verify(&credential, &request).await.unwrap();
+        assert_eq!(receipt.reference, challenge.id);
+        let key = format!("mpp:proof:{}", challenge.id);
+        assert!(store.get(&key).await.unwrap().is_some());
+
+        // Replaying the identical credential is rejected.
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert!(err.to_string().contains("already been used"));
     }
 
     // ==================== Chain ID caching tests ====================
