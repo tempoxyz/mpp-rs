@@ -24,7 +24,7 @@ jobs:
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@d51df19b0b52cd0916d64dea99da63fe1705c2dd # v0.8.1
+        uses: tempoxyz/changelogs@57e22cb5bd8367edc8cc1450b9eb0aea75d6e019 # v0.8.1
         with:
           ecosystem: rust
           conventional-commit: true
