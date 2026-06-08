@@ -104,7 +104,7 @@ impl TempoBuilder {
 
 /// Create a Tempo payment method configuration with smart defaults.
 ///
-/// Only `currency` and `recipient` are required. Returns a [`TempoBuilder`]
+/// Only `recipient` is required. Returns a [`TempoBuilder`]
 /// that can be passed to [`Mpp::create()`](super::Mpp::create).
 ///
 /// # Defaults
@@ -114,8 +114,9 @@ impl TempoBuilder {
 ///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
 ///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
-/// - **currency**: pathUSD (`0x20c0000000000000000000000000000000000000`)
-/// - **decimals**: `6` (for pathUSD / standard stablecoins)
+/// - **currency**: mainnet USDC, or pathUSD when `.chain_id(42431)` or a
+///   Moderato RPC URL is configured
+/// - **decimals**: `6` (for USDC / pathUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example
@@ -123,7 +124,7 @@ impl TempoBuilder {
 /// ```ignore
 /// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
-/// // Minimal — currency defaults to pathUSD
+/// // Minimal — currency defaults to mainnet USDC
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     recipient: "0xabc...123",
 /// }))?;

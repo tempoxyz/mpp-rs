@@ -478,6 +478,7 @@ pub struct ChargeMethod<P> {
     store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
+    fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
 }
 
 #[derive(Debug, Clone)]
@@ -487,7 +488,6 @@ pub struct FeePayerPolicy {
     pub max_priority_fee_per_gas: u128,
     pub max_total_fee: u128,
     pub max_validity_window_seconds: u64,
-    pub allowed_fee_tokens: Vec<Address>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -497,7 +497,6 @@ pub struct FeePayerPolicyOverride {
     pub max_priority_fee_per_gas: Option<u128>,
     pub max_total_fee: Option<u128>,
     pub max_validity_window_seconds: Option<u64>,
-    pub allowed_fee_tokens: Option<Vec<Address>>,
 }
 
 impl Default for FeePayerPolicy {
@@ -520,39 +519,52 @@ impl FeePayerPolicy {
             policy.max_validity_window_seconds = o
                 .max_validity_window_seconds
                 .unwrap_or(policy.max_validity_window_seconds);
-            if let Some(allowed_fee_tokens) = &o.allowed_fee_tokens {
-                policy.allowed_fee_tokens = allowed_fee_tokens.clone();
-            }
         }
         policy
     }
 
-    pub fn allows_fee_token(&self, fee_token: Address) -> bool {
-        self.allowed_fee_tokens
-            .iter()
-            .any(|allowed| *allowed == fee_token)
+    /// Return the default sponsor fee-token allowlist for a transaction chain.
+    ///
+    /// Known Tempo chains allow their default currency. Unknown chains use the
+    /// mainnet default, matching the server-side charge verifier fallback.
+    pub fn default_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
+        default_fee_payer_allowed_fee_tokens(chain_id)
+    }
+
+    /// Check whether the default sponsor allowlist accepts `fee_token`.
+    pub fn default_allows_fee_token(chain_id: u64, fee_token: Address) -> bool {
+        fee_token_allowed(&Self::default_allowed_fee_tokens(chain_id), fee_token)
     }
 
     fn get_by_chain_id(chain_id: u64) -> Self {
-        let network =
-            KnownTempoNetwork::from_chain_id(chain_id).unwrap_or(KnownTempoNetwork::Mainnet);
+        let network = KnownTempoNetwork::from_chain_id(chain_id);
         let mut policy = Self {
             max_gas: MAX_FEE_PAYER_GAS_LIMIT,
             max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
             max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
             max_total_fee: MAX_TOTAL_FEE_DEFAULT,
             max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
-            allowed_fee_tokens: vec![network
-                .default_currency()
-                .parse()
-                .expect("default Tempo fee token is a valid address")],
         };
-        if network == KnownTempoNetwork::Moderato {
+        if network == Some(KnownTempoNetwork::Moderato) {
             // Moderato regularly needs a higher priority fee than mainnet.
             policy.max_priority_fee_per_gas = 50_000_000_000;
         }
         policy
     }
+}
+
+fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
+    let network = KnownTempoNetwork::from_chain_id(chain_id).unwrap_or(KnownTempoNetwork::Mainnet);
+    vec![network
+        .default_currency()
+        .parse()
+        .expect("default Tempo fee token is a valid address")]
+}
+
+fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
+    allowed_fee_tokens
+        .iter()
+        .any(|allowed| *allowed == fee_token)
 }
 
 impl<P> ChargeMethod<P>
@@ -570,17 +582,27 @@ where
             store: None,
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
+            fee_payer_allowed_fee_tokens: None,
         }
     }
 
-    /// Override the fee-sponsor policy applied to fee-payer envelopes.
+    /// Override fee-sponsor limit policy applied to fee-payer envelopes.
     ///
     /// Each unset field falls back to the per-chain default. Use to raise or
     /// lower `max_gas`, `max_fee_per_gas`, `max_priority_fee_per_gas`,
-    /// `max_total_fee`, or `max_validity_window_seconds` per server, or to
-    /// replace the sponsor fee-token allowlist.
+    /// `max_total_fee`, or `max_validity_window_seconds` per server.
     pub fn with_fee_payer_policy_override(mut self, overrides: FeePayerPolicyOverride) -> Self {
         self.fee_payer_policy_override = Some(overrides);
+        self
+    }
+
+    /// Replace the default sponsor fee-token allowlist.
+    ///
+    /// By default, fee-payer co-signing accepts the known default currency for
+    /// the transaction chain ID. Use this to restrict or widen the accepted
+    /// fee tokens for a server.
+    pub fn with_fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
+        self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
         self
     }
 
@@ -1055,7 +1077,11 @@ where
 
         let policy = FeePayerPolicy::resolve(tx.chain_id, self.fee_payer_policy_override.as_ref());
 
-        if !policy.allows_fee_token(fee_token) {
+        let allowed_fee_tokens = self
+            .fee_payer_allowed_fee_tokens
+            .clone()
+            .unwrap_or_else(|| FeePayerPolicy::default_allowed_fee_tokens(tx.chain_id));
+        if !fee_token_allowed(&allowed_fee_tokens, fee_token) {
             return Err(VerificationError::new(format!(
                 "Fee token {:#x} is not allowed by fee payer policy",
                 fee_token
@@ -1163,6 +1189,7 @@ where
         let store = self.store.clone();
         let cached_chain_id = Arc::clone(&self.cached_chain_id);
         let fee_payer_policy_override = self.fee_payer_policy_override.clone();
+        let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
 
         async move {
             let this = ChargeMethod {
@@ -1171,6 +1198,7 @@ where
                 store,
                 cached_chain_id,
                 fee_payer_policy_override,
+                fee_payer_allowed_fee_tokens,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -2771,7 +2799,7 @@ mod tests {
         );
     }
 
-    /// All five policy override fields are respected when set together.
+    /// All five limit policy override fields are respected when set together.
     #[test]
     fn test_policy_override_all_fields_applied() {
         // Generous overrides — tx should pass all checks.
@@ -2781,10 +2809,6 @@ mod tests {
             max_priority_fee_per_gas: Some(2_000_000_000),
             max_total_fee: Some(40_000_000_000_000_000),
             max_validity_window_seconds: Some(600),
-            allowed_fee_tokens: Some(vec![KnownTempoNetwork::Mainnet
-                .default_currency()
-                .parse::<Address>()
-                .unwrap()]),
         };
         let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
 
@@ -2844,25 +2868,29 @@ mod tests {
             moderato.max_validity_window_seconds,
             tempo_mainnet.max_validity_window_seconds
         );
-        assert!(tempo_mainnet.allows_fee_token(
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            CHAIN_ID,
             KnownTempoNetwork::Mainnet
                 .default_currency()
                 .parse::<Address>()
                 .unwrap()
         ));
-        assert!(!tempo_mainnet.allows_fee_token(
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            CHAIN_ID,
             KnownTempoNetwork::Moderato
                 .default_currency()
                 .parse::<Address>()
                 .unwrap()
         ));
-        assert!(moderato.allows_fee_token(
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
             KnownTempoNetwork::Moderato
                 .default_currency()
                 .parse::<Address>()
                 .unwrap()
         ));
-        assert!(!moderato.allows_fee_token(
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
             KnownTempoNetwork::Mainnet
                 .default_currency()
                 .parse::<Address>()
@@ -2872,14 +2900,12 @@ mod tests {
 
     #[test]
     fn test_cosign_rejects_non_allowlisted_fee_token() {
-        let overrides = FeePayerPolicyOverride {
-            allowed_fee_tokens: Some(vec![KnownTempoNetwork::Mainnet
-                .default_currency()
-                .parse::<Address>()
-                .unwrap()]),
-            ..Default::default()
-        };
-        let (method, client_signer, _) = make_cosign_method(Some(overrides));
+        let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap()];
+        let (method, client_signer, _) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
 
         let tx = make_fee_payer_tx(60);
         let encoded = sign_and_encode_0x78(tx, &client_signer);
@@ -2899,6 +2925,27 @@ mod tests {
                 .contains("is not allowed by fee payer policy"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_cosign_uses_custom_fee_token_allowlist() {
+        let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap()];
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+
+        let tx = make_fee_payer_tx(60);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("cosign should accept a custom allowlisted fee token");
     }
 
     /// Sponsor MUST strip an attacker-injected wire access list: an honest
