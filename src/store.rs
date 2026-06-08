@@ -34,21 +34,16 @@ pub trait Store: Send + Sync {
 
     /// Atomically store `value` only if `key` is absent; returns `true` if inserted.
     ///
-    /// The default is a non-atomic `get`-then-`put`; production backends should
-    /// override it (e.g. Redis `SET NX`, SQL `ON CONFLICT DO NOTHING`).
+    /// A generic `get`-then-`put` is racy, so the default **fails closed** with
+    /// [`StoreError::AtomicUnsupported`]. Backends used for replay protection
+    /// must override this with native atomics (Redis `SET NX`, SQL
+    /// `ON CONFLICT DO NOTHING`, CAS, etc.).
     fn put_if_absent(
         &self,
-        key: &str,
-        value: serde_json::Value,
+        _key: &str,
+        _value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
-        let key = key.to_string();
-        Box::pin(async move {
-            if self.get(&key).await?.is_some() {
-                return Ok(false);
-            }
-            self.put(&key, value).await?;
-            Ok(true)
-        })
+        Box::pin(async { Err(StoreError::AtomicUnsupported) })
     }
 }
 
@@ -58,6 +53,8 @@ pub enum StoreError {
     Internal(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("atomic put_if_absent is not supported by this store backend")]
+    AtomicUnsupported,
 }
 
 // ==================== MemoryStore ====================

@@ -654,10 +654,16 @@ where
         }
 
         if let Some(store) = &self.store {
-            store
-                .put(&replay_key, serde_json::Value::Bool(true))
+            // Atomic claim; the early get above is only a fast-path.
+            let reserved = store
+                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+            if !reserved {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
         }
 
         Ok(Receipt::success(METHOD_NAME, tx_hash))
@@ -897,19 +903,16 @@ where
         if let Some(store) = &self.store {
             let tx_hash_pre = keccak256(&final_tx_bytes);
             let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
-            let seen = store
-                .get(&dedup_key)
+            // Atomically reserve before broadcasting.
+            let reserved = store
+                .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
+                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+            if !reserved {
                 return Err(VerificationError::new(
                     "Transaction has already been submitted.",
                 ));
             }
-            store
-                .put(&dedup_key, serde_json::Value::Bool(true))
-                .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
         }
 
         // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
@@ -936,13 +939,20 @@ where
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
 
-        // Record the on-chain tx hash for hash-based replay protection
+        // Record the on-chain tx hash for hash-based replay protection. Use the
+        // atomic claim so a concurrent hash credential for the same tx cannot
+        // also succeed.
         if let Some(store) = &self.store {
             let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
-            store
-                .put(&replay_key, serde_json::Value::Bool(true))
+            let reserved = store
+                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+            if !reserved {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
         }
 
         Ok(receipt.transaction_hash())
@@ -1265,12 +1275,16 @@ where
                     }
                 }
 
-                // Single-use: reserve a key fingerprinting the credential
-                // (challenge id + source + signature) atomically after verifying.
+                // Single-use: atomically reserve a canonical credential
+                // fingerprint after verifying.
                 if let Some(store) = &this.store {
-                    let fingerprint = keccak256(
-                        format!("{}|{}|{}", credential.challenge.id, source, sig_hex).as_bytes(),
-                    );
+                    let fingerprint = proof::proof_fingerprint(
+                        &credential.challenge.id,
+                        parsed_source.address,
+                        parsed_source.chain_id,
+                        sig_hex,
+                    )
+                    .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
                     let replay_key = format!("mpp:proof:{:x}", fingerprint);
                     let reserved = store
                         .put_if_absent(&replay_key, serde_json::Value::Bool(true))
@@ -2560,15 +2574,65 @@ mod tests {
         // First submission succeeds and records the proof fingerprint.
         let receipt = method.verify(&credential, &request).await.unwrap();
         assert_eq!(receipt.reference, challenge.id);
-        let source = proof::proof_source(signer.address(), 42431);
         let fingerprint =
-            keccak256(format!("{}|{}|{}", challenge.id, source, signature).as_bytes());
+            proof::proof_fingerprint(&challenge.id, signer.address(), 42431, &signature).unwrap();
         let key = format!("mpp:proof:{:x}", fingerprint);
         assert!(store.get(&key).await.unwrap().is_some());
 
         // Replaying the identical credential is rejected.
         let err = method.verify(&credential, &request).await.unwrap_err();
         assert!(err.to_string().contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn test_proof_credential_replay_rejected_across_spellings() {
+        use crate::store::MemoryStore;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+        );
+
+        // Re-encode the same proof: uppercase signature hex + lowercased source
+        // address. Semantically identical, so it must hit the same replay key.
+        let upper_sig = signature.to_uppercase().replace("0X", "0x");
+        let lower_source = format!("did:pkh:eip155:42431:0x{:x}", signer.address());
+        assert_ne!(
+            signature, upper_sig,
+            "test must actually mutate the spelling"
+        );
+        let credential_variant = PaymentCredential::with_source(
+            challenge.to_echo(),
+            lower_source,
+            crate::protocol::core::PaymentPayload::proof(upper_sig),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store);
+        method.cached_chain_id.set(42431).unwrap();
+
+        method.verify(&credential, &request).await.unwrap();
+
+        // Re-encoded variant of the same proof is rejected as a replay.
+        let err = method
+            .verify(&credential_variant, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already been used"),
+            "re-encoded proof must hit the same replay key, got: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
