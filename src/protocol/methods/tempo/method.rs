@@ -569,6 +569,9 @@ where
     ///
     /// When set, each verified transaction hash is recorded and subsequent
     /// attempts to replay the same hash are rejected.
+    ///
+    /// The store must support atomic [`Store::put_if_absent`], else verification
+    /// fails closed with `StoreError::AtomicUnsupported`.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
         self

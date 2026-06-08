@@ -33,20 +33,16 @@ pub trait Store: Send + Sync {
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
 
-    /// Atomically insert if absent; returns `true` on insert.
+    /// Atomically store `value` only if `key` is absent; returns `true` if inserted.
+    ///
+    /// Defaults to fail closed with [`StoreError::AtomicUnsupported`]; backends
+    /// must override with native atomics (Redis `SET NX`, SQL unique insert, CAS).
     fn put_if_absent(
         &self,
-        key: &str,
-        value: serde_json::Value,
+        _key: &str,
+        _value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
-        let key = key.to_string();
-        Box::pin(async move {
-            if self.get(&key).await?.is_some() {
-                return Ok(false);
-            }
-            self.put(&key, value).await?;
-            Ok(true)
-        })
+        Box::pin(async { Err(StoreError::AtomicUnsupported) })
     }
 }
 
@@ -56,6 +52,8 @@ pub enum StoreError {
     Internal(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("atomic put_if_absent is not supported by this store backend")]
+    AtomicUnsupported,
 }
 
 // ==================== MemoryStore ====================
@@ -466,6 +464,41 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn default_put_if_absent_fails_closed() {
+        // Inherited default must refuse rather than silently race.
+        struct MinimalStore;
+        impl Store for MinimalStore {
+            fn get(
+                &self,
+                _key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(
+                &self,
+                _key: &str,
+                _value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn delete(
+                &self,
+                _key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let err = MinimalStore
+            .put_if_absent("k", serde_json::json!(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AtomicUnsupported));
     }
 
     #[tokio::test]
