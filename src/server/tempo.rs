@@ -143,9 +143,9 @@ impl TempoBuilder {
 ///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
 ///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
-/// - **currency**: mainnet USDC, or pathUSD when `.chain_id(42431)` or a
-///   Moderato RPC URL is configured
-/// - **decimals**: `6` (for USDC / pathUSD / standard stablecoins)
+/// - **currency**: pathUSD by default, mainnet USDC with `.chain_id(4217)`,
+///   or pathUSD with `.chain_id(42431)` / a Moderato RPC URL
+/// - **decimals**: `6` (for pathUSD / USDC / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example
@@ -153,7 +153,7 @@ impl TempoBuilder {
 /// ```ignore
 /// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
-/// // Minimal — currency defaults to mainnet USDC
+/// // Minimal — currency defaults to pathUSD
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     recipient: "0xabc...123",
 /// }))?;

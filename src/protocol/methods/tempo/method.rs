@@ -43,8 +43,8 @@ use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
 use super::{
-    network::TempoNetwork as KnownTempoNetwork, proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE,
-    METHOD_NAME,
+    network::TempoNetwork as KnownTempoNetwork, proof, TempoChargeExt, CHAIN_ID,
+    DEFAULT_CURRENCY_TESTNET, INTENT_CHARGE, METHOD_NAME,
 };
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
@@ -554,17 +554,16 @@ impl FeePayerPolicy {
 }
 
 fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
-    let network = KnownTempoNetwork::from_chain_id(chain_id).unwrap_or(KnownTempoNetwork::Mainnet);
-    vec![network
-        .default_currency()
+    let token = KnownTempoNetwork::from_chain_id(chain_id)
+        .map(|network| network.default_currency())
+        .unwrap_or(DEFAULT_CURRENCY_TESTNET);
+    vec![token
         .parse()
         .expect("default Tempo fee token is a valid address")]
 }
 
 fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
-    allowed_fee_tokens
-        .iter()
-        .any(|allowed| *allowed == fee_token)
+    allowed_fee_tokens.contains(&fee_token)
 }
 
 impl<P> ChargeMethod<P>
@@ -3118,6 +3117,10 @@ mod tests {
                 .default_currency()
                 .parse::<Address>()
                 .unwrap()
+        ));
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            31337,
+            DEFAULT_CURRENCY_TESTNET.parse::<Address>().unwrap()
         ));
     }
 
