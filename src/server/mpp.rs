@@ -892,6 +892,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(signer) = builder.fee_payer_signer {
             method = method.with_fee_payer(signer);
         }
+        if let Some(allowed_fee_tokens) = builder.fee_payer_allowed_fee_tokens {
+            method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+        }
 
         // Resolve currency from chain_id when not explicitly set
         let currency = if builder.currency_explicit {
@@ -1078,6 +1081,8 @@ mod tests {
     use crate::protocol::traits::ErrorCode;
     #[cfg(feature = "tempo")]
     use crate::server::{tempo, ChargeOptions, TempoConfig};
+    #[cfg(feature = "tempo")]
+    use alloy::primitives::Address;
     use std::{
         future::Future,
         sync::{Arc, Mutex},
@@ -1392,6 +1397,39 @@ mod tests {
             request.chain_id().unwrap_or(CHAIN_ID),
             request.currency_address().unwrap()
         ));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_fee_payer_custom_currency_can_override_allowed_fee_tokens() {
+        let custom_token: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            })
+            .currency("0x9999999999999999999999999999999999999999")
+            .fee_payer(true)
+            .fee_payer_signer(fee_payer_signer)
+            .fee_payer_allowed_fee_tokens(vec![custom_token])
+            .secret_key("test-secret"),
+        )
+        .unwrap();
+
+        let challenge = mpp.charge("1").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        assert!(request.fee_payer());
+        assert_eq!(request.currency_address().unwrap(), custom_token);
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            request.chain_id().unwrap_or(CHAIN_ID),
+            custom_token
+        ));
+        assert_eq!(
+            mpp.method.fee_payer_allowed_fee_tokens(),
+            Some([custom_token].as_slice())
+        );
     }
 
     #[cfg(feature = "tempo")]

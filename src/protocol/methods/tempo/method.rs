@@ -606,6 +606,11 @@ where
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
+        self.fee_payer_allowed_fee_tokens.as_deref()
+    }
+
     /// Configure a store for transaction hash deduplication.
     ///
     /// When set, each verified transaction hash is recorded and subsequent

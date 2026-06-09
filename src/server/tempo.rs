@@ -1,5 +1,7 @@
 //! Tempo payment method configuration and builder.
 
+use alloy::primitives::Address;
+
 use super::mpp::detect_realm;
 
 pub use crate::protocol::methods::tempo::session_method::{
@@ -33,6 +35,7 @@ pub struct TempoBuilder {
     pub(crate) fee_payer: bool,
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
+    pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
 }
 
 impl TempoBuilder {
@@ -100,6 +103,17 @@ impl TempoBuilder {
         self.fee_payer_signer = Some(signer);
         self
     }
+
+    /// Replace the fee-sponsor token allowlist used when co-signing fee-payer
+    /// transactions.
+    ///
+    /// By default, sponsored transactions accept the known default currency for
+    /// the transaction chain ID. Use this when `.currency(...)` points at a
+    /// custom token that the fee payer should sponsor.
+    pub fn fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
+        self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -153,6 +167,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer: false,
         chain_id: None,
         fee_payer_signer: None,
+        fee_payer_allowed_fee_tokens: None,
     }
 }
 
