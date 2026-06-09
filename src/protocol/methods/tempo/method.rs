@@ -326,11 +326,33 @@ fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferL
     None
 }
 
+/// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
+/// for a `did:pkh:eip155` DID matching `expected_chain_id`, else `Err`.
+fn parse_hash_credential_source(
+    source: Option<&str>,
+    expected_chain_id: u64,
+) -> Result<Option<Address>, VerificationError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+
+    let invalid = || VerificationError::new("Hash credential source is invalid.");
+
+    let parsed = proof::parse_proof_source(source).map_err(|_| invalid())?;
+    if parsed.chain_id != expected_chain_id {
+        return Err(invalid());
+    }
+
+    Ok(Some(parsed.address))
+}
+
 fn match_receipt_transfer_logs(
     logs: &[serde_json::Value],
-    tx_sender: Address,
+    expected_sender: Address,
     currency: Address,
     expected: &[Transfer],
+    source: Option<&str>,
+    validate_sender: Option<&ValidateSenderCallback>,
 ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
     let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
     sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
@@ -363,7 +385,6 @@ fn match_receipt_transfer_logs(
                 };
 
                 if parsed.address() != currency
-                    || parsed.from() != tx_sender
                     || parsed.to() != transfer.recipient
                     || parsed.amount() != transfer.amount
                 {
@@ -376,6 +397,21 @@ fn match_receipt_transfer_logs(
                     }
                 } else if prefer_memo != parsed.memo().is_some() {
                     continue;
+                }
+
+                // On a sender mismatch, validate_sender may authorize the log.
+                let sender = parsed.from();
+                if sender != expected_sender {
+                    let authorized = validate_sender.is_some_and(|cb| {
+                        cb(SenderValidation {
+                            expected_sender,
+                            sender,
+                            source,
+                        })
+                    });
+                    if !authorized {
+                        continue;
+                    }
                 }
 
                 return Some((log_idx, parsed.matched()));
@@ -432,6 +468,22 @@ fn assert_challenge_bound_memo(
     }
 }
 
+/// Arguments passed to a [`ValidateSenderCallback`] on a sender mismatch.
+#[derive(Debug, Clone, Copy)]
+pub struct SenderValidation<'a> {
+    /// The expected sender (source address, or receipt sender if no source).
+    pub expected_sender: Address,
+    /// The actual `from` address on the transfer log.
+    pub sender: Address,
+    /// The raw credential source DID, if provided.
+    pub source: Option<&'a str>,
+}
+
+/// Authorizes a transfer whose sender differs from the expected sender;
+/// return `true` to accept.
+pub type ValidateSenderCallback =
+    dyn for<'a> Fn(SenderValidation<'a>) -> bool + Send + Sync + 'static;
+
 /// Tempo charge method for one-time payment verification.
 ///
 /// This is a **Tempo-specific** payment verifier. It expects:
@@ -475,6 +527,7 @@ pub struct ChargeMethod<P> {
     store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
+    validate_sender: Option<Arc<ValidateSenderCallback>>,
 }
 
 #[derive(Debug, Clone)]
@@ -552,7 +605,18 @@ where
             store: None,
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
+            validate_sender: None,
         }
+    }
+
+    /// Set a callback invoked when a hash-credential transfer's sender differs
+    /// from the expected sender; returning `true` accepts the transfer.
+    pub fn with_validate_sender<F>(mut self, validate_sender: F) -> Self
+    where
+        F: for<'a> Fn(SenderValidation<'a>) -> bool + Send + Sync + 'static,
+    {
+        self.validate_sender = Some(Arc::new(validate_sender));
+        self
     }
 
     /// Override the fee-sponsor policy applied to fee-payer envelopes.
@@ -598,9 +662,14 @@ where
         &self,
         tx_hash: &str,
         charge: &ChargeRequest,
+        source: Option<&str>,
+        expected_chain_id: u64,
         challenge_id: &str,
         realm: &str,
     ) -> Result<Receipt, VerificationError> {
+        // Validate the source before reserving the hash.
+        let source_address = parse_hash_credential_source(source, expected_chain_id)?;
+
         let hash = tx_hash
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
@@ -645,8 +714,18 @@ where
         })?;
         let expected = Self::expected_transfers(charge)?;
 
+        // Use the source address if present, otherwise the receipt sender.
+        let expected_sender = source_address.unwrap_or_else(|| receipt.from());
+
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
-        let matched_logs = self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        let matched_logs = self.verify_tip20_transfers(
+            &receipt,
+            expected_sender,
+            currency,
+            &expected,
+            source,
+            self.validate_sender.as_deref(),
+        )?;
 
         if charge.memo().is_none() {
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
@@ -670,20 +749,28 @@ where
     fn verify_tip20_transfers(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
+        expected_sender: Address,
         currency: Address,
         expected: &[Transfer],
+        source: Option<&str>,
+        validate_sender: Option<&ValidateSenderCallback>,
     ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
-
-        let tx_sender = receipt.from();
 
         let logs = receipt_json
             .get("logs")
             .and_then(|v| v.as_array())
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
-        match_receipt_transfer_logs(logs, tx_sender, currency, expected)
+        match_receipt_transfer_logs(
+            logs,
+            expected_sender,
+            currency,
+            expected,
+            source,
+            validate_sender,
+        )
     }
 
     /// Validate that a transaction contains all expected payment calls (supports splits).
@@ -929,8 +1016,9 @@ where
             )));
         }
 
-        // Verify the receipt contains the expected TIP-20 transfer(s)
-        let matched_logs = self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        // Verify the receipt contains the expected TIP-20 transfer(s).
+        let matched_logs =
+            self.verify_tip20_transfers(&receipt, receipt.from(), currency, &expected, None, None)?;
         if charge.memo().is_none() {
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
@@ -1137,6 +1225,7 @@ where
         let store = self.store.clone();
         let cached_chain_id = Arc::clone(&self.cached_chain_id);
         let fee_payer_policy_override = self.fee_payer_policy_override.clone();
+        let validate_sender = self.validate_sender.clone();
 
         async move {
             let this = ChargeMethod {
@@ -1145,6 +1234,7 @@ where
                 store,
                 cached_chain_id,
                 fee_payer_policy_override,
+                validate_sender,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -1200,6 +1290,8 @@ where
                 this.verify_hash(
                     charge_payload.tx_hash().unwrap(),
                     &request,
+                    credential.source.as_deref(),
+                    expected_chain_id,
                     &credential.challenge.id,
                     &credential.challenge.realm,
                 )
@@ -1633,7 +1725,8 @@ mod tests {
             memo: None,
         }];
 
-        let matched = match_receipt_transfer_logs(&logs, sender, currency, &expected).unwrap();
+        let matched =
+            match_receipt_transfer_logs(&logs, sender, currency, &expected, None, None).unwrap();
 
         assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
     }
@@ -1662,11 +1755,244 @@ mod tests {
             },
         ];
 
-        let matched = match_receipt_transfer_logs(&logs, sender, currency, &expected).unwrap();
+        let matched =
+            match_receipt_transfer_logs(&logs, sender, currency, &expected, None, None).unwrap();
 
         assert_eq!(matched.len(), 2);
         assert!(matched.contains(&MatchedTransferLog::Memo(memo)));
         assert!(matched.contains(&MatchedTransferLog::Transfer));
+    }
+
+    // ==================== Hash credential source validation ====================
+
+    const HASH_SOURCE_INVALID: &str = "Hash credential source is invalid.";
+
+    fn did_pkh(chain_id: u64, address: Address) -> String {
+        format!("did:pkh:eip155:{chain_id}:{address}")
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_absent_is_none() {
+        assert_eq!(
+            parse_hash_credential_source(None, MODERATO_CHAIN_ID).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_valid_returns_address() {
+        let address = Address::repeat_byte(0x11);
+        let source = did_pkh(MODERATO_CHAIN_ID, address);
+        let parsed = parse_hash_credential_source(Some(&source), MODERATO_CHAIN_ID).unwrap();
+        assert_eq!(parsed, Some(address));
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_chain_id_mismatch_is_rejected() {
+        let source = did_pkh(1, Address::repeat_byte(0x11));
+        let err = parse_hash_credential_source(Some(&source), MODERATO_CHAIN_ID).unwrap_err();
+        assert_eq!(err.to_string(), HASH_SOURCE_INVALID);
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_rejects_malformed_variants() {
+        let address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2";
+        let cases = [
+            "not-a-valid-did",
+            "did:pkh:solana:42431:0xa5cc3c03994db5b0d9ba5e4f6d2efbd9f213b141",
+            &format!("did:pkh:eip155:042431:{address}"),
+            &format!("did:pkh:eip155:not-a-number:{address}"),
+            &format!("did:pkh:eip155:42431:extra:{address}"),
+            "did:pkh:eip155:42431:not-an-address",
+        ];
+        for case in cases {
+            let err = parse_hash_credential_source(Some(case), MODERATO_CHAIN_ID).unwrap_err();
+            assert_eq!(err.to_string(), HASH_SOURCE_INVALID, "case: {case}");
+        }
+    }
+
+    #[test]
+    fn test_match_transfer_logs_accepts_source_matching_transfer_sender() {
+        let currency = Address::repeat_byte(0x20);
+        let source = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let logs = vec![make_transfer_with_memo_log(
+            currency, source, recipient, amount, memo,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let matched =
+            match_receipt_transfer_logs(&logs, source, currency, &expected, None, None).unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
+    }
+
+    #[test]
+    fn test_match_transfer_logs_rejects_source_differing_from_transfer_sender() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let actual_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let logs = vec![make_transfer_log(
+            currency,
+            actual_sender,
+            recipient,
+            amount,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let err =
+            match_receipt_transfer_logs(&logs, declared_source, currency, &expected, None, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("No matching transfer event found"));
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_override_allows_mismatch() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let actual_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let source_did = did_pkh(MODERATO_CHAIN_ID, declared_source);
+        let logs = vec![make_transfer_log(
+            currency,
+            actual_sender,
+            recipient,
+            amount,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let cb_did = source_did.clone();
+        let cb: Box<ValidateSenderCallback> = Box::new(move |v: SenderValidation| {
+            assert_eq!(v.expected_sender, declared_source);
+            assert_eq!(v.sender, actual_sender);
+            assert_eq!(v.source, Some(cb_did.as_str()));
+            true
+        });
+        let matched = match_receipt_transfer_logs(
+            &logs,
+            declared_source,
+            currency,
+            &expected,
+            Some(&source_did),
+            Some(cb.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Transfer]);
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_returning_false_rejects() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let actual_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let logs = vec![make_transfer_log(
+            currency,
+            actual_sender,
+            recipient,
+            amount,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let cb: Box<ValidateSenderCallback> = Box::new(|_v: SenderValidation| false);
+        let err = match_receipt_transfer_logs(
+            &logs,
+            declared_source,
+            currency,
+            &expected,
+            None,
+            Some(cb.as_ref()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("No matching transfer event found"));
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_not_called_when_sender_matches() {
+        let currency = Address::repeat_byte(0x20);
+        let source = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let logs = vec![make_transfer_with_memo_log(
+            currency, source, recipient, amount, memo,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        // Callback panics if invoked; sender already matches.
+        let cb: Box<ValidateSenderCallback> = Box::new(|_v: SenderValidation| {
+            panic!("validate_sender must not run when sender already matches")
+        });
+        let matched = match_receipt_transfer_logs(
+            &logs,
+            source,
+            currency,
+            &expected,
+            None,
+            Some(cb.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_not_called_for_memo_incompatible_logs() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let wrong_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let wanted_memo = attribution::encode("challenge-123", "api.example.com", None);
+        let other_memo = attribution::encode("challenge-999", "api.example.com", None);
+        // First log has a wrong sender and a non-matching memo; second matches.
+        let logs = vec![
+            make_transfer_with_memo_log(currency, wrong_sender, recipient, amount, other_memo),
+            make_transfer_with_memo_log(currency, declared_source, recipient, amount, wanted_memo),
+        ];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: Some(wanted_memo),
+        }];
+
+        let cb: Box<ValidateSenderCallback> = Box::new(|_v: SenderValidation| {
+            panic!("validate_sender must not run for memo-incompatible logs")
+        });
+        let matched = match_receipt_transfer_logs(
+            &logs,
+            declared_source,
+            currency,
+            &expected,
+            None,
+            Some(cb.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(wanted_memo)]);
     }
 
     #[test]
