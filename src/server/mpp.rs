@@ -494,6 +494,7 @@ where
             recipient: Some(recipient.to_string()),
             description: options.description.map(|s| s.to_string()),
             external_id: options.external_id.map(|s| s.to_string()),
+            mppx_scope: options.mppx_scope.cloned(),
             ..Default::default()
         };
         {
@@ -673,6 +674,13 @@ where
         if request.recipient != expected.recipient {
             return Err(VerificationError::with_code(
                 "Recipient mismatch: credential was issued for a different recipient",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+
+        if request.mppx_scope != expected.mppx_scope {
+            return Err(VerificationError::with_code(
+                "Framework scope mismatch: credential was issued for a different route",
                 crate::protocol::traits::ErrorCode::CredentialMismatch,
             ));
         }
@@ -1139,6 +1147,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
                     "failed to serialize methodDetails: {e}"
                 ))
             })?),
+            mppx_scope: options.mppx_scope.cloned(),
             ..Default::default()
         };
 

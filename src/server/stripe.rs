@@ -32,6 +32,8 @@ pub struct StripeChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Optional metadata key-value pairs.
     pub metadata: Option<&'a std::collections::HashMap<String, String>>,
+    /// Framework adapter route/resource/query scope.
+    pub mppx_scope: Option<&'a serde_json::Value>,
 }
 
 /// Builder returned by [`stripe()`] for configuring a Stripe payment method.

@@ -168,10 +168,12 @@ pub trait ChargeConfig {
 }
 
 /// Options passed from a [`ChargeConfig`] to [`ChargeChallenger::challenge`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ChallengeOptions {
     /// Human-readable description.
     pub description: Option<&'static str>,
+    /// Framework adapter route/resource/query scope.
+    pub mppx_scope: Option<serde_json::Value>,
 }
 
 /// Axum extractor that gates a handler behind payment verification.
@@ -298,6 +300,16 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         self.verify_payment(credential_str)
     }
 
+    /// Verify a credential string against route amount and framework scope.
+    fn verify_payment_for_amount_and_scope(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        _mppx_scope: Option<serde_json::Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        self.verify_payment_for_amount(credential_str, amount)
+    }
+
     /// Verify a credential string against route amount and actual request body bytes.
     fn verify_payment_for_amount_with_body(
         &self,
@@ -307,6 +319,18 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
         let _ = body;
         self.verify_payment_for_amount(credential_str, amount)
+    }
+
+    /// Verify a credential string against route amount, framework scope, and request body bytes.
+    fn verify_payment_for_amount_scope_and_body(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let _ = mppx_scope;
+        self.verify_payment_for_amount_with_body(credential_str, amount, body)
     }
 }
 
@@ -325,6 +349,7 @@ where
             amount,
             super::ChargeOptions {
                 description: options.description,
+                mppx_scope: options.mppx_scope.as_ref(),
                 ..Default::default()
             },
         )
@@ -341,6 +366,7 @@ where
             amount,
             super::ChargeOptions {
                 description: options.description,
+                mppx_scope: options.mppx_scope.as_ref(),
                 ..Default::default()
             },
             body,
@@ -416,6 +442,60 @@ where
         })
     }
 
+    fn verify_payment_for_amount_and_scope(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.charge_with_options(
+            amount,
+            super::ChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        ) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request(
+                &mpp,
+                &credential,
+                &expected_request,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
     fn verify_payment_for_amount_with_body(
         &self,
         credential_str: &str,
@@ -433,6 +513,63 @@ where
         };
 
         let expected_challenge = match self.charge(amount) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        let body = body.to_vec();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request_and_body(
+                &mpp,
+                &credential,
+                &expected_request,
+                &body,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn verify_payment_for_amount_scope_and_body(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.charge_with_options(
+            amount,
+            super::ChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        ) {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -481,6 +618,7 @@ where
             amount,
             super::StripeChargeOptions {
                 description: options.description,
+                mppx_scope: options.mppx_scope.as_ref(),
                 ..Default::default()
             },
         )
@@ -497,6 +635,7 @@ where
             amount,
             super::StripeChargeOptions {
                 description: options.description,
+                mppx_scope: options.mppx_scope.as_ref(),
                 ..Default::default()
             },
             body,
@@ -541,6 +680,60 @@ where
         };
 
         let expected_challenge = match self.stripe_charge(amount) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request(
+                &mpp,
+                &credential,
+                &expected_request,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn verify_payment_for_amount_and_scope(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.stripe_charge_with_options(
+            amount,
+            super::StripeChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        ) {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -621,6 +814,63 @@ where
             .map_err(|e| e.to_string())
         })
     }
+
+    fn verify_payment_for_amount_scope_and_body(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.stripe_charge_with_options(
+            amount,
+            super::StripeChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        ) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        let body = body.to_vec();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request_and_body(
+                &mpp,
+                &credential,
+                &expected_request,
+                &body,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
 }
 
 impl<S, C> FromRequestParts<S> for MppCharge<C>
@@ -636,6 +886,7 @@ where
         state: &S,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
+        let mppx_scope = mppx_scope_from_parts(parts);
         let auth_header = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -646,6 +897,7 @@ where
         async move {
             let options = ChallengeOptions {
                 description: C::description(),
+                mppx_scope: mppx_scope.clone(),
             };
 
             let credential_str = match auth_header {
@@ -659,7 +911,7 @@ where
             };
 
             let receipt = match challenger
-                .verify_payment_for_amount(&credential_str, C::amount())
+                .verify_payment_for_amount_and_scope(&credential_str, C::amount(), mppx_scope)
                 .await
             {
                 Ok(r) => r,
@@ -695,6 +947,7 @@ where
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
         let (parts, body) = req.into_parts();
+        let mppx_scope = mppx_scope_from_parts(&parts);
         let auth_header = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -712,6 +965,7 @@ where
                 .to_bytes();
             let options = ChallengeOptions {
                 description: C::description(),
+                mppx_scope: mppx_scope.clone(),
             };
 
             let credential_str = match auth_header {
@@ -725,7 +979,12 @@ where
             };
 
             let receipt = match challenger
-                .verify_payment_for_amount_with_body(&credential_str, C::amount(), &body)
+                .verify_payment_for_amount_scope_and_body(
+                    &credential_str,
+                    C::amount(),
+                    mppx_scope,
+                    &body,
+                )
                 .await
             {
                 Ok(r) => r,
@@ -745,6 +1004,28 @@ where
                 _config: std::marker::PhantomData,
             })
         }
+    }
+}
+
+fn mppx_scope_from_parts(parts: &http_types::request::Parts) -> Option<serde_json::Value> {
+    let mut scope = serde_json::Map::new();
+    let path = parts.uri.path();
+    if !path.is_empty() {
+        scope.insert("route".into(), serde_json::Value::String(path.to_string()));
+        scope.insert(
+            "resource".into(),
+            serde_json::Value::String(path.to_string()),
+        );
+    }
+    if let Some(query) = parts.uri.query() {
+        if !query.is_empty() {
+            scope.insert("query".into(), serde_json::Value::String(query.to_string()));
+        }
+    }
+    if scope.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(scope))
     }
 }
 
@@ -1037,8 +1318,16 @@ mod tests {
         challenger: impl ChargeChallenger,
         auth_header: Option<&str>,
     ) -> Result<MppCharge<C>, MppChargeRejection> {
+        run_extractor_with_uri::<C>(challenger, auth_header, "/test").await
+    }
+
+    async fn run_extractor_with_uri<C: ChargeConfig>(
+        challenger: impl ChargeChallenger,
+        auth_header: Option<&str>,
+        uri: &str,
+    ) -> Result<MppCharge<C>, MppChargeRejection> {
         let state: Arc<dyn ChargeChallenger> = Arc::new(challenger);
-        let mut builder = http_types::Request::builder().uri("/test");
+        let mut builder = http_types::Request::builder().uri(uri);
         if let Some(auth) = auth_header {
             builder = builder.header(header::AUTHORIZATION, auth);
         }
@@ -1348,6 +1637,7 @@ mod tests {
                         amount,
                         crate::server::ChargeOptions {
                             description: options.description,
+                            mppx_scope: options.mppx_scope.as_ref(),
                             ..Default::default()
                         },
                     )
@@ -1392,12 +1682,65 @@ mod tests {
                         .map_err(|e| e.to_string())
                 })
             }
+
+            fn verify_payment_for_amount_and_scope(
+                &self,
+                credential_str: &str,
+                amount: &str,
+                mppx_scope: Option<serde_json::Value>,
+            ) -> std::pin::Pin<Box<dyn Future<Output = Result<Receipt, String>> + Send>>
+            {
+                let credential = match parse_authorization(credential_str) {
+                    Ok(c) => c,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                let expected = match self
+                    .mpp
+                    .charge_with_options(
+                        amount,
+                        crate::server::ChargeOptions {
+                            mppx_scope: mppx_scope.as_ref(),
+                            ..Default::default()
+                        },
+                    )
+                    .and_then(|c| c.request.decode())
+                {
+                    Ok(req) => req,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                let mpp = self.mpp.clone();
+                Box::pin(async move {
+                    mpp.verify_credential_with_expected_request(&credential, &expected)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }
         }
 
         // Mint an `Authorization: Payment …` string for the given route amount.
+        fn scope_for_uri(uri: &str) -> serde_json::Value {
+            let req = http_types::Request::builder().uri(uri).body(()).unwrap();
+            let (parts, _body) = req.into_parts();
+            mppx_scope_from_parts(&parts).unwrap()
+        }
+
         fn mint_credential(challenger: &RealBindingChallenger, amount: &str) -> String {
+            mint_scoped_credential(challenger, amount, "/test")
+        }
+
+        fn mint_scoped_credential(
+            challenger: &RealBindingChallenger,
+            amount: &str,
+            uri: &str,
+        ) -> String {
             let challenge = challenger
-                .challenge(amount, ChallengeOptions::default())
+                .challenge(
+                    amount,
+                    ChallengeOptions {
+                        mppx_scope: Some(scope_for_uri(uri)),
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
             let credential =
                 PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
@@ -1442,6 +1785,20 @@ mod tests {
                 .await
                 .expect_err("premium credential must not satisfy the cheap route");
             assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+        }
+
+        #[tokio::test]
+        async fn test_extractor_rejects_cross_resource_credential_replay() {
+            let challenger = RealBindingChallenger::new();
+            let auth =
+                mint_scoped_credential(&challenger, OneCent::amount(), "/paid/one?view=full");
+
+            let err =
+                run_extractor_with_uri::<OneCent>(challenger, Some(&auth), "/paid/two?view=full")
+                    .await
+                    .expect_err("same-price cross-resource replay must be rejected");
+            assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+            assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
         }
     }
 }

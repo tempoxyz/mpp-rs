@@ -102,4 +102,6 @@ pub struct ChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Enable fee sponsorship.
     pub fee_payer: bool,
+    /// Framework adapter route/resource/query scope.
+    pub mppx_scope: Option<&'a serde_json::Value>,
 }
