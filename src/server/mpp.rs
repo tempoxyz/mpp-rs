@@ -19,7 +19,7 @@
 use crate::error::Result;
 #[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::protocol::core::PaymentChallenge;
-use crate::protocol::core::{PaymentCredential, Receipt};
+use crate::protocol::core::{Base64UrlJson, PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, VerificationError};
 use crate::server::events::{
@@ -110,6 +110,7 @@ pub struct Mpp<M, S = ()> {
     decimals: u32,
     fee_payer: bool,
     chain_id: Option<u64>,
+    opaque: Option<Base64UrlJson>,
     events: ServerEvents,
 }
 
@@ -131,6 +132,7 @@ where
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -153,6 +155,7 @@ where
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -174,6 +177,7 @@ where
             decimals: self.decimals,
             fee_payer: self.fee_payer,
             chain_id: self.chain_id,
+            opaque: self.opaque,
             events: self.events,
         }
     }
@@ -182,6 +186,33 @@ where
     pub fn with_events(mut self, events: ServerEvents) -> Self {
         self.events = events;
         self
+    }
+
+    /// Pin the route `opaque` for issuance and verification: challenge helpers
+    /// emit it, and verification rejects any credential that doesn't match.
+    pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
+        self.opaque = Some(opaque);
+        self
+    }
+
+    /// Stamp the configured `opaque` onto an issued challenge and recompute its
+    /// HMAC id. No-op when unconfigured.
+    #[cfg(any(feature = "tempo", feature = "stripe"))]
+    fn apply_pinned_opaque(&self, mut challenge: PaymentChallenge) -> PaymentChallenge {
+        if let Some(opaque) = &self.opaque {
+            challenge.id = crate::protocol::core::compute_challenge_id(
+                &self.secret_key,
+                &challenge.realm,
+                challenge.method.as_str(),
+                challenge.intent.as_str(),
+                challenge.request.raw(),
+                challenge.expires.as_deref(),
+                challenge.digest.as_deref(),
+                Some(opaque.raw()),
+            );
+            challenge.opaque = Some(opaque.clone());
+        }
+        challenge
     }
 
     /// Get the event registry used by this payment handler.
@@ -251,6 +282,22 @@ where
         self.chain_id
     }
 
+    /// Reject unless the credential's echoed `opaque` equals the configured one.
+    fn verify_opaque(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<(), VerificationError> {
+        let configured_opaque = self.opaque.as_ref().map(|o| o.raw());
+        let echoed_opaque = credential.challenge.opaque.as_ref().map(|o| o.raw());
+        if echoed_opaque != configured_opaque {
+            return Err(VerificationError::with_code(
+                "credential opaque data does not match this route's requirements",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            ));
+        }
+        Ok(())
+    }
+
     /// Tier-2 pinned field verification.
     ///
     /// After the HMAC check (Tier 1) confirms the echoed challenge was issued
@@ -293,12 +340,7 @@ where
             ));
         }
 
-        if credential.challenge.opaque.is_some() {
-            return Err(VerificationError::with_code(
-                "credential opaque data does not match this route's requirements",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
-            ));
-        }
+        self.verify_opaque(credential)?;
 
         // Request-level core fields: currency, recipient
         if let Some(ref expected_currency) = self.currency {
@@ -460,13 +502,14 @@ where
                 request.method_details = Some(serde_json::Value::Object(details));
             }
         }
-        crate::protocol::methods::tempo::charge_challenge_with_options(
+        let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.secret_key,
             &self.realm,
             &request,
             options.expires,
             options.description,
-        )
+        )?;
+        Ok(self.apply_pinned_opaque(challenge))
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -481,13 +524,14 @@ where
         currency: &str,
         recipient: &str,
     ) -> Result<PaymentChallenge> {
-        crate::protocol::methods::tempo::charge_challenge(
+        let challenge = crate::protocol::methods::tempo::charge_challenge(
             &self.secret_key,
             &self.realm,
             amount,
             currency,
             recipient,
-        )
+        )?;
+        Ok(self.apply_pinned_opaque(challenge))
     }
 
     /// Generate a charge challenge with full options (base units).
@@ -498,13 +542,14 @@ where
         expires: Option<&str>,
         description: Option<&str>,
     ) -> Result<PaymentChallenge> {
-        crate::protocol::methods::tempo::charge_challenge_with_options(
+        let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.secret_key,
             &self.realm,
             request,
             expires,
             description,
-        )
+        )?;
+        Ok(self.apply_pinned_opaque(challenge))
     }
 
     /// Verify a payment credential (simple API).
@@ -643,7 +688,7 @@ where
             recipient: Some(recipient.to_string()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
+        let encoded = Base64UrlJson::from_typed(&request)?;
 
         let expires = {
             let expiry_time = OffsetDateTime::now_utc()
@@ -668,7 +713,7 @@ where
             None,
         );
 
-        Ok(PaymentChallenge {
+        Ok(self.apply_pinned_opaque(PaymentChallenge {
             id,
             realm: self.realm.clone(),
             method: "tempo".into(),
@@ -678,7 +723,7 @@ where
             description: None,
             digest: None,
             opaque: None,
-        })
+        }))
     }
 
     /// Generate a session challenge with method details populated from the session method.
@@ -734,7 +779,7 @@ where
             method_details,
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request)?;
+        let encoded = Base64UrlJson::from_typed(&request)?;
 
         let default_expires;
         let expires = match options.expires {
@@ -766,7 +811,7 @@ where
             None,
         );
 
-        Ok(PaymentChallenge {
+        Ok(self.apply_pinned_opaque(PaymentChallenge {
             id,
             realm: self.realm.clone(),
             method: "tempo".into(),
@@ -776,7 +821,7 @@ where
             description: options.description.map(|s| s.to_string()),
             digest: None,
             opaque: None,
-        })
+        }))
     }
 
     /// Verify a session credential.
@@ -789,6 +834,7 @@ where
         })?;
 
         self.verify_hmac_and_expiry(credential)?;
+        self.verify_opaque(credential)?;
 
         let request: crate::protocol::intents::SessionRequest =
             credential.challenge.request.decode().map_err(|e| {
@@ -895,6 +941,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(allowed_fee_tokens) = builder.fee_payer_allowed_fee_tokens {
             method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
         }
+        if let Some(store) = builder.store {
+            method = method.with_store(store);
+        }
 
         // Resolve currency from chain_id when not explicitly set
         let currency = if builder.currency_explicit {
@@ -920,6 +969,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
             chain_id: builder.chain_id,
+            opaque: None,
             events: ServerEvents::default(),
         })
     }
@@ -945,7 +995,6 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         amount: &str,
         options: super::StripeChargeOptions<'_>,
     ) -> Result<PaymentChallenge> {
-        use crate::protocol::core::Base64UrlJson;
         use time::{Duration, OffsetDateTime};
 
         use crate::protocol::methods::stripe::StripeMethodDetails;
@@ -996,7 +1045,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             None,
         );
 
-        Ok(PaymentChallenge {
+        Ok(self.apply_pinned_opaque(PaymentChallenge {
             id,
             realm: self.realm.clone(),
             method: crate::protocol::methods::stripe::METHOD_NAME.into(),
@@ -1006,7 +1055,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             description: options.description.map(|s| s.to_string()),
             digest: None,
             opaque: None,
-        })
+        }))
     }
 }
 
@@ -1065,6 +1114,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             decimals: builder.decimals as u32,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         })
     }
@@ -1174,7 +1224,7 @@ mod tests {
             realm: "api.example.com".into(),
             method: "mock".into(),
             intent: "charge".into(),
-            request: crate::protocol::core::Base64UrlJson::from_raw(request),
+            request: Base64UrlJson::from_raw(request),
             expires: Some(expires),
             digest: None,
             opaque: None,
@@ -1301,7 +1351,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
@@ -1577,6 +1627,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -1609,7 +1660,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered_request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&tampered_request).unwrap();
         echo.request = encoded;
 
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -1686,7 +1737,7 @@ mod tests {
         let challenge = mpp.charge("0.10").unwrap();
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         request.currency = "0xDEAD000000000000000000000000000000000000".into();
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1715,7 +1766,7 @@ mod tests {
         let challenge = mpp.charge("0.10").unwrap();
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         request.recipient = Some("0xDEAD000000000000000000000000000000000000".into());
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1747,7 +1798,7 @@ mod tests {
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         let md = request.method_details.get_or_insert(serde_json::json!({}));
         md["chainId"] = serde_json::json!(9999);
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1781,7 +1832,7 @@ mod tests {
         if let Some(md) = request.method_details.as_mut() {
             md.as_object_mut().unwrap().remove("chainId");
         }
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
 
         let mut echo = challenge.to_echo();
         echo.request = encoded;
@@ -1809,12 +1860,8 @@ mod tests {
         let challenge = mpp.charge("0.10").unwrap();
 
         let mut echo = challenge.to_echo();
-        echo.opaque = Some(
-            crate::protocol::core::Base64UrlJson::from_value(
-                &serde_json::json!({"route": "other"}),
-            )
-            .unwrap(),
-        );
+        echo.opaque =
+            Some(Base64UrlJson::from_value(&serde_json::json!({"route": "other"})).unwrap());
         echo.id = crate::protocol::core::compute_challenge_id(
             "test-secret",
             "MPP Payment",
@@ -1831,6 +1878,141 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("opaque"));
+    }
+
+    /// Mint a credential whose echoed `opaque` is `opaque`, with a valid HMAC
+    /// recomputed over it (all test handlers share the same realm/secret).
+    #[cfg(feature = "tempo")]
+    fn opaque_credential(opaque: Option<Base64UrlJson>) -> PaymentCredential {
+        let mut echo = create_hmac_test_mpp().charge("0.10").unwrap().to_echo();
+        echo.opaque = opaque;
+        echo.id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "charge",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"))
+    }
+
+    #[cfg(feature = "tempo")]
+    fn route_opaque() -> Base64UrlJson {
+        Base64UrlJson::from_value(&serde_json::json!({"route": "a"})).unwrap()
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_configured_match_accepted() {
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let credential = opaque_credential(Some(route_opaque()));
+
+        assert!(mpp.verify_credential(&credential).await.is_ok());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_configured_mismatch_rejected() {
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let other = Base64UrlJson::from_value(&serde_json::json!({"route": "b"})).unwrap();
+        let credential = opaque_credential(Some(other));
+
+        let err = mpp.verify_credential(&credential).await.unwrap_err();
+        assert!(err.message.contains("opaque"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_configured_but_absent_rejected() {
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let credential = opaque_credential(None);
+
+        let err = mpp.verify_credential(&credential).await.unwrap_err();
+        assert!(err.message.contains("opaque"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_pinned_opaque_charge_helper_roundtrips() {
+        // charge() emits the configured opaque, so its credential verifies.
+        let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
+        let challenge = mpp.charge("0.10").unwrap();
+        assert_eq!(
+            challenge.opaque.as_ref().map(|o| o.raw()),
+            Some(route_opaque().raw())
+        );
+
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xbeef"));
+        assert!(mpp.verify_credential(&credential).await.is_ok());
+    }
+
+    #[cfg(feature = "tempo")]
+    fn session_opaque_credential(
+        mpp: &Mpp<TempoSuccessMethod, MockSessionMethod>,
+        opaque: Option<Base64UrlJson>,
+    ) -> PaymentCredential {
+        let mut echo = mpp
+            .session_challenge(
+                "1000",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap()
+            .to_echo();
+        echo.opaque = opaque;
+        echo.id = crate::protocol::core::compute_challenge_id(
+            "test-secret",
+            "MPP Payment",
+            "tempo",
+            "session",
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(|o| o.raw()),
+        );
+        let payload_json = serde_json::json!({
+            "action": "open",
+            "type": "transaction",
+            "channelId": "0xabc",
+            "transaction": "0x1234",
+            "cumulativeAmount": "5000",
+            "signature": "0xdef"
+        });
+        PaymentCredential::new(echo, payload_json)
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_session_pinned_opaque_match_accepted() {
+        let mpp = create_session_test_mpp().with_opaque(route_opaque());
+        let credential = session_opaque_credential(&mpp, Some(route_opaque()));
+
+        assert!(mpp.verify_session(&credential).await.is_ok());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_session_pinned_opaque_mismatch_rejected() {
+        let mpp = create_session_test_mpp().with_opaque(route_opaque());
+        let other = Base64UrlJson::from_value(&serde_json::json!({"route": "b"})).unwrap();
+        let credential = session_opaque_credential(&mpp, Some(other));
+
+        let err = mpp.verify_session(&credential).await.unwrap_err();
+        assert!(err.message.contains("opaque"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_session_pinned_opaque_absent_rejected() {
+        let mpp = create_session_test_mpp().with_opaque(route_opaque());
+        let credential = session_opaque_credential(&mpp, None);
+
+        let err = mpp.verify_session(&credential).await.unwrap_err();
+        assert!(err.message.contains("opaque"));
     }
 
     #[cfg(feature = "tempo")]
@@ -2022,6 +2204,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         }
     }
@@ -2098,6 +2281,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         };
 
@@ -2141,6 +2325,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         };
 
@@ -2149,7 +2334,7 @@ mod tests {
             realm: "MPP Payment".into(),
             method: "tempo".into(),
             intent: "session".into(),
-            request: crate::protocol::core::Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
+            request: Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
             expires: None,
             digest: None,
             opaque: None,
@@ -2183,7 +2368,7 @@ mod tests {
             currency: "0x20c0000000000000000000000000000000000000".into(),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&tampered).unwrap();
+        let encoded = Base64UrlJson::from_typed(&tampered).unwrap();
         echo.request = encoded;
 
         let payload_json = serde_json::json!({
@@ -2242,6 +2427,7 @@ mod tests {
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
             chain_id: None,
+            opaque: None,
             events: ServerEvents::default(),
         };
 
@@ -2368,7 +2554,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let id = crate::protocol::methods::tempo::generate_challenge_id(
             "test-secret",
             "MPP Payment",
@@ -2618,7 +2804,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             ..Default::default()
         };
-        let encoded = crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let id = crate::protocol::methods::tempo::generate_challenge_id(
             "test-secret",
             "MPP Payment",

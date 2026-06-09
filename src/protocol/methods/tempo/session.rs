@@ -6,6 +6,44 @@ use crate::error::{MppError, Result};
 use crate::protocol::intents::SessionRequest;
 use serde::{Deserialize, Serialize};
 
+/// Legacy contract-backed Tempo session protocol marker.
+pub const SESSION_PROTOCOL_LEGACY: &str = "v1";
+
+/// TIP-1034 precompile-backed Tempo session protocol marker.
+pub const SESSION_PROTOCOL_TIP1034: &str = "v2";
+
+/// Full TIP-1034 channel descriptor used to derive and verify a channel ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDescriptor {
+    pub payer: String,
+    pub payee: String,
+    pub operator: String,
+    pub token: String,
+    pub salt: String,
+    pub authorized_signer: String,
+    pub expiring_nonce_hash: String,
+}
+
+/// Server-provided reusable TIP-1034 channel state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    pub accepted_cumulative: String,
+    pub chain_id: u64,
+    pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close_requested_at: Option<String>,
+    pub deposit: String,
+    pub descriptor: ChannelDescriptor,
+    pub escrow: String,
+    pub required_cumulative: String,
+    pub settled: String,
+    pub spent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<u64>,
+}
+
 /// Custom deserializer that only accepts the literal string "transaction".
 fn deserialize_transaction_literal<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -36,6 +74,9 @@ where
 ///     min_voucher_delta: Some("1000".to_string()),
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
+///     operator: None,
+///     session_protocol: None,
+///     session_snapshot: None,
 /// };
 /// assert_eq!(details.escrow_contract, "0x1234567890abcdef1234567890abcdef12345678");
 /// ```
@@ -55,6 +96,15 @@ pub struct TempoSessionMethodDetails {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_payer: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_protocol: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_snapshot: Option<SessionSnapshot>,
 }
 
 /// Session credential payload, discriminated on the `action` field.
@@ -84,6 +134,8 @@ pub enum SessionCredentialPayload {
         #[serde(rename = "channelId")]
         channel_id: String,
         transaction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        descriptor: Option<ChannelDescriptor>,
         #[serde(rename = "authorizedSigner", skip_serializing_if = "Option::is_none")]
         authorized_signer: Option<String>,
         #[serde(rename = "cumulativeAmount")]
@@ -97,6 +149,8 @@ pub enum SessionCredentialPayload {
         #[serde(rename = "channelId")]
         channel_id: String,
         transaction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        descriptor: Option<ChannelDescriptor>,
         #[serde(rename = "additionalDeposit")]
         additional_deposit: String,
     },
@@ -104,6 +158,8 @@ pub enum SessionCredentialPayload {
     Voucher {
         #[serde(rename = "channelId")]
         channel_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        descriptor: Option<ChannelDescriptor>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
         signature: String,
@@ -112,6 +168,8 @@ pub enum SessionCredentialPayload {
     Close {
         #[serde(rename = "channelId")]
         channel_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        descriptor: Option<ChannelDescriptor>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
         signature: String,
@@ -156,6 +214,18 @@ pub trait TempoSessionExt {
 
     /// Check if fee sponsorship is enabled.
     fn fee_payer(&self) -> bool;
+
+    /// Get the TIP-1034 operator address from methodDetails, if present.
+    fn operator(&self) -> Option<String>;
+
+    /// Get the session protocol version marker from methodDetails, if present.
+    fn session_protocol(&self) -> Option<String>;
+
+    /// Whether methodDetails explicitly requests the TIP-1034 session protocol.
+    fn is_tip1034_session(&self) -> bool;
+
+    /// Get the reusable TIP-1034 session snapshot from methodDetails, if present.
+    fn session_snapshot(&self) -> Option<SessionSnapshot>;
 
     /// Parse the method_details as Tempo session-specific details.
     fn tempo_session_details(&self) -> Result<TempoSessionMethodDetails>;
@@ -209,6 +279,33 @@ impl TempoSessionExt for SessionRequest {
             .unwrap_or(false)
     }
 
+    fn operator(&self) -> Option<String> {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("operator"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn session_protocol(&self) -> Option<String> {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("sessionProtocol"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn is_tip1034_session(&self) -> bool {
+        self.session_protocol().as_deref() == Some(SESSION_PROTOCOL_TIP1034)
+    }
+
+    fn session_snapshot(&self) -> Option<SessionSnapshot> {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("sessionSnapshot"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
     fn tempo_session_details(&self) -> Result<TempoSessionMethodDetails> {
         match &self.method_details {
             Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
@@ -245,7 +342,9 @@ mod tests {
                 "channelId": "0xchannel123",
                 "minVoucherDelta": "500",
                 "chainId": 42431,
-                "feePayer": true
+                "feePayer": true,
+                "operator": "0x1111111111111111111111111111111111111111",
+                "sessionProtocol": SESSION_PROTOCOL_TIP1034
             })),
             ..Default::default()
         }
@@ -261,6 +360,9 @@ mod tests {
             min_voucher_delta: Some("1000".to_string()),
             chain_id: Some(42431),
             fee_payer: Some(true),
+            operator: Some("0x1111111111111111111111111111111111111111".to_string()),
+            session_protocol: Some(SESSION_PROTOCOL_TIP1034.to_string()),
+            session_snapshot: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
@@ -276,6 +378,14 @@ mod tests {
         assert_eq!(parsed.min_voucher_delta.as_deref(), Some("1000"));
         assert_eq!(parsed.chain_id, Some(42431));
         assert_eq!(parsed.fee_payer, Some(true));
+        assert_eq!(
+            parsed.operator.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            parsed.session_protocol.as_deref(),
+            Some(SESSION_PROTOCOL_TIP1034)
+        );
     }
 
     #[test]
@@ -286,6 +396,9 @@ mod tests {
             min_voucher_delta: None,
             chain_id: None,
             fee_payer: None,
+            operator: None,
+            session_protocol: None,
+            session_snapshot: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
@@ -294,6 +407,9 @@ mod tests {
         assert!(!json.contains("minVoucherDelta"));
         assert!(!json.contains("chainId"));
         assert!(!json.contains("feePayer"));
+        assert!(!json.contains("operator"));
+        assert!(!json.contains("sessionProtocol"));
+        assert!(!json.contains("sessionSnapshot"));
     }
 
     // ==================== SessionCredentialPayload Tests ====================
@@ -304,6 +420,7 @@ mod tests {
             payload_type: "transaction".to_string(),
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx456".to_string(),
+            descriptor: None,
             authorized_signer: Some("0xsigner789".to_string()),
             cumulative_amount: "10000".to_string(),
             signature: "0xsig".to_string(),
@@ -340,6 +457,7 @@ mod tests {
             payload_type: "transaction".to_string(),
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx456".to_string(),
+            descriptor: None,
             authorized_signer: None,
             cumulative_amount: "10000".to_string(),
             signature: "0xsig".to_string(),
@@ -365,6 +483,7 @@ mod tests {
             payload_type: "transaction".to_string(),
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx789".to_string(),
+            descriptor: None,
             additional_deposit: "5000".to_string(),
         };
 
@@ -395,6 +514,7 @@ mod tests {
     fn test_voucher_payload_serialization() {
         let payload = SessionCredentialPayload::Voucher {
             channel_id: "0xchannel123".to_string(),
+            descriptor: None,
             cumulative_amount: "15000".to_string(),
             signature: "0xvouchersig".to_string(),
         };
@@ -411,10 +531,12 @@ mod tests {
         match parsed {
             SessionCredentialPayload::Voucher {
                 channel_id,
+                descriptor,
                 cumulative_amount,
                 signature,
             } => {
                 assert_eq!(channel_id, "0xchannel123");
+                assert!(descriptor.is_none());
                 assert_eq!(cumulative_amount, "15000");
                 assert_eq!(signature, "0xvouchersig");
             }
@@ -426,6 +548,7 @@ mod tests {
     fn test_close_payload_serialization() {
         let payload = SessionCredentialPayload::Close {
             channel_id: "0xchannel123".to_string(),
+            descriptor: None,
             cumulative_amount: "20000".to_string(),
             signature: "0xclosesig".to_string(),
         };
@@ -440,10 +563,12 @@ mod tests {
         match parsed {
             SessionCredentialPayload::Close {
                 channel_id,
+                descriptor,
                 cumulative_amount,
                 signature,
             } => {
                 assert_eq!(channel_id, "0xchannel123");
+                assert!(descriptor.is_none());
                 assert_eq!(cumulative_amount, "20000");
                 assert_eq!(signature, "0xclosesig");
             }

@@ -34,7 +34,7 @@ pub fn compute_precompile_channel_id(
     expiring_nonce_hash: B256,
     chain_id: u64,
 ) -> B256 {
-    let encoded = (
+    compute_precompile_channel_id_with_escrow(
         payer,
         payee,
         operator,
@@ -43,6 +43,33 @@ pub fn compute_precompile_channel_id(
         authorized_signer,
         expiring_nonce_hash,
         TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+}
+
+/// Compute a TIP-1034 channel id with an explicit escrow/precompile address.
+#[cfg(feature = "tempo")]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_precompile_channel_id_with_escrow(
+    payer: Address,
+    payee: Address,
+    operator: Address,
+    token: Address,
+    salt: B256,
+    authorized_signer: Address,
+    expiring_nonce_hash: B256,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> B256 {
+    let encoded = (
+        payer,
+        payee,
+        operator,
+        token,
+        salt,
+        authorized_signer,
+        expiring_nonce_hash,
+        escrow_contract,
         U256::from(chain_id),
     )
         .abi_encode();
@@ -53,7 +80,7 @@ pub fn compute_precompile_channel_id(
 alloy::sol! {
     /// EIP-712 voucher struct. `uint96` (legacy escrow uses `uint128`).
     #[derive(Debug)]
-    struct PrecompileVoucher {
+    struct Voucher {
         bytes32 channelId;
         uint96 cumulativeAmount;
     }
@@ -62,6 +89,51 @@ alloy::sol! {
 /// Maximum cumulative amount the precompile accepts (2^96 − 1).
 #[cfg(feature = "tempo")]
 pub const PRECOMPILE_MAX_CUMULATIVE_AMOUNT: u128 = (1u128 << 96) - 1;
+
+/// Compute the TIP-1034 EIP-712 voucher signing hash.
+#[cfg(feature = "tempo")]
+pub fn precompile_voucher_signing_hash(
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<B256> {
+    precompile_voucher_signing_hash_with_escrow(
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+}
+
+/// Compute the TIP-1034 EIP-712 voucher signing hash with an explicit
+/// escrow/precompile verifier.
+#[cfg(feature = "tempo")]
+pub fn precompile_voucher_signing_hash_with_escrow(
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<B256> {
+    if cumulative_amount > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
+        return Err(MppError::InvalidConfig(format!(
+            "cumulative_amount {cumulative_amount} exceeds precompile uint96 max"
+        )));
+    }
+
+    let domain = eip712_domain! {
+        name: PRECOMPILE_DOMAIN_NAME,
+        version: PRECOMPILE_DOMAIN_VERSION,
+        chain_id: chain_id,
+        verifying_contract: escrow_contract,
+    };
+
+    let voucher = Voucher {
+        channelId: channel_id,
+        cumulativeAmount: Uint::<96, 2>::from(cumulative_amount),
+    };
+
+    Ok(voucher.eip712_signing_hash(&domain))
+}
 
 /// Sign a TIP-1034 voucher (EIP-712). Returns 65-byte ECDSA signature.
 /// Rejects `cumulative_amount > PRECOMPILE_MAX_CUMULATIVE_AMOUNT` with
@@ -73,25 +145,31 @@ pub async fn sign_precompile_voucher(
     cumulative_amount: u128,
     chain_id: u64,
 ) -> Result<Bytes> {
-    if cumulative_amount > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
-        return Err(MppError::InvalidConfig(format!(
-            "cumulative_amount {cumulative_amount} exceeds precompile uint96 max"
-        )));
-    }
+    sign_precompile_voucher_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await
+}
 
-    let domain = eip712_domain! {
-        name: PRECOMPILE_DOMAIN_NAME,
-        version: PRECOMPILE_DOMAIN_VERSION,
-        chain_id: chain_id,
-        verifying_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
-    };
-
-    let voucher = PrecompileVoucher {
-        channelId: channel_id,
-        cumulativeAmount: Uint::<96, 2>::from(cumulative_amount),
-    };
-
-    let signing_hash = voucher.eip712_signing_hash(&domain);
+/// Sign a TIP-1034 voucher with an explicit escrow/precompile verifier.
+#[cfg(feature = "tempo")]
+pub async fn sign_precompile_voucher_with_escrow(
+    signer: &impl Signer,
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<Bytes> {
+    let signing_hash = precompile_voucher_signing_hash_with_escrow(
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )?;
     let signature = signer.sign_hash(&signing_hash).await.map_err(|e| {
         MppError::InvalidSignature(Some(format!("failed to sign precompile voucher: {e}")))
     })?;
@@ -202,6 +280,41 @@ mod tests {
     }
 
     #[cfg(feature = "tempo")]
+    #[test]
+    fn compute_precompile_channel_id_matches_mppx_golden() {
+        let channel_id = compute_precompile_channel_id_with_escrow(
+            "0x3d6885f89100445ca9869d1b0a49c97cfdbafeee"
+                .parse()
+                .unwrap(),
+            "0xda2390fEE8d9744b39A8A855675649e95617aCd8"
+                .parse()
+                .unwrap(),
+            Address::ZERO,
+            "0x20C0000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+            "0xfb05173ba9285aef8a91f275930f68ad3565a491edb810c07baa60b643fdd378"
+                .parse()
+                .unwrap(),
+            "0xFE9d3D9cBb5f6FBe495b03f7Ec90d4Adc22126f5"
+                .parse()
+                .unwrap(),
+            "0x4e40183cda8c676032af4f7b038178505d877ae1c36b374239fe20ac3485c3ab"
+                .parse()
+                .unwrap(),
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+
+        assert_eq!(
+            channel_id,
+            "0xb3946b996bd166db3b61fba0f6af2918b6687bc054e2f4bae979edffc7bd0b4d"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn sign_precompile_voucher_roundtrips_via_eip712() {
         use alloy::primitives::{Bytes, B256};
@@ -225,7 +338,7 @@ mod tests {
             chain_id: chain_id,
             verifying_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
         };
-        let voucher = PrecompileVoucher {
+        let voucher = Voucher {
             channelId: channel_id,
             cumulativeAmount: alloy::primitives::Uint::<96, 2>::from(cumulative),
         };
@@ -233,6 +346,36 @@ mod tests {
         let parsed = alloy::signers::Signature::try_from(sig.as_ref()).unwrap();
         let recovered = parsed.recover_address_from_prehash(&hash).unwrap();
         assert_eq!(recovered, signer.address());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn precompile_voucher_signing_hash_matches_tip1034_golden() {
+        let channel_id: B256 = "0x57e629663a75a0a49f8dc65c9f62ee38ab5dfa9124d7316d160766e4ecbc1227"
+            .parse()
+            .unwrap();
+        let hash = precompile_voucher_signing_hash(channel_id, 50, 42431).unwrap();
+        let expected: B256 = "0x41a23f1573d302acae1dcec60d237f78d2514768faf670ef27458931c38b5db3"
+            .parse()
+            .unwrap();
+        assert_eq!(hash, expected);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn precompile_voucher_signing_hash_binds_explicit_escrow() {
+        let channel_id = B256::repeat_byte(0x42);
+        let canonical =
+            precompile_voucher_signing_hash(channel_id, 50, 42431).expect("canonical hash");
+        let custom = precompile_voucher_signing_hash_with_escrow(
+            channel_id,
+            50,
+            Address::repeat_byte(0x11),
+            42431,
+        )
+        .expect("custom hash");
+
+        assert_ne!(canonical, custom);
     }
 
     #[cfg(feature = "tempo")]

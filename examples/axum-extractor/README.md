@@ -66,3 +66,4 @@ async fn expensive(charge: MppCharge<OneDollar>) -> WithReceipt<&'static str> {
 | `PRIVATE_KEY` | Random | Client's private key (hex, with or without `0x` prefix) |
 | `BASE_URL` | `http://localhost:3000` | Client's base URL for the server |
 | `RPC_URL` | `https://rpc.moderato.tempo.xyz` | Tempo RPC endpoint |
+| `MPP_SECRET_KEY` | `axum-example-secret` | Server secret key for challenge verification |
