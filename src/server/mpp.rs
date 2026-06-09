@@ -938,6 +938,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(signer) = builder.fee_payer_signer {
             method = method.with_fee_payer(signer);
         }
+        if let Some(store) = builder.store {
+            method = method.with_store(store);
+        }
 
         // Resolve currency from chain_id when not explicitly set
         let currency = if builder.currency_explicit {
