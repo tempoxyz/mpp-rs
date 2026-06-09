@@ -313,6 +313,9 @@ where
                 channel_id: None,
                 min_voucher_delta: None,
                 fee_payer: None,
+                operator: None,
+                session_protocol: None,
+                session_snapshot: None,
             }),
         }
     }
@@ -748,6 +751,7 @@ where
                 channel_id,
                 cumulative_amount,
                 signature,
+                ..
             } => (channel_id, cumulative_amount, signature),
             _ => unreachable!(),
         };
@@ -865,6 +869,7 @@ where
                 channel_id,
                 cumulative_amount,
                 signature,
+                ..
             } => (channel_id, cumulative_amount, signature),
             _ => unreachable!(),
         };
@@ -1231,6 +1236,9 @@ where
             min_voucher_delta: Some(self.config.min_voucher_delta.to_string()),
             channel_id: None,
             fee_payer: None,
+            operator: None,
+            session_protocol: None,
+            session_snapshot: None,
         };
         serde_json::to_value(details).ok()
     }
@@ -2800,6 +2808,7 @@ mod tests {
             "0x3333333333333333333333333333333333333333",
             SessionCredentialPayload::Voucher {
                 channel_id,
+                descriptor: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2837,6 +2846,7 @@ mod tests {
             "0x3333333333333333333333333333333333333333", // matches stored token
             SessionCredentialPayload::Voucher {
                 channel_id,
+                descriptor: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2875,6 +2885,7 @@ mod tests {
             "0x9999999999999999999999999999999999999999",       // wrong token
             SessionCredentialPayload::Voucher {
                 channel_id,
+                descriptor: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2911,6 +2922,7 @@ mod tests {
             "0x3333333333333333333333333333333333333333",
             SessionCredentialPayload::Close {
                 channel_id,
+                descriptor: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2948,6 +2960,7 @@ mod tests {
             SessionCredentialPayload::TopUp {
                 payload_type: "transaction".to_string(),
                 channel_id,
+                descriptor: None,
                 additional_deposit: "5000".to_string(),
                 transaction: format!("0x{}", "bb".repeat(32)),
             },

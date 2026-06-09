@@ -565,10 +565,11 @@ where
         self
     }
 
-    /// Configure a store for transaction hash deduplication.
+    /// Configure a store for replay deduplication.
     ///
     /// When set, each verified transaction hash is recorded and subsequent
-    /// attempts to replay the same hash are rejected.
+    /// attempts to replay the same hash are rejected. Zero-amount proof
+    /// credentials are likewise made single-use per credential fingerprint.
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
@@ -891,6 +892,7 @@ where
         if let Some(store) = &self.store {
             let tx_hash_pre = keccak256(&final_tx_bytes);
             let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
+            // Atomically reserve before broadcasting.
             let claimed = store
                 .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
@@ -906,7 +908,7 @@ where
         // receipt. The Tempo node holds the connection open until the transaction
         // is mined/pre-confirmed and returns the full receipt, avoiding the
         // client-side polling loop of send_raw_transaction + get_receipt.
-        let raw_hex = format!("0x{}", alloy::primitives::hex::encode(&final_tx_bytes));
+        let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
         let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
             .provider
             .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
@@ -926,7 +928,9 @@ where
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
 
-        // Atomically claim the on-chain tx hash for replay protection.
+        // Record the on-chain tx hash for hash-based replay protection. Use the
+        // atomic claim so a concurrent hash credential for the same tx cannot
+        // also succeed.
         if let Some(store) = &self.store {
             let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
             let claimed = store
@@ -1000,11 +1004,8 @@ where
             ));
         }
 
-        if !tx.access_list.is_empty() {
-            return Err(VerificationError::new(
-                "Fee payer transaction must not include an access list",
-            ));
-        }
+        // Stripped by `to_recoverable_signed`; guard against regression.
+        debug_assert!(tx.access_list.is_empty());
 
         if tx.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
             return Err(VerificationError::new(
@@ -1259,6 +1260,30 @@ where
                     if key_info.expiry == 0 || key_info.isRevoked || key_info.expiry <= now_secs {
                         return Err(VerificationError::new(
                             "Proof signature does not match source.",
+                        ));
+                    }
+                }
+
+                // Single-use: atomically reserve a canonical credential
+                // fingerprint after verifying.
+                if let Some(store) = &this.store {
+                    let fingerprint = proof::proof_fingerprint(
+                        &credential.challenge.id,
+                        parsed_source.address,
+                        parsed_source.chain_id,
+                        sig_hex,
+                    )
+                    .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
+                    let replay_key = format!("mpp:proof:{:x}", fingerprint);
+                    let reserved = store
+                        .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+                        .await
+                        .map_err(|e| {
+                            VerificationError::new(format!("Failed to record proof: {e}"))
+                        })?;
+                    if !reserved {
+                        return Err(VerificationError::new(
+                            "Proof credential has already been used.",
                         ));
                     }
                 }
@@ -2282,9 +2307,10 @@ mod tests {
         );
     }
 
-    /// cosign_fee_payer_transaction rejects txs with non-empty access lists.
+    /// A client that signs over a non-empty access list fails recovery
+    /// (sponsor strips before ecrecover → recovered ≠ envelope.sender).
     #[test]
-    fn test_cosign_rejects_non_empty_access_list() {
+    fn test_cosign_rejects_access_list_signed_by_client() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token: Address = "0x20c0000000000000000000000000000000000000"
@@ -2312,10 +2338,10 @@ mod tests {
             fee_token,
         );
 
-        let err = result.expect_err("should reject access list");
+        let err = result.expect_err("malicious access-list signature must not cosign");
         assert!(
-            err.to_string().contains("access list"),
-            "error should mention access list, got: {err}"
+            err.to_string().to_lowercase().contains("sender mismatch"),
+            "expected sender mismatch, got: {err}"
         );
     }
 
@@ -2542,6 +2568,189 @@ mod tests {
         // Original hash should still be blocked
         let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
         assert!(seen.is_some(), "original hash should still be recorded");
+    }
+
+    #[tokio::test]
+    async fn test_proof_credential_replay_rejected() {
+        use crate::store::MemoryStore;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store.clone());
+        // Pre-cache the chain id so verify() needs no RPC; Direct-mode proof
+        // verification is purely cryptographic.
+        method.cached_chain_id.set(42431).unwrap();
+
+        // First submission succeeds and records the proof fingerprint.
+        let receipt = method.verify(&credential, &request).await.unwrap();
+        assert_eq!(receipt.reference, challenge.id);
+        let fingerprint =
+            proof::proof_fingerprint(&challenge.id, signer.address(), 42431, &signature).unwrap();
+        let key = format!("mpp:proof:{:x}", fingerprint);
+        assert!(store.get(&key).await.unwrap().is_some());
+
+        // Replaying the identical credential is rejected.
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert!(err.to_string().contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn test_proof_credential_replay_rejected_across_spellings() {
+        use crate::store::MemoryStore;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+        );
+
+        // Re-encode the same proof: uppercase signature hex + lowercased source
+        // address. Semantically identical, so it must hit the same replay key.
+        let upper_sig = signature.to_uppercase().replace("0X", "0x");
+        let lower_source = format!("did:pkh:eip155:42431:0x{:x}", signer.address());
+        assert_ne!(
+            signature, upper_sig,
+            "test must actually mutate the spelling"
+        );
+        let credential_variant = PaymentCredential::with_source(
+            challenge.to_echo(),
+            lower_source,
+            crate::protocol::core::PaymentPayload::proof(upper_sig),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store);
+        method.cached_chain_id.set(42431).unwrap();
+
+        method.verify(&credential, &request).await.unwrap();
+
+        // Re-encoded variant of the same proof is rejected as a replay.
+        let err = method
+            .verify(&credential_variant, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already been used"),
+            "re-encoded proof must hit the same replay key, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_proof_submissions_only_one_succeeds() {
+        use crate::store::{MemoryStore, Store, StoreError};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::time::Duration;
+
+        // Delays the claim so both verifiers reach `put_if_absent` together.
+        struct SlowStore {
+            inner: MemoryStore,
+            delay: Duration,
+        }
+        impl Store for SlowStore {
+            fn get(
+                &self,
+                key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                self.inner.get(key)
+            }
+            fn put(
+                &self,
+                key: &str,
+                value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                self.inner.put(key, value)
+            }
+            fn delete(
+                &self,
+                key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                self.inner.delete(key)
+            }
+            fn put_if_absent(
+                &self,
+                key: &str,
+                value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+                let key = key.to_string();
+                let delay = self.delay;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    self.inner.put_if_absent(&key, value).await
+                })
+            }
+        }
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(SlowStore {
+            inner: MemoryStore::new(),
+            delay: Duration::from_millis(50),
+        });
+        let method = ChargeMethod::new(provider).with_store(store);
+        method.cached_chain_id.set(42431).unwrap();
+
+        let m1 = method.clone();
+        let c1 = credential.clone();
+        let r1 = request.clone();
+        let t1 = tokio::spawn(async move { m1.verify(&c1, &r1).await });
+        let m2 = method.clone();
+        let c2 = credential.clone();
+        let r2 = request.clone();
+        let t2 = tokio::spawn(async move { m2.verify(&c2, &r2).await });
+
+        let res1 = t1.await.unwrap();
+        let res2 = t2.await.unwrap();
+
+        let successes = [res1.is_ok(), res2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent proof submission must succeed"
+        );
+        let err = res1.err().or(res2.err()).unwrap();
+        assert!(err.to_string().contains("already been used"));
     }
 
     // ==================== Chain ID caching tests ====================
@@ -2839,5 +3048,76 @@ mod tests {
             moderato.max_validity_window_seconds,
             tempo_mainnet.max_validity_window_seconds
         );
+    }
+
+    /// Sponsor MUST strip an attacker-injected wire access list: an honest
+    /// client signature over an empty-access-list tx is still cosigned, and
+    /// the broadcast 0x76 carries an empty access list.
+    #[test]
+    fn test_cosign_strips_tampered_access_list() {
+        use alloy::eips::eip2930::{AccessList, AccessListItem};
+        use alloy::eips::Decodable2718;
+        use alloy::primitives::B256;
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+
+        use crate::protocol::methods::tempo::FeePayerEnvelope78;
+
+        let client_signer = PrivateKeySigner::random();
+        let fee_payer_signer = PrivateKeySigner::random();
+        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+
+        // Honest tx with empty access list, signed by the client.
+        let tx = make_fee_payer_tx(60);
+        let signature: tempo_primitives::transaction::TempoSignature = client_signer
+            .sign_hash_sync(&tx.signature_hash())
+            .unwrap()
+            .into();
+
+        // Build envelope directly (from_signing_tx would strip) and inject
+        // an attacker-controlled access list into the wire field.
+        let envelope = FeePayerEnvelope78 {
+            chain_id: tx.chain_id,
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+            max_fee_per_gas: tx.max_fee_per_gas,
+            gas_limit: tx.gas_limit,
+            calls: tx.calls.clone(),
+            access_list: AccessList(vec![AccessListItem {
+                address: Address::repeat_byte(0xaa),
+                storage_keys: vec![B256::ZERO],
+            }]),
+            nonce_key: tx.nonce_key,
+            nonce: tx.nonce,
+            valid_before: tx.valid_before.map(|v| v.get()),
+            valid_after: tx.valid_after.map(|v| v.get()),
+            fee_token: tx.fee_token,
+            sender: client_signer.address(),
+            tempo_authorization_list: tx.tempo_authorization_list.clone(),
+            key_authorization: tx.key_authorization.clone(),
+            signature,
+        };
+        let envelope_bytes = envelope.encoded_envelope();
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let cosigned = method
+            .cosign_fee_payer_transaction(
+                &envelope_bytes,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("sponsor must cosign tampered envelope");
+
+        let signed = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        assert!(
+            signed.tx().access_list.is_empty(),
+            "broadcast tx must have empty access list"
+        );
+        assert_eq!(signed.tx().fee_token, Some(fee_token));
     }
 }

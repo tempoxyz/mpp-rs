@@ -33,6 +33,7 @@ pub struct TempoBuilder {
     pub(crate) fee_payer: bool,
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
+    pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
 }
 
 impl TempoBuilder {
@@ -100,6 +101,20 @@ impl TempoBuilder {
         self.fee_payer_signer = Some(signer);
         self
     }
+
+    /// Set the replay-protection store (default: in-memory).
+    ///
+    /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
+    pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Disable replay-protection storage (removes the default in-memory store).
+    pub fn without_store(mut self) -> Self {
+        self.store = None;
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -152,6 +167,8 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer: false,
         chain_id: None,
         fee_payer_signer: None,
+        // Default in-memory store; replay protection on by default.
+        store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
     }
 }
 
@@ -196,3 +213,37 @@ pub type TempoProvider = alloy::providers::fillers::FillProvider<
     alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
     tempo_alloy::TempoNetwork,
 >;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tempo_builder_defaults_to_a_store() {
+        // Replay protection must be active on the default server path.
+        let builder = tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        });
+        assert!(
+            builder.store.is_some(),
+            "default builder should configure a replay-protection store"
+        );
+    }
+
+    #[test]
+    fn tempo_builder_store_override_and_opt_out() {
+        let custom: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::MemoryStore::new());
+        let builder = tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        })
+        .store(custom.clone());
+        assert!(builder.store.is_some());
+
+        let builder = builder.without_store();
+        assert!(
+            builder.store.is_none(),
+            "without_store() should clear the configured store"
+        );
+    }
+}

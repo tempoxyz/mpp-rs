@@ -99,6 +99,8 @@
 pub mod charge;
 pub mod fee_payer_envelope;
 pub mod network;
+#[cfg(feature = "tempo")]
+pub mod precompile_voucher;
 pub(crate) mod proof;
 pub mod session;
 pub mod session_receipt;
@@ -125,6 +127,13 @@ pub use session_receipt as stream_receipt;
 /// Deprecated: use [`SessionReceipt`] instead. Remove in next major version.
 #[deprecated(since = "0.5.0", note = "renamed to SessionReceipt")]
 pub type StreamReceipt = SessionReceipt;
+#[cfg(feature = "tempo")]
+pub use precompile_voucher::{
+    compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
+    precompile_voucher_signing_hash, precompile_voucher_signing_hash_with_escrow,
+    sign_precompile_voucher, sign_precompile_voucher_with_escrow, PRECOMPILE_DOMAIN_NAME,
+    PRECOMPILE_DOMAIN_VERSION, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
+};
 pub use transaction::{
     Call, SignatureType, TempoTransaction, TempoTransactionRequest, TEMPO_SEND_TRANSACTION_METHOD,
     TEMPO_TX_TYPE_ID,

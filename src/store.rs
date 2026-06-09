@@ -35,8 +35,10 @@ pub trait Store: Send + Sync {
 
     /// Atomically store `value` only if `key` is absent; returns `true` if inserted.
     ///
-    /// Defaults to fail closed with [`StoreError::AtomicUnsupported`]; backends
-    /// must override with native atomics (Redis `SET NX`, SQL unique insert, CAS).
+    /// A generic `get`-then-`put` is racy, so the default **fails closed** with
+    /// [`StoreError::AtomicUnsupported`]. Backends used for replay protection
+    /// must override this with native atomics (Redis `SET NX`, SQL
+    /// `ON CONFLICT DO NOTHING`, CAS, etc.).
     fn put_if_absent(
         &self,
         _key: &str,
@@ -124,11 +126,12 @@ impl Store for MemoryStore {
         key: &str,
         value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let key = key.to_string();
         let serialized =
             serde_json::to_string(&value).map_err(|e| StoreError::Serialization(e.to_string()));
-        let key = key.to_string();
         Box::pin(async move {
             let serialized = serialized?;
+            // Check-and-insert under one mutex guard.
             let mut data = self.data.lock().unwrap();
             if data.contains_key(&key) {
                 return Ok(false);
@@ -232,6 +235,7 @@ impl Store for FileStore {
         Box::pin(async move {
             let serialized = serde_json::to_string_pretty(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            // `create_new` is an atomic O_EXCL create: fails if the file exists.
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -428,6 +432,25 @@ mod tests {
 
         // Delete missing key is a no-op
         store.delete("nonexistent").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_store_put_if_absent() {
+        let store = MemoryStore::new();
+
+        // First reservation succeeds.
+        assert!(store
+            .put_if_absent("k", serde_json::json!(true))
+            .await
+            .unwrap());
+        assert_eq!(store.get("k").await.unwrap(), Some(serde_json::json!(true)));
+
+        // Second reservation of the same key fails and does not overwrite.
+        assert!(!store
+            .put_if_absent("k", serde_json::json!("other"))
+            .await
+            .unwrap());
+        assert_eq!(store.get("k").await.unwrap(), Some(serde_json::json!(true)));
     }
 
     #[tokio::test]

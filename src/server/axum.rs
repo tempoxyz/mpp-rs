@@ -912,4 +912,171 @@ mod tests {
         assert_eq!(charge.receipt.reference, "0xroute-aware");
         assert_eq!(seen_amount.lock().unwrap().as_deref(), Some("0.01"));
     }
+
+    // Framework route-replay conformance: exercise the real extractor
+    // (`MppCharge<C>`) and per-route amount selection against the production
+    // binding logic, matching the two-price axum-extractor example.
+    #[cfg(feature = "tempo")]
+    mod route_replay {
+        use super::*;
+        use crate::protocol::core::headers::format_authorization;
+        use crate::protocol::core::{PaymentCredential, PaymentPayload};
+        use crate::protocol::intents::ChargeRequest;
+        use crate::protocol::traits::VerificationError;
+        use crate::server::{ChargeMethod, Mpp};
+        use std::future::Future;
+
+        #[derive(Debug)]
+        struct OneDollar;
+        impl ChargeConfig for OneDollar {
+            fn amount() -> &'static str {
+                "1.00"
+            }
+        }
+
+        // Chain-free charge method so verification never needs RPC.
+        #[derive(Clone)]
+        struct SuccessMethod;
+
+        #[allow(clippy::manual_async_fn)]
+        impl ChargeMethod for SuccessMethod {
+            fn method(&self) -> &str {
+                "tempo"
+            }
+            fn verify(
+                &self,
+                _credential: &PaymentCredential,
+                _request: &ChargeRequest,
+            ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+                async { Ok(Receipt::success("tempo", "0xtxhash")) }
+            }
+        }
+
+        // Faithful challenger delegating to the production binding logic.
+        #[derive(Clone)]
+        struct RealBindingChallenger {
+            mpp: Mpp<SuccessMethod>,
+        }
+
+        impl RealBindingChallenger {
+            fn new() -> Self {
+                Self {
+                    mpp: Mpp::new_with_config(
+                        SuccessMethod,
+                        "MPP Payment",
+                        "test-secret",
+                        "0x20c0000000000000000000000000000000000000",
+                        "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                    ),
+                }
+            }
+        }
+
+        impl ChargeChallenger for RealBindingChallenger {
+            fn challenge(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                self.mpp
+                    .charge_with_options(
+                        amount,
+                        crate::server::ChargeOptions {
+                            description: options.description,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+            }
+
+            fn verify_payment(
+                &self,
+                credential_str: &str,
+            ) -> std::pin::Pin<Box<dyn Future<Output = Result<Receipt, String>> + Send>>
+            {
+                let credential = match parse_authorization(credential_str) {
+                    Ok(c) => c,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                let mpp = self.mpp.clone();
+                Box::pin(async move {
+                    mpp.verify_credential(&credential)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }
+
+            fn verify_payment_for_amount(
+                &self,
+                credential_str: &str,
+                amount: &str,
+            ) -> std::pin::Pin<Box<dyn Future<Output = Result<Receipt, String>> + Send>>
+            {
+                let credential = match parse_authorization(credential_str) {
+                    Ok(c) => c,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                let expected = match self.mpp.charge(amount).and_then(|c| c.request.decode()) {
+                    Ok(req) => req,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                let mpp = self.mpp.clone();
+                Box::pin(async move {
+                    mpp.verify_credential_with_expected_request(&credential, &expected)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }
+        }
+
+        // Mint an `Authorization: Payment …` string for the given route amount.
+        fn mint_credential(challenger: &RealBindingChallenger, amount: &str) -> String {
+            let challenge = challenger
+                .challenge(amount, ChallengeOptions::default())
+                .unwrap();
+            let credential =
+                PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+            format_authorization(&credential).unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_extractor_accepts_credential_on_matching_route() {
+            let challenger = RealBindingChallenger::new();
+            let auth = mint_credential(&challenger, OneCent::amount());
+
+            let charge = run_extractor::<OneCent>(challenger, Some(&auth))
+                .await
+                .expect("credential minted for the route must verify");
+            assert_eq!(charge.receipt.reference, "0xtxhash");
+        }
+
+        #[tokio::test]
+        async fn test_extractor_rejects_cross_route_credential_replay() {
+            let challenger = RealBindingChallenger::new();
+            // Mint for the cheap route, replay on the expensive route.
+            let auth = mint_credential(&challenger, OneCent::amount());
+
+            let err = run_extractor::<OneDollar>(challenger, Some(&auth))
+                .await
+                .expect_err("cross-route replay must be rejected");
+            assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+            assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+        }
+
+        #[tokio::test]
+        async fn test_extractor_selects_per_route_amount() {
+            let challenger = RealBindingChallenger::new();
+            // A credential minted at $1.00 is accepted by the premium route...
+            let auth = mint_credential(&challenger, OneDollar::amount());
+            assert!(run_extractor::<OneDollar>(challenger.clone(), Some(&auth))
+                .await
+                .is_ok());
+            // ...but rejected by the cheap route, proving the extractor passes
+            // each route's own `ChargeConfig::amount()` to verification.
+            let err = run_extractor::<OneCent>(challenger, Some(&auth))
+                .await
+                .expect_err("premium credential must not satisfy the cheap route");
+            assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+        }
+    }
 }

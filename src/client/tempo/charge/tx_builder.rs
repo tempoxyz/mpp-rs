@@ -5,7 +5,7 @@
 
 use std::num::NonZeroU64;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Signature, U256};
 use alloy::providers::Provider;
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
@@ -45,7 +45,7 @@ pub struct TempoTxOptions {
 pub fn build_tempo_tx(options: TempoTxOptions) -> TempoTransaction {
     TempoTransaction {
         chain_id: options.chain_id,
-        // Fee payer mode: fee_token is None (server chooses at co-sign time)
+        // Fee payer mode: fee_token is supplied by the server at co-sign time.
         fee_token: if options.fee_payer {
             None
         } else {
@@ -59,13 +59,10 @@ pub fn build_tempo_tx(options: TempoTxOptions) -> TempoTransaction {
         nonce: options.nonce,
         key_authorization: options.key_authorization,
         access_list: Default::default(),
-        // Fee payer mode: placeholder signature triggers skip_fee_token in signing hash
+        // Placeholder marks the transaction as fee-payer sponsored for the
+        // user's signing hash. The server replaces it during co-signing.
         fee_payer_signature: if options.fee_payer {
-            Some(alloy::primitives::Signature::new(
-                U256::ZERO,
-                U256::ZERO,
-                false,
-            ))
+            Some(Signature::new(U256::ZERO, U256::ZERO, false))
         } else {
             None
         },
@@ -347,6 +344,26 @@ mod tests {
 
         assert!(tx.calls.is_empty());
         assert_eq!(tx.chain_id, 42431);
+    }
+
+    #[test]
+    fn test_build_tempo_tx_fee_payer_sets_placeholder() {
+        let tx = build_tempo_tx(TempoTxOptions {
+            calls: vec![],
+            chain_id: 42431,
+            fee_token: Address::repeat_byte(0x33),
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_payer: true,
+            valid_before: Some(9999999999),
+            key_authorization: None,
+        });
+
+        assert!(tx.fee_token.is_none());
+        assert!(tx.fee_payer_signature.is_some());
     }
 
     #[test]

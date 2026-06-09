@@ -1,5 +1,14 @@
+use crate::proxy::headers::scrub_request_headers;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+/// Canonical proxy→upstream request-header pipeline: generic scrub, then
+/// per-service strip/inject. Reversing the order would drop the injected
+/// `Authorization`.
+pub fn apply_proxy_request_headers(service: &Service, headers: &mut Vec<(String, String)>) {
+    scrub_request_headers(headers);
+    service.apply_request_headers(headers);
+}
 
 /// A proxied upstream service with route definitions.
 #[derive(Debug, Clone)]
@@ -12,6 +21,9 @@ pub struct Service {
     pub routes: Vec<Route>,
     /// Headers to inject on upstream requests.
     pub headers: HashMap<String, String>,
+    /// Caller-supplied request headers to drop before forwarding (vendor-specific
+    /// strips on top of [`crate::proxy::headers::scrub_request_headers`]).
+    pub strip_request_headers: Vec<String>,
     /// Human-readable title.
     pub title: Option<String>,
     /// Human-readable description.
@@ -67,8 +79,24 @@ impl Service {
             base_url: base_url.into(),
             routes: Vec::new(),
             headers: HashMap::new(),
+            strip_request_headers: Vec::new(),
             title: None,
             description: None,
+        }
+    }
+
+    /// Drop `strip_request_headers`, then upsert `headers`. Prefer
+    /// [`apply_proxy_request_headers`] which composes this with the generic scrub.
+    pub fn apply_request_headers(&self, headers: &mut Vec<(String, String)>) {
+        headers.retain(|(name, _)| {
+            !self
+                .strip_request_headers
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(name))
+        });
+        for (name, value) in &self.headers {
+            headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+            headers.push((name.clone(), value.clone()));
         }
     }
 }
@@ -80,6 +108,7 @@ pub struct ServiceBuilder {
     base_url: String,
     routes: Vec<Route>,
     headers: HashMap<String, String>,
+    strip_request_headers: Vec<String>,
     title: Option<String>,
     description: Option<String>,
 }
@@ -97,6 +126,12 @@ impl ServiceBuilder {
     /// Inject a custom header on upstream requests.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Mark a caller-supplied request header to drop before forwarding (e.g. `Stripe-Account`).
+    pub fn strip_request_header(mut self, name: impl Into<String>) -> Self {
+        self.strip_request_headers.push(name.into());
         self
     }
 
@@ -131,6 +166,7 @@ impl ServiceBuilder {
             base_url: self.base_url,
             routes: self.routes,
             headers: self.headers,
+            strip_request_headers: self.strip_request_headers,
             title: self.title,
             description: self.description,
         }
