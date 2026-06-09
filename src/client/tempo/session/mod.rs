@@ -1458,6 +1458,7 @@ mod tests {
                 signature,
                 cumulative_amount,
                 channel_id: cid,
+                ..
             } => {
                 assert_eq!(cumulative_amount, "1500");
                 assert_eq!(cid, channel_id.to_string());

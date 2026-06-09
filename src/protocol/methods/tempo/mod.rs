@@ -129,7 +129,9 @@ pub use session_receipt as stream_receipt;
 pub type StreamReceipt = SessionReceipt;
 #[cfg(feature = "tempo")]
 pub use precompile_voucher::{
-    compute_precompile_channel_id, sign_precompile_voucher, PRECOMPILE_DOMAIN_NAME,
+    compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
+    precompile_voucher_signing_hash, precompile_voucher_signing_hash_with_escrow,
+    sign_precompile_voucher, sign_precompile_voucher_with_escrow, PRECOMPILE_DOMAIN_NAME,
     PRECOMPILE_DOMAIN_VERSION, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 pub use transaction::{

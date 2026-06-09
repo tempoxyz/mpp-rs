@@ -191,6 +191,53 @@ pub async fn sign_and_encode_async(
     Ok(signed_tx.encoded_2718())
 }
 
+/// Sign a fee-sponsored Tempo transaction and encode the client-submitted 0x76.
+///
+/// Session fee-payer requests submit a type-0x76 transaction with a `0x00`
+/// fee-payer marker. The marker lets the server recover the payer against the
+/// same preimage the payer signed, then replace it with the sponsor signature.
+pub async fn sign_and_encode_fee_payer_request_async(
+    mut tx: tempo_primitives::transaction::TempoTransaction,
+    signer: &impl alloy::signers::Signer,
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer request requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer request must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer request must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer request must include valid_before".to_string(),
+        ));
+    }
+
+    tx.access_list = AccessList::default();
+
+    let sig_hash = tx.signature_hash();
+    let hash_to_sign = effective_signing_hash(sig_hash, mode);
+    let inner_signature = signer
+        .sign_hash(&hash_to_sign)
+        .await
+        .mpp_http("failed to sign transaction")?;
+
+    let signed_tx = tx.into_signed(build_tempo_signature(inner_signature, mode));
+    let mut out = Vec::new();
+    signed_tx.encode_for_fee_payer_service(&mut out);
+    Ok(out)
+}
+
 /// Async version of [`sign_and_encode_fee_payer_envelope`].
 pub async fn sign_and_encode_fee_payer_envelope_async(
     mut tx: tempo_primitives::transaction::TempoTransaction,
@@ -438,6 +485,41 @@ mod tests {
 
         // V1 and V2 should produce different signatures
         assert_ne!(v1_bytes, v2_bytes, "fee payer V1 and V2 should differ");
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_encode_fee_payer_request_rejects_missing_placeholder() {
+        let signer = test_signer();
+        let mut tx = test_tx();
+        tx.fee_token = None;
+        tx.nonce_key = alloy::primitives::U256::MAX;
+        tx.valid_before = NonZeroU64::new(9999999999);
+
+        let err = sign_and_encode_fee_payer_request_async(tx, &signer, &TempoSigningMode::Direct)
+            .await
+            .expect_err("missing placeholder should fail");
+
+        assert!(err.to_string().contains("fee_payer_signature"));
+    }
+
+    #[tokio::test]
+    async fn test_sign_and_encode_fee_payer_request_produces_tempo_tx() {
+        let signer = test_signer();
+        let mut tx = test_tx();
+        tx.fee_token = None;
+        tx.nonce_key = alloy::primitives::U256::MAX;
+        tx.valid_before = NonZeroU64::new(9999999999);
+        tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
+            alloy::primitives::U256::ZERO,
+            alloy::primitives::U256::ZERO,
+            false,
+        ));
+
+        let bytes = sign_and_encode_fee_payer_request_async(tx, &signer, &TempoSigningMode::Direct)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes[0], tempo_primitives::transaction::TEMPO_TX_TYPE_ID);
     }
 
     #[test]
