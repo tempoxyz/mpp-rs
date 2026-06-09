@@ -39,10 +39,13 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
-use crate::tempo::{attribution, MODERATO_CHAIN_ID};
+use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
-use super::{proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
+use super::{
+    network::TempoNetwork as KnownTempoNetwork, proof, TempoChargeExt, CHAIN_ID,
+    DEFAULT_CURRENCY_TESTNET, INTENT_CHARGE, METHOD_NAME,
+};
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
 const MAX_FEE_PER_GAS_DEFAULT: u128 = 100_000_000_000;
@@ -528,6 +531,7 @@ pub struct ChargeMethod<P> {
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
+    fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
 }
 
 #[derive(Debug, Clone)]
@@ -550,44 +554,69 @@ pub struct FeePayerPolicyOverride {
 
 impl Default for FeePayerPolicy {
     fn default() -> FeePayerPolicy {
-        FeePayerPolicy {
-            max_gas: MAX_FEE_PAYER_GAS_LIMIT,
-            max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
-            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
-            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
-            max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
-        }
+        Self::get_by_chain_id(CHAIN_ID)
     }
 }
 
 impl FeePayerPolicy {
     /// Merge overrides onto the per-chain default.
     pub fn resolve(chain_id: u64, overrides: Option<&FeePayerPolicyOverride>) -> Self {
-        let base = Self::get_by_chain_id(chain_id);
-        let Some(o) = overrides else { return base };
-        Self {
-            max_gas: o.max_gas.unwrap_or(base.max_gas),
-            max_fee_per_gas: o.max_fee_per_gas.unwrap_or(base.max_fee_per_gas),
-            max_priority_fee_per_gas: o
+        let mut policy = Self::get_by_chain_id(chain_id);
+        if let Some(o) = overrides {
+            policy.max_gas = o.max_gas.unwrap_or(policy.max_gas);
+            policy.max_fee_per_gas = o.max_fee_per_gas.unwrap_or(policy.max_fee_per_gas);
+            policy.max_priority_fee_per_gas = o
                 .max_priority_fee_per_gas
-                .unwrap_or(base.max_priority_fee_per_gas),
-            max_total_fee: o.max_total_fee.unwrap_or(base.max_total_fee),
-            max_validity_window_seconds: o
+                .unwrap_or(policy.max_priority_fee_per_gas);
+            policy.max_total_fee = o.max_total_fee.unwrap_or(policy.max_total_fee);
+            policy.max_validity_window_seconds = o
                 .max_validity_window_seconds
-                .unwrap_or(base.max_validity_window_seconds),
+                .unwrap_or(policy.max_validity_window_seconds);
         }
+        policy
+    }
+
+    /// Return the default sponsor fee-token allowlist for a transaction chain.
+    ///
+    /// Known Tempo chains allow their default currency. Unknown chains use the
+    /// mainnet default, matching the server-side charge verifier fallback.
+    pub fn default_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
+        default_fee_payer_allowed_fee_tokens(chain_id)
+    }
+
+    /// Check whether the default sponsor allowlist accepts `fee_token`.
+    pub fn default_allows_fee_token(chain_id: u64, fee_token: Address) -> bool {
+        fee_token_allowed(&Self::default_allowed_fee_tokens(chain_id), fee_token)
     }
 
     fn get_by_chain_id(chain_id: u64) -> Self {
-        match chain_id {
+        let network = KnownTempoNetwork::from_chain_id(chain_id);
+        let mut policy = Self {
+            max_gas: MAX_FEE_PAYER_GAS_LIMIT,
+            max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
+            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
+            max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
+        };
+        if network == Some(KnownTempoNetwork::Moderato) {
             // Moderato regularly needs a higher priority fee than mainnet.
-            MODERATO_CHAIN_ID => Self {
-                max_priority_fee_per_gas: 50_000_000_000,
-                ..Self::default()
-            },
-            _ => Self::default(),
+            policy.max_priority_fee_per_gas = 50_000_000_000;
         }
+        policy
     }
+}
+
+fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
+    let token = KnownTempoNetwork::from_chain_id(chain_id)
+        .map(|network| network.default_currency())
+        .unwrap_or(DEFAULT_CURRENCY_TESTNET);
+    vec![token
+        .parse()
+        .expect("default Tempo fee token is a valid address")]
+}
+
+fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
+    allowed_fee_tokens.contains(&fee_token)
 }
 
 impl<P> ChargeMethod<P>
@@ -606,6 +635,7 @@ where
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,
+            fee_payer_allowed_fee_tokens: None,
         }
     }
 
@@ -629,10 +659,29 @@ where
         self
     }
 
-    /// Configure a store for transaction hash deduplication.
+    /// Replace the default sponsor fee-token allowlist.
+    ///
+    /// By default, fee-payer co-signing accepts the known default currency for
+    /// the transaction chain ID. Use this to restrict or widen the accepted
+    /// fee tokens for a server.
+    pub fn with_fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
+        self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
+        self.fee_payer_allowed_fee_tokens.as_deref()
+    }
+
+    /// Configure a store for replay deduplication.
     ///
     /// When set, each verified transaction hash is recorded and subsequent
-    /// attempts to replay the same hash are rejected.
+    /// attempts to replay the same hash are rejected. Zero-amount proof
+    /// credentials are likewise made single-use per credential fingerprint.
+    ///
+    /// The store must support atomic [`Store::put_if_absent`], else verification
+    /// fails closed with `StoreError::AtomicUnsupported`.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
         self
@@ -675,18 +724,6 @@ where
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
         let replay_key = format!("mpp:charge:{:#x}", hash);
-
-        if let Some(store) = &self.store {
-            let seen = store
-                .get(&replay_key)
-                .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
-                return Err(VerificationError::new(
-                    "Transaction hash has already been used.",
-                ));
-            }
-        }
 
         let receipt = self
             .provider
@@ -732,10 +769,15 @@ where
         }
 
         if let Some(store) = &self.store {
-            store
-                .put(&replay_key, serde_json::Value::Bool(true))
+            let claimed = store
+                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+            if !claimed {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
         }
 
         Ok(Receipt::success(METHOD_NAME, tx_hash))
@@ -977,25 +1019,21 @@ where
             charge.fee_payer(),
         )?;
 
-        // Pre-broadcast dedup: hash the final tx bytes (after co-signing/validation)
-        // and check/mark in store before broadcasting. Uses a separate namespace
-        // from the post-broadcast hash-based dedup in verify_hash.
+        // Pre-broadcast dedup of the final tx bytes. Separate namespace from
+        // the post-broadcast hash dedup in verify_hash.
         if let Some(store) = &self.store {
             let tx_hash_pre = keccak256(&final_tx_bytes);
             let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
-            let seen = store
-                .get(&dedup_key)
+            // Atomically reserve before broadcasting.
+            let claimed = store
+                .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
+                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+            if !claimed {
                 return Err(VerificationError::new(
                     "Transaction has already been submitted.",
                 ));
             }
-            store
-                .put(&dedup_key, serde_json::Value::Bool(true))
-                .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
         }
 
         // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
@@ -1023,13 +1061,20 @@ where
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
 
-        // Record the on-chain tx hash for hash-based replay protection
+        // Record the on-chain tx hash for hash-based replay protection. Use the
+        // atomic claim so a concurrent hash credential for the same tx cannot
+        // also succeed.
         if let Some(store) = &self.store {
             let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
-            store
-                .put(&replay_key, serde_json::Value::Bool(true))
+            let claimed = store
+                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+            if !claimed {
+                return Err(VerificationError::new(
+                    "Transaction hash has already been used.",
+                ));
+            }
         }
 
         Ok(receipt.transaction_hash())
@@ -1123,6 +1168,17 @@ where
         };
 
         let policy = FeePayerPolicy::resolve(tx.chain_id, self.fee_payer_policy_override.as_ref());
+
+        let allowed_fee_tokens = self
+            .fee_payer_allowed_fee_tokens
+            .clone()
+            .unwrap_or_else(|| FeePayerPolicy::default_allowed_fee_tokens(tx.chain_id));
+        if !fee_token_allowed(&allowed_fee_tokens, fee_token) {
+            return Err(VerificationError::new(format!(
+                "Fee token {:#x} is not allowed by fee payer policy",
+                fee_token
+            )));
+        }
 
         if tx.max_fee_per_gas > policy.max_fee_per_gas {
             return Err(VerificationError::new(format!(
@@ -1226,6 +1282,7 @@ where
         let cached_chain_id = Arc::clone(&self.cached_chain_id);
         let fee_payer_policy_override = self.fee_payer_policy_override.clone();
         let validate_sender = self.validate_sender.clone();
+        let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
 
         async move {
             let this = ChargeMethod {
@@ -1235,6 +1292,7 @@ where
                 cached_chain_id,
                 fee_payer_policy_override,
                 validate_sender,
+                fee_payer_allowed_fee_tokens,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -1352,6 +1410,30 @@ where
                     if key_info.expiry == 0 || key_info.isRevoked || key_info.expiry <= now_secs {
                         return Err(VerificationError::new(
                             "Proof signature does not match source.",
+                        ));
+                    }
+                }
+
+                // Single-use: atomically reserve a canonical credential
+                // fingerprint after verifying.
+                if let Some(store) = &this.store {
+                    let fingerprint = proof::proof_fingerprint(
+                        &credential.challenge.id,
+                        parsed_source.address,
+                        parsed_source.chain_id,
+                        sig_hex,
+                    )
+                    .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
+                    let replay_key = format!("mpp:proof:{:x}", fingerprint);
+                    let reserved = store
+                        .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+                        .await
+                        .map_err(|e| {
+                            VerificationError::new(format!("Failed to record proof: {e}"))
+                        })?;
+                    if !reserved {
+                        return Err(VerificationError::new(
+                            "Proof credential has already been used.",
                         ));
                     }
                 }
@@ -2094,8 +2176,9 @@ mod tests {
 
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let tx = make_fee_payer_tx(60);
@@ -2548,8 +2631,9 @@ mod tests {
     fn test_cosign_rejects_wrong_nonce_key() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2581,8 +2665,9 @@ mod tests {
     fn test_cosign_rejects_missing_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2615,8 +2700,9 @@ mod tests {
     fn test_cosign_rejects_access_list_signed_by_client() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2652,8 +2738,9 @@ mod tests {
     fn test_cosign_rejects_expired_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         // Build a tx with valid_before in the past
@@ -2691,8 +2778,9 @@ mod tests {
     #[test]
     fn test_cosign_rejects_empty_input() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let provider =
@@ -2718,8 +2806,9 @@ mod tests {
     #[test]
     fn test_cosign_rejects_wrong_type_byte() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let provider =
@@ -2816,6 +2905,41 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_replay_rejected_via_put_if_absent() {
+        use crate::store::{MemoryStore, Store};
+        use std::sync::Arc;
+
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let key = format!("mpp:charge:{}", hash.parse::<B256>().unwrap());
+
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let key = key.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                store
+                    .put_if_absent(&key, serde_json::Value::Bool(true))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut claims = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                claims += 1;
+            }
+        }
+        assert_eq!(
+            claims, 1,
+            "exactly one concurrent verifier may claim the tx hash"
+        );
+    }
+
     #[tokio::test]
     async fn test_store_dedup_different_hashes_independent() {
         use crate::store::{MemoryStore, Store};
@@ -2835,6 +2959,189 @@ mod tests {
         // Original hash should still be blocked
         let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
         assert!(seen.is_some(), "original hash should still be recorded");
+    }
+
+    #[tokio::test]
+    async fn test_proof_credential_replay_rejected() {
+        use crate::store::MemoryStore;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store.clone());
+        // Pre-cache the chain id so verify() needs no RPC; Direct-mode proof
+        // verification is purely cryptographic.
+        method.cached_chain_id.set(42431).unwrap();
+
+        // First submission succeeds and records the proof fingerprint.
+        let receipt = method.verify(&credential, &request).await.unwrap();
+        assert_eq!(receipt.reference, challenge.id);
+        let fingerprint =
+            proof::proof_fingerprint(&challenge.id, signer.address(), 42431, &signature).unwrap();
+        let key = format!("mpp:proof:{:x}", fingerprint);
+        assert!(store.get(&key).await.unwrap().is_some());
+
+        // Replaying the identical credential is rejected.
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert!(err.to_string().contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn test_proof_credential_replay_rejected_across_spellings() {
+        use crate::store::MemoryStore;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+        );
+
+        // Re-encode the same proof: uppercase signature hex + lowercased source
+        // address. Semantically identical, so it must hit the same replay key.
+        let upper_sig = signature.to_uppercase().replace("0X", "0x");
+        let lower_source = format!("did:pkh:eip155:42431:0x{:x}", signer.address());
+        assert_ne!(
+            signature, upper_sig,
+            "test must actually mutate the spelling"
+        );
+        let credential_variant = PaymentCredential::with_source(
+            challenge.to_echo(),
+            lower_source,
+            crate::protocol::core::PaymentPayload::proof(upper_sig),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store);
+        method.cached_chain_id.set(42431).unwrap();
+
+        method.verify(&credential, &request).await.unwrap();
+
+        // Re-encoded variant of the same proof is rejected as a replay.
+        let err = method
+            .verify(&credential_variant, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already been used"),
+            "re-encoded proof must hit the same replay key, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_proof_submissions_only_one_succeeds() {
+        use crate::store::{MemoryStore, Store, StoreError};
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::time::Duration;
+
+        // Delays the claim so both verifiers reach `put_if_absent` together.
+        struct SlowStore {
+            inner: MemoryStore,
+            delay: Duration,
+        }
+        impl Store for SlowStore {
+            fn get(
+                &self,
+                key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                self.inner.get(key)
+            }
+            fn put(
+                &self,
+                key: &str,
+                value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                self.inner.put(key, value)
+            }
+            fn delete(
+                &self,
+                key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                self.inner.delete(key)
+            }
+            fn put_if_absent(
+                &self,
+                key: &str,
+                value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+                let key = key.to_string();
+                let delay = self.delay;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    self.inner.put_if_absent(&key, value).await
+                })
+            }
+        }
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(SlowStore {
+            inner: MemoryStore::new(),
+            delay: Duration::from_millis(50),
+        });
+        let method = ChargeMethod::new(provider).with_store(store);
+        method.cached_chain_id.set(42431).unwrap();
+
+        let m1 = method.clone();
+        let c1 = credential.clone();
+        let r1 = request.clone();
+        let t1 = tokio::spawn(async move { m1.verify(&c1, &r1).await });
+        let m2 = method.clone();
+        let c2 = credential.clone();
+        let r2 = request.clone();
+        let t2 = tokio::spawn(async move { m2.verify(&c2, &r2).await });
+
+        let res1 = t1.await.unwrap();
+        let res2 = t2.await.unwrap();
+
+        let successes = [res1.is_ok(), res2.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one concurrent proof submission must succeed"
+        );
+        let err = res1.err().or(res2.err()).unwrap();
+        assert!(err.to_string().contains("already been used"));
     }
 
     // ==================== Chain ID caching tests ====================
@@ -2925,8 +3232,9 @@ mod tests {
         Address,
     ) {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -3063,7 +3371,7 @@ mod tests {
         );
     }
 
-    /// All five policy override fields are respected when set together.
+    /// All five limit policy override fields are respected when set together.
     #[test]
     fn test_policy_override_all_fields_applied() {
         // Generous overrides — tx should pass all checks.
@@ -3132,6 +3440,88 @@ mod tests {
             moderato.max_validity_window_seconds,
             tempo_mainnet.max_validity_window_seconds
         );
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            CHAIN_ID,
+            KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            CHAIN_ID,
+            KnownTempoNetwork::Moderato
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
+            KnownTempoNetwork::Moderato
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
+            KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            31337,
+            DEFAULT_CURRENCY_TESTNET.parse::<Address>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_cosign_rejects_non_allowlisted_fee_token() {
+        let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap()];
+        let (method, client_signer, _) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+
+        let tx = make_fee_payer_tx(60);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                KnownTempoNetwork::Moderato
+                    .default_currency()
+                    .parse::<Address>()
+                    .unwrap(),
+            )
+            .expect_err("cosign should reject non-allowlisted fee token");
+        assert!(
+            err.to_string()
+                .contains("is not allowed by fee payer policy"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cosign_uses_custom_fee_token_allowlist() {
+        let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap()];
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+
+        let tx = make_fee_payer_tx(60);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("cosign should accept a custom allowlisted fee token");
     }
 
     /// Sponsor MUST strip an attacker-injected wire access list: an honest
@@ -3149,8 +3539,9 @@ mod tests {
 
         let client_signer = PrivateKeySigner::random();
         let fee_payer_signer = PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         // Honest tx with empty access list, signed by the client.

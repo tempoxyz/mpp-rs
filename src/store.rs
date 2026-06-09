@@ -4,6 +4,7 @@
 //! Implementations handle serialization internally.
 
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 
 /// Async key-value store interface.
@@ -31,6 +32,20 @@ pub trait Store: Send + Sync {
         &self,
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
+
+    /// Atomically store `value` only if `key` is absent; returns `true` if inserted.
+    ///
+    /// A generic `get`-then-`put` is racy, so the default **fails closed** with
+    /// [`StoreError::AtomicUnsupported`]. Backends used for replay protection
+    /// must override this with native atomics (Redis `SET NX`, SQL
+    /// `ON CONFLICT DO NOTHING`, CAS, etc.).
+    fn put_if_absent(
+        &self,
+        _key: &str,
+        _value: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        Box::pin(async { Err(StoreError::AtomicUnsupported) })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +54,8 @@ pub enum StoreError {
     Internal(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("atomic put_if_absent is not supported by this store backend")]
+    AtomicUnsupported,
 }
 
 // ==================== MemoryStore ====================
@@ -102,6 +119,26 @@ impl Store for MemoryStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         self.data.lock().unwrap().remove(key);
         Box::pin(async { Ok(()) })
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let key = key.to_string();
+        let serialized =
+            serde_json::to_string(&value).map_err(|e| StoreError::Serialization(e.to_string()));
+        Box::pin(async move {
+            let serialized = serialized?;
+            // Check-and-insert under one mutex guard.
+            let mut data = self.data.lock().unwrap();
+            if data.contains_key(&key) {
+                return Ok(false);
+            }
+            data.insert(key, serialized);
+            Ok(true)
+        })
     }
 }
 
@@ -184,6 +221,32 @@ impl Store for FileStore {
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(StoreError::Internal(e.to_string())),
+            }
+        })
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let path = self.key_path(key);
+        Box::pin(async move {
+            let serialized = serde_json::to_string_pretty(&value)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            // `create_new` is an atomic O_EXCL create: fails if the file exists.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(serialized.as_bytes())
+                        .map_err(|e| StoreError::Internal(e.to_string()))?;
+                    Ok(true)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
                 Err(e) => Err(StoreError::Internal(e.to_string())),
             }
         })
@@ -372,6 +435,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_store_put_if_absent() {
+        let store = MemoryStore::new();
+
+        // First reservation succeeds.
+        assert!(store
+            .put_if_absent("k", serde_json::json!(true))
+            .await
+            .unwrap());
+        assert_eq!(store.get("k").await.unwrap(), Some(serde_json::json!(true)));
+
+        // Second reservation of the same key fails and does not overwrite.
+        assert!(!store
+            .put_if_absent("k", serde_json::json!("other"))
+            .await
+            .unwrap());
+        assert_eq!(store.get("k").await.unwrap(), Some(serde_json::json!(true)));
+    }
+
+    #[tokio::test]
     async fn memory_store_overwrite() {
         let store = MemoryStore::new();
         store.put("k", serde_json::json!("first")).await.unwrap();
@@ -404,6 +486,134 @@ mod tests {
         store.delete("nonexistent").await.unwrap();
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn default_put_if_absent_fails_closed() {
+        // Inherited default must refuse rather than silently race.
+        struct MinimalStore;
+        impl Store for MinimalStore {
+            fn get(
+                &self,
+                _key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(
+                &self,
+                _key: &str,
+                _value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn delete(
+                &self,
+                _key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let err = MinimalStore
+            .put_if_absent("k", serde_json::json!(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AtomicUnsupported));
+    }
+
+    #[tokio::test]
+    async fn memory_store_put_if_absent_sequential() {
+        let store = MemoryStore::new();
+        assert!(store
+            .put_if_absent("k", serde_json::json!("first"))
+            .await
+            .unwrap());
+        assert!(!store
+            .put_if_absent("k", serde_json::json!("second"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("k").await.unwrap(),
+            Some(serde_json::json!("first"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_store_put_if_absent_concurrent_exactly_one_wins() {
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let store = store.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                store
+                    .put_if_absent("k", serde_json::json!(i))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut winners = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "exactly one put_if_absent must win");
+        assert!(store.get("k").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn file_store_put_if_absent_sequential() {
+        let tmp =
+            std::env::temp_dir().join(format!("mpp_file_store_pia_seq_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = FileStore::new(&tmp).unwrap();
+        assert!(store
+            .put_if_absent("k", serde_json::json!("first"))
+            .await
+            .unwrap());
+        assert!(!store
+            .put_if_absent("k", serde_json::json!("second"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("k").await.unwrap(),
+            Some(serde_json::json!("first"))
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_store_put_if_absent_concurrent_exactly_one_wins() {
+        let tmp =
+            std::env::temp_dir().join(format!("mpp_file_store_pia_conc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = std::sync::Arc::new(FileStore::new(&tmp).unwrap());
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let store = store.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                store
+                    .put_if_absent("k", serde_json::json!(i))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut winners = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "exactly one put_if_absent must win");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

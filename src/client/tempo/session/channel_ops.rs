@@ -20,11 +20,17 @@ use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::precompile_voucher::{
-    compute_precompile_channel_id, sign_precompile_voucher, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
+    compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
+    sign_precompile_voucher, sign_precompile_voucher_with_escrow, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
-use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSessionExt};
+use crate::protocol::methods::tempo::session::{
+    ChannelDescriptor, SessionCredentialPayload, TempoSessionExt,
+};
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
 use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+
+#[cfg(feature = "tempo")]
+const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 
 /// Default escrow contract addresses per chain ID.
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
@@ -128,6 +134,7 @@ pub async fn create_voucher_payload(
 
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
+        descriptor: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -146,6 +153,56 @@ pub async fn create_precompile_voucher_payload(
 
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
+        descriptor: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&sig),
+    })
+}
+
+/// Voucher payload for TIP-1034 with the descriptor required for recovery.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_with_descriptor(
+    signer: &impl Signer,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    create_precompile_voucher_payload_with_descriptor_and_escrow(
+        signer,
+        descriptor,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await
+}
+
+/// Voucher payload for TIP-1034 with an explicit escrow/precompile address.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_with_descriptor_and_escrow(
+    signer: &impl Signer,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        escrow_contract,
+        chain_id,
+    )?;
+    let sig = sign_precompile_voucher_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )
+    .await?;
+
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -170,6 +227,7 @@ pub async fn create_close_payload(
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
+        descriptor: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -187,6 +245,65 @@ pub async fn create_precompile_close_payload(
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
+        descriptor: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&sig),
+    })
+}
+
+/// Close payload for TIP-1034 with the descriptor required for recovery.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_with_descriptor(
+    signer: &impl Signer,
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    create_precompile_close_payload_with_descriptor_and_escrow(
+        signer,
+        channel_id,
+        descriptor,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await
+}
+
+/// Close payload for TIP-1034 with a descriptor and explicit escrow/precompile verifier.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_with_descriptor_and_escrow(
+    signer: &impl Signer,
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let expected_channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        escrow_contract,
+        chain_id,
+    )?;
+    if expected_channel_id != channel_id {
+        return Err(MppError::InvalidConfig(
+            "TIP-1034 close descriptor does not match channel_id".to_string(),
+        ));
+    }
+
+    let sig = sign_precompile_voucher_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )
+    .await?;
+
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -339,6 +456,7 @@ where
         payload_type: "transaction".to_string(),
         channel_id: channel_id.to_string(),
         transaction: signed_tx_hex,
+        descriptor: None,
         authorized_signer: Some(authorized_signer.to_string()),
         cumulative_amount: options.initial_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&voucher_sig),
@@ -361,6 +479,236 @@ pub fn compute_expiring_nonce_hash(unsigned_tx: &TempoTransaction, sender: Addre
     unsigned_tx.encode_for_signing(&mut buf);
     buf.extend_from_slice(sender.as_slice());
     keccak256(buf)
+}
+
+/// Compute `expiringNonceHash` for a fee-sponsored TIP-1034 channel open.
+///
+/// The sender signature is verified against the submitted transaction, but
+/// TIP-1034 derives channel identity from the fee-payer hash preimage that
+/// marks the transaction as sponsorable.
+#[cfg(feature = "tempo")]
+pub fn compute_fee_payer_expiring_nonce_hash(
+    unsigned_tx: &TempoTransaction,
+    sender: Address,
+) -> B256 {
+    let mut tx = unsigned_tx.clone();
+    tx.fee_payer_signature = Some(alloy::primitives::Signature::new(
+        U256::ZERO,
+        U256::ZERO,
+        false,
+    ));
+    compute_expiring_nonce_hash(&tx, sender)
+}
+
+/// Build the wire descriptor for a TIP-1034 precompile channel.
+#[cfg(feature = "tempo")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_channel_descriptor(
+    payer: Address,
+    payee: Address,
+    operator: Address,
+    token: Address,
+    salt: B256,
+    authorized_signer: Address,
+    expiring_nonce_hash: B256,
+) -> ChannelDescriptor {
+    ChannelDescriptor {
+        payer: payer.to_string(),
+        payee: payee.to_string(),
+        operator: operator.to_string(),
+        token: token.to_string(),
+        salt: salt.to_string(),
+        authorized_signer: authorized_signer.to_string(),
+        expiring_nonce_hash: expiring_nonce_hash.to_string(),
+    }
+}
+
+#[cfg(feature = "tempo")]
+fn parse_precompile_amount(value: u128, label: &str) -> Result<Uint<96, 2>, MppError> {
+    if value > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
+        return Err(MppError::InvalidConfig(format!(
+            "{label} {value} exceeds precompile uint96 max"
+        )));
+    }
+    Ok(Uint::<96, 2>::from(value))
+}
+
+#[cfg(feature = "tempo")]
+fn precompile_open_tx_nonce_fields(fee_payer: bool, nonce: u64) -> (u64, U256, Option<u64>) {
+    if !fee_payer {
+        return (nonce, U256::ZERO, None);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    (
+        0,
+        U256::MAX,
+        Some(now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS)),
+    )
+}
+
+/// Convert a JSON wire descriptor into the generated precompile ABI tuple.
+#[cfg(feature = "tempo")]
+pub fn precompile_descriptor_from_wire(
+    descriptor: &ChannelDescriptor,
+) -> Result<ITIP20ChannelReserve::ChannelDescriptor, MppError> {
+    Ok(ITIP20ChannelReserve::ChannelDescriptor {
+        payer: descriptor.payer.parse().map_err(|e| {
+            MppError::InvalidConfig(format!("invalid TIP-1034 descriptor payer: {e}"))
+        })?,
+        payee: descriptor.payee.parse().map_err(|e| {
+            MppError::InvalidConfig(format!("invalid TIP-1034 descriptor payee: {e}"))
+        })?,
+        operator: descriptor.operator.parse().map_err(|e| {
+            MppError::InvalidConfig(format!("invalid TIP-1034 descriptor operator: {e}"))
+        })?,
+        token: descriptor.token.parse().map_err(|e| {
+            MppError::InvalidConfig(format!("invalid TIP-1034 descriptor token: {e}"))
+        })?,
+        salt: descriptor.salt.parse().map_err(|e| {
+            MppError::InvalidConfig(format!("invalid TIP-1034 descriptor salt: {e}"))
+        })?,
+        authorizedSigner: descriptor.authorized_signer.parse().map_err(|e| {
+            MppError::InvalidConfig(format!("invalid TIP-1034 descriptor authorizedSigner: {e}"))
+        })?,
+        expiringNonceHash: descriptor.expiring_nonce_hash.parse().map_err(|e| {
+            MppError::InvalidConfig(format!(
+                "invalid TIP-1034 descriptor expiringNonceHash: {e}"
+            ))
+        })?,
+    })
+}
+
+/// Compute a TIP-1034 channel ID from a wire descriptor.
+#[cfg(feature = "tempo")]
+pub fn compute_precompile_channel_id_from_descriptor(
+    descriptor: &ChannelDescriptor,
+    chain_id: u64,
+) -> Result<B256, MppError> {
+    compute_precompile_channel_id_from_descriptor_with_escrow(
+        descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+}
+
+/// Compute a TIP-1034 channel ID from a wire descriptor and explicit escrow.
+#[cfg(feature = "tempo")]
+pub fn compute_precompile_channel_id_from_descriptor_with_escrow(
+    descriptor: &ChannelDescriptor,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<B256, MppError> {
+    let descriptor = precompile_descriptor_from_wire(descriptor)?;
+    Ok(compute_precompile_channel_id_with_escrow(
+        descriptor.payer,
+        descriptor.payee,
+        descriptor.operator,
+        descriptor.token,
+        descriptor.salt,
+        descriptor.authorizedSigner,
+        descriptor.expiringNonceHash,
+        escrow_contract,
+        chain_id,
+    ))
+}
+
+/// ABI-encode `open(payee, operator, token, uint96 deposit, salt, authorizedSigner)`.
+#[cfg(feature = "tempo")]
+pub fn encode_precompile_open_call(
+    payee: Address,
+    operator: Address,
+    token: Address,
+    deposit: u128,
+    salt: B256,
+    authorized_signer: Address,
+) -> Result<Bytes, MppError> {
+    Ok(Bytes::from(
+        ITIP20ChannelReserve::openCall::new((
+            payee,
+            operator,
+            token,
+            parse_precompile_amount(deposit, "deposit")?,
+            salt,
+            authorized_signer,
+        ))
+        .abi_encode(),
+    ))
+}
+
+/// ABI-encode `topUp(descriptor, uint96 additionalDeposit)`.
+#[cfg(feature = "tempo")]
+pub fn encode_precompile_top_up_call(
+    descriptor: &ChannelDescriptor,
+    additional_deposit: u128,
+) -> Result<Bytes, MppError> {
+    Ok(Bytes::from(
+        ITIP20ChannelReserve::topUpCall::new((
+            precompile_descriptor_from_wire(descriptor)?,
+            parse_precompile_amount(additional_deposit, "additional_deposit")?,
+        ))
+        .abi_encode(),
+    ))
+}
+
+/// ABI-encode `getChannel(descriptor)`.
+#[cfg(feature = "tempo")]
+pub fn encode_precompile_get_channel_call(
+    descriptor: &ChannelDescriptor,
+) -> Result<Bytes, MppError> {
+    Ok(Bytes::from(
+        ITIP20ChannelReserve::getChannelCall::new((precompile_descriptor_from_wire(descriptor)?,))
+            .abi_encode(),
+    ))
+}
+
+/// ABI-encode `getChannelState(channelId)`.
+#[cfg(feature = "tempo")]
+pub fn encode_precompile_get_channel_state_call(channel_id: B256) -> Bytes {
+    Bytes::from(ITIP20ChannelReserve::getChannelStateCall::new((channel_id,)).abi_encode())
+}
+
+/// ABI-encode `requestClose(descriptor)`.
+#[cfg(feature = "tempo")]
+pub fn encode_precompile_request_close_call(
+    descriptor: &ChannelDescriptor,
+) -> Result<Bytes, MppError> {
+    Ok(Bytes::from(
+        ITIP20ChannelReserve::requestCloseCall::new(
+            (precompile_descriptor_from_wire(descriptor)?,),
+        )
+        .abi_encode(),
+    ))
+}
+
+/// ABI-encode `withdraw(descriptor)`.
+#[cfg(feature = "tempo")]
+pub fn encode_precompile_withdraw_call(descriptor: &ChannelDescriptor) -> Result<Bytes, MppError> {
+    Ok(Bytes::from(
+        ITIP20ChannelReserve::withdrawCall::new((precompile_descriptor_from_wire(descriptor)?,))
+            .abi_encode(),
+    ))
+}
+
+/// Build a descriptor-backed TIP-1034 top-up credential payload.
+#[cfg(feature = "tempo")]
+pub fn create_precompile_top_up_payload(
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    transaction: String,
+    additional_deposit: u128,
+) -> SessionCredentialPayload {
+    SessionCredentialPayload::TopUp {
+        payload_type: "transaction".to_string(),
+        channel_id: channel_id.to_string(),
+        transaction,
+        descriptor: Some(descriptor),
+        additional_deposit: additional_deposit.to_string(),
+    }
 }
 
 /// Options for [`create_precompile_open_payload`]. Replaces `escrow_contract`
@@ -429,33 +777,53 @@ where
         input: Bytes::from(open_data),
     }];
 
-    let nonce = provider
-        .get_transaction_count(payer)
-        .await
-        .mpp_http("failed to get nonce")?;
+    let nonce = if options.fee_payer {
+        0
+    } else {
+        provider
+            .get_transaction_count(payer)
+            .await
+            .mpp_http("failed to get nonce")?
+    };
 
     let gas_price = provider
         .get_gas_price()
         .await
         .mpp_http("failed to get gas price")?;
 
+    let (nonce, nonce_key, valid_before) =
+        precompile_open_tx_nonce_fields(options.fee_payer, nonce);
+
     let unsigned_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
         fee_token: options.currency,
         nonce,
-        nonce_key: U256::ZERO,
+        nonce_key,
         gas_limit: 2_000_000,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
-        valid_before: None,
+        valid_before,
         key_authorization: signing_mode.key_authorization().cloned(),
     });
 
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
-    let expiring_nonce_hash = compute_expiring_nonce_hash(&unsigned_tx, payer);
+    let expiring_nonce_hash = if options.fee_payer {
+        compute_fee_payer_expiring_nonce_hash(&unsigned_tx, payer)
+    } else {
+        compute_expiring_nonce_hash(&unsigned_tx, payer)
+    };
+    let descriptor = build_channel_descriptor(
+        payer,
+        options.payee,
+        options.operator,
+        options.currency,
+        salt,
+        authorized_signer,
+        expiring_nonce_hash,
+    );
     let channel_id = compute_precompile_channel_id(
         payer,
         options.payee,
@@ -467,9 +835,17 @@ where
         options.chain_id,
     );
 
-    let tx_bytes =
+    let tx_bytes = if options.fee_payer {
+        crate::client::tempo::signing::sign_and_encode_fee_payer_request_async(
+            unsigned_tx,
+            signer,
+            signing_mode,
+        )
+        .await?
+    } else {
         crate::client::tempo::signing::sign_and_encode_async(unsigned_tx, signer, signing_mode)
-            .await?;
+            .await?
+    };
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
     let voucher_sig =
@@ -489,6 +865,7 @@ where
         payload_type: "transaction".to_string(),
         channel_id: channel_id.to_string(),
         transaction: signed_tx_hex,
+        descriptor: Some(descriptor),
         authorized_signer: Some(authorized_signer.to_string()),
         cumulative_amount: options.initial_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&voucher_sig),
@@ -691,6 +1068,33 @@ mod tests {
     }
 
     #[cfg(feature = "tempo")]
+    #[test]
+    fn test_precompile_open_tx_nonce_fields_for_fee_payer() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let (nonce, nonce_key, valid_before) = precompile_open_tx_nonce_fields(true, 7);
+
+        assert_eq!(nonce, 0);
+        assert_eq!(nonce_key, U256::MAX);
+        let valid_before = valid_before.expect("fee payer open sets valid_before");
+        assert!(valid_before >= before);
+        assert!(valid_before <= before + FEE_PAYER_VALID_BEFORE_SECS + 1);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_precompile_open_tx_nonce_fields_for_direct_payer() {
+        let (nonce, nonce_key, valid_before) = precompile_open_tx_nonce_fields(false, 7);
+
+        assert_eq!(nonce, 7);
+        assert_eq!(nonce_key, U256::ZERO);
+        assert!(valid_before.is_none());
+    }
+
+    #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn test_create_precompile_open_payload_rejects_uint96_overflow() {
         use crate::protocol::methods::tempo::precompile_voucher::PRECOMPILE_MAX_CUMULATIVE_AMOUNT;
@@ -864,6 +1268,7 @@ mod tests {
 
         let payload = SessionCredentialPayload::Voucher {
             channel_id: "0xabc".to_string(),
+            descriptor: None,
             cumulative_amount: "5000".to_string(),
             signature: "0xdef".to_string(),
         };
@@ -894,10 +1299,12 @@ mod tests {
         match payload {
             SessionCredentialPayload::Voucher {
                 channel_id: cid,
+                descriptor,
                 cumulative_amount,
                 signature,
             } => {
                 assert!(cid.starts_with("0x"));
+                assert!(descriptor.is_none());
                 assert_eq!(cumulative_amount, "1000");
                 assert!(signature.starts_with("0x"));
             }
@@ -923,15 +1330,46 @@ mod tests {
         match payload {
             SessionCredentialPayload::Close {
                 channel_id: cid,
+                descriptor,
                 cumulative_amount,
                 signature,
             } => {
                 assert!(cid.starts_with("0x"));
+                assert!(descriptor.is_none());
                 assert_eq!(cumulative_amount, "2000");
                 assert!(signature.starts_with("0x"));
             }
             _ => panic!("Expected Close variant"),
         }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_create_precompile_close_payload_rejects_descriptor_mismatch() {
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let descriptor = build_channel_descriptor(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            Address::ZERO,
+            Address::repeat_byte(0x33),
+            B256::repeat_byte(0x44),
+            Address::repeat_byte(0x55),
+            B256::repeat_byte(0x66),
+        );
+
+        let err = create_precompile_close_payload_with_descriptor(
+            &signer,
+            B256::repeat_byte(0x77),
+            descriptor,
+            2000,
+            42431,
+        )
+        .await
+        .expect_err("descriptor/channel mismatch should fail");
+
+        assert!(err.to_string().contains("does not match channel_id"));
     }
 
     #[test]
@@ -1116,6 +1554,7 @@ mod tests {
 
         let payload = SessionCredentialPayload::Voucher {
             channel_id: "0xabc".to_string(),
+            descriptor: None,
             cumulative_amount: "5000".to_string(),
             signature: "0xdef".to_string(),
         };
