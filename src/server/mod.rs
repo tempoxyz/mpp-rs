@@ -102,4 +102,6 @@ pub struct ChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Enable fee sponsorship.
     pub fee_payer: bool,
+    /// Actual request body bytes to bind into the challenge digest.
+    pub request_body: Option<&'a [u8]>,
 }

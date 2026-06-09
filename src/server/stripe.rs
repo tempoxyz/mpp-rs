@@ -32,6 +32,8 @@ pub struct StripeChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Optional metadata key-value pairs.
     pub metadata: Option<&'a std::collections::HashMap<String, String>>,
+    /// Actual request body bytes to bind into the challenge digest.
+    pub request_body: Option<&'a [u8]>,
 }
 
 /// Builder returned by [`stripe()`] for configuring a Stripe payment method.

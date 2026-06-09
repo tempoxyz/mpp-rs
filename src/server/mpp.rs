@@ -502,13 +502,27 @@ where
                 request.method_details = Some(serde_json::Value::Object(details));
             }
         }
-        let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
+        let mut challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.secret_key,
             &self.realm,
             &request,
             options.expires,
             options.description,
         )?;
+        if let Some(body) = options.request_body {
+            let digest = crate::body_digest::compute(body);
+            challenge.id = crate::protocol::core::compute_challenge_id(
+                &self.secret_key,
+                &challenge.realm,
+                challenge.method.as_str(),
+                challenge.intent.as_str(),
+                challenge.request.raw(),
+                challenge.expires.as_deref(),
+                Some(&digest),
+                challenge.opaque.as_ref().map(|o| o.raw()),
+            );
+            challenge.digest = Some(digest);
+        }
         Ok(self.apply_pinned_opaque(challenge))
     }
 
@@ -568,6 +582,24 @@ where
         self.verify(credential, &request).await
     }
 
+    /// Verify a payment credential against the actual request body bytes.
+    ///
+    /// Use this when the echoed challenge contains a body digest. The digest is
+    /// recomputed over `body` before method-specific payment verification runs.
+    pub async fn verify_credential_with_body(
+        &self,
+        credential: &PaymentCredential,
+        body: &[u8],
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request: ChargeRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+        self.verify_with_body(credential, &request, Some(body))
+            .await
+    }
+
     /// Verify a payment credential, ensuring the charge request matches the server's expected values.
     ///
     /// This prevents cross-route credential replay attacks where a credential
@@ -584,6 +616,36 @@ where
             .decode()
             .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
 
+        self.verify_expected_request_matches(credential, &request, expected)?;
+
+        self.verify(credential, &request).await
+    }
+
+    /// Verify a payment credential against expected route values and actual body bytes.
+    pub async fn verify_credential_with_expected_request_and_body(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+        body: &[u8],
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request: ChargeRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
+
+        self.verify_expected_request_matches(credential, &request, expected)?;
+
+        self.verify_with_body(credential, &request, Some(body))
+            .await
+    }
+
+    fn verify_expected_request_matches(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+        expected: &ChargeRequest,
+    ) -> std::result::Result<(), VerificationError> {
         if request.amount != expected.amount {
             return Err(VerificationError::with_code(
                 format!(
@@ -638,7 +700,7 @@ where
             }
         }
 
-        self.verify(credential, &request).await
+        Ok(())
     }
 
     /// Verify a charge credential with an explicit request.
@@ -647,8 +709,18 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
+        self.verify_with_body(credential, request, None).await
+    }
+
+    async fn verify_with_body(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+        body: Option<&[u8]>,
+    ) -> std::result::Result<Receipt, VerificationError> {
         // Tier 1: HMAC provenance + expiry
         self.verify_hmac_and_expiry(credential)?;
+        self.verify_body_digest(credential, body)?;
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request)?;
         let receipt = self.method.verify(credential, request).await?;
@@ -663,6 +735,30 @@ where
             })
             .await;
         Ok(receipt)
+    }
+
+    fn verify_body_digest(
+        &self,
+        credential: &PaymentCredential,
+        body: Option<&[u8]>,
+    ) -> std::result::Result<(), VerificationError> {
+        match (credential.challenge.digest.as_deref(), body) {
+            (Some(_), None) => Err(VerificationError::with_code(
+                "body digest present but request body was not provided",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            )),
+            (None, Some(_)) => Err(VerificationError::with_code(
+                "missing body digest",
+                crate::protocol::traits::ErrorCode::CredentialMismatch,
+            )),
+            (Some(digest), Some(body)) if !crate::body_digest::verify(digest, body) => {
+                Err(VerificationError::with_code(
+                    "body digest mismatch",
+                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1029,6 +1125,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
                 })?
         };
 
+        let digest = options.request_body.map(crate::body_digest::compute);
         let id = crate::protocol::core::compute_challenge_id(
             &self.secret_key,
             &self.realm,
@@ -1036,7 +1133,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             crate::protocol::methods::stripe::INTENT_CHARGE,
             encoded_request.raw(),
             Some(&expires),
-            None,
+            digest.as_deref(),
             None,
         );
 
@@ -1048,7 +1145,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             request: encoded_request,
             expires: Some(expires),
             description: options.description.map(|s| s.to_string()),
-            digest: None,
+            digest,
             opaque: None,
         }))
     }
@@ -1230,6 +1327,37 @@ mod tests {
         }
     }
 
+    fn test_credential_with_body_digest(secret_key: &str, body: &[u8]) -> PaymentCredential {
+        let request = test_request();
+        let encoded = Base64UrlJson::from_typed(&request).unwrap();
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let digest = crate::body_digest::compute(body);
+        let id = crate::protocol::core::compute_challenge_id(
+            secret_key,
+            "api.example.com",
+            "mock",
+            "charge",
+            encoded.raw(),
+            Some(&expires),
+            Some(&digest),
+            None,
+        );
+
+        let echo = ChallengeEcho {
+            id,
+            realm: "api.example.com".into(),
+            method: "mock".into(),
+            intent: "charge".into(),
+            request: encoded,
+            expires: Some(expires),
+            digest: Some(digest),
+            opaque: None,
+        };
+        PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
+    }
+
     #[test]
     fn test_mpp_creation() {
         let payment = Mpp::new(MockMethod, "api.example.com", "secret");
@@ -1387,6 +1515,67 @@ mod tests {
         assert_eq!(seen.recipient, request.recipient);
     }
 
+    #[tokio::test]
+    async fn test_verify_credential_with_body_digest_accepts_matching_body() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let body = br#"{"query":"paid"}"#;
+        let credential = test_credential_with_body_digest("secret", body);
+
+        let receipt = payment
+            .verify_credential_with_body(&credential, body)
+            .await
+            .unwrap();
+
+        assert!(receipt.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_verify_credential_with_body_digest_rejects_mismatch() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let credential = test_credential_with_body_digest("secret", br#"{"query":"paid"}"#);
+
+        let err = payment
+            .verify_credential_with_body(&credential, br#"{"query":"tampered"}"#)
+            .await
+            .unwrap_err();
+
+        assert!(err.message.contains("body digest mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_credential_rejects_digest_without_body() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let credential = test_credential_with_body_digest("secret", br#"{"query":"paid"}"#);
+
+        let err = payment.verify_credential(&credential).await.unwrap_err();
+
+        assert!(err.message.contains("request body was not provided"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_credential_with_body_rejects_missing_digest() {
+        let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+        let mut credential = test_credential_with_body_digest("secret", br#"{"query":"paid"}"#);
+        credential.challenge.digest = None;
+        credential.challenge.id = crate::protocol::core::compute_challenge_id(
+            "secret",
+            "api.example.com",
+            "mock",
+            "charge",
+            credential.challenge.request.raw(),
+            credential.challenge.expires.as_deref(),
+            None,
+            None,
+        );
+
+        let err = payment
+            .verify_credential_with_body(&credential, br#"{"query":"paid"}"#)
+            .await
+            .unwrap_err();
+
+        assert!(err.message.contains("missing body digest"));
+    }
+
     #[cfg(feature = "tempo")]
     fn create_test_mpp() -> Mpp<crate::server::TempoChargeMethod<crate::server::TempoProvider>> {
         Mpp::create(
@@ -1525,6 +1714,26 @@ mod tests {
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "5500000");
         assert_eq!(challenge.description, Some("API access fee".to_string()));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_charge_with_options_binds_request_body_digest() {
+        let mpp = create_test_mpp();
+        let body = br#"{"query":"paid"}"#;
+        let challenge = mpp
+            .charge_with_options(
+                "0.10",
+                ChargeOptions {
+                    request_body: Some(body),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let digest = crate::body_digest::compute(body);
+        assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
+        assert!(challenge.verify("test-secret"));
     }
 
     // ── Real HMAC challenge verification tests ─────────────────────────
