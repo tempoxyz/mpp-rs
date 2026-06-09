@@ -471,6 +471,12 @@ where
         self.charge_with_options(amount, super::ChargeOptions::default())
     }
 
+    /// Generate a charge challenge and bind it to the actual request body bytes.
+    #[cfg(feature = "tempo")]
+    pub fn charge_with_body(&self, amount: &str, body: &[u8]) -> Result<PaymentChallenge> {
+        self.charge_with_options_and_body(amount, super::ChargeOptions::default(), body)
+    }
+
     /// Generate a charge challenge with a dollar amount and additional options.
     ///
     /// Requires currency and recipient to be bound (via [`Mpp::create()`]).
@@ -502,28 +508,26 @@ where
                 request.method_details = Some(serde_json::Value::Object(details));
             }
         }
-        let mut challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
+        let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.secret_key,
             &self.realm,
             &request,
             options.expires,
             options.description,
         )?;
-        if let Some(body) = options.request_body {
-            let digest = crate::body_digest::compute(body);
-            challenge.id = crate::protocol::core::compute_challenge_id(
-                &self.secret_key,
-                &challenge.realm,
-                challenge.method.as_str(),
-                challenge.intent.as_str(),
-                challenge.request.raw(),
-                challenge.expires.as_deref(),
-                Some(&digest),
-                challenge.opaque.as_ref().map(|o| o.raw()),
-            );
-            challenge.digest = Some(digest);
-        }
         Ok(self.apply_pinned_opaque(challenge))
+    }
+
+    /// Generate a charge challenge with options and bind it to the actual request body bytes.
+    #[cfg(feature = "tempo")]
+    pub fn charge_with_options_and_body(
+        &self,
+        amount: &str,
+        options: super::ChargeOptions<'_>,
+        body: &[u8],
+    ) -> Result<PaymentChallenge> {
+        let challenge = self.charge_with_options(amount, options)?;
+        Ok(self.with_body_digest(challenge, body))
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -759,6 +763,23 @@ where
             }
             _ => Ok(()),
         }
+    }
+
+    #[cfg(any(feature = "tempo", feature = "stripe"))]
+    fn with_body_digest(&self, mut challenge: PaymentChallenge, body: &[u8]) -> PaymentChallenge {
+        let digest = crate::body_digest::compute(body);
+        challenge.id = crate::protocol::core::compute_challenge_id(
+            &self.secret_key,
+            &challenge.realm,
+            challenge.method.as_str(),
+            challenge.intent.as_str(),
+            challenge.request.raw(),
+            challenge.expires.as_deref(),
+            Some(&digest),
+            challenge.opaque.as_ref().map(|o| o.raw()),
+        );
+        challenge.digest = Some(digest);
+        challenge
     }
 }
 
@@ -1077,6 +1098,15 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         self.stripe_charge_with_options(amount, super::StripeChargeOptions::default())
     }
 
+    /// Generate a Stripe charge challenge and bind it to the actual request body bytes.
+    pub fn stripe_charge_with_body(&self, amount: &str, body: &[u8]) -> Result<PaymentChallenge> {
+        self.stripe_charge_with_options_and_body(
+            amount,
+            super::StripeChargeOptions::default(),
+            body,
+        )
+    }
+
     /// Generate a Stripe charge challenge with additional options.
     ///
     /// Accepts [`StripeChargeOptions`](super::StripeChargeOptions) for description,
@@ -1125,7 +1155,6 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
                 })?
         };
 
-        let digest = options.request_body.map(crate::body_digest::compute);
         let id = crate::protocol::core::compute_challenge_id(
             &self.secret_key,
             &self.realm,
@@ -1133,7 +1162,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             crate::protocol::methods::stripe::INTENT_CHARGE,
             encoded_request.raw(),
             Some(&expires),
-            digest.as_deref(),
+            None,
             None,
         );
 
@@ -1145,9 +1174,20 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             request: encoded_request,
             expires: Some(expires),
             description: options.description.map(|s| s.to_string()),
-            digest,
+            digest: None,
             opaque: None,
         }))
+    }
+
+    /// Generate a Stripe charge challenge with options and bind it to the actual request body bytes.
+    pub fn stripe_charge_with_options_and_body(
+        &self,
+        amount: &str,
+        options: super::StripeChargeOptions<'_>,
+        body: &[u8],
+    ) -> Result<PaymentChallenge> {
+        let challenge = self.stripe_charge_with_options(amount, options)?;
+        Ok(self.with_body_digest(challenge, body))
     }
 }
 
@@ -1722,12 +1762,12 @@ mod tests {
         let mpp = create_test_mpp();
         let body = br#"{"query":"paid"}"#;
         let challenge = mpp
-            .charge_with_options(
+            .charge_with_options_and_body(
                 "0.10",
                 ChargeOptions {
-                    request_body: Some(body),
                     ..Default::default()
                 },
+                body,
             )
             .unwrap();
 
