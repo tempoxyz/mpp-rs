@@ -1,5 +1,7 @@
 //! Tempo payment method configuration and builder.
 
+use alloy::primitives::Address;
+
 use super::mpp::detect_realm;
 
 pub use crate::protocol::methods::tempo::session_method::{
@@ -33,6 +35,7 @@ pub struct TempoBuilder {
     pub(crate) fee_payer: bool,
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
+    pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
 }
 
@@ -102,6 +105,17 @@ impl TempoBuilder {
         self
     }
 
+    /// Replace the fee-sponsor token allowlist used when co-signing fee-payer
+    /// transactions.
+    ///
+    /// By default, sponsored transactions accept the known default currency for
+    /// the transaction chain ID. Use this when `.currency(...)` points at a
+    /// custom token that the fee payer should sponsor.
+    pub fn fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
+        self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
+        self
+    }
+
     /// Set the replay-protection store (default: in-memory).
     ///
     /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
@@ -119,7 +133,7 @@ impl TempoBuilder {
 
 /// Create a Tempo payment method configuration with smart defaults.
 ///
-/// Only `currency` and `recipient` are required. Returns a [`TempoBuilder`]
+/// Only `recipient` is required. Returns a [`TempoBuilder`]
 /// that can be passed to [`Mpp::create()`](super::Mpp::create).
 ///
 /// # Defaults
@@ -129,8 +143,9 @@ impl TempoBuilder {
 ///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
 ///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
-/// - **currency**: pathUSD (`0x20c0000000000000000000000000000000000000`)
-/// - **decimals**: `6` (for pathUSD / standard stablecoins)
+/// - **currency**: pathUSD by default, mainnet USDC with `.chain_id(4217)`,
+///   or pathUSD with `.chain_id(42431)` / a Moderato RPC URL
+/// - **decimals**: `6` (for pathUSD / USDC / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example
@@ -167,6 +182,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer: false,
         chain_id: None,
         fee_payer_signer: None,
+        fee_payer_allowed_fee_tokens: None,
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
     }

@@ -938,6 +938,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(signer) = builder.fee_payer_signer {
             method = method.with_fee_payer(signer);
         }
+        if let Some(allowed_fee_tokens) = builder.fee_payer_allowed_fee_tokens {
+            method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+        }
         if let Some(store) = builder.store {
             method = method.with_store(store);
         }
@@ -1119,9 +1122,16 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
 mod tests {
     use super::*;
     use crate::protocol::core::{ChallengeEcho, PaymentPayload};
+    #[cfg(feature = "tempo")]
+    use crate::protocol::methods::tempo::{
+        FeePayerPolicy, TempoChargeExt, CHAIN_ID, DEFAULT_CURRENCY_MAINNET,
+        DEFAULT_CURRENCY_TESTNET,
+    };
     use crate::protocol::traits::ErrorCode;
     #[cfg(feature = "tempo")]
     use crate::server::{tempo, ChargeOptions, TempoConfig};
+    #[cfg(feature = "tempo")]
+    use alloy::primitives::Address;
     use std::{
         future::Future,
         sync::{Arc, Mutex},
@@ -1403,16 +1413,100 @@ mod tests {
     fn test_mpp_create() {
         let mpp = create_test_mpp();
         assert_eq!(mpp.realm(), "MPP Payment");
-        // No chain_id set → unknown chain → defaults to pathUSD
-        assert_eq!(
-            mpp.currency(),
-            Some("0x20c0000000000000000000000000000000000000")
-        );
+        // No chain_id set follows the existing local/dev fallback.
+        assert_eq!(mpp.currency(), Some(DEFAULT_CURRENCY_TESTNET));
         assert_eq!(
             mpp.recipient(),
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2")
         );
         assert_eq!(mpp.decimals(), 6);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_default_fee_payer_charge_uses_allowlisted_currency() {
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            })
+            .chain_id(CHAIN_ID)
+            .fee_payer(true)
+            .fee_payer_signer(fee_payer_signer)
+            .secret_key("test-secret"),
+        )
+        .unwrap();
+
+        let challenge = mpp.charge("1").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        assert!(mpp.fee_payer());
+        assert!(request.fee_payer());
+        assert_eq!(request.chain_id(), Some(CHAIN_ID));
+        assert_eq!(request.currency, DEFAULT_CURRENCY_MAINNET);
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            request.chain_id().unwrap_or(CHAIN_ID),
+            request.currency_address().unwrap()
+        ));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_unknown_chain_fee_payer_charge_uses_allowlisted_local_currency() {
+        let chain_id = 31337;
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            })
+            .chain_id(chain_id)
+            .fee_payer(true)
+            .fee_payer_signer(fee_payer_signer)
+            .secret_key("test-secret"),
+        )
+        .unwrap();
+
+        let challenge = mpp.charge("1").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        assert!(request.fee_payer());
+        assert_eq!(request.chain_id(), Some(chain_id));
+        assert_eq!(request.currency, DEFAULT_CURRENCY_TESTNET);
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            chain_id,
+            request.currency_address().unwrap()
+        ));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_fee_payer_custom_currency_can_override_allowed_fee_tokens() {
+        let custom_token: Address = "0x9999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            })
+            .currency("0x9999999999999999999999999999999999999999")
+            .fee_payer(true)
+            .fee_payer_signer(fee_payer_signer)
+            .fee_payer_allowed_fee_tokens(vec![custom_token])
+            .secret_key("test-secret"),
+        )
+        .unwrap();
+
+        let challenge = mpp.charge("1").unwrap();
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        assert!(request.fee_payer());
+        assert_eq!(request.currency_address().unwrap(), custom_token);
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            request.chain_id().unwrap_or(CHAIN_ID),
+            custom_token
+        ));
+        assert_eq!(
+            mpp.method.fee_payer_allowed_fee_tokens(),
+            Some([custom_token].as_slice())
+        );
     }
 
     #[cfg(feature = "tempo")]
@@ -1473,10 +1567,7 @@ mod tests {
 
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "100000");
-        assert_eq!(
-            request.currency,
-            "0x20c0000000000000000000000000000000000000"
-        );
+        assert_eq!(request.currency, DEFAULT_CURRENCY_TESTNET);
         assert_eq!(
             request.recipient,
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string())
