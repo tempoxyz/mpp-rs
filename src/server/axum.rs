@@ -1010,8 +1010,15 @@ where
 fn mppx_scope_from_parts(parts: &http_types::request::Parts) -> Option<serde_json::Value> {
     let mut scope = serde_json::Map::new();
     let path = parts.uri.path();
+    let route = parts
+        .extensions
+        .get::<::axum::extract::MatchedPath>()
+        .map(|matched| matched.as_str())
+        .unwrap_or(path);
+    if !route.is_empty() {
+        scope.insert("route".into(), serde_json::Value::String(route.to_string()));
+    }
     if !path.is_empty() {
-        scope.insert("route".into(), serde_json::Value::String(path.to_string()));
         scope.insert(
             "resource".into(),
             serde_json::Value::String(path.to_string()),
@@ -1334,6 +1341,74 @@ mod tests {
         let req = builder.body(()).unwrap();
         let (mut parts, _body) = req.into_parts();
         MppCharge::<C>::from_request_parts(&mut parts, &state).await
+    }
+
+    #[tokio::test]
+    async fn test_extractor_binds_axum_matched_route_scope() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        #[derive(Clone)]
+        struct ScopeCaptureChallenger {
+            seen_scope: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        }
+
+        impl ChargeChallenger for ScopeCaptureChallenger {
+            fn challenge(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                *self.seen_scope.lock().unwrap() = options.mppx_scope;
+                Ok(PaymentChallenge::new(
+                    "mock-id",
+                    "mock-realm",
+                    "tempo",
+                    "charge",
+                    Base64UrlJson::from_value(&serde_json::json!({"amount": amount})).unwrap(),
+                ))
+            }
+
+            fn verify_payment(
+                &self,
+                _credential_str: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+            {
+                Box::pin(std::future::ready(Err("unused".into())))
+            }
+        }
+
+        async fn paid(_charge: MppCharge<OneCent>) -> &'static str {
+            "paid"
+        }
+
+        let seen_scope = Arc::new(std::sync::Mutex::new(None));
+        let state: Arc<dyn ChargeChallenger> = Arc::new(ScopeCaptureChallenger {
+            seen_scope: seen_scope.clone(),
+        });
+        let app = axum::Router::new()
+            .route("/paid/{id}", get(paid))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http_types::Request::builder()
+                    .uri("/paid/one?view=full")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            seen_scope.lock().unwrap().as_ref(),
+            Some(&serde_json::json!({
+                "route": "/paid/{id}",
+                "resource": "/paid/one",
+                "query": "view=full",
+            }))
+        );
     }
 
     async fn run_body_extractor<C: ChargeConfig>(
