@@ -1833,6 +1833,35 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[tokio::test]
+    async fn test_hmac_verify_expected_request_with_body_digest_happy_path() {
+        let mpp = create_hmac_test_mpp();
+        let body = br#"{"query":"paid"}"#;
+        let challenge = mpp.charge_with_body("0.10", body).unwrap();
+        let expected_request: ChargeRequest = challenge.request.decode().unwrap();
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+
+        let receipt = mpp
+            .verify_credential_with_expected_request_and_body(&credential, &expected_request, body)
+            .await
+            .unwrap();
+
+        assert!(receipt.is_success());
+        assert_eq!(receipt.reference, "0xtxhash");
+
+        let err = mpp
+            .verify_credential_with_expected_request_and_body(
+                &credential,
+                &expected_request,
+                br#"{"query":"tampered"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("body digest mismatch"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
     async fn test_hmac_tampered_request_rejected() {
         let mpp = create_hmac_test_mpp();
         let challenge = mpp.charge("0.10").unwrap();
@@ -3211,5 +3240,51 @@ mod tests {
         let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
         assert!(request["methodDetails"].is_object());
         assert!(challenge.description.is_none());
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_with_body_binds_request_body_digest() {
+        let mpp = test_stripe_mpp();
+        let body = br#"{"query":"paid"}"#;
+        let challenge = mpp.stripe_charge_with_body("0.10", body).unwrap();
+
+        let digest = crate::body_digest::compute(body);
+        assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
+        assert!(challenge.verify("test-hmac-secret"));
+
+        let mut tampered = challenge.clone();
+        tampered.digest = Some(crate::body_digest::compute(br#"{"query":"tampered"}"#));
+        assert!(!tampered.verify("test-hmac-secret"));
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_stripe_charge_with_options_and_body_preserves_options() {
+        use crate::server::StripeChargeOptions;
+
+        let mpp = test_stripe_mpp();
+        let body = br#"{"query":"paid"}"#;
+        let challenge = mpp
+            .stripe_charge_with_options_and_body(
+                "0.50",
+                StripeChargeOptions {
+                    description: Some("body-bound stripe charge"),
+                    external_id: Some("order-42"),
+                    ..Default::default()
+                },
+                body,
+            )
+            .unwrap();
+
+        let digest = crate::body_digest::compute(body);
+        assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            challenge.description.as_deref(),
+            Some("body-bound stripe charge")
+        );
+        assert!(challenge.verify("test-hmac-secret"));
+        let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
+        assert_eq!(request["externalId"], "order-42");
     }
 }
