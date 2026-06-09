@@ -25,6 +25,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use http_types::{header, HeaderValue, Request, Response, StatusCode};
 
 use crate::protocol::core::headers::{
@@ -40,6 +42,12 @@ pub trait PaymentVerifier: Send + Sync + 'static {
     /// Generate a `WWW-Authenticate: Payment ...` challenge header value.
     fn challenge(&self) -> Result<String, String>;
 
+    /// Generate a body-bound `WWW-Authenticate: Payment ...` challenge header value.
+    fn challenge_with_body(&self, body: &[u8]) -> Result<String, String> {
+        let _ = body;
+        self.challenge()
+    }
+
     /// Verify a credential string and return a `Payment-Receipt` header value.
     ///
     /// The `credential` is the raw `Authorization` header value
@@ -48,6 +56,16 @@ pub trait PaymentVerifier: Send + Sync + 'static {
         &self,
         credential: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
+
+    /// Verify a credential string against the actual request body bytes.
+    fn verify_with_body(
+        &self,
+        credential: &str,
+        body: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let _ = body;
+        self.verify(credential)
+    }
 }
 
 // ==================== FnVerifier ====================
@@ -56,10 +74,18 @@ pub trait PaymentVerifier: Send + Sync + 'static {
 #[allow(clippy::type_complexity)]
 pub struct FnVerifier {
     challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
+    challenge_with_body_fn: Option<Box<dyn Fn(&[u8]) -> Result<String, String> + Send + Sync>>,
     verify_fn: Box<
         dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
             + Send
             + Sync,
+    >,
+    verify_with_body_fn: Option<
+        Box<
+            dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+                + Send
+                + Sync,
+        >,
     >,
 }
 
@@ -68,11 +94,29 @@ impl PaymentVerifier for FnVerifier {
         (self.challenge_fn)()
     }
 
+    fn challenge_with_body(&self, body: &[u8]) -> Result<String, String> {
+        match &self.challenge_with_body_fn {
+            Some(f) => f(body),
+            None => self.challenge(),
+        }
+    }
+
     fn verify(
         &self,
         credential: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         (self.verify_fn)(credential.to_string())
+    }
+
+    fn verify_with_body(
+        &self,
+        credential: &str,
+        body: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        match &self.verify_with_body_fn {
+            Some(f) => f(credential.to_string(), body.to_vec()),
+            None => self.verify(credential),
+        }
     }
 }
 
@@ -109,7 +153,9 @@ impl PaymentLayer<FnVerifier> {
     ) -> Self {
         Self::new(FnVerifier {
             challenge_fn: Box::new(challenge_fn),
+            challenge_with_body_fn: None,
             verify_fn: Box::new(verify_fn),
+            verify_with_body_fn: None,
         })
     }
 }
@@ -220,6 +266,136 @@ where
     }
 }
 
+// ==================== PaymentBodyLayer ====================
+
+/// Tower [`Layer`](tower_layer::Layer) that binds payment verification to request body bytes.
+///
+/// The request body is buffered, used for body-digest challenge/verification,
+/// and then replayed to the inner service as `http_body_util::Full<Bytes>`.
+#[derive(Clone)]
+pub struct PaymentBodyLayer<V> {
+    verifier: Arc<V>,
+}
+
+impl<V: PaymentVerifier> PaymentBodyLayer<V> {
+    /// Create a body-aware payment layer with a custom [`PaymentVerifier`].
+    pub fn new(verifier: V) -> Self {
+        Self {
+            verifier: Arc::new(verifier),
+        }
+    }
+}
+
+impl<S, V: PaymentVerifier> tower_layer::Layer<S> for PaymentBodyLayer<V> {
+    type Service = PaymentBodyService<S, V>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PaymentBodyService {
+            inner,
+            verifier: Arc::clone(&self.verifier),
+        }
+    }
+}
+
+/// Tower [`Service`](tower_service::Service) for body-bound payment verification.
+#[derive(Clone)]
+pub struct PaymentBodyService<S, V> {
+    inner: S,
+    verifier: Arc<V>,
+}
+
+impl<S, V, ReqBody, ResBody> tower_service::Service<Request<ReqBody>> for PaymentBodyService<S, V>
+where
+    S: tower_service::Service<Request<http_body_util::Full<Bytes>>, Response = Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    S::Error: Send,
+    V: PaymentVerifier,
+    ReqBody: http_body::Body<Data = Bytes> + Send + 'static,
+    ReqBody::Error: std::fmt::Display + Send + Sync + 'static,
+    ResBody: Default + Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Response<ResBody>, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        let verifier = Arc::clone(&self.verifier);
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+
+        Box::pin(async move {
+            let (parts, body) = req.into_parts();
+            let body = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Failed to read request body: {e}"),
+                    ));
+                }
+            };
+
+            let auth_header = parts
+                .headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_payment_scheme)
+                .map(|s| s.to_string());
+
+            let credential = match auth_header {
+                Some(c) => c,
+                None => {
+                    let challenge = match verifier.challenge_with_body(&body) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return Ok(error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                &format!("Failed to generate challenge: {e}"),
+                            ));
+                        }
+                    };
+                    let mut resp = Response::new(ResBody::default());
+                    *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
+                    resp.headers_mut().insert(
+                        WWW_AUTHENTICATE_HEADER,
+                        HeaderValue::from_str(&challenge)
+                            .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
+                    );
+                    resp.headers_mut()
+                        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                    return Ok(resp);
+                }
+            };
+
+            let receipt_header = match verifier.verify_with_body(&credential, &body).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::PAYMENT_REQUIRED,
+                        &format!("Payment verification failed: {e}"),
+                    ));
+                }
+            };
+
+            let req = Request::from_parts(parts, http_body_util::Full::new(body));
+            let mut resp = inner.call(req).await?;
+
+            if let Ok(val) = HeaderValue::from_str(&receipt_header) {
+                resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
+            }
+
+            Ok(resp)
+        })
+    }
+}
+
 /// Build a minimal error response.
 fn error_response<B: Default>(status: StatusCode, _message: &str) -> Response<B> {
     let mut resp = Response::new(B::default());
@@ -236,9 +412,17 @@ fn error_response<B: Default>(status: StatusCode, _message: &str) -> Response<B>
 struct ChargeVerifier {
     /// Builds a fresh `WWW-Authenticate` header value per request.
     challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
+    /// Builds a fresh body-bound `WWW-Authenticate` header value per request.
+    challenge_with_body_fn: Box<dyn Fn(&[u8]) -> Result<String, String> + Send + Sync>,
     /// Shared mpp instance for verification (type-erased).
     verify_fn: Box<
         dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+            + Send
+            + Sync,
+    >,
+    /// Shared mpp instance for body-bound verification (type-erased).
+    verify_with_body_fn: Box<
+        dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
             + Send
             + Sync,
     >,
@@ -249,11 +433,23 @@ impl PaymentVerifier for ChargeVerifier {
         (self.challenge_fn)()
     }
 
+    fn challenge_with_body(&self, body: &[u8]) -> Result<String, String> {
+        (self.challenge_with_body_fn)(body)
+    }
+
     fn verify(
         &self,
         credential: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         (self.verify_fn)(credential.to_string())
+    }
+
+    fn verify_with_body(
+        &self,
+        credential: &str,
+        body: &[u8],
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        (self.verify_with_body_fn)(credential.to_string(), body.to_vec())
     }
 }
 
@@ -296,7 +492,18 @@ impl PaymentLayer<ChargeVerifier> {
                 .map_err(|e| format!("Failed to format challenge: {e}"))
         });
 
+        let mpp_for_body_challenge = mpp.clone();
+        let charge_amount_for_body = amount.to_string();
+        let challenge_with_body_fn = Box::new(move |body: &[u8]| {
+            let challenge = mpp_for_body_challenge
+                .charge_with_body(&charge_amount_for_body, body)
+                .map_err(|e| format!("Failed to generate challenge: {e}"))?;
+            format_www_authenticate(&challenge)
+                .map_err(|e| format!("Failed to format challenge: {e}"))
+        });
+
         let mpp_for_verify = mpp.clone();
+        let expected_request_for_body = expected_request.clone();
         let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
             let mpp = mpp_for_verify.clone();
             let expected_request = expected_request.clone();
@@ -313,16 +520,63 @@ impl PaymentLayer<ChargeVerifier> {
             })
         });
 
+        let mpp_for_body_verify = mpp.clone();
+        let verify_with_body_fn = Box::new(
+            move |credential_str: String,
+                  body: Vec<u8>|
+                  -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+                let mpp = mpp_for_body_verify.clone();
+                let expected_request = expected_request_for_body.clone();
+                Box::pin(async move {
+                    let credential = parse_authorization(&credential_str)
+                        .map_err(|e| format!("Invalid credential: {e}"))?;
+
+                    let receipt = mpp
+                        .verify_credential_with_expected_request_and_body(
+                            &credential,
+                            &expected_request,
+                            &body,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    format_receipt(&receipt).map_err(|e| format!("Failed to format receipt: {e}"))
+                })
+            },
+        );
+
         Ok(Self::new(ChargeVerifier {
             challenge_fn,
+            challenge_with_body_fn,
             verify_fn,
+            verify_with_body_fn,
         }))
+    }
+}
+
+impl PaymentBodyLayer<ChargeVerifier> {
+    /// Create a body-aware payment layer that charges a dollar amount per request.
+    ///
+    /// This buffers the request body, binds issued challenges to its digest,
+    /// verifies credentials against the same bytes, and replays the body to
+    /// the inner service.
+    #[cfg(feature = "tempo")]
+    pub fn charge<M, S>(mpp: &super::Mpp<M, S>, amount: &str) -> crate::error::Result<Self>
+    where
+        M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        let layer = PaymentLayer::charge(mpp, amount)?;
+        Ok(Self {
+            verifier: layer.verifier,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_layer::Layer;
 
     #[derive(Clone)]
     struct MockVerifier {
@@ -385,7 +639,9 @@ mod tests {
     fn test_fn_verifier_challenge() {
         let v = FnVerifier {
             challenge_fn: Box::new(|| Ok("Payment test".to_string())),
+            challenge_with_body_fn: None,
             verify_fn: Box::new(|_| Box::pin(async { Ok("receipt".to_string()) })),
+            verify_with_body_fn: None,
         };
         assert_eq!(v.challenge().unwrap(), "Payment test");
     }
@@ -523,6 +779,121 @@ mod tests {
 
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[derive(Clone)]
+    struct BodyAwareVerifier {
+        challenge_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        verify_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl PaymentVerifier for BodyAwareVerifier {
+        fn challenge(&self) -> Result<String, String> {
+            Ok("Payment id=\"legacy\"".to_string())
+        }
+
+        fn challenge_with_body(&self, body: &[u8]) -> Result<String, String> {
+            *self.challenge_body.lock().unwrap() = Some(body.to_vec());
+            Ok("Payment id=\"body-bound\"".to_string())
+        }
+
+        fn verify(
+            &self,
+            _credential: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+            Box::pin(async { Err("legacy verifier should not be called".to_string()) })
+        }
+
+        fn verify_with_body(
+            &self,
+            _credential: &str,
+            body: &[u8],
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+            *self.verify_body.lock().unwrap() = Some(body.to_vec());
+            Box::pin(async { Ok("mock-receipt-token".to_string()) })
+        }
+    }
+
+    #[derive(Clone)]
+    struct BodyEchoService;
+
+    impl tower_service::Service<Request<http_body_util::Full<Bytes>>> for BodyEchoService {
+        type Response = Response<Vec<u8>>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<Vec<u8>>, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<http_body_util::Full<Bytes>>) -> Self::Future {
+            Box::pin(async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                Ok(Response::new(body.to_vec()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_body_service_no_auth_binds_challenge_to_body() {
+        use tower_service::Service;
+
+        let challenge_body = Arc::new(std::sync::Mutex::new(None));
+        let layer = PaymentBodyLayer::new(BodyAwareVerifier {
+            challenge_body: challenge_body.clone(),
+            verify_body: Arc::new(std::sync::Mutex::new(None)),
+        });
+        let mut svc = layer.layer(BodyEchoService);
+
+        let req = Request::builder()
+            .uri("/premium")
+            .body(http_body_util::Full::new(Bytes::from_static(
+                br#"{"query":"paid"}"#,
+            )))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            resp.headers().get(WWW_AUTHENTICATE_HEADER).unwrap(),
+            "Payment id=\"body-bound\""
+        );
+        assert_eq!(
+            challenge_body.lock().unwrap().as_deref(),
+            Some(br#"{"query":"paid"}"#.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_body_service_valid_auth_verifies_and_replays_body() {
+        use tower_service::Service;
+
+        let verify_body = Arc::new(std::sync::Mutex::new(None));
+        let layer = PaymentBodyLayer::new(BodyAwareVerifier {
+            challenge_body: Arc::new(std::sync::Mutex::new(None)),
+            verify_body: verify_body.clone(),
+        });
+        let mut svc = layer.layer(BodyEchoService);
+
+        let req = Request::builder()
+            .uri("/premium")
+            .header(header::AUTHORIZATION, "Payment eyJmYWtlIjp0cnVlfQ")
+            .body(http_body_util::Full::new(Bytes::from_static(
+                br#"{"query":"paid"}"#,
+            )))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), br#"{"query":"paid"}"#);
+        assert_eq!(
+            resp.headers().get(PAYMENT_RECEIPT_HEADER).unwrap(),
+            "mock-receipt-token"
+        );
+        assert_eq!(
+            verify_body.lock().unwrap().as_deref(),
+            Some(br#"{"query":"paid"}"#.as_slice())
+        );
     }
 
     // ==================== Real ChargeVerifier tests ====================

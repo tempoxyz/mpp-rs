@@ -70,8 +70,10 @@
 
 use std::sync::Arc;
 
-use axum_core::extract::{FromRef, FromRequestParts};
+use axum_core::extract::{FromRef, FromRequest, FromRequestParts, Request};
 use axum_core::response::IntoResponse;
+use bytes::Bytes;
+use http_body_util::BodyExt;
 use http_types::{header, HeaderValue, StatusCode};
 
 #[cfg(any(feature = "stripe", feature = "tempo"))]
@@ -166,7 +168,7 @@ pub trait ChargeConfig {
 }
 
 /// Options passed from a [`ChargeConfig`] to [`ChargeChallenger::challenge`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct ChallengeOptions {
     /// Human-readable description.
     pub description: Option<&'static str>,
@@ -213,6 +215,20 @@ pub struct MppCharge<C: ChargeConfig> {
     _config: std::marker::PhantomData<C>,
 }
 
+/// Axum extractor that gates a handler behind body-bound payment verification.
+///
+/// This extractor consumes the request body, binds issued challenges to the
+/// body digest, verifies submitted credentials against the same bytes, and
+/// exposes the preserved bytes to the handler.
+#[derive(Debug)]
+pub struct MppChargeWithBody<C: ChargeConfig> {
+    /// The verified payment receipt.
+    pub receipt: Receipt,
+    /// The request body bytes that were bound to the challenge digest.
+    pub body: Bytes,
+    _config: std::marker::PhantomData<C>,
+}
+
 /// Rejection type for [`MppCharge`] extractors.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -252,6 +268,17 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         options: ChallengeOptions,
     ) -> Result<PaymentChallenge, String>;
 
+    /// Generate a charge challenge bound to the actual request body bytes.
+    fn challenge_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<PaymentChallenge, String> {
+        let _ = body;
+        self.challenge(amount, options)
+    }
+
     /// Verify a credential string and return a receipt.
     fn verify_payment(
         &self,
@@ -269,6 +296,17 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         _amount: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
         self.verify_payment(credential_str)
+    }
+
+    /// Verify a credential string against route amount and actual request body bytes.
+    fn verify_payment_for_amount_with_body(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        body: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let _ = body;
+        self.verify_payment_for_amount(credential_str, amount)
     }
 }
 
@@ -289,6 +327,23 @@ where
                 description: options.description,
                 ..Default::default()
             },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn challenge_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<PaymentChallenge, String> {
+        self.charge_with_options_and_body(
+            amount,
+            super::ChargeOptions {
+                description: options.description,
+                ..Default::default()
+            },
+            body,
         )
         .map_err(|e| e.to_string())
     }
@@ -360,6 +415,56 @@ where
             .map_err(|e| e.to_string())
         })
     }
+
+    fn verify_payment_for_amount_with_body(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        body: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.charge(amount) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        let body = body.to_vec();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request_and_body(
+                &mpp,
+                &credential,
+                &expected_request,
+                &body,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
 }
 
 #[cfg(feature = "stripe")]
@@ -378,6 +483,23 @@ where
                 description: options.description,
                 ..Default::default()
             },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn challenge_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<PaymentChallenge, String> {
+        self.stripe_charge_with_options_and_body(
+            amount,
+            super::StripeChargeOptions {
+                description: options.description,
+                ..Default::default()
+            },
+            body,
         )
         .map_err(|e| e.to_string())
     }
@@ -449,6 +571,56 @@ where
             .map_err(|e| e.to_string())
         })
     }
+
+    fn verify_payment_for_amount_with_body(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        body: &[u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        let credential = match parse_authorization(credential_str) {
+            Ok(c) => c,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Invalid credential: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_challenge = match self.stripe_charge(amount) {
+            Ok(challenge) => challenge,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to generate expected challenge: {}",
+                    e
+                ))))
+            }
+        };
+
+        let expected_request = match expected_challenge.request.decode() {
+            Ok(request) => request,
+            Err(e) => {
+                return Box::pin(std::future::ready(Err(format!(
+                    "Failed to decode expected request: {}",
+                    e
+                ))))
+            }
+        };
+
+        let mpp = self.clone();
+        let body = body.to_vec();
+        Box::pin(async move {
+            super::Mpp::verify_credential_with_expected_request_and_body(
+                &mpp,
+                &credential,
+                &expected_request,
+                &body,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
 }
 
 impl<S, C> FromRequestParts<S> for MppCharge<C>
@@ -503,6 +675,73 @@ where
 
             Ok(MppCharge {
                 receipt,
+                _config: std::marker::PhantomData,
+            })
+        }
+    }
+}
+
+impl<S, C> FromRequest<S> for MppChargeWithBody<C>
+where
+    Arc<dyn ChargeChallenger>: FromRef<S>,
+    C: ChargeConfig,
+    S: Send + Sync,
+{
+    type Rejection = MppChargeRejection;
+
+    fn from_request(
+        req: Request,
+        state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
+        let (parts, body) = req.into_parts();
+        let auth_header = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_payment_scheme)
+            .map(|s| s.to_string());
+
+        async move {
+            let body = body
+                .collect()
+                .await
+                .map_err(|e| {
+                    MppChargeRejection::InternalError(format!("Failed to read request body: {e}"))
+                })?
+                .to_bytes();
+            let options = ChallengeOptions {
+                description: C::description(),
+            };
+
+            let credential_str = match auth_header {
+                Some(c) => c,
+                None => {
+                    let challenge = challenger
+                        .challenge_with_body(C::amount(), options, &body)
+                        .map_err(MppChargeRejection::InternalError)?;
+                    return Err(MppChargeRejection::Challenge(PaymentRequired(challenge)));
+                }
+            };
+
+            let receipt = match challenger
+                .verify_payment_for_amount_with_body(&credential_str, C::amount(), &body)
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    let challenge = challenger
+                        .challenge_with_body(C::amount(), options, &body)
+                        .map_err(MppChargeRejection::InternalError)?;
+                    return Err(MppChargeRejection::VerificationFailed(PaymentRequired(
+                        challenge,
+                    )));
+                }
+            };
+
+            Ok(MppChargeWithBody {
+                receipt,
+                body,
                 _config: std::marker::PhantomData,
             })
         }
@@ -603,6 +842,66 @@ mod tests {
                     Err("payment rejected".into())
                 }
             })
+        }
+    }
+
+    struct BodyAwareChallenger {
+        seen_challenge_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        seen_verify_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl ChargeChallenger for BodyAwareChallenger {
+        fn challenge(
+            &self,
+            amount: &str,
+            _options: ChallengeOptions,
+        ) -> Result<PaymentChallenge, String> {
+            Ok(PaymentChallenge::new(
+                "mock-id",
+                "mock-realm",
+                "tempo",
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({"amount": amount})).unwrap(),
+            ))
+        }
+
+        fn challenge_with_body(
+            &self,
+            amount: &str,
+            options: ChallengeOptions,
+            body: &[u8],
+        ) -> Result<PaymentChallenge, String> {
+            *self.seen_challenge_body.lock().unwrap() = Some(body.to_vec());
+            let mut challenge = self.challenge(amount, options)?;
+            challenge.digest = Some(crate::body_digest::compute(body));
+            Ok(challenge)
+        }
+
+        fn verify_payment(
+            &self,
+            _credential_str: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            Box::pin(std::future::ready(Err(
+                "legacy verifier should not be called".into(),
+            )))
+        }
+
+        fn verify_payment_for_amount_with_body(
+            &self,
+            _credential_str: &str,
+            _amount: &str,
+            body: &[u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            *self.seen_verify_body.lock().unwrap() = Some(body.to_vec());
+            Box::pin(std::future::ready(Ok(Receipt {
+                status: crate::protocol::core::ReceiptStatus::Success,
+                method: crate::protocol::core::MethodName::new("tempo"),
+                timestamp: "2025-01-01T00:00:00Z".into(),
+                reference: "0xbody-aware".into(),
+                external_id: None,
+            })))
         }
     }
 
@@ -748,6 +1047,20 @@ mod tests {
         MppCharge::<C>::from_request_parts(&mut parts, &state).await
     }
 
+    async fn run_body_extractor<C: ChargeConfig>(
+        challenger: impl ChargeChallenger,
+        auth_header: Option<&str>,
+        body: &'static str,
+    ) -> Result<MppChargeWithBody<C>, MppChargeRejection> {
+        let state: Arc<dyn ChargeChallenger> = Arc::new(challenger);
+        let mut builder = Request::builder().uri("/test");
+        if let Some(auth) = auth_header {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        let req = builder.body(axum_core::body::Body::from(body)).unwrap();
+        MppChargeWithBody::<C>::from_request(req, &state).await
+    }
+
     #[tokio::test]
     async fn test_extractor_no_auth_returns_challenge() {
         let result = run_extractor::<OneCent>(MockChallenger { accept: true }, None).await;
@@ -849,6 +1162,58 @@ mod tests {
         assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn test_body_extractor_challenge_binds_request_body() {
+        let seen_challenge_body = Arc::new(std::sync::Mutex::new(None));
+        let seen_verify_body = Arc::new(std::sync::Mutex::new(None));
+        let result = run_body_extractor::<OneCent>(
+            BodyAwareChallenger {
+                seen_challenge_body: seen_challenge_body.clone(),
+                seen_verify_body,
+            },
+            None,
+            r#"{"query":"paid"}"#,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        let challenge = match err {
+            MppChargeRejection::Challenge(PaymentRequired(challenge)) => challenge,
+            other => panic!("expected challenge rejection, got {other:?}"),
+        };
+        assert_eq!(
+            challenge.digest.as_deref(),
+            Some(crate::body_digest::compute(br#"{"query":"paid"}"#).as_str())
+        );
+        assert_eq!(
+            seen_challenge_body.lock().unwrap().as_deref(),
+            Some(br#"{"query":"paid"}"#.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_body_extractor_verifies_and_preserves_request_body() {
+        let seen_challenge_body = Arc::new(std::sync::Mutex::new(None));
+        let seen_verify_body = Arc::new(std::sync::Mutex::new(None));
+        let result = run_body_extractor::<OneCent>(
+            BodyAwareChallenger {
+                seen_challenge_body,
+                seen_verify_body: seen_verify_body.clone(),
+            },
+            Some("Payment eyJmYWtlIjp0cnVlfQ"),
+            r#"{"query":"paid"}"#,
+        )
+        .await;
+
+        let charge = result.unwrap();
+        assert_eq!(charge.receipt.reference, "0xbody-aware");
+        assert_eq!(charge.body.as_ref(), br#"{"query":"paid"}"#);
+        assert_eq!(
+            seen_verify_body.lock().unwrap().as_deref(),
+            Some(br#"{"query":"paid"}"#.as_slice())
+        );
     }
 
     #[tokio::test]

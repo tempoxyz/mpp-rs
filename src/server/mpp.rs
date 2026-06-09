@@ -680,7 +680,7 @@ where
         #[cfg(feature = "tempo")]
         if credential.challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME {
             let req_transfers =
-                crate::protocol::methods::tempo::transfers::get_request_transfers(&request)
+                crate::protocol::methods::tempo::transfers::get_request_transfers(request)
                     .map_err(|e| {
                         VerificationError::with_code(
                             format!("Invalid Tempo request in credential: {e}"),
