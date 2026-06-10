@@ -142,6 +142,13 @@ impl TempoCharge {
         self.chain_id
     }
 
+    /// Override the chain ID (e.g. a client-pinned chain when the challenge
+    /// omits `methodDetails.chainId`).
+    pub(crate) fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = chain_id;
+        self
+    }
+
     /// Get the currency address.
     pub fn currency(&self) -> Address {
         self.currency

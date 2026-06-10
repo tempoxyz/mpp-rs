@@ -43,6 +43,7 @@ pub struct TempoProvider {
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
     autoswap: Option<AutoswapConfig>,
+    expected_chain_id: Option<u64>,
 }
 
 impl TempoProvider {
@@ -62,6 +63,7 @@ impl TempoProvider {
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
             autoswap: None,
+            expected_chain_id: None,
         })
     }
 
@@ -103,6 +105,20 @@ impl TempoProvider {
         self.autoswap.as_ref()
     }
 
+    /// Pin the chain ID this provider will pay on. When set, [`pay`] rejects any
+    /// challenge whose `methodDetails.chainId` differs, before signing.
+    ///
+    /// [`pay`]: TempoProvider::pay
+    pub fn with_expected_chain_id(mut self, chain_id: u64) -> Self {
+        self.expected_chain_id = Some(chain_id);
+        self
+    }
+
+    /// Get the pinned expected chain ID, if set.
+    pub fn expected_chain_id(&self) -> Option<u64> {
+        self.expected_chain_id
+    }
+
     /// Get the signing mode.
     pub fn signing_mode(&self) -> &TempoSigningMode {
         &self.signing_mode
@@ -127,6 +143,24 @@ impl PaymentProvider for TempoProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
+
+        // Chain pinning: resolve the chain to sign on before signing.
+        // - challenge `chainId` present: must match the pin (if any), else reject;
+        // - challenge `chainId` absent: use the pin, signing on it.
+        if let Some(expected) = self.expected_chain_id {
+            use crate::protocol::methods::tempo::charge::TempoChargeExt;
+            let challenge_chain_id = challenge
+                .request
+                .decode::<crate::protocol::intents::ChargeRequest>()?
+                .chain_id();
+            match challenge_chain_id {
+                Some(got) if got != expected => {
+                    return Err(MppError::ChainIdMismatch { expected, got });
+                }
+                None => charge = charge.with_chain_id(expected),
+                _ => {}
+            }
+        }
 
         if charge.amount().is_zero() {
             let from = self.signing_mode.from_address(self.signer.address());
@@ -356,6 +390,128 @@ mod tests {
         assert!(!provider.supports("stripe", "charge"));
         assert!(!provider.supports("", ""));
         assert!(!provider.supports("TEMPO", "charge"));
+    }
+
+    /// Charge challenge with optional `chainId`. Zero amount keeps `pay()` on
+    /// the no-RPC proof path so the chain-pin gate runs without a live node.
+    fn chain_pin_challenge(chain_id: Option<u64>) -> PaymentChallenge {
+        use crate::protocol::core::Base64UrlJson;
+
+        let mut details = serde_json::Map::new();
+        if let Some(id) = chain_id {
+            details.insert("chainId".to_string(), serde_json::json!(id));
+        }
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": serde_json::Value::Object(details),
+        }))
+        .unwrap();
+        PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        )
+    }
+
+    #[test]
+    fn test_default_provider_has_no_chain_pin() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+        assert_eq!(provider.expected_chain_id(), None);
+    }
+
+    #[test]
+    fn test_with_expected_chain_id_sets_pin() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_expected_chain_id(42431);
+        assert_eq!(provider.expected_chain_id(), Some(42431));
+    }
+
+    /// A challenge whose `chainId` differs from the pin is rejected.
+    #[tokio::test]
+    async fn test_conflicting_chain_id_is_rejected() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_expected_chain_id(42431);
+
+        let challenge = chain_pin_challenge(Some(1));
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        match err {
+            MppError::ChainIdMismatch { expected, got } => {
+                assert_eq!(expected, 42431);
+                assert_eq!(got, 1);
+            }
+            other => panic!("expected ChainIdMismatch, got {other:?}"),
+        }
+    }
+
+    /// A challenge whose `chainId` matches the pin is accepted.
+    #[tokio::test]
+    async fn test_matching_chain_id_is_accepted() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_expected_chain_id(42431);
+
+        let challenge = chain_pin_challenge(Some(42431));
+        assert!(provider.pay(&challenge).await.is_ok());
+    }
+
+    /// An unpinned provider accepts any chain the challenge specifies.
+    #[tokio::test]
+    async fn test_unpinned_provider_accepts_any_chain_id() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
+
+        let challenge = chain_pin_challenge(Some(1));
+        assert!(provider.pay(&challenge).await.is_ok());
+    }
+
+    /// An omitted `chainId` defaults to mainnet; pinning to it accepts.
+    #[tokio::test]
+    async fn test_omitted_chain_id_matches_default_pin() {
+        use crate::protocol::methods::tempo::CHAIN_ID;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_expected_chain_id(CHAIN_ID);
+
+        let challenge = chain_pin_challenge(None);
+        assert!(provider.pay(&challenge).await.is_ok());
+    }
+
+    /// An omitted `chainId` uses the pin (signing on it), not the mainnet
+    /// default — matching the mpp-go ABI.
+    #[tokio::test]
+    async fn test_omitted_chain_id_uses_nondefault_pin() {
+        use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider = TempoProvider::new(signer.clone(), "https://rpc.example.com")
+            .unwrap()
+            .with_expected_chain_id(MODERATO_CHAIN_ID);
+
+        let challenge = chain_pin_challenge(None);
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        // The zero-amount proof source DID encodes the chain it signed on, so it
+        // must reflect the pin rather than the mainnet default.
+        assert_eq!(
+            credential.source,
+            Some(PaymentCredential::evm_did(
+                MODERATO_CHAIN_ID,
+                &signer.address().to_string()
+            ))
+        );
     }
 
     #[test]

@@ -168,8 +168,8 @@ pub enum MppError {
     #[error("HTTP error: {0}")]
     Http(String),
 
-    /// Chain ID mismatch between challenge and provider
-    #[error("Chain ID mismatch: challenge requires {expected}, provider connected to {got}")]
+    /// Chain ID mismatch between the expected (pinned) chain and the one found
+    #[error("Chain ID mismatch: expected {expected}, got {got}")]
     ChainIdMismatch { expected: u64, got: u64 },
 
     /// JSON serialization/deserialization error
