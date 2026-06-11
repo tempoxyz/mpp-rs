@@ -37,6 +37,7 @@ use tempo_alloy::contracts::precompiles::{
 };
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
+use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tokio::sync::OnceCell;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -1016,11 +1017,8 @@ where
         Ok(receipt.transaction_hash())
     }
 
-    /// Turn a co-signed `0x76` tx into a `tempo_simulateV1` request.
-    ///
-    /// The `AASigned -> request` conversion drops `from`, so we recover the
-    /// signer and set it back; the node needs it to model the sender. Split out
-    /// from the RPC call so tests can check the request shape.
+    /// Decode a co-signed `0x76` tx and build the equivalent
+    /// `tempo_simulateV1` request.
     fn build_simulate_payload(
         final_tx_bytes: &[u8],
     ) -> Result<SimulatePayload<TempoTransactionRequest>, VerificationError> {
@@ -1032,8 +1030,32 @@ where
             VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
         })?;
 
+        // Extract the access key while the signature is still available; the
+        // `into()` conversion below discards it.
+        let keychain = match signed.signature() {
+            TempoSignature::Keychain(keychain_sig) => {
+                let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
+                    VerificationError::new(format!(
+                        "Failed to recover keychain access key for simulation: {e}"
+                    ))
+                })?;
+                let key_type = keychain_sig.signature.signature_type();
+                let key_data = match &keychain_sig.signature {
+                    PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
+                    _ => None,
+                };
+                Some((key_id, key_type, key_data))
+            }
+            TempoSignature::Primitive(_) => None,
+        };
+
         let mut req: TempoTransactionRequest = signed.into();
         req.inner.from = Some(sender);
+        if let Some((key_id, key_type, key_data)) = keychain {
+            req.key_id = Some(key_id);
+            req.key_type = Some(key_type);
+            req.key_data = key_data;
+        }
 
         Ok(SimulatePayload {
             block_state_calls: vec![SimBlock {
@@ -3398,6 +3420,102 @@ mod tests {
                 fee_token,
             )
             .expect("cosign should succeed")
+    }
+
+    /// Co-signed `0x76` tx whose client signature is a keychain (access-key)
+    /// signature. Returns `(cosigned bytes, wallet, access key)`.
+    fn make_keychain_cosigned_fee_payer_tx() -> (Vec<u8>, Address, Address) {
+        use super::super::FeePayerEnvelope78;
+        use alloy::signers::SignerSync;
+        use tempo_primitives::transaction::{
+            KeychainSignature, PrimitiveSignature, TempoSignature,
+        };
+
+        let wallet = Address::repeat_byte(0xab);
+        let access_key_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap();
+
+        let tx = make_fee_payer_tx(60);
+        let sig_hash = tx.signature_hash();
+        // V1 keychain signs sig_hash directly; inner signer is the access key.
+        let inner = access_key_signer.sign_hash_sync(&sig_hash).unwrap();
+        let keychain_sig = KeychainSignature::new_v1(wallet, PrimitiveSignature::Secp256k1(inner));
+        let signature = TempoSignature::Keychain(keychain_sig);
+        let envelope =
+            FeePayerEnvelope78::from_signing_tx(tx, wallet, signature).encoded_envelope();
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+        let cosigned = method
+            .cosign_fee_payer_transaction(
+                &envelope,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("cosign should succeed");
+
+        (cosigned, wallet, access_key_signer.address())
+    }
+
+    /// A keychain tx must be simulated as the access key, not the wallet alone:
+    /// the request sets `from` to the wallet *and* carries the access key as
+    /// `keyId`/`keyType` so the node applies keychain auth/revocation checks.
+    #[test]
+    fn test_build_simulate_payload_preserves_keychain_access_key() {
+        let (cosigned, wallet, access_key) = make_keychain_cosigned_fee_payer_tx();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .expect("payload must build");
+
+        let call = &payload.block_state_calls[0].calls[0];
+
+        assert_eq!(call.inner.from, Some(wallet), "from must be the wallet");
+        assert_eq!(
+            call.key_id,
+            Some(access_key),
+            "keyId must be the access key, not the wallet"
+        );
+        assert_eq!(
+            call.key_type,
+            Some(tempo_primitives::SignatureType::Secp256k1)
+        );
+        // Otherwise the assertions above would be vacuous.
+        assert_ne!(wallet, access_key);
+
+        // Confirm the keychain fields serialize onto the wire.
+        let p = serde_json::to_value(&payload).unwrap();
+        let wire_call = &p["blockStateCalls"][0]["calls"][0];
+        assert_eq!(
+            wire_call["keyId"].as_str().unwrap().to_lowercase(),
+            format!("{:#x}", access_key),
+        );
+        assert!(wire_call["keyType"].is_string() || wire_call["keyType"].is_number());
+    }
+
+    /// A plain EOA tx must not carry keychain fields.
+    #[test]
+    fn test_build_simulate_payload_omits_keychain_for_primitive_sig() {
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .expect("payload must build");
+
+        let call = &payload.block_state_calls[0].calls[0];
+        assert!(call.key_id.is_none(), "plain EOA tx must not set keyId");
+        assert!(call.key_type.is_none(), "plain EOA tx must not set keyType");
+        assert!(call.key_data.is_none(), "plain EOA tx must not set keyData");
     }
 
     /// The outbound `tempo_simulateV1` request must carry the full sponsor /
