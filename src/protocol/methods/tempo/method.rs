@@ -1031,7 +1031,8 @@ where
         })?;
 
         // Extract the access key while the signature is still available; the
-        // `into()` conversion below discards it.
+        // `into()` conversion below discards it. `keyId`/`keyType`/`keyData`
+        // are used by the node's gas model for keychain txs.
         let keychain = match signed.signature() {
             TempoSignature::Keychain(keychain_sig) => {
                 let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
@@ -1051,6 +1052,19 @@ where
 
         let mut req: TempoTransactionRequest = signed.into();
         req.inner.from = Some(sender);
+
+        // `From<AASigned>` leaves `inner.to` unset, which the node reads as a
+        // contract CREATE and rejects alongside the AA batch. The node rebuilds
+        // the batch as `calls ++ [inner.to call]`, so fold the last sub-call
+        // into `inner.to/value/input`: same resulting batch (order and
+        // fee-payer signature preserved) with a real call target.
+        let tail = req.calls.pop().ok_or_else(|| {
+            VerificationError::new("Cannot simulate Tempo AA transaction with no calls")
+        })?;
+        req.inner.to = Some(tail.to);
+        req.inner.value = Some(tail.value);
+        req.inner.input = tail.input.into();
+
         if let Some((key_id, key_type, key_data)) = keychain {
             req.key_id = Some(key_id);
             req.key_type = Some(key_type);
@@ -3463,11 +3477,10 @@ mod tests {
         (cosigned, wallet, access_key_signer.address())
     }
 
-    /// A keychain tx must be simulated as the access key, not the wallet alone:
-    /// the request sets `from` to the wallet *and* carries the access key as
-    /// `keyId`/`keyType` so the node applies keychain auth/revocation checks.
+    /// A keychain tx's request sets `from` to the wallet and carries the access
+    /// key as `keyId`/`keyType`, serialized onto the wire.
     #[test]
-    fn test_build_simulate_payload_preserves_keychain_access_key() {
+    fn test_build_simulate_payload_includes_keychain_fields() {
         let (cosigned, wallet, access_key) = make_keychain_cosigned_fee_payer_tx();
 
         let payload =
@@ -3518,27 +3531,36 @@ mod tests {
         assert!(call.key_data.is_none(), "plain EOA tx must not set keyData");
     }
 
-    /// The outbound `tempo_simulateV1` request must carry the full sponsor /
-    /// cosign ABI: the cosigned call's `from` (recovered sender), `feeToken`,
-    /// `feePayerSignature`, the payment `calls`, the expiring `nonceKey`, the
-    /// validity window, and `validation: false`. This is the request-shape
-    /// half of the conformance fixture (the response-handling half lives in the
-    /// revert/success/fail-closed tests).
+    /// The `tempo_simulateV1` request must carry the full sponsor/cosign ABI:
+    /// `from` (recovered sender), `feeToken`, `feePayerSignature`, `nonceKey`,
+    /// the validity window, and `validation: false`. The single payment call is
+    /// folded into `to`/`input` (not left in `calls`) so the node does not read
+    /// the empty `to` as a CREATE.
     #[test]
     fn test_build_simulate_payload_request_abi() {
         let cosigned = make_cosigned_fee_payer_tx();
 
         // The from we expect is the client sender recovered from the cosigned tx.
-        let expected_from = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice())
-            .unwrap()
-            .recover_signer()
-            .unwrap();
+        let signed = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let expected_from = signed.recover_signer().unwrap();
+        let expected_calls = signed.tx().calls.clone();
 
         let payload =
             ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
                 &cosigned,
             )
             .expect("payload must build");
+
+        // `build_aa()` must reproduce the original call list exactly, so the
+        // fee-payer signature still recovers.
+        let rebuilt = payload.block_state_calls[0].calls[0]
+            .clone()
+            .build_aa()
+            .expect("request must rebuild into an AA tx");
+        assert_eq!(
+            rebuilt.calls, expected_calls,
+            "rebuilt batch must match the signed tx's calls"
+        );
 
         // Serialize exactly as it goes over the wire (single-element param array).
         let params = serde_json::to_value((payload,)).unwrap();
@@ -3558,6 +3580,19 @@ mod tests {
             format!("{:#x}", expected_from),
             "request must set the recovered sender as `from`"
         );
+        // The single payment call must be folded into `to` (so the node does
+        // not treat the empty `to` as a CREATE) — not left in `calls`.
+        assert!(
+            call["to"].is_string(),
+            "payment call must be folded into `to`: {call}"
+        );
+        assert!(
+            call["calls"]
+                .as_array()
+                .map(|c| c.is_empty())
+                .unwrap_or(true),
+            "single-call request must leave `calls` empty: {call}"
+        );
         // Fee-sponsor fields the node needs to model gas affordability/execution.
         assert!(call["feeToken"].is_string(), "feeToken must be present");
         assert!(
@@ -3569,8 +3604,62 @@ mod tests {
             call["validBefore"].is_string(),
             "validBefore must be present"
         );
-        let calls = call["calls"].as_array().expect("payment calls present");
-        assert_eq!(calls.len(), 1, "expected the single payment call");
+    }
+
+    /// A multi-call AA batch must round-trip with its order preserved: the
+    /// last call is folded into `to`, the rest stay in `calls`, and the node's
+    /// `calls ++ [inner.to call]` reconstruction reproduces the original order.
+    #[test]
+    fn test_build_simulate_payload_preserves_multi_call_order() {
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+
+        // Three distinct calls so a reordering bug (e.g. moving the first call)
+        // would be observable.
+        let calls = vec![
+            tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                value: U256::ZERO,
+                input: Bytes::from(vec![0xaa]),
+            },
+            tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::from(7u64),
+                input: Bytes::from(vec![0xbb, 0xbb]),
+            },
+            tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x33)),
+                value: U256::ZERO,
+                input: Bytes::from(vec![0xcc, 0xcc, 0xcc]),
+            },
+        ];
+
+        let mut tx = make_fee_payer_tx(60);
+        tx.calls = calls.clone();
+        let signature: tempo_primitives::transaction::TempoSignature =
+            signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
+        let signed_bytes = tx.into_signed(signature).encoded_2718();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &signed_bytes,
+            )
+            .expect("payload must build");
+
+        let req = &payload.block_state_calls[0].calls[0];
+        // N-1 calls stay in `calls`, the last is folded into `to`.
+        assert_eq!(req.calls, calls[..2], "first N-1 calls stay in `calls`");
+        assert_eq!(req.inner.to, Some(calls[2].to), "last call folds into `to`");
+        assert_eq!(req.inner.value, Some(calls[2].value));
+
+        // The node reconstructs `calls ++ [inner.to call]`; verify it matches.
+        let rebuilt = req.clone().build_aa().expect("must rebuild");
+        assert_eq!(
+            rebuilt.calls, calls,
+            "reconstructed batch must preserve the original order"
+        );
     }
 
     /// A reverting simulation must block the broadcast so the sponsor never
