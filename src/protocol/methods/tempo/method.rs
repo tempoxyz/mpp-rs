@@ -1030,24 +1030,26 @@ where
             VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
         })?;
 
-        // Extract the access key while the signature is still available; the
-        // `into()` conversion below discards it. `keyId`/`keyType`/`keyData`
-        // are used by the node's gas model for keychain txs.
-        let keychain = match signed.signature() {
-            TempoSignature::Keychain(keychain_sig) => {
-                let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
-                    VerificationError::new(format!(
-                        "Failed to recover keychain access key for simulation: {e}"
-                    ))
-                })?;
-                let key_type = keychain_sig.signature.signature_type();
-                let key_data = match &keychain_sig.signature {
-                    PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
-                    _ => None,
-                };
-                Some((key_id, key_type, key_data))
-            }
-            TempoSignature::Primitive(_) => None,
+        // Extract auth metadata before `into()` discards the signature: the
+        // node sizes signature gas from `keyType`/`keyData` (primitive
+        // p256/webauthn included) and selects the keychain key via `keyId`.
+        let (key_id, key_type, key_data) = {
+            let (key_id, primitive_sig) = match signed.signature() {
+                TempoSignature::Keychain(keychain_sig) => {
+                    let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
+                        VerificationError::new(format!(
+                            "Failed to recover keychain access key for simulation: {e}"
+                        ))
+                    })?;
+                    (Some(key_id), &keychain_sig.signature)
+                }
+                TempoSignature::Primitive(primitive_sig) => (None, primitive_sig),
+            };
+            let key_data = match primitive_sig {
+                PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
+                _ => None,
+            };
+            (key_id, primitive_sig.signature_type(), key_data)
         };
 
         let mut req: TempoTransactionRequest = signed.into();
@@ -1065,10 +1067,10 @@ where
         req.inner.value = Some(tail.value);
         req.inner.input = tail.input.into();
 
-        if let Some((key_id, key_type, key_data)) = keychain {
+        req.key_type = Some(key_type);
+        req.key_data = key_data;
+        if let Some(key_id) = key_id {
             req.key_id = Some(key_id);
-            req.key_type = Some(key_type);
-            req.key_data = key_data;
         }
 
         Ok(SimulatePayload {
@@ -3514,7 +3516,8 @@ mod tests {
         assert!(wire_call["keyType"].is_string() || wire_call["keyType"].is_number());
     }
 
-    /// A plain EOA tx must not carry keychain fields.
+    /// A plain EOA tx carries no `keyId` but still advertises its `keyType`
+    /// so the node sizes signature gas correctly.
     #[test]
     fn test_build_simulate_payload_omits_keychain_for_primitive_sig() {
         let cosigned = make_cosigned_fee_payer_tx();
@@ -3527,8 +3530,15 @@ mod tests {
 
         let call = &payload.block_state_calls[0].calls[0];
         assert!(call.key_id.is_none(), "plain EOA tx must not set keyId");
-        assert!(call.key_type.is_none(), "plain EOA tx must not set keyType");
-        assert!(call.key_data.is_none(), "plain EOA tx must not set keyData");
+        assert_eq!(
+            call.key_type,
+            Some(tempo_primitives::SignatureType::Secp256k1),
+            "primitive tx must advertise its keyType for gas sizing"
+        );
+        assert!(
+            call.key_data.is_none(),
+            "secp256k1 tx has no WebAuthn auth data"
+        );
     }
 
     /// The `tempo_simulateV1` request must carry the full sponsor/cosign ABI:
