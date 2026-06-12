@@ -4,6 +4,7 @@
 //! method and intent. Method-specific interpretation happens in the methods layer.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use super::types::{Base64UrlJson, IntentName, MethodName, PayloadType, ReceiptStatus};
 
@@ -481,15 +482,15 @@ pub fn compute_challenge_id(
 }
 
 /// Constant-time string comparison to prevent timing attacks.
+///
+/// Delegated to the audited [`subtle`] crate: a hand-rolled loop carries no
+/// guarantee the compiler won't reintroduce data-dependent branches, and
+/// timing behavior is impractical to assert as conformance. Length is not
+/// secret (inputs are fixed-size protocol strings: a `sha-256=` base64
+/// body digest, or a base64url SHA-256 HMAC tag), so the length-mismatch
+/// fast-path in `ct_eq` is acceptable.
 pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        result |= x ^ y;
-    }
-    result == 0
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// Challenge echo in credential (echoes server challenge parameters).
