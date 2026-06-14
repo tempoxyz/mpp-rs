@@ -12,7 +12,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
@@ -20,7 +20,7 @@ jobs:
       - name: Install Claude CLI
         run: npm install -g @anthropic-ai/claude-code@2.1.96
       - name: Check changelog
-        uses: tempoxyz/changelogs/check@57e22cb5bd8367edc8cc1450b9eb0aea75d6e019 # master
+        uses: tempoxyz/changelogs/check@29ac40b71b3966761305991d99f21c5195d7466b # master
         with:
           ai: "claude -p"
           ecosystem: rust
