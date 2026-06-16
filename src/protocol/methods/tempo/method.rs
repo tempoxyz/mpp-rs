@@ -39,10 +39,13 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
 use crate::store::Store;
-use crate::tempo::{attribution, MODERATO_CHAIN_ID};
+use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
-use super::{proof, TempoChargeExt, CHAIN_ID, INTENT_CHARGE, METHOD_NAME};
+use super::{
+    network::TempoNetwork as KnownTempoNetwork, proof, TempoChargeExt, CHAIN_ID,
+    DEFAULT_CURRENCY_TESTNET, INTENT_CHARGE, METHOD_NAME,
+};
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
 const MAX_FEE_PER_GAS_DEFAULT: u128 = 100_000_000_000;
@@ -326,11 +329,33 @@ fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferL
     None
 }
 
+/// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
+/// for a `did:pkh:eip155` DID matching `expected_chain_id`, else `Err`.
+fn parse_hash_credential_source(
+    source: Option<&str>,
+    expected_chain_id: u64,
+) -> Result<Option<Address>, VerificationError> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+
+    let invalid = || VerificationError::new("Hash credential source is invalid.");
+
+    let parsed = proof::parse_proof_source(source).map_err(|_| invalid())?;
+    if parsed.chain_id != expected_chain_id {
+        return Err(invalid());
+    }
+
+    Ok(Some(parsed.address))
+}
+
 fn match_receipt_transfer_logs(
     logs: &[serde_json::Value],
-    tx_sender: Address,
+    expected_sender: Address,
     currency: Address,
     expected: &[Transfer],
+    source: Option<&str>,
+    validate_sender: Option<&ValidateSenderCallback>,
 ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
     let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
     sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
@@ -363,7 +388,6 @@ fn match_receipt_transfer_logs(
                 };
 
                 if parsed.address() != currency
-                    || parsed.from() != tx_sender
                     || parsed.to() != transfer.recipient
                     || parsed.amount() != transfer.amount
                 {
@@ -376,6 +400,21 @@ fn match_receipt_transfer_logs(
                     }
                 } else if prefer_memo != parsed.memo().is_some() {
                     continue;
+                }
+
+                // On a sender mismatch, validate_sender may authorize the log.
+                let sender = parsed.from();
+                if sender != expected_sender {
+                    let authorized = validate_sender.is_some_and(|cb| {
+                        cb(SenderValidation {
+                            expected_sender,
+                            sender,
+                            source,
+                        })
+                    });
+                    if !authorized {
+                        continue;
+                    }
                 }
 
                 return Some((log_idx, parsed.matched()));
@@ -432,6 +471,22 @@ fn assert_challenge_bound_memo(
     }
 }
 
+/// Arguments passed to a [`ValidateSenderCallback`] on a sender mismatch.
+#[derive(Debug, Clone, Copy)]
+pub struct SenderValidation<'a> {
+    /// The expected sender (source address, or receipt sender if no source).
+    pub expected_sender: Address,
+    /// The actual `from` address on the transfer log.
+    pub sender: Address,
+    /// The raw credential source DID, if provided.
+    pub source: Option<&'a str>,
+}
+
+/// Authorizes a transfer whose sender differs from the expected sender;
+/// return `true` to accept.
+pub type ValidateSenderCallback =
+    dyn for<'a> Fn(SenderValidation<'a>) -> bool + Send + Sync + 'static;
+
 /// Tempo charge method for one-time payment verification.
 ///
 /// This is a **Tempo-specific** payment verifier. It expects:
@@ -475,6 +530,8 @@ pub struct ChargeMethod<P> {
     store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
+    validate_sender: Option<Arc<ValidateSenderCallback>>,
+    fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
 }
 
 #[derive(Debug, Clone)]
@@ -497,44 +554,69 @@ pub struct FeePayerPolicyOverride {
 
 impl Default for FeePayerPolicy {
     fn default() -> FeePayerPolicy {
-        FeePayerPolicy {
-            max_gas: MAX_FEE_PAYER_GAS_LIMIT,
-            max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
-            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
-            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
-            max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
-        }
+        Self::get_by_chain_id(CHAIN_ID)
     }
 }
 
 impl FeePayerPolicy {
     /// Merge overrides onto the per-chain default.
     pub fn resolve(chain_id: u64, overrides: Option<&FeePayerPolicyOverride>) -> Self {
-        let base = Self::get_by_chain_id(chain_id);
-        let Some(o) = overrides else { return base };
-        Self {
-            max_gas: o.max_gas.unwrap_or(base.max_gas),
-            max_fee_per_gas: o.max_fee_per_gas.unwrap_or(base.max_fee_per_gas),
-            max_priority_fee_per_gas: o
+        let mut policy = Self::get_by_chain_id(chain_id);
+        if let Some(o) = overrides {
+            policy.max_gas = o.max_gas.unwrap_or(policy.max_gas);
+            policy.max_fee_per_gas = o.max_fee_per_gas.unwrap_or(policy.max_fee_per_gas);
+            policy.max_priority_fee_per_gas = o
                 .max_priority_fee_per_gas
-                .unwrap_or(base.max_priority_fee_per_gas),
-            max_total_fee: o.max_total_fee.unwrap_or(base.max_total_fee),
-            max_validity_window_seconds: o
+                .unwrap_or(policy.max_priority_fee_per_gas);
+            policy.max_total_fee = o.max_total_fee.unwrap_or(policy.max_total_fee);
+            policy.max_validity_window_seconds = o
                 .max_validity_window_seconds
-                .unwrap_or(base.max_validity_window_seconds),
+                .unwrap_or(policy.max_validity_window_seconds);
         }
+        policy
+    }
+
+    /// Return the default sponsor fee-token allowlist for a transaction chain.
+    ///
+    /// Known Tempo chains allow their default currency. Unknown chains use the
+    /// mainnet default, matching the server-side charge verifier fallback.
+    pub fn default_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
+        default_fee_payer_allowed_fee_tokens(chain_id)
+    }
+
+    /// Check whether the default sponsor allowlist accepts `fee_token`.
+    pub fn default_allows_fee_token(chain_id: u64, fee_token: Address) -> bool {
+        fee_token_allowed(&Self::default_allowed_fee_tokens(chain_id), fee_token)
     }
 
     fn get_by_chain_id(chain_id: u64) -> Self {
-        match chain_id {
+        let network = KnownTempoNetwork::from_chain_id(chain_id);
+        let mut policy = Self {
+            max_gas: MAX_FEE_PAYER_GAS_LIMIT,
+            max_fee_per_gas: MAX_FEE_PER_GAS_DEFAULT,
+            max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS_DEFAULT,
+            max_total_fee: MAX_TOTAL_FEE_DEFAULT,
+            max_validity_window_seconds: MAX_VALIDITY_WINDOW_SECS_DEFAULT,
+        };
+        if network == Some(KnownTempoNetwork::Moderato) {
             // Moderato regularly needs a higher priority fee than mainnet.
-            MODERATO_CHAIN_ID => Self {
-                max_priority_fee_per_gas: 50_000_000_000,
-                ..Self::default()
-            },
-            _ => Self::default(),
+            policy.max_priority_fee_per_gas = 50_000_000_000;
         }
+        policy
     }
+}
+
+fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
+    let token = KnownTempoNetwork::from_chain_id(chain_id)
+        .map(|network| network.default_currency())
+        .unwrap_or(DEFAULT_CURRENCY_TESTNET);
+    vec![token
+        .parse()
+        .expect("default Tempo fee token is a valid address")]
+}
+
+fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
+    allowed_fee_tokens.contains(&fee_token)
 }
 
 impl<P> ChargeMethod<P>
@@ -552,7 +634,19 @@ where
             store: None,
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
+            validate_sender: None,
+            fee_payer_allowed_fee_tokens: None,
         }
+    }
+
+    /// Set a callback invoked when a hash-credential transfer's sender differs
+    /// from the expected sender; returning `true` accepts the transfer.
+    pub fn with_validate_sender<F>(mut self, validate_sender: F) -> Self
+    where
+        F: for<'a> Fn(SenderValidation<'a>) -> bool + Send + Sync + 'static,
+    {
+        self.validate_sender = Some(Arc::new(validate_sender));
+        self
     }
 
     /// Override the fee-sponsor policy applied to fee-payer envelopes.
@@ -565,11 +659,29 @@ where
         self
     }
 
+    /// Replace the default sponsor fee-token allowlist.
+    ///
+    /// By default, fee-payer co-signing accepts the known default currency for
+    /// the transaction chain ID. Use this to restrict or widen the accepted
+    /// fee tokens for a server.
+    pub fn with_fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
+        self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
+        self.fee_payer_allowed_fee_tokens.as_deref()
+    }
+
     /// Configure a store for replay deduplication.
     ///
     /// When set, each verified transaction hash is recorded and subsequent
     /// attempts to replay the same hash are rejected. Zero-amount proof
     /// credentials are likewise made single-use per credential fingerprint.
+    ///
+    /// The store must support atomic [`Store::put_if_absent`], else verification
+    /// fails closed with `StoreError::AtomicUnsupported`.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
         self
@@ -599,26 +711,19 @@ where
         &self,
         tx_hash: &str,
         charge: &ChargeRequest,
+        source: Option<&str>,
+        expected_chain_id: u64,
         challenge_id: &str,
         realm: &str,
     ) -> Result<Receipt, VerificationError> {
+        // Validate the source before reserving the hash.
+        let source_address = parse_hash_credential_source(source, expected_chain_id)?;
+
         let hash = tx_hash
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
         let replay_key = format!("mpp:charge:{:#x}", hash);
-
-        if let Some(store) = &self.store {
-            let seen = store
-                .get(&replay_key)
-                .await
-                .map_err(|e| VerificationError::new(format!("Store error: {e}")))?;
-            if seen.is_some() {
-                return Err(VerificationError::new(
-                    "Transaction hash has already been used.",
-                ));
-            }
-        }
 
         let receipt = self
             .provider
@@ -646,20 +751,29 @@ where
         })?;
         let expected = Self::expected_transfers(charge)?;
 
+        // Use the source address if present, otherwise the receipt sender.
+        let expected_sender = source_address.unwrap_or_else(|| receipt.from());
+
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
-        let matched_logs = self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        let matched_logs = self.verify_tip20_transfers(
+            &receipt,
+            expected_sender,
+            currency,
+            &expected,
+            source,
+            self.validate_sender.as_deref(),
+        )?;
 
         if charge.memo().is_none() {
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
 
         if let Some(store) = &self.store {
-            // Atomic claim; the early get above is only a fast-path.
-            let reserved = store
+            let claimed = store
                 .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
-            if !reserved {
+            if !claimed {
                 return Err(VerificationError::new(
                     "Transaction hash has already been used.",
                 ));
@@ -677,20 +791,28 @@ where
     fn verify_tip20_transfers(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
+        expected_sender: Address,
         currency: Address,
         expected: &[Transfer],
+        source: Option<&str>,
+        validate_sender: Option<&ValidateSenderCallback>,
     ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
-
-        let tx_sender = receipt.from();
 
         let logs = receipt_json
             .get("logs")
             .and_then(|v| v.as_array())
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
-        match_receipt_transfer_logs(logs, tx_sender, currency, expected)
+        match_receipt_transfer_logs(
+            logs,
+            expected_sender,
+            currency,
+            expected,
+            source,
+            validate_sender,
+        )
     }
 
     /// Validate that a transaction contains all expected payment calls (supports splits).
@@ -897,18 +1019,17 @@ where
             charge.fee_payer(),
         )?;
 
-        // Pre-broadcast dedup: hash the final tx bytes (after co-signing/validation)
-        // and check/mark in store before broadcasting. Uses a separate namespace
-        // from the post-broadcast hash-based dedup in verify_hash.
+        // Pre-broadcast dedup of the final tx bytes. Separate namespace from
+        // the post-broadcast hash dedup in verify_hash.
         if let Some(store) = &self.store {
             let tx_hash_pre = keccak256(&final_tx_bytes);
             let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
             // Atomically reserve before broadcasting.
-            let reserved = store
+            let claimed = store
                 .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
-            if !reserved {
+            if !claimed {
                 return Err(VerificationError::new(
                     "Transaction has already been submitted.",
                 ));
@@ -933,8 +1054,9 @@ where
             )));
         }
 
-        // Verify the receipt contains the expected TIP-20 transfer(s)
-        let matched_logs = self.verify_tip20_transfers(&receipt, currency, &expected)?;
+        // Verify the receipt contains the expected TIP-20 transfer(s).
+        let matched_logs =
+            self.verify_tip20_transfers(&receipt, receipt.from(), currency, &expected, None, None)?;
         if charge.memo().is_none() {
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
@@ -944,11 +1066,11 @@ where
         // also succeed.
         if let Some(store) = &self.store {
             let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
-            let reserved = store
+            let claimed = store
                 .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
                 .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
-            if !reserved {
+            if !claimed {
                 return Err(VerificationError::new(
                     "Transaction hash has already been used.",
                 ));
@@ -1046,6 +1168,17 @@ where
         };
 
         let policy = FeePayerPolicy::resolve(tx.chain_id, self.fee_payer_policy_override.as_ref());
+
+        let allowed_fee_tokens = self
+            .fee_payer_allowed_fee_tokens
+            .clone()
+            .unwrap_or_else(|| FeePayerPolicy::default_allowed_fee_tokens(tx.chain_id));
+        if !fee_token_allowed(&allowed_fee_tokens, fee_token) {
+            return Err(VerificationError::new(format!(
+                "Fee token {:#x} is not allowed by fee payer policy",
+                fee_token
+            )));
+        }
 
         if tx.max_fee_per_gas > policy.max_fee_per_gas {
             return Err(VerificationError::new(format!(
@@ -1148,6 +1281,8 @@ where
         let store = self.store.clone();
         let cached_chain_id = Arc::clone(&self.cached_chain_id);
         let fee_payer_policy_override = self.fee_payer_policy_override.clone();
+        let validate_sender = self.validate_sender.clone();
+        let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
 
         async move {
             let this = ChargeMethod {
@@ -1156,6 +1291,8 @@ where
                 store,
                 cached_chain_id,
                 fee_payer_policy_override,
+                validate_sender,
+                fee_payer_allowed_fee_tokens,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -1211,6 +1348,8 @@ where
                 this.verify_hash(
                     charge_payload.tx_hash().unwrap(),
                     &request,
+                    credential.source.as_deref(),
+                    expected_chain_id,
                     &credential.challenge.id,
                     &credential.challenge.realm,
                 )
@@ -1668,7 +1807,8 @@ mod tests {
             memo: None,
         }];
 
-        let matched = match_receipt_transfer_logs(&logs, sender, currency, &expected).unwrap();
+        let matched =
+            match_receipt_transfer_logs(&logs, sender, currency, &expected, None, None).unwrap();
 
         assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
     }
@@ -1697,11 +1837,244 @@ mod tests {
             },
         ];
 
-        let matched = match_receipt_transfer_logs(&logs, sender, currency, &expected).unwrap();
+        let matched =
+            match_receipt_transfer_logs(&logs, sender, currency, &expected, None, None).unwrap();
 
         assert_eq!(matched.len(), 2);
         assert!(matched.contains(&MatchedTransferLog::Memo(memo)));
         assert!(matched.contains(&MatchedTransferLog::Transfer));
+    }
+
+    // ==================== Hash credential source validation ====================
+
+    const HASH_SOURCE_INVALID: &str = "Hash credential source is invalid.";
+
+    fn did_pkh(chain_id: u64, address: Address) -> String {
+        format!("did:pkh:eip155:{chain_id}:{address}")
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_absent_is_none() {
+        assert_eq!(
+            parse_hash_credential_source(None, MODERATO_CHAIN_ID).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_valid_returns_address() {
+        let address = Address::repeat_byte(0x11);
+        let source = did_pkh(MODERATO_CHAIN_ID, address);
+        let parsed = parse_hash_credential_source(Some(&source), MODERATO_CHAIN_ID).unwrap();
+        assert_eq!(parsed, Some(address));
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_chain_id_mismatch_is_rejected() {
+        let source = did_pkh(1, Address::repeat_byte(0x11));
+        let err = parse_hash_credential_source(Some(&source), MODERATO_CHAIN_ID).unwrap_err();
+        assert_eq!(err.to_string(), HASH_SOURCE_INVALID);
+    }
+
+    #[test]
+    fn test_parse_hash_credential_source_rejects_malformed_variants() {
+        let address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2";
+        let cases = [
+            "not-a-valid-did",
+            "did:pkh:solana:42431:0xa5cc3c03994db5b0d9ba5e4f6d2efbd9f213b141",
+            &format!("did:pkh:eip155:042431:{address}"),
+            &format!("did:pkh:eip155:not-a-number:{address}"),
+            &format!("did:pkh:eip155:42431:extra:{address}"),
+            "did:pkh:eip155:42431:not-an-address",
+        ];
+        for case in cases {
+            let err = parse_hash_credential_source(Some(case), MODERATO_CHAIN_ID).unwrap_err();
+            assert_eq!(err.to_string(), HASH_SOURCE_INVALID, "case: {case}");
+        }
+    }
+
+    #[test]
+    fn test_match_transfer_logs_accepts_source_matching_transfer_sender() {
+        let currency = Address::repeat_byte(0x20);
+        let source = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let logs = vec![make_transfer_with_memo_log(
+            currency, source, recipient, amount, memo,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let matched =
+            match_receipt_transfer_logs(&logs, source, currency, &expected, None, None).unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
+    }
+
+    #[test]
+    fn test_match_transfer_logs_rejects_source_differing_from_transfer_sender() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let actual_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let logs = vec![make_transfer_log(
+            currency,
+            actual_sender,
+            recipient,
+            amount,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let err =
+            match_receipt_transfer_logs(&logs, declared_source, currency, &expected, None, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("No matching transfer event found"));
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_override_allows_mismatch() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let actual_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let source_did = did_pkh(MODERATO_CHAIN_ID, declared_source);
+        let logs = vec![make_transfer_log(
+            currency,
+            actual_sender,
+            recipient,
+            amount,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let cb_did = source_did.clone();
+        let cb: Box<ValidateSenderCallback> = Box::new(move |v: SenderValidation| {
+            assert_eq!(v.expected_sender, declared_source);
+            assert_eq!(v.sender, actual_sender);
+            assert_eq!(v.source, Some(cb_did.as_str()));
+            true
+        });
+        let matched = match_receipt_transfer_logs(
+            &logs,
+            declared_source,
+            currency,
+            &expected,
+            Some(&source_did),
+            Some(cb.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Transfer]);
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_returning_false_rejects() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let actual_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let logs = vec![make_transfer_log(
+            currency,
+            actual_sender,
+            recipient,
+            amount,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        let cb: Box<ValidateSenderCallback> = Box::new(|_v: SenderValidation| false);
+        let err = match_receipt_transfer_logs(
+            &logs,
+            declared_source,
+            currency,
+            &expected,
+            None,
+            Some(cb.as_ref()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("No matching transfer event found"));
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_not_called_when_sender_matches() {
+        let currency = Address::repeat_byte(0x20);
+        let source = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let logs = vec![make_transfer_with_memo_log(
+            currency, source, recipient, amount, memo,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: None,
+        }];
+
+        // Callback panics if invoked; sender already matches.
+        let cb: Box<ValidateSenderCallback> = Box::new(|_v: SenderValidation| {
+            panic!("validate_sender must not run when sender already matches")
+        });
+        let matched = match_receipt_transfer_logs(
+            &logs,
+            source,
+            currency,
+            &expected,
+            None,
+            Some(cb.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
+    }
+
+    #[test]
+    fn test_match_transfer_logs_validate_sender_not_called_for_memo_incompatible_logs() {
+        let currency = Address::repeat_byte(0x20);
+        let declared_source = Address::repeat_byte(0x99);
+        let wrong_sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let wanted_memo = attribution::encode("challenge-123", "api.example.com", None);
+        let other_memo = attribution::encode("challenge-999", "api.example.com", None);
+        // First log has a wrong sender and a non-matching memo; second matches.
+        let logs = vec![
+            make_transfer_with_memo_log(currency, wrong_sender, recipient, amount, other_memo),
+            make_transfer_with_memo_log(currency, declared_source, recipient, amount, wanted_memo),
+        ];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: Some(wanted_memo),
+        }];
+
+        let cb: Box<ValidateSenderCallback> = Box::new(|_v: SenderValidation| {
+            panic!("validate_sender must not run for memo-incompatible logs")
+        });
+        let matched = match_receipt_transfer_logs(
+            &logs,
+            declared_source,
+            currency,
+            &expected,
+            None,
+            Some(cb.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(wanted_memo)]);
     }
 
     #[test]
@@ -1803,8 +2176,9 @@ mod tests {
 
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let tx = make_fee_payer_tx(60);
@@ -2257,8 +2631,9 @@ mod tests {
     fn test_cosign_rejects_wrong_nonce_key() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2290,8 +2665,9 @@ mod tests {
     fn test_cosign_rejects_missing_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2324,8 +2700,9 @@ mod tests {
     fn test_cosign_rejects_access_list_signed_by_client() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let mut tx = make_fee_payer_tx(60);
@@ -2361,8 +2738,9 @@ mod tests {
     fn test_cosign_rejects_expired_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         // Build a tx with valid_before in the past
@@ -2400,8 +2778,9 @@ mod tests {
     #[test]
     fn test_cosign_rejects_empty_input() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let provider =
@@ -2427,8 +2806,9 @@ mod tests {
     #[test]
     fn test_cosign_rejects_wrong_type_byte() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         let provider =
@@ -2522,6 +2902,41 @@ mod tests {
         assert_eq!(
             key1, key3,
             "0x-prefixed and unprefixed should produce same key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_replay_rejected_via_put_if_absent() {
+        use crate::store::{MemoryStore, Store};
+        use std::sync::Arc;
+
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let key = format!("mpp:charge:{}", hash.parse::<B256>().unwrap());
+
+        let start = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let key = key.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                store
+                    .put_if_absent(&key, serde_json::Value::Bool(true))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut claims = 0;
+        for h in handles {
+            if h.await.unwrap() {
+                claims += 1;
+            }
+        }
+        assert_eq!(
+            claims, 1,
+            "exactly one concurrent verifier may claim the tx hash"
         );
     }
 
@@ -2817,8 +3232,9 @@ mod tests {
         Address,
     ) {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
@@ -2955,7 +3371,7 @@ mod tests {
         );
     }
 
-    /// All five policy override fields are respected when set together.
+    /// All five limit policy override fields are respected when set together.
     #[test]
     fn test_policy_override_all_fields_applied() {
         // Generous overrides — tx should pass all checks.
@@ -3024,6 +3440,88 @@ mod tests {
             moderato.max_validity_window_seconds,
             tempo_mainnet.max_validity_window_seconds
         );
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            CHAIN_ID,
+            KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            CHAIN_ID,
+            KnownTempoNetwork::Moderato
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
+            KnownTempoNetwork::Moderato
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
+            KnownTempoNetwork::Mainnet
+                .default_currency()
+                .parse::<Address>()
+                .unwrap()
+        ));
+        assert!(FeePayerPolicy::default_allows_fee_token(
+            31337,
+            DEFAULT_CURRENCY_TESTNET.parse::<Address>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_cosign_rejects_non_allowlisted_fee_token() {
+        let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap()];
+        let (method, client_signer, _) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+
+        let tx = make_fee_payer_tx(60);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                KnownTempoNetwork::Moderato
+                    .default_currency()
+                    .parse::<Address>()
+                    .unwrap(),
+            )
+            .expect_err("cosign should reject non-allowlisted fee token");
+        assert!(
+            err.to_string()
+                .contains("is not allowed by fee payer policy"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cosign_uses_custom_fee_token_allowlist() {
+        let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap()];
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
+
+        let tx = make_fee_payer_tx(60);
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("cosign should accept a custom allowlisted fee token");
     }
 
     /// Sponsor MUST strip an attacker-injected wire access list: an honest
@@ -3041,8 +3539,9 @@ mod tests {
 
         let client_signer = PrivateKeySigner::random();
         let fee_payer_signer = PrivateKeySigner::random();
-        let fee_token: Address = "0x20c0000000000000000000000000000000000000"
-            .parse()
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
             .unwrap();
 
         // Honest tx with empty access list, signed by the client.
