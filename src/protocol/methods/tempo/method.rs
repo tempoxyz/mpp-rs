@@ -1086,22 +1086,39 @@ where
         })
     }
 
-    /// Simulate a co-signed `0x76` tx and error if it would revert. Fails
-    /// closed: an RPC error is treated as a failed check, not a pass.
+    /// Simulate a co-signed `0x76` tx and error if it would revert. Generally
+    /// fails closed: an RPC error is treated as a failed check, not a pass.
+    /// Exception: nodes without `tempo_simulateV1` (JSON-RPC -32601) skip the
+    /// check rather than reject every sponsored payment.
     async fn simulate_before_broadcast(
         &self,
         final_tx_bytes: &[u8],
     ) -> Result<(), VerificationError> {
+        // Standard JSON-RPC "method not found" code.
+        const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+
         let payload = Self::build_simulate_payload(final_tx_bytes)?;
 
         // tempo_simulateV1(payload, block?) — omit block to use the latest state.
-        let response: TempoSimulateResponse = self
+        let response: TempoSimulateResponse = match self
             .provider
             .raw_request("tempo_simulateV1".into(), (payload,))
             .await
-            .map_err(|e| {
-                VerificationError::network_error(format!("Pre-broadcast simulation failed: {e}"))
-            })?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // Node doesn't support pre-simulation: skip the check rather
+                // than failing the payment.
+                if e.as_error_resp()
+                    .is_some_and(|err| err.code == JSONRPC_METHOD_NOT_FOUND)
+                {
+                    return Ok(());
+                }
+                return Err(VerificationError::network_error(format!(
+                    "Pre-broadcast simulation failed: {e}"
+                )));
+            }
+        };
 
         let call: &SimCallResult = response
             .blocks
@@ -3761,5 +3778,32 @@ mod tests {
             err.to_string().contains("Pre-broadcast simulation failed"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A node that doesn't implement `tempo_simulateV1` (JSON-RPC "method not
+    /// found", -32601) has nothing to simulate against, so the check is skipped
+    /// and the broadcast proceeds rather than rejecting the payment.
+    #[tokio::test]
+    async fn test_simulate_before_broadcast_skips_when_method_not_found() {
+        use alloy::providers::mock::Asserter;
+
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let asserter = Asserter::new();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: -32601,
+            message: "the method tempo_simulateV1 does not exist/is not available".into(),
+            data: None,
+        });
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+
+        method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect("method-not-found must skip the check, not fail");
     }
 }
