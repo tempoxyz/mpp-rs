@@ -23,16 +23,21 @@
 //! assert!(receipt.is_success());
 //! ```
 
+use alloy::consensus::transaction::SignerRecoverable;
+use alloy::eips::Decodable2718;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
+use alloy::rpc::types::simulate::{SimBlock, SimCallResult, SimulatePayload};
 use alloy::sol_types::SolCall;
 use std::future::Future;
 use std::sync::Arc;
 use tempo_alloy::contracts::precompiles::{
     IAccountKeychain, IStablecoinDEX, ACCOUNT_KEYCHAIN_ADDRESS, ITIP20, STABLECOIN_DEX_ADDRESS,
 };
+use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
+use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tokio::sync::OnceCell;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -619,6 +624,19 @@ fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool
     allowed_fee_tokens.contains(&fee_token)
 }
 
+/// `tempo_simulateV1` response; we only read the per-call status.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TempoSimulateResponse {
+    #[serde(default)]
+    blocks: Vec<TempoSimulateBlock>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TempoSimulateBlock {
+    #[serde(default)]
+    calls: Vec<SimCallResult>,
+}
+
 impl<P> ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
@@ -1019,6 +1037,13 @@ where
             charge.fee_payer(),
         )?;
 
+        // The sponsor pays the gas here, so simulate first and bail if the tx
+        // would revert. Static validation above only checks call shape, not
+        // execution. Fails closed: no simulation, no broadcast.
+        if charge.fee_payer() {
+            self.simulate_before_broadcast(&final_tx_bytes).await?;
+        }
+
         // Pre-broadcast dedup of the final tx bytes. Separate namespace from
         // the post-broadcast hash dedup in verify_hash.
         if let Some(store) = &self.store {
@@ -1080,6 +1105,136 @@ where
         Ok(receipt.transaction_hash())
     }
 
+    /// Decode a co-signed `0x76` tx and build the equivalent
+    /// `tempo_simulateV1` request.
+    fn build_simulate_payload(
+        final_tx_bytes: &[u8],
+    ) -> Result<SimulatePayload<TempoTransactionRequest>, VerificationError> {
+        let signed =
+            tempo_primitives::AASigned::decode_2718(&mut &final_tx_bytes[..]).map_err(|e| {
+                VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
+            })?;
+        let sender = signed.recover_signer().map_err(|e| {
+            VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
+        })?;
+
+        // Extract auth metadata before `into()` discards the signature: the
+        // node sizes signature gas from `keyType`/`keyData` (primitive
+        // p256/webauthn included) and selects the keychain key via `keyId`.
+        let (key_id, key_type, key_data) = {
+            let (key_id, primitive_sig) = match signed.signature() {
+                TempoSignature::Keychain(keychain_sig) => {
+                    let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
+                        VerificationError::new(format!(
+                            "Failed to recover keychain access key for simulation: {e}"
+                        ))
+                    })?;
+                    (Some(key_id), &keychain_sig.signature)
+                }
+                TempoSignature::Primitive(primitive_sig) => (None, primitive_sig),
+            };
+            let key_data = match primitive_sig {
+                PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
+                _ => None,
+            };
+            (key_id, primitive_sig.signature_type(), key_data)
+        };
+
+        let mut req: TempoTransactionRequest = signed.into();
+        req.inner.from = Some(sender);
+
+        // `From<AASigned>` leaves `inner.to` unset, which the node reads as a
+        // contract CREATE and rejects alongside the AA batch. The node rebuilds
+        // the batch as `calls ++ [inner.to call]`, so fold the last sub-call
+        // into `inner.to/value/input`: same resulting batch (order and
+        // fee-payer signature preserved) with a real call target.
+        let tail = req.calls.pop().ok_or_else(|| {
+            VerificationError::new("Cannot simulate Tempo AA transaction with no calls")
+        })?;
+        req.inner.to = Some(tail.to);
+        req.inner.value = Some(tail.value);
+        req.inner.input = tail.input.into();
+
+        req.key_type = Some(key_type);
+        req.key_data = key_data;
+        if let Some(key_id) = key_id {
+            req.key_id = Some(key_id);
+        }
+
+        Ok(SimulatePayload {
+            block_state_calls: vec![SimBlock {
+                block_overrides: None,
+                state_overrides: None,
+                calls: vec![req],
+            }],
+            // We only care about execution outcome, not mempool admission.
+            validation: false,
+            trace_transfers: false,
+            return_full_transactions: false,
+        })
+    }
+
+    /// Simulate a co-signed `0x76` tx and error if it would revert. Generally
+    /// fails closed: an RPC error is treated as a failed check, not a pass.
+    /// Exception: nodes without `tempo_simulateV1` (JSON-RPC -32601) skip the
+    /// check rather than reject every sponsored payment.
+    async fn simulate_before_broadcast(
+        &self,
+        final_tx_bytes: &[u8],
+    ) -> Result<(), VerificationError> {
+        // Standard JSON-RPC "method not found" code.
+        const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+
+        let payload = Self::build_simulate_payload(final_tx_bytes)?;
+
+        // tempo_simulateV1(payload, block?) — omit block to use the latest state.
+        let response: TempoSimulateResponse = match self
+            .provider
+            .raw_request("tempo_simulateV1".into(), (payload,))
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // Node doesn't support pre-simulation: skip the check rather
+                // than failing the payment.
+                if e.as_error_resp()
+                    .is_some_and(|err| err.code == JSONRPC_METHOD_NOT_FOUND)
+                {
+                    return Ok(());
+                }
+                return Err(VerificationError::network_error(format!(
+                    "Pre-broadcast simulation failed: {e}"
+                )));
+            }
+        };
+
+        let call: &SimCallResult = response
+            .blocks
+            .first()
+            .and_then(|block| block.calls.first())
+            .ok_or_else(|| {
+                VerificationError::new("Pre-broadcast simulation returned no call results")
+            })?;
+
+        if !call.status {
+            let detail = match &call.error {
+                Some(err) => format!("{} (code {})", err.message, err.code),
+                None if !call.return_data.is_empty() => {
+                    format!(
+                        "revert data {}",
+                        alloy::hex::encode_prefixed(&call.return_data)
+                    )
+                }
+                None => "no revert reason returned".to_string(),
+            };
+            return Err(VerificationError::transaction_failed(format!(
+                "Sponsored transaction would revert in pre-broadcast simulation: {detail}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Co-sign a fee payer transaction.
     ///
     /// Accepts a `0x78` fee payer envelope, recovers the sender via
@@ -1092,7 +1247,6 @@ where
         fee_token: Address,
     ) -> Result<Vec<u8>, VerificationError> {
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
-        use alloy::consensus::transaction::SignerRecoverable;
         use alloy::eips::Encodable2718;
         use alloy::signers::SignerSync;
         use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
@@ -2171,7 +2325,6 @@ mod tests {
     #[test]
     fn test_fee_payer_round_trip_0x78_envelope() {
         use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
-        use alloy::eips::Decodable2718;
         use alloy::signers::SignerSync;
 
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
@@ -3530,7 +3683,6 @@ mod tests {
     #[test]
     fn test_cosign_strips_tampered_access_list() {
         use alloy::eips::eip2930::{AccessList, AccessListItem};
-        use alloy::eips::Decodable2718;
         use alloy::primitives::B256;
         use alloy::signers::local::PrivateKeySigner;
         use alloy::signers::SignerSync;
@@ -3594,5 +3746,390 @@ mod tests {
             "broadcast tx must have empty access list"
         );
         assert_eq!(signed.tx().fee_token, Some(fee_token));
+    }
+
+    /// Build a co-signed `0x76` transaction the same way `broadcast_transaction`
+    /// does, for exercising `simulate_before_broadcast` against a mocked node.
+    fn make_cosigned_fee_payer_tx() -> Vec<u8> {
+        use super::super::FeePayerEnvelope78;
+        use alloy::signers::SignerSync;
+
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap();
+
+        let tx = make_fee_payer_tx(60);
+        let sig_hash = tx.signature_hash();
+        let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
+        let signature: tempo_primitives::transaction::TempoSignature = sig.into();
+        let envelope = FeePayerEnvelope78::from_signing_tx(tx, client_signer.address(), signature)
+            .encoded_envelope();
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+        method
+            .cosign_fee_payer_transaction(
+                &envelope,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("cosign should succeed")
+    }
+
+    /// Co-signed `0x76` tx whose client signature is a keychain (access-key)
+    /// signature. Returns `(cosigned bytes, wallet, access key)`.
+    fn make_keychain_cosigned_fee_payer_tx() -> (Vec<u8>, Address, Address) {
+        use super::super::FeePayerEnvelope78;
+        use alloy::signers::SignerSync;
+        use tempo_primitives::transaction::{
+            KeychainSignature, PrimitiveSignature, TempoSignature,
+        };
+
+        let wallet = Address::repeat_byte(0xab);
+        let access_key_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_token = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap();
+
+        let tx = make_fee_payer_tx(60);
+        let sig_hash = tx.signature_hash();
+        // V1 keychain signs sig_hash directly; inner signer is the access key.
+        let inner = access_key_signer.sign_hash_sync(&sig_hash).unwrap();
+        let keychain_sig = KeychainSignature::new_v1(wallet, PrimitiveSignature::Secp256k1(inner));
+        let signature = TempoSignature::Keychain(keychain_sig);
+        let envelope =
+            FeePayerEnvelope78::from_signing_tx(tx, wallet, signature).encoded_envelope();
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+        let cosigned = method
+            .cosign_fee_payer_transaction(
+                &envelope,
+                method.fee_payer_signer.as_ref().unwrap(),
+                fee_token,
+            )
+            .expect("cosign should succeed");
+
+        (cosigned, wallet, access_key_signer.address())
+    }
+
+    /// A keychain tx's request sets `from` to the wallet and carries the access
+    /// key as `keyId`/`keyType`, serialized onto the wire.
+    #[test]
+    fn test_build_simulate_payload_includes_keychain_fields() {
+        let (cosigned, wallet, access_key) = make_keychain_cosigned_fee_payer_tx();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .expect("payload must build");
+
+        let call = &payload.block_state_calls[0].calls[0];
+
+        assert_eq!(call.inner.from, Some(wallet), "from must be the wallet");
+        assert_eq!(
+            call.key_id,
+            Some(access_key),
+            "keyId must be the access key, not the wallet"
+        );
+        assert_eq!(
+            call.key_type,
+            Some(tempo_primitives::SignatureType::Secp256k1)
+        );
+        // Otherwise the assertions above would be vacuous.
+        assert_ne!(wallet, access_key);
+
+        // Confirm the keychain fields serialize onto the wire.
+        let p = serde_json::to_value(&payload).unwrap();
+        let wire_call = &p["blockStateCalls"][0]["calls"][0];
+        assert_eq!(
+            wire_call["keyId"].as_str().unwrap().to_lowercase(),
+            format!("{:#x}", access_key),
+        );
+        assert!(wire_call["keyType"].is_string() || wire_call["keyType"].is_number());
+    }
+
+    /// A plain EOA tx carries no `keyId` but still advertises its `keyType`
+    /// so the node sizes signature gas correctly.
+    #[test]
+    fn test_build_simulate_payload_omits_keychain_for_primitive_sig() {
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .expect("payload must build");
+
+        let call = &payload.block_state_calls[0].calls[0];
+        assert!(call.key_id.is_none(), "plain EOA tx must not set keyId");
+        assert_eq!(
+            call.key_type,
+            Some(tempo_primitives::SignatureType::Secp256k1),
+            "primitive tx must advertise its keyType for gas sizing"
+        );
+        assert!(
+            call.key_data.is_none(),
+            "secp256k1 tx has no WebAuthn auth data"
+        );
+    }
+
+    /// The `tempo_simulateV1` request must carry the full sponsor/cosign ABI:
+    /// `from` (recovered sender), `feeToken`, `feePayerSignature`, `nonceKey`,
+    /// the validity window, and `validation: false`. The single payment call is
+    /// folded into `to`/`input` (not left in `calls`) so the node does not read
+    /// the empty `to` as a CREATE.
+    #[test]
+    fn test_build_simulate_payload_request_abi() {
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        // The from we expect is the client sender recovered from the cosigned tx.
+        let signed = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let expected_from = signed.recover_signer().unwrap();
+        let expected_calls = signed.tx().calls.clone();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .expect("payload must build");
+
+        // `build_aa()` must reproduce the original call list exactly, so the
+        // fee-payer signature still recovers.
+        let rebuilt = payload.block_state_calls[0].calls[0]
+            .clone()
+            .build_aa()
+            .expect("request must rebuild into an AA tx");
+        assert_eq!(
+            rebuilt.calls, expected_calls,
+            "rebuilt batch must match the signed tx's calls"
+        );
+
+        // Serialize exactly as it goes over the wire (single-element param array).
+        let params = serde_json::to_value((payload,)).unwrap();
+        let arr = params.as_array().expect("params serialize to a JSON array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "tempo_simulateV1 takes a single payload param"
+        );
+
+        let p = &arr[0];
+        assert_eq!(p["validation"], serde_json::json!(false));
+
+        let call = &p["blockStateCalls"][0]["calls"][0];
+        assert_eq!(
+            call["from"].as_str().unwrap().to_lowercase(),
+            format!("{:#x}", expected_from),
+            "request must set the recovered sender as `from`"
+        );
+        // The single payment call must be folded into `to` (so the node does
+        // not treat the empty `to` as a CREATE) — not left in `calls`.
+        assert!(
+            call["to"].is_string(),
+            "payment call must be folded into `to`: {call}"
+        );
+        assert!(
+            call["calls"]
+                .as_array()
+                .map(|c| c.is_empty())
+                .unwrap_or(true),
+            "single-call request must leave `calls` empty: {call}"
+        );
+        // Fee-sponsor fields the node needs to model gas affordability/execution.
+        assert!(call["feeToken"].is_string(), "feeToken must be present");
+        assert!(
+            call["feePayerSignature"].is_string() || call["feePayerSignature"].is_object(),
+            "feePayerSignature must be present: {call}"
+        );
+        assert!(call["nonceKey"].is_string(), "nonceKey must be present");
+        assert!(
+            call["validBefore"].is_string(),
+            "validBefore must be present"
+        );
+    }
+
+    /// A multi-call AA batch must round-trip with its order preserved: the
+    /// last call is folded into `to`, the rest stay in `calls`, and the node's
+    /// `calls ++ [inner.to call]` reconstruction reproduces the original order.
+    #[test]
+    fn test_build_simulate_payload_preserves_multi_call_order() {
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+
+        // Three distinct calls so a reordering bug (e.g. moving the first call)
+        // would be observable.
+        let calls = vec![
+            tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                value: U256::ZERO,
+                input: Bytes::from(vec![0xaa]),
+            },
+            tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x22)),
+                value: U256::from(7u64),
+                input: Bytes::from(vec![0xbb, 0xbb]),
+            },
+            tempo_primitives::transaction::Call {
+                to: TxKind::Call(Address::repeat_byte(0x33)),
+                value: U256::ZERO,
+                input: Bytes::from(vec![0xcc, 0xcc, 0xcc]),
+            },
+        ];
+
+        let mut tx = make_fee_payer_tx(60);
+        tx.calls = calls.clone();
+        let signature: tempo_primitives::transaction::TempoSignature =
+            signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
+        let signed_bytes = tx.into_signed(signature).encoded_2718();
+
+        let payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &signed_bytes,
+            )
+            .expect("payload must build");
+
+        let req = &payload.block_state_calls[0].calls[0];
+        // N-1 calls stay in `calls`, the last is folded into `to`.
+        assert_eq!(req.calls, calls[..2], "first N-1 calls stay in `calls`");
+        assert_eq!(req.inner.to, Some(calls[2].to), "last call folds into `to`");
+        assert_eq!(req.inner.value, Some(calls[2].value));
+
+        // The node reconstructs `calls ++ [inner.to call]`; verify it matches.
+        let rebuilt = req.clone().build_aa().expect("must rebuild");
+        assert_eq!(
+            rebuilt.calls, calls,
+            "reconstructed batch must preserve the original order"
+        );
+    }
+
+    /// A reverting simulation must block the broadcast so the sponsor never
+    /// pays gas for a failing transaction.
+    #[tokio::test]
+    async fn test_simulate_before_broadcast_rejects_revert() {
+        use alloy::providers::mock::Asserter;
+
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "blocks": [{
+                "calls": [{
+                    "returnData": "0x",
+                    "gasUsed": "0x5208",
+                    "status": "0x0",
+                    "error": { "code": 3, "message": "execution reverted" }
+                }]
+            }]
+        }));
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+
+        let err = method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect_err("reverting simulation must be rejected");
+        assert!(
+            err.to_string().contains("would revert"),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("execution reverted"));
+    }
+
+    /// A successful simulation must allow the broadcast to proceed.
+    #[tokio::test]
+    async fn test_simulate_before_broadcast_accepts_success() {
+        use alloy::providers::mock::Asserter;
+
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "blocks": [{
+                "calls": [{
+                    "returnData": "0x",
+                    "gasUsed": "0x5208",
+                    "status": "0x1"
+                }]
+            }]
+        }));
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+
+        method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect("successful simulation must pass");
+    }
+
+    /// If the simulation RPC itself errors, fail closed: the sponsor must not
+    /// broadcast a transaction it could not simulate.
+    #[tokio::test]
+    async fn test_simulate_before_broadcast_fails_closed_on_rpc_error() {
+        use alloy::providers::mock::Asserter;
+
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("tempo_simulateV1 unavailable");
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+
+        let err = method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect_err("RPC failure must fail closed");
+        assert!(
+            err.to_string().contains("Pre-broadcast simulation failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A node that doesn't implement `tempo_simulateV1` (JSON-RPC "method not
+    /// found", -32601) has nothing to simulate against, so the check is skipped
+    /// and the broadcast proceeds rather than rejecting the payment.
+    #[tokio::test]
+    async fn test_simulate_before_broadcast_skips_when_method_not_found() {
+        use alloy::providers::mock::Asserter;
+
+        let cosigned = make_cosigned_fee_payer_tx();
+
+        let asserter = Asserter::new();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: -32601,
+            message: "the method tempo_simulateV1 does not exist/is not available".into(),
+            data: None,
+        });
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+
+        method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect("method-not-found must skip the check, not fail");
     }
 }

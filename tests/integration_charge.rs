@@ -1957,3 +1957,162 @@ async fn test_proof_credential_replay_rejected() {
     handle.abort();
     let _ = handle.await;
 }
+
+/// Authorize `access_key` for `wallet`'s account on-chain with a single pathUSD
+/// spending limit, in its own transaction (so the limit is live in committed
+/// state for any later charge). The wallet signs and pays its own gas.
+async fn wallet_authorize_access_key(
+    rpc: &str,
+    wallet: &PrivateKeySigner,
+    access_key: Address,
+    path_usd_limit: U256,
+) {
+    use tempo_alloy::contracts::precompiles::{IAccountKeychain, ACCOUNT_KEYCHAIN_ADDRESS};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let config = IAccountKeychain::KeyRestrictions {
+        expiry: now + 3_600, // 1 hour from now
+        enforceLimits: true,
+        limits: vec![IAccountKeychain::TokenLimit {
+            token: PATH_USD,
+            amount: path_usd_limit,
+            period: 0,
+        }],
+        allowAnyCalls: true, // only the spending limit should bite
+        allowedCalls: vec![],
+    };
+    let calldata = IAccountKeychain::authorizeKey_1Call {
+        keyId: access_key,
+        signatureType: IAccountKeychain::SignatureType::Secp256k1,
+        config,
+    }
+    .abi_encode();
+
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+    let nonce = provider
+        .get_transaction_count(wallet.address())
+        .await
+        .expect("nonce");
+    let chain_id = provider.get_chain_id().await.expect("chain id");
+    let gas_price = provider.get_gas_price().await.expect("gas price");
+
+    let tx = TempoTransaction {
+        chain_id,
+        nonce,
+        gas_limit: 5_000_000,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price,
+        fee_token: Some(PATH_USD),
+        calls: vec![Call {
+            to: TxKind::Call(ACCOUNT_KEYCHAIN_ADDRESS),
+            value: U256::ZERO,
+            input: Bytes::from(calldata),
+        }],
+        ..Default::default()
+    };
+    let sig = wallet.sign_hash_sync(&tx.signature_hash()).unwrap();
+    let signed = tx.into_signed(sig.into());
+    let raw = format!("0x{}", hex::encode(signed.encoded_2718()));
+    let tx_hash: B256 = provider
+        .raw_request("eth_sendRawTransaction".into(), (raw,))
+        .await
+        .expect("authorizeKey send failed");
+
+    let receipt = wait_for_receipt(&provider, tx_hash)
+        .await
+        .expect("authorizeKey receipt");
+    assert!(receipt.status(), "authorizeKey tx reverted: {tx_hash:#x}");
+}
+
+/// A valid keychain (access-key) sponsored charge passes the pre-broadcast
+/// simulation gate and settles on-chain, with the sponsor as the fee payer.
+#[tokio::test]
+async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
+    use mpp::client::tempo::signing::{KeychainVersion, TempoSigningMode};
+
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+
+    let sponsor_signer = PrivateKeySigner::random();
+    let wallet_signer = PrivateKeySigner::random();
+    let access_key_signer = PrivateKeySigner::random();
+
+    // Sponsor pays gas; wallet holds the funds the access key spends.
+    fund_account(&rpc, sponsor_signer.address()).await;
+    fund_account(&rpc, wallet_signer.address()).await;
+
+    // Provision the access key on-chain with a generous pathUSD limit so the
+    // 0.01 charge is well within bounds.
+    wallet_authorize_access_key(
+        &rpc,
+        &wallet_signer,
+        access_key_signer.address(),
+        U256::from(1_000_000u64),
+    )
+    .await;
+
+    let sponsor_addr = sponsor_signer.address();
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", sponsor_addr),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(sponsor_signer)
+        .secret_key("keychain-sim-test"),
+    )
+    .expect("failed to create Mpp");
+
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    // Access key acts for the wallet; key already on-chain (no key_authorization).
+    let provider = TempoProvider::new(access_key_signer, &rpc)
+        .expect("failed to create TempoProvider")
+        .with_signing_mode(TempoSigningMode::Keychain {
+            wallet: wallet_signer.address(),
+            key_authorization: None,
+            version: KeychainVersion::V2,
+        });
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("keychain fee-payer payment failed");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "valid keychain sponsored charge must pass simulation and settle"
+    );
+
+    let receipt_hdr = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("missing Payment-Receipt header")
+        .to_str()
+        .unwrap();
+    let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
+    assert_eq!(receipt.status, mpp::ReceiptStatus::Success);
+
+    // The sponsor, not the wallet, is the on-chain fee payer.
+    let provider_http =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+    let tx_hash: B256 = receipt.reference.parse().expect("receipt ref is a tx hash");
+    let chain_receipt = wait_for_receipt(&provider_http, tx_hash)
+        .await
+        .expect("on-chain receipt");
+    assert_eq!(
+        chain_receipt.fee_payer, sponsor_addr,
+        "sponsor must be the on-chain fee payer for the keychain charge"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
