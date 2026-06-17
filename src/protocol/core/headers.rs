@@ -104,57 +104,70 @@ pub const PAYMENT_SCHEME: &str = "Payment";
 /// - Comma or space separated parameters
 fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
     let mut params = HashMap::new();
-    let chars: Vec<char> = params_str.chars().collect();
+    let bytes = params_str.as_bytes();
     let mut i = 0;
 
-    while i < chars.len() {
-        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == ',') {
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
             i += 1;
         }
-        if i >= chars.len() {
+        if i >= bytes.len() {
             break;
         }
 
         let key_start = i;
-        while i < chars.len() && chars[i] != '=' && !chars[i].is_whitespace() {
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if i >= chars.len() || chars[i] != '=' {
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != ',' {
+        if i >= bytes.len() || bytes[i] != b'=' {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' {
                 i += 1;
             }
             continue;
         }
 
-        let key: String = chars[key_start..i].iter().collect();
+        let key = params_str[key_start..i].to_string();
         i += 1;
 
-        if i >= chars.len() {
+        if i >= bytes.len() {
             break;
         }
 
-        let value = if chars[i] == '"' {
+        let value = if bytes[i] == b'"' {
             i += 1;
             let mut value = String::new();
-            while i < chars.len() && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < chars.len() {
+            while i < bytes.len() && bytes[i] != b'"' {
+                if key == "request" && value.len() >= MAX_TOKEN_LEN {
+                    return Err(MppError::invalid_challenge_reason(format!(
+                        "Request parameter exceeds maximum length of {} bytes",
+                        MAX_TOKEN_LEN
+                    )));
+                }
+
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     i += 1;
-                    value.push(chars[i]);
+                    value.push(bytes[i] as char);
                 } else {
-                    value.push(chars[i]);
+                    value.push(bytes[i] as char);
                 }
                 i += 1;
             }
-            if i < chars.len() {
+            if i < bytes.len() {
                 i += 1;
             }
             value
         } else {
             let value_start = i;
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != ',' {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' {
                 i += 1;
             }
-            chars[value_start..i].iter().collect()
+            if key == "request" && i - value_start > MAX_TOKEN_LEN {
+                return Err(MppError::invalid_challenge_reason(format!(
+                    "Request parameter exceeds maximum length of {} bytes",
+                    MAX_TOKEN_LEN
+                )));
+            }
+            params_str[value_start..i].to_string()
         };
 
         if params.contains_key(&key) {
@@ -227,12 +240,6 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     let method = MethodName::new(method_raw);
     let intent = IntentName::new(require_param!(params, "intent"));
     let request_b64 = require_param!(params, "request").clone();
-    if request_b64.len() > MAX_TOKEN_LEN {
-        return Err(MppError::invalid_challenge_reason(format!(
-            "Request parameter exceeds maximum length of {} bytes",
-            MAX_TOKEN_LEN
-        )));
-    }
 
     let request_bytes = base64url_decode(&request_b64)?;
     // Validate that the decoded bytes are valid JSON (matches TS SDK behavior)
