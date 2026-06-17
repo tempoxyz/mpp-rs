@@ -305,8 +305,15 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         &self,
         credential_str: &str,
         amount: &str,
-        _mppx_scope: Option<serde_json::Value>,
+        mppx_scope: Option<serde_json::Value>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        if mppx_scope.is_some() {
+            let _ = credential_str;
+            let _ = amount;
+            return Box::pin(std::future::ready(Err(
+                "framework scope verification is not implemented for this ChargeChallenger".into(),
+            )));
+        }
         self.verify_payment_for_amount(credential_str, amount)
     }
 
@@ -329,7 +336,14 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         mppx_scope: Option<serde_json::Value>,
         body: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
-        let _ = mppx_scope;
+        if mppx_scope.is_some() {
+            let _ = credential_str;
+            let _ = amount;
+            let _ = body;
+            return Box::pin(std::future::ready(Err(
+                "framework scope verification is not implemented for this ChargeChallenger".into(),
+            )));
+        }
         self.verify_payment_for_amount_with_body(credential_str, amount, body)
     }
 }
@@ -1131,6 +1145,16 @@ mod tests {
                 }
             })
         }
+
+        fn verify_payment_for_amount_and_scope(
+            &self,
+            credential_str: &str,
+            amount: &str,
+            _mppx_scope: Option<serde_json::Value>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            self.verify_payment_for_amount(credential_str, amount)
+        }
     }
 
     struct BodyAwareChallenger {
@@ -1190,6 +1214,17 @@ mod tests {
                 reference: "0xbody-aware".into(),
                 external_id: None,
             })))
+        }
+
+        fn verify_payment_for_amount_scope_and_body(
+            &self,
+            credential_str: &str,
+            amount: &str,
+            _mppx_scope: Option<serde_json::Value>,
+            body: &[u8],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            self.verify_payment_for_amount_with_body(credential_str, amount, body)
         }
     }
 
@@ -1446,6 +1481,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_extractor_fails_closed_when_challenger_does_not_verify_scope() {
+        struct LegacyChallenger;
+
+        impl ChargeChallenger for LegacyChallenger {
+            fn challenge(
+                &self,
+                amount: &str,
+                _options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                Ok(PaymentChallenge::new(
+                    "mock-id",
+                    "mock-realm",
+                    "tempo",
+                    "charge",
+                    Base64UrlJson::from_value(&serde_json::json!({"amount": amount})).unwrap(),
+                ))
+            }
+
+            fn verify_payment(
+                &self,
+                _credential_str: &str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+            {
+                Box::pin(std::future::ready(Ok(Receipt {
+                    status: crate::protocol::core::ReceiptStatus::Success,
+                    method: crate::protocol::core::MethodName::new("tempo"),
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    reference: "0xlegacy".into(),
+                    external_id: None,
+                })))
+            }
+        }
+
+        let result =
+            run_extractor::<OneCent>(LegacyChallenger, Some("Payment eyJmYWtlIjp0cnVlfQ")).await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
+    }
+
+    #[tokio::test]
     async fn test_extractor_invalid_payment_returns_challenge_for_retry() {
         let result = run_extractor::<OneCent>(
             MockChallenger { accept: false },
@@ -1625,6 +1701,16 @@ mod tests {
                     reference: "0xroute-aware".into(),
                     external_id: None,
                 })))
+            }
+
+            fn verify_payment_for_amount_and_scope(
+                &self,
+                credential_str: &str,
+                amount: &str,
+                _mppx_scope: Option<serde_json::Value>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+            {
+                self.verify_payment_for_amount(credential_str, amount)
             }
         }
 
