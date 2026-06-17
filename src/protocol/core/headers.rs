@@ -227,6 +227,12 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     let method = MethodName::new(method_raw);
     let intent = IntentName::new(require_param!(params, "intent"));
     let request_b64 = require_param!(params, "request").clone();
+    if request_b64.len() > MAX_TOKEN_LEN {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Request parameter exceeds maximum length of {} bytes",
+            MAX_TOKEN_LEN
+        )));
+    }
 
     let request_bytes = base64url_decode(&request_b64)?;
     // Validate that the decoded bytes are valid JSON (matches TS SDK behavior)
@@ -821,6 +827,18 @@ mod tests {
         let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="bm90IGpzb24""#;
         let result = parse_www_authenticate(header);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_oversized_request_parameter() {
+        let oversized_request = "a".repeat(MAX_TOKEN_LEN + 1);
+        let header = format!(
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="{}""#,
+            oversized_request
+        );
+
+        let err = parse_www_authenticate(&header).unwrap_err();
+        assert!(err.to_string().contains("Request parameter exceeds"));
     }
 
     #[test]
