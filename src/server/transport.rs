@@ -30,7 +30,9 @@
 //! ```
 
 use crate::error::MppError;
-use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+use crate::protocol::core::{
+    with_private_cache_control, PaymentChallenge, PaymentCredential, Receipt,
+};
 
 /// Context passed to [`Transport::respond_challenge`].
 pub struct ChallengeContext<'a, I> {
@@ -155,6 +157,22 @@ impl Transport for HttpTransport {
             crate::protocol::core::format_receipt(ctx.receipt).unwrap_or_else(|_| String::new());
 
         let mut resp = ctx.response;
+
+        // Receipt responses MUST be Cache-Control: private (spec §11.10),
+        // merged across any existing directives.
+        let existing_cc = resp
+            .headers()
+            .get_all(http_types::header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+        if let Ok(value) = http_types::HeaderValue::from_str(&cache_control) {
+            resp.headers_mut()
+                .insert(http_types::header::CACHE_CONTROL, value);
+        }
+
         if let Ok(value) = http_types::HeaderValue::from_str(&receipt_header) {
             resp.headers_mut()
                 .insert(crate::protocol::core::PAYMENT_RECEIPT_HEADER, value);
@@ -310,5 +328,68 @@ mod tests {
             .headers()
             .get(crate::protocol::core::PAYMENT_RECEIPT_HEADER)
             .is_some());
+        // Per spec, receipt responses must be Cache-Control: private.
+        assert_eq!(
+            resp.headers()
+                .get(http_types::header::CACHE_CONTROL)
+                .unwrap(),
+            "private"
+        );
+    }
+
+    #[test]
+    fn test_http_respond_receipt_merges_existing_cache_control() {
+        let transport = http();
+        let receipt = Receipt::success("tempo", "0xabc123");
+
+        let resp = http_types::Response::builder()
+            .status(http_types::StatusCode::OK)
+            .header(http_types::header::CACHE_CONTROL, "no-store")
+            .body("ok".to_string())
+            .unwrap();
+
+        let resp = transport.respond_receipt(ReceiptContext {
+            challenge_id: "ch-1",
+            receipt: &receipt,
+            response: resp,
+        });
+
+        // Existing directive preserved, `private` appended (not overwritten).
+        assert_eq!(
+            resp.headers()
+                .get(http_types::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store, private"
+        );
+    }
+
+    #[test]
+    fn test_http_respond_receipt_merges_multiple_cache_control_values() {
+        let transport = http();
+        let receipt = Receipt::success("tempo", "0xabc123");
+
+        // Two separate Cache-Control header lines (both valid HTTP).
+        let resp = http_types::Response::builder()
+            .status(http_types::StatusCode::OK)
+            .header(http_types::header::CACHE_CONTROL, "no-cache")
+            .header(http_types::header::CACHE_CONTROL, "max-age=60")
+            .body("ok".to_string())
+            .unwrap();
+
+        let resp = transport.respond_receipt(ReceiptContext {
+            challenge_id: "ch-1",
+            receipt: &receipt,
+            response: resp,
+        });
+
+        // Both existing directives preserved (not dropped) and `private` added,
+        // collapsed into a single normalized header value.
+        let values: Vec<_> = resp
+            .headers()
+            .get_all(http_types::header::CACHE_CONTROL)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(values, vec!["no-cache, max-age=60, private"]);
     }
 }
