@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::MppError;
+use crate::error::{MppError, PaymentError};
 use crate::protocol::core::PaymentCredential;
 
 use super::transport::{ChallengeContext, ReceiptContext, Transport};
@@ -147,7 +147,11 @@ impl Transport for WsTransport {
 
         WsResponse::Challenge {
             challenge: challenge_json,
-            error: ctx.error.map(|s| s.to_string()),
+            // WS frames already carry JSON, so we surface the human-readable
+            // problem detail rather than a separate problem+json document.
+            error: ctx
+                .error
+                .map(|e| e.to_problem_details(Some(ctx.challenge.id.as_str())).detail),
         }
     }
 

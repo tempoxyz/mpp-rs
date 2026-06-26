@@ -29,7 +29,7 @@
 //! }
 //! ```
 
-use crate::error::MppError;
+use crate::error::{MppError, PaymentError, PaymentErrorDetails};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
 /// Context passed to [`Transport::respond_challenge`].
@@ -38,8 +38,11 @@ pub struct ChallengeContext<'a, I> {
     pub challenge: &'a PaymentChallenge,
     /// The original transport input (e.g., HTTP request).
     pub input: &'a I,
-    /// Optional error message for the client.
-    pub error: Option<&'a str>,
+    /// The typed error that triggered a re-challenge, if any.
+    ///
+    /// Carried as [`MppError`] so transports can render an RFC 9457
+    /// `application/problem+json` body with the correct problem `type`.
+    pub error: Option<&'a MppError>,
 }
 
 /// Context passed to [`Transport::respond_receipt`].
@@ -129,15 +132,22 @@ impl Transport for HttpTransport {
         let www_auth = crate::protocol::core::format_www_authenticate(ctx.challenge)
             .unwrap_or_else(|_| "Payment".to_string());
 
-        let body = match ctx.error {
-            Some(msg) => serde_json::json!({ "error": msg }).to_string(),
-            None => serde_json::json!({ "error": "Payment Required" }).to_string(),
+        // Render an RFC 9457 problem document. A specific error maps to its own
+        // problem `type`; a bare challenge (no prior error) uses `payment-required`.
+        let mut problem = match ctx.error {
+            Some(err) => err.to_problem_details(Some(ctx.challenge.id.as_str())),
+            None => PaymentErrorDetails::payment_required(ctx.challenge.id.as_str()),
         };
+        // This is always a 402 re-challenge; keep the problem `status` in sync
+        // with the HTTP status (some errors otherwise carry 400/410).
+        problem.status = 402;
+        let body =
+            serde_json::to_string(&problem).expect("PaymentErrorDetails serialization cannot fail");
 
         let mut resp = http_types::Response::builder()
             .status(http_types::StatusCode::PAYMENT_REQUIRED)
             .header(http_types::header::WWW_AUTHENTICATE, &www_auth)
-            .header(http_types::header::CONTENT_TYPE, "application/json")
+            .header(http_types::header::CONTENT_TYPE, "application/problem+json")
             .body(body)
             .expect("response builder cannot fail");
 
@@ -279,14 +289,102 @@ mod tests {
             .body(())
             .unwrap();
 
+        let err = MppError::VerificationFailed(Some("Verification failed".to_string()));
         let resp = transport.respond_challenge(ChallengeContext {
             challenge: &challenge,
             input: &req,
-            error: Some("Verification failed"),
+            error: Some(&err),
         });
 
         assert_eq!(resp.status(), http_types::StatusCode::PAYMENT_REQUIRED);
-        assert!(resp.body().contains("Verification failed"));
+        assert_eq!(
+            resp.headers()
+                .get(http_types::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/problem+json"
+        );
+        // RFC 9457 problem body carries the correct type, status, detail, and id.
+        let problem: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/verification-failed"
+        );
+        assert_eq!(problem["status"], 402);
+        assert_eq!(problem["challengeId"], "test-id");
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Verification failed"));
+    }
+
+    #[test]
+    fn test_http_respond_challenge_normalizes_status_to_402() {
+        // A problem whose default status is 400/410 must still report 402 on the
+        // 402 re-challenge path, in sync with the HTTP status.
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+
+        // BadRequest defaults to HTTP 400 in to_problem_details().
+        let err = MppError::BadRequest(Some("bad".to_string()));
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: Some(&err),
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::PAYMENT_REQUIRED);
+        let problem: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert_eq!(problem["status"], 402);
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/bad-request"
+        );
+    }
+
+    #[test]
+    fn test_http_respond_challenge_bare_uses_payment_required() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: None,
+        });
+
+        let problem: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/payment-required"
+        );
+        assert_eq!(problem["status"], 402);
+        assert_eq!(problem["challengeId"], "test-id");
     }
 
     #[test]
