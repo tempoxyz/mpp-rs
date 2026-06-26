@@ -96,6 +96,27 @@ pub const PAYMENT_RECEIPT_HEADER: &str = "payment-receipt";
 /// Scheme identifier for the Payment authentication scheme
 pub const PAYMENT_SCHEME: &str = "Payment";
 
+/// Merge a `private` directive into an existing `Cache-Control` value.
+///
+/// Receipt responses MUST be `Cache-Control: private` (draft-httpauth-payment-00
+/// §11.10). Empty/none → `"private"`; already-private → unchanged; otherwise
+/// `, private` is appended, preserving other directives. Mirrors mppx.
+pub fn with_private_cache_control(value: Option<&str>) -> String {
+    match value {
+        Some(v) if !v.trim().is_empty() => {
+            let has_private = v
+                .split(',')
+                .any(|directive| directive.trim().eq_ignore_ascii_case("private"));
+            if has_private {
+                v.to_string()
+            } else {
+                format!("{v}, private")
+            }
+        }
+        _ => "private".to_string(),
+    }
+}
+
 /// Parse key="value" pairs from an auth-param string.
 ///
 /// This is a simple parser that handles:
@@ -526,6 +547,32 @@ mod tests {
     use super::*;
     use crate::protocol::core::types::{PayloadType, ReceiptStatus};
     use crate::protocol::core::PaymentPayload;
+
+    #[test]
+    fn test_with_private_cache_control() {
+        // No existing value → "private".
+        assert_eq!(with_private_cache_control(None), "private");
+        // Empty / whitespace-only existing value → "private".
+        assert_eq!(with_private_cache_control(Some("")), "private");
+        assert_eq!(with_private_cache_control(Some("   ")), "private");
+        // Other directives preserved, `private` appended.
+        assert_eq!(
+            with_private_cache_control(Some("no-store")),
+            "no-store, private"
+        );
+        assert_eq!(
+            with_private_cache_control(Some("public, max-age=60")),
+            "public, max-age=60, private"
+        );
+        // Already private → returned unchanged (no duplicate).
+        assert_eq!(with_private_cache_control(Some("private")), "private");
+        assert_eq!(
+            with_private_cache_control(Some("private, max-age=0")),
+            "private, max-age=0"
+        );
+        // Detection is case-insensitive and whitespace-tolerant.
+        assert_eq!(with_private_cache_control(Some("  PRIVATE ")), "  PRIVATE ");
+    }
 
     fn test_challenge() -> PaymentChallenge {
         PaymentChallenge {
