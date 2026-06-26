@@ -1147,7 +1147,24 @@ mod tests {
                 .await
                 .expect_err("cross-route replay must be rejected");
             assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
-            assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+
+            // The rendered 402 body must be the specific `malformed-credential`
+            // (binding check fails), not a generic `verification-failed`.
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/problem+json"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let problem: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                problem["type"],
+                "https://paymentauth.org/problems/malformed-credential"
+            );
+            assert_eq!(problem["status"], 402);
         }
 
         #[tokio::test]
