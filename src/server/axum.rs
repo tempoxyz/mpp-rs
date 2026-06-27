@@ -611,6 +611,7 @@ mod tests {
                         timestamp: "2025-01-01T00:00:00Z".into(),
                         reference: "0xabc".into(),
                         external_id: None,
+                        subscription_id: None,
                     })
                 } else {
                     Err("payment rejected".into())
@@ -711,6 +712,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".into(),
             reference: "0xabc".into(),
             external_id: None,
+            subscription_id: None,
         };
 
         let resp = WithReceipt {
@@ -913,6 +915,7 @@ mod tests {
                     timestamp: "2025-01-01T00:00:00Z".into(),
                     reference: "0xroute-aware".into(),
                     external_id: None,
+                    subscription_id: None,
                 })))
             }
         }

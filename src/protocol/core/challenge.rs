@@ -790,7 +790,8 @@ impl PaymentCredential {
 
 /// Payment receipt from server (parsed from Payment-Receipt header).
 ///
-/// Per IETF spec, contains: status, method, timestamp, reference.
+/// Per IETF spec, contains: status, method, timestamp, reference. Payment
+/// methods MAY add fields; the Tempo subscription method adds `subscriptionId`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
     /// Receipt status ("success" or "failed")
@@ -808,6 +809,11 @@ pub struct Receipt {
     /// Merchant correlation reference, echoed from the credential payload.
     #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
+
+    /// Server-issued subscription identifier, present on receipts for the
+    /// subscription intent (activation and renewal).
+    #[serde(rename = "subscriptionId", skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
 }
 
 impl Receipt {
@@ -820,6 +826,7 @@ impl Receipt {
             timestamp: now_iso8601(),
             reference: reference.into(),
             external_id: None,
+            subscription_id: None,
         }
     }
 
@@ -827,6 +834,13 @@ impl Receipt {
     #[must_use]
     pub fn with_external_id(mut self, external_id: impl Into<String>) -> Self {
         self.external_id = Some(external_id.into());
+        self
+    }
+
+    /// Set the server-issued subscription identifier.
+    #[must_use]
+    pub fn with_subscription_id(mut self, subscription_id: impl Into<String>) -> Self {
+        self.subscription_id = Some(subscription_id.into());
         self
     }
 
@@ -1073,6 +1087,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc".to_string(),
             external_id: None,
+            subscription_id: None,
         };
         assert!(success.is_success());
         assert!(success.external_id.is_none());
@@ -1092,6 +1107,22 @@ mod tests {
         let bare = Receipt::success("tempo", "0xabc");
         let bare_json = serde_json::to_string(&bare).unwrap();
         assert!(!bare_json.contains("externalId"));
+    }
+
+    #[test]
+    fn test_receipt_with_subscription_id() {
+        let receipt = Receipt::success("tempo", "0xabc").with_subscription_id("sub_123");
+        assert_eq!(receipt.subscription_id.as_deref(), Some("sub_123"));
+
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert!(json.contains("\"subscriptionId\":\"sub_123\""));
+
+        let parsed: Receipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.subscription_id.as_deref(), Some("sub_123"));
+
+        let bare = Receipt::success("tempo", "0xabc");
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("subscriptionId"));
     }
 
     #[test]
