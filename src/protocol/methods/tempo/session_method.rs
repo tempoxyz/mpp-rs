@@ -193,8 +193,24 @@ async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
 }
 
 /// Validate the close voucher amount against spent, on-chain settled, and deposit.
-/// Matches mppx handleClose:
-/// https://github.com/wevm/mppx/blob/c526ea6/src/tempo/server/Session.ts#L837-L846
+/// Aligned with the current mppx session `handleCloseCredential` validation
+/// (wevm/mppx `src/tempo/session/server/CredentialVerification.ts`), not the
+/// older `#343` zero-close carve-out.
+///
+/// The close amount must be `>= spent` and `>= on-chain settled`. Closing at
+/// exactly the settled amount is legitimate (it captures, it does not replay),
+/// so the settled gate is `>=` rather than the older strict `>`. Replay
+/// protection against an already-drained channel lives in the deposit==0 guard:
+/// a channel whose on-chain deposit is zero while it still carries a nonzero
+/// close amount or locally recorded spend has already been settled and must not
+/// be closed again (CVE-2026-34209 / GHSA-mv9j-8jvg-j8mr). The captured amount
+/// is `max(spent, settled)` and must fit within the on-chain deposit.
+///
+/// A zero-amount close is allowed only for a genuinely funded, untouched channel
+/// (deposit > 0, nothing spent, nothing settled), refunding the entire deposit
+/// to the payer. A zero deposit is never a valid close target (unfunded or
+/// already settled), so it is rejected as a closed channel, matching mppx's
+/// `ChannelClosedError` for the same condition.
 fn validate_close_amount(
     cumulative_amount: u128,
     spent: u128,
@@ -207,15 +223,26 @@ fn validate_close_amount(
             spent,
         )));
     }
-    if cumulative_amount <= on_chain_settled {
+    // Drained-channel / unfunded guard. mppx rejects a zero-deposit channel that
+    // still carries value (`deposit == 0 && (cumulative != 0 || spent != 0)`) with
+    // a `ChannelClosedError`. mpp-rs additionally rejects the fully-zero deposit
+    // case: without mppx's store proof that the channel was ever funded, a zero
+    // on-chain deposit is never a valid close target, so reject it as closed.
+    if on_chain_deposit == 0 {
+        return Err(VerificationError::channel_closed(
+            "channel deposit is zero (settled or unfunded)",
+        ));
+    }
+    if cumulative_amount < on_chain_settled {
         return Err(VerificationError::new(format!(
-            "close voucher amount must be > {} (on-chain settled)",
+            "close voucher amount must be >= {} (on-chain settled)",
             on_chain_settled,
         )));
     }
-    if cumulative_amount > on_chain_deposit {
+    let capture_amount = spent.max(on_chain_settled);
+    if capture_amount > on_chain_deposit {
         return Err(VerificationError::amount_exceeds_deposit(
-            "close voucher amount exceeds on-chain deposit",
+            "close capture amount exceeds on-chain deposit",
         ));
     }
     Ok(())
@@ -3028,8 +3055,11 @@ mod tests {
     }
 
     // ==================== validate_close_amount tests ====================
-    // Mirror the mppx Session.test.ts close tests:
-    // https://github.com/wevm/mppx/blob/c526ea6/src/tempo/server/Session.test.ts#L1105-L1315
+    // Aligned with the current mppx session `handleCloseCredential` validation
+    // (wevm/mppx src/tempo/session/server/CredentialVerification.ts): the close
+    // amount must be `>= spent` and `>= on-chain settled`, a zero on-chain
+    // deposit is rejected, and the captured `max(spent, settled)` must fit the
+    // deposit.
 
     #[test]
     fn test_close_accepts_voucher_at_spent_amount() {
@@ -3066,39 +3096,67 @@ mod tests {
     }
 
     #[test]
-    fn test_close_rejects_voucher_equal_to_settled() {
+    fn test_close_accepts_voucher_equal_to_settled() {
+        // Aligned with current mppx: closing at exactly the on-chain settled
+        // amount captures the settled value, it does not replay it, so the
+        // settled gate is `>=` and an equal-to-settled close is valid.
         // spent=0, settled=1_000_000, deposit=10_000_000
-        // close at 1_000_000 (== settled) should fail (strict >)
-        let err = validate_close_amount(1_000_000, 0, 1_000_000, 10_000_000).unwrap_err();
-        assert!(
-            err.message
-                .contains("close voucher amount must be > 1000000 (on-chain settled)"),
-            "got: {}",
-            err.message,
-        );
+        assert!(validate_close_amount(1_000_000, 0, 1_000_000, 10_000_000).is_ok());
     }
 
     #[test]
     fn test_close_rejects_voucher_below_settled() {
+        // Regression for CVE-2026-34209 / GHSA-mv9j-8jvg-j8mr: a close voucher
+        // below a nonzero on-chain settled amount undercloses already-settled
+        // value and must stay rejected (`>= settled`).
         // spent=0, settled=1_000_000, deposit=10_000_000
         // close at 500_000 (below settled) should fail
         let err = validate_close_amount(500_000, 0, 1_000_000, 10_000_000).unwrap_err();
         assert!(
             err.message
-                .contains("close voucher amount must be > 1000000 (on-chain settled)"),
+                .contains("close voucher amount must be >= 1000000 (on-chain settled)"),
             "got: {}",
             err.message,
         );
     }
 
     #[test]
-    fn test_close_rejects_voucher_exceeding_deposit() {
-        // spent=0, settled=0, deposit=10_000_000
-        // close at 99_999_999 (above deposit) should fail
-        let err = validate_close_amount(99_999_999, 0, 0, 10_000_000).unwrap_err();
+    fn test_close_rejects_capture_exceeding_deposit() {
+        // The captured amount is max(spent, settled). When on-chain settled
+        // exceeds the deposit, the capture cannot be honored and must fail.
+        // spent=0, settled=10_000_001, deposit=10_000_000
+        let err = validate_close_amount(10_000_001, 0, 10_000_001, 10_000_000).unwrap_err();
         assert!(
             err.message
-                .contains("close voucher amount exceeds on-chain deposit"),
+                .contains("close capture amount exceeds on-chain deposit"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_rejects_zero_deposit_untouched() {
+        // Codex P2: a zero-amount close against a zero on-chain deposit must be
+        // rejected. With deposit==0 the channel is either unfunded or already
+        // settled to zero; in the `close_signer: None` path this previously
+        // finalized the channel and returned a success receipt without any
+        // on-chain close. (0, 0, 0, 0) must now be an error.
+        let err = validate_close_amount(0, 0, 0, 0).unwrap_err();
+        assert!(
+            err.message.contains("channel deposit is zero"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_rejects_zero_deposit_with_value() {
+        // mppx drained-channel guard: a zero-deposit channel that still carries
+        // a nonzero close amount has already been settled and must not be
+        // closed again.
+        let err = validate_close_amount(1_000, 0, 0, 0).unwrap_err();
+        assert!(
+            err.message.contains("channel deposit is zero"),
             "got: {}",
             err.message,
         );
@@ -3124,11 +3182,34 @@ mod tests {
     }
 
     #[test]
-    fn test_close_at_zero_rejects_when_zero_settled() {
-        // close at 0 with settled=0: 0 <= 0 is true, so rejected
-        let err = validate_close_amount(0, 0, 0, 10_000_000).unwrap_err();
+    fn test_close_at_zero_allowed_for_untouched_channel() {
+        // close at 0 with spent=0 and settled=0: the channel is untouched, so
+        // a zero-amount cooperative close is legitimate and refunds the entire
+        // on-chain deposit to the payer (no settled voucher exists to replay)
+        assert!(validate_close_amount(0, 0, 0, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_close_at_zero_rejects_when_settled_nonzero() {
+        // close at 0 once settlement has advanced undercloses already-settled
+        // value and must be rejected (`>= settled`)
+        let err = validate_close_amount(0, 0, 1_000, 10_000_000).unwrap_err();
         assert!(
-            err.message.contains("on-chain settled"),
+            err.message
+                .contains("close voucher amount must be >= 1000 (on-chain settled)"),
+            "got: {}",
+            err.message,
+        );
+    }
+
+    #[test]
+    fn test_close_at_zero_rejects_when_spent_nonzero() {
+        // close at 0 with metered spend on the channel must be rejected; the
+        // untouched-channel carve-out requires spent=0 as well
+        let err = validate_close_amount(0, 500, 0, 10_000_000).unwrap_err();
+        assert!(
+            err.message
+                .contains("close voucher amount must be >= 500 (spent)"),
             "got: {}",
             err.message,
         );
