@@ -41,6 +41,10 @@ mod middleware;
 pub use error::HttpError;
 pub use provider::{MultiProvider, PaymentProvider};
 
+/// Default number of payment challenge retries after the initial 402 response.
+#[cfg(any(feature = "client", feature = "middleware"))]
+pub const DEFAULT_MAX_PAYMENT_RETRIES: usize = 3;
+
 #[cfg(feature = "client")]
 pub use accept_payment_policy::AcceptPaymentPolicy;
 
