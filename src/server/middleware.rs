@@ -31,7 +31,7 @@ use http_types::{header, HeaderValue, Request, Response, StatusCode};
 
 use crate::protocol::core::headers::{
     extract_payment_scheme, format_receipt, format_www_authenticate, parse_authorization,
-    PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
+    with_private_cache_control, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
 };
 
 /// Trait for payment verification in middleware context.
@@ -219,42 +219,50 @@ where
             let credential = match auth_header {
                 Some(c) => c,
                 None => {
-                    // No credential — return 402 with challenge.
-                    let challenge = match verifier.challenge() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            return Ok(error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!("Failed to generate challenge: {}", e),
-                            ));
-                        }
-                    };
-                    let mut resp = Response::new(ResBody::default());
-                    *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
-                    resp.headers_mut().insert(
-                        WWW_AUTHENTICATE_HEADER,
-                        HeaderValue::from_str(&challenge)
-                            .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
-                    );
-                    resp.headers_mut()
-                        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                    return Ok(resp);
+                    // No credential — return a fresh, retryable 402 challenge.
+                    return Ok(match verifier.challenge() {
+                        Ok(challenge) => challenge_response(&challenge),
+                        Err(e) => error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Failed to generate challenge: {}", e),
+                        ),
+                    });
                 }
             };
 
             // Verify the credential.
             let receipt_header = match verifier.verify(&credential).await {
                 Ok(r) => r,
-                Err(e) => {
-                    return Ok(error_response(
-                        StatusCode::PAYMENT_REQUIRED,
-                        &format!("Payment verification failed: {}", e),
-                    ));
+                Err(_e) => {
+                    // Verification failed — per the Payment auth spec, return a
+                    // fresh, retryable 402 carrying a new `WWW-Authenticate`
+                    // challenge (not a dead-end bare 402) so the client can pay
+                    // again. Mirrors the no-credential path above.
+                    return Ok(match verifier.challenge() {
+                        Ok(challenge) => challenge_response(&challenge),
+                        Err(e) => error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Failed to generate challenge: {}", e),
+                        ),
+                    });
                 }
             };
 
             // Call the inner service.
             let mut resp = inner.call(req).await?;
+
+            // Receipt responses MUST be Cache-Control: private (spec §11.10).
+            let existing_cc = resp
+                .headers()
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+            if let Ok(val) = HeaderValue::from_str(&cache_control) {
+                resp.headers_mut().insert(header::CACHE_CONTROL, val);
+            }
 
             // Attach the receipt header.
             if let Ok(val) = HeaderValue::from_str(&receipt_header) {
@@ -400,6 +408,24 @@ where
 fn error_response<B: Default>(status: StatusCode, _message: &str) -> Response<B> {
     let mut resp = Response::new(B::default());
     *resp.status_mut() = status;
+    resp
+}
+
+/// Build a retryable `402 Payment Required` response carrying a fresh
+/// `WWW-Authenticate: Payment` challenge and `Cache-Control: no-store`.
+///
+/// Used for both the no-credential and failed-verification paths so that a
+/// client always receives a usable challenge it can pay against, per the
+/// Payment authentication scheme.
+fn challenge_response<B: Default>(challenge: &str) -> Response<B> {
+    let mut resp = Response::new(B::default());
+    *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
+    resp.headers_mut().insert(
+        WWW_AUTHENTICATE_HEADER,
+        HeaderValue::from_str(challenge).unwrap_or_else(|_| HeaderValue::from_static("Payment")),
+    );
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
@@ -739,11 +765,21 @@ mod tests {
             resp.headers().get(PAYMENT_RECEIPT_HEADER).unwrap(),
             "mock-receipt-token"
         );
+        // Per spec, receipt responses must be Cache-Control: private.
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private"
+        );
     }
 
-    /// Test: invalid auth → 402 error.
+    /// Test: invalid auth → retryable 402 with a fresh challenge.
+    ///
+    /// A failed credential must yield a 402 that carries a new
+    /// `WWW-Authenticate: Payment` challenge and `Cache-Control: no-store`,
+    /// so the client can pay again. A bare 402 (no challenge) is a dead end
+    /// the Payment auth scheme — and this SDK's own client — reject.
     #[tokio::test]
-    async fn test_service_invalid_auth_returns_402() {
+    async fn test_service_invalid_auth_returns_retryable_402() {
         use tower_service::Service;
 
         let layer = PaymentLayer::new(MockVerifier {
@@ -779,6 +815,16 @@ mod tests {
 
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        // Must carry a fresh challenge so the client can retry.
+        assert_eq!(
+            resp.headers().get(WWW_AUTHENTICATE_HEADER).unwrap(),
+            "Payment id=\"challenge\""
+        );
+        // 402 responses must not be cached.
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 
     #[derive(Clone)]

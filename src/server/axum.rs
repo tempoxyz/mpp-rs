@@ -79,8 +79,8 @@ use http_types::{header, HeaderValue, StatusCode};
 #[cfg(any(feature = "stripe", feature = "tempo"))]
 use crate::protocol::core::headers::parse_authorization;
 use crate::protocol::core::headers::{
-    extract_payment_scheme, format_receipt, format_www_authenticate, PAYMENT_RECEIPT_HEADER,
-    WWW_AUTHENTICATE_HEADER,
+    extract_payment_scheme, format_receipt, format_www_authenticate, with_private_cache_control,
+    PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
 };
 use crate::protocol::core::{PaymentChallenge, Receipt};
 
@@ -1085,6 +1085,19 @@ impl<T: IntoResponse> IntoResponse for WithReceipt<T> {
         if let Ok(header_val) = format_receipt(&self.receipt) {
             if let Ok(val) = HeaderValue::from_str(&header_val) {
                 resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
+
+                // Receipt responses MUST be Cache-Control: private (spec §11.10).
+                let existing_cc = resp
+                    .headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+                if let Ok(cc) = HeaderValue::from_str(&cache_control) {
+                    resp.headers_mut().insert(header::CACHE_CONTROL, cc);
+                }
             }
         }
         resp
@@ -1330,6 +1343,11 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+        // Per spec, receipt responses must be Cache-Control: private.
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private"
+        );
     }
 
     #[test]
