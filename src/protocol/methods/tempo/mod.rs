@@ -70,6 +70,7 @@
 //! #     amount: "1000".into(), currency: "0x".into(), recipient: None,
 //! #     description: None, external_id: None,
 //! #     decimals: None,
+//! #     mppx_scope: None,
 //! #     method_details: Some(serde_json::json!({
 //! #         "feePayer": true
 //! #     })),
