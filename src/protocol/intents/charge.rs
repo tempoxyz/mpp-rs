@@ -28,6 +28,7 @@ use crate::evm::U256;
 ///     description: Some("API access".to_string()),
 ///     external_id: None,
 ///     method_details: None,
+///     mppx_scope: None,
 /// };
 ///
 /// assert_eq!(req.amount, "1000000");
@@ -63,6 +64,10 @@ pub struct ChargeRequest {
     /// Method-specific extension fields (interpreted by methods layer)
     #[serde(rename = "methodDetails", skip_serializing_if = "Option::is_none")]
     pub method_details: Option<serde_json::Value>,
+
+    /// Framework adapter route/resource/query scope.
+    #[serde(rename = "_mppx_scope", skip_serializing_if = "Option::is_none")]
+    pub mppx_scope: Option<serde_json::Value>,
 }
 
 impl ChargeRequest {
