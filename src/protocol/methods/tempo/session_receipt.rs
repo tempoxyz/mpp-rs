@@ -126,6 +126,7 @@ impl SessionReceipt {
             timestamp: self.timestamp.clone(),
             reference: self.reference.clone(),
             external_id: None,
+            subscription_id: None,
         }
     }
 }
