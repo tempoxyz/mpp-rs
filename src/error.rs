@@ -22,6 +22,15 @@ pub const SESSION_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/se
 #[deprecated(since = "0.5.0", note = "renamed to SESSION_PROBLEM_TYPE_BASE")]
 pub const STREAM_PROBLEM_TYPE_BASE: &str = SESSION_PROBLEM_TYPE_BASE;
 
+/// Default hint for payment-required errors.
+pub const HINT_PAYMENT_REQUIRED: &str = "Use a supported wallet to pay for this resource using one of the supported payment methods returned in the WWW-Authenticate header. See https://mpp.dev/tools/wallet.md";
+
+/// Default hint for malformed-credential errors.
+pub const HINT_MALFORMED_CREDENTIAL: &str = "Use a supported wallet to construct valid credentials for one of the supported payment methods returned in the WWW-Authenticate header. See https://mpp.dev/tools/wallet.md";
+
+/// Default hint for method-unsupported errors.
+pub const HINT_METHOD_UNSUPPORTED: &str = HINT_PAYMENT_REQUIRED;
+
 /// RFC 9457 Problem Details structure for payment errors.
 ///
 /// This struct provides a standardized format for HTTP error responses,
@@ -58,6 +67,11 @@ pub struct PaymentErrorDetails {
     /// The challenge ID associated with this error, if applicable.
     #[serde(rename = "challengeId", skip_serializing_if = "Option::is_none")]
     pub challenge_id: Option<String>,
+
+    /// An optional hint providing guidance on how to resolve this error.
+    /// This is an RFC 9457 extension member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 impl PaymentErrorDetails {
@@ -69,6 +83,7 @@ impl PaymentErrorDetails {
             status: 402,
             detail: String::new(),
             challenge_id: None,
+            hint: None,
         }
     }
 
@@ -113,6 +128,12 @@ impl PaymentErrorDetails {
     /// Set the associated challenge ID.
     pub fn with_challenge_id(mut self, id: impl Into<String>) -> Self {
         self.challenge_id = Some(id.into());
+        self
+    }
+
+    /// Set the hint message providing guidance on how to resolve this error.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
         self
     }
 }
@@ -617,7 +638,8 @@ impl PaymentError for MppError {
             // Core payment-auth errors
             Self::MalformedCredential(_) => PaymentErrorDetails::core("malformed-credential")
                 .with_title("MalformedCredentialError")
-                .with_status(402),
+                .with_status(402)
+                .with_hint(HINT_MALFORMED_CREDENTIAL),
             Self::InvalidChallenge { .. } => PaymentErrorDetails::core("invalid-challenge")
                 .with_title("InvalidChallengeError")
                 .with_status(402),
@@ -629,7 +651,8 @@ impl PaymentError for MppError {
                 .with_status(402),
             Self::PaymentRequired { .. } => PaymentErrorDetails::core("payment-required")
                 .with_title("PaymentRequiredError")
-                .with_status(402),
+                .with_status(402)
+                .with_hint(HINT_PAYMENT_REQUIRED),
             Self::InvalidPayload(_) => PaymentErrorDetails::core("invalid-payload")
                 .with_title("InvalidPayloadError")
                 .with_status(402),
@@ -638,7 +661,8 @@ impl PaymentError for MppError {
                 .with_status(400),
             Self::UnsupportedPaymentMethod(_) => PaymentErrorDetails::core("method-unsupported")
                 .with_title("PaymentMethodUnsupportedError")
-                .with_status(400),
+                .with_status(400)
+                .with_hint(HINT_METHOD_UNSUPPORTED),
             Self::PaymentActionRequired(_) => PaymentErrorDetails::core("payment-action-required")
                 .with_title("PaymentActionRequiredError")
                 .with_status(402),
@@ -814,6 +838,50 @@ mod tests {
         assert!(json.contains("\"type\":"));
         assert!(json.contains("verification-failed"));
         assert!(json.contains("\"challengeId\":\"abc123\""));
+        // hint should be omitted when None
+        assert!(!json.contains("\"hint\""));
+    }
+
+    #[test]
+    fn test_problem_details_with_hint() {
+        let problem = PaymentErrorDetails::core("payment-required")
+            .with_title("PaymentRequiredError")
+            .with_status(402)
+            .with_detail("Payment is required.")
+            .with_hint("Use a wallet");
+
+        assert_eq!(problem.hint, Some("Use a wallet".to_string()));
+
+        let json = serde_json::to_string(&problem).unwrap();
+        assert!(json.contains("\"hint\":\"Use a wallet\""));
+    }
+
+    #[test]
+    fn test_payment_required_default_hint() {
+        let err = MppError::payment_required_default();
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.hint, Some(HINT_PAYMENT_REQUIRED.to_string()));
+    }
+
+    #[test]
+    fn test_malformed_credential_default_hint() {
+        let err = MppError::malformed_credential_default();
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.hint, Some(HINT_MALFORMED_CREDENTIAL.to_string()));
+    }
+
+    #[test]
+    fn test_method_unsupported_default_hint() {
+        let err = MppError::unsupported_method(&"lightning");
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.hint, Some(HINT_METHOD_UNSUPPORTED.to_string()));
+    }
+
+    #[test]
+    fn test_other_errors_no_hint() {
+        let err = MppError::verification_failed("bad proof");
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.hint, None);
     }
 
     #[test]
