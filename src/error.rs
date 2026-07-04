@@ -115,6 +115,17 @@ impl PaymentErrorDetails {
         self.challenge_id = Some(id.into());
         self
     }
+
+    /// Standard RFC 9457 problem for a bare `402` payment challenge (no prior
+    /// error). Used when a server advertises a challenge without a specific
+    /// failure to report.
+    pub fn payment_required(challenge_id: impl Into<String>) -> Self {
+        Self::core("payment-required")
+            .with_title("Payment Required")
+            .with_status(402)
+            .with_detail("Payment is required.")
+            .with_challenge_id(challenge_id)
+    }
 }
 
 /// Trait for errors that can be converted to RFC 9457 Problem Details.

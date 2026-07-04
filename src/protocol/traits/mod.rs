@@ -11,6 +11,8 @@
 mod charge;
 mod session;
 
+use crate::error::{MppError, PaymentError, PaymentErrorDetails};
+
 pub use charge::ChargeMethod;
 pub use session::SessionMethod;
 
@@ -259,29 +261,30 @@ impl From<&str> for VerificationError {
 
 // ==================== Conversion to RFC 9457 Problem Details ====================
 
-use crate::error::{MppError, PaymentError, PaymentErrorDetails};
-
 impl From<VerificationError> for MppError {
     fn from(err: VerificationError) -> Self {
+        // Preserve each code's specific RFC 9457 problem type instead of
+        // collapsing to `verification-failed`. Core codes follow
+        // `ErrorCode::spec_code()`; session/channel codes keep `session/*`.
         match err.code {
-            Some(ErrorCode::Expired) => MppError::PaymentExpired(None),
-            Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
+            Some(ErrorCode::Expired) => MppError::PaymentExpired(Some(err.message)),
+            Some(ErrorCode::InvalidCredential)
+            | Some(ErrorCode::CredentialMismatch)
+            | Some(ErrorCode::InvalidPayload) => MppError::MalformedCredential(Some(err.message)),
+            Some(ErrorCode::InvalidAmount) => MppError::PaymentInsufficient(Some(err.message)),
+            Some(ErrorCode::ChainIdMismatch) => MppError::UnsupportedPaymentMethod(err.message),
             Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(Some(err.message)),
             Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(Some(err.message)),
             Some(ErrorCode::InsufficientBalance) => {
                 MppError::InsufficientBalance(Some(err.message))
             }
-            Some(ErrorCode::InvalidPayload) => MppError::InvalidPayload(Some(err.message)),
             Some(ErrorCode::InvalidSignature) => MppError::InvalidSignature(Some(err.message)),
             Some(ErrorCode::AmountExceedsDeposit) => {
                 MppError::AmountExceedsDeposit(Some(err.message))
             }
             Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(Some(err.message)),
-            Some(ErrorCode::CredentialMismatch)
-            | Some(ErrorCode::InvalidAmount)
-            | Some(ErrorCode::InvalidRecipient)
+            Some(ErrorCode::InvalidRecipient)
             | Some(ErrorCode::TransactionFailed)
-            | Some(ErrorCode::ChainIdMismatch)
             | Some(ErrorCode::NotFound)
             | Some(ErrorCode::NetworkError)
             | None => MppError::VerificationFailed(Some(err.message)),
@@ -333,5 +336,47 @@ mod tests {
             ErrorCode::TransactionFailed.spec_code(),
             "verification-failed"
         );
+    }
+
+    #[test]
+    fn test_verification_error_preserves_specific_problem_type() {
+        use crate::error::PaymentError;
+
+        // Locks the full mapping: every code keeps its specific problem type
+        // through `From<VerificationError>` rather than collapsing.
+        let cases = [
+            (ErrorCode::Expired, "payment-expired"),
+            (ErrorCode::InvalidCredential, "malformed-credential"),
+            (ErrorCode::CredentialMismatch, "malformed-credential"),
+            (ErrorCode::InvalidPayload, "malformed-credential"),
+            (ErrorCode::InvalidAmount, "payment-insufficient"),
+            (ErrorCode::ChainIdMismatch, "method-unsupported"),
+            (ErrorCode::ChannelNotFound, "channel-not-found"),
+            (ErrorCode::ChannelClosed, "channel-finalized"),
+            (ErrorCode::InsufficientBalance, "insufficient-balance"),
+            (ErrorCode::InvalidSignature, "invalid-signature"),
+            (ErrorCode::AmountExceedsDeposit, "amount-exceeds-deposit"),
+            (ErrorCode::DeltaTooSmall, "delta-too-small"),
+            (ErrorCode::InvalidRecipient, "verification-failed"),
+            (ErrorCode::TransactionFailed, "verification-failed"),
+            (ErrorCode::NotFound, "verification-failed"),
+            (ErrorCode::NetworkError, "verification-failed"),
+        ];
+
+        for (code, suffix) in cases {
+            let err = VerificationError::with_code("detail here", code);
+            let mpp_err = MppError::from(err);
+            let problem = mpp_err.to_problem_details(None);
+            assert!(
+                problem.problem_type.ends_with(suffix),
+                "{code:?} → {} (expected suffix {suffix})",
+                problem.problem_type
+            );
+            // The error detail must survive the conversion.
+            assert!(
+                problem.detail.contains("detail here"),
+                "{code:?} dropped detail"
+            );
+        }
     }
 }
