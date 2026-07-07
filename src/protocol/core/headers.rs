@@ -735,6 +735,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "0xabc123".to_string(),
             external_id: None,
+            subscription_id: None,
         };
 
         let header = format_receipt(&receipt).unwrap();
@@ -743,6 +744,35 @@ mod tests {
         assert_eq!(parsed.status, ReceiptStatus::Success);
         assert_eq!(parsed.method.as_str(), "tempo");
         assert_eq!(parsed.reference, "0xabc123");
+    }
+
+    #[test]
+    fn test_receipt_subscription_id_round_trip() {
+        let receipt = Receipt {
+            status: ReceiptStatus::Success,
+            method: "tempo".into(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            reference: "0xabc123".to_string(),
+            external_id: None,
+            subscription_id: Some("sub_123".to_string()),
+        };
+
+        let header = format_receipt(&receipt).unwrap();
+        let parsed = parse_receipt(&header).unwrap();
+
+        assert_eq!(parsed.subscription_id.as_deref(), Some("sub_123"));
+    }
+
+    #[test]
+    fn test_parse_receipt_preserves_foreign_subscription_id() {
+        // A receipt produced by a non-Rust SDK (e.g. mppx) carrying subscriptionId
+        // must survive parsing rather than being silently dropped.
+        let json = r#"{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc123","subscriptionId":"sub_123"}"#;
+        let header = base64url_encode(json.as_bytes());
+
+        let parsed = parse_receipt(&header).unwrap();
+
+        assert_eq!(parsed.subscription_id.as_deref(), Some("sub_123"));
     }
 
     #[test]
