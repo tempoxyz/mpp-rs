@@ -17,14 +17,12 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-      - name: Install Claude CLI
-        run: npm install -g @anthropic-ai/claude-code@2.1.96
       - name: Remove repo-local Claude settings
         run: rm -rf .claude/
       - name: Check changelog
         uses: tempoxyz/changelogs/check@29ac40b71b3966761305991d99f21c5195d7466b # master
         with:
-          ai: "claude --bare -p"
+          ai: "npx -y @anthropic-ai/claude-code@2.1.96 --bare -p"
           ecosystem: rust
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
