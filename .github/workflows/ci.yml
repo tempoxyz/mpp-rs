@@ -126,7 +126,7 @@ jobs:
         run: docker compose down
 
   deny:
-    uses: tempoxyz/ci/.github/workflows/deny.yml@main
+    uses: tempoxyz/ci/.github/workflows/deny.yml@934b6a6317ac26272eaecf0d265472f4105c99d6
     permissions:
       contents: read
 
