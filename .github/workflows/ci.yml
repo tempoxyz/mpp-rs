@@ -66,7 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo update -p native-tls
-      - uses: taiki-e/install-action@1d61d36a4863808ca6088b87190e597d75755fc8 # cargo-hack
+      - uses: taiki-e/install-action@21a189af180aa6f2c24819952c0803c9b2b7f614 # cargo-hack
       - name: Tests
         run: cargo test --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,integration-stripe,integration-ws
         env:
