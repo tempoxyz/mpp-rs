@@ -1105,6 +1105,7 @@ impl<T: IntoResponse> IntoResponse for WithReceipt<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use crate::protocol::core::Base64UrlJson;
@@ -1227,6 +1228,7 @@ mod tests {
                 timestamp: "2025-01-01T00:00:00Z".into(),
                 reference: "0xbody-aware".into(),
                 external_id: None,
+                subscription_id: None,
             })))
         }
 
@@ -1530,6 +1532,7 @@ mod tests {
                     timestamp: "2025-01-01T00:00:00Z".into(),
                     reference: "0xlegacy".into(),
                     external_id: None,
+                    subscription_id: None,
                 })))
             }
         }
