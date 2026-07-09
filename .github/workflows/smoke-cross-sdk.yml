@@ -55,9 +55,8 @@ jobs:
 
       - name: Provision AMM liquidity
         run: |
-          workdir="$(mktemp -d)"
-          cd "$workdir"
-          npm install --no-audit --no-fund viem@2.47.10
+          cd .github/smoke-cross-sdk
+          npm ci --no-audit --no-fund
           node --input-type=module <<'EOF'
           import { createClient, http, parseUnits } from 'viem'
           import { privateKeyToAccount } from 'viem/accounts'
