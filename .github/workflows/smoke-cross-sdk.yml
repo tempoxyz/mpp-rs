@@ -55,8 +55,10 @@ jobs:
 
       - name: Provision AMM liquidity
         run: |
-          cd "$(mktemp -d)"
-          npm exec --yes --package viem@2.47.10 -- node --input-type=module <<'EOF'
+          workdir="$(mktemp -d)"
+          cd "$workdir"
+          npm install --no-audit --no-fund viem@2.47.10
+          node --input-type=module <<'EOF'
           import { createClient, http, parseUnits } from 'viem'
           import { privateKeyToAccount } from 'viem/accounts'
           import { tempoLocalnet } from 'viem/chains'
