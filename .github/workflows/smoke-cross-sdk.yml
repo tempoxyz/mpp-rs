@@ -29,9 +29,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install mppx CLI
-        run: npm i -g mppx@0.6.20
-
       - name: Start Tempo node
         run: docker compose up -d
 
@@ -59,9 +56,7 @@ jobs:
       - name: Provision AMM liquidity
         run: |
           cd "$(mktemp -d)"
-          npm init -y > /dev/null
-          npm i viem@2.47.10 > /dev/null 2>&1
-          node --input-type=module <<'EOF'
+          npm exec --yes --package viem@2.47.10 -- node --input-type=module <<'EOF'
           import { createClient, http, parseUnits } from 'viem'
           import { privateKeyToAccount } from 'viem/accounts'
           import { tempoLocalnet } from 'viem/chains'
@@ -124,7 +119,7 @@ jobs:
 
       - name: Smoke test — mppx pays /api/ping
         run: |
-          response=$(mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
+          response=$(npm exec --yes --package mppx@0.6.20 -- mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
           echo "$response"
           echo "$response" | grep -q '"pong"' || { echo "Response missing pong field"; exit 1; }
         env:
