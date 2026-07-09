@@ -1044,7 +1044,13 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         let secret_key = builder
             .secret_key
             .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
-            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            })
             .ok_or_else(|| {
                 crate::error::MppError::InvalidConfig(format!(
                     "Missing secret key. Set {} environment variable or pass .secret_key(...).",
@@ -1219,7 +1225,13 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
         let secret_key = builder
             .hmac_secret_key
             .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
-            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| {
+                if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            })
             .ok_or_else(|| {
                 crate::error::MppError::InvalidConfig(format!(
                     "Missing secret key. Set {} environment variable or pass .secret_key(...).",

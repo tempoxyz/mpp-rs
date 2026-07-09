@@ -3,6 +3,8 @@ name: Changelog
 on:
   pull_request:
     types: [opened, synchronize]
+    paths-ignore:
+      - ".github/**"
 
 jobs:
   changelog:
