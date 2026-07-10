@@ -14,30 +14,40 @@ jobs:
       - name: Check admin permission
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           SENDER_LOGIN: ${{ github.event.sender.login }}
         run: |
-          PERM=$(gh api "repos/${{ github.repository }}/collaborators/${SENDER_LOGIN}/permission" --jq '.permission')
+          PERM=$(gh api "repos/${REPOSITORY}/collaborators/${SENDER_LOGIN}/permission" --jq '.permission')
           if [[ "$PERM" != "admin" ]]; then
             echo "::error::Only admins can trigger pr-audit (got: $PERM)"
             exit 1
           fi
 
       - name: Publish event
+        env:
+          EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }}
+          EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
+          EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          echo "${{ secrets.EVENTS_KEY }}" > "${{ runner.temp }}/key"
-          echo "${{ secrets.EVENTS_CERT }}" > "${{ runner.temp }}/cert"
+          key_path="${RUNNER_TEMP}/key"
+          cert_path="${RUNNER_TEMP}/cert"
+          printf '%s' "$EVENTS_KEY" > "$key_path"
+          printf '%s' "$EVENTS_CERT" > "$cert_path"
 
-          curl -sf -o /dev/null -X POST ${{ secrets.EVENTS_ARGS }} \
+          payload=$(jq -n \
+            --arg repository "$REPOSITORY" \
+            --arg sha "$PR_SHA" \
+            --argjson pr_number "$PR_NUMBER" \
+            '{repository: $repository, event: "pr_audit", data: {pr_number: $pr_number, sha: $sha}}')
+
+          # shellcheck disable=SC2086
+          curl -sf -o /dev/null -X POST ${EVENTS_ARGS} \
             -H "Content-Type: application/json" \
-            --key "${{ runner.temp }}/key" \
-            --cert "${{ runner.temp }}/cert" \
-            -d '{
-              "repository": "${{ github.repository }}",
-              "event": "pr_audit",
-              "data": {
-                "pr_number": ${{ github.event.pull_request.number }},
-                "sha": "${{ github.event.pull_request.head.sha }}"
-              }
-            }'
+            --key "$key_path" \
+            --cert "$cert_path" \
+            -d "$payload"
