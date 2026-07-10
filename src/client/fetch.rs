@@ -12,6 +12,7 @@ use super::events::{
     PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
 use super::provider::PaymentProvider;
+use super::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
@@ -60,6 +61,36 @@ pub trait PaymentExt: Sized {
         policy: &AcceptPaymentPolicy,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send;
 
+    /// Like [`send_with_payment`](Self::send_with_payment), with a custom cap
+    /// for incremental payment challenge retries after the initial 402.
+    fn send_with_payment_max_retries<P: PaymentProvider>(
+        self,
+        provider: &P,
+        max_payment_retries: usize,
+    ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send {
+        self.send_with_payment_policy_max_retries(
+            provider,
+            &AcceptPaymentPolicy::Always,
+            max_payment_retries,
+        )
+    }
+
+    /// Like [`send_with_payment_policy`](Self::send_with_payment_policy), with
+    /// a custom cap for incremental payment challenge retries.
+    fn send_with_payment_policy_max_retries<P: PaymentProvider>(
+        self,
+        provider: &P,
+        policy: &AcceptPaymentPolicy,
+        max_payment_retries: usize,
+    ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send {
+        self.send_with_payment_options_max_retries(
+            provider,
+            policy,
+            ClientEvents::default(),
+            max_payment_retries,
+        )
+    }
+
     /// Like [`send_with_payment_policy`](Self::send_with_payment_policy), with
     /// event callbacks for the 402 payment flow.
     fn send_with_payment_options<P: PaymentProvider>(
@@ -71,6 +102,19 @@ pub trait PaymentExt: Sized {
         let _ = events;
         self.send_with_payment_policy(provider, policy)
     }
+
+    /// Like [`send_with_payment_options`](Self::send_with_payment_options),
+    /// with a custom cap for incremental payment challenge retries.
+    fn send_with_payment_options_max_retries<P: PaymentProvider>(
+        self,
+        provider: &P,
+        policy: &AcceptPaymentPolicy,
+        events: ClientEvents,
+        max_payment_retries: usize,
+    ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send {
+        let _ = max_payment_retries;
+        self.send_with_payment_options(provider, policy, events)
+    }
 }
 
 impl PaymentExt for RequestBuilder {
@@ -79,8 +123,28 @@ impl PaymentExt for RequestBuilder {
         provider: &P,
         policy: &AcceptPaymentPolicy,
     ) -> Result<Response, HttpError> {
-        self.send_with_payment_options(provider, policy, ClientEvents::default())
-            .await
+        self.send_with_payment_options_max_retries(
+            provider,
+            policy,
+            ClientEvents::default(),
+            DEFAULT_MAX_PAYMENT_RETRIES,
+        )
+        .await
+    }
+
+    async fn send_with_payment_policy_max_retries<P: PaymentProvider>(
+        self,
+        provider: &P,
+        policy: &AcceptPaymentPolicy,
+        max_payment_retries: usize,
+    ) -> Result<Response, HttpError> {
+        self.send_with_payment_options_max_retries(
+            provider,
+            policy,
+            ClientEvents::default(),
+            max_payment_retries,
+        )
+        .await
     }
 
     async fn send_with_payment_options<P: PaymentProvider>(
@@ -88,6 +152,22 @@ impl PaymentExt for RequestBuilder {
         provider: &P,
         policy: &AcceptPaymentPolicy,
         events: ClientEvents,
+    ) -> Result<Response, HttpError> {
+        self.send_with_payment_options_max_retries(
+            provider,
+            policy,
+            events,
+            DEFAULT_MAX_PAYMENT_RETRIES,
+        )
+        .await
+    }
+
+    async fn send_with_payment_options_max_retries<P: PaymentProvider>(
+        self,
+        provider: &P,
+        policy: &AcceptPaymentPolicy,
+        events: ClientEvents,
+        max_payment_retries: usize,
     ) -> Result<Response, HttpError> {
         let retry_builder = self.try_clone().ok_or(HttpError::CloneFailed)?;
 
@@ -120,39 +200,42 @@ impl PaymentExt for RequestBuilder {
         // Caller's header (if any) wins for retry-time ranking.
         let ranking_accept = caller_accept.or(provider_accept);
 
-        let resp = this.send().await?;
+        let mut paid_challenge_ids = std::collections::HashSet::new();
+        let mut resp = this.send().await?;
 
-        if resp.status() != StatusCode::PAYMENT_REQUIRED {
-            return Ok(resp);
-        }
+        for attempt in 0..max_payment_retries {
+            if resp.status() != StatusCode::PAYMENT_REQUIRED {
+                return Ok(resp);
+            }
 
-        let www_auth_values: Vec<&str> = resp
-            .headers()
-            .get_all(WWW_AUTHENTICATE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
+            let www_auth_values: Vec<&str> = resp
+                .headers()
+                .get_all(WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
 
-        if www_auth_values.is_empty() {
-            events
-                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                    challenge: None,
-                    error: HttpError::MissingChallenge.to_string(),
-                    reason: None,
-                }))
-                .await;
-            return Err(HttpError::MissingChallenge);
-        }
+            if www_auth_values.is_empty() {
+                events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: None,
+                        error: HttpError::MissingChallenge.to_string(),
+                        reason: None,
+                    }))
+                    .await;
+                return Err(HttpError::MissingChallenge);
+            }
 
-        let challenges: Vec<_> = parse_www_authenticate_all(www_auth_values)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+            let challenges: Vec<_> = parse_www_authenticate_all(www_auth_values)
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .collect();
 
-        let challenge =
-            match select_supported_challenge(&challenges, ranking_accept.as_deref(), |challenge| {
-                provider.supports(challenge.method.as_str(), challenge.intent.as_str())
-            }) {
+            let challenge = match select_supported_challenge(
+                &challenges,
+                ranking_accept.as_deref(),
+                |challenge| provider.supports(challenge.method.as_str(), challenge.intent.as_str()),
+            ) {
                 Ok(challenge) => challenge.clone(),
                 Err(ChallengeSelectionError::Expired(challenge)) => {
                     let err = HttpError::Payment(expired_payment_error(&challenge));
@@ -180,19 +263,53 @@ impl PaymentExt for RequestBuilder {
                 }
             };
 
-        let override_credential = events
-            .emit_challenge_received(ChallengeReceivedContext {
-                challenge: challenge.clone(),
-                challenges: challenges.clone(),
-            })
-            .await;
+            if !paid_challenge_ids.insert(challenge.id.clone()) {
+                events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: Some(challenge),
+                        error: "payment retry returned a previously paid challenge".to_string(),
+                        reason: None,
+                    }))
+                    .await;
+                return Ok(resp);
+            }
 
-        let credential = match override_credential {
-            Some(credential) => credential,
-            None => match provider.pay(&challenge).await {
-                Ok(credential) => credential,
+            let override_credential = events
+                .emit_challenge_received(ChallengeReceivedContext {
+                    challenge: challenge.clone(),
+                    challenges: challenges.clone(),
+                })
+                .await;
+
+            let credential = match override_credential {
+                Some(credential) => credential,
+                None => match provider.pay(&challenge).await {
+                    Ok(credential) => credential,
+                    Err(err) => {
+                        let http_err = HttpError::Payment(err);
+                        events
+                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                                challenge: Some(challenge),
+                                error: http_err.to_string(),
+                                reason: None,
+                            }))
+                            .await;
+                        return Err(http_err);
+                    }
+                },
+            };
+
+            events
+                .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
+                    challenge: challenge.clone(),
+                    credential: credential.clone(),
+                }))
+                .await;
+
+            let auth_header = match format_authorization(&credential) {
+                Ok(auth_header) => auth_header,
                 Err(err) => {
-                    let http_err = HttpError::Payment(err);
+                    let http_err = HttpError::InvalidCredential(err.to_string());
                     events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),
@@ -202,70 +319,49 @@ impl PaymentExt for RequestBuilder {
                         .await;
                     return Err(http_err);
                 }
-            },
-        };
+            };
 
-        events
-            .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
-                challenge: challenge.clone(),
-                credential: credential.clone(),
-            }))
-            .await;
+            let retry = retry_builder.try_clone().ok_or(HttpError::CloneFailed)?;
+            resp = match retry.header(AUTHORIZATION_HEADER, auth_header).send().await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let http_err = HttpError::Request(err);
+                    events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: http_err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    return Err(http_err);
+                }
+            };
 
-        let auth_header = match format_authorization(&credential) {
-            Ok(auth_header) => auth_header,
-            Err(err) => {
-                let http_err = HttpError::InvalidCredential(err.to_string());
+            let status = resp.status();
+            if status.is_success() {
+                events
+                    .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
+                        challenge,
+                        credential,
+                        status,
+                    }))
+                    .await;
+                return Ok(resp);
+            }
+
+            if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == max_payment_retries {
                 events
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
-                        error: http_err.to_string(),
+                        error: format!("payment retry returned unsuccessful status: {status}"),
                         reason: None,
                     }))
                     .await;
-                return Err(http_err);
+                return Ok(resp);
             }
-        };
-
-        let retry_resp = match retry_builder
-            .header(AUTHORIZATION_HEADER, auth_header)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(err) => {
-                let http_err = HttpError::Request(err);
-                events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: Some(challenge),
-                        error: http_err.to_string(),
-                        reason: None,
-                    }))
-                    .await;
-                return Err(http_err);
-            }
-        };
-
-        let status = retry_resp.status();
-        if status.is_success() {
-            events
-                .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
-                    challenge,
-                    credential,
-                    status,
-                }))
-                .await;
-        } else {
-            events
-                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                    challenge: Some(challenge),
-                    error: format!("payment retry returned unsuccessful status: {status}"),
-                    reason: None,
-                }))
-                .await;
         }
 
-        Ok(retry_resp)
+        Ok(resp)
     }
 }
 
@@ -295,13 +391,14 @@ mod tests {
         use axum::routing::get;
         use axum::Router;
         use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
         /// Mock provider that records calls and returns a fixed credential.
         #[derive(Clone)]
         struct MockProvider {
             pay_count: Arc<AtomicU32>,
+            challenge_ids: Arc<Mutex<Vec<String>>>,
             fail: bool,
         }
 
@@ -309,6 +406,7 @@ mod tests {
             fn new() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: false,
                 }
             }
@@ -316,12 +414,17 @@ mod tests {
             fn failing() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: true,
                 }
             }
 
             fn call_count(&self) -> u32 {
                 self.pay_count.load(Ordering::SeqCst)
+            }
+
+            fn challenge_ids(&self) -> Vec<String> {
+                self.challenge_ids.lock().unwrap().clone()
             }
         }
 
@@ -335,6 +438,10 @@ mod tests {
                 challenge: &crate::protocol::core::PaymentChallenge,
             ) -> Result<PaymentCredential, MppError> {
                 self.pay_count.fetch_add(1, Ordering::SeqCst);
+                self.challenge_ids
+                    .lock()
+                    .unwrap()
+                    .push(challenge.id.clone());
                 if self.fail {
                     return Err(MppError::Http("mock provider failure".into()));
                 }
@@ -348,15 +455,14 @@ mod tests {
 
         /// Build a test challenge and its formatted WWW-Authenticate header value.
         fn test_challenge() -> (PaymentChallenge, String) {
+            test_challenge_with_id("test-id-123")
+        }
+
+        fn test_challenge_with_id(id: &str) -> (PaymentChallenge, String) {
             let request =
                 Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-            let challenge = PaymentChallenge::new(
-                "test-id-123",
-                "test.example.com",
-                "tempo",
-                "charge",
-                request,
-            );
+            let challenge =
+                PaymentChallenge::new(id, "test.example.com", "tempo", "charge", request);
             let header = format_www_authenticate(&challenge).unwrap();
             (challenge, header)
         }
@@ -496,7 +602,7 @@ mod tests {
                     let www_auth = www_auth.clone();
                     async move {
                         if req.headers().get("authorization").is_some() {
-                            AxumStatusCode::PAYMENT_REQUIRED.into_response()
+                            AxumStatusCode::FORBIDDEN.into_response()
                         } else {
                             (
                                 AxumStatusCode::PAYMENT_REQUIRED,
@@ -529,7 +635,117 @@ mod tests {
                     failed_count.fetch_add(1, Ordering::SeqCst);
                     async move {
                         assert!(ctx.challenge.is_some());
-                        assert!(ctx.error.contains("402 Payment Required"));
+                        assert!(ctx.error.contains("403 Forbidden"));
+                    }
+                }
+            });
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(response_count.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_incremental_402_retries_stop_at_default_cap() {
+            let headers = Arc::new(
+                (0..DEFAULT_MAX_PAYMENT_RETRIES)
+                    .map(|i| test_challenge_with_id(&format!("cap-{i}")).1)
+                    .collect::<Vec<_>>(),
+            );
+            let request_count = Arc::new(AtomicU32::new(0));
+            let counter = request_count.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let headers = headers.clone();
+                    let counter = counter.clone();
+                    async move {
+                        let index = counter.fetch_add(1, Ordering::SeqCst) as usize;
+                        let www_auth = headers
+                            .get(index)
+                            .unwrap_or_else(|| headers.last().unwrap())
+                            .clone();
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+            let events = ClientEvents::default();
+            let failed_count = Arc::new(AtomicU32::new(0));
+
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |_| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async {}
+                }
+            });
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(provider.call_count(), DEFAULT_MAX_PAYMENT_RETRIES as u32);
+            assert_eq!(
+                request_count.load(Ordering::SeqCst),
+                DEFAULT_MAX_PAYMENT_RETRIES as u32 + 1
+            );
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_incremental_402_retries_do_not_pay_repeated_challenge() {
+            let (_, www_auth) = test_challenge();
+            let request_count = Arc::new(AtomicU32::new(0));
+            let counter = request_count.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let www_auth = www_auth.clone();
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+            let events = ClientEvents::default();
+            let failed_count = Arc::new(AtomicU32::new(0));
+
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_some());
+                        assert!(ctx.error.contains("previously paid challenge"));
                     }
                 }
             });
@@ -542,8 +758,97 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
             assert_eq!(provider.call_count(), 1);
-            assert_eq!(response_count.load(Ordering::SeqCst), 0);
+            assert_eq!(request_count.load(Ordering::SeqCst), 2);
             assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_incremental_402_retries_use_configured_cap() {
+            let (_, www_auth) = test_challenge();
+            let request_count = Arc::new(AtomicU32::new(0));
+            let counter = request_count.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let www_auth = www_auth.clone();
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment_max_retries(&provider, 1)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn test_incremental_402_retries_pay_replacement_challenges() {
+            let (_, first_header) = test_challenge_with_id("first");
+            let (_, second_header) = test_challenge_with_id("second");
+            let (_, third_header) = test_challenge_with_id("third");
+            let headers = Arc::new([first_header, second_header, third_header]);
+            let request_count = Arc::new(AtomicU32::new(0));
+            let counter = request_count.clone();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move || {
+                    let headers = headers.clone();
+                    let counter = counter.clone();
+                    async move {
+                        let index = counter.fetch_add(1, Ordering::SeqCst) as usize;
+                        if let Some(www_auth) = headers.get(index) {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth.clone())],
+                                "pay up",
+                            )
+                                .into_response()
+                        } else {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                provider.challenge_ids(),
+                vec![
+                    "first".to_string(),
+                    "second".to_string(),
+                    "third".to_string()
+                ]
+            );
+            assert_eq!(request_count.load(Ordering::SeqCst), 4);
         }
 
         #[tokio::test]
