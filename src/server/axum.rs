@@ -1227,6 +1227,7 @@ mod tests {
                 timestamp: "2025-01-01T00:00:00Z".into(),
                 reference: "0xbody-aware".into(),
                 external_id: None,
+                subscription_id: None,
             })))
         }
 
@@ -1530,6 +1531,7 @@ mod tests {
                     timestamp: "2025-01-01T00:00:00Z".into(),
                     reference: "0xlegacy".into(),
                     external_id: None,
+                    subscription_id: None,
                 })))
             }
         }
