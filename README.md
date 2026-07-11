@@ -22,9 +22,21 @@ Rust SDK for the [**Machine Payments Protocol**](https://mpp.dev)
 [![Crates.io](https://img.shields.io/crates/v/mpp.svg)](https://crates.io/crates/mpp)
 [![License](https://img.shields.io/crates/l/mpp.svg)](LICENSE-MIT)
 
-[MPP](https://mpp.dev) lets any client — agents, apps, or humans — pay for any service in the same HTTP request. It standardizes [HTTP 402](https://mpp.dev/protocol/http-402) with an open [IETF specification](https://paymentauth.org), so servers can charge and clients can pay without API keys, billing accounts, or checkout flows.
+[MPP](https://mpp.dev/) (the Machine Payments Protocol) is an open standard for machine-to-machine payments, co-authored by [Tempo](https://tempo.xyz/) and [Stripe](https://stripe.com/). Paying for a resource over HTTP typically requires API keys, billing accounts, or checkout flows set up ahead of time. MPP lets any client, including an AI agent, an app, or a person, pay as part of the HTTP exchange using the native [`402 Payment Required` response](https://mpp.dev/protocol/http-402).
 
-You can get started today by reading the [Rust SDK docs](https://mpp.dev/sdk/rust), exploring the [protocol overview](https://mpp.dev/protocol/), or jumping straight to the [quickstart](https://mpp.dev/quickstart/).
+This crate is the [Rust SDK](https://mpp.dev/sdk/rust) for MPP. It supports developers building either side of a paid HTTP exchange: servers that charge for access with Tempo or Stripe, and clients that automatically handle 402 payment challenges. Typical scenarios include gating an API behind per-call payments or building an agent that pays for tools or data as it works. See the [quickstart](https://mpp.dev/quickstart) for server and client patterns.
+
+## MPP SDKs
+
+MPP has official SDKs in multiple languages:
+
+| Language | Repository |
+|----------|------------|
+| Rust | `mpp-rs` (this repository) |
+| Go | [`tempoxyz/mpp-go`](https://github.com/tempoxyz/mpp-go) |
+| Python | [`tempoxyz/pympp`](https://github.com/tempoxyz/pympp) |
+| TypeScript | [`wevm/mppx`](https://github.com/wevm/mppx) |
+| Ruby | [`stripe/mpp-rb`](https://github.com/stripe/mpp-rb) |
 
 ## Install
 
@@ -129,7 +141,7 @@ if let WsServerMessage::Challenge { challenge, .. } = msg {
 }
 ```
 
-WSS (WebSocket Secure) is handled at the connection layer — the transport itself is protocol-agnostic. On the server, terminate TLS via a reverse proxy (nginx, Cloudflare) or use `axum-server` with rustls. On the client, `tokio-tungstenite` supports `wss://` URLs via its `native-tls` or `rustls` features:
+WSS (WebSocket Secure) is handled at the connection layer. The transport itself is protocol-agnostic. On the server, terminate TLS via a reverse proxy (nginx, Cloudflare) or use `axum-server` with rustls. On the client, `tokio-tungstenite` supports `wss://` URLs via its `native-tls` or `rustls` features:
 
 ```toml
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
@@ -152,11 +164,11 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 ## Payment Methods
 
-MPP supports multiple [payment methods](https://mpp.dev/payment-methods/) through one protocol — [Tempo](https://mpp.dev/payment-methods/tempo/), [Stripe](https://mpp.dev/payment-methods/stripe/), [Lightning](https://mpp.dev/payment-methods/lightning/), [Card](https://mpp.dev/payment-methods/card/), and [custom methods](https://mpp.dev/payment-methods/custom). The server advertises which methods it accepts, and the client chooses which one to pay with. This SDK implements Tempo (charge and session intents) and Stripe (charge intent via Shared Payment Tokens).
+MPP supports multiple [payment methods](https://mpp.dev/payment-methods) through one protocol: [Tempo](https://mpp.dev/payment-methods/tempo), [Stripe](https://mpp.dev/payment-methods/stripe), [Lightning](https://mpp.dev/payment-methods/lightning), [Card](https://mpp.dev/payment-methods/card), and [custom methods](https://mpp.dev/payment-methods/custom). The server advertises which methods it accepts, and the client chooses which one to pay with. This SDK implements Tempo (charge and session intents) and Stripe (charge intent via Shared Payment Tokens).
 
 ## Protocol
 
-Built on the ["Payment" HTTP Authentication Scheme](https://paymentauth.org), an open specification proposed to the IETF. See [mpp.dev/protocol](https://mpp.dev/protocol/) for the full protocol overview, or the [IETF specification](https://paymentauth.org) for the wire format.
+Built on the ["Payment" HTTP Authentication Scheme](https://paymentauth.org/). The source specifications are maintained in [`tempoxyz/mpp-specs`](https://github.com/tempoxyz/mpp-specs). See [mpp.dev/protocol](https://mpp.dev/protocol) for the protocol overview or [paymentauth.org](https://paymentauth.org/) for the wire format.
 
 ## Contributing
 
