@@ -7,9 +7,11 @@ on:
 permissions: {}
 
 jobs:
-  publish:
+  authorize:
+    if: github.event.label.name == 'cyclops'
     runs-on: ubuntu-latest
-    if: github.event.action == 'labeled' && github.event.label.name == 'cyclops'
+    permissions:
+      contents: read
     steps:
       - name: Check admin permission
         env:
@@ -22,22 +24,12 @@ jobs:
             exit 1
           fi
 
-      - name: Publish event
-        run: |
-          set -euo pipefail
-
-          echo "${{ secrets.EVENTS_KEY }}" > "${{ runner.temp }}/key"
-          echo "${{ secrets.EVENTS_CERT }}" > "${{ runner.temp }}/cert"
-
-          curl -sf -o /dev/null -X POST ${{ secrets.EVENTS_ARGS }} \
-            -H "Content-Type: application/json" \
-            --key "${{ runner.temp }}/key" \
-            --cert "${{ runner.temp }}/cert" \
-            -d '{
-              "repository": "${{ github.repository }}",
-              "event": "pr_audit",
-              "data": {
-                "pr_number": ${{ github.event.pull_request.number }},
-                "sha": "${{ github.event.pull_request.head.sha }}"
-              }
-            }'
+  pr-audit:
+    needs: authorize
+    permissions:
+      contents: read
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@512158c4e90e42eef8aa7fc3fc3186a79b5b4648
+    secrets:
+      EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
+      EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
+      EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }}
