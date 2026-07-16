@@ -16,9 +16,10 @@ jobs:
       - name: Check admin permission
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           SENDER_LOGIN: ${{ github.event.sender.login }}
         run: |
-          PERM=$(gh api "repos/${{ github.repository }}/collaborators/${SENDER_LOGIN}/permission" --jq '.permission')
+          PERM=$(gh api "repos/${REPOSITORY}/collaborators/${SENDER_LOGIN}/permission" --jq '.permission')
           if [[ "$PERM" != "admin" ]]; then
             echo "::error::Only admins can trigger pr-audit (got: $PERM)"
             exit 1
