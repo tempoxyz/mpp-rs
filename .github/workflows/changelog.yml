@@ -12,7 +12,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
@@ -22,7 +22,7 @@ jobs:
       - name: Remove repo-local Claude settings
         run: rm -rf .claude/
       - name: Check changelog
-        uses: tempoxyz/changelogs/check@29ac40b71b3966761305991d99f21c5195d7466b # master
+        uses: tempoxyz/changelogs/check@f168e5c51e24831f7145eda2725cc3597b9c46cb # master
         with:
           ai: "claude --bare -p"
           ecosystem: rust
