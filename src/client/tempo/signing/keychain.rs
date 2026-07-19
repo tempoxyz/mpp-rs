@@ -64,12 +64,12 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
     }
 
     let result = keychain
-        .getRemainingLimit(wallet_address, key_address, token)
+        .getRemainingLimitWithPeriod(wallet_address, key_address, token)
         .call()
         .await
         .mpp_http("failed to query remaining limit")?;
 
-    Ok(Some(result))
+    Ok(Some(result.remaining))
 }
 
 /// Resolve the spending limit for a token from a key authorization.
