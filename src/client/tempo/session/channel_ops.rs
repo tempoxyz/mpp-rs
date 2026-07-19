@@ -64,6 +64,8 @@ pub struct ChannelEntry {
     pub chain_id: u64,
     /// Whether the channel has been opened on-chain.
     pub opened: bool,
+    /// TIP-1034 descriptor required on every native session action.
+    pub descriptor: Option<ChannelDescriptor>,
 }
 
 /// Resolve chain ID from a session challenge's methodDetails.
@@ -450,6 +452,7 @@ where
         escrow_contract: options.escrow_contract,
         chain_id: options.chain_id,
         opened: true,
+        descriptor: None,
     };
 
     let payload = SessionCredentialPayload::Open {
@@ -859,6 +862,7 @@ where
         escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
         chain_id: options.chain_id,
         opened: true,
+        descriptor: Some(descriptor.clone()),
     };
 
     let payload = SessionCredentialPayload::Open {
@@ -990,6 +994,7 @@ pub async fn try_recover_channel<P: Provider<TempoNetwork>>(
             escrow_contract,
             chain_id,
             opened: true,
+            descriptor: None,
         })
     } else {
         None
@@ -1132,6 +1137,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
+            descriptor: None,
         };
         let cloned = entry.clone();
         assert_eq!(cloned.cumulative_amount, 1000);
@@ -1653,6 +1659,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
+            descriptor: None,
         };
         let debug = format!("{:?}", entry);
         assert!(debug.contains("ChannelEntry"));

@@ -23,6 +23,7 @@ use mpp::{
     },
     format_authorization, MppError, PaymentChallenge, PaymentCredential, Receipt,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{
     from_str as json_from_str, from_value as json_from_value, value::RawValue, Value,
 };
@@ -67,7 +68,8 @@ const FATAL_TERMINATION_MESSAGE: &str =
 /// Emitted as part of an MPP `needVoucher` frame when a streaming session's
 /// channel balance has been exhausted and the server is asking the client
 /// for a new signed cumulative voucher.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VoucherRequest {
     /// Channel ID (`"0x…"`).
     pub channel_id: String,
@@ -93,6 +95,15 @@ pub trait VoucherProvider: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
 }
 
+/// Companion provider for the final signed session close action.
+pub trait CloseProvider: Clone + Send + Sync + 'static {
+    /// Produce a close credential for the authorized session channel.
+    fn close_credential(
+        &self,
+        channel_id: &str,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
+}
+
 /// Default no-op [`VoucherProvider`].
 ///
 /// Returns an error for every voucher request. Use this when your
@@ -104,6 +115,14 @@ impl VoucherProvider for NoVoucher {
     async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
         Err(MppError::bad_request(
             "voucher provider not configured; configure MppWsConnect::with_voucher_provider",
+        ))
+    }
+}
+
+impl CloseProvider for NoVoucher {
+    async fn close_credential(&self, _: &str) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request(
+            "close provider not configured for this MPP session",
         ))
     }
 }
@@ -915,6 +934,19 @@ mod tests {
             deposit: "200".into(),
         };
         assert!(NoVoucher.next_voucher(&req).await.is_err());
+    }
+
+    #[test]
+    fn voucher_request_uses_canonical_camel_case_wire_fields() {
+        let request: VoucherRequest = serde_json::from_value(serde_json::json!({
+            "channelId": "0xabc",
+            "requiredCumulative": "100",
+            "acceptedCumulative": "50",
+            "deposit": "200"
+        }))
+        .unwrap();
+        assert_eq!(request.channel_id, "0xabc");
+        assert_eq!(request.required_cumulative, "100");
     }
 
     #[test]
