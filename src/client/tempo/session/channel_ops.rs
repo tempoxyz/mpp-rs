@@ -21,7 +21,9 @@ use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
-    sign_precompile_voucher, sign_precompile_voucher_with_escrow, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
+    sign_precompile_voucher, sign_precompile_voucher_primitive,
+    sign_precompile_voucher_primitive_with_escrow, sign_precompile_voucher_with_escrow,
+    PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::{
     ChannelDescriptor, SessionCredentialPayload, TempoSessionExt,
@@ -58,14 +60,16 @@ pub struct ChannelEntry {
     pub salt: B256,
     /// Running cumulative amount of all vouchers issued.
     pub cumulative_amount: u128,
+    /// Latest known channel deposit.
+    pub deposit: u128,
+    /// Full TIP-1034 descriptor. Legacy contract channels do not have one.
+    pub descriptor: Option<ChannelDescriptor>,
     /// Escrow contract address.
     pub escrow_contract: Address,
     /// Chain ID where the escrow contract is deployed.
     pub chain_id: u64,
     /// Whether the channel has been opened on-chain.
     pub opened: bool,
-    /// TIP-1034 descriptor required on every native session action.
-    pub descriptor: Option<ChannelDescriptor>,
 }
 
 /// Resolve chain ID from a session challenge's methodDetails.
@@ -161,6 +165,24 @@ pub async fn create_precompile_voucher_payload(
     })
 }
 
+/// Native primitive-signature version of [`create_precompile_voucher_payload`].
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_primitive(
+    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let signature =
+        sign_precompile_voucher_primitive(signer, channel_id, cumulative_amount, chain_id).await?;
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
+}
+
 /// Voucher payload for TIP-1034 with the descriptor required for recovery.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_voucher_payload_with_descriptor(
@@ -177,6 +199,35 @@ pub async fn create_precompile_voucher_payload_with_descriptor(
         chain_id,
     )
     .await
+}
+
+/// Primitive-signature voucher payload with the descriptor required for recovery.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
+    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    let signature = sign_precompile_voucher_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
 }
 
 /// Voucher payload for TIP-1034 with an explicit escrow/precompile address.
@@ -253,6 +304,24 @@ pub async fn create_precompile_close_payload(
     })
 }
 
+/// Native primitive-signature version of [`create_precompile_close_payload`].
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_primitive(
+    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let signature =
+        sign_precompile_voucher_primitive(signer, channel_id, cumulative_amount, chain_id).await?;
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
+}
+
 /// Close payload for TIP-1034 with the descriptor required for recovery.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_close_payload_with_descriptor(
@@ -271,6 +340,41 @@ pub async fn create_precompile_close_payload_with_descriptor(
         chain_id,
     )
     .await
+}
+
+/// Primitive-signature close payload with the descriptor required for recovery.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_with_descriptor_primitive(
+    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let expected = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    if expected != channel_id {
+        return Err(MppError::InvalidConfig(
+            "TIP-1034 close descriptor does not match channel_id".into(),
+        ));
+    }
+    let signature = sign_precompile_voucher_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
 }
 
 /// Close payload for TIP-1034 with a descriptor and explicit escrow/precompile verifier.
@@ -347,7 +451,6 @@ where
 
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
-
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
     // Generate random salt
@@ -449,10 +552,11 @@ where
         channel_id,
         salt,
         cumulative_amount: options.initial_amount,
+        deposit: options.deposit,
+        descriptor: None,
         escrow_contract: options.escrow_contract,
         chain_id: options.chain_id,
         opened: true,
-        descriptor: None,
     };
 
     let payload = SessionCredentialPayload::Open {
@@ -743,7 +847,7 @@ pub async fn create_precompile_open_payload<P, S>(
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
 where
     P: Provider<TempoNetwork>,
-    S: Signer + Clone,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
 {
     if options.deposit > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
         return Err(MppError::InvalidConfig(format!(
@@ -760,6 +864,7 @@ where
 
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
+    let primitive_signer = signer.clone().into();
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
     let salt = B256::random();
@@ -839,30 +944,39 @@ where
     );
 
     let tx_bytes = if options.fee_payer {
-        crate::client::tempo::signing::sign_and_encode_fee_payer_request_async(
+        crate::client::tempo::signing::sign_and_encode_fee_payer_request_primitive_async(
             unsigned_tx,
-            signer,
+            &primitive_signer,
             signing_mode,
         )
         .await?
     } else {
-        crate::client::tempo::signing::sign_and_encode_async(unsigned_tx, signer, signing_mode)
-            .await?
+        crate::client::tempo::signing::sign_and_encode_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
     };
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
-    let voucher_sig =
-        sign_precompile_voucher(signer, channel_id, options.initial_amount, options.chain_id)
-            .await?;
+    let voucher_sig = sign_precompile_voucher_primitive(
+        &primitive_signer,
+        channel_id,
+        options.initial_amount,
+        options.chain_id,
+    )
+    .await?;
 
     let entry = ChannelEntry {
         channel_id,
         salt,
         cumulative_amount: options.initial_amount,
+        deposit: options.deposit,
+        descriptor: Some(descriptor.clone()),
         escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
         chain_id: options.chain_id,
         opened: true,
-        descriptor: Some(descriptor.clone()),
     };
 
     let payload = SessionCredentialPayload::Open {
@@ -991,10 +1105,11 @@ pub async fn try_recover_channel<P: Provider<TempoNetwork>>(
             channel_id,
             salt: B256::ZERO,
             cumulative_amount: on_chain.settled,
+            deposit: on_chain.deposit,
+            descriptor: None,
             escrow_contract,
             chain_id,
             opened: true,
-            descriptor: None,
         })
     } else {
         None
@@ -1134,10 +1249,11 @@ mod tests {
             channel_id: B256::ZERO,
             salt: B256::ZERO,
             cumulative_amount: 1000,
+            deposit: 0,
+            descriptor: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
         let cloned = entry.clone();
         assert_eq!(cloned.cumulative_amount, 1000);
@@ -1656,10 +1772,11 @@ mod tests {
             channel_id: B256::ZERO,
             salt: B256::ZERO,
             cumulative_amount: 0,
+            deposit: 0,
+            descriptor: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
-            descriptor: None,
         };
         let debug = format!("{:?}", entry);
         assert!(debug.contains("ChannelEntry"));

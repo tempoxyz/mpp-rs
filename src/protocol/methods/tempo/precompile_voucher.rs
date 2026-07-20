@@ -10,6 +10,8 @@ use alloy::signers::Signer;
 use alloy::sol_types::{eip712_domain, SolStruct, SolValue};
 #[cfg(feature = "tempo")]
 use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+#[cfg(feature = "tempo")]
+use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
 
 #[cfg(feature = "tempo")]
 use crate::error::{MppError, Result};
@@ -175,6 +177,73 @@ pub async fn sign_precompile_voucher_with_escrow(
     })?;
 
     Ok(Bytes::from(signature.as_bytes().to_vec()))
+}
+
+/// Sign a TIP-1034 voucher with a signer that returns a Tempo primitive
+/// signature, including P-256 and WebAuthn signers.
+#[cfg(feature = "tempo")]
+pub async fn sign_precompile_voucher_primitive(
+    signer: &impl Signer<PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<Bytes> {
+    sign_precompile_voucher_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await
+}
+
+/// Sign a TIP-1034 voucher with an explicit verifier and a Tempo primitive
+/// signer.
+#[cfg(feature = "tempo")]
+pub async fn sign_precompile_voucher_primitive_with_escrow(
+    signer: &impl Signer<PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<Bytes> {
+    let signing_hash = precompile_voucher_signing_hash_with_escrow(
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )?;
+    let signature = signer.sign_hash(&signing_hash).await.map_err(|e| {
+        MppError::InvalidSignature(Some(format!("failed to sign precompile voucher: {e}")))
+    })?;
+    Ok(signature.to_bytes())
+}
+
+/// Verify a canonical TIP-1020 primitive signature over a TIP-1034 voucher.
+#[cfg(feature = "tempo")]
+pub fn verify_precompile_voucher_signature(
+    signature: &[u8],
+    expected_signer: Address,
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<bool> {
+    let signing_hash = precompile_voucher_signing_hash_with_escrow(
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )?;
+    let primitive = PrimitiveSignature::from_bytes(signature)
+        .map_err(|e| MppError::InvalidSignature(Some(e.to_string())))?;
+    if primitive.to_bytes().as_ref() != signature {
+        return Ok(false);
+    }
+    Ok(TempoSignature::Primitive(primitive)
+        .recover_signer(&signing_hash)
+        .is_ok_and(|address| address == expected_signer))
 }
 
 #[cfg(test)]
@@ -433,5 +502,59 @@ mod tests {
         .unwrap();
 
         assert_ne!(precompile_sig, legacy_sig);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn verifies_accounts_sdk_webcrypto_p256_voucher_vector() {
+        // Generated with viem 2.52.2 `TempoAccount.fromWebCryptoP256` and
+        // `TempoAccount.signVoucher`, which is the path used by MPPx.
+        let channel_id = B256::repeat_byte(0xab);
+        let signature = alloy::hex::decode(
+            "01a8e4059a7c38ba2fc568b9d0b5d5c6e4f7c80e2e3e94905977923457b14e8a727a45b06c3c3c725536c9f0383e1c85995a1ddb8a2018c308ad0762a1fb6dc24b3ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d01",
+        )
+        .unwrap();
+        let expected_signer = "0xf0159a522607cd6ab1097204c9fafb7bbe6afb6c"
+            .parse()
+            .unwrap();
+
+        assert!(verify_precompile_voucher_signature(
+            &signature,
+            expected_signer,
+            channel_id,
+            1_234_567,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            4217,
+        )
+        .unwrap());
+    }
+
+    #[cfg(all(feature = "tempo", feature = "client"))]
+    #[tokio::test]
+    async fn p256_signer_produces_verifiable_webcrypto_compatible_voucher() {
+        use crate::client::tempo::signing::{P256Jwk, TempoP256Signer};
+
+        let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
+            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
+            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+        })
+        .unwrap();
+        let channel_id = B256::repeat_byte(0xab);
+        let signature = sign_precompile_voucher_primitive(&signer, channel_id, 1_234_567, 4217)
+            .await
+            .unwrap();
+
+        assert!(verify_precompile_voucher_signature(
+            &signature,
+            signer.address(),
+            channel_id,
+            1_234_567,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            4217,
+        )
+        .unwrap());
     }
 }

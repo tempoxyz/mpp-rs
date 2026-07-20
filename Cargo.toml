@@ -35,14 +35,29 @@ server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
 evm = ["alloy", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives", "dep:tempo-contracts", "uuid"]
+tempo = [
+  "evm",
+  "tempo-alloy",
+  "tempo-primitives",
+  "dep:tempo-contracts",
+  "dep:async-trait",
+  "dep:p256",
+  "uuid",
+]
 stripe = ["dep:reqwest", "reqwest?/form"]
+sqlite = ["tempo", "dep:dirs", "dep:rusqlite"]
 
 # Utilities
 utils = ["hex", "rand"]
 
 # Middleware support (requires client)
-middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
+middleware = [
+  "client",
+  "reqwest-middleware",
+  "dep:async-trait",
+  "anyhow",
+  "http-types",
+]
 
 # Tower middleware support (server-side)
 tower = [
@@ -102,6 +117,9 @@ alloy = { version = "2.1.0", features = ["full"], optional = true }
 tempo-alloy = { version = "1.8.1", optional = true }
 tempo-primitives = { version = "1.8.1", optional = true }
 tempo-contracts = { version = "1.8.1", optional = true }
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+dirs = { version = "6", optional = true }
+rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
