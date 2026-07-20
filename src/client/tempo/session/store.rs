@@ -376,7 +376,7 @@ mod sqlite {
                         cumulative_amount, accepted_cumulative, challenge_echo, state,
                         close_requested_at, grace_ready_at, created_at, last_used_at, server_spent
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        'v2', ?13, ?14, ?15, ?16, '0', '{}', 'active', 0, 0, ?17, ?17, '0')
+                        'v2', ?13, ?14, ?15, ?16, '0', '{}', ?17, 0, 0, ?18, ?18, '0')
                      ON CONFLICT(channel_id) DO UPDATE SET
                         version=excluded.version, scope_key=excluded.scope_key,
                         origin=excluded.origin, request_url=excluded.request_url,
@@ -386,7 +386,8 @@ mod sqlite {
                         session_protocol=excluded.session_protocol,
                         descriptor_json=excluded.descriptor_json, entry_json=excluded.entry_json,
                         deposit=excluded.deposit, cumulative_amount=excluded.cumulative_amount,
-                        state='active', close_requested_at=0, last_used_at=excluded.last_used_at",
+                        state=excluded.state, close_requested_at=0,
+                        last_used_at=excluded.last_used_at",
                     params![
                         format!("{:#x}", merged.channel_id),
                         i64::from(SCHEMA_VERSION),
@@ -404,6 +405,7 @@ mod sqlite {
                         json,
                         merged.deposit.to_string(),
                         merged.cumulative_amount.to_string(),
+                        if merged.opened { "active" } else { "pending" },
                         now,
                     ],
                 )
@@ -577,6 +579,17 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&json).unwrap(),
             serde_json::to_value(JsonChannelEntry::from(&current)).unwrap()
         );
+        let pending = StoredChannelEntry {
+            channel_id: B256::repeat_byte(0x12),
+            opened: false,
+            ..current
+        };
+        store.set(&pending).await.unwrap();
+        assert_eq!(store.get(&pending.key()).await.unwrap(), Some(pending));
+        let state: String = connection
+            .query_row("SELECT state FROM channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
         drop(connection);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();

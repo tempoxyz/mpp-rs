@@ -640,6 +640,11 @@ impl TempoSessionProvider {
                 "voucher cumulative amount exceeds channel deposit".into(),
             ));
         }
+        // A need-voucher frame can only be emitted after the server accepted
+        // the open credential. Promote a locally pending open at that point;
+        // until then a failed authorization must be retried as another open,
+        // not as a voucher for a channel that never reached the chain.
+        entry.opened = true;
 
         let payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_voucher_payload_with_descriptor_primitive(
@@ -722,7 +727,7 @@ impl TempoSessionProvider {
             .lock()
             .unwrap()
             .get(&key)
-            .filter(|entry| entry.opened)
+            .filter(|entry| entry.opened || is_precompile_escrow(entry.escrow_contract))
             .cloned()
             .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
         if entry.chain_id != expected_chain_id || entry.channel_id.to_string() != channel_id_hex {
@@ -1087,7 +1092,7 @@ impl PaymentProvider for TempoSessionProvider {
         // No existing channel — open a new one
         let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
 
-        let (entry, payload) = if precompile {
+        let (mut entry, payload) = if precompile {
             create_precompile_open_payload(
                 &provider,
                 &self.signer,
@@ -1124,6 +1129,15 @@ impl PaymentProvider for TempoSessionProvider {
             )
             .await?
         };
+
+        // The signed open is only a proposal until the server verifies it and
+        // returns a receipt. Keeping it pending prevents a retry after a 402
+        // verification failure from signing a voucher for a nonexistent
+        // channel. Voucher and close-ready messages promote it implicitly;
+        // cold starts reconcile it with the server snapshot and on-chain state.
+        if precompile {
+            entry.opened = false;
+        }
 
         self.channel_id_to_key
             .lock()
@@ -1601,7 +1615,7 @@ mod tests {
     // --- send_voucher error paths ---
 
     #[tokio::test]
-    async fn test_voucher_credential_returns_signed_cumulative_voucher() {
+    async fn voucher_request_promotes_pending_open_and_signs_cumulative_voucher() {
         use crate::protocol::methods::tempo::session::SessionCredentialPayload;
 
         let provider = make_test_provider();
@@ -1629,9 +1643,10 @@ mod tests {
                 descriptor: None,
                 escrow_contract: escrow,
                 chain_id: 42431,
-                opened: true,
+                opened: false,
             },
         );
+        assert_eq!(provider.cumulative(), 0);
 
         let credential = provider
             .voucher_credential(&channel_id_hex, 2000)
