@@ -1,5 +1,5 @@
 use alloy_transport_mpp::{
-    CloseProvider, MppApplicationWsConnect, VoucherProvider, VoucherRequest,
+    CloseProvider, CloseRequest, MppApplicationWsConnect, VoucherProvider, VoucherRequest,
 };
 use axum::{
     extract::ws::{rejection::WebSocketUpgradeRejection, Message, WebSocketUpgrade},
@@ -42,8 +42,12 @@ impl VoucherProvider for StubProvider {
 }
 
 impl CloseProvider for StubProvider {
-    async fn close_credential(&self, channel_id: &str) -> Result<PaymentCredential, MppError> {
-        assert_eq!(channel_id, "0xchannel");
+    async fn close_credential(
+        &self,
+        request: &CloseRequest,
+    ) -> Result<PaymentCredential, MppError> {
+        assert_eq!(request.channel_id, "0xchannel");
+        assert_eq!(request.cumulative_amount, "37");
         Ok(PaymentCredential::new(
             challenge().to_echo(),
             PaymentPayload::hash("0xclose"),
@@ -75,8 +79,8 @@ fn receipt() -> Value {
         "reference": "0xchannel",
         "challengeId": "challenge-1",
         "channelId": "0xchannel",
-        "acceptedCumulative": "0",
-        "spent": "0"
+        "acceptedCumulative": "100",
+        "spent": "37"
     })
 }
 

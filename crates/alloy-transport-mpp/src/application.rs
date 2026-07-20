@@ -24,7 +24,7 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::{CloseProvider, VoucherProvider, VoucherRequest};
+use crate::{CloseProvider, CloseRequest, VoucherProvider, VoucherRequest};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -278,14 +278,8 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
             match self.next_frame().await? {
                 ServerFrame::CloseReady { data } => {
                     self.accept_receipt(data.clone(), true);
-                    let channel_id =
-                        data.get("channelId")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| MppWsError::PaymentError {
-                                status: 400,
-                                message: "close-ready receipt is missing channelId".to_owned(),
-                            })?;
-                    let credential = self.voucher_provider.close_credential(channel_id).await?;
+                    let request = close_request(&data)?;
+                    let credential = self.voucher_provider.close_credential(&request).await?;
                     send_authorization(&mut self.socket, &credential).await?;
                     let _ = self
                         .events_tx
@@ -358,6 +352,23 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
         };
         let _ = self.events_tx.send(event);
     }
+}
+
+fn close_request(receipt: &Value) -> Result<CloseRequest, MppWsError> {
+    let required = |name: &str| {
+        receipt
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| MppWsError::PaymentError {
+                status: 400,
+                message: format!("close-ready receipt is missing {name}"),
+            })
+    };
+    Ok(CloseRequest {
+        channel_id: required("channelId")?,
+        cumulative_amount: required("spent")?,
+    })
 }
 
 #[derive(Serialize)]

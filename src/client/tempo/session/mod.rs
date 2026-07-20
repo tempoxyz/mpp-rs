@@ -337,6 +337,28 @@ impl TempoSessionProvider {
         &self,
         channel_id_hex: &str,
     ) -> Result<PaymentCredential, MppError> {
+        self.close_credential_inner(channel_id_hex, None).await
+    }
+
+    /// Create a signed close credential for an exact server-confirmed spend.
+    ///
+    /// Canonical bidirectional transports obtain this amount from the
+    /// `payment-close-ready` receipt. It may be lower than the latest voucher
+    /// ceiling, but it may never exceed the amount this provider authorized.
+    pub async fn close_credential_at(
+        &self,
+        channel_id_hex: &str,
+        cumulative_amount: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        self.close_credential_inner(channel_id_hex, Some(cumulative_amount))
+            .await
+    }
+
+    async fn close_credential_inner(
+        &self,
+        channel_id_hex: &str,
+        requested_cumulative: Option<u128>,
+    ) -> Result<PaymentCredential, MppError> {
         let challenge =
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for close".into())
@@ -369,6 +391,13 @@ impl TempoSessionProvider {
                 "channel does not match active session".into(),
             ));
         }
+        let cumulative_amount = requested_cumulative.unwrap_or(entry.cumulative_amount);
+        if cumulative_amount > entry.cumulative_amount {
+            return Err(MppError::InvalidConfig(format!(
+                "close amount {cumulative_amount} exceeds locally authorized cumulative amount {}",
+                entry.cumulative_amount
+            )));
+        }
 
         let payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_close_payload_with_descriptor(
@@ -377,7 +406,7 @@ impl TempoSessionProvider {
                 entry.descriptor.ok_or_else(|| {
                     MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                 })?,
-                entry.cumulative_amount,
+                cumulative_amount,
                 entry.chain_id,
             )
             .await?
@@ -385,7 +414,7 @@ impl TempoSessionProvider {
             create_close_payload(
                 &self.signer,
                 entry.channel_id,
-                entry.cumulative_amount,
+                cumulative_amount,
                 entry.escrow_contract,
                 entry.chain_id,
             )
@@ -1620,8 +1649,14 @@ mod tests {
             other => panic!("expected voucher payload, got {other:?}"),
         }
 
+        let close_amount = 1_200;
+        let expected_close_sig =
+            sign_precompile_voucher(&signer, channel_id, close_amount, chain_id)
+                .await
+                .unwrap();
+        let expected_close_hex = alloy::hex::encode_prefixed(&expected_close_sig);
         let close = provider
-            .close_credential(&channel_id.to_string())
+            .close_credential_at(&channel_id.to_string(), close_amount)
             .await
             .expect("close credential succeeds");
         match close
@@ -1636,10 +1671,18 @@ mod tests {
             } => {
                 assert_eq!(actual_channel_id, channel_id.to_string());
                 assert_eq!(actual_descriptor, Some(descriptor));
-                assert_eq!(cumulative_amount, "1500");
-                assert_eq!(signature, expected_hex);
+                assert_eq!(cumulative_amount, close_amount.to_string());
+                assert_eq!(signature, expected_close_hex);
             }
             other => panic!("expected close payload, got {other:?}"),
         }
+
+        let error = provider
+            .close_credential_at(&channel_id.to_string(), 1_501)
+            .await
+            .expect_err("close amount above the voucher ceiling must fail");
+        assert!(error
+            .to_string()
+            .contains("exceeds locally authorized cumulative amount"));
     }
 }

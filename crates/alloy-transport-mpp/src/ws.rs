@@ -81,6 +81,21 @@ pub struct VoucherRequest {
     pub deposit: String,
 }
 
+/// Server-issued parameters for the final signed session close action.
+///
+/// The cumulative amount is the authoritative `spent` value from the
+/// `payment-close-ready` receipt. It can be lower than the most recent voucher
+/// ceiling, so clients must sign this exact amount instead of reusing their
+/// locally authorized maximum.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseRequest {
+    /// Channel ID (`"0x…"`).
+    pub channel_id: String,
+    /// Exact cumulative amount requested by the close-ready receipt.
+    pub cumulative_amount: String,
+}
+
 /// Optional companion to [`PaymentProvider`] for streaming/session intents.
 ///
 /// When the server emits a `needVoucher` frame, the translator calls
@@ -100,7 +115,7 @@ pub trait CloseProvider: Clone + Send + Sync + 'static {
     /// Produce a close credential for the authorized session channel.
     fn close_credential(
         &self,
-        channel_id: &str,
+        request: &CloseRequest,
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
 }
 
@@ -120,7 +135,7 @@ impl VoucherProvider for NoVoucher {
 }
 
 impl CloseProvider for NoVoucher {
-    async fn close_credential(&self, _: &str) -> Result<PaymentCredential, MppError> {
+    async fn close_credential(&self, _: &CloseRequest) -> Result<PaymentCredential, MppError> {
         Err(MppError::bad_request(
             "close provider not configured for this MPP session",
         ))

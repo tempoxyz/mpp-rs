@@ -16,7 +16,8 @@ pub use application::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use ws::{
-    CloseProvider, MppEvent, MppHandle, MppWsConnect, NoVoucher, VoucherProvider, VoucherRequest,
+    CloseProvider, CloseRequest, MppEvent, MppHandle, MppWsConnect, NoVoucher, VoucherProvider,
+    VoucherRequest,
 };
 
 // Re-exports for ergonomics.
