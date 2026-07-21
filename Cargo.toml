@@ -45,7 +45,7 @@ tempo = [
   "uuid",
 ]
 stripe = ["dep:reqwest", "reqwest?/form"]
-sqlite = ["tempo", "dep:dirs", "dep:rusqlite"]
+sqlite = ["tempo", "dep:rusqlite"]
 
 # Utilities
 utils = ["hex", "rand"]
@@ -118,7 +118,6 @@ tempo-alloy = { version = "1.8.1", optional = true }
 tempo-primitives = { version = "1.8.1", optional = true }
 tempo-contracts = { version = "1.8.1", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
-dirs = { version = "6", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 # HTTP client dependencies (optional)
