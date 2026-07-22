@@ -271,31 +271,12 @@ impl TempoSessionProvider {
         })
     }
 
-    /// Cache key identifying a channel. Precompile channel ids bind `operator`,
-    /// so it is appended for precompile channels; legacy keys are unchanged.
-    fn channel_key(
-        payee: &Address,
-        currency: &Address,
-        escrow: &Address,
-        operator: Option<Address>,
-    ) -> String {
-        match operator {
-            Some(op) => format!("{:#x}:{:#x}:{:#x}:{:#x}", payee, currency, escrow, op),
-            None => format!("{:#x}:{:#x}:{:#x}", payee, currency, escrow),
-        }
-    }
-
-    /// Operator identity for the cache key: the parsed operator for precompile
-    /// escrow, `None` for legacy escrow.
-    fn key_operator(
-        escrow: &Address,
-        session_req: &SessionRequest,
-    ) -> Result<Option<Address>, MppError> {
-        if is_precompile_escrow(*escrow) {
-            Ok(Some(Self::parse_operator(session_req)?))
-        } else {
-            Ok(None)
-        }
+    /// Cache key identifying the reusable payment scope.
+    ///
+    /// This intentionally matches MPPx: operator is channel identity, not
+    /// payment scope, while chain ID must prevent cross-network reuse.
+    fn channel_key(payee: &Address, currency: &Address, escrow: &Address, chain_id: u64) -> String {
+        format!("{:#x}:{:#x}:{:#x}:{chain_id}", payee, currency, escrow)
     }
 
     /// Parse `methodDetails.operator` from a precompile session request.
@@ -340,10 +321,8 @@ impl TempoSessionProvider {
             .parse()
             .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
 
-        let operator = Self::key_operator(&escrow_contract, &session_req)?;
-
         Ok((
-            Self::channel_key(&payee, &currency, &escrow_contract, operator),
+            Self::channel_key(&payee, &currency, &escrow_contract, chain_id),
             chain_id,
         ))
     }
@@ -561,11 +540,6 @@ impl TempoSessionProvider {
             .token
             .parse()
             .mpp_config("invalid snapshot token")?;
-        let operator = snapshot
-            .descriptor
-            .operator
-            .parse()
-            .mpp_config("invalid snapshot operator")?;
         let escrow = snapshot
             .escrow
             .parse()
@@ -595,7 +569,7 @@ impl TempoSessionProvider {
             .map_err(Self::store_error)?;
 
         let entry = Self::channel_entry(recovered.clone())?;
-        let key = Self::channel_key(&payee, &token, &escrow, Some(operator));
+        let key = Self::channel_key(&payee, &token, &escrow, snapshot.chain_id);
         self.channel_id_to_key
             .lock()
             .unwrap()
@@ -1293,8 +1267,12 @@ impl TempoSessionProvider {
         let payer = self.signing_mode.from_address(self.signer.address());
         let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
         let precompile = is_precompile_escrow(escrow_contract);
-        let operator = Self::key_operator(&escrow_contract, &session_req)?;
-        let key = Self::channel_key(&payee, &currency, &escrow_contract, operator);
+        let operator = if precompile {
+            Some(Self::parse_operator(&session_req)?)
+        } else {
+            None
+        };
+        let key = Self::channel_key(&payee, &currency, &escrow_contract, chain_id);
         let session_snapshot = session_req.session_snapshot();
 
         let provider =
@@ -1657,19 +1635,12 @@ mod tests {
             .parse()
             .unwrap();
 
-        // Legacy: no operator → 3 fields.
-        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow, None);
+        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow, 4217);
         assert_eq!(key, key.to_lowercase());
-        assert_eq!(key.matches(':').count(), 2);
+        assert_eq!(key.matches(':').count(), 3);
 
-        // Precompile: operator appended → 4 fields, distinct per operator.
-        let op_a = Address::repeat_byte(0x01);
-        let op_b = Address::repeat_byte(0x02);
-        let key_a = TempoSessionProvider::channel_key(&payee, &currency, &escrow, Some(op_a));
-        let key_b = TempoSessionProvider::channel_key(&payee, &currency, &escrow, Some(op_b));
-        assert_eq!(key_a.matches(':').count(), 3);
-        assert_ne!(key_a, key_b);
-        assert_ne!(key_a, key);
+        let other_chain = TempoSessionProvider::channel_key(&payee, &currency, &escrow, 42431);
+        assert_ne!(key, other_chain);
     }
 
     #[test]
@@ -2002,7 +1973,7 @@ mod tests {
 
         *provider.last_challenge.lock().unwrap() =
             Some(make_scoped_challenge(payee, currency, escrow));
-        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow, None);
+        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow, 42431);
         provider
             .channel_id_to_key
             .lock()
@@ -2086,7 +2057,7 @@ mod tests {
         *provider.last_challenge.lock().unwrap() =
             Some(make_scoped_challenge(expected_payee, currency, escrow));
 
-        let other_key = TempoSessionProvider::channel_key(&other_payee, &currency, &escrow, None);
+        let other_key = TempoSessionProvider::channel_key(&other_payee, &currency, &escrow, 42431);
         provider
             .channel_id_to_key
             .lock()
@@ -2154,7 +2125,7 @@ mod tests {
         *provider.last_challenge.lock().unwrap() =
             Some(make_scoped_challenge(expected_payee, currency, escrow));
 
-        let other_key = TempoSessionProvider::channel_key(&other_payee, &currency, &escrow, None);
+        let other_key = TempoSessionProvider::channel_key(&other_payee, &currency, &escrow, 42431);
         provider.channels.lock().unwrap().insert(
             other_key,
             ChannelEntry {
@@ -2291,31 +2262,6 @@ mod tests {
     }
 
     #[cfg(feature = "tempo")]
-    #[test]
-    fn key_operator_only_applies_to_precompile_escrow() {
-        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
-
-        let op = Address::repeat_byte(0x42);
-        let req = SessionRequest {
-            method_details: Some(serde_json::json!({ "operator": op.to_string() })),
-            ..Default::default()
-        };
-
-        // Legacy escrow ignores operator → None (keeps legacy key shape).
-        let legacy = Address::repeat_byte(0x44);
-        assert_eq!(
-            TempoSessionProvider::key_operator(&legacy, &req).unwrap(),
-            None
-        );
-
-        // Precompile escrow binds operator → Some.
-        assert_eq!(
-            TempoSessionProvider::key_operator(&TIP20_CHANNEL_RESERVE_ADDRESS, &req).unwrap(),
-            Some(op)
-        );
-    }
-
-    #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn pay_branches_to_precompile_voucher_for_existing_precompile_channel() {
         use alloy::signers::local::PrivateKeySigner;
@@ -2365,7 +2311,7 @@ mod tests {
             &payee,
             &currency,
             &TIP20_CHANNEL_RESERVE_ADDRESS,
-            Some(operator),
+            chain_id,
         );
         provider.channels.lock().unwrap().insert(
             key.clone(),
@@ -2565,7 +2511,7 @@ mod tests {
             &payee,
             &currency,
             &TIP20_CHANNEL_RESERVE_ADDRESS,
-            Some(operator),
+            chain_id,
         );
         provider.channels.lock().unwrap().insert(
             key,
