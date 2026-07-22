@@ -1116,6 +1116,7 @@ impl TempoSessionProvider {
                         })?;
                 }
                 if entry.cumulative_amount > entry.deposit {
+                    self.assert_within_max_deposit(entry.cumulative_amount)?;
                     let Some(top_up) = top_up else {
                         return Err(MppError::InvalidConfig(
                             "session cumulative amount exceeds channel deposit".into(),
