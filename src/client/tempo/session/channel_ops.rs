@@ -527,6 +527,13 @@ where
         .await
         .mpp_http("failed to get gas price")?;
 
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        signer.address(),
+    )
+    .await?;
+
     let tempo_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
@@ -538,7 +545,7 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before: None,
-        key_authorization: signing_mode.key_authorization().cloned(),
+        key_authorization,
     });
 
     let tx_bytes =
@@ -957,6 +964,13 @@ where
     let (nonce, nonce_key, valid_before) =
         precompile_open_tx_nonce_fields(options.fee_payer, nonce);
 
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        primitive_signer.address(),
+    )
+    .await?;
+
     let unsigned_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
@@ -968,7 +982,7 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before,
-        key_authorization: signing_mode.key_authorization().cloned(),
+        key_authorization,
     });
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
@@ -1097,6 +1111,13 @@ where
         .mpp_http("failed to get gas price")?;
     let (nonce, nonce_key, valid_before) =
         precompile_open_tx_nonce_fields(options.fee_payer, nonce);
+
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        primitive_signer.address(),
+    )
+    .await?;
     let mut unsigned_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
@@ -1112,7 +1133,7 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before,
-        key_authorization: signing_mode.key_authorization().cloned(),
+        key_authorization,
     });
     add_sponsored_top_up_entropy(&mut unsigned_tx, options.fee_payer);
     let tx_bytes = if options.fee_payer {
