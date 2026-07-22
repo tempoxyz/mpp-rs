@@ -260,7 +260,6 @@ impl PaymentChallenge {
             intent: self.intent.clone(),
             request: self.request.clone(),
             expires: self.expires.clone(),
-            description: self.description.clone(),
             digest: self.digest.clone(),
             opaque: self.opaque.clone(),
         }
@@ -518,13 +517,6 @@ pub struct ChallengeEcho {
     /// Challenge expiration time (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
-
-    /// Human-readable description echoed from the server challenge.
-    ///
-    /// Some applications use this stable server-issued value to route
-    /// out-of-band session management credentials back to the paid resource.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
 
     /// Request body digest for body binding (RFC 9530 Content-Digest)
     #[serde(skip_serializing_if = "Option::is_none")]

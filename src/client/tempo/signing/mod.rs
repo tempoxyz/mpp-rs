@@ -303,6 +303,49 @@ pub async fn sign_and_encode_fee_payer_request_primitive_async(
     Ok(out)
 }
 
+/// Primitive-signature version of [`sign_and_encode_fee_payer_envelope_async`].
+///
+/// This mirrors MPPx/Tempo's sender-only `signTransaction({ feePayer: true })`
+/// encoding for both charge credentials and TIP-1034 session management.
+pub async fn sign_and_encode_fee_payer_envelope_primitive_async(
+    mut tx: tempo_primitives::transaction::TempoTransaction,
+    signer: &impl alloy::signers::Signer<PrimitiveSignature>,
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    let sender = mode.from_address(signer.address());
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".to_string(),
+        ));
+    }
+
+    tx.access_list = AccessList::default();
+    let sig_hash = tx.signature_hash();
+    let hash_to_sign = effective_signing_hash(sig_hash, mode);
+    let signature = signer
+        .sign_hash(&hash_to_sign)
+        .await
+        .mpp_http("failed to sign transaction")?;
+    let signature = build_tempo_signature_primitive(signature, mode);
+    Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
+}
+
 /// Async version of [`sign_and_encode_fee_payer_envelope`].
 pub async fn sign_and_encode_fee_payer_envelope_async(
     mut tx: tempo_primitives::transaction::TempoTransaction,

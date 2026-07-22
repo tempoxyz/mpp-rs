@@ -707,8 +707,7 @@ mod tests {
 
     #[test]
     fn test_parse_authorization() {
-        let mut challenge = test_challenge();
-        challenge.description = Some("OpenAI Responses WebSocket session".to_string());
+        let challenge = test_challenge();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             "did:pkh:eip155:42431:0x123",
@@ -719,10 +718,6 @@ mod tests {
         let parsed = parse_authorization(&header).unwrap();
 
         assert_eq!(parsed.challenge.id, "abc123");
-        assert_eq!(
-            parsed.challenge.description.as_deref(),
-            Some("OpenAI Responses WebSocket session")
-        );
         assert_eq!(
             parsed.source,
             Some("did:pkh:eip155:42431:0x123".to_string())

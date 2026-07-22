@@ -449,9 +449,11 @@ mod tests {
         let payload = credential.charge_payload().unwrap();
 
         assert!(payload.is_transaction());
-        assert!(payload
-            .signed_tx()
-            .is_some_and(|transaction| transaction.len() > 4));
+        let transaction = payload.signed_tx().expect("missing signed transaction");
+        assert!(
+            transaction.starts_with("0x78"),
+            "charges use sponsorship envelopes"
+        );
         assert_eq!(
             credential.source,
             Some(PaymentCredential::evm_did(
