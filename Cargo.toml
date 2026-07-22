@@ -17,6 +17,7 @@ members = [
   "crates/alloy-transport-mpp",
   "examples/axum-extractor",
   "examples/basic",
+  "examples/catalog-client",
   "examples/session/multi-fetch",
   "examples/session/sse",
   "examples/stripe",
