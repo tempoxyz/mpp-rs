@@ -1120,7 +1120,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
         provider
             .channels
@@ -1154,7 +1153,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
 
         provider.notify_update(&entry);
@@ -1188,7 +1186,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
         provider
             .channels
@@ -1213,7 +1210,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
-            descriptor: None,
         };
         provider
             .channels
@@ -1329,7 +1325,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
 
         // Should not panic when no callback is set
@@ -1357,7 +1352,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
         provider
             .channels
@@ -1384,7 +1378,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened,
-            descriptor: None,
         }
     }
 
@@ -1451,6 +1444,7 @@ mod tests {
                 channel_id,
                 salt: B256::ZERO,
                 cumulative_amount: 1000,
+                deposit: 10_000,
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
@@ -1539,7 +1533,6 @@ mod tests {
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
-                descriptor: None,
             },
         );
 
@@ -1603,7 +1596,6 @@ mod tests {
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
-                descriptor: None,
             },
         );
 
@@ -1812,11 +1804,10 @@ mod tests {
                 salt,
                 cumulative_amount: 1_000,
                 deposit: 10_000,
-                descriptor: Some(descriptor),
+                descriptor: Some(descriptor.clone()),
                 escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id,
                 opened: true,
-                descriptor: Some(descriptor.clone()),
             },
         );
         provider

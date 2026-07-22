@@ -1257,7 +1257,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
-            descriptor: None,
         };
         let cloned = entry.clone();
         assert_eq!(cloned.cumulative_amount, 1000);
@@ -1781,7 +1780,6 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
-            descriptor: None,
         };
         let debug = format!("{:?}", entry);
         assert!(debug.contains("ChannelEntry"));
