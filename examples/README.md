@@ -7,6 +7,7 @@ Standalone, runnable examples demonstrating the mpp HTTP 402 payment flow.
 | Example | Description |
 |---------|-------------|
 | [basic](./basic/) | Payment-gated Fortune Teller API (Tempo) |
+| [catalog-client](./catalog-client/) | Call arbitrary MPP service-catalog endpoints with Tempo Wallet state |
 | [stripe](./stripe/) | Payment-gated Fortune Teller API (Stripe SPT) |
 | [axum-extractor](./axum-extractor/) | Axum extractors with per-route pricing (`MppCharge<C>`) |
 | [session/multi-fetch](./session/multi-fetch/) | Multiple paid requests over a single payment channel |
