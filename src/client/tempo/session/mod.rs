@@ -219,11 +219,26 @@ impl TempoSessionProvider {
         &self,
         required_cumulative: u128,
         deposit: u128,
+        suggested_deposit: Option<&str>,
     ) -> Result<Option<u128>, MppError> {
         self.assert_within_max_deposit(required_cumulative)?;
-        Ok(required_cumulative
+        let Some(shortfall) = required_cumulative
             .checked_sub(deposit)
-            .filter(|additional| *additional > 0))
+            .filter(|additional| *additional > 0)
+        else {
+            return Ok(None);
+        };
+        let suggested = suggested_deposit
+            .map(str::parse::<u128>)
+            .transpose()
+            .mpp_config("invalid suggestedDeposit")?
+            .unwrap_or_default();
+        let proposed = shortfall.max(suggested);
+        let additional = match self.max_deposit {
+            Some(max_deposit) => proposed.min(max_deposit - deposit),
+            None => proposed,
+        };
+        Ok(Some(additional))
     }
 
     fn store_error(error: self::store::ChannelStoreError) -> MppError {
@@ -425,6 +440,21 @@ impl TempoSessionProvider {
     /// Like [`Self::bootstrap`], preserving caller headers such as routing or
     /// proxy headers on both bootstrap requests.
     pub async fn bootstrap_with_headers(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<Option<StoredChannelEntry>, MppError> {
+        // Bootstrap is a recovery optimization. Match MPPx by treating an
+        // unavailable or unusable snapshot as a cache miss so the normal
+        // session challenge can open or recover a channel instead.
+        Ok(self
+            .try_bootstrap_with_headers(client, url, headers)
+            .await
+            .unwrap_or(None))
+    }
+
+    async fn try_bootstrap_with_headers(
         &self,
         client: &reqwest::Client,
         url: &str,
@@ -914,9 +944,15 @@ impl TempoSessionProvider {
         required_cumulative: u128,
         server_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
-        if let Some(additional_deposit) =
-            self.required_top_up(required_cumulative, server_deposit)?
-        {
+        let session_request: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
+        if let Some(additional_deposit) = self.required_top_up(
+            required_cumulative,
+            server_deposit,
+            session_request.suggested_deposit.as_deref(),
+        )? {
             self.top_up_with_headers_for_challenge(
                 client,
                 url,
@@ -1331,9 +1367,12 @@ impl TempoSessionProvider {
                             "session cumulative amount exceeds channel deposit".into(),
                         ));
                     };
-                    let additional_deposit = entry
-                        .cumulative_amount
-                        .checked_sub(entry.deposit)
+                    let additional_deposit = self
+                        .required_top_up(
+                            entry.cumulative_amount,
+                            entry.deposit,
+                            session_req.suggested_deposit.as_deref(),
+                        )?
                         .ok_or_else(|| {
                             MppError::InvalidConfig("session top-up amount underflowed".into())
                         })?;
@@ -1346,7 +1385,13 @@ impl TempoSessionProvider {
                         additional_deposit,
                     )
                     .await?;
-                    entry.deposit = entry.cumulative_amount;
+                    entry.deposit =
+                        entry
+                            .deposit
+                            .checked_add(additional_deposit)
+                            .ok_or_else(|| {
+                                MppError::InvalidConfig("session deposit overflowed".into())
+                            })?;
                 }
 
                 let payload = if precompile {
@@ -1615,12 +1660,34 @@ mod tests {
     fn need_voucher_requires_top_up_before_signing_beyond_deposit() {
         let provider = make_test_provider().with_max_deposit(1_000_000);
 
-        assert_eq!(provider.required_top_up(12_000, 20_000).unwrap(), None);
         assert_eq!(
-            provider.required_top_up(25_000, 20_000).unwrap(),
+            provider
+                .required_top_up(12_000, 20_000, Some("500000"))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            provider
+                .required_top_up(25_000, 20_000, Some("500000"))
+                .unwrap(),
+            Some(500_000)
+        );
+        assert_eq!(
+            provider
+                .required_top_up(900_001, 900_000, Some("500000"))
+                .unwrap(),
+            Some(100_000)
+        );
+        assert_eq!(
+            provider.required_top_up(25_000, 20_000, None).unwrap(),
             Some(5_000)
         );
-        assert!(provider.required_top_up(1_000_001, 20_000).is_err());
+        assert!(provider
+            .required_top_up(1_000_001, 20_000, Some("500000"))
+            .is_err());
+        assert!(provider
+            .required_top_up(25_000, 20_000, Some("not-an-amount"))
+            .is_err());
     }
 
     #[test]
@@ -2692,5 +2759,35 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(proof_valid.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn bootstrap_treats_an_invalid_snapshot_as_a_cache_miss() {
+        use axum::{http::StatusCode, routing::head, Router};
+
+        let app = Router::new().route(
+            "/v1/responses",
+            head(|| async {
+                (
+                    StatusCode::NO_CONTENT,
+                    [("payment-session-snapshot", "not-base64")],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = make_test_provider();
+        let result = provider
+            .bootstrap(
+                &reqwest::Client::new(),
+                &format!("http://{address}/v1/responses"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
     }
 }
