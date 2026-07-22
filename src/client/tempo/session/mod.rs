@@ -714,6 +714,41 @@ impl TempoSessionProvider {
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
+    async fn top_up_credential_for_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        entry: &ChannelEntry,
+        additional_deposit: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        use alloy::providers::ProviderBuilder;
+        use tempo_alloy::TempoNetwork;
+
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
+        let descriptor = entry.descriptor.as_ref().ok_or_else(|| {
+            MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+        })?;
+        let payer = self.signing_mode.from_address(self.signer.address());
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
+        let payload = create_precompile_top_up_transaction_payload(
+            &provider,
+            &self.signer,
+            Some(&self.signing_mode),
+            payer,
+            TopUpPrecompilePayloadOptions {
+                descriptor,
+                additional_deposit,
+                chain_id: entry.chain_id,
+                fee_payer: session_req.fee_payer(),
+            },
+        )
+        .await?;
+        Ok(build_credential(challenge, payload, entry.chain_id, payer))
+    }
+
     /// Top up the active TIP-1034 channel through the service's HTTP management
     /// endpoint, then update the durable local channel view after acceptance.
     pub async fn top_up_with_headers(
@@ -749,9 +784,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
-        use alloy::providers::ProviderBuilder;
-        use reqwest::header::AUTHORIZATION;
-        use tempo_alloy::TempoNetwork;
+        use reqwest::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
@@ -794,42 +827,59 @@ impl TempoSessionProvider {
             .deposit
             .checked_add(additional_deposit)
             .ok_or_else(|| MppError::InvalidConfig("channel deposit overflowed".into()))?;
-        let session_req: SessionRequest = challenge
-            .request
-            .decode()
-            .mpp_config("failed to decode session request")?;
-        let descriptor = entry.descriptor.clone().ok_or_else(|| {
-            MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
-        })?;
-        let payer = self.signing_mode.from_address(self.signer.address());
-        let provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
-        let payload = create_precompile_top_up_transaction_payload(
-            &provider,
-            &self.signer,
-            Some(&self.signing_mode),
-            payer,
-            TopUpPrecompilePayloadOptions {
-                descriptor: &descriptor,
-                additional_deposit,
-                chain_id: entry.chain_id,
-                fee_payer: session_req.fee_payer(),
-            },
-        )
-        .await?;
-        let credential = build_credential(challenge, payload, entry.chain_id, payer);
+        let credential = self
+            .top_up_credential_for_challenge(challenge, &entry, additional_deposit)
+            .await?;
         headers.insert(
             AUTHORIZATION,
             crate::protocol::core::format_authorization(&credential)?
                 .parse()
                 .mpp_config("invalid top-up authorization header")?,
         );
-        let response = client
+        let mut response = client
             .post(url)
-            .headers(headers)
+            .headers(headers.clone())
             .send()
             .await
             .mpp_http("top-up POST failed")?;
+        if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+            let fresh_challenge = PaymentChallenge::from_headers(
+                response
+                    .headers()
+                    .get_all(WWW_AUTHENTICATE)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok()),
+            )
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|candidate| {
+                candidate.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME
+                    && candidate.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION
+            });
+            if let Some(fresh_challenge) = fresh_challenge {
+                let (fresh_key, fresh_chain_id) = self.expected_channel_key(&fresh_challenge)?;
+                if fresh_key != key || fresh_chain_id != entry.chain_id {
+                    return Err(MppError::InvalidConfig(
+                        "top-up route challenge does not match active session".into(),
+                    ));
+                }
+                let credential = self
+                    .top_up_credential_for_challenge(&fresh_challenge, &entry, additional_deposit)
+                    .await?;
+                headers.insert(
+                    AUTHORIZATION,
+                    crate::protocol::core::format_authorization(&credential)?
+                        .parse()
+                        .mpp_config("invalid refreshed top-up authorization header")?,
+                );
+                response = client
+                    .post(url)
+                    .headers(headers)
+                    .send()
+                    .await
+                    .mpp_http("refreshed top-up POST failed")?;
+            }
+        }
         let status = response.status();
         let receipt = response
             .headers()
