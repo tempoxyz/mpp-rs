@@ -1359,6 +1359,7 @@ mod tests {
             intent: "charge".into(),
             request: Base64UrlJson::from_raw(request),
             expires: Some(expires),
+            description: None,
             digest: None,
             opaque: None,
         };
@@ -1399,6 +1400,7 @@ mod tests {
             intent: "charge".into(),
             request: encoded,
             expires: Some(expires),
+            description: None,
             digest: Some(digest),
             opaque: None,
         };
@@ -1538,6 +1540,7 @@ mod tests {
                 intent: "charge".into(),
                 request: encoded,
                 expires: Some(expires),
+                description: None,
                 digest: None,
                 opaque: None,
             },
@@ -2638,6 +2641,7 @@ mod tests {
             intent: "session".into(),
             request: Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
         };
@@ -2875,6 +2879,7 @@ mod tests {
             intent: "charge".into(),
             request: encoded,
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
         };
@@ -3125,6 +3130,7 @@ mod tests {
             intent: "session".into(),
             request: encoded,
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
         };

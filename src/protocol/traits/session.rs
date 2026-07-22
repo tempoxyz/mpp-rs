@@ -150,6 +150,7 @@ mod tests {
             intent: "session".into(),
             request: crate::protocol::core::Base64UrlJson::from_raw("eyJ0ZXN0IjoidmFsdWUifQ"),
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
         };
