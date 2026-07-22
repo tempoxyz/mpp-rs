@@ -85,6 +85,12 @@ pub struct TempoSessionProvider {
     last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
 }
 
+struct ApplicationTopUp<'a> {
+    client: &'a reqwest::Client,
+    url: &'a str,
+    headers: reqwest::header::HeaderMap,
+}
+
 impl TempoSessionProvider {
     /// Create a new Tempo session provider.
     ///
@@ -988,21 +994,40 @@ impl TempoSessionProvider {
 impl TempoSessionProvider {
     /// Creates the initial authorization for a canonical application WebSocket.
     ///
-    /// Opening or reconnecting the socket is not itself a billable request.
-    /// Existing channels therefore echo their current highest voucher, while
-    /// new channels open with a zero cumulative amount. The server requests
-    /// each billable increment later with `payment-need-voucher` frames.
+    /// The opening credential satisfies the amount advertised by the socket's
+    /// HTTP payment challenge. The server requests later increments with
+    /// `payment-need-voucher` frames.
     pub async fn application_websocket_credential(
         &self,
         challenge: &PaymentChallenge,
     ) -> Result<PaymentCredential, MppError> {
-        self.payment_credential(challenge, false).await
+        self.payment_credential(challenge, None).await
+    }
+
+    /// Creates an application WebSocket authorization and tops up an existing
+    /// channel first when its opening challenge would exceed the deposit.
+    pub async fn application_websocket_credential_with_top_up(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+    ) -> Result<PaymentCredential, MppError> {
+        self.payment_credential(
+            challenge,
+            Some(ApplicationTopUp {
+                client,
+                url,
+                headers,
+            }),
+        )
+        .await
     }
 
     async fn payment_credential(
         &self,
         challenge: &PaymentChallenge,
-        include_request_amount: bool,
+        top_up: Option<ApplicationTopUp<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         use alloy::providers::ProviderBuilder;
         use tempo_alloy::TempoNetwork;
@@ -1033,11 +1058,7 @@ impl TempoSessionProvider {
             .parse()
             .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
 
-        let amount = if include_request_amount {
-            session_req.parse_amount()?
-        } else {
-            0
-        };
+        let amount = session_req.parse_amount()?;
         let payer = self.signing_mode.from_address(self.signer.address());
         let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
         let precompile = is_precompile_escrow(escrow_contract);
@@ -1095,9 +1116,27 @@ impl TempoSessionProvider {
                         })?;
                 }
                 if entry.cumulative_amount > entry.deposit {
-                    return Err(MppError::InvalidConfig(
-                        "session cumulative amount exceeds channel deposit".into(),
-                    ));
+                    let Some(top_up) = top_up else {
+                        return Err(MppError::InvalidConfig(
+                            "session cumulative amount exceeds channel deposit".into(),
+                        ));
+                    };
+                    let additional_deposit = entry
+                        .cumulative_amount
+                        .checked_sub(entry.deposit)
+                        .ok_or_else(|| {
+                            MppError::InvalidConfig("session top-up amount underflowed".into())
+                        })?;
+                    self.top_up_with_headers_for_challenge(
+                        top_up.client,
+                        top_up.url,
+                        top_up.headers,
+                        challenge,
+                        &entry.channel_id.to_string(),
+                        additional_deposit,
+                    )
+                    .await?;
+                    entry.deposit = entry.cumulative_amount;
                 }
 
                 let payload = if precompile {
@@ -1239,7 +1278,7 @@ impl PaymentProvider for TempoSessionProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        self.payment_credential(challenge, true).await
+        self.payment_credential(challenge, None).await
     }
 }
 
@@ -2173,11 +2212,11 @@ mod tests {
             .unwrap()
             .get_mut(&key)
             .unwrap()
-            .cumulative_amount = 10_000;
+            .cumulative_amount = 9_500;
         let socket_credential = provider
             .application_websocket_credential(&challenge)
             .await
-            .expect("a full channel can still authorize a websocket");
+            .expect("socket authorization satisfies its opening challenge");
         match socket_credential
             .payload_as::<crate::protocol::methods::tempo::session::SessionCredentialPayload>()
             .unwrap()
