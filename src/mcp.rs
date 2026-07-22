@@ -229,6 +229,7 @@ mod tests {
                 intent: "charge".into(),
                 request: Base64UrlJson::from_raw("eyJhbW91bnQiOiIxMDAwIn0"),
                 expires: None,
+                description: None,
                 digest: None,
                 opaque: None,
             },

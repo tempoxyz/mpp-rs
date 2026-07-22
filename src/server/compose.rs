@@ -258,6 +258,7 @@ mod tests {
             intent: "charge".into(),
             request: Base64UrlJson::from_raw(request_raw),
             expires: Some(expires),
+            description: None,
             digest: None,
             opaque: None,
         };
@@ -326,6 +327,7 @@ mod tests {
             intent: "session".into(),
             request: Base64UrlJson::from_raw(request.raw()),
             expires: Some(expires),
+            description: None,
             digest: None,
             opaque: None,
         };
