@@ -2,7 +2,10 @@ use alloy_transport_mpp::{
     CloseProvider, CloseRequest, MppApplicationWsConnect, VoucherProvider, VoucherRequest,
 };
 use axum::{
-    extract::ws::{rejection::WebSocketUpgradeRejection, Message, WebSocketUpgrade},
+    extract::{
+        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocketUpgrade},
+        State,
+    },
     http::{header::WWW_AUTHENTICATE, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -15,6 +18,9 @@ use mpp::{
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::{oneshot, Mutex};
+
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct StubProvider;
@@ -209,6 +215,38 @@ async fn route(upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> 
         .into_response()
 }
 
+type DisconnectSignal = Arc<Mutex<Option<oneshot::Sender<bool>>>>;
+
+async fn disconnect_route(
+    State(signal): State<DisconnectSignal>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let Ok(upgrade) = upgrade else {
+        let header = HeaderValue::from_str(&challenge().to_header().unwrap()).unwrap();
+        return (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, header)]).into_response();
+    };
+
+    upgrade
+        .on_upgrade(|mut socket| async move {
+            let authorization = socket.next().await.unwrap().unwrap();
+            assert!(matches!(authorization, Message::Text(_)));
+            socket
+                .send(Message::Text(
+                    json!({ "mpp": "payment-receipt", "data": receipt() })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let transport_only_close = matches!(socket.next().await, Some(Ok(Message::Close(_))));
+            if let Some(signal) = signal.lock().await.take() {
+                let _ = signal.send(transport_only_close);
+            }
+        })
+        .into_response()
+}
+
 #[tokio::test]
 async fn probes_then_authorizes_and_translates_application_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -225,4 +263,34 @@ async fn probes_then_authorizes_and_translates_application_messages() {
     socket.send("hello").await.unwrap();
     assert_eq!(socket.next().await.unwrap(), "world");
     assert_eq!(socket.close().await.unwrap()["channelId"], "0xchannel");
+}
+
+#[tokio::test]
+async fn disconnect_closes_transport_without_requesting_session_settlement() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (signal_tx, signal_rx) = oneshot::channel();
+    let signal = Arc::new(Mutex::new(Some(signal_tx)));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/", get(disconnect_route))
+                .with_state(signal),
+        )
+        .await
+        .unwrap();
+    });
+
+    let connector =
+        MppApplicationWsConnect::new(format!("ws://{address}/"), StubProvider, StubProvider);
+    connector
+        .connect()
+        .await
+        .unwrap()
+        .disconnect()
+        .await
+        .unwrap();
+
+    assert!(signal_rx.await.unwrap());
 }
