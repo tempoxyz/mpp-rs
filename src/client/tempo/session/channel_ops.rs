@@ -834,6 +834,18 @@ pub struct OpenPrecompilePayloadOptions {
     pub fee_payer: bool,
 }
 
+/// Options for a descriptor-backed TIP-1034 top-up transaction.
+pub struct TopUpPrecompilePayloadOptions<'a> {
+    /// Existing channel descriptor.
+    pub descriptor: &'a ChannelDescriptor,
+    /// Amount added to the existing channel deposit.
+    pub additional_deposit: u128,
+    /// Tempo chain ID.
+    pub chain_id: u64,
+    /// Whether the server may sponsor this management transaction.
+    pub fee_payer: bool,
+}
+
 /// Open payload targeting the TIP-1034 reserve precompile. Single-call tx
 /// (no `approve` needed: precompile is on the TIP-1035 implicit approvals
 /// list). Channel id is derived against the unsigned tx's `expiringNonceHash`.
@@ -990,6 +1002,98 @@ where
     };
 
     Ok((entry, payload))
+}
+
+/// Prepare and sign a descriptor-backed TIP-1034 top-up transaction.
+///
+/// This mirrors MPPx's `createTopUpPayload`: the returned transaction is sent
+/// to the MPP server as a management credential, and the server broadcasts it
+/// before accepting a voucher that requires the additional headroom.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_top_up_transaction_payload<P, S>(
+    provider: &P,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
+    payer: Address,
+    options: TopUpPrecompilePayloadOptions<'_>,
+) -> Result<SessionCredentialPayload, MppError>
+where
+    P: Provider<TempoNetwork>,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
+{
+    let additional_deposit =
+        parse_precompile_amount(options.additional_deposit, "additional_deposit")?;
+    if additional_deposit.is_zero() {
+        return Err(MppError::InvalidConfig(
+            "top-up amount must be greater than zero".into(),
+        ));
+    }
+
+    let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
+    let signing_mode = signing_mode.unwrap_or(&default_mode);
+    let primitive_signer = signer.clone().into();
+    let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
+    let calls = vec![Call {
+        to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
+        value: U256::ZERO,
+        input: Bytes::from(
+            ITIP20ChannelReserve::topUpCall::new((descriptor, additional_deposit)).abi_encode(),
+        ),
+    }];
+    let nonce = if options.fee_payer {
+        0
+    } else {
+        provider
+            .get_transaction_count(payer)
+            .await
+            .mpp_http("failed to get nonce")?
+    };
+    let gas_price = provider
+        .get_gas_price()
+        .await
+        .mpp_http("failed to get gas price")?;
+    let (nonce, nonce_key, valid_before) =
+        precompile_open_tx_nonce_fields(options.fee_payer, nonce);
+    let unsigned_tx = build_tempo_tx(TempoTxOptions {
+        calls,
+        chain_id: options.chain_id,
+        fee_token: options
+            .descriptor
+            .token
+            .parse()
+            .mpp_config("invalid TIP-1034 descriptor token")?,
+        nonce,
+        nonce_key,
+        gas_limit: 2_000_000,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price,
+        fee_payer: options.fee_payer,
+        valid_before,
+        key_authorization: signing_mode.key_authorization().cloned(),
+    });
+    let tx_bytes = if options.fee_payer {
+        crate::client::tempo::signing::sign_and_encode_fee_payer_request_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
+    } else {
+        crate::client::tempo::signing::sign_and_encode_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
+    };
+    let channel_id =
+        compute_precompile_channel_id_from_descriptor(options.descriptor, options.chain_id)?;
+    Ok(create_precompile_top_up_payload(
+        channel_id,
+        options.descriptor.clone(),
+        alloy::hex::encode_prefixed(&tx_bytes),
+        options.additional_deposit,
+    ))
 }
 
 /// On-chain channel state returned by the escrow contract.

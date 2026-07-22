@@ -34,22 +34,41 @@ impl PaymentProvider for StubProvider {
 
 impl VoucherProvider for StubProvider {
     async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request(
+            "socket-bound voucher challenge was not forwarded",
+        ))
+    }
+
+    async fn next_voucher_for_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        _: &VoucherRequest,
+    ) -> Result<PaymentCredential, MppError> {
+        assert_eq!(challenge.id, "challenge-1");
         Ok(PaymentCredential::new(
-            challenge().to_echo(),
+            challenge.to_echo(),
             PaymentPayload::hash("0xvoucher"),
         ))
     }
 }
 
 impl CloseProvider for StubProvider {
-    async fn close_credential(
+    async fn close_credential(&self, _: &CloseRequest) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request(
+            "socket-bound close challenge was not forwarded",
+        ))
+    }
+
+    async fn close_credential_for_challenge(
         &self,
+        challenge: &PaymentChallenge,
         request: &CloseRequest,
     ) -> Result<PaymentCredential, MppError> {
+        assert_eq!(challenge.id, "challenge-1");
         assert_eq!(request.channel_id, "0xchannel");
         assert_eq!(request.cumulative_amount, "37");
         Ok(PaymentCredential::new(
-            challenge().to_echo(),
+            challenge.to_echo(),
             PaymentPayload::hash("0xclose"),
         ))
     }
@@ -118,6 +137,31 @@ async fn route(upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> 
             };
             let application: Value = serde_json::from_str(&application).unwrap();
             assert_eq!(application, json!({ "mpp": "message", "data": "hello" }));
+
+            socket
+                .send(Message::Text(
+                    json!({
+                        "mpp": "payment-need-voucher",
+                        "data": {
+                            "channelId": "0xchannel",
+                            "requiredCumulative": "100",
+                            "acceptedCumulative": "0",
+                            "deposit": "100"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let voucher = socket.next().await.unwrap().unwrap();
+            let Message::Text(voucher) = voucher else {
+                panic!("expected voucher authorization text frame")
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&voucher).unwrap()["mpp"],
+                "authorization"
+            );
 
             socket
                 .send(Message::Text(

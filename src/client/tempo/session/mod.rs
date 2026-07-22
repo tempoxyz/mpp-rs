@@ -21,9 +21,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload,
     create_precompile_close_payload_with_descriptor_primitive, create_precompile_open_payload,
+    create_precompile_top_up_transaction_payload,
     create_precompile_voucher_payload_with_descriptor_primitive, create_voucher_payload,
     is_precompile_escrow, resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry,
-    OpenPayloadOptions, OpenPrecompilePayloadOptions,
+    OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
 };
 use self::recovery::{
     hydrate_session_snapshot, read_on_chain_channel_state, recover_stored_channel, RecoveryScope,
@@ -194,6 +195,29 @@ impl TempoSessionProvider {
         if let Some(ref cb) = self.on_channel_update {
             cb(entry);
         }
+    }
+
+    fn assert_within_max_deposit(&self, cumulative_amount: u128) -> Result<(), MppError> {
+        if let Some(max_deposit) = self.max_deposit {
+            if cumulative_amount > max_deposit {
+                return Err(MppError::InvalidConfig(format!(
+                    "requested voucher amount {cumulative_amount} exceeds local max_deposit \
+                     {max_deposit}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn required_top_up(
+        &self,
+        required_cumulative: u128,
+        deposit: u128,
+    ) -> Result<Option<u128>, MppError> {
+        self.assert_within_max_deposit(required_cumulative)?;
+        Ok(required_cumulative
+            .checked_sub(deposit)
+            .filter(|additional| *additional > 0))
     }
 
     fn store_error(error: self::store::ChannelStoreError) -> MppError {
@@ -604,6 +628,19 @@ impl TempoSessionProvider {
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for voucher".into())
             })?;
+        self.voucher_credential_for_challenge(&challenge, channel_id_hex, required_cumulative)
+            .await
+    }
+
+    /// Create a voucher bound to the challenge selected for one transport
+    /// connection, avoiding cross-signing during overlapping reconnects.
+    pub async fn voucher_credential_for_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        required_cumulative: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        self.assert_within_max_deposit(required_cumulative)?;
 
         // Find the channel entry by channel ID
         let key = {
@@ -613,7 +650,7 @@ impl TempoSessionProvider {
         let key = key.ok_or_else(|| {
             MppError::InvalidConfig(format!("no channel found for id {}", channel_id_hex))
         })?;
-        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(challenge)?;
         if key != expected_key {
             return Err(MppError::InvalidConfig(
                 "channel does not match active session".into(),
@@ -673,7 +710,200 @@ impl TempoSessionProvider {
         self.notify_update(&entry);
 
         let payer = self.signing_mode.from_address(self.signer.address());
-        Ok(build_credential(&challenge, payload, entry.chain_id, payer))
+        Ok(build_credential(challenge, payload, entry.chain_id, payer))
+    }
+
+    /// Top up the active TIP-1034 channel through the service's HTTP management
+    /// endpoint, then update the durable local channel view after acceptance.
+    pub async fn top_up_with_headers(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<Option<Receipt>, MppError> {
+        let challenge =
+            self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
+                MppError::InvalidConfig("no challenge available for top-up".into())
+            })?;
+        self.top_up_with_headers_for_challenge(
+            client,
+            url,
+            headers,
+            &challenge,
+            channel_id_hex,
+            additional_deposit,
+        )
+        .await
+    }
+
+    /// Top up using the challenge selected for one transport connection.
+    pub async fn top_up_with_headers_for_challenge(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        mut headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<Option<Receipt>, MppError> {
+        use alloy::providers::ProviderBuilder;
+        use reqwest::header::AUTHORIZATION;
+        use tempo_alloy::TempoNetwork;
+
+        if additional_deposit == 0 {
+            return Err(MppError::InvalidConfig(
+                "top-up amount must be greater than zero".into(),
+            ));
+        }
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(channel_id_hex)
+            .cloned()
+            .ok_or_else(|| {
+                MppError::InvalidConfig(format!("no channel found for id {channel_id_hex}"))
+            })?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(challenge)?;
+        if key != expected_key {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
+        let mut entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        if entry.chain_id != expected_chain_id || entry.channel_id.to_string() != channel_id_hex {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
+        if !is_precompile_escrow(entry.escrow_contract) {
+            return Err(MppError::InvalidConfig(
+                "automatic top-up requires the native TIP-1034 precompile".into(),
+            ));
+        }
+        let new_deposit = entry
+            .deposit
+            .checked_add(additional_deposit)
+            .ok_or_else(|| MppError::InvalidConfig("channel deposit overflowed".into()))?;
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
+        let descriptor = entry.descriptor.clone().ok_or_else(|| {
+            MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+        })?;
+        let payer = self.signing_mode.from_address(self.signer.address());
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
+        let payload = create_precompile_top_up_transaction_payload(
+            &provider,
+            &self.signer,
+            Some(&self.signing_mode),
+            payer,
+            TopUpPrecompilePayloadOptions {
+                descriptor: &descriptor,
+                additional_deposit,
+                chain_id: entry.chain_id,
+                fee_payer: session_req.fee_payer(),
+            },
+        )
+        .await?;
+        let credential = build_credential(challenge, payload, entry.chain_id, payer);
+        headers.insert(
+            AUTHORIZATION,
+            crate::protocol::core::format_authorization(&credential)?
+                .parse()
+                .mpp_config("invalid top-up authorization header")?,
+        );
+        let response = client
+            .post(url)
+            .headers(headers)
+            .send()
+            .await
+            .mpp_http("top-up POST failed")?;
+        let status = response.status();
+        let receipt = response
+            .headers()
+            .get("payment-receipt")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| crate::protocol::core::parse_receipt(value).ok());
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(MppError::Http(format!(
+                "top-up POST returned {status}: {body}"
+            )));
+        }
+
+        entry.deposit = new_deposit;
+        entry.opened = true;
+        self.persist_channel(&entry).await?;
+        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.notify_update(&entry);
+        Ok(receipt)
+    }
+
+    /// Mirror MPPx need-voucher handling: top up over HTTP when required, then
+    /// return the voucher that the WebSocket transport sends in-band.
+    pub async fn voucher_credential_with_top_up(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        channel_id_hex: &str,
+        required_cumulative: u128,
+        server_deposit: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        let challenge =
+            self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
+                MppError::InvalidConfig("no challenge available for voucher".into())
+            })?;
+        self.voucher_credential_with_top_up_for_challenge(
+            client,
+            url,
+            headers,
+            &challenge,
+            channel_id_hex,
+            required_cumulative,
+            server_deposit,
+        )
+        .await
+    }
+
+    /// Handle a need-voucher event using its socket-bound challenge.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn voucher_credential_with_top_up_for_challenge(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        required_cumulative: u128,
+        server_deposit: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        if let Some(additional_deposit) =
+            self.required_top_up(required_cumulative, server_deposit)?
+        {
+            self.top_up_with_headers_for_challenge(
+                client,
+                url,
+                headers,
+                challenge,
+                channel_id_hex,
+                additional_deposit,
+            )
+            .await?;
+        }
+        self.voucher_credential_for_challenge(challenge, channel_id_hex, required_cumulative)
+            .await
     }
 
     /// Create the final signed close credential for an active session channel.
@@ -698,6 +928,21 @@ impl TempoSessionProvider {
             .await
     }
 
+    /// Create an exact close credential bound to one transport connection.
+    pub async fn close_credential_at_for_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        cumulative_amount: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        self.close_credential_for_challenge_inner(
+            challenge,
+            channel_id_hex,
+            Some(cumulative_amount),
+        )
+        .await
+    }
+
     async fn close_credential_inner(
         &self,
         channel_id_hex: &str,
@@ -707,6 +952,16 @@ impl TempoSessionProvider {
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for close".into())
             })?;
+        self.close_credential_for_challenge_inner(&challenge, channel_id_hex, requested_cumulative)
+            .await
+    }
+
+    async fn close_credential_for_challenge_inner(
+        &self,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        requested_cumulative: Option<u128>,
+    ) -> Result<PaymentCredential, MppError> {
         let key = self
             .channel_id_to_key
             .lock()
@@ -716,7 +971,7 @@ impl TempoSessionProvider {
             .ok_or_else(|| {
                 MppError::InvalidConfig(format!("no channel found for id {channel_id_hex}"))
             })?;
-        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(challenge)?;
         if key != expected_key {
             return Err(MppError::InvalidConfig(
                 "channel does not match active session".into(),
@@ -765,7 +1020,7 @@ impl TempoSessionProvider {
             .await?
         };
         let payer = self.signing_mode.from_address(self.signer.address());
-        Ok(build_credential(&challenge, payload, entry.chain_id, payer))
+        Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
     /// Send a voucher for a need-voucher SSE event.
@@ -1091,6 +1346,11 @@ impl PaymentProvider for TempoSessionProvider {
 
         // No existing channel — open a new one
         let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
+        if deposit < amount {
+            return Err(MppError::InvalidConfig(format!(
+                "opening deposit {deposit} below request amount {amount}"
+            )));
+        }
 
         let (mut entry, payload) = if precompile {
             create_precompile_open_payload(
@@ -1268,6 +1528,18 @@ mod tests {
         let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
 
         assert!(provider.resolve_deposit(None).is_err());
+    }
+
+    #[test]
+    fn need_voucher_requires_top_up_before_signing_beyond_deposit() {
+        let provider = make_test_provider().with_max_deposit(1_000_000);
+
+        assert_eq!(provider.required_top_up(12_000, 20_000).unwrap(), None);
+        assert_eq!(
+            provider.required_top_up(25_000, 20_000).unwrap(),
+            Some(5_000)
+        );
+        assert!(provider.required_top_up(1_000_001, 20_000).is_err());
     }
 
     #[test]

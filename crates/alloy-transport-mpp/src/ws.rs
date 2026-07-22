@@ -108,6 +108,19 @@ pub trait VoucherProvider: Clone + Send + Sync + 'static {
         &self,
         request: &VoucherRequest,
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
+
+    /// Produce a voucher bound to the challenge selected for this socket.
+    ///
+    /// Providers that do not retain mutable challenge state can use the
+    /// default implementation. Session managers should override this so
+    /// overlapping reconnects cannot cross-sign credentials.
+    fn next_voucher_for_challenge(
+        &self,
+        _challenge: &PaymentChallenge,
+        request: &VoucherRequest,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
+        self.next_voucher(request)
+    }
 }
 
 /// Companion provider for the final signed session close action.
@@ -117,6 +130,15 @@ pub trait CloseProvider: Clone + Send + Sync + 'static {
         &self,
         request: &CloseRequest,
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
+
+    /// Produce a close credential bound to this socket's selected challenge.
+    fn close_credential_for_challenge(
+        &self,
+        _challenge: &PaymentChallenge,
+        request: &CloseRequest,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
+        self.close_credential(request)
+    }
 }
 
 /// Default no-op [`VoucherProvider`].
