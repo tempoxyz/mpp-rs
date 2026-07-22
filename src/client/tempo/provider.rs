@@ -166,6 +166,7 @@ impl PaymentProvider for TempoProvider {
             let from = self.signing_mode.from_address(self.signer.address());
             let signature = sign_proof(
                 &self.signer,
+                from,
                 charge.chain_id(),
                 &challenge.id,
                 &challenge.realm,

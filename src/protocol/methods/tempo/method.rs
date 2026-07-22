@@ -1531,6 +1531,7 @@ where
 
                 // Fast path: signer IS the source address (Direct mode).
                 if !proof::verify_proof(
+                    parsed_source.address,
                     expected_chain_id,
                     &credential.challenge.id,
                     &credential.challenge.realm,
@@ -1540,6 +1541,7 @@ where
                     // Keychain fallback: signer may be an access key authorized
                     // for the source wallet. Recover the signer and check on-chain.
                     let recovered = proof::recover_proof_signer(
+                        parsed_source.address,
                         expected_chain_id,
                         &credential.challenge.id,
                         &credential.challenge.realm,
@@ -1746,9 +1748,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
@@ -1770,9 +1778,15 @@ mod tests {
         let other = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&other, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &other,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let payload = crate::protocol::core::PaymentPayload::proof(signature);
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
@@ -1783,6 +1797,7 @@ mod tests {
         let source = credential.source.as_deref().unwrap();
         let parsed = proof::parse_proof_source(source).unwrap();
         assert!(!proof::verify_proof(
+            parsed.address,
             42431,
             &credential.challenge.id,
             &credential.challenge.realm,
@@ -3121,9 +3136,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
@@ -3159,9 +3180,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
 
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
@@ -3254,9 +3281,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
