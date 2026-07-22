@@ -29,7 +29,7 @@ use crate::protocol::methods::tempo::session::{
     ChannelDescriptor, SessionCredentialPayload, TempoSessionExt,
 };
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
-use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+use crate::protocol::methods::tempo::CHAIN_ID;
 
 #[cfg(feature = "tempo")]
 const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
@@ -75,33 +75,38 @@ pub struct ChannelEntry {
 /// Resolve chain ID from a session challenge's methodDetails.
 pub fn resolve_chain_id(challenge: &PaymentChallenge) -> u64 {
     let session: Result<SessionRequest, _> = challenge.request.decode();
-    session
-        .ok()
-        .and_then(|r| r.chain_id())
-        .unwrap_or(MODERATO_CHAIN_ID)
+    session.ok().and_then(|r| r.chain_id()).unwrap_or(CHAIN_ID)
 }
 
-/// Resolve escrow contract address from challenge methodDetails, an override, or defaults.
+/// Resolve escrow contract address from an override, challenge hints, or defaults.
 pub fn resolve_escrow(
     challenge: &PaymentChallenge,
     chain_id: u64,
     escrow_override: Option<Address>,
 ) -> Result<Address, MppError> {
-    // Try challenge methodDetails first
-    if let Ok(req) = challenge.request.decode::<SessionRequest>() {
-        if let Ok(addr_str) = req.escrow_contract() {
-            if let Ok(addr) = addr_str.parse::<Address>() {
-                return Ok(addr);
-            }
-        }
-    }
-
-    // Then override
+    // Match MPPx: an explicit client override wins over server hints.
     if let Some(addr) = escrow_override {
         return Ok(addr);
     }
 
-    // Then defaults
+    if let Ok(req) = challenge.request.decode::<SessionRequest>() {
+        if let Some(details) = req.method_details.as_ref() {
+            for key in ["escrowContract", "escrow"] {
+                if let Some(addr) = details
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse::<Address>().ok())
+                {
+                    return Ok(addr);
+                }
+            }
+        }
+        if req.is_tip1034_session() {
+            return Ok(TIP20_CHANNEL_RESERVE_ADDRESS);
+        }
+    }
+
+    // Legacy sessions retain their chain-specific escrow fallback.
     default_escrow_contract(chain_id).ok_or_else(|| {
         MppError::InvalidConfig(
             "No escrowContract available. Provide it in parameters or ensure the server challenge includes it.".to_string(),
@@ -661,6 +666,35 @@ fn precompile_open_tx_nonce_fields(fee_payer: bool, nonce: u64) -> (u64, U256, O
     )
 }
 
+/// Returns a random past timestamp for a sponsored repeatable transaction.
+///
+/// MPPx adds `validAfter` to sponsored top-ups so two otherwise identical
+/// top-up calls do not serialize to the same transaction.
+#[cfg(feature = "tempo")]
+fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let latest = now.saturating_sub(60);
+    if latest == 0 {
+        return None;
+    }
+
+    let random = B256::random();
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&random[..8]);
+    let timestamp = (u64::from_be_bytes(prefix) % latest).max(1);
+    std::num::NonZeroU64::new(timestamp)
+}
+
+#[cfg(feature = "tempo")]
+fn add_sponsored_top_up_entropy(transaction: &mut TempoTransaction, fee_payer: bool) {
+    if fee_payer {
+        transaction.valid_after = random_past_valid_after();
+    }
+}
+
 /// Convert a JSON wire descriptor into the generated precompile ABI tuple.
 #[cfg(feature = "tempo")]
 pub fn precompile_descriptor_from_wire(
@@ -930,7 +964,6 @@ where
         valid_before,
         key_authorization: signing_mode.key_authorization().cloned(),
     });
-
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
     let expiring_nonce_hash = if options.fee_payer {
@@ -1057,7 +1090,7 @@ where
         .mpp_http("failed to get gas price")?;
     let (nonce, nonce_key, valid_before) =
         precompile_open_tx_nonce_fields(options.fee_payer, nonce);
-    let unsigned_tx = build_tempo_tx(TempoTxOptions {
+    let mut unsigned_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
         fee_token: options
@@ -1074,6 +1107,7 @@ where
         valid_before,
         key_authorization: signing_mode.key_authorization().cloned(),
     });
+    add_sponsored_top_up_entropy(&mut unsigned_tx, options.fee_payer);
     let tx_bytes = if options.fee_payer {
         crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
             unsigned_tx,
@@ -1322,6 +1356,35 @@ mod tests {
     }
 
     #[cfg(feature = "tempo")]
+    #[test]
+    fn sponsored_repeatable_transactions_get_past_valid_after_entropy() {
+        let mut transaction = build_tempo_tx(TempoTxOptions {
+            calls: vec![],
+            chain_id: 4217,
+            fee_token: Address::repeat_byte(0x22),
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_payer: true,
+            valid_before: None,
+            key_authorization: None,
+        });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        add_sponsored_top_up_entropy(&mut transaction, true);
+        let valid_after = transaction
+            .valid_after
+            .expect("sponsored top-ups get transaction entropy");
+
+        assert!(valid_after.get() <= now.saturating_sub(60));
+    }
+
+    #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn test_create_precompile_open_payload_rejects_uint96_overflow() {
         use crate::protocol::methods::tempo::precompile_voucher::PRECOMPILE_MAX_CUMULATIVE_AMOUNT;
@@ -1447,6 +1510,59 @@ mod tests {
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
         assert_eq!(result, escrow_addr.parse::<Address>().unwrap());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn tip1034_challenge_without_escrow_uses_canonical_precompile() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": Address::repeat_byte(0x44).to_string(),
+                "methodDetails": { "sessionProtocol": "v2" }
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+        };
+
+        assert_eq!(
+            resolve_escrow(&challenge, 4217, None).unwrap(),
+            TIP20_CHANNEL_RESERVE_ADDRESS
+        );
+    }
+
+    #[test]
+    fn test_resolve_escrow_accepts_legacy_alias_hint() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let hinted = Address::repeat_byte(0x22);
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": Address::repeat_byte(0x44).to_string(),
+                "methodDetails": { "escrow": hinted.to_string() }
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+        };
+
+        assert_eq!(resolve_escrow(&challenge, 4217, None).unwrap(), hinted);
     }
 
     #[test]
@@ -1647,7 +1763,7 @@ mod tests {
             opaque: None,
         };
 
-        assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
+        assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
     }
 
     #[test]
@@ -1669,8 +1785,8 @@ mod tests {
             opaque: None,
         };
 
-        // Should fall back to MODERATO_CHAIN_ID on decode failure
-        assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
+        // Match MPPx's default Tempo client: mainnet when no chain is advertised.
+        assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
     }
 
     #[test]
@@ -1891,11 +2007,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_escrow_challenge_priority_order() {
+    fn test_resolve_escrow_override_priority_order() {
         use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
 
-        // Challenge has a valid escrow, override is also present.
-        // Challenge should take priority.
+        // Match MPPx: an explicit caller override wins over a challenge hint.
         let escrow_addr = "0x2222222222222222222222222222222222222222";
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
             .parse()
@@ -1922,9 +2037,8 @@ mod tests {
 
         let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();
         assert_eq!(
-            result,
-            escrow_addr.parse::<Address>().unwrap(),
-            "challenge escrow should take priority over override"
+            result, override_addr,
+            "override should take priority over challenge escrow"
         );
     }
 
