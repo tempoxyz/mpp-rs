@@ -985,13 +985,25 @@ impl TempoSessionProvider {
     }
 }
 
-impl PaymentProvider for TempoSessionProvider {
-    fn supports(&self, method: &str, intent: &str) -> bool {
-        method == crate::protocol::methods::tempo::METHOD_NAME
-            && intent == crate::protocol::methods::tempo::INTENT_SESSION
+impl TempoSessionProvider {
+    /// Creates the initial authorization for a canonical application WebSocket.
+    ///
+    /// Opening or reconnecting the socket is not itself a billable request.
+    /// Existing channels therefore echo their current highest voucher, while
+    /// new channels open with a zero cumulative amount. The server requests
+    /// each billable increment later with `payment-need-voucher` frames.
+    pub async fn application_websocket_credential(
+        &self,
+        challenge: &PaymentChallenge,
+    ) -> Result<PaymentCredential, MppError> {
+        self.payment_credential(challenge, false).await
     }
 
-    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+    async fn payment_credential(
+        &self,
+        challenge: &PaymentChallenge,
+        include_request_amount: bool,
+    ) -> Result<PaymentCredential, MppError> {
         use alloy::providers::ProviderBuilder;
         use tempo_alloy::TempoNetwork;
 
@@ -1021,7 +1033,11 @@ impl PaymentProvider for TempoSessionProvider {
             .parse()
             .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
 
-        let amount: u128 = session_req.parse_amount()?;
+        let amount = if include_request_amount {
+            session_req.parse_amount()?
+        } else {
+            0
+        };
         let payer = self.signing_mode.from_address(self.signer.address());
         let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
         let precompile = is_precompile_escrow(escrow_contract);
@@ -1213,6 +1229,17 @@ impl PaymentProvider for TempoSessionProvider {
         self.notify_update(&entry);
 
         Ok(build_credential(challenge, payload, chain_id, payer))
+    }
+}
+
+impl PaymentProvider for TempoSessionProvider {
+    fn supports(&self, method: &str, intent: &str) -> bool {
+        method == crate::protocol::methods::tempo::METHOD_NAME
+            && intent == crate::protocol::methods::tempo::INTENT_SESSION
+    }
+
+    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        self.payment_credential(challenge, true).await
     }
 }
 
@@ -2086,7 +2113,7 @@ mod tests {
             .channel_id_to_key
             .lock()
             .unwrap()
-            .insert(channel_id.to_string(), key);
+            .insert(channel_id.to_string(), key.clone());
 
         let req = SessionRequest {
             amount: "500".to_string(),
@@ -2139,6 +2166,35 @@ mod tests {
             }
             other => panic!("expected voucher payload, got {other:?}"),
         }
+
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .cumulative_amount = 10_000;
+        let socket_credential = provider
+            .application_websocket_credential(&challenge)
+            .await
+            .expect("a full channel can still authorize a websocket");
+        match socket_credential
+            .payload_as::<crate::protocol::methods::tempo::session::SessionCredentialPayload>()
+            .unwrap()
+        {
+            crate::protocol::methods::tempo::session::SessionCredentialPayload::Voucher {
+                cumulative_amount,
+                ..
+            } => assert_eq!(cumulative_amount, "10000"),
+            other => panic!("expected voucher payload, got {other:?}"),
+        }
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .cumulative_amount = 1_500;
 
         let close_amount = 1_200;
         let expected_close_sig =
