@@ -3,7 +3,7 @@
 use alloy::primitives::{keccak256, Address, B256};
 use alloy::sol_types::{eip712_domain, SolStruct};
 #[cfg(feature = "evm")]
-use tempo_primitives::transaction::TempoSignature;
+use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
 
 use crate::error::{MppError, ResultExt};
 
@@ -121,6 +121,28 @@ pub async fn sign_proof(
         .mpp_http("failed to sign proof")?;
 
     Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
+}
+
+/// Sign a wallet-bound proof with any native Tempo primitive signer.
+///
+/// This supports secp256k1, P-256, and WebAuthn-shaped primitive signatures.
+/// When `account` is a root wallet and the signer is an access key, the server
+/// verifies the recovered primitive signer against that wallet's on-chain
+/// keychain authorization.
+#[cfg(feature = "evm")]
+pub async fn sign_proof_primitive(
+    signer: &impl alloy::signers::Signer<PrimitiveSignature>,
+    account: Address,
+    chain_id: u64,
+    challenge_id: &str,
+    realm: &str,
+) -> crate::error::Result<String> {
+    let signature = signer
+        .sign_hash(&signing_hash(account, chain_id, challenge_id, realm))
+        .await
+        .mpp_http("failed to sign proof")?;
+    let envelope = TempoSignature::Primitive(signature);
+    Ok(alloy::hex::encode_prefixed(envelope.to_bytes()))
 }
 
 /// Verify a zero-amount charge proof against the expected signer.

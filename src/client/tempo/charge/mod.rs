@@ -33,11 +33,13 @@ pub mod tx_builder;
 use std::num::NonZeroU64;
 
 use alloy::primitives::{Address, TxKind, U256};
-use tempo_primitives::transaction::{Call, SignedKeyAuthorization};
+use tempo_primitives::transaction::{Call, SignedKeyAuthorization, TempoTransaction};
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::client::tempo::signing::{
-    sign_and_encode_async, sign_and_encode_fee_payer_envelope_async, TempoSigningMode,
+    sign_and_encode_async, sign_and_encode_fee_payer_envelope_async,
+    sign_and_encode_fee_payer_request_primitive_async, sign_and_encode_primitive_async,
+    TempoPrimitiveSigner, TempoSigningMode,
 };
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
@@ -242,34 +244,46 @@ impl TempoCharge {
         signer: &(impl alloy::signers::Signer + Clone),
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        if self.amount.is_zero() {
-            let signing_mode = options.signing_mode.unwrap_or_default();
-            let from = signing_mode.from_address(signer.address());
-            let credential = PaymentCredential::with_source(
-                self.challenge.to_echo(),
-                proof::proof_source(from, self.chain_id),
-                PaymentPayload::proof(
-                    proof::sign_proof(
-                        signer,
-                        from,
-                        self.chain_id,
-                        &self.challenge.id,
-                        &self.challenge.realm,
-                    )
-                    .await?,
-                ),
-            );
+        self.prepare(signer.address(), options)
+            .await?
+            .sign_secp256k1(signer)
+            .await
+    }
 
-            return Ok(SignedTempoCharge {
-                credential,
-                tx_bytes: None,
+    /// Sign the charge with a native Tempo primitive signer.
+    ///
+    /// This accepts either a secp256k1 key or an Accounts SDK-compatible P-256
+    /// access key through [`TempoPrimitiveSigner`] and Alloy's existing signer
+    /// interface.
+    pub async fn sign_with_primitive_options(
+        self,
+        signer: &TempoPrimitiveSigner,
+        options: SignOptions,
+    ) -> Result<SignedTempoCharge, MppError> {
+        self.prepare(alloy::signers::Signer::address(signer), options)
+            .await?
+            .sign_primitive(signer)
+            .await
+    }
+
+    async fn prepare(
+        self,
+        signer_address: Address,
+        options: SignOptions,
+    ) -> Result<PreparedTempoCharge, MppError> {
+        let signing_mode = options.signing_mode.unwrap_or_default();
+        let from = signing_mode.from_address(signer_address);
+
+        if self.amount.is_zero() {
+            return Ok(PreparedTempoCharge {
+                challenge: self.challenge,
                 chain_id: self.chain_id,
+                fee_payer: self.fee_payer,
                 from,
+                signing_mode,
+                transaction: None,
             });
         }
-
-        let signing_mode = options.signing_mode.unwrap_or_default();
-        let from = signing_mode.from_address(signer.address());
 
         // Resolve RPC provider + build calls
         let rpc_url = match options.rpc_url {
@@ -372,22 +386,102 @@ impl TempoCharge {
             key_authorization: tx_key_authorization,
         });
 
-        // If fee sponsorship is requested, send the `0x78` fee payer envelope
-        // so MPPx servers can co-sign and broadcast (standard `0x76`).
-        let tx_bytes = if self.fee_payer {
-            sign_and_encode_fee_payer_envelope_async(tx, signer, &signing_mode).await?
-        } else {
-            sign_and_encode_async(tx, signer, &signing_mode).await?
+        Ok(PreparedTempoCharge {
+            challenge: self.challenge,
+            chain_id: self.chain_id,
+            fee_payer: self.fee_payer,
+            from,
+            signing_mode,
+            transaction: Some(tx),
+        })
+    }
+}
+
+struct PreparedTempoCharge {
+    challenge: PaymentChallenge,
+    chain_id: u64,
+    fee_payer: bool,
+    from: Address,
+    signing_mode: TempoSigningMode,
+    transaction: Option<TempoTransaction>,
+}
+
+impl PreparedTempoCharge {
+    async fn sign_secp256k1(
+        mut self,
+        signer: &(impl alloy::signers::Signer + Clone),
+    ) -> Result<SignedTempoCharge, MppError> {
+        let Some(transaction) = self.transaction.take() else {
+            let signature = proof::sign_proof(
+                signer,
+                self.from,
+                self.chain_id,
+                &self.challenge.id,
+                &self.challenge.realm,
+            )
+            .await?;
+            return Ok(self.proof(signature));
         };
+        let tx_bytes = if self.fee_payer {
+            sign_and_encode_fee_payer_envelope_async(transaction, signer, &self.signing_mode)
+                .await?
+        } else {
+            sign_and_encode_async(transaction, signer, &self.signing_mode).await?
+        };
+        Ok(self.transaction(tx_bytes))
+    }
 
-        let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
+    async fn sign_primitive(
+        mut self,
+        signer: &TempoPrimitiveSigner,
+    ) -> Result<SignedTempoCharge, MppError> {
+        let Some(transaction) = self.transaction.take() else {
+            let signature = proof::sign_proof_primitive(
+                signer,
+                self.from,
+                self.chain_id,
+                &self.challenge.id,
+                &self.challenge.realm,
+            )
+            .await?;
+            return Ok(self.proof(signature));
+        };
+        let tx_bytes = if self.fee_payer {
+            sign_and_encode_fee_payer_request_primitive_async(
+                transaction,
+                signer,
+                &self.signing_mode,
+            )
+            .await?
+        } else {
+            sign_and_encode_primitive_async(transaction, signer, &self.signing_mode).await?
+        };
+        Ok(self.transaction(tx_bytes))
+    }
 
-        Ok(SignedTempoCharge {
+    fn proof(self, signature: String) -> SignedTempoCharge {
+        let credential = PaymentCredential::with_source(
+            self.challenge.to_echo(),
+            proof::proof_source(self.from, self.chain_id),
+            PaymentPayload::proof(signature),
+        );
+        SignedTempoCharge {
+            credential,
+            tx_bytes: None,
+            chain_id: self.chain_id,
+            from: self.from,
+        }
+    }
+
+    fn transaction(self, tx_bytes: Vec<u8>) -> SignedTempoCharge {
+        let credential =
+            build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, self.from);
+        SignedTempoCharge {
             credential,
             tx_bytes: Some(tx_bytes),
             chain_id: self.chain_id,
-            from,
-        })
+            from: self.from,
+        }
     }
 }
 

@@ -208,25 +208,9 @@ mod sqlite {
 
     /// Return the database path shared by Tempo command-line applications.
     pub fn default_channel_database_path() -> ChannelStoreResult<PathBuf> {
-        home_directory()
-            .map(|home| home.join(".tempo").join("wallet").join("channels.db"))
+        super::super::super::default_wallet_directory()
+            .map(|directory| directory.join("channels.db"))
             .ok_or_else(|| ChannelStoreError::Io("home directory is unavailable".into()))
-    }
-
-    #[cfg(not(windows))]
-    fn home_directory() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-
-    #[cfg(windows)]
-    fn home_directory() -> Option<PathBuf> {
-        std::env::var_os("USERPROFILE")
-            .map(PathBuf::from)
-            .or_else(|| {
-                let drive = std::env::var_os("HOMEDRIVE")?;
-                let path = std::env::var_os("HOMEPATH")?;
-                Some(PathBuf::from(drive).join(path))
-            })
     }
 
     impl SqliteChannelStore {
