@@ -16,6 +16,7 @@ use alloy::{
     primitives::{Address, B256},
     signers::Signer,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload,
@@ -35,7 +36,8 @@ use super::signing::TempoPrimitiveSigner;
 use crate::client::PaymentProvider;
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
-use crate::protocol::intents::SessionRequest;
+use crate::protocol::intents::{ChargeRequest, SessionRequest};
+use crate::protocol::methods::tempo::proof::sign_proof_primitive;
 use crate::protocol::methods::tempo::session::TempoSessionExt;
 
 /// Tempo session provider with automatic channel management.
@@ -422,6 +424,185 @@ impl TempoSessionProvider {
             .await
             .map_err(Self::store_error)?;
         Self::channel_entry(recovered).map(|entry| Some((entry, false)))
+    }
+
+    /// Rehydrate a reusable native session through the server's authenticated
+    /// `HEAD` bootstrap flow.
+    ///
+    /// The first request advertises `tempo/charge`. A supporting server returns
+    /// a zero-amount proof challenge, which this provider signs with the same
+    /// root/access-key identity used for the session. The authorized response
+    /// carries `Payment-Session-Snapshot`; this provider reconciles it with
+    /// TIP-1034 on-chain state, persists it, and activates it in memory.
+    pub async fn bootstrap(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<Option<StoredChannelEntry>, MppError> {
+        self.bootstrap_with_headers(client, url, reqwest::header::HeaderMap::new())
+            .await
+    }
+
+    /// Like [`Self::bootstrap`], preserving caller headers such as routing or
+    /// proxy headers on both bootstrap requests.
+    pub async fn bootstrap_with_headers(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        mut headers: reqwest::header::HeaderMap,
+    ) -> Result<Option<StoredChannelEntry>, MppError> {
+        use alloy::providers::ProviderBuilder;
+        use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+        use tempo_alloy::TempoNetwork;
+
+        headers.insert(
+            crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
+            HeaderValue::from_static("tempo/charge"),
+        );
+        headers.remove(AUTHORIZATION);
+
+        let challenge_response = client
+            .head(url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .mpp_http("session bootstrap challenge request failed")?;
+
+        let response = if challenge_response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+            let challenge = PaymentChallenge::from_headers(
+                challenge_response
+                    .headers()
+                    .get_all(WWW_AUTHENTICATE)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok()),
+            )
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|challenge| {
+                if challenge.method.as_str() != crate::protocol::methods::tempo::METHOD_NAME
+                    || challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_CHARGE
+                {
+                    return false;
+                }
+                challenge
+                    .request
+                    .decode::<ChargeRequest>()
+                    .ok()
+                    .and_then(|request| request.parse_amount().ok())
+                    == Some(0)
+            });
+            let Some(challenge) = challenge else {
+                return Ok(None);
+            };
+
+            let request: ChargeRequest = challenge.request.decode()?;
+            let chain_id = request
+                .method_details
+                .as_ref()
+                .and_then(|details| details.get("chainId"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
+            let payer = self.signing_mode.from_address(self.signer.address());
+            let signature = sign_proof_primitive(
+                &self.signer,
+                payer,
+                chain_id,
+                &challenge.id,
+                &challenge.realm,
+            )
+            .await?;
+            let credential = PaymentCredential::with_source(
+                challenge.to_echo(),
+                PaymentCredential::evm_did(chain_id, &payer.to_string()),
+                crate::protocol::core::PaymentPayload::proof(signature),
+            );
+            headers.insert(
+                AUTHORIZATION,
+                crate::protocol::core::format_authorization(&credential)?
+                    .parse()
+                    .mpp_config("invalid bootstrap authorization header")?,
+            );
+            client
+                .head(url)
+                .headers(headers)
+                .send()
+                .await
+                .mpp_http("authorized session bootstrap request failed")?
+        } else {
+            challenge_response
+        };
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let Some(snapshot_header) = response.headers().get("payment-session-snapshot") else {
+            return Ok(None);
+        };
+        let snapshot_bytes = STANDARD
+            .decode(
+                snapshot_header
+                    .to_str()
+                    .mpp_config("invalid Payment-Session-Snapshot header")?,
+            )
+            .mpp_config("invalid Payment-Session-Snapshot base64")?;
+        let snapshot: crate::protocol::methods::tempo::session::SessionSnapshot =
+            serde_json::from_slice(&snapshot_bytes)
+                .mpp_config("invalid Payment-Session-Snapshot JSON")?;
+
+        let payer = self.signing_mode.from_address(self.signer.address());
+        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+        let payee = snapshot
+            .descriptor
+            .payee
+            .parse()
+            .mpp_config("invalid snapshot payee")?;
+        let token = snapshot
+            .descriptor
+            .token
+            .parse()
+            .mpp_config("invalid snapshot token")?;
+        let operator = snapshot
+            .descriptor
+            .operator
+            .parse()
+            .mpp_config("invalid snapshot operator")?;
+        let escrow = snapshot
+            .escrow
+            .parse()
+            .mpp_config("invalid snapshot escrow")?;
+        let channel_id = snapshot
+            .channel_id
+            .parse()
+            .mpp_config("invalid snapshot channelId")?;
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
+        let state = read_on_chain_channel_state(&provider, channel_id).await?;
+        let recovered = hydrate_session_snapshot(
+            &snapshot,
+            RecoveryScope {
+                payer,
+                authorized_signer,
+                payee,
+                token,
+                escrow,
+                chain_id: snapshot.chain_id,
+            },
+            state,
+        )?;
+        self.channel_store
+            .set(&recovered)
+            .await
+            .map_err(Self::store_error)?;
+
+        let entry = Self::channel_entry(recovered.clone())?;
+        let key = Self::channel_key(&payee, &token, &escrow, Some(operator));
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(entry.channel_id.to_string(), key.clone());
+        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.notify_update(&entry);
+        Ok(Some(recovered))
     }
 
     /// Get the cumulative voucher amount for the first active channel.
@@ -2391,5 +2572,129 @@ mod tests {
             chain_id,
         )
         .unwrap());
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn bootstrap_authenticates_with_wallet_bound_p256_proof() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use axum::{
+            http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::head,
+            Router,
+        };
+
+        use crate::client::tempo::signing::{
+            KeychainVersion, P256Jwk, TempoP256Signer, TempoSigningMode,
+        };
+        use crate::protocol::{
+            core::{Base64UrlJson, PaymentChallenge, PaymentCredential},
+            methods::tempo::proof::recover_proof_signer,
+        };
+
+        let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
+            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
+            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+        })
+        .unwrap();
+        let root = Address::repeat_byte(0x44);
+        let chain_id = 4217;
+        let challenge = PaymentChallenge::new(
+            "bootstrap-proof",
+            "openai.example.com",
+            crate::protocol::methods::tempo::METHOD_NAME,
+            crate::protocol::methods::tempo::INTENT_CHARGE,
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "0",
+                "currency": Address::repeat_byte(0x20).to_string(),
+                "recipient": Address::repeat_byte(0x30).to_string(),
+                "methodDetails": { "chainId": chain_id }
+            }))
+            .unwrap(),
+        );
+        let challenge_header = challenge.to_header().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let proof_valid = Arc::new(AtomicBool::new(false));
+        let access_key = signer.address();
+        let app = Router::new().route(
+            "/v1/responses",
+            head({
+                let calls = calls.clone();
+                let proof_valid = proof_valid.clone();
+                move |headers: HeaderMap| {
+                    let calls = calls.clone();
+                    let proof_valid = proof_valid.clone();
+                    let challenge_header = challenge_header.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let Some(authorization) = headers.get(AUTHORIZATION) else {
+                            return (
+                                StatusCode::PAYMENT_REQUIRED,
+                                [("www-authenticate", challenge_header)],
+                            )
+                                .into_response();
+                        };
+                        let valid = authorization
+                            .to_str()
+                            .ok()
+                            .and_then(|value| PaymentCredential::from_header(value).ok())
+                            .and_then(|credential| {
+                                let payload = credential.charge_payload().ok()?;
+                                let source = credential.source?;
+                                let recovered = recover_proof_signer(
+                                    root,
+                                    chain_id,
+                                    "bootstrap-proof",
+                                    "openai.example.com",
+                                    payload.proof_signature()?,
+                                )
+                                .ok()?;
+                                Some(
+                                    source
+                                        == PaymentCredential::evm_did(chain_id, &root.to_string())
+                                        && recovered == access_key,
+                                )
+                            })
+                            .unwrap_or(false);
+                        proof_valid.store(valid, Ordering::SeqCst);
+                        if valid {
+                            StatusCode::NO_CONTENT.into_response()
+                        } else {
+                            StatusCode::UNAUTHORIZED.into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: root,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            });
+        let result = provider
+            .bootstrap(
+                &reqwest::Client::new(),
+                &format!("http://{address}/v1/responses"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "server intentionally returned no snapshot"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(proof_valid.load(Ordering::SeqCst));
     }
 }
