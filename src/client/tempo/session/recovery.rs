@@ -78,6 +78,21 @@ pub struct RecoveryScope {
     pub chain_id: u64,
 }
 
+/// Return whether this client controls the voucher authority bound into a descriptor.
+///
+/// A different authority is expected after access-key rotation and makes the old
+/// channel non-reusable; it is not a malformed snapshot.
+pub fn can_sign_descriptor(
+    descriptor: &ChannelDescriptor,
+    payer: Address,
+    authorized_signer: Address,
+) -> Result<bool, MppError> {
+    Ok(
+        parse_address("descriptor payer", &descriptor.payer)? == payer
+            && descriptor_authority(descriptor)? == authorized_signer,
+    )
+}
+
 /// Reconcile a locally stored entry with its descriptor and on-chain state.
 pub fn recover_stored_channel(
     mut entry: StoredChannelEntry,
@@ -353,6 +368,18 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.cumulative_amount, 300);
         assert_eq!(recovered.deposit, 1_000);
+    }
+
+    #[test]
+    fn rotated_access_key_cannot_reuse_old_descriptor() {
+        let old_authority = Address::repeat_byte(0x60);
+        let new_authority = Address::repeat_byte(0x70);
+        assert!(!can_sign_descriptor(
+            &descriptor(old_authority),
+            Address::repeat_byte(0x10),
+            new_authority,
+        )
+        .unwrap());
     }
 
     #[tokio::test]
