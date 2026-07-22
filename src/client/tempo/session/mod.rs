@@ -30,7 +30,8 @@ use self::channel_ops::{
     OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
 };
 use self::recovery::{
-    hydrate_session_snapshot, read_on_chain_channel_state, recover_stored_channel, RecoveryScope,
+    can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
+    recover_stored_channel, RecoveryScope,
 };
 use self::store::{
     channel_key as persistent_channel_key, ChannelStore, MemoryChannelStore, StoredChannelEntry,
@@ -403,6 +404,12 @@ impl TempoSessionProvider {
             .await
             .map_err(Self::store_error)?;
 
+        let snapshot = if let Some(snapshot) = snapshot {
+            can_sign_descriptor(&snapshot.descriptor, scope.payer, scope.authorized_signer)?
+                .then_some(snapshot)
+        } else {
+            None
+        };
         if let Some(snapshot) = snapshot {
             let snapshot_channel_id = snapshot.channel_id.parse().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot channelId: {error}"))
@@ -442,6 +449,9 @@ impl TempoSessionProvider {
         let Some(stored) = stored else {
             return Ok(None);
         };
+        if !can_sign_descriptor(&stored.descriptor, scope.payer, scope.authorized_signer)? {
+            return Ok(None);
+        }
 
         let state = read_on_chain_channel_state(provider, stored.channel_id).await?;
         if state.deposit == 0 || state.close_requested_at != 0 {
