@@ -197,4 +197,47 @@ mod tests {
         };
         assert_eq!(active_account(&state).unwrap(), address);
     }
+
+    #[test]
+    fn loads_accounts_sdk_access_key() {
+        let path =
+            std::env::temp_dir().join(format!("mpp-rs-tempo-wallet-{}.json", std::process::id()));
+        let json = r#"{
+          "tempo-cli.store": {
+            "state": {
+              "activeAccount": 0,
+              "chainId": 4217,
+              "accounts": [{"address":"0x1111111111111111111111111111111111111111"}],
+              "accessKeys": [{
+                "address":"0xf0159a522607cd6ab1097204c9fafb7bbe6afb6c",
+                "access":"0x1111111111111111111111111111111111111111",
+                "chainId":4217,
+                "keyType":"p256",
+                "handle":{"kind":"webcrypto-p256","jwk":{
+                  "kty":"EC","crv":"P-256",
+                  "x":"OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
+                  "y":"0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
+                  "d":"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI"
+                }}
+              }]
+            }
+          }
+        }"#;
+        fs::write(&path, json).unwrap();
+        let wallet = TempoWallet::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            wallet.account,
+            "0x1111111111111111111111111111111111111111"
+                .parse::<Address>()
+                .unwrap()
+        );
+        assert_eq!(
+            wallet.access_key,
+            "0xf0159a522607cd6ab1097204c9fafb7bbe6afb6c"
+                .parse::<Address>()
+                .unwrap()
+        );
+    }
 }
