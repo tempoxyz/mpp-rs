@@ -959,7 +959,7 @@ where
     );
 
     let tx_bytes = if options.fee_payer {
-        crate::client::tempo::signing::sign_and_encode_fee_payer_request_primitive_async(
+        crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
             unsigned_tx,
             &primitive_signer,
             signing_mode,
@@ -1075,7 +1075,7 @@ where
         key_authorization: signing_mode.key_authorization().cloned(),
     });
     let tx_bytes = if options.fee_payer {
-        crate::client::tempo::signing::sign_and_encode_fee_payer_request_primitive_async(
+        crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
             unsigned_tx,
             &primitive_signer,
             signing_mode,

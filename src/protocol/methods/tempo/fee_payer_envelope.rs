@@ -1,19 +1,16 @@
 //! Fee payer envelope (magic byte 0x78).
 //!
-//! This is a helper encoding used for fee-sponsored transactions.
+//! This is the native sender-signed encoding used for fee-sponsored Tempo
+//! transactions before the sponsor completes them.
 //!
 //! It is **not** a broadcastable Tempo transaction type. Instead, clients send a
 //! `0x78 || rlp([...])` envelope to a sponsoring server, which validates the
 //! envelope, reconstitutes a normal 0x76 Tempo transaction, attaches a
 //! `fee_payer_signature`, and then broadcasts.
 //!
-//! Note: this envelope format is specific to mpp-rs. The TypeScript/Viem SDK
-//! (mppx) achieves fee sponsorship differently — the client sends a standard
-//! `0x76` transaction to a JSON-RPC sidecar (`Handler.feePayer()` in tempo-ts)
-//! via viem's `withFeePayer` transport, which cosigns using
-//! `signTransaction({ feePayer: account })` and returns a complete `0x76`.
-//! The `0x78` envelope exists in mpp-rs because it embeds the fee-payer flow
-//! inline in the MPP credential exchange rather than using a separate RPC hop.
+//! This mirrors MPPx/Tempo's `signTransaction({ feePayer: true })` behavior:
+//! the client submits a pre-cosign `0x78` envelope, and the server or hosted
+//! fee-payer transport validates it before producing the completed transaction.
 
 use std::num::NonZeroU64;
 

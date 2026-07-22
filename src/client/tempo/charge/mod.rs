@@ -38,7 +38,7 @@ use tempo_primitives::transaction::{Call, SignedKeyAuthorization, TempoTransacti
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::client::tempo::signing::{
     sign_and_encode_async, sign_and_encode_fee_payer_envelope_async,
-    sign_and_encode_fee_payer_request_primitive_async, sign_and_encode_primitive_async,
+    sign_and_encode_fee_payer_envelope_primitive_async, sign_and_encode_primitive_async,
     TempoPrimitiveSigner, TempoSigningMode,
 };
 use crate::error::{MppError, ResultExt};
@@ -447,7 +447,7 @@ impl PreparedTempoCharge {
             return Ok(self.proof(signature));
         };
         let tx_bytes = if self.fee_payer {
-            sign_and_encode_fee_payer_request_primitive_async(
+            sign_and_encode_fee_payer_envelope_primitive_async(
                 transaction,
                 signer,
                 &self.signing_mode,
