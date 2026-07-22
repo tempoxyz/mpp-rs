@@ -212,6 +212,7 @@ where
 
         let mut client = MppApplicationWs {
             socket,
+            challenge,
             voucher_provider: self.voucher_provider.clone(),
             receipt_tx: self.receipt_tx.clone(),
             events_tx: self.events_tx.clone(),
@@ -224,6 +225,7 @@ where
 /// An authorized canonical MPP WebSocket carrying arbitrary text messages.
 pub struct MppApplicationWs<V> {
     socket: Socket,
+    challenge: PaymentChallenge,
     voucher_provider: V,
     receipt_tx: watch::Sender<Option<Value>>,
     events_tx: broadcast::Sender<MppApplicationEvent>,
@@ -248,7 +250,10 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
                     let _ = self
                         .events_tx
                         .send(MppApplicationEvent::NeedVoucher(data.clone()));
-                    let voucher = self.voucher_provider.next_voucher(&data).await?;
+                    let voucher = self
+                        .voucher_provider
+                        .next_voucher_for_challenge(&self.challenge, &data)
+                        .await?;
                     send_authorization(&mut self.socket, &voucher).await?;
                     let _ = self.events_tx.send(MppApplicationEvent::VoucherSent);
                 }
@@ -262,6 +267,16 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
                 }
             }
         }
+    }
+
+    /// Closes only the application WebSocket, leaving the payment session open.
+    ///
+    /// Use this when an application transport is shutting down but its channel
+    /// should remain reusable by a later connection. To settle and refund the
+    /// channel instead, use [`Self::close`].
+    pub async fn disconnect(mut self) -> Result<(), MppWsError> {
+        self.socket.close(None).await?;
+        Ok(())
     }
 
     /// Requests a final session receipt and channel settlement handshake.
@@ -279,7 +294,10 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
                 ServerFrame::CloseReady { data } => {
                     self.accept_receipt(data.clone(), true);
                     let request = close_request(&data)?;
-                    let credential = self.voucher_provider.close_credential(&request).await?;
+                    let credential = self
+                        .voucher_provider
+                        .close_credential_for_challenge(&self.challenge, &request)
+                        .await?;
                     send_authorization(&mut self.socket, &credential).await?;
                     let _ = self
                         .events_tx
@@ -294,7 +312,10 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
                     }
                 }
                 ServerFrame::NeedVoucher { data } => {
-                    let voucher = self.voucher_provider.next_voucher(&data).await?;
+                    let voucher = self
+                        .voucher_provider
+                        .next_voucher_for_challenge(&self.challenge, &data)
+                        .await?;
                     send_authorization(&mut self.socket, &voucher).await?;
                 }
                 ServerFrame::Error { status, message } => {
