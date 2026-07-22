@@ -269,6 +269,16 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
         }
     }
 
+    /// Closes only the application WebSocket, leaving the payment session open.
+    ///
+    /// Use this when an application transport is shutting down but its channel
+    /// should remain reusable by a later connection. To settle and refund the
+    /// channel instead, use [`Self::close`].
+    pub async fn disconnect(mut self) -> Result<(), MppWsError> {
+        self.socket.close(None).await?;
+        Ok(())
+    }
+
     /// Requests a final session receipt and channel settlement handshake.
     pub async fn close(mut self) -> Result<Value, MppWsError>
     where
