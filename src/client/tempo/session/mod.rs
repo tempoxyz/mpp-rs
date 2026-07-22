@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, B256};
 
 use self::channel_ops::{
-    build_credential, create_close_payload, create_open_payload, create_precompile_close_payload,
-    create_precompile_open_payload, create_precompile_voucher_payload, create_voucher_payload,
+    build_credential, create_close_payload, create_open_payload,
+    create_precompile_close_payload_with_descriptor, create_precompile_open_payload,
+    create_precompile_voucher_payload_with_descriptor, create_voucher_payload,
     is_precompile_escrow, resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry,
     OpenPayloadOptions, OpenPrecompilePayloadOptions,
 };
@@ -252,20 +253,16 @@ impl TempoSessionProvider {
             .unwrap_or(0)
     }
 
-    /// Send a voucher for a need-voucher SSE event.
+    /// Create a signed voucher credential for an active session channel.
     ///
-    /// Called during SSE session metering when the server emits a `payment-need-voucher`
-    /// event. Updates the internal cumulative amount and POSTs a signed voucher
-    /// credential to the server.
-    ///
-    /// Mirrors the TypeScript SDK's `SessionManager.sse` need-voucher handling.
-    pub async fn send_voucher(
+    /// This is used by streaming transports such as SSE and WebSocket, where
+    /// the server requests a new cumulative voucher in-band rather than with a
+    /// fresh HTTP 402 response.
+    pub async fn voucher_credential(
         &self,
-        client: &reqwest::Client,
-        url: &str,
         channel_id_hex: &str,
         required_cumulative: u128,
-    ) -> Result<(), MppError> {
+    ) -> Result<PaymentCredential, MppError> {
         let challenge =
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for voucher".into())
@@ -303,9 +300,11 @@ impl TempoSessionProvider {
         }
 
         let payload = if is_precompile_escrow(entry.escrow_contract) {
-            create_precompile_voucher_payload(
+            create_precompile_voucher_payload_with_descriptor(
                 &self.signer,
-                entry.channel_id,
+                entry.descriptor.clone().ok_or_else(|| {
+                    MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+                })?,
                 entry.cumulative_amount,
                 entry.chain_id,
             )
@@ -321,12 +320,131 @@ impl TempoSessionProvider {
             .await?
         };
 
-        // Update the registry
+        // Update the registry only after the voucher has been signed.
         self.channels.lock().unwrap().insert(key, entry.clone());
         self.notify_update(&entry);
 
-        let credential =
-            build_credential(&challenge, payload, entry.chain_id, self.signer.address());
+        Ok(build_credential(
+            &challenge,
+            payload,
+            entry.chain_id,
+            self.signer.address(),
+        ))
+    }
+
+    /// Create the final signed close credential for an active session channel.
+    pub async fn close_credential(
+        &self,
+        channel_id_hex: &str,
+    ) -> Result<PaymentCredential, MppError> {
+        self.close_credential_inner(channel_id_hex, None).await
+    }
+
+    /// Create a signed close credential for an exact server-confirmed spend.
+    ///
+    /// Canonical bidirectional transports obtain this amount from the
+    /// `payment-close-ready` receipt. It may be lower than the latest voucher
+    /// ceiling, but it may never exceed the amount this provider authorized.
+    pub async fn close_credential_at(
+        &self,
+        channel_id_hex: &str,
+        cumulative_amount: u128,
+    ) -> Result<PaymentCredential, MppError> {
+        self.close_credential_inner(channel_id_hex, Some(cumulative_amount))
+            .await
+    }
+
+    async fn close_credential_inner(
+        &self,
+        channel_id_hex: &str,
+        requested_cumulative: Option<u128>,
+    ) -> Result<PaymentCredential, MppError> {
+        let challenge =
+            self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
+                MppError::InvalidConfig("no challenge available for close".into())
+            })?;
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(channel_id_hex)
+            .cloned()
+            .ok_or_else(|| {
+                MppError::InvalidConfig(format!("no channel found for id {channel_id_hex}"))
+            })?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        if key != expected_key {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
+        let entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.opened)
+            .cloned()
+            .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        if entry.chain_id != expected_chain_id || entry.channel_id.to_string() != channel_id_hex {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
+        let cumulative_amount = requested_cumulative.unwrap_or(entry.cumulative_amount);
+        if cumulative_amount > entry.cumulative_amount {
+            return Err(MppError::InvalidConfig(format!(
+                "close amount {cumulative_amount} exceeds locally authorized cumulative amount {}",
+                entry.cumulative_amount
+            )));
+        }
+
+        let payload = if is_precompile_escrow(entry.escrow_contract) {
+            create_precompile_close_payload_with_descriptor(
+                &self.signer,
+                entry.channel_id,
+                entry.descriptor.ok_or_else(|| {
+                    MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+                })?,
+                cumulative_amount,
+                entry.chain_id,
+            )
+            .await?
+        } else {
+            create_close_payload(
+                &self.signer,
+                entry.channel_id,
+                cumulative_amount,
+                entry.escrow_contract,
+                entry.chain_id,
+            )
+            .await?
+        };
+        Ok(build_credential(
+            &challenge,
+            payload,
+            entry.chain_id,
+            self.signer.address(),
+        ))
+    }
+
+    /// Send a voucher for a need-voucher SSE event.
+    ///
+    /// Called during SSE session metering when the server emits a `payment-need-voucher`
+    /// event. Updates the internal cumulative amount and POSTs a signed voucher
+    /// credential to the server.
+    ///
+    /// Mirrors the TypeScript SDK's `SessionManager.sse` need-voucher handling.
+    pub async fn send_voucher(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        channel_id_hex: &str,
+        required_cumulative: u128,
+    ) -> Result<(), MppError> {
+        let credential = self
+            .voucher_credential(channel_id_hex, required_cumulative)
+            .await?;
         let auth_header = crate::protocol::core::format_authorization(&credential)?;
 
         let resp = client
@@ -396,28 +514,7 @@ impl TempoSessionProvider {
             ));
         }
 
-        let payer = self.signer.address();
-
-        let payload = if is_precompile_escrow(entry.escrow_contract) {
-            create_precompile_close_payload(
-                &self.signer,
-                entry.channel_id,
-                entry.cumulative_amount,
-                entry.chain_id,
-            )
-            .await?
-        } else {
-            create_close_payload(
-                &self.signer,
-                entry.channel_id,
-                entry.cumulative_amount,
-                entry.escrow_contract,
-                entry.chain_id,
-            )
-            .await?
-        };
-
-        let credential = build_credential(&challenge, payload, entry.chain_id, payer);
+        let credential = self.close_credential(&entry.channel_id.to_string()).await?;
 
         let auth_header = crate::protocol::core::format_authorization(&credential)?;
 
@@ -521,9 +618,11 @@ impl PaymentProvider for TempoSessionProvider {
                 entry.cumulative_amount += amount;
 
                 let payload = if precompile {
-                    create_precompile_voucher_payload(
+                    create_precompile_voucher_payload_with_descriptor(
                         &self.signer,
-                        entry.channel_id,
+                        entry.descriptor.clone().ok_or_else(|| {
+                            MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+                        })?,
                         entry.cumulative_amount,
                         chain_id,
                     )
@@ -811,6 +910,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
+            descriptor: None,
         };
         provider
             .channels
@@ -842,6 +942,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
+            descriptor: None,
         };
 
         provider.notify_update(&entry);
@@ -873,6 +974,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
+            descriptor: None,
         };
         provider
             .channels
@@ -895,6 +997,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
+            descriptor: None,
         };
         provider
             .channels
@@ -1008,6 +1111,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
+            descriptor: None,
         };
 
         // Should not panic when no callback is set
@@ -1033,6 +1137,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
+            descriptor: None,
         };
         provider
             .channels
@@ -1057,6 +1162,7 @@ mod tests {
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened,
+            descriptor: None,
         }
     }
 
@@ -1097,6 +1203,57 @@ mod tests {
     }
 
     // --- send_voucher error paths ---
+
+    #[tokio::test]
+    async fn test_voucher_credential_returns_signed_cumulative_voucher() {
+        use crate::protocol::methods::tempo::session::SessionCredentialPayload;
+
+        let provider = make_test_provider();
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = Address::repeat_byte(0x33);
+        let channel_id = B256::repeat_byte(0x44);
+        let channel_id_hex = channel_id.to_string();
+
+        *provider.last_challenge.lock().unwrap() =
+            Some(make_scoped_challenge(payee, currency, escrow));
+        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow, None);
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id_hex.clone(), key.clone());
+        provider.channels.lock().unwrap().insert(
+            key.clone(),
+            ChannelEntry {
+                channel_id,
+                salt: B256::ZERO,
+                cumulative_amount: 1000,
+                escrow_contract: escrow,
+                chain_id: 42431,
+                opened: true,
+                descriptor: None,
+            },
+        );
+
+        let credential = provider
+            .voucher_credential(&channel_id_hex, 2000)
+            .await
+            .unwrap();
+
+        match credential.payload_as::<SessionCredentialPayload>().unwrap() {
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                cumulative_amount,
+                ..
+            } => {
+                assert_eq!(channel_id, channel_id_hex);
+                assert_eq!(cumulative_amount, "2000");
+            }
+            other => panic!("expected voucher payload, got {other:?}"),
+        }
+        assert_eq!(provider.cumulative(), 2000);
+    }
 
     #[tokio::test]
     async fn test_send_voucher_missing_challenge() {
@@ -1158,6 +1315,7 @@ mod tests {
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
+                descriptor: None,
             },
         );
 
@@ -1219,6 +1377,7 @@ mod tests {
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
+                descriptor: None,
             },
         );
 
@@ -1374,7 +1533,7 @@ mod tests {
         use alloy::signers::local::PrivateKeySigner;
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
-        use crate::client::tempo::session::channel_ops::ChannelEntry;
+        use crate::client::tempo::session::channel_ops::{build_channel_descriptor, ChannelEntry};
         use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
         use crate::protocol::methods::tempo::precompile_voucher::{
             compute_precompile_channel_id, sign_precompile_voucher,
@@ -1400,6 +1559,15 @@ mod tests {
             expiring_nonce_hash,
             chain_id,
         );
+        let descriptor = build_channel_descriptor(
+            payer,
+            payee,
+            operator,
+            currency,
+            salt,
+            authorized_signer,
+            expiring_nonce_hash,
+        );
 
         let provider =
             TempoSessionProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
@@ -1412,7 +1580,7 @@ mod tests {
             Some(operator),
         );
         provider.channels.lock().unwrap().insert(
-            key,
+            key.clone(),
             ChannelEntry {
                 channel_id,
                 salt,
@@ -1420,8 +1588,14 @@ mod tests {
                 escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id,
                 opened: true,
+                descriptor: Some(descriptor.clone()),
             },
         );
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), key);
 
         let req = SessionRequest {
             amount: "500".to_string(),
@@ -1458,10 +1632,15 @@ mod tests {
                 signature,
                 cumulative_amount,
                 channel_id: cid,
+                descriptor: actual_descriptor,
                 ..
             } => {
                 assert_eq!(cumulative_amount, "1500");
                 assert_eq!(cid, channel_id.to_string());
+                assert_eq!(
+                    serde_json::to_value(actual_descriptor).unwrap(),
+                    serde_json::to_value(Some(descriptor.clone())).unwrap()
+                );
                 assert_eq!(
                     signature, expected_hex,
                     "voucher must use precompile EIP-712 domain"
@@ -1469,5 +1648,41 @@ mod tests {
             }
             other => panic!("expected voucher payload, got {other:?}"),
         }
+
+        let close_amount = 1_200;
+        let expected_close_sig =
+            sign_precompile_voucher(&signer, channel_id, close_amount, chain_id)
+                .await
+                .unwrap();
+        let expected_close_hex = alloy::hex::encode_prefixed(&expected_close_sig);
+        let close = provider
+            .close_credential_at(&channel_id.to_string(), close_amount)
+            .await
+            .expect("close credential succeeds");
+        match close
+            .payload_as::<crate::protocol::methods::tempo::session::SessionCredentialPayload>()
+            .unwrap()
+        {
+            crate::protocol::methods::tempo::session::SessionCredentialPayload::Close {
+                channel_id: actual_channel_id,
+                descriptor: actual_descriptor,
+                cumulative_amount,
+                signature,
+            } => {
+                assert_eq!(actual_channel_id, channel_id.to_string());
+                assert_eq!(actual_descriptor, Some(descriptor));
+                assert_eq!(cumulative_amount, close_amount.to_string());
+                assert_eq!(signature, expected_close_hex);
+            }
+            other => panic!("expected close payload, got {other:?}"),
+        }
+
+        let error = provider
+            .close_credential_at(&channel_id.to_string(), 1_501)
+            .await
+            .expect_err("close amount above the voucher ceiling must fail");
+        assert!(error
+            .to_string()
+            .contains("exceeds locally authorized cumulative amount"));
     }
 }
