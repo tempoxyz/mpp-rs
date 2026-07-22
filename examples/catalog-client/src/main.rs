@@ -1,4 +1,4 @@
-use std::{env, sync::Arc};
+use std::{env, io::Read, sync::Arc};
 
 use mpp::{
     client::{
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = args
         .next()
         .ok_or("usage: mpp-catalog-client METHOD URL [BODY]")?;
-    let body = args.next();
+    let body = read_body(args.next())?;
     if args.next().is_some() {
         return Err("usage: mpp-catalog-client METHOD URL [BODY]".into());
     }
@@ -106,10 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let request = client.request(method, target).headers(request_headers);
     let request = match body {
-        Some(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(value) => request.json(&value),
-            Err(_) => request.body(body),
-        },
+        Some(RequestBody::Json(value)) => request.json(&value),
+        Some(RequestBody::Raw(bytes)) => request.body(bytes),
         None => request,
     };
     let response = request.send_with_payment(&providers).await?;
@@ -118,6 +116,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("status={status}");
     println!("{response_body}");
     Ok(())
+}
+
+enum RequestBody {
+    Json(serde_json::Value),
+    Raw(Vec<u8>),
+}
+
+fn read_body(argument: Option<String>) -> Result<Option<RequestBody>, Box<dyn std::error::Error>> {
+    let Some(argument) = argument else {
+        return Ok(None);
+    };
+    if argument == "-" {
+        let mut bytes = Vec::new();
+        std::io::stdin().read_to_end(&mut bytes)?;
+        return Ok(Some(RequestBody::Raw(bytes)));
+    }
+    if let Some(path) = argument.strip_prefix('@') {
+        return Ok(Some(RequestBody::Raw(std::fs::read(path)?)));
+    }
+    Ok(Some(
+        serde_json::from_str(&argument)
+            .map(RequestBody::Json)
+            .unwrap_or_else(|_| RequestBody::Raw(argument.into_bytes())),
+    ))
 }
 
 fn read_u128(name: &str, default: u128) -> Result<u128, Box<dyn std::error::Error>> {

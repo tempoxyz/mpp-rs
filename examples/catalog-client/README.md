@@ -19,8 +19,11 @@ cargo run -p catalog-client-example -- \
 ```
 
 The optional third positional argument is sent as JSON when it parses as JSON,
-or as a raw request body otherwise. Set `MPP_REQUEST_HEADERS` to a JSON object
-for application-specific headers.
+or as a raw request body otherwise. Pass `-` to read raw bytes from stdin or
+`@PATH` to read them from a file. Set `MPP_REQUEST_HEADERS` to a JSON object for
+application-specific headers and content types. Together these cover the
+catalog's JSON, form, file, and authenticated application requests without
+service-specific payment adapters.
 
 Configuration:
 
