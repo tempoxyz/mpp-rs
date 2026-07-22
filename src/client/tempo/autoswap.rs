@@ -8,8 +8,8 @@
 //!
 //! 1. Check the client's balance of the challenge currency
 //! 2. If balance >= amount, no swap needed — proceed normally
-//! 3. If balance < amount, compute the deficit and query the DEX for a quote
-//! 4. Prepend a `swapExactAmountOut` call to the transaction's call list
+//! 3. If balance < amount, query the DEX for an exact-output quote
+//! 4. Prepend `approve` and `swapExactAmountOut` calls to the transaction
 //!    so the swap and transfer execute atomically in a single AA transaction
 //!
 //! # Example
@@ -99,6 +99,17 @@ pub async fn quote_swap<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>
     Ok(amount_in)
 }
 
+/// Build the approval required by the Stablecoin DEX.
+pub fn build_approve_call(token_in: Address, max_amount_in: u128) -> Call {
+    Call {
+        to: TxKind::Call(token_in),
+        value: U256::ZERO,
+        input: Bytes::from(
+            ITIP20::approveCall::new((DEX_ADDRESS, U256::from(max_amount_in))).abi_encode(),
+        ),
+    }
+}
+
 /// Build the swap call to prepend to the transaction.
 ///
 /// Applies slippage tolerance to the quoted `amount_in` to compute `max_amount_in`.
@@ -129,20 +140,20 @@ pub fn build_swap_call(
     }
 }
 
-/// Resolve autoswap: check balance, quote, and return the swap call if needed.
+/// Resolve autoswap: check balance, quote, and return the approval + swap calls if needed.
 ///
-/// Returns `Ok(Some(call))` if a swap is needed, `Ok(None)` if balance is sufficient.
+/// Returns `Ok(Some(calls))` if a swap is needed, `Ok(None)` if balance is sufficient.
 ///
 /// Validates that:
 /// 1. The slippage tolerance is within bounds
 /// 2. The user has sufficient `token_in` balance to cover `max_amount_in`
-pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>>(
+pub async fn resolve_autoswap_calls<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>>(
     provider: &P,
     owner: Address,
     currency: Address,
     amount: U256,
     config: &AutoswapConfig,
-) -> Result<Option<Call>, MppError> {
+) -> Result<Option<Vec<Call>>, MppError> {
     if config.slippage_bps > MAX_SLIPPAGE_BPS {
         return Err(MppError::InvalidConfig(format!(
             "autoswap slippage {}bps exceeds maximum {}bps",
@@ -155,17 +166,18 @@ pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNe
         return Ok(None);
     }
 
-    let deficit = match check_balance_deficit(provider, owner, currency, amount).await? {
-        Some(d) => d,
+    match check_balance_deficit(provider, owner, currency, amount).await? {
+        Some(_) => {}
         None => return Ok(None),
-    };
+    }
 
-    // Convert deficit to u128 for the DEX call (TIP-20 tokens use u128 amounts).
-    let deficit_u128: u128 = deficit
+    // Match MPPx: acquire the full requested output amount when the target
+    // balance is insufficient, leaving any pre-existing dust untouched.
+    let amount_out: u128 = amount
         .try_into()
-        .map_err(|_| MppError::InvalidAmount(format!("deficit {} exceeds u128", deficit)))?;
+        .map_err(|_| MppError::InvalidAmount(format!("amount {amount} exceeds u128")))?;
 
-    let quoted_amount_in = quote_swap(provider, config.token_in, currency, deficit_u128).await?;
+    let quoted_amount_in = quote_swap(provider, config.token_in, currency, amount_out).await?;
 
     // Compute max_amount_in with slippage and verify the user can cover it.
     let max_amount_in =
@@ -182,13 +194,35 @@ pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNe
         ));
     }
 
-    Ok(Some(build_swap_call(
-        config.token_in,
-        currency,
-        deficit_u128,
-        quoted_amount_in,
-        config.slippage_bps,
-    )))
+    Ok(Some(vec![
+        build_approve_call(config.token_in, max_amount_in),
+        build_swap_call(
+            config.token_in,
+            currency,
+            amount_out,
+            quoted_amount_in,
+            config.slippage_bps,
+        ),
+    ]))
+}
+
+/// Resolve the DEX swap call without its approval call.
+///
+/// This compatibility helper preserves the original API. Transaction builders
+/// should use [`resolve_autoswap_calls`] so the DEX approval and swap execute
+/// atomically in the correct order.
+pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>>(
+    provider: &P,
+    owner: Address,
+    currency: Address,
+    amount: U256,
+    config: &AutoswapConfig,
+) -> Result<Option<Call>, MppError> {
+    Ok(
+        resolve_autoswap_calls(provider, owner, currency, amount, config)
+            .await?
+            .and_then(|mut calls| calls.pop()),
+    )
 }
 
 #[cfg(test)]
@@ -245,5 +279,59 @@ mod tests {
         let decoded =
             IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..]).unwrap();
         assert_eq!(decoded.maxAmountIn, 1_050_000);
+    }
+
+    #[test]
+    fn test_build_approve_call() {
+        let token_in = address!("0x20c0000000000000000000000000000000000000");
+        let call = build_approve_call(token_in, 5_050_500);
+
+        assert_eq!(call.to, TxKind::Call(token_in));
+        let decoded = ITIP20::approveCall::abi_decode_raw(&call.input[4..]).unwrap();
+        assert_eq!(decoded.spender, DEX_ADDRESS);
+        assert_eq!(decoded.amount, U256::from(5_050_500));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_autoswap_returns_approve_then_swap() {
+        use alloy::{
+            primitives::Bytes,
+            providers::{mock::Asserter, ProviderBuilder},
+        };
+
+        let token_in = address!("0x20c0000000000000000000000000000000000000");
+        let token_out = address!("0x20C000000000000000000000b9537d11c60E8b50");
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            &U256::from(52_906),
+        )));
+        asserter.push_success(&Bytes::from(
+            IStablecoinDEX::quoteSwapExactAmountOutCall::abi_encode_returns(&5_000_500u128),
+        ));
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            &U256::from(16_852_785),
+        )));
+        let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+
+        let calls = resolve_autoswap_calls(
+            &provider,
+            Address::repeat_byte(0x11),
+            token_out,
+            U256::from(5_000_000),
+            &AutoswapConfig::new(token_in, 100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(calls.len(), 2);
+        let approve = ITIP20::approveCall::abi_decode_raw(&calls[0].input[4..]).unwrap();
+        assert_eq!(approve.spender, DEX_ADDRESS);
+        assert_eq!(approve.amount, U256::from(5_050_505));
+        let swap =
+            IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&calls[1].input[4..]).unwrap();
+        assert_eq!(swap.amountOut, 5_000_000);
+        assert_eq!(swap.maxAmountIn, 5_050_505);
     }
 }

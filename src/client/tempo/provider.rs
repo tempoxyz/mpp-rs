@@ -181,7 +181,7 @@ impl PaymentProvider for TempoProvider {
             let provider =
                 alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
 
-            if let Some(swap_call) = super::autoswap::resolve_autoswap(
+            if let Some(swap_calls) = super::autoswap::resolve_autoswap_calls(
                 &provider,
                 from,
                 charge.currency(),
@@ -190,7 +190,11 @@ impl PaymentProvider for TempoProvider {
             )
             .await?
             {
-                charge = charge.with_prepended_call(swap_call)?;
+                // `with_prepended_call` inserts at index zero, so walk the
+                // sequence backwards to retain approve -> swap -> transfer.
+                for call in swap_calls.into_iter().rev() {
+                    charge = charge.with_prepended_call(call)?;
+                }
             }
         }
 

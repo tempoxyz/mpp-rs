@@ -859,6 +859,8 @@ pub fn create_precompile_top_up_payload(
 /// (always the precompile) with `operator`. `deposit` and `initial_amount`
 /// must fit `uint96`.
 pub struct OpenPrecompilePayloadOptions {
+    /// Calls executed atomically before the channel open.
+    pub prefix_calls: Vec<Call>,
     /// Optional relayer for `settle`/`close`; `Address::ZERO` = payee-only.
     pub operator: Address,
     /// Voucher signer; defaults to `payer` if `None`.
@@ -873,6 +875,8 @@ pub struct OpenPrecompilePayloadOptions {
 
 /// Options for a descriptor-backed TIP-1034 top-up transaction.
 pub struct TopUpPrecompilePayloadOptions<'a> {
+    /// Calls executed atomically before the channel top-up.
+    pub prefix_calls: Vec<Call>,
     /// Existing channel descriptor.
     pub descriptor: &'a ChannelDescriptor,
     /// Amount added to the existing channel deposit.
@@ -883,9 +887,10 @@ pub struct TopUpPrecompilePayloadOptions<'a> {
     pub fee_payer: bool,
 }
 
-/// Open payload targeting the TIP-1034 reserve precompile. Single-call tx
-/// (no `approve` needed: precompile is on the TIP-1035 implicit approvals
-/// list). Channel id is derived against the unsigned tx's `expiringNonceHash`.
+/// Open payload targeting the TIP-1034 reserve precompile. The escrow open
+/// itself needs no approval because the precompile is on the TIP-1035 implicit
+/// approvals list; optional prefix calls may acquire the deposit currency.
+/// Channel id is derived against the complete unsigned tx's `expiringNonceHash`.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_open_payload<P, S>(
     provider: &P,
@@ -928,11 +933,12 @@ where
     ))
     .abi_encode();
 
-    let calls = vec![Call {
+    let mut calls = options.prefix_calls;
+    calls.push(Call {
         to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
         value: U256::ZERO,
         input: Bytes::from(open_data),
-    }];
+    });
 
     let nonce = if options.fee_payer {
         0
@@ -1069,13 +1075,14 @@ where
     let signing_mode = signing_mode.unwrap_or(&default_mode);
     let primitive_signer = signer.clone().into();
     let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
-    let calls = vec![Call {
+    let mut calls = options.prefix_calls;
+    calls.push(Call {
         to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
         value: U256::ZERO,
         input: Bytes::from(
             ITIP20ChannelReserve::topUpCall::new((descriptor, additional_deposit)).abi_encode(),
         ),
-    }];
+    });
     let nonce = if options.fee_payer {
         0
     } else {
@@ -1398,6 +1405,7 @@ mod tests {
             .connect_http("http://localhost:1".parse().unwrap());
 
         let opts = OpenPrecompilePayloadOptions {
+            prefix_calls: Vec::new(),
             operator: Address::ZERO,
             authorized_signer: None,
             payee: Address::repeat_byte(0x11),

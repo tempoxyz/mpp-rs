@@ -13,10 +13,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alloy::{
-    primitives::{Address, B256},
+    primitives::{Address, B256, U256},
+    providers::Provider,
     signers::Signer,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use tempo_alloy::TempoNetwork;
+use tempo_primitives::transaction::Call;
 
 use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload,
@@ -32,6 +35,7 @@ use self::recovery::{
 use self::store::{
     channel_key as persistent_channel_key, ChannelStore, MemoryChannelStore, StoredChannelEntry,
 };
+use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
 use crate::client::PaymentProvider;
 use crate::error::{MppError, ResultExt};
@@ -75,6 +79,8 @@ pub struct TempoSessionProvider {
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
     default_deposit: Option<u128>,
+    /// Stablecoin used to acquire the session currency before open/top-up.
+    autoswap: Option<AutoswapConfig>,
     /// Channel registry: key is `payee:currency:escrow` (lowercase).
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Durable channel view. Recovery policy remains owned by this provider.
@@ -112,6 +118,7 @@ impl TempoSessionProvider {
             signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
             max_deposit: None,
             default_deposit: None,
+            autoswap: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
@@ -153,6 +160,17 @@ impl TempoSessionProvider {
     pub fn with_default_deposit(mut self, amount: u128) -> Self {
         self.default_deposit = Some(amount);
         self
+    }
+
+    /// Enable atomic stablecoin swaps before native session opens and top-ups.
+    pub fn with_autoswap(mut self, config: AutoswapConfig) -> Self {
+        self.autoswap = Some(config);
+        self
+    }
+
+    /// Get the autoswap configuration, if set.
+    pub fn autoswap(&self) -> Option<&AutoswapConfig> {
+        self.autoswap.as_ref()
     }
 
     /// Persist reusable native MPP channels in `store`.
@@ -213,6 +231,27 @@ impl TempoSessionProvider {
             }
         }
         Ok(())
+    }
+
+    async fn autoswap_calls<P: Provider<TempoNetwork>>(
+        &self,
+        provider: &P,
+        payer: Address,
+        currency: Address,
+        amount: u128,
+    ) -> Result<Vec<Call>, MppError> {
+        let Some(config) = &self.autoswap else {
+            return Ok(Vec::new());
+        };
+        Ok(super::autoswap::resolve_autoswap_calls(
+            provider,
+            payer,
+            currency,
+            U256::from(amount),
+            config,
+        )
+        .await?
+        .unwrap_or_default())
     }
 
     fn required_top_up(
@@ -737,12 +776,24 @@ impl TempoSessionProvider {
         let payer = self.signing_mode.from_address(self.signer.address());
         let provider =
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
+        let prefix_calls = self
+            .autoswap_calls(
+                &provider,
+                payer,
+                descriptor
+                    .token
+                    .parse()
+                    .mpp_config("invalid TIP-1034 descriptor token")?,
+                additional_deposit,
+            )
+            .await?;
         let payload = create_precompile_top_up_transaction_payload(
             &provider,
             &self.signer,
             Some(&self.signing_mode),
             payer,
             TopUpPrecompilePayloadOptions {
+                prefix_calls,
                 descriptor,
                 additional_deposit,
                 chain_id: entry.chain_id,
@@ -1477,12 +1528,16 @@ impl TempoSessionProvider {
         }
 
         let (entry, payload) = if precompile {
+            let prefix_calls = self
+                .autoswap_calls(&provider, payer, currency, deposit)
+                .await?;
             create_precompile_open_payload(
                 &provider,
                 &self.signer,
                 Some(&self.signing_mode),
                 payer,
                 OpenPrecompilePayloadOptions {
+                    prefix_calls,
                     operator: operator.unwrap_or(Address::ZERO),
                     authorized_signer: Some(authorized_signer),
                     payee,
@@ -1593,18 +1648,22 @@ mod tests {
         let auth_signer: Address = "0x2222222222222222222222222222222222222222"
             .parse()
             .unwrap();
+        let swap_token = Address::repeat_byte(0x33);
+        let autoswap = AutoswapConfig::new(swap_token, 100);
 
         let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
             .unwrap()
             .with_escrow_contract(escrow)
             .with_authorized_signer(auth_signer)
             .with_max_deposit(1_000_000)
-            .with_default_deposit(500_000);
+            .with_default_deposit(500_000)
+            .with_autoswap(autoswap);
 
         assert_eq!(provider.escrow_contract, Some(escrow));
         assert_eq!(provider.authorized_signer, Some(auth_signer));
         assert_eq!(provider.max_deposit, Some(1_000_000));
         assert_eq!(provider.default_deposit, Some(500_000));
+        assert_eq!(provider.autoswap().unwrap().token_in, swap_token);
     }
 
     #[test]
