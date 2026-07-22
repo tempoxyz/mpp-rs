@@ -33,7 +33,9 @@ pub mod tx_builder;
 use std::num::NonZeroU64;
 
 use alloy::primitives::{Address, TxKind, U256};
-use tempo_primitives::transaction::{Call, SignedKeyAuthorization, TempoTransaction};
+use tempo_primitives::transaction::{
+    Call, SignatureType, SignedKeyAuthorization, TempoTransaction,
+};
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::client::tempo::signing::{
@@ -83,6 +85,18 @@ fn encode_transfer(
             }
             .abi_encode(),
         )
+    }
+}
+
+fn apply_estimation_signer_hints(
+    request: &mut TempoTransactionRequest,
+    signing_mode: &TempoSigningMode,
+    signer_address: Address,
+    signature_type: SignatureType,
+) {
+    request.key_type = Some(signature_type);
+    if matches!(signing_mode, TempoSigningMode::Keychain { .. }) {
+        request.key_id = Some(signer_address);
     }
 }
 
@@ -244,7 +258,7 @@ impl TempoCharge {
         signer: &(impl alloy::signers::Signer + Clone),
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        self.prepare(signer.address(), options)
+        self.prepare(signer.address(), SignatureType::Secp256k1, options)
             .await?
             .sign_secp256k1(signer)
             .await
@@ -260,15 +274,24 @@ impl TempoCharge {
         signer: &TempoPrimitiveSigner,
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        self.prepare(alloy::signers::Signer::address(signer), options)
-            .await?
-            .sign_primitive(signer)
-            .await
+        let signature_type = match signer {
+            TempoPrimitiveSigner::Secp256k1(_) => SignatureType::Secp256k1,
+            TempoPrimitiveSigner::P256(_) => SignatureType::P256,
+        };
+        self.prepare(
+            alloy::signers::Signer::address(signer),
+            signature_type,
+            options,
+        )
+        .await?
+        .sign_primitive(signer)
+        .await
     }
 
     async fn prepare(
         self,
         signer_address: Address,
+        signature_type: SignatureType,
         options: SignOptions,
     ) -> Result<PreparedTempoCharge, MppError> {
         let signing_mode = options.signing_mode.unwrap_or_default();
@@ -372,6 +395,7 @@ impl TempoCharge {
             req.inner.nonce = Some(nonce);
             req.inner.max_fee_per_gas = Some(max_fee_per_gas);
             req.inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
+            apply_estimation_signer_hints(&mut req, &signing_mode, signer_address, signature_type);
 
             estimate_gas(&provider, req).await?
         };
@@ -670,6 +694,41 @@ mod tests {
         assert!(opts.key_authorization.is_none());
         assert!(opts.valid_before.is_none());
         assert!(opts.nonce_key.is_none());
+    }
+
+    #[test]
+    fn estimation_hints_direct_signature_type_without_key_id() {
+        let signer = Address::repeat_byte(0x11);
+        let mut request = TempoTransactionRequest::default();
+
+        apply_estimation_signer_hints(
+            &mut request,
+            &TempoSigningMode::Direct,
+            signer,
+            SignatureType::Secp256k1,
+        );
+
+        assert_eq!(request.key_type, Some(SignatureType::Secp256k1));
+        assert_eq!(request.key_id, None);
+    }
+
+    #[test]
+    fn estimation_hints_keychain_p256_access_key() {
+        use crate::client::tempo::signing::KeychainVersion;
+
+        let signer = Address::repeat_byte(0x11);
+        let wallet = Address::repeat_byte(0x22);
+        let mode = TempoSigningMode::Keychain {
+            wallet,
+            version: KeychainVersion::V2,
+            key_authorization: None,
+        };
+        let mut request = TempoTransactionRequest::default();
+
+        apply_estimation_signer_hints(&mut request, &mode, signer, SignatureType::P256);
+
+        assert_eq!(request.key_type, Some(SignatureType::P256));
+        assert_eq!(request.key_id, Some(signer));
     }
 
     #[test]

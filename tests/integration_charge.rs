@@ -1520,6 +1520,13 @@ async fn test_keychain_source_did_consistent_across_proof_and_paid() {
     // Fund the wallet address (access key signs on its behalf).
     fund_account(&rpc, server_signer.address()).await;
     fund_account(&rpc, wallet_signer.address()).await;
+    wallet_authorize_access_key(
+        &rpc,
+        &wallet_signer,
+        access_key_signer.address(),
+        U256::from(1_000_000u64),
+    )
+    .await;
 
     let mpp = Mpp::create(
         tempo(TempoConfig {
