@@ -2,7 +2,7 @@
 //!
 //! Provides `.send_with_payment()` method for opt-in per-request payment handling.
 
-use reqwest::header::WWW_AUTHENTICATE;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
@@ -17,9 +17,7 @@ use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
-use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
-};
+use crate::protocol::core::{format_authorization, parse_www_authenticate_all};
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -321,8 +319,27 @@ impl PaymentExt for RequestBuilder {
                 }
             };
 
-            let retry = retry_builder.try_clone().ok_or(HttpError::CloneFailed)?;
-            resp = match retry.header(AUTHORIZATION_HEADER, auth_header).send().await {
+            let auth_header = match HeaderValue::from_str(&auth_header) {
+                Ok(auth_header) => auth_header,
+                Err(err) => {
+                    let http_err = HttpError::InvalidCredential(err.to_string());
+                    events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: http_err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    return Err(http_err);
+                }
+            };
+            let mut payment_headers = HeaderMap::new();
+            payment_headers.insert(AUTHORIZATION, auth_header);
+            let retry = retry_builder
+                .try_clone()
+                .ok_or(HttpError::CloneFailed)?
+                .headers(payment_headers);
+            resp = match retry.send().await {
                 Ok(resp) => resp,
                 Err(err) => {
                     let http_err = HttpError::Request(err);
@@ -517,6 +534,53 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
             assert_eq!(call_count.load(Ordering::SeqCst), 2); // initial 402 + retry
+        }
+
+        #[tokio::test]
+        async fn test_paid_retry_replaces_caller_authorization() {
+            let (_, www_auth) = test_challenge();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        let authorization = req
+                            .headers()
+                            .get_all("authorization")
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .collect::<Vec<_>>();
+                        match authorization.as_slice() {
+                            [value] if value.starts_with("Payment ") => {
+                                (AxumStatusCode::OK, "ok").into_response()
+                            }
+                            ["Bearer upstream-token"] => (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response(),
+                            _ => (AxumStatusCode::BAD_REQUEST, "duplicate authorization")
+                                .into_response(),
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .bearer_auth("upstream-token")
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
         }
 
         #[tokio::test]
