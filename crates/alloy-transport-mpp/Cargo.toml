@@ -29,7 +29,7 @@ alloy-transport-ws = { version = "2.1.0", default-features = false }
 mpp = { path = "../..", default-features = false, features = ["ws"] }
 
 futures = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -53,8 +53,20 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 tokio-tungstenite = "0.28"
 
 [features]
-default = ["aws-lc-rs"]
-aws-lc-rs = ["alloy-transport-ws/aws-lc-rs", "dep:rustls", "rustls?/aws-lc-rs"]
-ring = ["alloy-transport-ws/ring", "dep:rustls", "rustls?/ring"]
-native-tls = ["alloy-transport-ws/native-tls"]
-rustls-tls = ["alloy-transport-ws/rustls-tls"]
+# Ring is the lightweight default. Consumers that require a different TLS
+# backend should disable default features and select exactly one below.
+default = ["ring"]
+aws-lc-rs = [
+  "alloy-transport-ws/aws-lc-rs",
+  "dep:rustls",
+  "reqwest/rustls",
+  "rustls?/aws-lc-rs",
+]
+ring = [
+  "alloy-transport-ws/ring",
+  "dep:rustls",
+  "reqwest/rustls-no-provider",
+  "rustls?/ring",
+]
+native-tls = ["alloy-transport-ws/native-tls", "reqwest/native-tls"]
+rustls-tls = ["alloy-transport-ws/rustls-tls", "reqwest/rustls-no-provider"]

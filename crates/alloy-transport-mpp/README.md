@@ -12,6 +12,17 @@ internally via a user-supplied
 [`PaymentProvider`](https://docs.rs/mpp/latest/mpp/client/trait.PaymentProvider.html)
 (and a `VoucherProvider` for streaming/session intents).
 
+Ring is the default TLS backend. Select another backend explicitly and disable
+default features so Cargo does not compile more than one crypto provider:
+
+```toml
+alloy-transport-mpp = { git = "https://github.com/tempoxyz/mpp-rs", default-features = false, features = ["aws-lc-rs"] }
+```
+
+The available backend features are `ring`, `aws-lc-rs`, and `native-tls`.
+`rustls-tls` exposes the provider-neutral Rustls plumbing for applications that
+install their own process-wide Rustls crypto provider.
+
 ```rust,ignore
 use alloy_provider::ProviderBuilder;
 use alloy_transport_mpp::MppWsConnect;
