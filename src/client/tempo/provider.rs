@@ -104,6 +104,10 @@ impl TempoProvider {
         self.autoswap.as_ref()
     }
 
+    fn fee_token(&self) -> Option<alloy::primitives::Address> {
+        self.autoswap.as_ref().map(|config| config.token_in)
+    }
+
     /// Pin the chain ID this provider will pay on. When set, [`pay`] rejects any
     /// challenge whose `methodDetails.chainId` differs, before signing.
     ///
@@ -172,7 +176,10 @@ impl PaymentProvider for TempoProvider {
             charge = charge.with_memo(memo);
         }
 
-        // If autoswap is enabled, check balance and prepend a swap call if needed.
+        // If autoswap is configured, keep gas payable in the funded input token
+        // even when the output-token balance already covers the charge itself.
+        // Otherwise the transfer can leave too little output token for gas.
+        let fee_token = self.fee_token();
         if let Some(autoswap_config) = &self.autoswap {
             let from = self
                 .signing_mode
@@ -201,6 +208,7 @@ impl PaymentProvider for TempoProvider {
         let options = SignOptions {
             rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
+            fee_token,
             ..Default::default()
         };
         let signed = charge
@@ -268,6 +276,17 @@ mod tests {
             provider.signing_mode(),
             TempoSigningMode::Keychain { .. }
         ));
+    }
+
+    #[test]
+    fn autoswap_input_token_is_always_used_for_fees() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let token_in = alloy::primitives::Address::repeat_byte(0x11);
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_autoswap(AutoswapConfig::new(token_in, 100));
+
+        assert_eq!(provider.fee_token(), Some(token_in));
     }
 
     #[test]
