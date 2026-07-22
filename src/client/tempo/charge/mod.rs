@@ -251,6 +251,7 @@ impl TempoCharge {
                 PaymentPayload::proof(
                     proof::sign_proof(
                         signer,
+                        from,
                         self.chain_id,
                         &self.challenge.id,
                         &self.challenge.realm,
