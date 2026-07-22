@@ -37,11 +37,26 @@ pub struct SessionSnapshot {
     pub deposit: String,
     pub descriptor: ChannelDescriptor,
     pub escrow: String,
+    /// Highest server-accepted voucher, used to resume into an empty store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highest_voucher: Option<SnapshotVoucher>,
     pub required_cumulative: String,
     pub settled: String,
     pub spent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub units: Option<u64>,
+}
+
+/// Signed voucher included in a reusable server session snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVoucher {
+    /// Channel identifier covered by the voucher.
+    pub channel_id: String,
+    /// Server-accepted cumulative amount.
+    pub cumulative_amount: String,
+    /// Canonical TIP-1020 primitive signature.
+    pub signature: String,
 }
 
 /// Custom deserializer that only accepts the literal string "transaction".
