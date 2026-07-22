@@ -304,6 +304,22 @@ impl TempoCharge {
         let provider =
             alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
 
+        let managed_key_authorization = if options.key_authorization.is_none() {
+            crate::client::tempo::signing::keychain::resolve_key_authorization(
+                &provider,
+                &signing_mode,
+                signer_address,
+            )
+            .await?
+        } else {
+            None
+        };
+        let key_authorization = options
+            .key_authorization
+            .as_deref()
+            .cloned()
+            .or(managed_key_authorization);
+
         let calls = match self.calls {
             Some(c) => c,
             None => self.build_transfer_calls()?,
@@ -339,14 +355,9 @@ impl TempoCharge {
             // co-signs and pays for gas.
             1_000_000
         } else {
-            let key_auth = options
-                .key_authorization
-                .as_deref()
-                .or_else(|| signing_mode.key_authorization());
-
             let mut req = TempoTransactionRequest {
                 calls: calls.clone(),
-                key_authorization: key_auth.cloned(),
+                key_authorization: key_authorization.clone(),
                 ..Default::default()
             }
             .with_fee_token(fee_token)
@@ -366,12 +377,6 @@ impl TempoCharge {
         };
 
         // Build the key_authorization for the transaction
-        let tx_key_authorization = options
-            .key_authorization
-            .as_deref()
-            .or_else(|| signing_mode.key_authorization())
-            .cloned();
-
         let tx = build_tempo_tx(TempoTxOptions {
             calls,
             chain_id: self.chain_id,
@@ -383,7 +388,7 @@ impl TempoCharge {
             max_priority_fee_per_gas,
             fee_payer: self.fee_payer,
             valid_before,
-            key_authorization: tx_key_authorization,
+            key_authorization,
         });
 
         Ok(PreparedTempoCharge {

@@ -6,10 +6,13 @@
 
 use alloy::primitives::{Address, U256};
 use tempo_alloy::contracts::precompiles::{IAccountKeychain, ACCOUNT_KEYCHAIN_ADDRESS};
+use tempo_alloy::TempoNetwork;
 use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::client::tempo::TempoClientError;
 use crate::error::{MppError, ResultExt};
+
+use super::TempoSigningMode;
 
 /// Validate key info returned from the keychain precompile.
 ///
@@ -32,6 +35,74 @@ fn validate_key_info(
     Ok(key_info.enforceLimits)
 }
 
+/// Resolve a stored one-time key authorization against authoritative chain state.
+///
+/// Tempo Wallet persists the signed authorization so a newly created access key
+/// can provision itself with its first transaction. Once the key exists on-chain,
+/// replaying that authorization fails with `KeyAlreadyExists`. Match viem's Tempo
+/// transaction preparation: attach the stored authorization only while the access
+/// key is not currently active on the wallet's keychain.
+pub(crate) async fn resolve_key_authorization<P: alloy::providers::Provider<TempoNetwork>>(
+    provider: &P,
+    signing_mode: &TempoSigningMode,
+    key_address: Address,
+) -> Result<Option<SignedKeyAuthorization>, MppError> {
+    let TempoSigningMode::Keychain {
+        wallet,
+        key_authorization: Some(key_authorization),
+        ..
+    } = signing_mode
+    else {
+        return Ok(None);
+    };
+
+    let now_secs = unix_time_secs();
+    if key_authorization
+        .authorization
+        .expiry
+        .is_some_and(|expiry| expiry.get() <= now_secs)
+    {
+        return Ok(None);
+    }
+
+    let keychain = IAccountKeychain::new(ACCOUNT_KEYCHAIN_ADDRESS, provider);
+    let key_info = keychain
+        .getKey(*wallet, key_address)
+        .call()
+        .await
+        .mpp_http("failed to query key authorization state")?;
+
+    if should_attach_key_authorization(key_authorization, &key_info, key_address, now_secs) {
+        Ok(Some(key_authorization.as_ref().clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn should_attach_key_authorization(
+    key_authorization: &SignedKeyAuthorization,
+    key_info: &IAccountKeychain::KeyInfo,
+    key_address: Address,
+    now_secs: u64,
+) -> bool {
+    if key_authorization
+        .authorization
+        .expiry
+        .is_some_and(|expiry| expiry.get() <= now_secs)
+    {
+        return false;
+    }
+
+    key_info.keyId != key_address || key_info.isRevoked || key_info.expiry <= now_secs
+}
+
+fn unix_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Query the key's remaining spending limit for a token.
 ///
 /// Returns `Ok(None)` if the key doesn't enforce limits (unlimited spending),
@@ -47,10 +118,7 @@ pub async fn query_key_spending_limit<P: alloy::providers::Provider>(
 ) -> Result<Option<U256>, MppError> {
     let keychain = IAccountKeychain::new(ACCOUNT_KEYCHAIN_ADDRESS, provider);
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now_secs = unix_time_secs();
 
     let key_info = keychain
         .getKey(wallet_address, key_address)
@@ -277,6 +345,63 @@ mod tests {
             format!("{:#x}", ACCOUNT_KEYCHAIN_ADDRESS),
             "0xaaaaaaaa00000000000000000000000000000000"
         );
+    }
+
+    #[test]
+    fn test_pending_authorization_is_dropped_for_active_on_chain_key() {
+        let signer = test_signer();
+        let key_authorization = make_signed_auth(&signer, None);
+        let mut key_info = make_key_info(9_999_999_999, false, false);
+        key_info.keyId = signer.address();
+
+        assert!(!should_attach_key_authorization(
+            &key_authorization,
+            &key_info,
+            signer.address(),
+            1_000,
+        ));
+    }
+
+    #[test]
+    fn test_pending_authorization_is_kept_for_missing_on_chain_key() {
+        let signer = test_signer();
+        let key_authorization = make_signed_auth(&signer, None);
+        let key_info = make_key_info(0, false, false);
+
+        assert!(should_attach_key_authorization(
+            &key_authorization,
+            &key_info,
+            signer.address(),
+            1_000,
+        ));
+    }
+
+    #[test]
+    fn test_expired_pending_authorization_is_dropped() {
+        let signer = test_signer();
+        let authorization = KeyAuthorization {
+            chain_id: 42431,
+            key_type: SignatureType::Secp256k1,
+            key_id: signer.address(),
+            expiry: NonZeroU64::new(1_000),
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let signature = signer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let key_authorization = authorization.into_signed(PrimitiveSignature::Secp256k1(signature));
+        let key_info = make_key_info(0, false, false);
+
+        assert!(!should_attach_key_authorization(
+            &key_authorization,
+            &key_info,
+            signer.address(),
+            1_000,
+        ));
     }
 
     // --- validate_key_info tests ---
