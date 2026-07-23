@@ -2,6 +2,6 @@
 "mpp": patch
 ---
 
-Refuse a second, distinct charge challenge after a payment credential has been
-submitted for the same HTTP request, while preserving incremental session
-top-up retries.
+Continue retrying distinct charge challenges within the configured payment
+retry limit, matching MPPx and allowing sponsored servers to rotate challenges
+that were rejected before settlement.

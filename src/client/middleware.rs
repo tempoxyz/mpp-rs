@@ -12,7 +12,6 @@ use crate::client::accept_payment_policy::AcceptPaymentPolicy;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
-use crate::client::error::HttpError;
 use crate::client::events::{
     ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
     CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
@@ -185,7 +184,6 @@ where
         };
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
-        let mut submitted_charge_id: Option<String> = None;
 
         for attempt in 0..self.max_payment_retries {
             if resp.status() != StatusCode::PAYMENT_REQUIRED {
@@ -254,7 +252,7 @@ where
                 }
             };
 
-            if paid_challenge_ids.contains(&challenge.id) {
+            if !paid_challenge_ids.insert(challenge.id.clone()) {
                 self.events
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
@@ -264,29 +262,6 @@ where
                     .await;
                 return Ok(resp);
             }
-            if challenge.intent.as_str() == "charge" {
-                if let Some(paid_challenge_id) = &submitted_charge_id {
-                    let retry_challenge_id = challenge.id.clone();
-                    let error = HttpError::IndeterminatePayment {
-                        paid_challenge_id: paid_challenge_id.clone(),
-                        retry_challenge_id: retry_challenge_id.clone(),
-                    };
-                    self.events
-                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                            challenge: Some(challenge),
-                            error: error.to_string(),
-                            reason: Some(PaymentFailureReason::IndeterminateCharge {
-                                paid_challenge_id: paid_challenge_id.clone(),
-                                retry_challenge_id,
-                            }),
-                        }))
-                        .await;
-                    return Err(reqwest_middleware::Error::Middleware(anyhow::Error::new(
-                        error,
-                    )));
-                }
-            }
-            paid_challenge_ids.insert(challenge.id.clone());
 
             let override_credential = self
                 .events
@@ -320,9 +295,6 @@ where
                     credential: credential.clone(),
                 }))
                 .await;
-            if challenge.intent.as_str() == "charge" {
-                submitted_charge_id = Some(challenge.id.clone());
-            }
 
             let auth_header =
                 match format_authorization(&credential).context("failed to format credential") {
@@ -517,14 +489,6 @@ mod tests {
 
         fn test_challenge_with_id(id: &str) -> (PaymentChallenge, String) {
             test_challenge_with_id_and_expires(id, None)
-        }
-
-        fn test_challenge_with_intent(id: &str, intent: &str) -> (PaymentChallenge, String) {
-            let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "500"})).unwrap();
-            let challenge =
-                PaymentChallenge::new(id, "middleware.example.com", "tempo", intent, request);
-            let header = format_www_authenticate(&challenge).unwrap();
-            (challenge, header)
         }
 
         fn test_challenge_with_id_and_expires(
@@ -736,7 +700,7 @@ mod tests {
         async fn test_middleware_incremental_402_retries_stop_at_default_cap() {
             let headers = Arc::new(
                 (0..DEFAULT_MAX_PAYMENT_RETRIES)
-                    .map(|i| test_challenge_with_intent(&format!("cap-{i}"), "session").1)
+                    .map(|i| test_challenge_with_id(&format!("cap-{i}")).1)
                     .collect::<Vec<_>>(),
             );
             let request_count = Arc::new(AtomicU32::new(0));
@@ -886,69 +850,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_middleware_distinct_charge_after_paid_retry_is_indeterminate() {
+        async fn test_middleware_incremental_402_retries_pay_replacement_challenges() {
             let (_, first_header) = test_challenge_with_id("first");
             let (_, second_header) = test_challenge_with_id("second");
-            let headers = Arc::new([first_header, second_header]);
-            let request_count = Arc::new(AtomicU32::new(0));
-            let counter = request_count.clone();
-
-            let app = Router::new().route(
-                "/paid",
-                get(move || {
-                    let headers = headers.clone();
-                    let counter = counter.clone();
-                    async move {
-                        let index = counter.fetch_add(1, Ordering::SeqCst) as usize;
-                        (
-                            AxumStatusCode::PAYMENT_REQUIRED,
-                            [(WWW_AUTH_NAME, headers[index].clone())],
-                            "pay up",
-                        )
-                    }
-                }),
-            );
-
-            let base_url = spawn_server(app).await;
-            let provider = TestProvider::new();
-            let events = ClientEvents::default();
-            let observed_reason = Arc::new(Mutex::new(None));
-            let _failed_sub = events.on_payment_failed({
-                let observed_reason = observed_reason.clone();
-                move |context| {
-                    *observed_reason.lock().unwrap() = context.reason;
-                    async {}
-                }
-            });
-            let client = ClientBuilder::new(reqwest::Client::new())
-                .with(PaymentMiddleware::new(provider.clone()).with_events(events))
-                .build();
-
-            let error = client
-                .get(format!("{}/paid", base_url))
-                .send()
-                .await
-                .unwrap_err();
-
-            assert!(error
-                .to_string()
-                .contains("payment outcome is indeterminate"));
-            assert_eq!(
-                *observed_reason.lock().unwrap(),
-                Some(PaymentFailureReason::IndeterminateCharge {
-                    paid_challenge_id: "first".to_string(),
-                    retry_challenge_id: "second".to_string(),
-                })
-            );
-            assert_eq!(provider.call_count(), 1);
-            assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        }
-
-        #[tokio::test]
-        async fn test_middleware_incremental_402_retries_pay_replacement_challenges() {
-            let (_, first_header) = test_challenge_with_intent("first", "session");
-            let (_, second_header) = test_challenge_with_intent("second", "session");
-            let (_, third_header) = test_challenge_with_intent("third", "session");
+            let (_, third_header) = test_challenge_with_id("third");
             let headers = Arc::new([first_header, second_header, third_header]);
             let request_count = Arc::new(AtomicU32::new(0));
             let counter = request_count.clone();

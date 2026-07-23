@@ -199,7 +199,6 @@ impl PaymentExt for RequestBuilder {
         let ranking_accept = caller_accept.or(provider_accept);
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
-        let mut submitted_charge_id: Option<String> = None;
         let mut resp = this.send().await?;
 
         for attempt in 0..max_payment_retries {
@@ -262,7 +261,7 @@ impl PaymentExt for RequestBuilder {
                 }
             };
 
-            if paid_challenge_ids.contains(&challenge.id) {
+            if !paid_challenge_ids.insert(challenge.id.clone()) {
                 events
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: Some(challenge),
@@ -272,27 +271,6 @@ impl PaymentExt for RequestBuilder {
                     .await;
                 return Ok(resp);
             }
-            if challenge.intent.as_str() == "charge" {
-                if let Some(paid_challenge_id) = &submitted_charge_id {
-                    let retry_challenge_id = challenge.id.clone();
-                    let err = HttpError::IndeterminatePayment {
-                        paid_challenge_id: paid_challenge_id.clone(),
-                        retry_challenge_id: retry_challenge_id.clone(),
-                    };
-                    events
-                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                            challenge: Some(challenge),
-                            error: err.to_string(),
-                            reason: Some(PaymentFailureReason::IndeterminateCharge {
-                                paid_challenge_id: paid_challenge_id.clone(),
-                                retry_challenge_id,
-                            }),
-                        }))
-                        .await;
-                    return Err(err);
-                }
-            }
-            paid_challenge_ids.insert(challenge.id.clone());
 
             let override_credential = events
                 .emit_challenge_received(ChallengeReceivedContext {
@@ -337,9 +315,6 @@ impl PaymentExt for RequestBuilder {
                     credential: credential.clone(),
                 }))
                 .await;
-            if challenge.intent.as_str() == "charge" {
-                submitted_charge_id = Some(challenge.id.clone());
-            }
 
             let auth_header = match format_authorization(&credential) {
                 Ok(auth_header) => auth_header,
@@ -513,13 +488,10 @@ mod tests {
         }
 
         fn test_challenge_with_id(id: &str) -> (PaymentChallenge, String) {
-            test_challenge_with_intent(id, "charge")
-        }
-
-        fn test_challenge_with_intent(id: &str, intent: &str) -> (PaymentChallenge, String) {
             let request =
                 Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-            let challenge = PaymentChallenge::new(id, "test.example.com", "tempo", intent, request);
+            let challenge =
+                PaymentChallenge::new(id, "test.example.com", "tempo", "charge", request);
             let header = format_www_authenticate(&challenge).unwrap();
             (challenge, header)
         }
@@ -760,7 +732,7 @@ mod tests {
         async fn test_incremental_402_retries_stop_at_default_cap() {
             let headers = Arc::new(
                 (0..DEFAULT_MAX_PAYMENT_RETRIES)
-                    .map(|i| test_challenge_with_intent(&format!("cap-{i}"), "session").1)
+                    .map(|i| test_challenge_with_id(&format!("cap-{i}")).1)
                     .collect::<Vec<_>>(),
             );
             let request_count = Arc::new(AtomicU32::new(0));
@@ -904,71 +876,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_distinct_charge_after_paid_retry_is_indeterminate() {
+        async fn test_incremental_402_retries_pay_replacement_challenges() {
             let (_, first_header) = test_challenge_with_id("first");
             let (_, second_header) = test_challenge_with_id("second");
-            let headers = Arc::new([first_header, second_header]);
-            let request_count = Arc::new(AtomicU32::new(0));
-            let counter = request_count.clone();
-
-            let app = Router::new().route(
-                "/paid",
-                get(move || {
-                    let headers = headers.clone();
-                    let counter = counter.clone();
-                    async move {
-                        let index = counter.fetch_add(1, Ordering::SeqCst) as usize;
-                        (
-                            AxumStatusCode::PAYMENT_REQUIRED,
-                            [(WWW_AUTH_NAME, headers[index].clone())],
-                            "pay up",
-                        )
-                    }
-                }),
-            );
-
-            let base_url = spawn_server(app).await;
-            let provider = MockProvider::new();
-            let client = reqwest::Client::new();
-            let events = ClientEvents::default();
-            let observed_reason = Arc::new(Mutex::new(None));
-            let _failed_sub = events.on_payment_failed({
-                let observed_reason = observed_reason.clone();
-                move |context| {
-                    *observed_reason.lock().unwrap() = context.reason;
-                    async {}
-                }
-            });
-
-            let error = client
-                .get(format!("{}/paid", base_url))
-                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(
-                error,
-                HttpError::IndeterminatePayment {
-                    ref paid_challenge_id,
-                    ref retry_challenge_id,
-                } if paid_challenge_id == "first" && retry_challenge_id == "second"
-            ));
-            assert_eq!(
-                *observed_reason.lock().unwrap(),
-                Some(PaymentFailureReason::IndeterminateCharge {
-                    paid_challenge_id: "first".to_string(),
-                    retry_challenge_id: "second".to_string(),
-                })
-            );
-            assert_eq!(provider.call_count(), 1);
-            assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        }
-
-        #[tokio::test]
-        async fn test_incremental_402_retries_pay_replacement_challenges() {
-            let (_, first_header) = test_challenge_with_intent("first", "session");
-            let (_, second_header) = test_challenge_with_intent("second", "session");
-            let (_, third_header) = test_challenge_with_intent("third", "session");
+            let (_, third_header) = test_challenge_with_id("third");
             let headers = Arc::new([first_header, second_header, third_header]);
             let request_count = Arc::new(AtomicU32::new(0));
             let counter = request_count.clone();
