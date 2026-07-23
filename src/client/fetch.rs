@@ -11,7 +11,7 @@ use super::events::{
     ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use super::provider::PaymentProvider;
+use super::provider::{PaymentContext, PaymentProvider};
 use super::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
@@ -281,7 +281,19 @@ impl PaymentExt for RequestBuilder {
 
             let credential = match override_credential {
                 Some(credential) => credential,
-                None => match provider.pay(&challenge).await {
+                None => match provider
+                    .pay_with_context(
+                        &challenge,
+                        PaymentContext {
+                            url: url.clone().ok_or(HttpError::CloneFailed)?,
+                            headers: peek
+                                .as_ref()
+                                .map(|request| request.headers().clone())
+                                .unwrap_or_default(),
+                        },
+                    )
+                    .await
+                {
                     Ok(credential) => credential,
                     Err(err) => {
                         let http_err = HttpError::Payment(err);

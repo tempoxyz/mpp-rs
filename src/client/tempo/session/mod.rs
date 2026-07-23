@@ -38,7 +38,7 @@ use self::store::{
 };
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
-use crate::client::PaymentProvider;
+use crate::client::{PaymentContext, PaymentProvider};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use crate::protocol::intents::{ChargeRequest, SessionRequest};
@@ -80,6 +80,8 @@ pub struct TempoSessionProvider {
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
     default_deposit: Option<u128>,
+    /// Preferred automatic top-up size. Exact shortfalls are used when unset.
+    top_up_amount: Option<u128>,
     /// Stablecoin used to acquire the session currency before open/top-up.
     autoswap: Option<AutoswapConfig>,
     /// Channel registry: key is `payee:currency:escrow` (lowercase).
@@ -92,6 +94,8 @@ pub struct TempoSessionProvider {
     on_channel_update: Option<Arc<dyn Fn(&ChannelEntry) + Send + Sync>>,
     /// Last challenge received from the server, used for `close()`.
     last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
+    /// Serializes channel recovery, cumulative advancement, and credential creation.
+    payment_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct ApplicationTopUp<'a> {
@@ -119,12 +123,14 @@ impl TempoSessionProvider {
             signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
             max_deposit: None,
             default_deposit: None,
+            top_up_amount: None,
             autoswap: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
+            payment_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -160,6 +166,12 @@ impl TempoSessionProvider {
     /// Set the default deposit in atomic units.
     pub fn with_default_deposit(mut self, amount: u128) -> Self {
         self.default_deposit = Some(amount);
+        self
+    }
+
+    /// Set the preferred automatic top-up size in atomic units.
+    pub fn with_top_up_amount(mut self, amount: u128) -> Self {
+        self.top_up_amount = Some(amount);
         self
     }
 
@@ -273,7 +285,9 @@ impl TempoSessionProvider {
             .transpose()
             .mpp_config("invalid suggestedDeposit")?
             .unwrap_or_default();
-        let proposed = shortfall.max(suggested);
+        let proposed = shortfall
+            .max(suggested)
+            .max(self.top_up_amount.unwrap_or_default());
         let additional = match self.max_deposit {
             Some(max_deposit) => proposed.min(max_deposit - deposit),
             None => proposed,
@@ -1331,6 +1345,7 @@ impl TempoSessionProvider {
         challenge: &PaymentChallenge,
         top_up: Option<ApplicationTopUp<'_>>,
     ) -> Result<PaymentCredential, MppError> {
+        let _payment_guard = self.payment_lock.lock().await;
         use alloy::providers::ProviderBuilder;
         use tempo_alloy::TempoNetwork;
 
@@ -1600,6 +1615,21 @@ impl PaymentProvider for TempoSessionProvider {
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         self.payment_credential(challenge, None).await
     }
+
+    async fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<PaymentCredential, MppError> {
+        let client = reqwest::Client::new();
+        self.application_websocket_credential_with_top_up(
+            &client,
+            context.url.as_str(),
+            context.headers,
+            challenge,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1757,6 +1787,24 @@ mod tests {
         assert!(provider
             .required_top_up(25_000, 20_000, Some("not-an-amount"))
             .is_err());
+    }
+
+    #[test]
+    fn configured_top_up_amount_batches_shortfalls() {
+        let provider = make_test_provider()
+            .with_max_deposit(10_000_000)
+            .with_top_up_amount(5_000_000);
+
+        assert_eq!(
+            provider.required_top_up(5_001, 5_000, None).unwrap(),
+            Some(5_000_000)
+        );
+        assert_eq!(
+            provider
+                .required_top_up(9_500_001, 9_500_000, None)
+                .unwrap(),
+            Some(500_000)
+        );
     }
 
     #[test]
