@@ -32,7 +32,7 @@ use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher}
 use crate::protocol::methods::tempo::CHAIN_ID;
 
 #[cfg(feature = "tempo")]
-const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 
 /// Default escrow contract addresses per chain ID.
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
@@ -517,15 +517,12 @@ where
         },
     ];
 
-    let nonce = provider
-        .get_transaction_count(payer)
-        .await
-        .mpp_http("failed to get nonce")?;
-
     let gas_price = provider
         .get_gas_price()
         .await
         .mpp_http("failed to get gas price")?;
+
+    let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
     let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
         provider,
@@ -539,12 +536,12 @@ where
         chain_id: options.chain_id,
         fee_token: options.currency,
         nonce,
-        nonce_key: U256::ZERO,
+        nonce_key,
         gas_limit: 2_000_000,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
-        valid_before: None,
+        valid_before,
         key_authorization,
     });
 
@@ -656,11 +653,7 @@ fn parse_precompile_amount(value: u128, label: &str) -> Result<Uint<96, 2>, MppE
 }
 
 #[cfg(feature = "tempo")]
-fn precompile_open_tx_nonce_fields(fee_payer: bool, nonce: u64) -> (u64, U256, Option<u64>) {
-    if !fee_payer {
-        return (nonce, U256::ZERO, None);
-    }
-
+fn session_transaction_nonce_fields() -> (u64, U256, Option<u64>) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -669,14 +662,14 @@ fn precompile_open_tx_nonce_fields(fee_payer: bool, nonce: u64) -> (u64, U256, O
     (
         0,
         U256::MAX,
-        Some(now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS)),
+        Some(now.saturating_add(EXPIRING_NONCE_VALID_BEFORE_SECS)),
     )
 }
 
-/// Returns a random past timestamp for a sponsored repeatable transaction.
+/// Returns a random past timestamp for a repeatable transaction.
 ///
-/// MPPx adds `validAfter` to sponsored top-ups so two otherwise identical
-/// top-up calls do not serialize to the same transaction.
+/// MPPx adds `validAfter` to top-ups so two otherwise identical expiring
+/// transactions do not serialize to the same replay-protection hash.
 #[cfg(feature = "tempo")]
 fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
     let now = std::time::SystemTime::now()
@@ -696,10 +689,8 @@ fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
 }
 
 #[cfg(feature = "tempo")]
-fn add_sponsored_top_up_entropy(transaction: &mut TempoTransaction, fee_payer: bool) {
-    if fee_payer {
-        transaction.valid_after = random_past_valid_after();
-    }
+fn add_top_up_entropy(transaction: &mut TempoTransaction) {
+    transaction.valid_after = random_past_valid_after();
 }
 
 /// Convert a JSON wire descriptor into the generated precompile ABI tuple.
@@ -947,22 +938,12 @@ where
         input: Bytes::from(open_data),
     });
 
-    let nonce = if options.fee_payer {
-        0
-    } else {
-        provider
-            .get_transaction_count(payer)
-            .await
-            .mpp_http("failed to get nonce")?
-    };
-
     let gas_price = provider
         .get_gas_price()
         .await
         .mpp_http("failed to get gas price")?;
 
-    let (nonce, nonce_key, valid_before) =
-        precompile_open_tx_nonce_fields(options.fee_payer, nonce);
+    let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
     let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
         provider,
@@ -1070,7 +1051,7 @@ pub async fn create_precompile_top_up_transaction_payload<P, S>(
     provider: &P,
     signer: &S,
     signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
-    payer: Address,
+    _payer: Address,
     options: TopUpPrecompilePayloadOptions<'_>,
 ) -> Result<SessionCredentialPayload, MppError>
 where
@@ -1097,20 +1078,11 @@ where
             ITIP20ChannelReserve::topUpCall::new((descriptor, additional_deposit)).abi_encode(),
         ),
     });
-    let nonce = if options.fee_payer {
-        0
-    } else {
-        provider
-            .get_transaction_count(payer)
-            .await
-            .mpp_http("failed to get nonce")?
-    };
     let gas_price = provider
         .get_gas_price()
         .await
         .mpp_http("failed to get gas price")?;
-    let (nonce, nonce_key, valid_before) =
-        precompile_open_tx_nonce_fields(options.fee_payer, nonce);
+    let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
     let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
         provider,
@@ -1135,7 +1107,7 @@ where
         valid_before,
         key_authorization,
     });
-    add_sponsored_top_up_entropy(&mut unsigned_tx, options.fee_payer);
+    add_top_up_entropy(&mut unsigned_tx);
     let tx_bytes = if options.fee_payer {
         crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
             unsigned_tx,
@@ -1358,34 +1330,24 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_precompile_open_tx_nonce_fields_for_fee_payer() {
+    fn session_transactions_use_expiring_nonces_without_sponsorship() {
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let (nonce, nonce_key, valid_before) = precompile_open_tx_nonce_fields(true, 7);
+        let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
         assert_eq!(nonce, 0);
         assert_eq!(nonce_key, U256::MAX);
-        let valid_before = valid_before.expect("fee payer open sets valid_before");
+        let valid_before = valid_before.expect("session transaction sets valid_before");
         assert!(valid_before >= before);
-        assert!(valid_before <= before + FEE_PAYER_VALID_BEFORE_SECS + 1);
+        assert!(valid_before <= before + EXPIRING_NONCE_VALID_BEFORE_SECS + 1);
     }
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_precompile_open_tx_nonce_fields_for_direct_payer() {
-        let (nonce, nonce_key, valid_before) = precompile_open_tx_nonce_fields(false, 7);
-
-        assert_eq!(nonce, 7);
-        assert_eq!(nonce_key, U256::ZERO);
-        assert!(valid_before.is_none());
-    }
-
-    #[cfg(feature = "tempo")]
-    #[test]
-    fn sponsored_repeatable_transactions_get_past_valid_after_entropy() {
+    fn repeatable_top_ups_get_past_valid_after_entropy() {
         let mut transaction = build_tempo_tx(TempoTxOptions {
             calls: vec![],
             chain_id: 4217,
@@ -1395,7 +1357,7 @@ mod tests {
             gas_limit: 500_000,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 100_000_000,
-            fee_payer: true,
+            fee_payer: false,
             valid_before: None,
             key_authorization: None,
         });
@@ -1404,10 +1366,10 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        add_sponsored_top_up_entropy(&mut transaction, true);
+        add_top_up_entropy(&mut transaction);
         let valid_after = transaction
             .valid_after
-            .expect("sponsored top-ups get transaction entropy");
+            .expect("top-ups get transaction entropy");
 
         assert!(valid_after.get() <= now.saturating_sub(60));
     }
