@@ -6,7 +6,21 @@
 
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use reqwest::header::HeaderMap;
+use reqwest::Url;
 use std::future::Future;
+
+/// HTTP request context available while creating a payment credential.
+///
+/// Session providers use this to submit management credentials, such as a
+/// channel top-up, to the same resource before replaying the paid request.
+#[derive(Clone, Debug)]
+pub struct PaymentContext {
+    /// URL of the request that returned the payment challenge.
+    pub url: Url,
+    /// Caller-provided request headers to preserve for management requests.
+    pub headers: HeaderMap,
+}
 
 /// Trait for payment providers that can execute payments for challenges.
 ///
@@ -64,6 +78,20 @@ pub trait PaymentProvider: Clone + Send + Sync {
         &self,
         challenge: &PaymentChallenge,
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send;
+
+    /// Execute payment with access to the challenged HTTP request.
+    ///
+    /// Most providers only need the challenge and inherit this default. A
+    /// session provider may use the URL and headers to top up its channel via
+    /// the resource's management endpoint before returning a voucher.
+    fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
+        let _ = context;
+        self.pay(challenge)
+    }
 
     /// Build an `Accept-Payment` header value from this provider's supported methods.
     ///
@@ -151,6 +179,26 @@ impl PaymentProvider for MultiProvider {
         )))
     }
 
+    async fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<PaymentCredential, MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider.dyn_pay_with_context(challenge, context).await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let headers: Vec<String> = self
             .providers
@@ -173,6 +221,11 @@ trait DynPaymentProvider: Send + Sync {
         &'a self,
         challenge: &'a PaymentChallenge,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
+    fn dyn_pay_with_context<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -188,6 +241,15 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
     {
         Box::pin(PaymentProvider::pay(self, challenge))
+    }
+
+    fn dyn_pay_with_context<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
+    {
+        Box::pin(PaymentProvider::pay_with_context(self, challenge, context))
     }
 
     fn dyn_accept_payment_header(&self) -> Option<String> {
