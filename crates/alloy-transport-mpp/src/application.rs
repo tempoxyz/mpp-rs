@@ -10,7 +10,8 @@ use std::{fmt, time::Duration};
 use futures::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use mpp::{
-    client::PaymentProvider, format_authorization, MppError, PaymentChallenge, PaymentCredential,
+    client::{PaymentContext, PaymentProvider},
+    format_authorization, MppError, PaymentChallenge, PaymentCredential,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -172,13 +173,21 @@ where
     async fn connect_inner(&self) -> Result<MppApplicationWs<V>, MppWsError> {
         install_default_crypto_provider();
         let probe_url = probe_url(&self.url)?;
-        let mut probe = reqwest::Client::new()
-            .get(probe_url)
-            .headers(self.headers.clone());
+        let mut probe_headers = self.headers.clone();
         if let Some(accept) = self.payment_provider.accept_payment_header() {
-            probe = probe.header("Accept-Payment", accept);
+            probe_headers.insert(
+                HeaderName::from_static("accept-payment"),
+                accept.parse().map_err(|error| {
+                    MppError::InvalidConfig(format!("invalid Accept-Payment header: {error}"))
+                })?,
+            );
         }
-        let response = probe.send().await.map_err(MppWsError::Probe)?;
+        let response = reqwest::Client::new()
+            .get(probe_url.clone())
+            .headers(probe_headers.clone())
+            .send()
+            .await
+            .map_err(MppWsError::Probe)?;
         if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
             return Err(MppWsError::ProbeStatus {
                 status: response.status().as_u16(),
@@ -199,10 +208,21 @@ where
                 .supports(challenge.method.as_str(), challenge.intent.as_str())
         })
         .ok_or(MppWsError::UnsupportedChallenge)?;
+        let payment_context = PaymentContext {
+            url: probe_url,
+            headers: probe_headers,
+        };
+        let challenge = self
+            .payment_provider
+            .prepare_application_websocket_challenge(&challenge, payment_context.clone())
+            .await?;
         let _ = self
             .events_tx
             .send(MppApplicationEvent::Challenge(challenge.clone()));
-        let credential = self.payment_provider.pay(&challenge).await?;
+        let credential = self
+            .payment_provider
+            .pay_with_context(&challenge, payment_context)
+            .await?;
 
         let mut request = self.url.as_str().into_client_request()?;
         request.headers_mut().extend(self.headers.clone());
