@@ -24,6 +24,15 @@ pub enum HttpError {
     /// Payment provider error
     Payment(MppError),
 
+    /// A charge credential was already submitted for this logical request and
+    /// the server returned a distinct charge challenge.
+    IndeterminatePayment {
+        /// Challenge whose credential was already submitted.
+        paid_challenge_id: String,
+        /// Fresh challenge returned by the paid retry.
+        retry_challenge_id: String,
+    },
+
     /// HTTP request error
     #[cfg(feature = "client")]
     Request(reqwest::Error),
@@ -42,6 +51,15 @@ impl fmt::Display for HttpError {
             Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),
             Self::CloneFailed => write!(f, "request could not be cloned for retry"),
             Self::Payment(e) => write!(f, "payment failed: {}", e),
+            Self::IndeterminatePayment {
+                paid_challenge_id,
+                retry_challenge_id,
+            } => write!(
+                f,
+                "payment outcome is indeterminate: charge challenge {paid_challenge_id} was \
+                 submitted before the server returned distinct charge challenge \
+                 {retry_challenge_id}; refusing another payment"
+            ),
             #[cfg(feature = "client")]
             Self::Request(e) => write!(f, "HTTP request failed: {}", e),
         }
