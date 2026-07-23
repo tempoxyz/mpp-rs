@@ -13,8 +13,9 @@ use axum::{
 };
 use futures::StreamExt;
 use mpp::{
-    client::PaymentProvider, protocol::core::Base64UrlJson, MppError, PaymentChallenge,
-    PaymentCredential, PaymentPayload,
+    client::{PaymentContext, PaymentProvider},
+    protocol::core::Base64UrlJson,
+    MppError, PaymentChallenge, PaymentCredential, PaymentPayload,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -35,6 +36,57 @@ impl PaymentProvider for StubProvider {
             challenge.to_echo(),
             PaymentPayload::hash("0xopen"),
         ))
+    }
+}
+
+#[derive(Clone)]
+struct ContextProvider {
+    observed: Arc<Mutex<Option<PaymentContext>>>,
+}
+
+impl PaymentProvider for ContextProvider {
+    fn supports(&self, method: &str, intent: &str) -> bool {
+        method == "tempo" && intent == "session"
+    }
+
+    async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        panic!("application transport must call pay_with_context")
+    }
+
+    async fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        _: PaymentContext,
+    ) -> Result<PaymentCredential, MppError> {
+        Ok(PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::hash("0xopen"),
+        ))
+    }
+
+    async fn prepare_application_websocket_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<PaymentChallenge, MppError> {
+        *self.observed.lock().await = Some(context);
+        Ok(challenge.clone())
+    }
+
+    fn accept_payment_header(&self) -> Option<String> {
+        Some("tempo/session".into())
+    }
+}
+
+impl VoucherProvider for ContextProvider {
+    async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request("unexpected voucher request"))
+    }
+}
+
+impl CloseProvider for ContextProvider {
+    async fn close_credential(&self, _: &CloseRequest) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request("unexpected close request"))
     }
 }
 
@@ -263,6 +315,48 @@ async fn probes_then_authorizes_and_translates_application_messages() {
     socket.send("hello").await.unwrap();
     assert_eq!(socket.next().await.unwrap(), "world");
     assert_eq!(socket.close().await.unwrap()["channelId"], "0xchannel");
+}
+
+#[tokio::test]
+async fn payment_provider_receives_probe_url_and_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (signal_tx, signal_rx) = oneshot::channel();
+    let signal = Arc::new(Mutex::new(Some(signal_tx)));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/", get(disconnect_route))
+                .with_state(signal),
+        )
+        .await
+        .unwrap();
+    });
+
+    let observed = Arc::new(Mutex::new(None));
+    let provider = ContextProvider {
+        observed: Arc::clone(&observed),
+    };
+    let connector =
+        MppApplicationWsConnect::new(format!("ws://{address}/"), provider.clone(), provider)
+            .with_header(
+                "x-test-routing".parse().unwrap(),
+                HeaderValue::from_static("preserved"),
+            );
+    connector
+        .connect()
+        .await
+        .unwrap()
+        .disconnect()
+        .await
+        .unwrap();
+
+    assert!(signal_rx.await.unwrap());
+    let context = observed.lock().await.take().unwrap();
+    assert_eq!(context.url.as_str(), format!("http://{address}/"));
+    assert_eq!(context.headers["x-test-routing"], "preserved");
+    assert_eq!(context.headers["accept-payment"], "tempo/session");
 }
 
 #[tokio::test]

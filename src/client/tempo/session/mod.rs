@@ -517,6 +517,104 @@ impl TempoSessionProvider {
             .unwrap_or(None))
     }
 
+    /// Reconcile an application WebSocket challenge with reusable client state.
+    ///
+    /// When the challenged scope already exists locally, this re-probes with a
+    /// `Payment-Session` channel hint so the server can include its latest
+    /// signed snapshot without the authenticated `HEAD` bootstrap flow. A
+    /// missing local scope, unsupported hint, or missing snapshot falls back to
+    /// bootstrap so fresh and stale clients remain recoverable.
+    pub async fn recover_application_websocket_challenge_with_headers(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        mut headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+    ) -> Result<PaymentChallenge, MppError> {
+        use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+
+        let bootstrap_headers = headers.clone();
+        let (key, _) = self.expected_channel_key(challenge)?;
+        let payer = self.signing_mode.from_address(self.signer.address());
+        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+
+        let cached_in_memory = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.opened)
+            .map(|entry| {
+                let descriptor = entry.descriptor.as_ref().ok_or_else(|| {
+                    MppError::InvalidConfig(
+                        "cached native MPP channel is missing its descriptor".into(),
+                    )
+                })?;
+                can_sign_descriptor(descriptor, payer, authorized_signer)
+                    .map(|controlled| controlled.then_some(entry.channel_id))
+            })
+            .transpose()?
+            .flatten();
+        let cached_channel_id = match cached_in_memory {
+            Some(channel_id) => Some(channel_id),
+            None => self
+                .channel_store
+                .get(&key)
+                .await
+                .map_err(Self::store_error)?
+                .filter(|entry| entry.opened && entry.key() == key)
+                .map(|entry| {
+                    can_sign_descriptor(&entry.descriptor, payer, authorized_signer)
+                        .map(|controlled| controlled.then_some(entry.channel_id))
+                })
+                .transpose()?
+                .flatten(),
+        };
+
+        if let Some(channel_id) = cached_channel_id {
+            headers.insert(
+                crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
+                HeaderValue::from_static("tempo/session"),
+            );
+            headers.insert(
+                reqwest::header::HeaderName::from_static("payment-session"),
+                channel_id
+                    .to_string()
+                    .parse()
+                    .mpp_config("invalid Payment-Session header")?,
+            );
+            headers.remove(AUTHORIZATION);
+            if let Ok(response) = client.get(url).headers(headers.clone()).send().await {
+                if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+                    let refreshed = PaymentChallenge::from_headers(
+                        response
+                            .headers()
+                            .get_all(WWW_AUTHENTICATE)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok()),
+                    )
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .find(|candidate| {
+                        candidate.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME
+                            && candidate.intent.as_str()
+                                == crate::protocol::methods::tempo::INTENT_SESSION
+                    });
+                    if let Some(refreshed) = refreshed {
+                        let request: SessionRequest = refreshed.request.decode()?;
+                        if request.session_snapshot().is_some() {
+                            return Ok(refreshed);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.bootstrap_with_headers(client, url, bootstrap_headers)
+            .await?;
+        Ok(challenge.clone())
+    }
+
     async fn try_bootstrap_with_headers(
         &self,
         client: &reqwest::Client,
@@ -1624,6 +1722,20 @@ impl PaymentProvider for TempoSessionProvider {
         let client = reqwest::Client::new();
         self.application_websocket_credential_with_top_up(
             &client,
+            context.url.as_str(),
+            context.headers,
+            challenge,
+        )
+        .await
+    }
+
+    async fn prepare_application_websocket_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<PaymentChallenge, MppError> {
+        self.recover_application_websocket_challenge_with_headers(
+            &reqwest::Client::new(),
             context.url.as_str(),
             context.headers,
             challenge,
@@ -2752,6 +2864,158 @@ mod tests {
             chain_id,
         )
         .unwrap());
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn challenge_recovery_uses_channel_hint_before_identity_bootstrap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::protocol::methods::tempo::session::{
+            ChannelDescriptor, SessionSnapshot, TempoSessionMethodDetails,
+        };
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider().with_channel_store(store.clone());
+        let payer = provider.signer.address();
+        let channel_id = B256::repeat_byte(0x33);
+        let descriptor = ChannelDescriptor {
+            authorized_signer: payer.to_string(),
+            expiring_nonce_hash: B256::repeat_byte(0x44).to_string(),
+            operator: Address::ZERO.to_string(),
+            payee: payee.to_string(),
+            payer: payer.to_string(),
+            salt: B256::repeat_byte(0x55).to_string(),
+            token: currency.to_string(),
+        };
+        store
+            .set(&StoredChannelEntry {
+                channel_id,
+                cumulative_amount: 1_000,
+                deposit: 10_000,
+                descriptor: descriptor.clone(),
+                escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
+                chain_id: 42431,
+                opened: true,
+            })
+            .await
+            .unwrap();
+
+        let mut refreshed_request: SessionRequest = challenge.request.decode().unwrap();
+        refreshed_request.method_details = Some(
+            serde_json::to_value(TempoSessionMethodDetails {
+                escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+                channel_id: Some(channel_id.to_string()),
+                min_voucher_delta: None,
+                chain_id: Some(42431),
+                fee_payer: Some(true),
+                operator: Some(Address::ZERO.to_string()),
+                session_protocol: Some("v2".into()),
+                session_snapshot: Some(SessionSnapshot {
+                    accepted_cumulative: "2000".into(),
+                    chain_id: 42431,
+                    channel_id: channel_id.to_string(),
+                    close_requested_at: None,
+                    deposit: "10000".into(),
+                    descriptor,
+                    escrow: TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+                    highest_voucher: None,
+                    required_cumulative: "3000".into(),
+                    settled: "0".into(),
+                    spent: "2000".into(),
+                    units: Some(2),
+                }),
+            })
+            .unwrap(),
+        );
+        let refreshed_challenge = PaymentChallenge::new(
+            "refreshed-id",
+            challenge.realm.clone(),
+            crate::protocol::methods::tempo::METHOD_NAME,
+            crate::protocol::methods::tempo::INTENT_SESSION,
+            crate::protocol::core::Base64UrlJson::from_typed(&refreshed_request).unwrap(),
+        );
+        let refreshed_header = refreshed_challenge.to_header().unwrap();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let head_calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/responses",
+            get({
+                let get_calls = Arc::clone(&get_calls);
+                move |headers: HeaderMap| {
+                    let get_calls = Arc::clone(&get_calls);
+                    let refreshed_header = refreshed_header.clone();
+                    async move {
+                        get_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(
+                            headers
+                                .get("payment-session")
+                                .and_then(|value| value.to_str().ok()),
+                            Some(channel_id.to_string().as_str())
+                        );
+                        (
+                            StatusCode::PAYMENT_REQUIRED,
+                            [("www-authenticate", refreshed_header)],
+                        )
+                            .into_response()
+                    }
+                }
+            })
+            .head({
+                let head_calls = Arc::clone(&head_calls);
+                move || {
+                    let head_calls = Arc::clone(&head_calls);
+                    async move {
+                        head_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{address}/v1/responses");
+
+        let result = provider
+            .recover_application_websocket_challenge_with_headers(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.id, "refreshed-id");
+        assert_eq!(get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 0);
+
+        let empty_provider = make_test_provider();
+        let result = empty_provider
+            .recover_application_websocket_challenge_with_headers(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.id, "test-id");
+        assert_eq!(get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(feature = "axum")]
