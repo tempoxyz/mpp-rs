@@ -24,7 +24,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use alloy::sol_types::SolCall;
 use axum::{routing::get, Json, Router};
-use mpp::client::{Fetch, HttpError, PaymentProvider, TempoProvider};
+use mpp::client::{Fetch, PaymentProvider, TempoProvider};
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};
 use mpp::server::{tempo, Mpp, TempoConfig};
 use reqwest::Client;
@@ -1101,10 +1101,9 @@ async fn test_e2e_charge_with_fee_payer() {
     let _ = handle.await;
 }
 
-/// Fee payer requested but server has no signer configured → indeterminate
-/// after the paid retry returns a fresh charge challenge.
+/// Fee payer requested but server has no signer configured → 402.
 #[tokio::test]
-async fn test_fee_payer_requested_but_no_signer_is_indeterminate() {
+async fn test_fee_payer_requested_but_no_signer_returns_402() {
     let rpc = rpc_url();
     let chain_id = get_chain_id(&rpc).await;
 
@@ -1130,21 +1129,20 @@ async fn test_fee_payer_requested_but_no_signer_is_indeterminate() {
 
     let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
 
-    let error = Client::new()
+    let resp = Client::new()
         .get(format!("{url}/paid"))
         .send_with_payment(&provider)
         .await
-        .expect_err("fresh charge challenge after payment should be indeterminate");
+        .expect("request failed");
 
+    assert_eq!(
+        resp.status(),
+        402,
+        "fee payer requested without signer should return 402"
+    );
     assert!(
-        matches!(
-            error,
-            HttpError::IndeterminatePayment {
-                ref paid_challenge_id,
-                ref retry_challenge_id,
-            } if paid_challenge_id != retry_challenge_id
-        ),
-        "fee payer requested without a signer should refuse a second charge: {error}"
+        resp.headers().contains_key("www-authenticate"),
+        "should return a fresh challenge for retry"
     );
 
     handle.abort();

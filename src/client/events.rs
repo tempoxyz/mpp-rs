@@ -104,15 +104,6 @@ pub enum PaymentFailureReason {
     /// Client refused before signing because the challenge was expired or had
     /// an unparseable `expires`. `provider.pay()` was not called.
     PreSigningExpired { expires: Option<String> },
-    /// A paid retry returned a distinct charge challenge. The first charge may
-    /// already have settled, so the client refused to create another
-    /// credential for the same logical request.
-    IndeterminateCharge {
-        /// Challenge whose credential was already submitted.
-        paid_challenge_id: String,
-        /// Fresh challenge returned by the paid retry.
-        retry_challenge_id: String,
-    },
 }
 
 /// Context for `payment.failed`.
