@@ -12,10 +12,11 @@ use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::contracts::precompiles::{ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS};
+use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::{Call, TempoTransaction};
+use tempo_primitives::transaction::{Call, SignatureType, TempoTransaction};
 
-use crate::client::tempo::charge::tx_builder::{build_tempo_tx, TempoTxOptions};
+use crate::client::tempo::charge::tx_builder::{build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
@@ -689,8 +690,33 @@ fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
 }
 
 #[cfg(feature = "tempo")]
-fn add_top_up_entropy(transaction: &mut TempoTransaction) {
-    transaction.valid_after = random_past_valid_after();
+fn session_estimation_request(
+    options: &TempoTxOptions,
+    valid_after: Option<std::num::NonZeroU64>,
+    payer: Address,
+    signer: Address,
+    signature_type: SignatureType,
+    keychain: bool,
+) -> TempoTransactionRequest {
+    let mut request = TempoTransactionRequest {
+        calls: options.calls.clone(),
+        key_authorization: options.key_authorization.clone(),
+        valid_before: options.valid_before.and_then(std::num::NonZeroU64::new),
+        valid_after,
+        ..Default::default()
+    }
+    .with_fee_token(options.fee_token)
+    .with_nonce_key(options.nonce_key);
+    request.inner.from = Some(payer);
+    request.inner.chain_id = Some(options.chain_id);
+    request.inner.nonce = Some(options.nonce);
+    request.inner.max_fee_per_gas = Some(options.max_fee_per_gas);
+    request.inner.max_priority_fee_per_gas = Some(options.max_priority_fee_per_gas);
+    request.key_type = Some(signature_type);
+    if keychain {
+        request.key_id = Some(signer);
+    }
+    request
 }
 
 /// Convert a JSON wire descriptor into the generated precompile ABI tuple.
@@ -1051,7 +1077,7 @@ pub async fn create_precompile_top_up_transaction_payload<P, S>(
     provider: &P,
     signer: &S,
     signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
-    _payer: Address,
+    payer: Address,
     options: TopUpPrecompilePayloadOptions<'_>,
 ) -> Result<SessionCredentialPayload, MppError>
 where
@@ -1069,6 +1095,12 @@ where
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
     let primitive_signer = signer.clone().into();
+    let signature_type = match &primitive_signer {
+        crate::client::tempo::signing::TempoPrimitiveSigner::Secp256k1(_) => {
+            SignatureType::Secp256k1
+        }
+        crate::client::tempo::signing::TempoPrimitiveSigner::P256(_) => SignatureType::P256,
+    };
     let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
     let mut calls = options.prefix_calls;
     calls.push(Call {
@@ -1090,14 +1122,16 @@ where
         primitive_signer.address(),
     )
     .await?;
-    let mut unsigned_tx = build_tempo_tx(TempoTxOptions {
+    let fee_token = options
+        .descriptor
+        .token
+        .parse()
+        .mpp_config("invalid TIP-1034 descriptor token")?;
+    let valid_after = random_past_valid_after();
+    let mut transaction_options = TempoTxOptions {
         calls,
         chain_id: options.chain_id,
-        fee_token: options
-            .descriptor
-            .token
-            .parse()
-            .mpp_config("invalid TIP-1034 descriptor token")?,
+        fee_token,
         nonce,
         nonce_key,
         gas_limit: 2_000_000,
@@ -1106,8 +1140,23 @@ where
         fee_payer: options.fee_payer,
         valid_before,
         key_authorization,
-    });
-    add_top_up_entropy(&mut unsigned_tx);
+    };
+    if !options.fee_payer {
+        let request = session_estimation_request(
+            &transaction_options,
+            valid_after,
+            payer,
+            primitive_signer.address(),
+            signature_type,
+            matches!(
+                signing_mode,
+                crate::client::tempo::signing::TempoSigningMode::Keychain { .. }
+            ),
+        );
+        transaction_options.gas_limit = estimate_gas(provider, request).await?;
+    }
+    let mut unsigned_tx = build_tempo_tx(transaction_options);
+    unsigned_tx.valid_after = valid_after;
     let tx_bytes = if options.fee_payer {
         crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
             unsigned_tx,
@@ -1366,7 +1415,7 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        add_top_up_entropy(&mut transaction);
+        transaction.valid_after = random_past_valid_after();
         let valid_after = transaction
             .valid_after
             .expect("top-ups get transaction entropy");
@@ -1402,6 +1451,53 @@ mod tests {
             .await
             .expect_err("deposit > uint96 must be rejected");
         assert!(matches!(err, MppError::InvalidConfig(_)));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn top_up_stops_when_preflight_reverts() {
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            signers::local::PrivateKeySigner,
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800");
+        asserter.push_failure_msg("execution reverted: insufficient balance");
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+        let signer = PrivateKeySigner::random();
+        let payer = signer.address();
+        let descriptor = ChannelDescriptor {
+            payer: payer.to_string(),
+            payee: Address::repeat_byte(0x11).to_string(),
+            operator: Address::ZERO.to_string(),
+            token: Address::repeat_byte(0x22).to_string(),
+            salt: B256::repeat_byte(0x33).to_string(),
+            authorized_signer: payer.to_string(),
+            expiring_nonce_hash: B256::repeat_byte(0x44).to_string(),
+        };
+
+        let error = create_precompile_top_up_transaction_payload(
+            &provider,
+            &signer,
+            None,
+            payer,
+            TopUpPrecompilePayloadOptions {
+                prefix_calls: vec![],
+                descriptor: &descriptor,
+                additional_deposit: 5_000_000,
+                chain_id: 4217,
+                fee_payer: false,
+            },
+        )
+        .await
+        .expect_err("a reverting top-up must fail before it is signed");
+
+        assert!(matches!(
+            error,
+            MppError::Tempo(crate::client::tempo::TempoClientError::InsufficientBalance { .. })
+        ));
     }
 
     #[test]
