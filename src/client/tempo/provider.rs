@@ -39,6 +39,7 @@ use crate::client::PaymentProvider;
 pub struct TempoProvider {
     signer: TempoPrimitiveSigner,
     rpc_url: reqwest::Url,
+    rpc_provider: alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
     autoswap: Option<AutoswapConfig>,
@@ -55,10 +56,12 @@ impl TempoProvider {
         signer: impl Into<TempoPrimitiveSigner>,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
-        let url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let rpc_provider = super::rpc_provider(url.clone());
         Ok(Self {
             signer: signer.into(),
             rpc_url: url,
+            rpc_provider,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
             autoswap: None,
@@ -184,12 +187,9 @@ impl PaymentProvider for TempoProvider {
             let from = self
                 .signing_mode
                 .from_address(alloy::signers::Signer::address(&self.signer));
-            let rpc_url: reqwest::Url = self.rpc_url.clone();
-            let provider =
-                alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
 
             if let Some(swap_calls) = super::autoswap::resolve_autoswap_calls(
-                &provider,
+                &self.rpc_provider,
                 from,
                 charge.currency(),
                 charge.amount(),
@@ -206,13 +206,12 @@ impl PaymentProvider for TempoProvider {
         }
 
         let options = SignOptions {
-            rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
             fee_token,
             ..Default::default()
         };
         let signed = charge
-            .sign_with_primitive_options(&self.signer, options)
+            .sign_with_primitive_provider_options(&self.signer, &self.rpc_provider, options)
             .await?;
         Ok(signed.into_credential())
     }
@@ -221,6 +220,7 @@ impl PaymentProvider for TempoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::providers::Provider;
     use alloy::signers::Signer;
 
     #[test]
@@ -230,6 +230,21 @@ mod tests {
 
         assert_eq!(provider.rpc_url().as_str(), "https://rpc.example.com/");
         assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn test_tempo_provider_clones_share_rpc_client() {
+        let provider = TempoProvider::new(
+            alloy::signers::local::PrivateKeySigner::random(),
+            "https://rpc.example.com",
+        )
+        .unwrap();
+        let cloned = provider.clone();
+
+        assert!(std::ptr::eq(
+            provider.rpc_provider.client(),
+            cloned.rpc_provider.client()
+        ));
     }
 
     #[test]
