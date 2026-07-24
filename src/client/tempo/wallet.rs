@@ -4,19 +4,20 @@ use std::{
     fs,
     path::{Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use alloy::primitives::{Address, Bytes, Signature, B256, U256};
-use alloy::signers::Signer;
-use serde::{de::Error as _, Deserialize, Deserializer};
+use alloy::signers::{local::PrivateKeySigner, Signer};
+use serde::Deserialize;
 use tempo_primitives::transaction::{
     tt_signature::{P256SignatureWithPreHash, WebAuthnSignature},
     KeyAuthorization, PrimitiveSignature, SignatureType, SignedKeyAuthorization, TokenLimit,
 };
 
-use super::signing::{P256Jwk, TempoP256Signer};
+use super::signing::{P256Jwk, TempoP256Signer, TempoPrimitiveSigner};
 
-/// A Tempo Wallet account and its active P-256 access key.
+/// A Tempo Wallet account and its selected locally signable access key.
 #[derive(Debug)]
 pub struct TempoWallet {
     /// Root Tempo account controlled by the access key.
@@ -25,8 +26,8 @@ pub struct TempoWallet {
     pub access_key: Address,
     /// Chain selected by Tempo Wallet.
     pub chain_id: u64,
-    /// Native signer reconstructed from the persisted WebCrypto JWK.
-    pub signer: TempoP256Signer,
+    /// Native signer reconstructed from the persisted key material.
+    pub signer: TempoPrimitiveSigner,
     /// Signed authorization attached while the active access key is not yet on-chain.
     pub key_authorization: Option<Box<SignedKeyAuthorization>>,
 }
@@ -59,20 +60,19 @@ pub enum TempoWalletError {
     /// No matching access key was available for the active account and chain.
     #[error("Tempo Wallet has no access key for active chain {0}")]
     MissingAccessKey(u64),
-    /// The stored key is not an extractable WebCrypto P-256 JWK.
-    #[error("Tempo Wallet access key must be an extractable P-256 JWK")]
-    UnsupportedAccessKey,
-    /// The persisted JWK could not be reconstructed.
-    #[error("failed to load Tempo Wallet access key: {0}")]
-    InvalidAccessKey(#[from] super::signing::P256SignerError),
-    /// The JWK-derived address did not match the stored access-key address.
-    #[error("Tempo Wallet access-key address does not match its persisted JWK")]
-    AccessKeyAddressMismatch,
 }
 
 impl TempoWallet {
     /// Load the active account and access key from a Tempo Wallet store.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, TempoWalletError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::load_at(path, now)
+    }
+
+    fn load_at(path: impl AsRef<Path>, now: u64) -> Result<Self, TempoWalletError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|source| TempoWalletError::Read {
             path: path.to_owned(),
@@ -85,25 +85,35 @@ impl TempoWallet {
             })?;
         let state = file.store.state;
         let account = active_account(&state)?;
-        let access_key = state
+        state
             .access_keys
             .into_iter()
-            .find(|key| key.chain_id == state.chain_id && key.access == account)
-            .ok_or(TempoWalletError::MissingAccessKey(state.chain_id))?;
-        if access_key.key_type != "p256" || access_key.handle.kind != "webcrypto-p256" {
-            return Err(TempoWalletError::UnsupportedAccessKey);
-        }
-        let signer = TempoP256Signer::from_webcrypto_jwk(&access_key.handle.jwk)?;
-        if signer.address() != access_key.address {
-            return Err(TempoWalletError::AccessKeyAddressMismatch);
-        }
-        Ok(Self {
-            account,
-            access_key: access_key.address,
-            chain_id: state.chain_id,
-            signer,
-            key_authorization: access_key.key_authorization.map(Box::new),
-        })
+            .filter(|key| key.chain_id == state.chain_id && key.access == account)
+            .filter(|key| key.expiry.is_none_or(|expiry| expiry >= now))
+            // Mirrors Accounts `accessKeys.select({ calls: undefined })`: a
+            // scoped key requires concrete calls and is not selected generically.
+            .filter(|key| key.scopes.is_none())
+            .find_map(|key| {
+                let signer = hydrate_access_key(&key).ok()?;
+                if signer.address() != key.address {
+                    return None;
+                }
+                let key_authorization = key
+                    .key_authorization
+                    .as_ref()
+                    .map(parse_key_authorization)
+                    .transpose()
+                    .ok()?
+                    .map(Box::new);
+                Some(Self {
+                    account,
+                    access_key: key.address,
+                    chain_id: state.chain_id,
+                    signer,
+                    key_authorization,
+                })
+            })
+            .ok_or(TempoWalletError::MissingAccessKey(state.chain_id))
     }
 
     /// Load `~/.tempo/wallet/store.json`.
@@ -151,29 +161,83 @@ struct TempoAccessKey {
     access: Address,
     chain_id: u64,
     key_type: String,
-    handle: TempoAccessKeyHandle,
-    #[serde(default, deserialize_with = "deserialize_key_authorization")]
-    key_authorization: Option<SignedKeyAuthorization>,
+    #[serde(default)]
+    expiry: Option<u64>,
+    #[serde(default)]
+    handle: Option<TempoAccessKeyHandle>,
+    #[serde(default)]
+    private_key: Option<String>,
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
+    scopes: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    key_authorization: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TempoAccessKeyHandle {
+    #[serde(default)]
     kind: String,
-    jwk: P256Jwk,
+    #[serde(default)]
+    jwk: Option<P256Jwk>,
+    #[serde(default)]
+    private_key: Option<String>,
 }
 
-fn deserialize_key_authorization<'de, D>(
-    deserializer: D,
-) -> Result<Option<SignedKeyAuthorization>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    value
+fn hydrate_access_key(key: &TempoAccessKey) -> Result<TempoPrimitiveSigner, String> {
+    if let Some(private_key) = key.private_key.as_deref() {
+        return match key.key_type.as_str() {
+            "p256" => {
+                let bytes = alloy::hex::decode(private_key)
+                    .map_err(|error| format!("invalid P-256 private key: {error}"))?;
+                TempoP256Signer::from_slice(&bytes)
+                    .map(TempoPrimitiveSigner::from)
+                    .map_err(|error| error.to_string())
+            }
+            "secp256k1" => private_key
+                .parse::<PrivateKeySigner>()
+                .map(TempoPrimitiveSigner::from)
+                .map_err(|error| error.to_string()),
+            _ => Err("unsupported access-key type".to_owned()),
+        };
+    }
+
+    let handle = key
+        .handle
         .as_ref()
-        .map(parse_key_authorization)
-        .transpose()
-        .map_err(D::Error::custom)
+        .ok_or_else(|| "missing access-key handle".to_owned())?;
+    if let Some(private_key) = handle.private_key.as_deref() {
+        return match handle.kind.as_str() {
+            "p256" => {
+                let bytes = alloy::hex::decode(private_key)
+                    .map_err(|error| format!("invalid P-256 private key: {error}"))?;
+                TempoP256Signer::from_slice(&bytes)
+                    .map(TempoPrimitiveSigner::from)
+                    .map_err(|error| error.to_string())
+            }
+            "secp256k1" => private_key
+                .parse::<PrivateKeySigner>()
+                .map(TempoPrimitiveSigner::from)
+                .map_err(|error| error.to_string()),
+            _ => Err("unsupported private-key handle".to_owned()),
+        };
+    }
+
+    match handle.kind.as_str() {
+        "webcrypto-p256" if key.public_key.is_some() => {
+            let jwk = handle
+                .jwk
+                .as_ref()
+                .ok_or_else(|| "missing P-256 JWK".to_owned())?;
+            TempoP256Signer::from_webcrypto_jwk(jwk)
+                .map(TempoPrimitiveSigner::from)
+                .map_err(|error| error.to_string())
+        }
+        "webcrypto-p256" => Err("missing P-256 public key".to_owned()),
+        _ => Err("unsupported access-key handle".to_owned()),
+    }
 }
 
 fn parse_key_authorization(value: &serde_json::Value) -> Result<SignedKeyAuthorization, String> {
@@ -449,6 +513,7 @@ mod tests {
                 "access":"0x1111111111111111111111111111111111111111",
                 "chainId":4217,
                 "keyType":"p256",
+                "publicKey":"0x043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d",
                 "handle":{"kind":"webcrypto-p256","jwk":{
                   "kty":"EC","crv":"P-256",
                   "x":"OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
@@ -476,6 +541,14 @@ mod tests {
           }
         }"#;
         fs::write(&path, json).unwrap();
+        let decoded: TempoWalletFile = serde_json::from_str(json).unwrap();
+        let key = &decoded.store.state.access_keys[0];
+        assert_eq!(
+            hydrate_access_key(key).unwrap().address(),
+            key.address,
+            "fixture access-key material must match its stored address"
+        );
+        parse_key_authorization(key.key_authorization.as_ref().unwrap()).unwrap();
         let wallet = TempoWallet::load(&path).unwrap();
         fs::remove_file(path).unwrap();
 
@@ -502,5 +575,103 @@ mod tests {
             panic!("expected WebAuthn root authorization")
         };
         assert_eq!(signature.webauthn_data.as_ref(), b"\x01\x02\x03{}");
+    }
+
+    #[test]
+    fn skips_expired_scoped_and_unusable_keys_in_persisted_order() {
+        let root = "0x1111111111111111111111111111111111111111";
+        let first_key = format!("0x{}", "01".repeat(32));
+        let selected_key = format!("0x{}", "02".repeat(32));
+        let first = TempoP256Signer::from_slice(&alloy::hex::decode(&first_key).unwrap()).unwrap();
+        let selected =
+            TempoP256Signer::from_slice(&alloy::hex::decode(&selected_key).unwrap()).unwrap();
+        let path = write_store(serde_json::json!([
+            {
+                "access": root,
+                "address": first.address(),
+                "chainId": 4217,
+                "expiry": 99,
+                "keyType": "p256",
+                "privateKey": first_key,
+            },
+            {
+                "access": root,
+                "address": first.address(),
+                "chainId": 4217,
+                "keyType": "p256",
+                "privateKey": format!("0x{}", "03".repeat(31)),
+            },
+            {
+                "access": root,
+                "address": first.address(),
+                "chainId": 4217,
+                "keyType": "p256",
+                "privateKey": format!("0x{}", "01".repeat(32)),
+                "scopes": [],
+            },
+            {
+                "access": root,
+                "address": selected.address(),
+                "chainId": 4217,
+                "keyType": "p256",
+                "privateKey": selected_key,
+            },
+        ]));
+
+        let wallet = TempoWallet::load_at(&path, 100).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(wallet.signer.address(), selected.address());
+        assert_eq!(wallet.access_key, selected.address());
+    }
+
+    #[test]
+    fn hydrates_accounts_private_key_handle_and_secp256k1_key() {
+        let root = "0x1111111111111111111111111111111111111111";
+        let private_key = format!("0x{}", "03".repeat(32));
+        let signer = private_key.parse::<PrivateKeySigner>().unwrap();
+        let path = write_store(serde_json::json!([
+            {
+                "access": root,
+                "address": signer.address(),
+                "chainId": 4217,
+                "keyType": "secp256k1",
+                "handle": {
+                    "kind": "secp256k1",
+                    "privateKey": private_key,
+                },
+            },
+        ]));
+
+        let wallet = TempoWallet::load_at(&path, 100).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(wallet.signer.address(), signer.address());
+        assert_eq!(wallet.access_key, signer.address());
+    }
+
+    fn write_store(access_keys: serde_json::Value) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mpp-rs-tempo-wallet-{}-{unique}.json",
+            std::process::id()
+        ));
+        let value = serde_json::json!({
+            "tempo-cli.store": {
+                "state": {
+                    "activeAccount": 0,
+                    "chainId": 4217,
+                    "accounts": [{
+                        "address": "0x1111111111111111111111111111111111111111",
+                    }],
+                    "accessKeys": access_keys,
+                },
+            },
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        path
     }
 }
