@@ -555,23 +555,7 @@ impl TempoSessionProvider {
             })
             .transpose()?
             .flatten();
-        let cached_channel_id = match cached_in_memory {
-            Some(channel_id) => Some(channel_id),
-            None => self
-                .channel_store
-                .get(&key)
-                .await
-                .map_err(Self::store_error)?
-                .filter(|entry| entry.opened && entry.key() == key)
-                .map(|entry| {
-                    can_sign_descriptor(&entry.descriptor, payer, authorized_signer)
-                        .map(|controlled| controlled.then_some(entry.channel_id))
-                })
-                .transpose()?
-                .flatten(),
-        };
-
-        if let Some(channel_id) = cached_channel_id {
+        if let Some(channel_id) = cached_in_memory {
             headers.insert(
                 crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
                 HeaderValue::from_static("tempo/session"),
@@ -2868,7 +2852,7 @@ mod tests {
 
     #[cfg(feature = "axum")]
     #[tokio::test]
-    async fn challenge_recovery_uses_channel_hint_before_identity_bootstrap() {
+    async fn challenge_recovery_bootstraps_before_using_durable_channel_hint() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use axum::{
@@ -2928,7 +2912,7 @@ mod tests {
                     channel_id: channel_id.to_string(),
                     close_requested_at: None,
                     deposit: "10000".into(),
-                    descriptor,
+                    descriptor: descriptor.clone(),
                     escrow: TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
                     highest_voucher: None,
                     required_cumulative: "3000".into(),
@@ -2998,9 +2982,48 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(result.id, "test-id");
+        assert_eq!(get_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 1);
+
+        let key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+        provider.channels.lock().unwrap().insert(
+            key.clone(),
+            ChannelEntry {
+                channel_id,
+                salt: B256::repeat_byte(0x55),
+                cumulative_amount: 1_000,
+                deposit: 10_000,
+                descriptor: Some(descriptor),
+                escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), key);
+
+        let result = provider
+            .recover_application_websocket_challenge_with_headers(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+            )
+            .await
+            .unwrap();
+
         assert_eq!(result.id, "refreshed-id");
         assert_eq!(get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(head_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 1);
 
         let empty_provider = make_test_provider();
         let result = empty_provider
@@ -3015,7 +3038,7 @@ mod tests {
 
         assert_eq!(result.id, "test-id");
         assert_eq!(get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(head_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(feature = "axum")]
