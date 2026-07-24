@@ -1450,21 +1450,15 @@ impl TempoSessionProvider {
 
     fn resolve_deposit(&self, suggested_deposit: Option<&str>) -> Result<u128, MppError> {
         let suggested = suggested_deposit.and_then(|s| s.parse::<u128>().ok());
-
-        match (suggested, self.max_deposit, self.default_deposit) {
-            // Both suggested and max: use the smaller
-            (Some(s), Some(max), _) => Ok(s.min(max)),
-            // Only suggested
-            (Some(s), None, _) => Ok(s),
-            // Only max
-            (None, Some(max), _) => Ok(max),
-            // Only default
-            (None, None, Some(def)) => Ok(def),
-            // Nothing
-            (None, None, None) => Err(MppError::InvalidConfig(
+        let proposed = suggested
+            .or(self.default_deposit)
+            .or(self.max_deposit)
+            .ok_or_else(|| {
+                MppError::InvalidConfig(
                 "No deposit amount available. Set `default_deposit`, `max_deposit`, or ensure the server challenge includes `suggestedDeposit`.".to_string(),
-            )),
-        }
+                )
+            })?;
+        Ok(self.max_deposit.map_or(proposed, |max| proposed.min(max)))
     }
 }
 
@@ -2233,14 +2227,24 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_deposit_max_and_default_prefers_max() {
+    fn test_resolve_deposit_max_caps_default_without_replacing_it() {
         let signer = PrivateKeySigner::random();
         let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
             .unwrap()
             .with_max_deposit(5000)
             .with_default_deposit(2000);
 
-        // When no suggested, max takes priority over default
+        assert_eq!(provider.resolve_deposit(None).unwrap(), 2000);
+    }
+
+    #[test]
+    fn test_resolve_deposit_max_caps_larger_default() {
+        let signer = PrivateKeySigner::random();
+        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_max_deposit(5000)
+            .with_default_deposit(8000);
+
         assert_eq!(provider.resolve_deposit(None).unwrap(), 5000);
     }
 
