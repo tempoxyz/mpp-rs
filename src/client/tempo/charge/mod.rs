@@ -33,6 +33,7 @@ pub mod tx_builder;
 use std::num::NonZeroU64;
 
 use alloy::primitives::{Address, TxKind, U256};
+use alloy::providers::Provider;
 use tempo_primitives::transaction::{
     Call, SignatureType, SignedKeyAuthorization, TempoTransaction,
 };
@@ -47,7 +48,7 @@ use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::methods::tempo::charge::{parse_memo_bytes_checked, TempoChargeExt};
-use crate::protocol::methods::tempo::network::TempoNetwork;
+use crate::protocol::methods::tempo::network::TempoNetwork as TempoChain;
 use crate::protocol::methods::tempo::proof;
 use crate::protocol::methods::tempo::transfers::get_transfers;
 use crate::protocol::methods::tempo::types::Split;
@@ -288,11 +289,59 @@ impl TempoCharge {
         .await
     }
 
+    pub(crate) async fn sign_with_primitive_provider_options(
+        self,
+        signer: &TempoPrimitiveSigner,
+        provider: &impl Provider<tempo_alloy::TempoNetwork>,
+        options: SignOptions,
+    ) -> Result<SignedTempoCharge, MppError> {
+        let signature_type = match signer {
+            TempoPrimitiveSigner::Secp256k1(_) => SignatureType::Secp256k1,
+            TempoPrimitiveSigner::P256(_) => SignatureType::P256,
+        };
+        self.prepare_with_provider(
+            alloy::signers::Signer::address(signer),
+            signature_type,
+            options,
+            provider,
+        )
+        .await?
+        .sign_primitive(signer)
+        .await
+    }
+
     async fn prepare(
         self,
         signer_address: Address,
         signature_type: SignatureType,
         options: SignOptions,
+    ) -> Result<PreparedTempoCharge, MppError> {
+        let rpc_url = match options.rpc_url.as_deref() {
+            Some(url) => url.parse().mpp_config("invalid RPC URL")?,
+            None => {
+                let network = TempoChain::from_chain_id(self.chain_id).ok_or_else(|| {
+                    MppError::InvalidConfig(format!(
+                        "unknown chain ID {}: provide rpc_url in SignOptions",
+                        self.chain_id
+                    ))
+                })?;
+                network
+                    .default_rpc_url()
+                    .parse()
+                    .mpp_config("invalid RPC URL")?
+            }
+        };
+        let provider = super::rpc_provider(rpc_url);
+        self.prepare_with_provider(signer_address, signature_type, options, &provider)
+            .await
+    }
+
+    async fn prepare_with_provider(
+        self,
+        signer_address: Address,
+        signature_type: SignatureType,
+        options: SignOptions,
+        provider: &impl Provider<tempo_alloy::TempoNetwork>,
     ) -> Result<PreparedTempoCharge, MppError> {
         let signing_mode = options.signing_mode.unwrap_or_default();
         let from = signing_mode.from_address(signer_address);
@@ -308,28 +357,9 @@ impl TempoCharge {
             });
         }
 
-        // Resolve RPC provider + build calls
-        let rpc_url = match options.rpc_url {
-            Some(url) => url.parse().mpp_config("invalid RPC URL")?,
-            None => {
-                let network = TempoNetwork::from_chain_id(self.chain_id).ok_or_else(|| {
-                    MppError::InvalidConfig(format!(
-                        "unknown chain ID {}: provide rpc_url in SignOptions",
-                        self.chain_id
-                    ))
-                })?;
-                network
-                    .default_rpc_url()
-                    .parse()
-                    .mpp_config("invalid RPC URL")?
-            }
-        };
-        let provider =
-            alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
-
         let managed_key_authorization = if options.key_authorization.is_none() {
             crate::client::tempo::signing::keychain::resolve_key_authorization(
-                &provider,
+                provider,
                 &signing_mode,
                 signer_address,
             )
@@ -397,7 +427,7 @@ impl TempoCharge {
             req.inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
             apply_estimation_signer_hints(&mut req, &signing_mode, signer_address, signature_type);
 
-            estimate_gas(&provider, req).await?
+            estimate_gas(provider, req).await?
         };
 
         // Build the key_authorization for the transaction
