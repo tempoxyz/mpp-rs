@@ -43,7 +43,7 @@ use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use crate::protocol::intents::{ChargeRequest, SessionRequest};
 use crate::protocol::methods::tempo::proof::sign_proof_primitive;
-use crate::protocol::methods::tempo::session::TempoSessionExt;
+use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSessionExt};
 
 /// Tempo session provider with automatic channel management.
 ///
@@ -90,12 +90,20 @@ pub struct TempoSessionProvider {
     channel_store: Arc<dyn ChannelStore>,
     /// Maps channel ID hex → channel key for reverse lookup.
     channel_id_to_key: Arc<Mutex<HashMap<String, String>>>,
+    /// Newly prepared channels awaiting acceptance by the server.
+    pending_opens: Arc<Mutex<HashMap<String, PendingOpen>>>,
     /// Optional callback for channel state changes.
     on_channel_update: Option<Arc<dyn Fn(&ChannelEntry) + Send + Sync>>,
     /// Last challenge received from the server, used for `close()`.
     last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
     /// Serializes channel recovery, cumulative advancement, and credential creation.
     payment_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOpen {
+    challenge_id: String,
+    store_key: String,
 }
 
 struct ApplicationTopUp<'a> {
@@ -128,6 +136,7 @@ impl TempoSessionProvider {
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
+            pending_opens: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -320,6 +329,82 @@ impl TempoSessionProvider {
         }
         self.channel_store
             .set(&Self::stored_entry(entry)?)
+            .await
+            .map_err(Self::store_error)
+    }
+
+    fn credential_channel_id(credential: &PaymentCredential) -> Option<String> {
+        let payload: SessionCredentialPayload =
+            serde_json::from_value(credential.payload.clone()).ok()?;
+        Some(match payload {
+            SessionCredentialPayload::Open { channel_id, .. }
+            | SessionCredentialPayload::TopUp { channel_id, .. }
+            | SessionCredentialPayload::Voucher { channel_id, .. }
+            | SessionCredentialPayload::Close { channel_id, .. } => channel_id,
+        })
+    }
+
+    fn commit_referenced_open(&self, channel_id: &str) {
+        let runtime_key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(channel_id)
+            .cloned();
+        let is_current = runtime_key.is_some_and(|runtime_key| {
+            self.channels
+                .lock()
+                .unwrap()
+                .get(&runtime_key)
+                .is_some_and(|entry| entry.channel_id.to_string() == channel_id)
+        });
+        if is_current {
+            self.pending_opens.lock().unwrap().remove(channel_id);
+        }
+    }
+
+    fn commit_credential(&self, credential: &PaymentCredential) {
+        let Some(channel_id) = Self::credential_channel_id(credential) else {
+            return;
+        };
+        self.commit_referenced_open(&channel_id);
+    }
+
+    async fn rollback_credential(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let Some(channel_id) = Self::credential_channel_id(credential) else {
+            return Ok(());
+        };
+        let _guard = self.payment_lock.lock().await;
+        let pending = {
+            let mut pending_opens = self.pending_opens.lock().unwrap();
+            let Some(pending) = pending_opens.get(&channel_id) else {
+                return Ok(());
+            };
+            if pending.challenge_id != challenge.id {
+                return Ok(());
+            }
+            let Some(pending) = pending_opens.remove(&channel_id) else {
+                return Ok(());
+            };
+            pending
+        };
+
+        let runtime_key = self.channel_id_to_key.lock().unwrap().remove(&channel_id);
+        if let Some(runtime_key) = runtime_key {
+            let mut channels = self.channels.lock().unwrap();
+            if channels
+                .get(&runtime_key)
+                .is_some_and(|entry| entry.channel_id.to_string() == channel_id)
+            {
+                channels.remove(&runtime_key);
+            }
+        }
+        self.channel_store
+            .delete(&pending.store_key)
             .await
             .map_err(Self::store_error)
     }
@@ -1468,6 +1553,9 @@ impl TempoSessionProvider {
         };
         let key = Self::channel_key(&payee, &currency, &escrow_contract, chain_id);
         let session_snapshot = session_req.session_snapshot();
+        if let Some(snapshot) = &session_snapshot {
+            self.commit_referenced_open(&snapshot.channel_id);
+        }
 
         let provider =
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
@@ -1682,6 +1770,13 @@ impl TempoSessionProvider {
             .insert(entry.channel_id.to_string(), key.clone());
         self.persist_channel(&entry).await?;
         self.channels.lock().unwrap().insert(key, entry.clone());
+        self.pending_opens.lock().unwrap().insert(
+            entry.channel_id.to_string(),
+            PendingOpen {
+                challenge_id: challenge.id.clone(),
+                store_key: Self::stored_entry(&entry)?.key(),
+            },
+        );
         self.notify_update(&entry);
 
         Ok(build_credential(challenge, payload, chain_id, payer))
@@ -1725,6 +1820,23 @@ impl PaymentProvider for TempoSessionProvider {
             challenge,
         )
         .await
+    }
+
+    async fn commit_payment(
+        &self,
+        _challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        self.commit_credential(credential);
+        Ok(())
+    }
+
+    async fn rollback_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        self.rollback_credential(challenge, credential).await
     }
 }
 
@@ -2236,6 +2348,129 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn rejected_open_rolls_back_unless_server_snapshot_commits_it() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::protocol::methods::tempo::session::{
+            ChannelDescriptor, SessionCredentialPayload,
+        };
+
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider().with_channel_store(store.clone());
+        let payer = provider.signer.address();
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = B256::repeat_byte(0x33);
+        let descriptor = ChannelDescriptor {
+            payer: payer.to_string(),
+            payee: payee.to_string(),
+            operator: Address::ZERO.to_string(),
+            token: currency.to_string(),
+            salt: B256::repeat_byte(0x44).to_string(),
+            authorized_signer: payer.to_string(),
+            expiring_nonce_hash: B256::repeat_byte(0x55).to_string(),
+        };
+        let entry = ChannelEntry {
+            channel_id,
+            salt: B256::repeat_byte(0x44),
+            cumulative_amount: 100,
+            deposit: 500_000,
+            descriptor: Some(descriptor),
+            escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id: 4217,
+            opened: true,
+        };
+        let stored = TempoSessionProvider::stored_entry(&entry).unwrap();
+        let store_key = stored.key();
+        let runtime_key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            4217,
+        );
+        let challenge = make_test_challenge();
+
+        store.set(&stored).await.unwrap();
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert(runtime_key.clone(), entry.clone());
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), runtime_key.clone());
+        provider.pending_opens.lock().unwrap().insert(
+            channel_id.to_string(),
+            PendingOpen {
+                challenge_id: challenge.id.clone(),
+                store_key: store_key.clone(),
+            },
+        );
+
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            PaymentCredential::evm_did(4217, &payer.to_string()),
+            SessionCredentialPayload::Voucher {
+                channel_id: channel_id.to_string(),
+                descriptor: None,
+                cumulative_amount: "100".into(),
+                signature: "0x00".into(),
+            },
+        );
+
+        let mut concurrent_challenge = challenge.clone();
+        concurrent_challenge.id = "concurrent-voucher".into();
+        provider
+            .rollback_payment(&concurrent_challenge, &credential)
+            .await
+            .unwrap();
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+        assert!(store.get(&store_key).await.unwrap().is_some());
+
+        provider
+            .rollback_payment(&challenge, &credential)
+            .await
+            .unwrap();
+
+        assert!(provider.channels.lock().unwrap().is_empty());
+        assert!(provider.channel_id_to_key.lock().unwrap().is_empty());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        assert!(store.get(&store_key).await.unwrap().is_none());
+
+        store.set(&stored).await.unwrap();
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .insert(runtime_key.clone(), entry);
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), runtime_key);
+        provider.pending_opens.lock().unwrap().insert(
+            channel_id.to_string(),
+            PendingOpen {
+                challenge_id: challenge.id.clone(),
+                store_key: store_key.clone(),
+            },
+        );
+
+        provider.commit_referenced_open(&channel_id.to_string());
+        provider
+            .rollback_payment(&challenge, &credential)
+            .await
+            .unwrap();
+
+        assert_eq!(provider.channels.lock().unwrap().len(), 1);
+        assert_eq!(provider.channel_id_to_key.lock().unwrap().len(), 1);
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        assert!(store.get(&store_key).await.unwrap().is_some());
     }
 
     // --- send_voucher error paths ---

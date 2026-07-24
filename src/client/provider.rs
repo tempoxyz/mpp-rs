@@ -110,6 +110,26 @@ pub trait PaymentProvider: Clone + Send + Sync {
         }
     }
 
+    /// Commit optimistic provider state after the server accepts a credential.
+    fn commit_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> impl Future<Output = Result<(), MppError>> + Send {
+        let _ = (challenge, credential);
+        async { Ok(()) }
+    }
+
+    /// Roll back optimistic provider state after the server rejects a credential.
+    fn rollback_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> impl Future<Output = Result<(), MppError>> + Send {
+        let _ = (challenge, credential);
+        async { Ok(()) }
+    }
+
     /// Build an `Accept-Payment` header value from this provider's supported methods.
     ///
     /// Returns `None` if the provider does not advertise specific methods.
@@ -118,6 +138,26 @@ pub trait PaymentProvider: Clone + Send + Sync {
     fn accept_payment_header(&self) -> Option<String> {
         None
     }
+}
+
+pub(crate) async fn commit_payments<P: PaymentProvider>(
+    provider: &P,
+    payments: &[(PaymentChallenge, PaymentCredential)],
+) -> Result<(), MppError> {
+    for (challenge, credential) in payments {
+        provider.commit_payment(challenge, credential).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn rollback_payments<P: PaymentProvider>(
+    provider: &P,
+    payments: &[(PaymentChallenge, PaymentCredential)],
+) -> Result<(), MppError> {
+    for (challenge, credential) in payments {
+        provider.rollback_payment(challenge, credential).await?;
+    }
+    Ok(())
 }
 
 /// A provider that wraps multiple payment providers and picks the right one.
@@ -238,6 +278,46 @@ impl PaymentProvider for MultiProvider {
         )))
     }
 
+    async fn commit_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider.dyn_commit_payment(challenge, credential).await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
+    async fn rollback_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider.dyn_rollback_payment(challenge, credential).await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let headers: Vec<String> = self
             .providers
@@ -270,6 +350,16 @@ trait DynPaymentProvider: Send + Sync {
         challenge: &'a PaymentChallenge,
         context: PaymentContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentChallenge, MppError>> + Send + 'a>>;
+    fn dyn_commit_payment<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
+    fn dyn_rollback_payment<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -304,6 +394,24 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     {
         Box::pin(PaymentProvider::prepare_application_websocket_challenge(
             self, challenge, context,
+        ))
+    }
+
+    fn dyn_commit_payment<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>> {
+        Box::pin(PaymentProvider::commit_payment(self, challenge, credential))
+    }
+
+    fn dyn_rollback_payment<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>> {
+        Box::pin(PaymentProvider::rollback_payment(
+            self, challenge, credential,
         ))
     }
 

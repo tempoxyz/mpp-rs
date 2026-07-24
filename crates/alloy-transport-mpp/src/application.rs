@@ -208,27 +208,45 @@ where
             .pay_with_context(&challenge, payment_context)
             .await?;
 
-        let mut request = self.url.as_str().into_client_request()?;
-        request.headers_mut().extend(self.headers.clone());
-        let (mut socket, _) = connect_async_with_config(request, None, false).await?;
-        send_authorization(&mut socket, &credential).await?;
-        let _ = self.events_tx.send(MppApplicationEvent::CredentialSent);
+        let result = async {
+            let mut request = self.url.as_str().into_client_request()?;
+            request.headers_mut().extend(self.headers.clone());
+            let (mut socket, _) = connect_async_with_config(request, None, false).await?;
+            send_authorization(&mut socket, &credential).await?;
+            let _ = self.events_tx.send(MppApplicationEvent::CredentialSent);
 
-        let mut client = MppApplicationWs {
-            socket,
-            challenge,
-            challenge_refresher: Arc::new(PaymentProbe {
-                client: http_client,
-                provider: self.payment_provider.clone(),
-                url: probe_url,
-                headers: probe_headers,
-            }),
-            voucher_provider: self.voucher_provider.clone(),
-            receipt_tx: self.receipt_tx.clone(),
-            events_tx: self.events_tx.clone(),
-        };
-        client.wait_for_receipt().await?;
-        Ok(client)
+            let mut client = MppApplicationWs {
+                socket,
+                challenge: challenge.clone(),
+                challenge_refresher: Arc::new(PaymentProbe {
+                    client: http_client,
+                    provider: self.payment_provider.clone(),
+                    url: probe_url,
+                    headers: probe_headers,
+                }),
+                voucher_provider: self.voucher_provider.clone(),
+                receipt_tx: self.receipt_tx.clone(),
+                events_tx: self.events_tx.clone(),
+            };
+            client.wait_for_receipt().await?;
+            Ok(client)
+        }
+        .await;
+
+        match result {
+            Ok(client) => {
+                self.payment_provider
+                    .commit_payment(&challenge, &credential)
+                    .await?;
+                Ok(client)
+            }
+            Err(error) => {
+                self.payment_provider
+                    .rollback_payment(&challenge, &credential)
+                    .await?;
+                Err(error)
+            }
+        }
     }
 }
 
