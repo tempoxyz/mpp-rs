@@ -69,10 +69,30 @@ impl TempoWallet {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        Self::load_at(path, now)
+        Self::load_at(path, now, None)
     }
 
-    fn load_at(path: impl AsRef<Path>, now: u64) -> Result<Self, TempoWalletError> {
+    /// Load the active account, preferring a specific locally signable access key.
+    ///
+    /// This allows a durable session client to keep using the key recorded in
+    /// its channel descriptor while retaining normal persisted-order fallback
+    /// when that key is expired, scoped, or no longer available locally.
+    pub fn load_preferred(
+        path: impl AsRef<Path>,
+        preferred_access_key: Address,
+    ) -> Result<Self, TempoWalletError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self::load_at(path, now, Some(preferred_access_key))
+    }
+
+    fn load_at(
+        path: impl AsRef<Path>,
+        now: u64,
+        preferred_access_key: Option<Address>,
+    ) -> Result<Self, TempoWalletError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|source| TempoWalletError::Read {
             path: path.to_owned(),
@@ -85,35 +105,45 @@ impl TempoWallet {
             })?;
         let state = file.store.state;
         let account = active_account(&state)?;
-        state
+        let chain_id = state.chain_id;
+        let mut fallback = None;
+        for key in state
             .access_keys
             .into_iter()
-            .filter(|key| key.chain_id == state.chain_id && key.access == account)
+            .filter(|key| key.chain_id == chain_id && key.access == account)
             .filter(|key| key.expiry.is_none_or(|expiry| expiry >= now))
             // Mirrors Accounts `accessKeys.select({ calls: undefined })`: a
             // scoped key requires concrete calls and is not selected generically.
             .filter(|key| key.scopes.is_none())
-            .find_map(|key| {
-                let signer = hydrate_access_key(&key).ok()?;
-                if signer.address() != key.address {
-                    return None;
-                }
-                let key_authorization = key
-                    .key_authorization
-                    .as_ref()
-                    .map(parse_key_authorization)
-                    .transpose()
-                    .ok()?
-                    .map(Box::new);
-                Some(Self {
-                    account,
-                    access_key: key.address,
-                    chain_id: state.chain_id,
-                    signer,
-                    key_authorization,
-                })
-            })
-            .ok_or(TempoWalletError::MissingAccessKey(state.chain_id))
+        {
+            let Some(signer) = hydrate_access_key(&key).ok() else {
+                continue;
+            };
+            if signer.address() != key.address {
+                continue;
+            }
+            let Some(key_authorization) = key
+                .key_authorization
+                .as_ref()
+                .map(parse_key_authorization)
+                .transpose()
+                .ok()
+            else {
+                continue;
+            };
+            let wallet = Self {
+                account,
+                access_key: key.address,
+                chain_id,
+                signer,
+                key_authorization: key_authorization.map(Box::new),
+            };
+            if preferred_access_key == Some(key.address) {
+                return Ok(wallet);
+            }
+            fallback.get_or_insert(wallet);
+        }
+        fallback.ok_or(TempoWalletError::MissingAccessKey(chain_id))
     }
 
     /// Load `~/.tempo/wallet/store.json`.
@@ -618,7 +648,7 @@ mod tests {
             },
         ]));
 
-        let wallet = TempoWallet::load_at(&path, 100).unwrap();
+        let wallet = TempoWallet::load_at(&path, 100, None).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(wallet.signer.address(), selected.address());
@@ -643,11 +673,43 @@ mod tests {
             },
         ]));
 
-        let wallet = TempoWallet::load_at(&path, 100).unwrap();
+        let wallet = TempoWallet::load_at(&path, 100, None).unwrap();
         fs::remove_file(path).unwrap();
 
         assert_eq!(wallet.signer.address(), signer.address());
         assert_eq!(wallet.access_key, signer.address());
+    }
+
+    #[test]
+    fn prefers_retained_session_access_key_over_persisted_order() {
+        let root = "0x1111111111111111111111111111111111111111";
+        let first_key = format!("0x{}", "01".repeat(32));
+        let retained_key = format!("0x{}", "02".repeat(32));
+        let first = TempoP256Signer::from_slice(&alloy::hex::decode(&first_key).unwrap()).unwrap();
+        let retained =
+            TempoP256Signer::from_slice(&alloy::hex::decode(&retained_key).unwrap()).unwrap();
+        let path = write_store(serde_json::json!([
+            {
+                "access": root,
+                "address": first.address(),
+                "chainId": 4217,
+                "keyType": "p256",
+                "privateKey": first_key,
+            },
+            {
+                "access": root,
+                "address": retained.address(),
+                "chainId": 4217,
+                "keyType": "p256",
+                "privateKey": retained_key,
+            },
+        ]));
+
+        let wallet = TempoWallet::load_at(&path, 100, Some(retained.address())).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(wallet.signer.address(), retained.address());
+        assert_eq!(wallet.access_key, retained.address());
     }
 
     fn write_store(access_keys: serde_json::Value) -> PathBuf {

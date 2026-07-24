@@ -258,6 +258,37 @@ mod sqlite {
             &self.path
         }
 
+        /// Return the signer of the most recently used active session for this service.
+        ///
+        /// Wallet-backed clients can use this before constructing their session
+        /// provider so a cold process retains the exact access key authorized by
+        /// the existing channel descriptor.
+        pub fn latest_authorized_signer(&self) -> ChannelStoreResult<Option<Address>> {
+            let value = self
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT authorized_signer FROM channels
+                     WHERE origin = ?1 AND state = 'active' AND session_protocol = 'v2'
+                         AND scope_key IS NOT NULL
+                     ORDER BY last_used_at DESC LIMIT 1",
+                    [&self.origin],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(io_error)?;
+            value
+                .map(|address| {
+                    address.parse().map_err(|error| {
+                        ChannelStoreError::InvalidEntry(format!(
+                            "invalid authorized_signer: {error}"
+                        ))
+                    })
+                })
+                .transpose()
+        }
+
         fn scoped_key(&self, key: &str) -> String {
             format!("{}\n{}", self.namespace, key)
         }
@@ -568,6 +599,10 @@ mod tests {
         assert_eq!(
             store.get(&current.key()).await.unwrap(),
             Some(current.clone())
+        );
+        assert_eq!(
+            store.latest_authorized_signer().unwrap(),
+            Some(current.descriptor.authorized_signer.parse().unwrap())
         );
 
         let connection = rusqlite::Connection::open(path).unwrap();
