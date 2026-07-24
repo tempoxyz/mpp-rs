@@ -70,6 +70,7 @@ use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSe
 pub struct TempoSessionProvider {
     signer: TempoPrimitiveSigner,
     rpc_url: reqwest::Url,
+    rpc_provider: alloy::providers::RootProvider<TempoNetwork>,
     /// Escrow contract address override. If None, resolved from challenge or defaults.
     escrow_contract: Option<Address>,
     /// Address authorized to sign vouchers. Defaults to signer address.
@@ -122,10 +123,12 @@ impl TempoSessionProvider {
         signer: impl Into<TempoPrimitiveSigner>,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
-        let url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let rpc_provider = super::rpc_provider(url.clone());
         Ok(Self {
             signer: signer.into(),
             rpc_url: url,
+            rpc_provider,
             escrow_contract: None,
             authorized_signer: None,
             signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
@@ -690,9 +693,7 @@ impl TempoSessionProvider {
         url: &str,
         mut headers: reqwest::header::HeaderMap,
     ) -> Result<Option<StoredChannelEntry>, MppError> {
-        use alloy::providers::ProviderBuilder;
         use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
-        use tempo_alloy::TempoNetwork;
 
         headers.insert(
             crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
@@ -808,9 +809,7 @@ impl TempoSessionProvider {
             .channel_id
             .parse()
             .mpp_config("invalid snapshot channelId")?;
-        let provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
-        let state = read_on_chain_channel_state(&provider, channel_id).await?;
+        let state = read_on_chain_channel_state(&self.rpc_provider, channel_id).await?;
         let recovered = hydrate_session_snapshot(
             &snapshot,
             RecoveryScope {
@@ -954,9 +953,6 @@ impl TempoSessionProvider {
         entry: &ChannelEntry,
         additional_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
-        use alloy::providers::ProviderBuilder;
-        use tempo_alloy::TempoNetwork;
-
         let session_req: SessionRequest = challenge
             .request
             .decode()
@@ -965,11 +961,9 @@ impl TempoSessionProvider {
             MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
         })?;
         let payer = self.signing_mode.from_address(self.signer.address());
-        let provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
         let prefix_calls = self
             .autoswap_calls(
-                &provider,
+                &self.rpc_provider,
                 payer,
                 descriptor
                     .token
@@ -979,7 +973,7 @@ impl TempoSessionProvider {
             )
             .await?;
         let payload = create_precompile_top_up_transaction_payload(
-            &provider,
+            &self.rpc_provider,
             &self.signer,
             Some(&self.signing_mode),
             payer,
@@ -1513,8 +1507,6 @@ impl TempoSessionProvider {
         top_up: Option<ApplicationTopUp<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         let _payment_guard = self.payment_lock.lock().await;
-        use alloy::providers::ProviderBuilder;
-        use tempo_alloy::TempoNetwork;
 
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
 
@@ -1557,9 +1549,6 @@ impl TempoSessionProvider {
             self.commit_referenced_open(&snapshot.channel_id);
         }
 
-        let provider =
-            ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(self.rpc_url.clone());
-
         // Check process memory first, then restore a durable native channel.
         let mut existing = self
             .channels
@@ -1571,7 +1560,7 @@ impl TempoSessionProvider {
         if existing.is_none() && precompile {
             existing = self
                 .restore_precompile_channel(
-                    &provider,
+                    &self.rpc_provider,
                     RecoveryScope {
                         payer,
                         authorized_signer,
@@ -1678,7 +1667,7 @@ impl TempoSessionProvider {
                 if let Ok(cid) = cid_str.parse::<B256>() {
                     let expected_authorized_signer = authorized_signer;
                     if let Some(mut recovered) = try_recover_channel(
-                        &provider,
+                        &self.rpc_provider,
                         escrow_contract,
                         cid,
                         chain_id,
@@ -1724,10 +1713,10 @@ impl TempoSessionProvider {
 
         let (entry, payload) = if precompile {
             let prefix_calls = self
-                .autoswap_calls(&provider, payer, currency, deposit)
+                .autoswap_calls(&self.rpc_provider, payer, currency, deposit)
                 .await?;
             create_precompile_open_payload(
-                &provider,
+                &self.rpc_provider,
                 &self.signer,
                 Some(&self.signing_mode),
                 payer,
@@ -1746,7 +1735,7 @@ impl TempoSessionProvider {
             .await?
         } else {
             create_open_payload(
-                &provider,
+                &self.rpc_provider,
                 self.secp256k1_signer()?,
                 Some(&self.signing_mode),
                 payer,
@@ -1856,6 +1845,19 @@ mod tests {
             "https://rpc.moderato.tempo.xyz/"
         );
         assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn test_session_provider_clones_share_rpc_client() {
+        let provider =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.example.com")
+                .unwrap();
+        let cloned = provider.clone();
+
+        assert!(std::ptr::eq(
+            provider.rpc_provider.client(),
+            cloned.rpc_provider.client()
+        ));
     }
 
     #[test]
