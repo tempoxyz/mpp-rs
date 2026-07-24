@@ -11,13 +11,15 @@ use super::events::{
     ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use super::provider::{PaymentContext, PaymentProvider};
+use super::provider::{commit_payments, rollback_payments, PaymentContext, PaymentProvider};
 use super::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
-use crate::protocol::core::{format_authorization, parse_www_authenticate_all};
+use crate::protocol::core::{
+    format_authorization, parse_www_authenticate_all, PaymentChallenge, PaymentCredential,
+};
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -199,6 +201,7 @@ impl PaymentExt for RequestBuilder {
         let ranking_accept = caller_accept.or(provider_accept);
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
+        let mut pending_payments: Vec<(PaymentChallenge, PaymentCredential)> = Vec::new();
         let mut resp = this.send().await?;
 
         for attempt in 0..max_payment_retries {
@@ -221,6 +224,9 @@ impl PaymentExt for RequestBuilder {
                         reason: None,
                     }))
                     .await;
+                rollback_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
                 return Err(HttpError::MissingChallenge);
             }
 
@@ -246,6 +252,9 @@ impl PaymentExt for RequestBuilder {
                             reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(err);
                 }
                 Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
@@ -257,6 +266,9 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(err);
                 }
             };
@@ -269,6 +281,9 @@ impl PaymentExt for RequestBuilder {
                         reason: None,
                     }))
                     .await;
+                rollback_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
                 return Ok(resp);
             }
 
@@ -281,33 +296,46 @@ impl PaymentExt for RequestBuilder {
 
             let credential = match override_credential {
                 Some(credential) => credential,
-                None => match provider
-                    .pay_with_context(
-                        &challenge,
-                        PaymentContext {
-                            url: url.clone().ok_or(HttpError::CloneFailed)?,
-                            headers: peek
-                                .as_ref()
-                                .map(|request| request.headers().clone())
-                                .unwrap_or_default(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(credential) => credential,
-                    Err(err) => {
-                        let http_err = HttpError::Payment(err);
-                        events
-                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                                challenge: Some(challenge),
-                                error: http_err.to_string(),
-                                reason: None,
-                            }))
-                            .await;
-                        return Err(http_err);
+                None => {
+                    let Some(url) = url.clone() else {
+                        rollback_payments(provider, &pending_payments)
+                            .await
+                            .map_err(HttpError::Payment)?;
+                        return Err(HttpError::CloneFailed);
+                    };
+                    match provider
+                        .pay_with_context(
+                            &challenge,
+                            PaymentContext {
+                                url,
+                                headers: peek
+                                    .as_ref()
+                                    .map(|request| request.headers().clone())
+                                    .unwrap_or_default(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(credential) => credential,
+                        Err(err) => {
+                            let http_err = HttpError::Payment(err);
+                            events
+                                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                                    challenge: Some(challenge),
+                                    error: http_err.to_string(),
+                                    reason: None,
+                                }))
+                                .await;
+                            rollback_payments(provider, &pending_payments)
+                                .await
+                                .map_err(HttpError::Payment)?;
+                            return Err(http_err);
+                        }
                     }
-                },
+                }
             };
+
+            pending_payments.push((challenge.clone(), credential.clone()));
 
             events
                 .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
@@ -327,6 +355,9 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             };
@@ -342,15 +373,23 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             };
             let mut payment_headers = HeaderMap::new();
             payment_headers.insert(AUTHORIZATION, auth_header);
-            let retry = retry_builder
-                .try_clone()
-                .ok_or(HttpError::CloneFailed)?
-                .headers(payment_headers);
+            let retry = match retry_builder.try_clone() {
+                Some(retry) => retry.headers(payment_headers),
+                None => {
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                    return Err(HttpError::CloneFailed);
+                }
+            };
             resp = match retry.send().await {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -362,6 +401,9 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             };
@@ -375,6 +417,9 @@ impl PaymentExt for RequestBuilder {
                         status,
                     }))
                     .await;
+                commit_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
                 return Ok(resp);
             }
 
@@ -382,6 +427,15 @@ impl PaymentExt for RequestBuilder {
             // payment flow error. Match MPPx by returning non-402 responses
             // and the final 402 without emitting `payment.failed`.
             if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == max_payment_retries {
+                if resp.headers().contains_key("payment-receipt") {
+                    commit_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                } else {
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                }
                 return Ok(resp);
             }
         }
@@ -423,6 +477,8 @@ mod tests {
         #[derive(Clone)]
         struct MockProvider {
             pay_count: Arc<AtomicU32>,
+            commit_count: Arc<AtomicU32>,
+            rollback_count: Arc<AtomicU32>,
             challenge_ids: Arc<Mutex<Vec<String>>>,
             fail: bool,
         }
@@ -431,6 +487,8 @@ mod tests {
             fn new() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    commit_count: Arc::new(AtomicU32::new(0)),
+                    rollback_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: false,
                 }
@@ -439,6 +497,8 @@ mod tests {
             fn failing() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    commit_count: Arc::new(AtomicU32::new(0)),
+                    rollback_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: true,
                 }
@@ -450,6 +510,14 @@ mod tests {
 
             fn challenge_ids(&self) -> Vec<String> {
                 self.challenge_ids.lock().unwrap().clone()
+            }
+
+            fn commit_count(&self) -> u32 {
+                self.commit_count.load(Ordering::SeqCst)
+            }
+
+            fn rollback_count(&self) -> u32 {
+                self.rollback_count.load(Ordering::SeqCst)
             }
         }
 
@@ -475,6 +543,24 @@ mod tests {
                     echo,
                     PaymentPayload::hash("0xmockhash"),
                 ))
+            }
+
+            async fn commit_payment(
+                &self,
+                _challenge: &PaymentChallenge,
+                _credential: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.commit_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn rollback_payment(
+                &self,
+                _challenge: &PaymentChallenge,
+                _credential: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.rollback_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
         }
 
@@ -659,6 +745,8 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 1);
+            assert_eq!(provider.rollback_count(), 0);
             assert_eq!(challenge_count.load(Ordering::SeqCst), 1);
             assert_eq!(credential_count.load(Ordering::SeqCst), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 1);
@@ -717,6 +805,8 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
             assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 0);
+            assert_eq!(provider.rollback_count(), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 0);
             assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }

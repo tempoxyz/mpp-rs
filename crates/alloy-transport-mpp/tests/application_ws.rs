@@ -137,6 +137,49 @@ impl CloseProvider for StubProvider {
     }
 }
 
+#[derive(Clone, Default)]
+struct TrackingProvider {
+    commits: Arc<AtomicUsize>,
+    rollbacks: Arc<AtomicUsize>,
+}
+
+impl PaymentProvider for TrackingProvider {
+    fn supports(&self, method: &str, intent: &str) -> bool {
+        method == "tempo" && intent == "session"
+    }
+
+    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        Ok(PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::hash("0xopen"),
+        ))
+    }
+
+    async fn commit_payment(
+        &self,
+        _: &PaymentChallenge,
+        _: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn rollback_payment(
+        &self,
+        _: &PaymentChallenge,
+        _: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        self.rollbacks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl VoucherProvider for TrackingProvider {
+    async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request("unexpected voucher request"))
+    }
+}
+
 fn challenge() -> PaymentChallenge {
     challenge_with_id("challenge-1")
 }
@@ -429,6 +472,32 @@ async fn disconnect_route(
         .into_response()
 }
 
+async fn rejection_route(upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>) -> Response {
+    let Ok(upgrade) = upgrade else {
+        let header = HeaderValue::from_str(&challenge().to_header().unwrap()).unwrap();
+        return (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, header)]).into_response();
+    };
+
+    upgrade
+        .on_upgrade(|mut socket| async move {
+            let authorization = socket.next().await.unwrap().unwrap();
+            assert!(matches!(authorization, Message::Text(_)));
+            socket
+                .send(Message::Text(
+                    json!({
+                        "mpp": "payment-error",
+                        "status": 410,
+                        "message": "session/channel-not-found"
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        })
+        .into_response()
+}
+
 #[tokio::test]
 async fn probes_then_authorizes_and_translates_application_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -547,4 +616,27 @@ async fn disconnect_closes_transport_without_requesting_session_settlement() {
         .unwrap();
 
     assert!(signal_rx.await.unwrap());
+}
+
+#[tokio::test]
+async fn rejected_initial_credential_rolls_back_provider_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/", get(rejection_route)))
+            .await
+            .unwrap();
+    });
+
+    let provider = TrackingProvider::default();
+    let connector = MppApplicationWsConnect::new(
+        format!("ws://{address}/"),
+        provider.clone(),
+        provider.clone(),
+    );
+    let error = connector.connect().await.err().unwrap();
+
+    assert!(error.to_string().contains("session/channel-not-found"));
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
 }
