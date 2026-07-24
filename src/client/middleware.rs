@@ -360,14 +360,10 @@ where
                 return Ok(resp);
             }
 
+            // A completed HTTP response is the application's answer, not a
+            // payment flow error. Match MPPx by returning non-402 responses
+            // and the final 402 without emitting `payment.failed`.
             if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == self.max_payment_retries {
-                self.events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: Some(challenge),
-                        error: format!("payment retry returned unsuccessful status: {status}"),
-                        reason: None,
-                    }))
-                    .await;
                 return Ok(resp);
             }
         }
@@ -635,7 +631,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_middleware_unsuccessful_paid_retry_emits_payment_failed() {
+        async fn test_middleware_unsuccessful_paid_retry_emits_no_payment_outcome() {
             let (_, www_auth) = test_challenge();
 
             let app = Router::new().route(
@@ -672,12 +668,9 @@ mod tests {
             });
             let _failed_sub = events.on_payment_failed({
                 let failed_count = failed_count.clone();
-                move |ctx| {
+                move |_| {
                     failed_count.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        assert!(ctx.challenge.is_some());
-                        assert!(ctx.error.contains("403 Forbidden"));
-                    }
+                    async {}
                 }
             });
             let client = ClientBuilder::new(reqwest::Client::new())
@@ -693,7 +686,7 @@ mod tests {
             assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
             assert_eq!(provider.call_count(), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 0);
-            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]
@@ -754,7 +747,7 @@ mod tests {
                 request_count.load(Ordering::SeqCst),
                 DEFAULT_MAX_PAYMENT_RETRIES as u32 + 1
             );
-            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]
