@@ -5,7 +5,7 @@
 //! initial credential, authorizes the upgraded socket in-band, and services
 //! session voucher requests while exposing only application payloads.
 
-use std::{fmt, time::Duration};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -15,6 +15,7 @@ use mpp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch};
 use tokio::time::timeout;
@@ -31,6 +32,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_EVENTS_CAPACITY: usize = 64;
+const CHALLENGE_REFRESH_WINDOW: TimeDuration = TimeDuration::seconds(5);
 
 /// Errors produced by the canonical paid WebSocket transport.
 #[derive(Debug, thiserror::Error)]
@@ -182,35 +184,17 @@ where
                 })?,
             );
         }
-        let response = reqwest::Client::new()
-            .get(probe_url.clone())
-            .headers(probe_headers.clone())
-            .send()
-            .await
-            .map_err(MppWsError::Probe)?;
-        if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
-            return Err(MppWsError::ProbeStatus {
-                status: response.status().as_u16(),
-            });
-        }
-
-        let challenge = PaymentChallenge::from_headers(
-            response
-                .headers()
-                .get_all(reqwest::header::WWW_AUTHENTICATE)
-                .iter()
-                .filter_map(|value| value.to_str().ok()),
+        let http_client = reqwest::Client::new();
+        let challenge = probe_challenge(
+            &http_client,
+            &probe_url,
+            &probe_headers,
+            &self.payment_provider,
         )
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|challenge| {
-            self.payment_provider
-                .supports(challenge.method.as_str(), challenge.intent.as_str())
-        })
-        .ok_or(MppWsError::UnsupportedChallenge)?;
+        .await?;
         let payment_context = PaymentContext {
-            url: probe_url,
-            headers: probe_headers,
+            url: probe_url.clone(),
+            headers: probe_headers.clone(),
         };
         let challenge = self
             .payment_provider
@@ -233,6 +217,12 @@ where
         let mut client = MppApplicationWs {
             socket,
             challenge,
+            challenge_refresher: Arc::new(PaymentProbe {
+                client: http_client,
+                provider: self.payment_provider.clone(),
+                url: probe_url,
+                headers: probe_headers,
+            }),
             voucher_provider: self.voucher_provider.clone(),
             receipt_tx: self.receipt_tx.clone(),
             events_tx: self.events_tx.clone(),
@@ -246,6 +236,7 @@ where
 pub struct MppApplicationWs<V> {
     socket: Socket,
     challenge: PaymentChallenge,
+    challenge_refresher: Arc<dyn ChallengeRefresher>,
     voucher_provider: V,
     receipt_tx: watch::Sender<Option<Value>>,
     events_tx: broadcast::Sender<MppApplicationEvent>,
@@ -270,6 +261,7 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
                     let _ = self
                         .events_tx
                         .send(MppApplicationEvent::NeedVoucher(data.clone()));
+                    self.refresh_challenge_if_expiring(&data.channel_id).await?;
                     let voucher = self
                         .voucher_provider
                         .next_voucher_for_challenge(&self.challenge, &data)
@@ -332,6 +324,7 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
                     }
                 }
                 ServerFrame::NeedVoucher { data } => {
+                    self.refresh_challenge_if_expiring(&data.channel_id).await?;
                     let voucher = self
                         .voucher_provider
                         .next_voucher_for_challenge(&self.challenge, &data)
@@ -384,6 +377,17 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
         }
     }
 
+    async fn refresh_challenge_if_expiring(&mut self, channel_id: &str) -> Result<(), MppWsError> {
+        if !challenge_needs_refresh(&self.challenge) {
+            return Ok(());
+        }
+        self.challenge = self.challenge_refresher.refresh(channel_id).await?;
+        let _ = self
+            .events_tx
+            .send(MppApplicationEvent::Challenge(self.challenge.clone()));
+        Ok(())
+    }
+
     fn accept_receipt(&self, receipt: Value, close_ready: bool) {
         let _ = self.receipt_tx.send(Some(receipt.clone()));
         let event = if close_ready {
@@ -393,6 +397,78 @@ impl<V: VoucherProvider> MppApplicationWs<V> {
         };
         let _ = self.events_tx.send(event);
     }
+}
+
+trait ChallengeRefresher: Send + Sync {
+    fn refresh<'a>(
+        &'a self,
+        channel_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PaymentChallenge, MppWsError>> + Send + 'a>>;
+}
+
+struct PaymentProbe<P> {
+    client: reqwest::Client,
+    provider: P,
+    url: Url,
+    headers: HeaderMap,
+}
+
+impl<P: PaymentProvider> ChallengeRefresher for PaymentProbe<P> {
+    fn refresh<'a>(
+        &'a self,
+        channel_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PaymentChallenge, MppWsError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut headers = self.headers.clone();
+            headers.insert(
+                HeaderName::from_static("payment-session"),
+                channel_id.parse().map_err(|error| {
+                    MppError::InvalidConfig(format!(
+                        "invalid Payment-Session channel ID header: {error}"
+                    ))
+                })?,
+            );
+            probe_challenge(&self.client, &self.url, &headers, &self.provider).await
+        })
+    }
+}
+
+async fn probe_challenge<P: PaymentProvider>(
+    client: &reqwest::Client,
+    url: &Url,
+    headers: &HeaderMap,
+    provider: &P,
+) -> Result<PaymentChallenge, MppWsError> {
+    let response = client
+        .get(url.clone())
+        .headers(headers.clone())
+        .send()
+        .await
+        .map_err(MppWsError::Probe)?;
+    if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+        return Err(MppWsError::ProbeStatus {
+            status: response.status().as_u16(),
+        });
+    }
+    PaymentChallenge::from_headers(
+        response
+            .headers()
+            .get_all(reqwest::header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    )
+    .into_iter()
+    .filter_map(Result::ok)
+    .find(|challenge| provider.supports(challenge.method.as_str(), challenge.intent.as_str()))
+    .ok_or(MppWsError::UnsupportedChallenge)
+}
+
+fn challenge_needs_refresh(challenge: &PaymentChallenge) -> bool {
+    challenge
+        .expires
+        .as_deref()
+        .and_then(|expires| OffsetDateTime::parse(expires, &Rfc3339).ok())
+        .is_some_and(|expires| expires <= OffsetDateTime::now_utc() + CHALLENGE_REFRESH_WINDOW)
 }
 
 fn close_request(receipt: &Value) -> Result<CloseRequest, MppWsError> {

@@ -6,7 +6,7 @@ use axum::{
         ws::{rejection::WebSocketUpgradeRejection, Message, WebSocketUpgrade},
         State,
     },
-    http::{header::WWW_AUTHENTICATE, HeaderValue, StatusCode},
+    http::{header::WWW_AUTHENTICATE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -14,14 +14,19 @@ use axum::{
 use futures::StreamExt;
 use mpp::{
     client::{PaymentContext, PaymentProvider},
+    parse_authorization,
     protocol::core::Base64UrlJson,
     MppError, PaymentChallenge, PaymentCredential, PaymentPayload,
 };
 use serde_json::{json, Value};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 #[derive(Clone)]
 struct StubProvider;
@@ -133,8 +138,12 @@ impl CloseProvider for StubProvider {
 }
 
 fn challenge() -> PaymentChallenge {
+    challenge_with_id("challenge-1")
+}
+
+fn challenge_with_id(id: &str) -> PaymentChallenge {
     PaymentChallenge::new(
-        "challenge-1",
+        id,
         "application-test",
         "tempo",
         "session",
@@ -145,6 +154,127 @@ fn challenge() -> PaymentChallenge {
         }))
         .unwrap(),
     )
+}
+
+#[derive(Clone)]
+struct RefreshProvider {
+    voucher_challenges: Arc<Mutex<Vec<String>>>,
+}
+
+impl PaymentProvider for RefreshProvider {
+    fn supports(&self, method: &str, intent: &str) -> bool {
+        method == "tempo" && intent == "session"
+    }
+
+    async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        Ok(PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::hash("0xopen"),
+        ))
+    }
+}
+
+impl VoucherProvider for RefreshProvider {
+    async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
+        Err(MppError::bad_request(
+            "socket-bound voucher challenge was not forwarded",
+        ))
+    }
+
+    async fn next_voucher_for_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        _: &VoucherRequest,
+    ) -> Result<PaymentCredential, MppError> {
+        self.voucher_challenges
+            .lock()
+            .await
+            .push(challenge.id.clone());
+        Ok(PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::hash("0xvoucher"),
+        ))
+    }
+}
+
+#[derive(Clone, Default)]
+struct RefreshState {
+    challenge_requests: Arc<AtomicUsize>,
+}
+
+async fn refresh_route(
+    State(state): State<RefreshState>,
+    headers: HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let Ok(upgrade) = upgrade else {
+        let request = state.challenge_requests.fetch_add(1, Ordering::SeqCst) + 1;
+        if request > 1 {
+            assert_eq!(headers["payment-session"], "0xchannel");
+        }
+        let expires = (OffsetDateTime::now_utc() + Duration::seconds(2))
+            .format(&Rfc3339)
+            .unwrap();
+        let header = HeaderValue::from_str(
+            &challenge_with_id(&format!("challenge-{request}"))
+                .with_expires(expires)
+                .to_header()
+                .unwrap(),
+        )
+        .unwrap();
+        return (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, header)]).into_response();
+    };
+
+    upgrade
+        .on_upgrade(|mut socket| async move {
+            let opening = socket.next().await.unwrap().unwrap();
+            assert!(matches!(opening, Message::Text(_)));
+            socket
+                .send(Message::Text(
+                    json!({ "mpp": "payment-receipt", "data": receipt() })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+            socket
+                .send(Message::Text(
+                    json!({
+                        "mpp": "payment-need-voucher",
+                        "data": {
+                            "channelId": "0xchannel",
+                            "requiredCumulative": "100",
+                            "acceptedCumulative": "0",
+                            "deposit": "100"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let voucher = socket.next().await.unwrap().unwrap();
+            let Message::Text(voucher) = voucher else {
+                panic!("expected voucher authorization text frame")
+            };
+            let voucher: Value = serde_json::from_str(&voucher).unwrap();
+            let credential =
+                parse_authorization(voucher["authorization"].as_str().unwrap()).unwrap();
+            assert_eq!(credential.challenge.id, "challenge-2");
+
+            socket
+                .send(Message::Text(
+                    json!({ "mpp": "message", "data": "after-refresh" })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        })
+        .into_response()
 }
 
 fn receipt() -> Value {
@@ -315,6 +445,36 @@ async fn probes_then_authorizes_and_translates_application_messages() {
     socket.send("hello").await.unwrap();
     assert_eq!(socket.next().await.unwrap(), "world");
     assert_eq!(socket.close().await.unwrap()["channelId"], "0xchannel");
+}
+
+#[tokio::test]
+async fn refreshes_expiring_challenge_before_later_voucher() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = RefreshState::default();
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/", get(refresh_route))
+                .with_state(server_state),
+        )
+        .await
+        .unwrap();
+    });
+
+    let voucher_challenges = Arc::new(Mutex::new(Vec::new()));
+    let provider = RefreshProvider {
+        voucher_challenges: Arc::clone(&voucher_challenges),
+    };
+    let connector =
+        MppApplicationWsConnect::new(format!("ws://{address}/"), provider.clone(), provider);
+    let mut socket = connector.connect().await.unwrap();
+
+    assert_eq!(socket.next().await.unwrap(), "after-refresh");
+    assert_eq!(state.challenge_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(*voucher_challenges.lock().await, ["challenge-2"]);
 }
 
 #[tokio::test]
