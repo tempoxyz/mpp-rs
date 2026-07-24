@@ -182,13 +182,13 @@ pub async fn resolve_autoswap_calls<P: alloy::providers::Provider<tempo_alloy::T
     // Compute max_amount_in with slippage and verify the user can cover it.
     let max_amount_in =
         quoted_amount_in.saturating_mul(10_000 + config.slippage_bps as u128) / 10_000;
-    let token_in_balance =
-        check_balance_deficit(provider, owner, config.token_in, U256::from(max_amount_in)).await?;
-    if token_in_balance.is_some() {
+    let required = U256::from(max_amount_in);
+    if let Some(deficit) = check_balance_deficit(provider, owner, config.token_in, required).await?
+    {
         return Err(MppError::from(
             crate::client::tempo::TempoClientError::InsufficientBalance {
                 token: config.token_in.to_string(),
-                available: String::new(),
+                available: (required - deficit).to_string(),
                 required: max_amount_in.to_string(),
             },
         ));
@@ -333,5 +333,43 @@ mod tests {
             IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&calls[1].input[4..]).unwrap();
         assert_eq!(swap.amountOut, 5_000_000);
         assert_eq!(swap.maxAmountIn, 5_050_505);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_autoswap_reports_available_input_balance() {
+        use alloy::{
+            primitives::Bytes,
+            providers::{mock::Asserter, ProviderBuilder},
+        };
+
+        let token_in = address!("0x20c0000000000000000000000000000000000000");
+        let token_out = address!("0x20C000000000000000000000b9537d11c60E8b50");
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            &U256::ZERO,
+        )));
+        asserter.push_success(&Bytes::from(
+            IStablecoinDEX::quoteSwapExactAmountOutCall::abi_encode_returns(&5_000_000u128),
+        ));
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            &U256::from(3_000),
+        )));
+        let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+
+        let err = resolve_autoswap_calls(
+            &provider,
+            Address::repeat_byte(0x11),
+            token_out,
+            U256::from(5_000_000),
+            &AutoswapConfig::new(token_in, 100),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("Insufficient {token_in} balance: have 3000, need 5050000")
+        );
     }
 }
