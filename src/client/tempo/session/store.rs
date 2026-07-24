@@ -463,7 +463,8 @@ mod sqlite {
                 "UPDATE channels
                  SET scope_key = origin || char(10) || lower(payee) || ':' || lower(token) || ':' ||
                      lower(escrow_contract) || ':' || chain_id
-                 WHERE scope_key IS NULL AND session_protocol = 'v2' AND descriptor_json IS NOT NULL;
+                 WHERE scope_key IS NULL AND origin <> '' AND session_protocol = 'v2'
+                     AND descriptor_json IS NOT NULL;
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_scope_key
                      ON channels(scope_key) WHERE scope_key IS NOT NULL;
                  CREATE INDEX IF NOT EXISTS idx_channels_origin ON channels(origin);",
@@ -648,6 +649,86 @@ mod tests {
         .unwrap();
         assert_eq!(store.get(&current.key()).await.unwrap(), Some(current));
         drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_preserves_multiple_unscoped_recovered_sessions() {
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-recovered-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("channels.db");
+        let current = entry();
+        let descriptor = serde_json::to_string(&current.descriptor).unwrap();
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE channels (
+                        channel_id TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 1,
+                        origin TEXT NOT NULL, request_url TEXT NOT NULL DEFAULT '',
+                        chain_id INTEGER NOT NULL, escrow_contract TEXT NOT NULL,
+                        token TEXT NOT NULL, payee TEXT NOT NULL, payer TEXT NOT NULL,
+                        authorized_signer TEXT NOT NULL, salt TEXT NOT NULL,
+                        deposit TEXT NOT NULL, cumulative_amount TEXT NOT NULL,
+                        challenge_echo TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active',
+                        close_requested_at INTEGER NOT NULL DEFAULT 0,
+                        grace_ready_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                        last_used_at INTEGER NOT NULL,
+                        accepted_cumulative TEXT NOT NULL DEFAULT '0',
+                        server_spent TEXT NOT NULL DEFAULT '0',
+                        session_protocol TEXT NOT NULL DEFAULT 'v1', descriptor_json TEXT
+                    );",
+                )
+                .unwrap();
+            for channel_id in [B256::repeat_byte(0x11), B256::repeat_byte(0x12)] {
+                connection
+                    .execute(
+                        "INSERT INTO channels (
+                            channel_id, version, origin, request_url, chain_id, escrow_contract,
+                            token, payee, payer, authorized_signer, salt, deposit,
+                            cumulative_amount, challenge_echo, state, close_requested_at,
+                            grace_ready_at, created_at, last_used_at, accepted_cumulative,
+                            server_spent, session_protocol, descriptor_json
+                         ) VALUES (?1, 1, '', '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                            '{}', 'active', 0, 0, 1, 1, '0', '0', 'v2', ?11)",
+                        rusqlite::params![
+                            format!("{channel_id:#x}"),
+                            i64::try_from(current.chain_id).unwrap(),
+                            format!("{:#x}", current.escrow),
+                            current.descriptor.token,
+                            current.descriptor.payee,
+                            current.descriptor.payer,
+                            current.descriptor.authorized_signer,
+                            current.descriptor.salt,
+                            current.deposit.to_string(),
+                            current.cumulative_amount.to_string(),
+                            descriptor,
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: "https://api.example.com".into(),
+            path: Some(path.clone()),
+            request_url: None,
+        })
+        .unwrap();
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let scoped: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM channels WHERE scope_key IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scoped, 0);
+        drop(connection);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
