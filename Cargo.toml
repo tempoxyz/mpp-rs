@@ -42,6 +42,7 @@ tempo = [
   "tempo-primitives",
   "dep:tempo-contracts",
   "dep:async-trait",
+  "dep:p256",
   "uuid",
 ]
 stripe = ["dep:reqwest", "reqwest?/form"]
@@ -122,9 +123,10 @@ alloy = { version = "2.1.0", default-features = false, features = [
 ], optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "f3d7db8c5dc94546f390033d5f8495882fe81d63", optional = true }
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "f3d7db8c5dc94546f390033d5f8495882fe81d63", optional = true }
-tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "f3d7db8c5dc94546f390033d5f8495882fe81d63", optional = true }
+tempo-alloy = { version = "1.8.1", optional = true }
+tempo-primitives = { version = "1.8.1", optional = true }
+tempo-contracts = { version = "1.8.1", optional = true }
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 # HTTP client dependencies (optional)

@@ -305,15 +305,14 @@ mod tests {
     }
 
     fn signer() -> TempoP256Signer {
-        let jwk = P256Jwk::from_base64url(
-            "EC",
-            "P-256",
-            "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
-            "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
-            "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
-        )
-        .unwrap();
-        TempoP256Signer::from_webcrypto_jwk(&jwk).unwrap()
+        TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
+            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
+            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+        })
+        .unwrap()
     }
 
     fn descriptor(authority: Address) -> ChannelDescriptor {

@@ -534,15 +534,14 @@ mod tests {
     async fn p256_signer_produces_verifiable_webcrypto_compatible_voucher() {
         use crate::client::tempo::signing::{P256Jwk, TempoP256Signer};
 
-        let jwk = P256Jwk::from_base64url(
-            "EC",
-            "P-256",
-            "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
-            "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
-            "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
-        )
+        let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
+            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
+            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+        })
         .unwrap();
-        let signer = TempoP256Signer::from_webcrypto_jwk(&jwk).unwrap();
         let channel_id = B256::repeat_byte(0xab);
         let signature = sign_precompile_voucher_primitive(&signer, channel_id, 1_234_567, 4217)
             .await

@@ -221,7 +221,7 @@ pub type TempoProvider = alloy::providers::fillers::FillProvider<
         alloy::providers::fillers::JoinFill<
             alloy::providers::fillers::NonceFiller,
             alloy::providers::fillers::JoinFill<
-                tempo_alloy::fillers::TempoGasFiller,
+                alloy::providers::fillers::GasFiller,
                 alloy::providers::fillers::ChainIdFiller,
             >,
         >,

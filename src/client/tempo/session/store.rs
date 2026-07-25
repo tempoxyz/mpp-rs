@@ -30,17 +30,6 @@ pub struct StoredChannelEntry {
     pub opened: bool,
 }
 
-/// Signing identity retained by an active durable channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredChannelCredential {
-    /// Root Tempo account that owns the channel.
-    pub account: Address,
-    /// Chain on which the channel was opened.
-    pub chain_id: u64,
-    /// Exact root or access-key signer authorized by the channel.
-    pub authorized_signer: Address,
-}
-
 impl StoredChannelEntry {
     /// Return the MPPx-compatible payment-scope key for this channel.
     pub fn key(&self) -> String {
@@ -269,49 +258,35 @@ mod sqlite {
             &self.path
         }
 
-        /// Return the credential of the most recently used active session for this service.
+        /// Return the signer of the most recently used active session for this service.
         ///
         /// Wallet-backed clients can use this before constructing their session
-        /// provider so a cold process retains the exact account, chain, and access
-        /// key authorized by the existing channel descriptor.
-        pub fn latest_credential(&self) -> ChannelStoreResult<Option<StoredChannelCredential>> {
+        /// provider so a cold process retains the exact access key authorized by
+        /// the existing channel descriptor.
+        pub fn latest_authorized_signer(&self) -> ChannelStoreResult<Option<Address>> {
             let value = self
                 .connection
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT payer, chain_id, authorized_signer FROM channels
+                    "SELECT authorized_signer FROM channels
                      WHERE origin = ?1 AND state = 'active' AND session_protocol = 'v2'
                          AND scope_key IS NOT NULL
                      ORDER BY last_used_at DESC LIMIT 1",
                     [&self.origin],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
+                    |row| row.get::<_, String>(0),
                 )
                 .optional()
                 .map_err(io_error)?;
-            let Some((account, chain_id, authorized_signer)) = value else {
-                return Ok(None);
-            };
-            let account = account.parse().map_err(|error| {
-                ChannelStoreError::InvalidEntry(format!("invalid payer: {error}"))
-            })?;
-            let chain_id = u64::try_from(chain_id).map_err(|_| {
-                ChannelStoreError::InvalidEntry("chainId must be non-negative".into())
-            })?;
-            let authorized_signer = authorized_signer.parse().map_err(|error| {
-                ChannelStoreError::InvalidEntry(format!("invalid authorized_signer: {error}"))
-            })?;
-            Ok(Some(StoredChannelCredential {
-                account,
-                chain_id,
-                authorized_signer,
-            }))
+            value
+                .map(|address| {
+                    address.parse().map_err(|error| {
+                        ChannelStoreError::InvalidEntry(format!(
+                            "invalid authorized_signer: {error}"
+                        ))
+                    })
+                })
+                .transpose()
         }
 
         fn scoped_key(&self, key: &str) -> String {
@@ -626,12 +601,8 @@ mod tests {
             Some(current.clone())
         );
         assert_eq!(
-            store.latest_credential().unwrap(),
-            Some(StoredChannelCredential {
-                account: current.descriptor.payer.parse().unwrap(),
-                chain_id: current.chain_id,
-                authorized_signer: current.descriptor.authorized_signer.parse().unwrap(),
-            })
+            store.latest_authorized_signer().unwrap(),
+            Some(current.descriptor.authorized_signer.parse().unwrap())
         );
 
         let connection = rusqlite::Connection::open(path).unwrap();

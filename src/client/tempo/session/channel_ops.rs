@@ -14,13 +14,9 @@ use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::contracts::precompiles::{ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS};
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::{Call, TempoTransaction};
+use tempo_primitives::transaction::{Call, SignatureType, TempoTransaction};
 
 use crate::client::tempo::charge::tx_builder::{build_tempo_tx, estimate_gas, TempoTxOptions};
-use crate::client::tempo::signing::{
-    prepare_wallet_request, sign_and_encode_fee_payer_envelope_wallet, sign_and_encode_wallet,
-    NativeTempoWallet, TempoPrimitiveSigner,
-};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
@@ -448,23 +444,22 @@ pub struct OpenPayloadOptions {
 /// 2. `escrow.open(payee, token, deposit, salt, authorizedSigner)`
 ///
 /// Then signs an initial voucher for `initial_amount`.
-pub async fn create_open_payload<P>(
+pub async fn create_open_payload<P, S>(
     provider: &P,
-    wallet: &NativeTempoWallet,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
     payer: Address,
     options: OpenPayloadOptions,
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
 where
     P: Provider<TempoNetwork>,
+    S: Signer + Clone,
 {
     use alloy::sol;
     use tempo_primitives::transaction::Call;
 
-    let TempoPrimitiveSigner::Secp256k1(voucher_signer) = wallet.signer() else {
-        return Err(MppError::InvalidConfig(
-            "legacy Tempo sessions require a secp256k1 voucher signer".into(),
-        ));
-    };
+    let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
+    let signing_mode = signing_mode.unwrap_or(&default_mode);
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
     // Generate random salt
@@ -530,6 +525,13 @@ where
 
     let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        signer.address(),
+    )
+    .await?;
+
     let tempo_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
@@ -541,15 +543,17 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before,
-        key_authorization: None,
+        key_authorization,
     });
 
-    let tx_bytes = sign_and_encode_wallet(provider, wallet, tempo_tx).await?;
+    let tx_bytes =
+        crate::client::tempo::signing::sign_and_encode_async(tempo_tx, signer, signing_mode)
+            .await?;
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
     // Sign the initial voucher
     let voucher_sig = sign_voucher(
-        voucher_signer,
+        signer,
         channel_id,
         options.initial_amount,
         options.escrow_contract,
@@ -690,6 +694,9 @@ fn session_estimation_request(
     options: &TempoTxOptions,
     valid_after: Option<std::num::NonZeroU64>,
     payer: Address,
+    signer: Address,
+    signature_type: SignatureType,
+    keychain: bool,
 ) -> TempoTransactionRequest {
     let mut request = TempoTransactionRequest {
         calls: options.calls.clone(),
@@ -705,6 +712,10 @@ fn session_estimation_request(
     request.inner.nonce = Some(options.nonce);
     request.inner.max_fee_per_gas = Some(options.max_fee_per_gas);
     request.inner.max_priority_fee_per_gas = Some(options.max_priority_fee_per_gas);
+    request.key_type = Some(signature_type);
+    if keychain {
+        request.key_id = Some(signer);
+    }
     request
 }
 
@@ -905,14 +916,16 @@ pub struct TopUpPrecompilePayloadOptions<'a> {
 /// approvals list; optional prefix calls may acquire the deposit currency.
 /// Channel id is derived against the complete unsigned tx's `expiringNonceHash`.
 #[cfg(feature = "tempo")]
-pub async fn create_precompile_open_payload<P>(
+pub async fn create_precompile_open_payload<P, S>(
     provider: &P,
-    wallet: &NativeTempoWallet,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
     payer: Address,
     options: OpenPrecompilePayloadOptions,
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
 where
     P: Provider<TempoNetwork>,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
 {
     if options.deposit > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
         return Err(MppError::InvalidConfig(format!(
@@ -926,6 +939,10 @@ where
             options.initial_amount
         )));
     }
+
+    let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
+    let signing_mode = signing_mode.unwrap_or(&default_mode);
+    let primitive_signer = signer.clone().into();
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
     let salt = B256::random();
@@ -954,6 +971,13 @@ where
 
     let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        primitive_signer.address(),
+    )
+    .await?;
+
     let unsigned_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
@@ -965,7 +989,7 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before,
-        key_authorization: None,
+        key_authorization,
     });
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
@@ -995,14 +1019,24 @@ where
     );
 
     let tx_bytes = if options.fee_payer {
-        sign_and_encode_fee_payer_envelope_wallet(provider, wallet, unsigned_tx).await?
+        crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
     } else {
-        sign_and_encode_wallet(provider, wallet, unsigned_tx).await?
+        crate::client::tempo::signing::sign_and_encode_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
     };
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
     let voucher_sig = sign_precompile_voucher_primitive(
-        wallet.signer(),
+        &primitive_signer,
         channel_id,
         options.initial_amount,
         options.chain_id,
@@ -1039,14 +1073,16 @@ where
 /// to the MPP server as a management credential, and the server broadcasts it
 /// before accepting a voucher that requires the additional headroom.
 #[cfg(feature = "tempo")]
-pub async fn create_precompile_top_up_transaction_payload<P>(
+pub async fn create_precompile_top_up_transaction_payload<P, S>(
     provider: &P,
-    wallet: &NativeTempoWallet,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
     payer: Address,
     options: TopUpPrecompilePayloadOptions<'_>,
 ) -> Result<SessionCredentialPayload, MppError>
 where
     P: Provider<TempoNetwork>,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
 {
     let additional_deposit =
         parse_precompile_amount(options.additional_deposit, "additional_deposit")?;
@@ -1056,6 +1092,15 @@ where
         ));
     }
 
+    let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
+    let signing_mode = signing_mode.unwrap_or(&default_mode);
+    let primitive_signer = signer.clone().into();
+    let signature_type = match &primitive_signer {
+        crate::client::tempo::signing::TempoPrimitiveSigner::Secp256k1(_) => {
+            SignatureType::Secp256k1
+        }
+        crate::client::tempo::signing::TempoPrimitiveSigner::P256(_) => SignatureType::P256,
+    };
     let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
     let mut calls = options.prefix_calls;
     calls.push(Call {
@@ -1071,6 +1116,12 @@ where
         .mpp_http("failed to get gas price")?;
     let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        primitive_signer.address(),
+    )
+    .await?;
     let fee_token = options
         .descriptor
         .token
@@ -1088,19 +1139,38 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before,
-        key_authorization: None,
+        key_authorization,
     };
     if !options.fee_payer {
-        let request = session_estimation_request(&transaction_options, valid_after, payer);
-        let request = prepare_wallet_request(provider, wallet, request).await?;
+        let request = session_estimation_request(
+            &transaction_options,
+            valid_after,
+            payer,
+            primitive_signer.address(),
+            signature_type,
+            matches!(
+                signing_mode,
+                crate::client::tempo::signing::TempoSigningMode::Keychain { .. }
+            ),
+        );
         transaction_options.gas_limit = estimate_gas(provider, request).await?;
     }
     let mut unsigned_tx = build_tempo_tx(transaction_options);
     unsigned_tx.valid_after = valid_after;
     let tx_bytes = if options.fee_payer {
-        sign_and_encode_fee_payer_envelope_wallet(provider, wallet, unsigned_tx).await?
+        crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
     } else {
-        sign_and_encode_wallet(provider, wallet, unsigned_tx).await?
+        crate::client::tempo::signing::sign_and_encode_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
     };
     let channel_id =
         compute_precompile_channel_id_from_descriptor(options.descriptor, options.chain_id)?;
@@ -1362,7 +1432,6 @@ mod tests {
 
         let signer = PrivateKeySigner::random();
         let payer = signer.address();
-        let wallet = NativeTempoWallet::new(signer.into());
         // Validation runs before any network IO.
         let provider = ProviderBuilder::<_, _, TempoNetwork>::default()
             .connect_http("http://localhost:1".parse().unwrap());
@@ -1378,7 +1447,7 @@ mod tests {
             chain_id: 4217,
             fee_payer: false,
         };
-        let err = create_precompile_open_payload(&provider, &wallet, payer, opts)
+        let err = create_precompile_open_payload(&provider, &signer, None, payer, opts)
             .await
             .expect_err("deposit > uint96 must be rejected");
         assert!(matches!(err, MppError::InvalidConfig(_)));
@@ -1399,7 +1468,6 @@ mod tests {
             ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
         let signer = PrivateKeySigner::random();
         let payer = signer.address();
-        let wallet = NativeTempoWallet::new(signer.into());
         let descriptor = ChannelDescriptor {
             payer: payer.to_string(),
             payee: Address::repeat_byte(0x11).to_string(),
@@ -1412,7 +1480,8 @@ mod tests {
 
         let error = create_precompile_top_up_transaction_payload(
             &provider,
-            &wallet,
+            &signer,
+            None,
             payer,
             TopUpPrecompilePayloadOptions {
                 prefix_calls: vec![],
