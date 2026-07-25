@@ -18,7 +18,10 @@ use alloy::{
     signers::Signer,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use tempo_alloy::TempoNetwork;
+use tempo_alloy::{
+    accounts::{TempoAccessKey, TempoWallet},
+    TempoNetwork,
+};
 use tempo_primitives::transaction::Call;
 
 use self::channel_ops::{
@@ -68,15 +71,13 @@ use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSe
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
 pub struct TempoSessionProvider {
-    signer: TempoPrimitiveSigner,
+    wallet: TempoWallet<TempoPrimitiveSigner>,
     rpc_url: reqwest::Url,
     rpc_provider: alloy::providers::RootProvider<TempoNetwork>,
     /// Escrow contract address override. If None, resolved from challenge or defaults.
     escrow_contract: Option<Address>,
     /// Address authorized to sign vouchers. Defaults to signer address.
     authorized_signer: Option<Address>,
-    /// Signing mode (direct or keychain).
-    signing_mode: crate::client::tempo::signing::TempoSigningMode,
     /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`.
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
@@ -123,15 +124,24 @@ impl TempoSessionProvider {
         signer: impl Into<TempoPrimitiveSigner>,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
+        Self::from_wallet(TempoWallet::new(signer.into()), rpc_url)
+    }
+
+    /// Create a session provider from a Tempo wallet that already owns its
+    /// direct or access-key signing context.
+    pub fn from_wallet(
+        wallet: TempoWallet<TempoPrimitiveSigner>,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
         let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
         let rpc_provider = super::rpc_provider(url.clone());
+        let authorized_signer = wallet.key_id();
         Ok(Self {
-            signer: signer.into(),
+            wallet,
             rpc_url: url,
             rpc_provider,
             escrow_contract: None,
-            authorized_signer: None,
-            signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
+            authorized_signer,
             max_deposit: None,
             default_deposit: None,
             top_up_amount: None,
@@ -146,6 +156,15 @@ impl TempoSessionProvider {
         })
     }
 
+    /// Create a session provider from one access key selected by Tempo
+    /// Accounts.
+    pub fn from_access_key(
+        access_key: TempoAccessKey,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
+        Self::from_wallet(access_key.into_wallet(), rpc_url)
+    }
+
     /// Set the escrow contract address override.
     pub fn with_escrow_contract(mut self, addr: Address) -> Self {
         self.escrow_contract = Some(addr);
@@ -155,17 +174,6 @@ impl TempoSessionProvider {
     /// Set the authorized signer address (for delegated voucher signing).
     pub fn with_authorized_signer(mut self, addr: Address) -> Self {
         self.authorized_signer = Some(addr);
-        self
-    }
-
-    /// Set the signing mode (direct or keychain).
-    ///
-    /// Default is [`TempoSigningMode::Direct`].
-    pub fn with_signing_mode(
-        mut self,
-        mode: crate::client::tempo::signing::TempoSigningMode,
-    ) -> Self {
-        self.signing_mode = mode;
         self
     }
 
@@ -218,11 +226,16 @@ impl TempoSessionProvider {
 
     /// Get a reference to the signer.
     pub fn signer(&self) -> &TempoPrimitiveSigner {
-        &self.signer
+        self.wallet.signer()
+    }
+
+    /// Get the Tempo wallet, including its root/access-key relationship.
+    pub fn wallet(&self) -> &TempoWallet<TempoPrimitiveSigner> {
+        &self.wallet
     }
 
     fn secp256k1_signer(&self) -> Result<&alloy::signers::local::PrivateKeySigner, MppError> {
-        match &self.signer {
+        match self.wallet.signer() {
             TempoPrimitiveSigner::Secp256k1(signer) => Ok(signer),
             TempoPrimitiveSigner::P256(_) => Err(MppError::InvalidConfig(
                 "P-256 session keys require the native TIP-1034 precompile".into(),
@@ -623,8 +636,10 @@ impl TempoSessionProvider {
 
         let bootstrap_headers = headers.clone();
         let (key, _) = self.expected_channel_key(challenge)?;
-        let payer = self.signing_mode.from_address(self.signer.address());
-        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+        let payer = self.wallet.account();
+        let authorized_signer = self
+            .authorized_signer
+            .unwrap_or_else(|| self.wallet.signer().address());
 
         let cached_in_memory = self
             .channels
@@ -742,9 +757,9 @@ impl TempoSessionProvider {
                 .and_then(|details| details.get("chainId"))
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
-            let payer = self.signing_mode.from_address(self.signer.address());
+            let payer = self.wallet.account();
             let signature = sign_proof_primitive(
-                &self.signer,
+                self.wallet.signer(),
                 payer,
                 chain_id,
                 &challenge.id,
@@ -789,8 +804,10 @@ impl TempoSessionProvider {
             serde_json::from_slice(&snapshot_bytes)
                 .mpp_config("invalid Payment-Session-Snapshot JSON")?;
 
-        let payer = self.signing_mode.from_address(self.signer.address());
-        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+        let payer = self.wallet.account();
+        let authorized_signer = self
+            .authorized_signer
+            .unwrap_or_else(|| self.wallet.signer().address());
         let payee = snapshot
             .descriptor
             .payee
@@ -919,7 +936,7 @@ impl TempoSessionProvider {
 
         let payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_voucher_payload_with_descriptor_primitive(
-                &self.signer,
+                self.wallet.signer(),
                 entry.descriptor.clone().ok_or_else(|| {
                     MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                 })?,
@@ -943,7 +960,7 @@ impl TempoSessionProvider {
         self.channels.lock().unwrap().insert(key, entry.clone());
         self.notify_update(&entry);
 
-        let payer = self.signing_mode.from_address(self.signer.address());
+        let payer = self.wallet.account();
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
@@ -960,7 +977,7 @@ impl TempoSessionProvider {
         let descriptor = entry.descriptor.as_ref().ok_or_else(|| {
             MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
         })?;
-        let payer = self.signing_mode.from_address(self.signer.address());
+        let payer = self.wallet.account();
         let prefix_calls = self
             .autoswap_calls(
                 &self.rpc_provider,
@@ -974,8 +991,7 @@ impl TempoSessionProvider {
             .await?;
         let payload = create_precompile_top_up_transaction_payload(
             &self.rpc_provider,
-            &self.signer,
-            Some(&self.signing_mode),
+            &self.wallet,
             payer,
             TopUpPrecompilePayloadOptions {
                 prefix_calls,
@@ -1297,7 +1313,7 @@ impl TempoSessionProvider {
 
         let payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_close_payload_with_descriptor_primitive(
-                &self.signer,
+                self.wallet.signer(),
                 entry.channel_id,
                 entry.descriptor.ok_or_else(|| {
                     MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
@@ -1316,7 +1332,7 @@ impl TempoSessionProvider {
             )
             .await?
         };
-        let payer = self.signing_mode.from_address(self.signer.address());
+        let payer = self.wallet.account();
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
@@ -1529,8 +1545,10 @@ impl TempoSessionProvider {
             .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
 
         let amount = session_req.parse_amount()?;
-        let payer = self.signing_mode.from_address(self.signer.address());
-        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+        let payer = self.wallet.account();
+        let authorized_signer = self
+            .authorized_signer
+            .unwrap_or_else(|| self.wallet.signer().address());
         let precompile = is_precompile_escrow(escrow_contract);
         let operator = if precompile {
             Some(Self::parse_operator(&session_req)?)
@@ -1625,7 +1643,7 @@ impl TempoSessionProvider {
 
                 let payload = if precompile {
                     create_precompile_voucher_payload_with_descriptor_primitive(
-                        &self.signer,
+                        self.wallet.signer(),
                         entry.descriptor.clone().ok_or_else(|| {
                             MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                         })?,
@@ -1711,8 +1729,7 @@ impl TempoSessionProvider {
                 .await?;
             create_precompile_open_payload(
                 &self.rpc_provider,
-                &self.signer,
-                Some(&self.signing_mode),
+                &self.wallet,
                 payer,
                 OpenPrecompilePayloadOptions {
                     prefix_calls,
@@ -1730,8 +1747,7 @@ impl TempoSessionProvider {
         } else {
             create_open_payload(
                 &self.rpc_provider,
-                self.secp256k1_signer()?,
-                Some(&self.signing_mode),
+                &self.wallet,
                 payer,
                 OpenPayloadOptions {
                     authorized_signer: self.authorized_signer,
@@ -2153,38 +2169,31 @@ mod tests {
         );
     }
 
-    // --- with_signing_mode ---
-
     #[test]
-    fn test_session_provider_with_signing_mode() {
-        use crate::client::tempo::signing::{KeychainVersion, TempoSigningMode};
+    fn test_session_provider_accepts_keychain_wallet() {
+        use tempo_alloy::accounts::TempoWallet;
 
         let signer = PrivateKeySigner::random();
-        let wallet: Address = "0x1111111111111111111111111111111111111111"
+        let account: Address = "0x1111111111111111111111111111111111111111"
             .parse()
             .unwrap();
-        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet,
-                key_authorization: None,
-                version: KeychainVersion::V1,
-            });
+        let key_id = signer.address();
+        let provider = TempoSessionProvider::from_wallet(
+            TempoWallet::for_account(account, TempoPrimitiveSigner::from(signer)),
+            "https://rpc.example.com",
+        )
+        .unwrap();
 
-        assert!(matches!(
-            provider.signing_mode,
-            TempoSigningMode::Keychain { .. }
-        ));
+        assert_eq!(provider.wallet().account(), account);
+        assert_eq!(provider.wallet().key_id(), Some(key_id));
     }
 
     #[test]
-    fn test_session_provider_default_signing_mode() {
-        use crate::client::tempo::signing::TempoSigningMode;
-
+    fn test_session_provider_default_wallet_is_direct() {
         let signer = PrivateKeySigner::random();
         let provider = TempoSessionProvider::new(signer, "https://rpc.example.com").unwrap();
 
-        assert!(matches!(provider.signing_mode, TempoSigningMode::Direct));
+        assert!(provider.wallet().key_id().is_none());
     }
 
     // --- resolve_deposit edge cases ---
@@ -2366,7 +2375,7 @@ mod tests {
 
         let store = Arc::new(MemoryChannelStore::default());
         let provider = make_test_provider().with_channel_store(store.clone());
-        let payer = provider.signer.address();
+        let payer = provider.signer().address();
         let payee = Address::repeat_byte(0x11);
         let currency = Address::repeat_byte(0x22);
         let channel_id = B256::repeat_byte(0x33);
@@ -2974,11 +2983,13 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn pay_signs_native_voucher_with_accounts_sdk_p256_access_key() {
-        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        use tempo_alloy::{
+            accounts::TempoWallet, contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS,
+        };
 
         use crate::client::tempo::{
             session::channel_ops::{build_channel_descriptor, ChannelEntry},
-            signing::{KeychainVersion, P256Jwk, TempoP256Signer, TempoSigningMode},
+            signing::{P256Jwk, TempoP256Signer, TempoPrimitiveSigner},
         };
         use crate::protocol::{
             core::{Base64UrlJson, PaymentChallenge},
@@ -2987,14 +2998,15 @@ mod tests {
             },
         };
 
-        let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
-            kty: "EC".into(),
-            crv: "P-256".into(),
-            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
-            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
-            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
-        })
+        let jwk = P256Jwk::from_base64url(
+            "EC",
+            "P-256",
+            "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
+            "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
+            "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+        )
         .unwrap();
+        let signer = TempoP256Signer::from_webcrypto_jwk(&jwk).unwrap();
         let payer = Address::repeat_byte(0x10);
         let payee = Address::repeat_byte(0x11);
         let currency = Address::repeat_byte(0x22);
@@ -3021,13 +3033,11 @@ mod tests {
             signer.address(),
             expiring_nonce_hash,
         );
-        let provider = TempoSessionProvider::new(signer.clone(), "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: payer,
-                key_authorization: None,
-                version: KeychainVersion::V2,
-            });
+        let provider = TempoSessionProvider::from_wallet(
+            TempoWallet::for_account(payer, TempoPrimitiveSigner::from(signer.clone())),
+            "https://rpc.example.com",
+        )
+        .unwrap();
         let key = TempoSessionProvider::channel_key(
             &payee,
             &currency,
@@ -3113,7 +3123,7 @@ mod tests {
         let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
         let store = Arc::new(MemoryChannelStore::default());
         let provider = make_test_provider().with_channel_store(store.clone());
-        let payer = provider.signer.address();
+        let payer = provider.signer().address();
         let channel_id = B256::repeat_byte(0x33);
         let descriptor = ChannelDescriptor {
             authorized_signer: payer.to_string(),
@@ -3294,22 +3304,23 @@ mod tests {
             Router,
         };
 
-        use crate::client::tempo::signing::{
-            KeychainVersion, P256Jwk, TempoP256Signer, TempoSigningMode,
-        };
+        use tempo_alloy::accounts::TempoWallet;
+
+        use crate::client::tempo::signing::{P256Jwk, TempoP256Signer, TempoPrimitiveSigner};
         use crate::protocol::{
             core::{Base64UrlJson, PaymentChallenge, PaymentCredential},
             methods::tempo::proof::recover_proof_signer,
         };
 
-        let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
-            kty: "EC".into(),
-            crv: "P-256".into(),
-            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
-            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
-            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
-        })
+        let jwk = P256Jwk::from_base64url(
+            "EC",
+            "P-256",
+            "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
+            "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
+            "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
+        )
         .unwrap();
+        let signer = TempoP256Signer::from_webcrypto_jwk(&jwk).unwrap();
         let root = Address::repeat_byte(0x44);
         let chain_id = 4217;
         let challenge = PaymentChallenge::new(
@@ -3383,13 +3394,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: root,
-                key_authorization: None,
-                version: KeychainVersion::V2,
-            });
+        let provider = TempoSessionProvider::from_wallet(
+            TempoWallet::for_account(root, TempoPrimitiveSigner::from(signer)),
+            "https://rpc.example.com",
+        )
+        .unwrap();
         let result = provider
             .bootstrap(
                 &reqwest::Client::new(),

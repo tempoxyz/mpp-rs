@@ -5,8 +5,9 @@ use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
 use super::autoswap::AutoswapConfig;
 use super::charge::SignOptions;
-use super::signing::{TempoPrimitiveSigner, TempoSigningMode};
+use super::signing::TempoPrimitiveSigner;
 use crate::client::PaymentProvider;
+use tempo_alloy::accounts::{TempoAccessKey, TempoWallet};
 
 /// Tempo payment provider using native primitive signing.
 ///
@@ -37,11 +38,10 @@ use crate::client::PaymentProvider;
 
 #[derive(Clone)]
 pub struct TempoProvider {
-    signer: TempoPrimitiveSigner,
+    wallet: TempoWallet<TempoPrimitiveSigner>,
     rpc_url: reqwest::Url,
     rpc_provider: alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
     client_id: Option<String>,
-    signing_mode: TempoSigningMode,
     autoswap: Option<AutoswapConfig>,
     expected_chain_id: Option<u64>,
 }
@@ -59,27 +59,44 @@ impl TempoProvider {
         let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
         let rpc_provider = super::rpc_provider(url.clone());
         Ok(Self {
-            signer: signer.into(),
+            wallet: TempoWallet::new(signer.into()),
             rpc_url: url,
             rpc_provider,
             client_id: None,
-            signing_mode: TempoSigningMode::Direct,
             autoswap: None,
             expected_chain_id: None,
         })
     }
 
+    /// Create a provider from a Tempo wallet that already owns its signing
+    /// context.
+    pub fn from_wallet(
+        wallet: TempoWallet<TempoPrimitiveSigner>,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
+        let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let rpc_provider = super::rpc_provider(url.clone());
+        Ok(Self {
+            wallet,
+            rpc_url: url,
+            rpc_provider,
+            client_id: None,
+            autoswap: None,
+            expected_chain_id: None,
+        })
+    }
+
+    /// Create a provider from one access key selected by Tempo Accounts.
+    pub fn from_access_key(
+        access_key: TempoAccessKey,
+        rpc_url: impl AsRef<str>,
+    ) -> Result<Self, MppError> {
+        Self::from_wallet(access_key.into_wallet(), rpc_url)
+    }
+
     /// Set an optional client identifier for attribution memos.
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
-        self
-    }
-
-    /// Set the signing mode (direct or keychain).
-    ///
-    /// Default is [`TempoSigningMode::Direct`].
-    pub fn with_signing_mode(mut self, mode: TempoSigningMode) -> Self {
-        self.signing_mode = mode;
         self
     }
 
@@ -125,14 +142,14 @@ impl TempoProvider {
         self.expected_chain_id
     }
 
-    /// Get the signing mode.
-    pub fn signing_mode(&self) -> &TempoSigningMode {
-        &self.signing_mode
-    }
-
     /// Get a reference to the signer.
     pub fn signer(&self) -> &TempoPrimitiveSigner {
-        &self.signer
+        self.wallet.signer()
+    }
+
+    /// Get the Tempo wallet, including its root/access-key relationship.
+    pub fn wallet(&self) -> &TempoWallet<TempoPrimitiveSigner> {
+        &self.wallet
     }
 
     /// Get the RPC URL.
@@ -184,9 +201,7 @@ impl PaymentProvider for TempoProvider {
         // Otherwise the transfer can leave too little output token for gas.
         let fee_token = self.fee_token();
         if let Some(autoswap_config) = &self.autoswap {
-            let from = self
-                .signing_mode
-                .from_address(alloy::signers::Signer::address(&self.signer));
+            let from = self.wallet.account();
 
             if let Some(swap_calls) = super::autoswap::resolve_autoswap_calls(
                 &self.rpc_provider,
@@ -206,12 +221,11 @@ impl PaymentProvider for TempoProvider {
         }
 
         let options = SignOptions {
-            signing_mode: Some(self.signing_mode.clone()),
             fee_token,
             ..Default::default()
         };
         let signed = charge
-            .sign_with_primitive_provider_options(&self.signer, &self.rpc_provider, options)
+            .sign_with_wallet_provider_options(&self.wallet, &self.rpc_provider, options)
             .await?;
         Ok(signed.into_credential())
     }
@@ -265,32 +279,30 @@ mod tests {
     }
 
     #[test]
-    fn test_tempo_provider_default_signing_mode() {
+    fn test_tempo_provider_default_wallet_is_direct() {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let provider = TempoProvider::new(signer, "https://rpc.example.com").unwrap();
 
-        assert!(matches!(provider.signing_mode(), TempoSigningMode::Direct));
+        assert!(provider.wallet().key_id().is_none());
     }
 
     #[test]
-    fn test_tempo_provider_with_signing_mode() {
-        use crate::client::tempo::signing::KeychainVersion;
+    fn test_tempo_provider_accepts_keychain_wallet() {
+        use tempo_alloy::accounts::TempoWallet;
+
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let wallet: alloy::primitives::Address = "0x1111111111111111111111111111111111111111"
             .parse()
             .unwrap();
-        let provider = TempoProvider::new(signer, "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet,
-                key_authorization: None,
-                version: KeychainVersion::V1,
-            });
+        let key_id = signer.address();
+        let provider = TempoProvider::from_wallet(
+            TempoWallet::for_account(wallet, TempoPrimitiveSigner::from(signer)),
+            "https://rpc.example.com",
+        )
+        .unwrap();
 
-        assert!(matches!(
-            provider.signing_mode(),
-            TempoSigningMode::Keychain { .. }
-        ));
+        assert_eq!(provider.wallet().account(), wallet);
+        assert_eq!(provider.wallet().key_id(), Some(key_id));
     }
 
     #[test]
@@ -361,7 +373,8 @@ mod tests {
     /// Server-side verify_proof handles keychain keys via on-chain lookup.
     #[tokio::test]
     async fn test_keychain_proof_source_uses_wallet_address() {
-        use crate::client::tempo::signing::KeychainVersion;
+        use tempo_alloy::accounts::TempoWallet;
+
         use crate::protocol::core::Base64UrlJson;
 
         let access_key = alloy::signers::local::PrivateKeySigner::random();
@@ -370,13 +383,14 @@ mod tests {
                 .parse()
                 .unwrap();
 
-        let provider = TempoProvider::new(access_key.clone(), "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet_address,
-                key_authorization: None,
-                version: KeychainVersion::V2,
-            });
+        let provider = TempoProvider::from_wallet(
+            TempoWallet::for_account(
+                wallet_address,
+                TempoPrimitiveSigner::from(access_key.clone()),
+            ),
+            "https://rpc.example.com",
+        )
+        .unwrap();
 
         let request = Base64UrlJson::from_value(&serde_json::json!({
             "amount": "0",
@@ -405,9 +419,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_p256_access_key_signs_wallet_bound_charge_proof() {
-        use crate::client::tempo::signing::{
-            KeychainVersion, TempoP256Signer, TempoPrimitiveSigner,
-        };
+        use tempo_alloy::accounts::TempoWallet;
+
+        use crate::client::tempo::signing::{TempoP256Signer, TempoPrimitiveSigner};
         use crate::protocol::core::Base64UrlJson;
 
         let access_key = TempoP256Signer::from_slice(&[7_u8; 32]).unwrap();
@@ -415,13 +429,11 @@ mod tests {
             "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
                 .parse()
                 .unwrap();
-        let provider = TempoProvider::new(access_key, "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet_address,
-                key_authorization: None,
-                version: KeychainVersion::V2,
-            });
+        let provider = TempoProvider::from_wallet(
+            TempoWallet::for_account(wallet_address, TempoPrimitiveSigner::from(access_key)),
+            "https://rpc.example.com",
+        )
+        .unwrap();
         assert!(matches!(provider.signer(), TempoPrimitiveSigner::P256(_)));
 
         let request = Base64UrlJson::from_value(&serde_json::json!({
@@ -453,7 +465,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_p256_access_key_signs_sponsored_charge_transaction() {
-        use crate::client::tempo::signing::{KeychainVersion, TempoP256Signer};
+        use tempo_alloy::accounts::TempoWallet;
+
+        use crate::client::tempo::signing::{TempoP256Signer, TempoPrimitiveSigner};
         use crate::protocol::core::Base64UrlJson;
 
         let access_key = TempoP256Signer::from_slice(&[9_u8; 32]).unwrap();
@@ -461,13 +475,11 @@ mod tests {
             "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
                 .parse()
                 .unwrap();
-        let provider = TempoProvider::new(access_key, "https://rpc.example.com")
-            .unwrap()
-            .with_signing_mode(TempoSigningMode::Keychain {
-                wallet: wallet_address,
-                key_authorization: None,
-                version: KeychainVersion::V2,
-            });
+        let provider = TempoProvider::from_wallet(
+            TempoWallet::for_account(wallet_address, TempoPrimitiveSigner::from(access_key)),
+            "https://rpc.example.com",
+        )
+        .unwrap();
         let request = Base64UrlJson::from_value(&serde_json::json!({
             "amount": "100",
             "currency": "0x20c0000000000000000000000000000000000000",

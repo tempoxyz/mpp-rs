@@ -1508,7 +1508,8 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
 /// source DID to see two different "users" for the same wallet.
 #[tokio::test]
 async fn test_keychain_source_did_consistent_across_proof_and_paid() {
-    use mpp::client::tempo::signing::{KeychainVersion, TempoSigningMode};
+    use mpp::client::tempo::signing::TempoPrimitiveSigner;
+    use tempo_alloy::accounts::TempoWallet;
 
     let rpc = rpc_url();
     let chain_id = get_chain_id(&rpc).await;
@@ -1540,13 +1541,14 @@ async fn test_keychain_source_did_consistent_across_proof_and_paid() {
 
     let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
 
-    let provider = TempoProvider::new(access_key_signer.clone(), &rpc)
-        .expect("failed to create TempoProvider")
-        .with_signing_mode(TempoSigningMode::Keychain {
-            wallet: wallet_signer.address(),
-            key_authorization: None,
-            version: KeychainVersion::V2,
-        });
+    let provider = TempoProvider::from_wallet(
+        TempoWallet::for_account(
+            wallet_signer.address(),
+            TempoPrimitiveSigner::from(access_key_signer.clone()),
+        ),
+        &rpc,
+    )
+    .expect("failed to create TempoProvider");
 
     // ---- $0 identity proof ----
     let identity_resp = Client::new()
@@ -2040,7 +2042,8 @@ async fn wallet_authorize_access_key(
 /// simulation gate and settles on-chain, with the sponsor as the fee payer.
 #[tokio::test]
 async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
-    use mpp::client::tempo::signing::{KeychainVersion, TempoSigningMode};
+    use mpp::client::tempo::signing::TempoPrimitiveSigner;
+    use tempo_alloy::accounts::TempoWallet;
 
     let rpc = rpc_url();
     let chain_id = get_chain_id(&rpc).await;
@@ -2079,13 +2082,14 @@ async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
     let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
 
     // Access key acts for the wallet; key already on-chain (no key_authorization).
-    let provider = TempoProvider::new(access_key_signer, &rpc)
-        .expect("failed to create TempoProvider")
-        .with_signing_mode(TempoSigningMode::Keychain {
-            wallet: wallet_signer.address(),
-            key_authorization: None,
-            version: KeychainVersion::V2,
-        });
+    let provider = TempoProvider::from_wallet(
+        TempoWallet::for_account(
+            wallet_signer.address(),
+            TempoPrimitiveSigner::from(access_key_signer),
+        ),
+        &rpc,
+    )
+    .expect("failed to create TempoProvider");
 
     let resp = Client::new()
         .get(format!("{url}/paid"))

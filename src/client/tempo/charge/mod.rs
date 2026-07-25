@@ -2,7 +2,7 @@
 //!
 //! Separates "what to pay" (parsed from the challenge) from "how to resolve
 //! gas/nonce/signer" so that simple users get a 3-line path and power users
-//! can inject their own nonce, gas config, and signing mode.
+//! can inject their own nonce and gas policy.
 //!
 //! # Simple path (3 lines)
 //!
@@ -21,7 +21,6 @@
 //!     gas_limit: Some(500_000),
 //!     max_fee_per_gas: Some(2_000_000_000),
 //!     max_priority_fee_per_gas: Some(100_000_000),
-//!     signing_mode: TempoSigningMode::Keychain { wallet, key_authorization: None },
 //!     rpc_url: Some("https://rpc.tempo.xyz".to_string()),
 //!     ..Default::default()
 //! }).await?;
@@ -34,15 +33,12 @@ use std::num::NonZeroU64;
 
 use alloy::primitives::{Address, TxKind, U256};
 use alloy::providers::Provider;
-use tempo_primitives::transaction::{
-    Call, SignatureType, SignedKeyAuthorization, TempoTransaction,
-};
+use tempo_primitives::transaction::Call;
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::client::tempo::signing::{
-    sign_and_encode_async, sign_and_encode_fee_payer_envelope_async,
-    sign_and_encode_fee_payer_envelope_primitive_async, sign_and_encode_primitive_async,
-    TempoPrimitiveSigner, TempoSigningMode,
+    prepare_wallet_request, sign_and_encode_fee_payer_envelope_wallet, sign_and_encode_wallet,
+    NativeTempoWallet, TempoPrimitiveSigner,
 };
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
@@ -86,18 +82,6 @@ fn encode_transfer(
             }
             .abi_encode(),
         )
-    }
-}
-
-fn apply_estimation_signer_hints(
-    request: &mut TempoTransactionRequest,
-    signing_mode: &TempoSigningMode,
-    signer_address: Address,
-    signature_type: SignatureType,
-) {
-    request.key_type = Some(signature_type);
-    if matches!(signing_mode, TempoSigningMode::Keychain { .. }) {
-        request.key_id = Some(signer_address);
     }
 }
 
@@ -243,79 +227,36 @@ impl TempoCharge {
     ///
     /// Returns an error if the chain_id is not a known Tempo network, or if
     /// RPC calls (nonce, gas estimation) fail.
-    pub async fn sign(
-        self,
-        signer: &(impl alloy::signers::Signer + Clone),
-    ) -> Result<SignedTempoCharge, MppError> {
+    pub async fn sign<S>(self, signer: &S) -> Result<SignedTempoCharge, MppError>
+    where
+        S: Clone + Into<TempoPrimitiveSigner>,
+    {
         self.sign_with_options(signer, SignOptions::default()).await
     }
 
-    /// Sign the charge with explicit options for gas, nonce, signing mode, etc.
+    /// Sign the charge with explicit nonce and gas options.
     ///
-    /// Power users use this to inject their own nonce resolution, gas bumping,
-    /// keychain signing mode, and key authorization provisioning.
-    pub async fn sign_with_options(
+    /// Access-key callers should use [`Self::sign_with_wallet_options`]; the
+    /// wallet already owns the account, key ID, signature type, and pending
+    /// authorization.
+    pub async fn sign_with_options<S>(
         self,
-        signer: &(impl alloy::signers::Signer + Clone),
+        signer: &S,
         options: SignOptions,
-    ) -> Result<SignedTempoCharge, MppError> {
-        self.prepare(signer.address(), SignatureType::Secp256k1, options)
-            .await?
-            .sign_secp256k1(signer)
-            .await
+    ) -> Result<SignedTempoCharge, MppError>
+    where
+        S: Clone + Into<TempoPrimitiveSigner>,
+    {
+        let wallet = NativeTempoWallet::new(signer.clone().into());
+        self.sign_with_wallet_options(&wallet, options).await
     }
 
-    /// Sign the charge with a native Tempo primitive signer.
-    ///
-    /// This accepts either a secp256k1 key or an Accounts SDK-compatible P-256
-    /// access key through [`TempoPrimitiveSigner`] and Alloy's existing signer
-    /// interface.
-    pub async fn sign_with_primitive_options(
+    /// Sign with a Tempo wallet, including Accounts-compatible access keys.
+    pub async fn sign_with_wallet_options(
         self,
-        signer: &TempoPrimitiveSigner,
+        wallet: &NativeTempoWallet,
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        let signature_type = match signer {
-            TempoPrimitiveSigner::Secp256k1(_) => SignatureType::Secp256k1,
-            TempoPrimitiveSigner::P256(_) => SignatureType::P256,
-        };
-        self.prepare(
-            alloy::signers::Signer::address(signer),
-            signature_type,
-            options,
-        )
-        .await?
-        .sign_primitive(signer)
-        .await
-    }
-
-    pub(crate) async fn sign_with_primitive_provider_options(
-        self,
-        signer: &TempoPrimitiveSigner,
-        provider: &impl Provider<tempo_alloy::TempoNetwork>,
-        options: SignOptions,
-    ) -> Result<SignedTempoCharge, MppError> {
-        let signature_type = match signer {
-            TempoPrimitiveSigner::Secp256k1(_) => SignatureType::Secp256k1,
-            TempoPrimitiveSigner::P256(_) => SignatureType::P256,
-        };
-        self.prepare_with_provider(
-            alloy::signers::Signer::address(signer),
-            signature_type,
-            options,
-            provider,
-        )
-        .await?
-        .sign_primitive(signer)
-        .await
-    }
-
-    async fn prepare(
-        self,
-        signer_address: Address,
-        signature_type: SignatureType,
-        options: SignOptions,
-    ) -> Result<PreparedTempoCharge, MppError> {
         let rpc_url = match options.rpc_url.as_deref() {
             Some(url) => url.parse().mpp_config("invalid RPC URL")?,
             None => {
@@ -332,46 +273,63 @@ impl TempoCharge {
             }
         };
         let provider = super::rpc_provider(rpc_url);
-        self.prepare_with_provider(signer_address, signature_type, options, &provider)
+        self.sign_with_wallet_provider_options(wallet, &provider, options)
             .await
     }
 
-    async fn prepare_with_provider(
+    /// Compatibility helper for a direct native primitive signer.
+    pub async fn sign_with_primitive_options(
         self,
-        signer_address: Address,
-        signature_type: SignatureType,
+        signer: &TempoPrimitiveSigner,
         options: SignOptions,
+    ) -> Result<SignedTempoCharge, MppError> {
+        self.sign_with_wallet_options(&NativeTempoWallet::new(signer.clone()), options)
+            .await
+    }
+
+    pub(crate) async fn sign_with_wallet_provider_options(
+        self,
+        wallet: &NativeTempoWallet,
         provider: &impl Provider<tempo_alloy::TempoNetwork>,
-    ) -> Result<PreparedTempoCharge, MppError> {
-        let signing_mode = options.signing_mode.unwrap_or_default();
-        let from = signing_mode.from_address(signer_address);
+        options: SignOptions,
+    ) -> Result<SignedTempoCharge, MppError> {
+        let from = wallet.account();
 
         if self.amount.is_zero() {
-            return Ok(PreparedTempoCharge {
-                challenge: self.challenge,
+            let signature = match wallet.signer() {
+                TempoPrimitiveSigner::Secp256k1(signer) if wallet.key_id().is_none() => {
+                    proof::sign_proof(
+                        signer,
+                        from,
+                        self.chain_id,
+                        &self.challenge.id,
+                        &self.challenge.realm,
+                    )
+                    .await?
+                }
+                signer => {
+                    proof::sign_proof_primitive(
+                        signer,
+                        from,
+                        self.chain_id,
+                        &self.challenge.id,
+                        &self.challenge.realm,
+                    )
+                    .await?
+                }
+            };
+            let credential = PaymentCredential::with_source(
+                self.challenge.to_echo(),
+                proof::proof_source(from, self.chain_id),
+                PaymentPayload::proof(signature),
+            );
+            return Ok(SignedTempoCharge {
+                credential,
+                tx_bytes: None,
                 chain_id: self.chain_id,
-                fee_payer: self.fee_payer,
                 from,
-                signing_mode,
-                transaction: None,
             });
         }
-
-        let managed_key_authorization = if options.key_authorization.is_none() {
-            crate::client::tempo::signing::keychain::resolve_key_authorization(
-                provider,
-                &signing_mode,
-                signer_address,
-            )
-            .await?
-        } else {
-            None
-        };
-        let key_authorization = options
-            .key_authorization
-            .as_deref()
-            .cloned()
-            .or(managed_key_authorization);
 
         let calls = match self.calls {
             Some(c) => c,
@@ -410,7 +368,6 @@ impl TempoCharge {
         } else {
             let mut req = TempoTransactionRequest {
                 calls: calls.clone(),
-                key_authorization: key_authorization.clone(),
                 ..Default::default()
             }
             .with_fee_token(fee_token)
@@ -425,12 +382,11 @@ impl TempoCharge {
             req.inner.nonce = Some(nonce);
             req.inner.max_fee_per_gas = Some(max_fee_per_gas);
             req.inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
-            apply_estimation_signer_hints(&mut req, &signing_mode, signer_address, signature_type);
 
+            let req = prepare_wallet_request(provider, wallet, req).await?;
             estimate_gas(provider, req).await?
         };
 
-        // Build the key_authorization for the transaction
         let tx = build_tempo_tx(TempoTxOptions {
             calls,
             chain_id: self.chain_id,
@@ -442,113 +398,27 @@ impl TempoCharge {
             max_priority_fee_per_gas,
             fee_payer: self.fee_payer,
             valid_before,
-            key_authorization,
+            key_authorization: None,
         });
-
-        Ok(PreparedTempoCharge {
-            challenge: self.challenge,
-            chain_id: self.chain_id,
-            fee_payer: self.fee_payer,
-            from,
-            signing_mode,
-            transaction: Some(tx),
-        })
-    }
-}
-
-struct PreparedTempoCharge {
-    challenge: PaymentChallenge,
-    chain_id: u64,
-    fee_payer: bool,
-    from: Address,
-    signing_mode: TempoSigningMode,
-    transaction: Option<TempoTransaction>,
-}
-
-impl PreparedTempoCharge {
-    async fn sign_secp256k1(
-        mut self,
-        signer: &(impl alloy::signers::Signer + Clone),
-    ) -> Result<SignedTempoCharge, MppError> {
-        let Some(transaction) = self.transaction.take() else {
-            let signature = proof::sign_proof(
-                signer,
-                self.from,
-                self.chain_id,
-                &self.challenge.id,
-                &self.challenge.realm,
-            )
-            .await?;
-            return Ok(self.proof(signature));
-        };
         let tx_bytes = if self.fee_payer {
-            sign_and_encode_fee_payer_envelope_async(transaction, signer, &self.signing_mode)
-                .await?
+            sign_and_encode_fee_payer_envelope_wallet(provider, wallet, tx).await?
         } else {
-            sign_and_encode_async(transaction, signer, &self.signing_mode).await?
+            sign_and_encode_wallet(provider, wallet, tx).await?
         };
-        Ok(self.transaction(tx_bytes))
-    }
-
-    async fn sign_primitive(
-        mut self,
-        signer: &TempoPrimitiveSigner,
-    ) -> Result<SignedTempoCharge, MppError> {
-        let Some(transaction) = self.transaction.take() else {
-            let signature = proof::sign_proof_primitive(
-                signer,
-                self.from,
-                self.chain_id,
-                &self.challenge.id,
-                &self.challenge.realm,
-            )
-            .await?;
-            return Ok(self.proof(signature));
-        };
-        let tx_bytes = if self.fee_payer {
-            sign_and_encode_fee_payer_envelope_primitive_async(
-                transaction,
-                signer,
-                &self.signing_mode,
-            )
-            .await?
-        } else {
-            sign_and_encode_primitive_async(transaction, signer, &self.signing_mode).await?
-        };
-        Ok(self.transaction(tx_bytes))
-    }
-
-    fn proof(self, signature: String) -> SignedTempoCharge {
-        let credential = PaymentCredential::with_source(
-            self.challenge.to_echo(),
-            proof::proof_source(self.from, self.chain_id),
-            PaymentPayload::proof(signature),
-        );
-        SignedTempoCharge {
-            credential,
-            tx_bytes: None,
-            chain_id: self.chain_id,
-            from: self.from,
-        }
-    }
-
-    fn transaction(self, tx_bytes: Vec<u8>) -> SignedTempoCharge {
-        let credential =
-            build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, self.from);
-        SignedTempoCharge {
+        let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
+        Ok(SignedTempoCharge {
             credential,
             tx_bytes: Some(tx_bytes),
             chain_id: self.chain_id,
-            from: self.from,
-        }
+            from,
+        })
     }
 }
 
 /// Options for controlling the signing pipeline.
 ///
-/// Power users set these to override the defaults (nonce resolution,
-/// gas estimation, signing mode, etc.). All fields are optional —
-/// unset fields are resolved automatically.
+/// Power users set these to override nonce and gas defaults. Signing context
+/// belongs to [`NativeTempoWallet`].
 #[derive(Debug, Clone, Default)]
 pub struct SignOptions {
     /// Override the RPC URL (otherwise resolved from chain_id).
@@ -565,10 +435,6 @@ pub struct SignOptions {
     pub max_priority_fee_per_gas: Option<u128>,
     /// Override the fee token address (default: the charge currency).
     pub fee_token: Option<Address>,
-    /// Override the signing mode (default: [`TempoSigningMode::Direct`]).
-    pub signing_mode: Option<TempoSigningMode>,
-    /// Provide a key authorization to include in the transaction.
-    pub key_authorization: Option<Box<SignedKeyAuthorization>>,
     /// Optional validity window upper bound (unix timestamp) for fee payer mode.
     pub valid_before: Option<u64>,
 }
@@ -720,45 +586,8 @@ mod tests {
         assert!(opts.max_fee_per_gas.is_none());
         assert!(opts.max_priority_fee_per_gas.is_none());
         assert!(opts.fee_token.is_none());
-        assert!(opts.signing_mode.is_none());
-        assert!(opts.key_authorization.is_none());
         assert!(opts.valid_before.is_none());
         assert!(opts.nonce_key.is_none());
-    }
-
-    #[test]
-    fn estimation_hints_direct_signature_type_without_key_id() {
-        let signer = Address::repeat_byte(0x11);
-        let mut request = TempoTransactionRequest::default();
-
-        apply_estimation_signer_hints(
-            &mut request,
-            &TempoSigningMode::Direct,
-            signer,
-            SignatureType::Secp256k1,
-        );
-
-        assert_eq!(request.key_type, Some(SignatureType::Secp256k1));
-        assert_eq!(request.key_id, None);
-    }
-
-    #[test]
-    fn estimation_hints_keychain_p256_access_key() {
-        use crate::client::tempo::signing::KeychainVersion;
-
-        let signer = Address::repeat_byte(0x11);
-        let wallet = Address::repeat_byte(0x22);
-        let mode = TempoSigningMode::Keychain {
-            wallet,
-            version: KeychainVersion::V2,
-            key_authorization: None,
-        };
-        let mut request = TempoTransactionRequest::default();
-
-        apply_estimation_signer_hints(&mut request, &mode, signer, SignatureType::P256);
-
-        assert_eq!(request.key_type, Some(SignatureType::P256));
-        assert_eq!(request.key_id, Some(signer));
     }
 
     #[test]
