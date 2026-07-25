@@ -3,6 +3,7 @@
 //! Contains the Tempo payment providers, transaction building,
 //! signing strategies, charge builder, and channel operations.
 
+mod accounts_provider;
 pub mod autoswap;
 pub mod charge;
 mod error;
@@ -12,6 +13,7 @@ pub mod signing;
 #[cfg(feature = "sqlite")]
 pub mod wallet;
 
+pub use accounts_provider::TempoAccountsProvider;
 pub use autoswap::AutoswapConfig;
 pub use error::TempoClientError;
 

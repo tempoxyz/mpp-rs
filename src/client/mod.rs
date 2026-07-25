@@ -64,7 +64,7 @@ pub use middleware::PaymentMiddleware;
 #[cfg(feature = "tempo")]
 pub use tempo::session::{channel_ops, TempoSessionProvider};
 #[cfg(feature = "tempo")]
-pub use tempo::{AutoswapConfig, TempoClientError, TempoProvider};
+pub use tempo::{AutoswapConfig, TempoAccountsProvider, TempoClientError, TempoProvider};
 #[cfg(feature = "tempo")]
 pub use tempo_alloy::TempoNetwork;
 

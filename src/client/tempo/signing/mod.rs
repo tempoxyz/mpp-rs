@@ -11,10 +11,13 @@ pub use p256::{P256Jwk, P256SignerError, TempoP256Signer, TempoPrimitiveSigner};
 
 use alloy::eips::eip2930::AccessList;
 use alloy::eips::Encodable2718;
+use alloy::network::NetworkWallet;
 use alloy::primitives::{Address, U256};
+use tempo_alloy::accounts::TempoAccessKey;
 use tempo_primitives::transaction::{
-    KeychainSignature, PrimitiveSignature, SignedKeyAuthorization, TempoSignature,
+    AASigned, KeychainSignature, PrimitiveSignature, SignedKeyAuthorization, TempoSignature,
 };
+use tempo_primitives::TempoTxEnvelope;
 
 // Re-export so callers can set the version without importing tempo_primitives directly.
 pub use tempo_primitives::transaction::KeychainVersion;
@@ -344,6 +347,68 @@ pub async fn sign_and_encode_fee_payer_envelope_primitive_async(
         .mpp_http("failed to sign transaction")?;
     let signature = build_tempo_signature_primitive(signature, mode);
     Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
+}
+
+async fn sign_access_key(
+    access_key: &TempoAccessKey,
+    transaction: tempo_primitives::transaction::TempoTransaction,
+) -> Result<AASigned, MppError> {
+    match access_key
+        .sign_request(transaction.into())
+        .await
+        .mpp_http("failed to sign Tempo transaction")?
+    {
+        TempoTxEnvelope::AA(signed) => Ok(signed),
+        _ => Err(MppError::InvalidConfig(
+            "MPP requires a Tempo AA transaction".into(),
+        )),
+    }
+}
+
+/// Sign and EIP-2718 encode a transaction with an exact key selected from
+/// Tempo Accounts.
+pub(crate) async fn sign_and_encode_access_key(
+    access_key: &TempoAccessKey,
+    transaction: tempo_primitives::transaction::TempoTransaction,
+) -> Result<Vec<u8>, MppError> {
+    Ok(sign_access_key(access_key, transaction)
+        .await?
+        .encoded_2718())
+}
+
+/// Sign an MPP fee-payer envelope with an exact key selected from Tempo
+/// Accounts.
+pub(crate) async fn sign_and_encode_fee_payer_access_key(
+    access_key: &TempoAccessKey,
+    mut transaction: tempo_primitives::transaction::TempoTransaction,
+) -> Result<Vec<u8>, MppError> {
+    if transaction.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires a fee_payer_signature placeholder".into(),
+        ));
+    }
+    if transaction.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token".into(),
+        ));
+    }
+    if transaction.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use the expiring nonce key".into(),
+        ));
+    }
+    if transaction.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".into(),
+        ));
+    }
+
+    transaction.access_list = AccessList::default();
+    let (transaction, signature, _) = sign_access_key(access_key, transaction).await?.into_parts();
+    Ok(
+        FeePayerEnvelope78::from_signing_tx(transaction, access_key.account(), signature)
+            .encoded_envelope(),
+    )
 }
 
 /// Async version of [`sign_and_encode_fee_payer_envelope`].
