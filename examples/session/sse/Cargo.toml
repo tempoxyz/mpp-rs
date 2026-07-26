@@ -15,7 +15,7 @@ path = "src/client.rs"
 [dependencies]
 mpp = { path = "../../..", features = ["server", "client", "tempo"] }
 alloy = { version = "2.0", features = ["provider-http"] }
-tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "5bf2a5d93bb73dcfbf8bff1243e91f843e0369c2" }
+tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "2048aab43e64743d298f27173476e0e5274a9448" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
