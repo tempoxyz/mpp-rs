@@ -8,13 +8,10 @@ use super::charge::{SignOptions, TempoCharge};
 use super::signing::{TempoPrimitiveSigner, TempoSigningMode};
 use crate::client::PaymentProvider;
 
-pub(super) async fn prepare_charge(
+pub(super) fn prepare_charge_request(
     challenge: &PaymentChallenge,
     expected_chain_id: Option<u64>,
     client_id: Option<&str>,
-    autoswap: Option<&AutoswapConfig>,
-    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
-    from: alloy::primitives::Address,
 ) -> Result<TempoCharge, MppError> {
     let mut charge = TempoCharge::from_challenge(challenge)?;
 
@@ -41,6 +38,27 @@ pub(super) async fn prepare_charge(
         ));
     }
 
+    Ok(charge)
+}
+
+pub(super) async fn prepare_charge(
+    challenge: &PaymentChallenge,
+    expected_chain_id: Option<u64>,
+    client_id: Option<&str>,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<TempoCharge, MppError> {
+    let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
+    apply_autoswap(charge, autoswap, provider, from).await
+}
+
+pub(super) async fn apply_autoswap(
+    mut charge: TempoCharge,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<TempoCharge, MppError> {
     if let Some(config) = autoswap {
         if let Some(calls) = super::autoswap::resolve_autoswap_calls(
             provider,
