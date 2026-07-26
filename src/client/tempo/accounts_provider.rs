@@ -1,8 +1,14 @@
 //! Tempo Charge provider backed by the Tempo Accounts store.
 
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-use tempo_alloy::accounts::TempoAccountsWallet;
+use tempo_alloy::accounts::{
+    TempoAccountsError, TempoAccountsWallet, TempoAuthorizationReservation,
+};
 
 use super::{autoswap::AutoswapConfig, charge::SignOptions};
 use crate::{
@@ -24,6 +30,7 @@ pub struct TempoAccountsProvider {
     client_id: Option<String>,
     autoswap: Option<AutoswapConfig>,
     expected_chain_id: Option<u64>,
+    pending_authorizations: Arc<Mutex<HashMap<String, TempoAuthorizationReservation>>>,
 }
 
 impl TempoAccountsProvider {
@@ -38,6 +45,7 @@ impl TempoAccountsProvider {
             client_id: None,
             autoswap: None,
             expected_chain_id: None,
+            pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -103,6 +111,44 @@ impl TempoAccountsProvider {
         self.rpc_url.as_ref()
     }
 
+    /// Return whether the Accounts store has a locally signable key covering
+    /// this charge's complete call intent.
+    pub async fn has_access_key_for_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+    ) -> Result<bool, MppError> {
+        let from = self
+            .wallet
+            .active_account()
+            .mpp_config("failed to read the active Tempo account")?;
+        let charge = super::provider::prepare_charge_request(
+            challenge,
+            self.expected_chain_id,
+            self.client_id.as_deref(),
+        )?;
+        if charge.amount().is_zero() {
+            return match self
+                .wallet
+                .clone()
+                .with_chain_id(charge.chain_id())
+                .active_access_key()
+            {
+                Ok(key) => Ok(key.account() == from),
+                Err(TempoAccountsError::MissingAccessKey { .. }) => Ok(false),
+                Err(error) => Err(error).mpp_config("failed to inspect Tempo Accounts access key"),
+            };
+        }
+
+        let rpc_provider = super::rpc_provider(self.settlement_rpc_url(charge.chain_id())?);
+        let charge =
+            super::provider::apply_autoswap(charge, self.autoswap.as_ref(), &rpc_provider, from)
+                .await?;
+        let request = charge.accounts_request(from)?;
+        self.wallet
+            .has_access_key_for_request(&request)
+            .mpp_config("failed to inspect Tempo Accounts access keys")
+    }
+
     fn settlement_rpc_url(&self, chain_id: u64) -> Result<reqwest::Url, MppError> {
         if let Some(url) = &self.rpc_url {
             return Ok(url.clone());
@@ -116,6 +162,50 @@ impl TempoAccountsProvider {
             .default_rpc_url()
             .parse()
             .mpp_config("invalid default Tempo RPC URL")
+    }
+
+    fn remember_authorization(
+        &self,
+        challenge_id: &str,
+        reservation: TempoAuthorizationReservation,
+    ) -> Result<(), MppError> {
+        let mut pending = self.pending_authorizations.lock().map_err(|_| {
+            MppError::InvalidConfig(
+                "Tempo authorization lifecycle state is unavailable".to_string(),
+            )
+        })?;
+        match pending.entry(challenge_id.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(reservation);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == reservation => {}
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(MppError::InvalidConfig(format!(
+                    "challenge {challenge_id} already has a different Tempo authorization in flight"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn take_authorization(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<Option<TempoAuthorizationReservation>, MppError> {
+        if credential.challenge.id != challenge.id {
+            return Err(MppError::InvalidConfig(
+                "payment lifecycle credential does not match its challenge".to_string(),
+            ));
+        }
+        self.pending_authorizations
+            .lock()
+            .map_err(|_| {
+                MppError::InvalidConfig(
+                    "Tempo authorization lifecycle state is unavailable".to_string(),
+                )
+            })
+            .map(|mut pending| pending.remove(&challenge.id))
     }
 }
 
@@ -140,7 +230,7 @@ impl PaymentProvider for TempoAccountsProvider {
             super::provider::apply_autoswap(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
 
-        charge
+        let signed = charge
             .sign_with_accounts_provider_options(
                 &self.wallet,
                 &rpc_provider,
@@ -150,8 +240,38 @@ impl PaymentProvider for TempoAccountsProvider {
                     ..Default::default()
                 },
             )
-            .await
-            .map(|signed| signed.into_credential())
+            .await?;
+        let reservation = signed.authorization_reservation();
+        let credential = signed.into_credential();
+        if let Some(reservation) = reservation {
+            if let Err(error) = self.remember_authorization(&challenge.id, reservation) {
+                let _ = self.wallet.release_authorization(reservation);
+                return Err(error);
+            }
+        }
+        Ok(credential)
+    }
+
+    async fn commit_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let _ = self.take_authorization(challenge, credential)?;
+        Ok(())
+    }
+
+    async fn rollback_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        if let Some(reservation) = self.take_authorization(challenge, credential)? {
+            self.wallet
+                .release_authorization(reservation)
+                .mpp_config("failed to release Tempo key authorization")?;
+        }
+        Ok(())
     }
 }
 
@@ -163,15 +283,24 @@ mod tests {
     };
 
     use alloy::{
-        eips::eip2718::Decodable2718, primitives::Address, signers::local::PrivateKeySigner,
+        eips::eip2718::Decodable2718,
+        network::NetworkWallet,
+        primitives::{Address, Signature},
+        rpc::types::TransactionRequest,
+        signers::local::PrivateKeySigner,
+        sol_types::SolCall,
     };
     use tempo_primitives::{
-        transaction::{KeychainVersion, TempoSignature},
+        transaction::{
+            KeyAuthorization, KeychainVersion, PrimitiveSignature, SignatureType, TempoSignature,
+        },
         AASigned,
     };
 
     use super::*;
     use crate::protocol::core::Base64UrlJson;
+    use tempo_alloy::contracts::precompiles::ITIP20;
+    use tempo_alloy::rpc::TempoTransactionRequest;
 
     static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -249,6 +378,88 @@ mod tests {
             Some(PaymentCredential::evm_did(4217, &account.to_string()))
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_charge_selects_the_key_on_the_challenge_chain() {
+        let (provider, path, _) = provider();
+        let mut other_chain = challenge("0", false);
+        other_chain.request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {"chainId": 42431},
+        }))
+        .unwrap();
+
+        let error = provider.pay(&other_chain).await.unwrap_err();
+        assert!(error.to_string().contains("42431"), "got: {error}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn challenge_preflight_checks_the_transfer_scope() {
+        let (provider, path, _) = provider();
+        let mut store: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        store["tempo-cli.store"]["state"]["accessKeys"][0]["scopes"] = serde_json::json!([{
+            "address": "0x20c0000000000000000000000000000000000000",
+            "selector": alloy::hex::encode_prefixed(ITIP20::transferWithMemoCall::SELECTOR),
+            "recipients": ["0x0000000000000000000000000000000000000001"],
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+
+        assert!(!provider
+            .has_access_key_for_challenge(&challenge("100", false))
+            .await
+            .unwrap());
+
+        store["tempo-cli.store"]["state"]["accessKeys"][0]["scopes"][0]["recipients"] =
+            serde_json::json!(["0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"]);
+        std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
+        assert!(provider
+            .has_access_key_for_challenge(&challenge("100", false))
+            .await
+            .unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_payment_releases_its_one_time_authorization() {
+        let account = Address::repeat_byte(0x11);
+        let signer = PrivateKeySigner::random();
+        let authorization =
+            KeyAuthorization::unrestricted(4217, SignatureType::Secp256k1, signer.address())
+                .into_signed(PrimitiveSignature::Secp256k1(Signature::test_signature()));
+        let wallet = TempoAccountsWallet::from_secp256k1(account, signer, Some(authorization))
+            .with_chain_id(4217);
+        let provider = TempoAccountsProvider::new(wallet.clone());
+        let reservation = wallet.authorization_reservation().unwrap();
+        let request = TempoTransactionRequest {
+            inner: TransactionRequest {
+                to: Some(Address::repeat_byte(0x22).into()),
+                nonce: Some(0),
+                gas: Some(100_000),
+                max_fee_per_gas: Some(1),
+                max_priority_fee_per_gas: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        wallet.sign_request(request.clone()).await.unwrap();
+        provider
+            .remember_authorization("challenge-123", reservation)
+            .unwrap();
+        let challenge = challenge("100", false);
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), serde_json::json!({"test": true}));
+
+        provider
+            .rollback_payment(&challenge, &credential)
+            .await
+            .unwrap();
+        wallet.sign_request(request).await.unwrap();
+        wallet.release_authorization(reservation).unwrap();
     }
 
     #[tokio::test]

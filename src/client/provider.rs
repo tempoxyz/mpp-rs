@@ -120,7 +120,12 @@ pub trait PaymentProvider: Clone + Send + Sync {
         async { Ok(()) }
     }
 
-    /// Roll back optimistic provider state after the server rejects a credential.
+    /// Roll back optimistic provider state after the credential was not sent
+    /// or the server definitively rejected it.
+    ///
+    /// Callers must not invoke this hook after an ambiguous transport failure:
+    /// the server may have accepted the credential even if its response was
+    /// lost.
     fn rollback_payment(
         &self,
         challenge: &PaymentChallenge,

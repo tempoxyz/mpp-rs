@@ -56,7 +56,7 @@ use crate::protocol::methods::tempo::transfers::get_transfers;
 use crate::protocol::methods::tempo::types::Split;
 use crate::protocol::methods::tempo::CHAIN_ID;
 use alloy::sol_types::SolCall;
-use tempo_alloy::accounts::TempoAccountsWallet;
+use tempo_alloy::accounts::{TempoAccountsWallet, TempoAuthorizationReservation};
 use tempo_alloy::contracts::precompiles::ITIP20;
 use tempo_alloy::rpc::TempoTransactionRequest;
 
@@ -224,6 +224,23 @@ impl TempoCharge {
             .collect())
     }
 
+    pub(crate) fn accounts_request(
+        &self,
+        from: Address,
+    ) -> Result<TempoTransactionRequest, MppError> {
+        let calls = match &self.calls {
+            Some(calls) => calls.clone(),
+            None => self.build_transfer_calls()?,
+        };
+        let mut request = TempoTransactionRequest {
+            calls,
+            ..Default::default()
+        };
+        request.inner.from = Some(from);
+        request.inner.chain_id = Some(self.chain_id);
+        Ok(request)
+    }
+
     /// Prepend a call to the transaction's call list.
     ///
     /// Used by autoswap to insert a DEX swap call before the transfer call.
@@ -328,6 +345,8 @@ impl TempoCharge {
 
         if self.amount.is_zero() {
             let access_key = wallet
+                .clone()
+                .with_chain_id(self.chain_id)
                 .active_access_key()
                 .mpp_config("failed to select Tempo Accounts access key")?;
             if access_key.account() != from {
@@ -359,6 +378,7 @@ impl TempoCharge {
                 tx_bytes: None,
                 chain_id: self.chain_id,
                 from,
+                authorization_reservation: None,
             });
         }
 
@@ -419,6 +439,7 @@ impl TempoCharge {
             .sign_request(request)
             .await
             .mpp_http("failed to sign Tempo transaction")?;
+        let authorization_reservation = access_key.authorization_reservation();
         let tx_bytes = if self.fee_payer {
             encode_signed_fee_payer_envelope(signed, from)?
         } else {
@@ -430,6 +451,7 @@ impl TempoCharge {
             tx_bytes: Some(tx_bytes),
             chain_id: self.chain_id,
             from,
+            authorization_reservation,
         })
     }
 
@@ -652,6 +674,7 @@ impl PreparedTempoCharge {
             tx_bytes: None,
             chain_id: self.chain_id,
             from: self.from,
+            authorization_reservation: None,
         }
     }
 
@@ -663,6 +686,7 @@ impl PreparedTempoCharge {
             tx_bytes: Some(tx_bytes),
             chain_id: self.chain_id,
             from: self.from,
+            authorization_reservation: None,
         }
     }
 }
@@ -703,6 +727,7 @@ pub struct SignedTempoCharge {
     tx_bytes: Option<Vec<u8>>,
     chain_id: u64,
     from: Address,
+    authorization_reservation: Option<TempoAuthorizationReservation>,
 }
 
 impl SignedTempoCharge {
@@ -724,6 +749,10 @@ impl SignedTempoCharge {
     /// Get the `from` address used for signing.
     pub fn from_address(&self) -> Address {
         self.from
+    }
+
+    pub(crate) fn authorization_reservation(&self) -> Option<TempoAuthorizationReservation> {
+        self.authorization_reservation
     }
 }
 
@@ -896,6 +925,7 @@ mod tests {
             tx_bytes: Some(vec![0x76, 0xab, 0xcd]),
             chain_id: 42431,
             from,
+            authorization_reservation: None,
         };
 
         let credential = signed.into_credential();
@@ -920,6 +950,7 @@ mod tests {
             tx_bytes: Some(vec![0x76]),
             chain_id: 4217,
             from,
+            authorization_reservation: None,
         };
 
         assert_eq!(signed.tx_bytes(), &[0x76]);

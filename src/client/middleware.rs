@@ -374,7 +374,9 @@ where
                             reason: None,
                         }))
                         .await;
-                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                    // The request may have reached the server even though its
+                    // response was lost. Preserve optimistic provider state
+                    // until a later challenge can reconcile it.
                     return Err(err);
                 }
             };

@@ -401,9 +401,9 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
-                    rollback_payments(provider, &pending_payments)
-                        .await
-                        .map_err(HttpError::Payment)?;
+                    // The request may have reached the server even though its
+                    // response was lost. Preserve optimistic provider state
+                    // until a later challenge can reconcile it.
                     return Err(http_err);
                 }
             };
