@@ -124,9 +124,9 @@ alloy = { version = "2.1.0", default-features = false, features = [
 ], optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e", optional = true }
-tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e", optional = true }
-tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "4e6231a07ddfd96f6e119f7a7fe8e4e13765f56e", optional = true }
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", rev = "0d852125034c2d86cba804bf047fbcdf9dd464df", optional = true }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", rev = "0d852125034c2d86cba804bf047fbcdf9dd464df", optional = true }
+tempo-contracts = { git = "https://github.com/tempoxyz/tempo", rev = "0d852125034c2d86cba804bf047fbcdf9dd464df", optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
