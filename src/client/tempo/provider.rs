@@ -4,9 +4,61 @@ use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 
 use super::autoswap::AutoswapConfig;
-use super::charge::SignOptions;
+use super::charge::{SignOptions, TempoCharge};
 use super::signing::{TempoPrimitiveSigner, TempoSigningMode};
 use crate::client::PaymentProvider;
+
+pub(super) async fn prepare_charge(
+    challenge: &PaymentChallenge,
+    expected_chain_id: Option<u64>,
+    client_id: Option<&str>,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<TempoCharge, MppError> {
+    let mut charge = TempoCharge::from_challenge(challenge)?;
+
+    if let Some(expected) = expected_chain_id {
+        use crate::protocol::methods::tempo::charge::TempoChargeExt;
+        match challenge
+            .request
+            .decode::<crate::protocol::intents::ChargeRequest>()?
+            .chain_id()
+        {
+            Some(got) if got != expected => {
+                return Err(MppError::ChainIdMismatch { expected, got });
+            }
+            None => charge = charge.with_chain_id(expected),
+            _ => {}
+        }
+    }
+
+    if charge.memo().is_none() {
+        charge = charge.with_memo(crate::tempo::attribution::encode(
+            &challenge.id,
+            &challenge.realm,
+            client_id,
+        ));
+    }
+
+    if let Some(config) = autoswap {
+        if let Some(calls) = super::autoswap::resolve_autoswap_calls(
+            provider,
+            from,
+            charge.currency(),
+            charge.amount(),
+            config,
+        )
+        .await?
+        {
+            for call in calls.into_iter().rev() {
+                charge = charge.with_prepended_call(call)?;
+            }
+        }
+    }
+
+    Ok(charge)
+}
 
 /// Tempo payment provider using native primitive signing.
 ///
@@ -148,66 +200,22 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
-
-        // Chain pinning: resolve the chain to sign on before signing.
-        // - challenge `chainId` present: must match the pin (if any), else reject;
-        // - challenge `chainId` absent: use the pin, signing on it.
-        if let Some(expected) = self.expected_chain_id {
-            use crate::protocol::methods::tempo::charge::TempoChargeExt;
-            let challenge_chain_id = challenge
-                .request
-                .decode::<crate::protocol::intents::ChargeRequest>()?
-                .chain_id();
-            match challenge_chain_id {
-                Some(got) if got != expected => {
-                    return Err(MppError::ChainIdMismatch { expected, got });
-                }
-                None => charge = charge.with_chain_id(expected),
-                _ => {}
-            }
-        }
-
-        // Auto-generate an attribution memo when the server doesn't provide one,
-        // so MPP transactions are identifiable on-chain via `TransferWithMemo` events.
-        if charge.memo().is_none() {
-            let memo = crate::tempo::attribution::encode(
-                &challenge.id,
-                &challenge.realm,
-                self.client_id.as_deref(),
-            );
-            charge = charge.with_memo(memo);
-        }
-
-        // If autoswap is configured, keep gas payable in the funded input token
-        // even when the output-token balance already covers the charge itself.
-        // Otherwise the transfer can leave too little output token for gas.
-        let fee_token = self.fee_token();
-        if let Some(autoswap_config) = &self.autoswap {
-            let from = self
-                .signing_mode
-                .from_address(alloy::signers::Signer::address(&self.signer));
-
-            if let Some(swap_calls) = super::autoswap::resolve_autoswap_calls(
-                &self.rpc_provider,
-                from,
-                charge.currency(),
-                charge.amount(),
-                autoswap_config,
-            )
-            .await?
-            {
-                // `with_prepended_call` inserts at index zero, so walk the
-                // sequence backwards to retain approve -> swap -> transfer.
-                for call in swap_calls.into_iter().rev() {
-                    charge = charge.with_prepended_call(call)?;
-                }
-            }
-        }
+        let from = self
+            .signing_mode
+            .from_address(alloy::signers::Signer::address(&self.signer));
+        let charge = prepare_charge(
+            challenge,
+            self.expected_chain_id,
+            self.client_id.as_deref(),
+            self.autoswap.as_ref(),
+            &self.rpc_provider,
+            from,
+        )
+        .await?;
 
         let options = SignOptions {
             signing_mode: Some(self.signing_mode.clone()),
-            fee_token,
+            fee_token: self.fee_token(),
             ..Default::default()
         };
         let signed = charge

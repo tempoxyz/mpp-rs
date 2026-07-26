@@ -105,54 +105,27 @@ impl PaymentProvider for TempoAccountsProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
-
-        if let Some(expected) = self.expected_chain_id {
-            use crate::protocol::methods::tempo::charge::TempoChargeExt;
-            let challenge_chain_id = challenge
-                .request
-                .decode::<crate::protocol::intents::ChargeRequest>()?
-                .chain_id();
-            match challenge_chain_id {
-                Some(got) if got != expected => {
-                    return Err(MppError::ChainIdMismatch { expected, got });
-                }
-                None => charge = charge.with_chain_id(expected),
-                _ => {}
-            }
-        }
-
-        if charge.memo().is_none() {
-            charge = charge.with_memo(crate::tempo::attribution::encode(
-                &challenge.id,
-                &challenge.realm,
-                self.client_id.as_deref(),
-            ));
-        }
-
-        let fee_token = self.fee_token();
-        if let Some(autoswap) = &self.autoswap {
-            if let Some(calls) = super::autoswap::resolve_autoswap_calls(
-                &self.rpc_provider,
-                self.wallet.account(),
-                charge.currency(),
-                charge.amount(),
-                autoswap,
-            )
-            .await?
-            {
-                for call in calls.into_iter().rev() {
-                    charge = charge.with_prepended_call(call)?;
-                }
-            }
-        }
+        let from = self
+            .wallet
+            .active_account()
+            .mpp_config("failed to read the active Tempo account")?;
+        let charge = super::provider::prepare_charge(
+            challenge,
+            self.expected_chain_id,
+            self.client_id.as_deref(),
+            self.autoswap.as_ref(),
+            &self.rpc_provider,
+            from,
+        )
+        .await?;
 
         charge
             .sign_with_accounts_provider_options(
                 &self.wallet,
                 &self.rpc_provider,
+                from,
                 SignOptions {
-                    fee_token,
+                    fee_token: self.fee_token(),
                     ..Default::default()
                 },
             )
@@ -165,7 +138,13 @@ impl PaymentProvider for TempoAccountsProvider {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use alloy::{primitives::Address, signers::local::PrivateKeySigner};
+    use alloy::{
+        eips::eip2718::Decodable2718, primitives::Address, signers::local::PrivateKeySigner,
+    };
+    use tempo_primitives::{
+        transaction::{KeychainVersion, TempoSignature},
+        AASigned,
+    };
 
     use super::*;
     use crate::protocol::core::Base64UrlJson;
@@ -220,6 +199,18 @@ mod tests {
         )
     }
 
+    fn assert_accounts_signature(signed: &AASigned, account: Address, key: Address) {
+        let TempoSignature::Keychain(signature) = signed.signature() else {
+            panic!("expected an Accounts keychain signature")
+        };
+        assert_eq!(signature.user_address, account);
+        assert_eq!(signature.version, KeychainVersion::V2);
+        assert_eq!(
+            signature.key_id(&signed.tx().signature_hash()).unwrap(),
+            key
+        );
+    }
+
     #[tokio::test]
     async fn zero_charge_uses_the_accounts_key_without_a_signing_mode() {
         let (provider, path, account) = provider();
@@ -234,13 +225,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounts_key_signs_a_standard_alloy_tempo_envelope() {
+        let (provider, path, account) = provider();
+        let key = provider.wallet().active_access_key().unwrap().address();
+        let charge =
+            super::super::charge::TempoCharge::from_challenge(&challenge("100", false)).unwrap();
+        let signed = charge
+            .sign_with_accounts_provider_options(
+                provider.wallet(),
+                &provider.rpc_provider,
+                account,
+                SignOptions {
+                    gas_limit: Some(200_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut encoded = signed.tx_bytes();
+        let decoded = AASigned::decode_2718(&mut encoded).unwrap();
+        assert_eq!(decoded.tx().chain_id, 4217);
+        assert_eq!(decoded.tx().gas_limit, 200_000);
+        assert_eq!(
+            decoded.tx().fee_token,
+            Some(
+                "0x20c0000000000000000000000000000000000000"
+                    .parse()
+                    .unwrap()
+            )
+        );
+        assert!(decoded.tx().fee_payer_signature.is_none());
+        assert_accounts_signature(&decoded, account, key);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn accounts_key_signs_a_sponsored_charge_without_a_signing_mode() {
         let (provider, path, account) = provider();
+        let key = provider.wallet().active_access_key().unwrap().address();
         let credential = provider.pay(&challenge("100", true)).await.unwrap();
 
         let payload = credential.charge_payload().unwrap();
         assert!(payload.is_transaction());
-        assert!(payload.signed_tx().unwrap().starts_with("0x78"));
+        let encoded =
+            alloy::hex::decode(payload.signed_tx().unwrap().trim_start_matches("0x")).unwrap();
+        let envelope =
+            crate::protocol::methods::tempo::FeePayerEnvelope78::decode_envelope(&encoded).unwrap();
+        assert_eq!(envelope.chain_id, 4217);
+        assert_eq!(envelope.sender, account);
+        assert_eq!(envelope.nonce_key, alloy::primitives::U256::MAX);
+        assert!(envelope.valid_before.is_some());
+        assert!(envelope.fee_token.is_none());
+        assert_accounts_signature(&envelope.to_recoverable_signed(), account, key);
         assert_eq!(
             credential.source,
             Some(PaymentCredential::evm_did(4217, &account.to_string()))

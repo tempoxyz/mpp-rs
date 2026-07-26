@@ -32,15 +32,17 @@ pub mod tx_builder;
 
 use std::num::NonZeroU64;
 
+use alloy::eips::Encodable2718;
+use alloy::network::NetworkWallet;
 use alloy::primitives::{Address, TxKind, U256};
 use alloy::providers::Provider;
 use tempo_primitives::transaction::{
-    Call, SignatureType, SignedKeyAuthorization, TempoTransaction,
+    Call, SignatureType, SignedKeyAuthorization, TempoTransaction, FEE_PAYER_SIGNATURE_MARKER,
 };
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::client::tempo::signing::{
-    sign_and_encode_access_key, sign_and_encode_async, sign_and_encode_fee_payer_access_key,
+    encode_signed_fee_payer_envelope, sign_and_encode_async,
     sign_and_encode_fee_payer_envelope_async, sign_and_encode_fee_payer_envelope_primitive_async,
     sign_and_encode_primitive_async, TempoPrimitiveSigner, TempoSigningMode,
 };
@@ -315,6 +317,7 @@ impl TempoCharge {
         self,
         wallet: &TempoAccountsWallet,
         provider: &impl Provider<tempo_alloy::TempoNetwork>,
+        from: Address,
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
         if options.signing_mode.is_some() || options.key_authorization.is_some() {
@@ -327,7 +330,17 @@ impl TempoCharge {
             let access_key = wallet
                 .active_access_key()
                 .mpp_config("failed to select Tempo Accounts access key")?;
-            let from = access_key.account();
+            if access_key.account() != from {
+                return Err(MppError::InvalidConfig(
+                    "the active Tempo account changed while preparing the charge".into(),
+                ));
+            }
+            if access_key.chain_id() != self.chain_id {
+                return Err(MppError::ChainIdMismatch {
+                    expected: access_key.chain_id(),
+                    got: self.chain_id,
+                });
+            }
             let signature = proof::sign_proof_primitive(
                 &access_key,
                 from,
@@ -374,14 +387,19 @@ impl TempoCharge {
             .or_else(|| self.fee_payer.then_some(1_000_000));
 
         let mut request = TempoTransactionRequest {
-            calls: calls.clone(),
+            calls,
             ..Default::default()
         }
-        .with_fee_token(fee_token)
         .with_nonce_key(nonce_key);
+        if self.fee_payer {
+            request.set_fee_payer_signature(FEE_PAYER_SIGNATURE_MARKER);
+        } else {
+            request.set_fee_token(fee_token);
+        }
         if let Some(valid_before) = valid_before.and_then(NonZeroU64::new) {
             request = request.with_valid_before(valid_before);
         }
+        request.inner.from = Some(from);
         request.inner.chain_id = Some(self.chain_id);
         request.inner.nonce = Some(nonce);
         request.inner.gas = explicit_gas;
@@ -393,27 +411,18 @@ impl TempoCharge {
             .await
             .mpp_http("failed to prepare Tempo Accounts access key")?;
         let from = access_key.account();
-        let gas_limit = match explicit_gas {
+        request.inner.gas = Some(match explicit_gas {
             Some(gas_limit) => gas_limit,
             None => estimate_gas(provider, request.clone()).await?,
-        };
-        let transaction = build_tempo_tx(TempoTxOptions {
-            calls,
-            chain_id: self.chain_id,
-            fee_token,
-            nonce,
-            nonce_key,
-            gas_limit,
-            max_fee_per_gas,
-            max_priority_fee_per_gas,
-            fee_payer: self.fee_payer,
-            valid_before,
-            key_authorization: request.key_authorization,
         });
+        let signed = access_key
+            .sign_request(request)
+            .await
+            .mpp_http("failed to sign Tempo transaction")?;
         let tx_bytes = if self.fee_payer {
-            sign_and_encode_fee_payer_access_key(&access_key, transaction).await?
+            encode_signed_fee_payer_envelope(signed, from)?
         } else {
-            sign_and_encode_access_key(&access_key, transaction).await?
+            signed.encoded_2718()
         };
         let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
         Ok(SignedTempoCharge {
