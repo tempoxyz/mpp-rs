@@ -27,6 +27,9 @@ default-members = ["."]
 exclude = ["fuzz"]
 resolver = "2"
 
+[workspace.dependencies]
+tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "9081cc65940c419ab60ebd1fd8170483ee49cfe1", default-features = false }
+
 [features]
 default = ["reqwest-default-tls"]
 
@@ -122,7 +125,7 @@ alloy = { version = "2.1.0", default-features = false, features = [
 ], optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "19915e655c2679f8c0f02400f88c10bb222d3912", default-features = false, optional = true }
+tempo-alloy = { workspace = true, optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
