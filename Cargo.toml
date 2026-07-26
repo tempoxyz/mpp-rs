@@ -38,6 +38,7 @@ server = ["tokio", "futures-core", "async-stream", "http-types"]
 evm = ["alloy", "hex", "rand"]
 tempo = [
   "evm",
+  "tokio",
   "tempo-alloy",
   "tempo-primitives",
   "dep:tempo-contracts",
