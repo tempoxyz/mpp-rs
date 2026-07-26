@@ -10,7 +10,7 @@ use std::{
 use alloy::primitives::{Address, Bytes, Signature, B256, U256};
 use alloy::signers::{local::PrivateKeySigner, Signer};
 use serde::Deserialize;
-use tempo_primitives::transaction::{
+use tempo_alloy::primitives::transaction::{
     tt_signature::{P256SignatureWithPreHash, WebAuthnSignature},
     KeyAuthorization, PrimitiveSignature, SignatureType, SignedKeyAuthorization, TokenLimit,
 };

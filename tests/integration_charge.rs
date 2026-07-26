@@ -30,9 +30,9 @@ use mpp::server::{tempo, Mpp, TempoConfig};
 use reqwest::Client;
 use tempo_alloy::contracts::precompiles::tip20::ITIP20;
 use tempo_alloy::contracts::precompiles::ITIPFeeAMM;
+use tempo_alloy::primitives::transaction::Call;
+use tempo_alloy::primitives::TempoTransaction;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::Call;
-use tempo_primitives::TempoTransaction;
 use tokio::sync::Mutex;
 
 /// Well-known dev private key (account[0] of test mnemonic).
@@ -229,7 +229,7 @@ async fn fund_account_amount(rpc: &str, to: Address, amount: U256) {
 fn encode_fee_payer_envelope_for_test(
     tx: &TempoTransaction,
     sender: Address,
-    signature: tempo_primitives::transaction::TempoSignature,
+    signature: tempo_alloy::primitives::transaction::TempoSignature,
 ) -> Vec<u8> {
     mpp::protocol::methods::tempo::FeePayerEnvelope78::from_signing_tx(
         tx.clone(),

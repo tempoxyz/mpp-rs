@@ -36,7 +36,7 @@ use alloy::eips::Encodable2718;
 use alloy::network::NetworkWallet;
 use alloy::primitives::{Address, TxKind, U256};
 use alloy::providers::Provider;
-use tempo_primitives::transaction::{
+use tempo_alloy::primitives::transaction::{
     Call, SignatureType, SignedKeyAuthorization, TempoTransaction, FEE_PAYER_SIGNATURE_MARKER,
 };
 

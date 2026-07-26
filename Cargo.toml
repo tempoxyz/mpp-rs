@@ -40,8 +40,6 @@ tempo = [
   "evm",
   "tokio",
   "tempo-alloy",
-  "tempo-primitives",
-  "dep:tempo-contracts",
   "dep:async-trait",
   "dep:p256",
   "uuid",
@@ -124,9 +122,7 @@ alloy = { version = "2.1.0", default-features = false, features = [
 ], optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "187e419a80472bdce5bdc7289088c6de0686a488", optional = true }
-tempo-primitives = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "187e419a80472bdce5bdc7289088c6de0686a488", optional = true }
-tempo-contracts = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "187e419a80472bdce5bdc7289088c6de0686a488", optional = true }
+tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "19915e655c2679f8c0f02400f88c10bb222d3912", default-features = false, optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 

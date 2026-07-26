@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tempo_primitives::transaction::{
+use tempo_alloy::primitives::transaction::{
     derive_p256_address, tt_signature::P256SignatureWithPreHash, PrimitiveSignature,
 };
 

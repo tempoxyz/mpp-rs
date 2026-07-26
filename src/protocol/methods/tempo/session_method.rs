@@ -362,16 +362,19 @@ where
 
         // Strip type byte (0x76) if present.
         let tx_data = if !tx_bytes.is_empty()
-            && tx_bytes[0] == tempo_primitives::transaction::TEMPO_TX_TYPE_ID
+            && tx_bytes[0] == tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID
         {
             &tx_bytes[1..]
         } else {
             tx_bytes
         };
 
-        let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..]).map_err(|e| {
-            VerificationError::invalid_payload(format!("failed to decode open transaction: {e}"))
-        })?;
+        let signed =
+            tempo_alloy::primitives::AASigned::rlp_decode(&mut &tx_data[..]).map_err(|e| {
+                VerificationError::invalid_payload(format!(
+                    "failed to decode open transaction: {e}"
+                ))
+            })?;
 
         let sender = signed
             .recover_signer()
@@ -966,8 +969,8 @@ where
             use alloy::primitives::Bytes;
             use alloy::signers::SignerSync;
             use alloy::sol_types::SolCall;
-            use tempo_primitives::transaction::Call;
-            use tempo_primitives::TempoTransaction;
+            use tempo_alloy::primitives::transaction::Call;
+            use tempo_alloy::primitives::TempoTransaction;
 
             alloy::sol! {
                 interface IEscrowClose {
@@ -2587,8 +2590,8 @@ mod tests {
         use alloy::signers::local::PrivateKeySigner;
         use alloy::signers::SignerSync;
         use alloy::sol_types::SolCall;
-        use tempo_primitives::transaction::Call;
-        use tempo_primitives::TempoTransaction;
+        use tempo_alloy::primitives::transaction::Call;
+        use tempo_alloy::primitives::TempoTransaction;
 
         alloy::sol! {
             interface IEscrowOpen {
@@ -2681,8 +2684,8 @@ mod tests {
         use alloy::signers::local::PrivateKeySigner;
         use alloy::signers::SignerSync;
         use alloy::sol_types::SolCall;
-        use tempo_primitives::transaction::Call;
-        use tempo_primitives::TempoTransaction;
+        use tempo_alloy::primitives::transaction::Call;
+        use tempo_alloy::primitives::TempoTransaction;
 
         alloy::sol! {
             interface IEscrowOpen {

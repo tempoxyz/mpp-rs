@@ -290,7 +290,7 @@ mod tests {
         signers::local::PrivateKeySigner,
         sol_types::SolCall,
     };
-    use tempo_primitives::{
+    use tempo_alloy::primitives::{
         transaction::{
             KeyAuthorization, KeychainVersion, PrimitiveSignature, SignatureType, TempoSignature,
         },

@@ -18,8 +18,8 @@ use alloy::{
     signers::Signer,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::Call;
 
 use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload,

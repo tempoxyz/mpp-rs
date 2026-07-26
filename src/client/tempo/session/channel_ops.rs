@@ -12,9 +12,9 @@ use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::contracts::precompiles::{ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS};
+use tempo_alloy::primitives::transaction::{Call, SignatureType, TempoTransaction};
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::{Call, SignatureType, TempoTransaction};
 
 use crate::client::tempo::charge::tx_builder::{build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::error::{MppError, ResultExt};
@@ -174,7 +174,7 @@ pub async fn create_precompile_voucher_payload(
 /// Native primitive-signature version of [`create_precompile_voucher_payload`].
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_voucher_payload_primitive(
-    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
     channel_id: B256,
     cumulative_amount: u128,
     chain_id: u64,
@@ -210,7 +210,7 @@ pub async fn create_precompile_voucher_payload_with_descriptor(
 /// Native primitive-signature voucher payload with the descriptor required for recovery.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
-    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
     descriptor: ChannelDescriptor,
     cumulative_amount: u128,
     chain_id: u64,
@@ -314,7 +314,7 @@ pub async fn create_precompile_close_payload(
 /// Native primitive-signature version of [`create_precompile_close_payload`].
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_close_payload_primitive(
-    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
     channel_id: B256,
     cumulative_amount: u128,
     chain_id: u64,
@@ -352,7 +352,7 @@ pub async fn create_precompile_close_payload_with_descriptor(
 /// Native primitive-signature close payload with the descriptor required for recovery.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_close_payload_with_descriptor_primitive(
-    signer: &impl Signer<tempo_primitives::transaction::PrimitiveSignature>,
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
     channel_id: B256,
     descriptor: ChannelDescriptor,
     cumulative_amount: u128,
@@ -456,7 +456,7 @@ where
     S: Signer + Clone,
 {
     use alloy::sol;
-    use tempo_primitives::transaction::Call;
+    use tempo_alloy::primitives::transaction::Call;
 
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
@@ -1343,10 +1343,10 @@ mod tests {
         // (crates/primitives/src/transaction/mod.rs L37-L45).
         use alloy::consensus::SignableTransaction;
         use alloy::primitives::keccak256;
-        use tempo_primitives::transaction::TempoTransaction;
+        use tempo_alloy::primitives::transaction::TempoTransaction;
 
         let payer = Address::repeat_byte(0xAA);
-        let calls = vec![tempo_primitives::transaction::Call {
+        let calls = vec![tempo_alloy::primitives::transaction::Call {
             to: TxKind::Call(Address::repeat_byte(0x11)),
             value: U256::ZERO,
             input: alloy::primitives::Bytes::new(),

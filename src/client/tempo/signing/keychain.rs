@@ -6,8 +6,8 @@
 
 use alloy::primitives::{Address, U256};
 use tempo_alloy::contracts::precompiles::{IAccountKeychain, ACCOUNT_KEYCHAIN_ADDRESS};
+use tempo_alloy::primitives::transaction::SignedKeyAuthorization;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::SignedKeyAuthorization;
 
 use crate::client::tempo::TempoClientError;
 use crate::error::{MppError, ResultExt};
@@ -165,7 +165,7 @@ mod tests {
 
     use super::*;
     use alloy::signers::{local::PrivateKeySigner, SignerSync};
-    use tempo_primitives::transaction::{
+    use tempo_alloy::primitives::transaction::{
         KeyAuthorization, PrimitiveSignature, SignatureType, TokenLimit,
     };
 

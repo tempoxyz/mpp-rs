@@ -11,7 +11,7 @@ use alloy::sol_types::{eip712_domain, SolStruct, SolValue};
 #[cfg(feature = "tempo")]
 use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 #[cfg(feature = "tempo")]
-use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
+use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
 
 #[cfg(feature = "tempo")]
 use crate::error::{MppError, Result};

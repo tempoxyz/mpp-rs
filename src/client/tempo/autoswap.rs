@@ -29,7 +29,7 @@ use alloy::sol_types::SolCall;
 use tempo_alloy::contracts::precompiles::{
     IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS as DEX_ADDRESS,
 };
-use tempo_primitives::transaction::Call;
+use tempo_alloy::primitives::transaction::Call;
 
 use crate::error::{MppError, ResultExt};
 

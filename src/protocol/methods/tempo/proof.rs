@@ -3,7 +3,7 @@
 use alloy::primitives::{keccak256, Address, B256};
 use alloy::sol_types::{eip712_domain, SolStruct};
 #[cfg(feature = "evm")]
-use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
+use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
 
 use crate::error::{MppError, ResultExt};
 
