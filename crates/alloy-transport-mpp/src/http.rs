@@ -128,15 +128,34 @@ where
 
 async fn decode_response(response: reqwest::Response) -> TransportResult<ResponsePacket> {
     let status = response.status();
+    let diagnostics = format_http_diagnostics(response.headers());
     let body = response.bytes().await.map_err(TransportErrorKind::custom)?;
     if !status.is_success() {
         return Err(TransportErrorKind::http_error(
             status.as_u16(),
-            String::from_utf8_lossy(&body).into_owned(),
+            format!("{}{diagnostics}", String::from_utf8_lossy(&body)),
         ));
     }
     serde_json::from_slice(&body)
         .map_err(|error| TransportError::deser_err(error, String::from_utf8_lossy(&body)))
+}
+
+fn format_http_diagnostics(headers: &reqwest::header::HeaderMap) -> String {
+    const DIAGNOSTIC_HEADERS: &[&str] = &["x-request-id", "cf-ray", "server", "report-to", "nel"];
+
+    let pairs = DIAGNOSTIC_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok().map(|value| format!("{name}: {value}")))
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nHTTP diagnostics:\n{}", pairs.join("\n"))
+    }
 }
 
 fn redact_url(url: &Url) -> String {
@@ -171,7 +190,10 @@ mod tests {
 
     use alloy_json_rpc::{Id, Request, RequestMeta};
     use axum::{
-        extract::State, http::StatusCode as AxumStatusCode, response::IntoResponse, routing::post,
+        extract::State,
+        http::{HeaderName, HeaderValue, StatusCode as AxumStatusCode},
+        response::IntoResponse,
+        routing::post,
         Router,
     };
     use mpp::{
@@ -385,6 +407,38 @@ mod tests {
         assert!(error.to_string().contains("402"));
         assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
         assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn preserves_whitelisted_http_diagnostics() {
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    AxumStatusCode::UNAUTHORIZED,
+                    [
+                        (
+                            HeaderName::from_static("x-request-id"),
+                            HeaderValue::from_static("request-123"),
+                        ),
+                        (
+                            HeaderName::from_static("authorization"),
+                            HeaderValue::from_static("secret"),
+                        ),
+                    ],
+                    "denied",
+                )
+            }),
+        );
+        let (url, task) = server(app).await;
+        let mut transport = MppHttpTransport::new(client(), url, MockProvider::default());
+
+        let error = transport.call(request()).await.unwrap_err().to_string();
+        assert!(error.contains("denied"));
+        assert!(error.contains("x-request-id: request-123"));
+        assert!(!error.contains("secret"));
+
         task.abort();
     }
 
