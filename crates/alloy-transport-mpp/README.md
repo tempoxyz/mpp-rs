@@ -1,14 +1,28 @@
 # alloy-transport-mpp
 
 [Machine Payments Protocol (MPP)](https://github.com/tempoxyz/mpp-rs)
-WebSocket transport for [alloy](https://github.com/alloy-rs/alloy).
+transports for [alloy](https://github.com/alloy-rs/alloy).
 
-This crate adds opt-in WebSocket transports that speak the MPP wire protocol.
-`MppWsConnect` is a drop-in Alloy `PubSubConnect` implementation for JSON-RPC,
-while `MppApplicationWsConnect` carries arbitrary text application messages.
-Both wrap payloads in canonical MPP `message` envelopes and handle payment
-`challenge`, `needVoucher`, `receipt`, signed session close, and `error` frames
-internally via a user-supplied
+`MppHttpTransport` is a drop-in Alloy transport for paid HTTP JSON-RPC
+endpoints. It delegates the canonical 402 challenge, payment retry, and
+commit/rollback lifecycle to `mpp`:
+
+```rust,ignore
+use alloy_provider::ProviderBuilder;
+use alloy_rpc_client::RpcClient;
+use alloy_transport_mpp::MppHttpTransport;
+
+let transport = MppHttpTransport::with_default_client(rpc_url, payment_provider)?;
+let client = RpcClient::new(transport, false);
+let provider = ProviderBuilder::new().connect_client(client);
+```
+
+The crate also includes opt-in WebSocket transports that speak the MPP wire
+protocol. `MppWsConnect` is a drop-in Alloy `PubSubConnect` implementation for
+JSON-RPC, while `MppApplicationWsConnect` carries arbitrary text application
+messages. Both wrap payloads in canonical MPP `message` envelopes and handle
+payment `challenge`, `needVoucher`, `receipt`, signed session close, and `error`
+frames internally via a user-supplied
 [`PaymentProvider`](https://docs.rs/mpp/latest/mpp/client/trait.PaymentProvider.html)
 (and a `VoucherProvider` for streaming/session intents).
 

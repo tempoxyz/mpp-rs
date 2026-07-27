@@ -8,12 +8,16 @@ extern crate tracing;
 #[cfg(not(target_family = "wasm"))]
 mod application;
 #[cfg(not(target_family = "wasm"))]
+mod http;
+#[cfg(not(target_family = "wasm"))]
 mod ws;
 #[cfg(not(target_family = "wasm"))]
 pub use application::{
     MppApplicationEvent, MppApplicationHandle, MppApplicationWs, MppApplicationWsConnect,
     MppWsError,
 };
+#[cfg(not(target_family = "wasm"))]
+pub use http::MppHttpTransport;
 #[cfg(not(target_family = "wasm"))]
 pub use ws::{
     CloseProvider, CloseRequest, MppEvent, MppHandle, MppWsConnect, NoVoucher, VoucherProvider,
