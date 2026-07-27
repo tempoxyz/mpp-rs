@@ -12,7 +12,8 @@ use alloy_provider::ProviderBuilder;
 use alloy_rpc_client::RpcClient;
 use alloy_transport_mpp::MppHttpTransport;
 
-let transport = MppHttpTransport::with_default_client(rpc_url, payment_provider)?;
+let transport = MppHttpTransport::with_default_client(rpc_url, payment_provider)?
+    .with_max_concurrent_requests(16);
 let client = RpcClient::new(transport, false);
 let provider = ProviderBuilder::new().connect_client(client);
 ```

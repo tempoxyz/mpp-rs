@@ -1,11 +1,12 @@
 //! Alloy HTTP JSON-RPC transport with automatic MPP payments.
 
-use std::{fmt, task};
+use std::{fmt, sync::Arc, task};
 
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
 use mpp::client::{Fetch, PaymentProvider};
 use reqwest::Url;
+use tokio::sync::Semaphore;
 use tower_service::Service;
 
 /// An Alloy HTTP transport that pays MPP challenges before replaying JSON-RPC requests.
@@ -18,6 +19,7 @@ pub struct MppHttpTransport<P> {
     client: reqwest::Client,
     url: Url,
     provider: P,
+    request_limit: Option<(usize, Arc<Semaphore>)>,
 }
 
 impl<P> MppHttpTransport<P> {
@@ -38,7 +40,19 @@ impl<P> MppHttpTransport<P> {
             client,
             url,
             provider,
+            request_limit: None,
         }
+    }
+
+    /// Bound concurrent HTTP payment flows.
+    ///
+    /// This is useful for consumers such as fork databases that can fan out a
+    /// large number of paid reads at once. The permit covers the complete HTTP
+    /// request, including any 402 payment and authenticated replay. A limit of
+    /// zero restores the default unbounded behavior.
+    pub fn with_max_concurrent_requests(mut self, limit: usize) -> Self {
+        self.request_limit = (limit != 0).then(|| (limit, Arc::new(Semaphore::new(limit))));
+        self
     }
 
     /// Return the underlying HTTP client.
@@ -61,6 +75,10 @@ impl<P> fmt::Debug for MppHttpTransport<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MppHttpTransport")
             .field("url", &redact_url(&self.url))
+            .field(
+                "max_concurrent_requests",
+                &self.request_limit.as_ref().map(|(limit, _)| limit),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -70,6 +88,12 @@ where
     P: PaymentProvider,
 {
     async fn request(self, packet: RequestPacket) -> TransportResult<ResponsePacket> {
+        let _permit = match self.request_limit {
+            Some((_, limit)) => Some(limit.acquire_owned().await.map_err(|_| {
+                TransportErrorKind::custom_str("MPP HTTP concurrency limiter is unavailable")
+            })?),
+            None => None,
+        };
         let body = serde_json::to_vec(&packet).map_err(TransportErrorKind::custom)?;
         let headers = packet.headers();
         let response = self
@@ -142,6 +166,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
+        time::Duration,
     };
 
     use alloy_json_rpc::{Id, Request, RequestMeta};
@@ -360,6 +385,48 @@ mod tests {
         assert!(error.to_string().contains("402"));
         assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
         assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bounds_concurrent_request_flows() {
+        #[derive(Clone, Default)]
+        struct AppState {
+            active: Arc<AtomicUsize>,
+            maximum: Arc<AtomicUsize>,
+        }
+
+        let state = AppState::default();
+        let observed = state.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                post(|State(state): State<AppState>| async move {
+                    let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    state.maximum.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    state.active.fetch_sub(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": "0x2a"
+                    }))
+                }),
+            )
+            .with_state(state);
+        let (url, task) = server(app).await;
+        let transport = MppHttpTransport::new(client(), url, MockProvider::default())
+            .with_max_concurrent_requests(2);
+
+        let requests = (0..8).map(|_| {
+            let mut transport = transport.clone();
+            tokio::spawn(async move { transport.call(request()).await.unwrap() })
+        });
+        for result in futures::future::join_all(requests).await {
+            result.unwrap();
+        }
+
+        assert_eq!(observed.maximum.load(Ordering::SeqCst), 2);
         task.abort();
     }
 
