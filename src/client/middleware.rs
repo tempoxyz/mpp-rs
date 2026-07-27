@@ -16,12 +16,31 @@ use crate::client::events::{
     ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
     CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use crate::client::provider::PaymentProvider;
+use crate::client::provider::{commit_payments, rollback_payments, PaymentProvider};
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+    format_authorization, parse_www_authenticate_all, PaymentChallenge, PaymentCredential,
+    AUTHORIZATION_HEADER,
 };
+
+async fn commit_middleware_payments<P: PaymentProvider>(
+    provider: &P,
+    payments: &[(PaymentChallenge, PaymentCredential)],
+) -> reqwest_middleware::Result<()> {
+    commit_payments(provider, payments)
+        .await
+        .map_err(|error| reqwest_middleware::Error::Middleware(anyhow::anyhow!(error)))
+}
+
+async fn rollback_middleware_payments<P: PaymentProvider>(
+    provider: &P,
+    payments: &[(PaymentChallenge, PaymentCredential)],
+) -> reqwest_middleware::Result<()> {
+    rollback_payments(provider, payments)
+        .await
+        .map_err(|error| reqwest_middleware::Error::Middleware(anyhow::anyhow!(error)))
+}
 
 /// Middleware that automatically handles 402 Payment Required responses.
 ///
@@ -184,6 +203,7 @@ where
         };
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
+        let mut pending_payments: Vec<(PaymentChallenge, PaymentCredential)> = Vec::new();
 
         for attempt in 0..self.max_payment_retries {
             if resp.status() != StatusCode::PAYMENT_REQUIRED {
@@ -205,6 +225,7 @@ where
                         reason: None,
                     }))
                     .await;
+                rollback_middleware_payments(&self.provider, &pending_payments).await?;
                 return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                     "402 response missing WWW-Authenticate header"
                 )));
@@ -235,6 +256,7 @@ where
                             reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
+                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
                     return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                         mpp_error
                     )));
@@ -248,6 +270,7 @@ where
                             reason: None,
                         }))
                         .await;
+                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
                     return Err(reqwest_middleware::Error::Middleware(err));
                 }
             };
@@ -260,6 +283,7 @@ where
                         reason: None,
                     }))
                     .await;
+                rollback_middleware_payments(&self.provider, &pending_payments).await?;
                 return Ok(resp);
             }
 
@@ -284,10 +308,13 @@ where
                                 reason: None,
                             }))
                             .await;
+                        rollback_middleware_payments(&self.provider, &pending_payments).await?;
                         return Err(reqwest_middleware::Error::Middleware(err));
                     }
                 },
             };
+
+            pending_payments.push((challenge.clone(), credential.clone()));
 
             self.events
                 .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
@@ -307,6 +334,7 @@ where
                                 reason: None,
                             }))
                             .await;
+                        rollback_middleware_payments(&self.provider, &pending_payments).await?;
                         return Err(reqwest_middleware::Error::Middleware(err));
                     }
                 };
@@ -322,14 +350,16 @@ where
                                 reason: None,
                             }))
                             .await;
+                        rollback_middleware_payments(&self.provider, &pending_payments).await?;
                         return Err(reqwest_middleware::Error::Middleware(err));
                     }
                 };
-            let mut retry_req = base_retry_req.try_clone().ok_or_else(|| {
-                reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+            let Some(mut retry_req) = base_retry_req.try_clone() else {
+                rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                     "request could not be cloned for payment retry"
-                ))
-            })?;
+                )));
+            };
             retry_req
                 .headers_mut()
                 .insert(AUTHORIZATION_HEADER, auth_header_value);
@@ -344,6 +374,9 @@ where
                             reason: None,
                         }))
                         .await;
+                    // The request may have reached the server even though its
+                    // response was lost. Preserve optimistic provider state
+                    // until a later challenge can reconcile it.
                     return Err(err);
                 }
             };
@@ -357,17 +390,19 @@ where
                         status,
                     }))
                     .await;
+                commit_middleware_payments(&self.provider, &pending_payments).await?;
                 return Ok(resp);
             }
 
+            // A completed HTTP response is the application's answer, not a
+            // payment flow error. Match MPPx by returning non-402 responses
+            // and the final 402 without emitting `payment.failed`.
             if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == self.max_payment_retries {
-                self.events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: Some(challenge),
-                        error: format!("payment retry returned unsuccessful status: {status}"),
-                        reason: None,
-                    }))
-                    .await;
+                if resp.headers().contains_key("payment-receipt") {
+                    commit_middleware_payments(&self.provider, &pending_payments).await?;
+                } else {
+                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                }
                 return Ok(resp);
             }
         }
@@ -424,6 +459,8 @@ mod tests {
         #[derive(Clone)]
         struct TestProvider {
             pay_count: Arc<AtomicU32>,
+            commit_count: Arc<AtomicU32>,
+            rollback_count: Arc<AtomicU32>,
             challenge_ids: Arc<Mutex<Vec<String>>>,
             fail: bool,
         }
@@ -432,6 +469,8 @@ mod tests {
             fn new() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    commit_count: Arc::new(AtomicU32::new(0)),
+                    rollback_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: false,
                 }
@@ -440,6 +479,8 @@ mod tests {
             fn failing() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    commit_count: Arc::new(AtomicU32::new(0)),
+                    rollback_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: true,
                 }
@@ -451,6 +492,14 @@ mod tests {
 
             fn challenge_ids(&self) -> Vec<String> {
                 self.challenge_ids.lock().unwrap().clone()
+            }
+
+            fn commit_count(&self) -> u32 {
+                self.commit_count.load(Ordering::SeqCst)
+            }
+
+            fn rollback_count(&self) -> u32 {
+                self.rollback_count.load(Ordering::SeqCst)
             }
         }
 
@@ -476,6 +525,24 @@ mod tests {
                     echo,
                     PaymentPayload::hash("0xmockhash"),
                 ))
+            }
+
+            async fn commit_payment(
+                &self,
+                _: &PaymentChallenge,
+                _: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.commit_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn rollback_payment(
+                &self,
+                _: &PaymentChallenge,
+                _: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.rollback_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
         }
 
@@ -555,6 +622,8 @@ mod tests {
 
             assert_eq!(resp.status(), reqwest::StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 1);
+            assert_eq!(provider.rollback_count(), 0);
             assert_eq!(call_count.load(Ordering::SeqCst), 2);
         }
 
@@ -635,7 +704,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_middleware_unsuccessful_paid_retry_emits_payment_failed() {
+        async fn test_middleware_unsuccessful_paid_retry_emits_no_payment_outcome() {
             let (_, www_auth) = test_challenge();
 
             let app = Router::new().route(
@@ -672,12 +741,9 @@ mod tests {
             });
             let _failed_sub = events.on_payment_failed({
                 let failed_count = failed_count.clone();
-                move |ctx| {
+                move |_| {
                     failed_count.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        assert!(ctx.challenge.is_some());
-                        assert!(ctx.error.contains("403 Forbidden"));
-                    }
+                    async {}
                 }
             });
             let client = ClientBuilder::new(reqwest::Client::new())
@@ -692,8 +758,10 @@ mod tests {
 
             assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
             assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 0);
+            assert_eq!(provider.rollback_count(), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 0);
-            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]
@@ -754,7 +822,7 @@ mod tests {
                 request_count.load(Ordering::SeqCst),
                 DEFAULT_MAX_PAYMENT_RETRIES as u32 + 1
             );
-            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]

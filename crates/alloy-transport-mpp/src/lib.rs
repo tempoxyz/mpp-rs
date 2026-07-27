@@ -6,9 +6,19 @@
 extern crate tracing;
 
 #[cfg(not(target_family = "wasm"))]
+mod application;
+#[cfg(not(target_family = "wasm"))]
 mod ws;
 #[cfg(not(target_family = "wasm"))]
-pub use ws::{MppEvent, MppHandle, MppWsConnect, NoVoucher, VoucherProvider, VoucherRequest};
+pub use application::{
+    MppApplicationEvent, MppApplicationHandle, MppApplicationWs, MppApplicationWsConnect,
+    MppWsError,
+};
+#[cfg(not(target_family = "wasm"))]
+pub use ws::{
+    CloseProvider, CloseRequest, MppEvent, MppHandle, MppWsConnect, NoVoucher, VoucherProvider,
+    VoucherRequest,
+};
 
 // Re-exports for ergonomics.
 #[cfg(not(target_family = "wasm"))]

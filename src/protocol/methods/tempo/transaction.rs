@@ -1,12 +1,12 @@
 //! Tempo transaction types for building and submitting transactions.
 //!
-//! This module re-exports transaction types from `tempo-alloy` and `tempo-primitives`
+//! This module re-exports transaction types from `tempo-alloy`
 //! for building Tempo transactions (type 0x76).
 //!
 //! # Transaction Types
 //!
 //! - [`TempoTransactionRequest`]: Builder for Tempo transactions (from tempo-alloy)
-//! - [`TempoTransaction`]: Full Tempo transaction with RLP encoding (from tempo-primitives)
+//! - [`TempoTransaction`]: Full Tempo transaction with RLP encoding
 //!
 //! # Transaction Flow
 //!
@@ -43,7 +43,7 @@
 /// - `tempo_authorization_list`: Tempo-specific authorization list
 pub use tempo_alloy::rpc::TempoTransactionRequest;
 
-/// Re-export TempoTransaction from tempo-primitives.
+/// Re-export [`TempoTransaction`] from `tempo-alloy`.
 ///
 /// This is the full Tempo transaction type (0x76) with:
 /// - RLP encoding/decoding
@@ -51,10 +51,10 @@ pub use tempo_alloy::rpc::TempoTransactionRequest;
 /// - Fee payer signature support
 /// - Multi-call support
 /// - TIP-20 fee token support
-pub use tempo_primitives::TempoTransaction;
+pub use tempo_alloy::primitives::TempoTransaction;
 
-/// Re-export transaction primitives from tempo-primitives.
-pub use tempo_primitives::transaction::{Call, SignatureType, TEMPO_TX_TYPE_ID};
+/// Re-export transaction primitives from `tempo-alloy`.
+pub use tempo_alloy::primitives::transaction::{Call, SignatureType, TEMPO_TX_TYPE_ID};
 
 /// JSON-RPC method name for Tempo transactions.
 pub const TEMPO_SEND_TRANSACTION_METHOD: &str = "tempo_sendTransaction";

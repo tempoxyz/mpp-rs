@@ -5,16 +5,20 @@
 //! Tempo transactions.
 
 pub mod keychain;
+pub mod p256;
+
+pub use p256::{P256Jwk, P256SignerError, TempoP256Signer, TempoPrimitiveSigner};
 
 use alloy::eips::eip2930::AccessList;
 use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, U256};
-use tempo_primitives::transaction::{
+use tempo_alloy::primitives::transaction::{
     KeychainSignature, PrimitiveSignature, SignedKeyAuthorization, TempoSignature,
 };
+use tempo_alloy::primitives::TempoTxEnvelope;
 
-// Re-export so callers can set the version without importing tempo_primitives directly.
-pub use tempo_primitives::transaction::KeychainVersion;
+// Re-export so callers can set the version without importing Tempo primitives directly.
+pub use tempo_alloy::primitives::transaction::KeychainVersion;
 
 use crate::error::{MppError, ResultExt};
 use crate::protocol::methods::tempo::FeePayerEnvelope78;
@@ -92,14 +96,18 @@ fn build_tempo_signature(
     inner_signature: alloy::signers::Signature,
     mode: &TempoSigningMode,
 ) -> TempoSignature {
+    build_tempo_signature_primitive(PrimitiveSignature::Secp256k1(inner_signature), mode)
+}
+
+fn build_tempo_signature_primitive(
+    primitive: PrimitiveSignature,
+    mode: &TempoSigningMode,
+) -> TempoSignature {
     match mode {
-        TempoSigningMode::Direct => {
-            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(inner_signature))
-        }
+        TempoSigningMode::Direct => TempoSignature::Primitive(primitive),
         TempoSigningMode::Keychain {
             wallet, version, ..
         } => {
-            let primitive = PrimitiveSignature::Secp256k1(inner_signature);
             let keychain_sig = match version {
                 KeychainVersion::V1 => KeychainSignature::new_v1(*wallet, primitive),
                 KeychainVersion::V2 => KeychainSignature::new(*wallet, primitive),
@@ -114,7 +122,7 @@ fn build_tempo_signature(
 /// Uses the provided signing mode to produce either a primitive ECDSA
 /// signature (direct) or a keychain envelope signature.
 pub fn sign_and_encode(
-    tx: tempo_primitives::transaction::TempoTransaction,
+    tx: tempo_alloy::primitives::transaction::TempoTransaction,
     signer: &impl alloy::signers::SignerSync,
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
@@ -136,7 +144,7 @@ pub fn sign_and_encode(
 /// `tx.access_list` is stripped before signing so the signature binds the
 /// shape the sponsor reconstructs (see [`FeePayerEnvelope78::to_recoverable_signed`]).
 pub fn sign_and_encode_fee_payer_envelope(
-    mut tx: tempo_primitives::transaction::TempoTransaction,
+    mut tx: tempo_alloy::primitives::transaction::TempoTransaction,
     signer: &(impl alloy::signers::SignerSync + alloy::signers::Signer),
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
@@ -176,7 +184,7 @@ pub fn sign_and_encode_fee_payer_envelope(
 
 /// Async version of [`sign_and_encode`] for signers that require async signing.
 pub async fn sign_and_encode_async(
-    tx: tempo_primitives::transaction::TempoTransaction,
+    tx: tempo_alloy::primitives::transaction::TempoTransaction,
     signer: &impl alloy::signers::Signer,
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
@@ -191,13 +199,30 @@ pub async fn sign_and_encode_async(
     Ok(signed_tx.encoded_2718())
 }
 
+/// Sign a Tempo transaction with a signer that emits a native primitive
+/// signature, including Accounts SDK P-256 access keys.
+pub async fn sign_and_encode_primitive_async(
+    tx: tempo_alloy::primitives::transaction::TempoTransaction,
+    signer: &impl alloy::signers::Signer<PrimitiveSignature>,
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    let sig_hash = tx.signature_hash();
+    let hash_to_sign = effective_signing_hash(sig_hash, mode);
+    let signature = signer
+        .sign_hash(&hash_to_sign)
+        .await
+        .mpp_http("failed to sign transaction")?;
+    let signed_tx = tx.into_signed(build_tempo_signature_primitive(signature, mode));
+    Ok(signed_tx.encoded_2718())
+}
+
 /// Sign a fee-sponsored Tempo transaction and encode the client-submitted 0x76.
 ///
 /// Session fee-payer requests submit a type-0x76 transaction with a `0x00`
 /// fee-payer marker. The marker lets the server recover the payer against the
 /// same preimage the payer signed, then replace it with the sponsor signature.
 pub async fn sign_and_encode_fee_payer_request_async(
-    mut tx: tempo_primitives::transaction::TempoTransaction,
+    mut tx: tempo_alloy::primitives::transaction::TempoTransaction,
     signer: &impl alloy::signers::Signer,
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
@@ -238,9 +263,133 @@ pub async fn sign_and_encode_fee_payer_request_async(
     Ok(out)
 }
 
+/// Primitive-signature version of [`sign_and_encode_fee_payer_request_async`].
+pub async fn sign_and_encode_fee_payer_request_primitive_async(
+    mut tx: tempo_alloy::primitives::transaction::TempoTransaction,
+    signer: &impl alloy::signers::Signer<PrimitiveSignature>,
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer request requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer request must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer request must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer request must include valid_before".to_string(),
+        ));
+    }
+
+    tx.access_list = AccessList::default();
+    let sig_hash = tx.signature_hash();
+    let hash_to_sign = effective_signing_hash(sig_hash, mode);
+    let signature = signer
+        .sign_hash(&hash_to_sign)
+        .await
+        .mpp_http("failed to sign transaction")?;
+    let signed_tx = tx.into_signed(build_tempo_signature_primitive(signature, mode));
+    let mut out = Vec::new();
+    signed_tx.encode_for_fee_payer_service(&mut out);
+    Ok(out)
+}
+
+/// Primitive-signature version of [`sign_and_encode_fee_payer_envelope_async`].
+///
+/// This mirrors MPPx/Tempo's sender-only `signTransaction({ feePayer: true })`
+/// encoding for both charge credentials and TIP-1034 session management.
+pub async fn sign_and_encode_fee_payer_envelope_primitive_async(
+    mut tx: tempo_alloy::primitives::transaction::TempoTransaction,
+    signer: &impl alloy::signers::Signer<PrimitiveSignature>,
+    mode: &TempoSigningMode,
+) -> Result<Vec<u8>, MppError> {
+    let sender = mode.from_address(signer.address());
+    if tx.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires fee_payer_signature placeholder; build tx with TempoTxOptions { fee_payer: true }"
+                .to_string(),
+        ));
+    }
+    if tx.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token (server chooses)".to_string(),
+        ));
+    }
+    if tx.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use expiring nonce key (U256::MAX)".to_string(),
+        ));
+    }
+    if tx.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".to_string(),
+        ));
+    }
+
+    tx.access_list = AccessList::default();
+    let sig_hash = tx.signature_hash();
+    let hash_to_sign = effective_signing_hash(sig_hash, mode);
+    let signature = signer
+        .sign_hash(&hash_to_sign)
+        .await
+        .mpp_http("failed to sign transaction")?;
+    let signature = build_tempo_signature_primitive(signature, mode);
+    Ok(FeePayerEnvelope78::from_signing_tx(tx, sender, signature).encoded_envelope())
+}
+
+/// Convert an Alloy-signed Tempo AA transaction to MPP's non-broadcastable
+/// fee-payer envelope.
+pub(crate) fn encode_signed_fee_payer_envelope(
+    envelope: TempoTxEnvelope,
+    sender: Address,
+) -> Result<Vec<u8>, MppError> {
+    let TempoTxEnvelope::AA(signed) = envelope else {
+        return Err(MppError::InvalidConfig(
+            "MPP fee sponsorship requires a Tempo AA transaction".into(),
+        ));
+    };
+    let (transaction, signature, _) = signed.into_parts();
+    if transaction.fee_payer_signature.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope requires a fee_payer_signature placeholder".into(),
+        ));
+    }
+    if transaction.fee_token.is_some() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include fee_token".into(),
+        ));
+    }
+    if transaction.nonce_key != U256::MAX {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must use the expiring nonce key".into(),
+        ));
+    }
+    if transaction.valid_before.is_none() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must include valid_before".into(),
+        ));
+    }
+    if transaction.access_list != AccessList::default() {
+        return Err(MppError::InvalidConfig(
+            "fee payer envelope must not include an access list".into(),
+        ));
+    }
+    Ok(FeePayerEnvelope78::from_signing_tx(transaction, sender, signature).encoded_envelope())
+}
+
 /// Async version of [`sign_and_encode_fee_payer_envelope`].
 pub async fn sign_and_encode_fee_payer_envelope_async(
-    mut tx: tempo_primitives::transaction::TempoTransaction,
+    mut tx: tempo_alloy::primitives::transaction::TempoTransaction,
     signer: &impl alloy::signers::Signer,
     mode: &TempoSigningMode,
 ) -> Result<Vec<u8>, MppError> {
@@ -286,7 +435,7 @@ mod tests {
     use super::*;
     use alloy::primitives::{Bytes, TxKind, U256};
     use alloy::signers::local::PrivateKeySigner;
-    use tempo_primitives::transaction::{AASigned, Call, TempoTransaction};
+    use tempo_alloy::primitives::transaction::{AASigned, Call, TempoTransaction};
 
     fn test_signer() -> PrivateKeySigner {
         "0x1234567890123456789012345678901234567890123456789012345678901234"
@@ -365,7 +514,9 @@ mod tests {
     #[test]
     fn test_key_authorization_keychain_some() {
         use alloy::signers::SignerSync;
-        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+        use tempo_alloy::primitives::transaction::{
+            KeyAuthorization, PrimitiveSignature, SignatureType,
+        };
 
         let signer = test_signer();
         let auth = KeyAuthorization {
@@ -519,7 +670,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(bytes[0], tempo_primitives::transaction::TEMPO_TX_TYPE_ID);
+        assert_eq!(
+            bytes[0],
+            tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID
+        );
     }
 
     #[test]
@@ -655,7 +809,9 @@ mod tests {
     fn test_sign_and_encode_with_key_authorization_in_tx() {
         use alloy::eips::eip2718::Decodable2718;
         use alloy::signers::SignerSync;
-        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+        use tempo_alloy::primitives::transaction::{
+            KeyAuthorization, PrimitiveSignature, SignatureType,
+        };
 
         let signer = test_signer();
         let auth = KeyAuthorization {
@@ -779,7 +935,7 @@ mod tests {
     #[test]
     fn test_sign_and_encode_direct_produces_primitive_signature() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let signer = test_signer();
         let bytes = sign_and_encode(test_tx(), &signer, &TempoSigningMode::Direct).unwrap();
@@ -794,7 +950,7 @@ mod tests {
     #[test]
     fn test_sign_and_encode_keychain_produces_keychain_signature() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let wallet = Address::repeat_byte(0xAA);
         let mode = TempoSigningMode::Keychain {
@@ -822,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn test_sign_and_encode_async_direct_produces_primitive_signature() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let signer = test_signer();
         let bytes = sign_and_encode_async(test_tx(), &signer, &TempoSigningMode::Direct)
@@ -839,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn test_sign_and_encode_async_keychain_produces_keychain_signature() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let wallet = Address::repeat_byte(0xBB);
         let mode = TempoSigningMode::Keychain {
@@ -859,6 +1015,41 @@ mod tests {
             }
             other => panic!("Expected Keychain signature, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn p256_access_key_encodes_as_native_keychain_signature() {
+        use alloy::eips::eip2718::Decodable2718;
+
+        let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
+            y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
+            d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+        })
+        .unwrap();
+        let wallet = Address::repeat_byte(0xBB);
+        let bytes = sign_and_encode_primitive_async(
+            test_tx(),
+            &signer,
+            &TempoSigningMode::Keychain {
+                wallet,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            },
+        )
+        .await
+        .unwrap();
+        let decoded = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+        let TempoSignature::Keychain(signature) = decoded.signature() else {
+            panic!("expected keychain signature")
+        };
+        assert_eq!(signature.user_address, wallet);
+        assert!(matches!(
+            signature.signature,
+            PrimitiveSignature::P256(ref p256) if p256.pre_hash
+        ));
     }
 
     // --- Keychain V1 vs V2 ---
@@ -897,7 +1088,7 @@ mod tests {
     #[test]
     fn test_v1_key_id_recovers_signer() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let signer = test_signer();
         let mode = keychain_mode(KeychainVersion::V1);
@@ -924,7 +1115,7 @@ mod tests {
     #[test]
     fn test_v2_key_id_recovers_signer() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let signer = test_signer();
         let mode = keychain_mode(KeychainVersion::V2);
@@ -951,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn test_v2_async_key_id_recovers_signer() {
         use alloy::eips::eip2718::Decodable2718;
-        use tempo_primitives::transaction::TempoSignature;
+        use tempo_alloy::primitives::transaction::TempoSignature;
 
         let signer = test_signer();
         let mode = keychain_mode(KeychainVersion::V2);

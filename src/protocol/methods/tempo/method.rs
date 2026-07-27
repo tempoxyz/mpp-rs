@@ -35,9 +35,9 @@ use std::sync::Arc;
 use tempo_alloy::contracts::precompiles::{
     IAccountKeychain, IStablecoinDEX, ACCOUNT_KEYCHAIN_ADDRESS, ITIP20, STABLECOIN_DEX_ADDRESS,
 };
+use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tokio::sync::OnceCell;
 
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -89,7 +89,7 @@ fn call_selector(data: &Bytes) -> Option<[u8; 4]> {
     }
 }
 
-fn decode_approve_spender(call: &tempo_primitives::transaction::Call) -> Option<Address> {
+fn decode_approve_spender(call: &tempo_alloy::primitives::transaction::Call) -> Option<Address> {
     if call_selector(&call.input) != Some(ITIP20::approveCall::SELECTOR) || call.input.len() != 68 {
         return None;
     }
@@ -97,7 +97,7 @@ fn decode_approve_spender(call: &tempo_primitives::transaction::Call) -> Option<
     Some(Address::from_slice(&call.input[16..36]))
 }
 
-fn decode_swap_token_in(call: &tempo_primitives::transaction::Call) -> Option<Address> {
+fn decode_swap_token_in(call: &tempo_alloy::primitives::transaction::Call) -> Option<Address> {
     if call_selector(&call.input) != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
         return None;
     }
@@ -108,7 +108,7 @@ fn decode_swap_token_in(call: &tempo_primitives::transaction::Call) -> Option<Ad
 }
 
 fn transfer_call_offset(
-    calls: &[tempo_primitives::transaction::Call],
+    calls: &[tempo_alloy::primitives::transaction::Call],
 ) -> Result<usize, VerificationError> {
     let first_selector = calls.first().and_then(|call| call_selector(&call.input));
 
@@ -126,8 +126,8 @@ fn transfer_call_offset(
 }
 
 fn get_transfer_calls(
-    calls: &[tempo_primitives::transaction::Call],
-) -> Result<&[tempo_primitives::transaction::Call], VerificationError> {
+    calls: &[tempo_alloy::primitives::transaction::Call],
+) -> Result<&[tempo_alloy::primitives::transaction::Call], VerificationError> {
     let offset = transfer_call_offset(calls)?;
     let transfer_calls = &calls[offset..];
 
@@ -146,7 +146,7 @@ fn get_transfer_calls(
 }
 
 fn validate_fee_payer_calls(
-    calls: &[tempo_primitives::transaction::Call],
+    calls: &[tempo_alloy::primitives::transaction::Call],
 ) -> Result<(), VerificationError> {
     if calls.is_empty() {
         return Err(disallowed_fee_payer_call_pattern_error());
@@ -852,14 +852,14 @@ where
 
         // Skip type byte (0x76) for Tempo transactions
         let tx_data = if !tx_bytes.is_empty()
-            && tx_bytes[0] == tempo_primitives::transaction::TEMPO_TX_TYPE_ID
+            && tx_bytes[0] == tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID
         {
             &tx_bytes[1..]
         } else {
             tx_bytes
         };
 
-        let signed = tempo_primitives::AASigned::rlp_decode(&mut &tx_data[..])
+        let signed = tempo_alloy::primitives::AASigned::rlp_decode(&mut &tx_data[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {}", e)))?;
         let tx = signed.tx();
 
@@ -1110,8 +1110,8 @@ where
     fn build_simulate_payload(
         final_tx_bytes: &[u8],
     ) -> Result<SimulatePayload<TempoTransactionRequest>, VerificationError> {
-        let signed =
-            tempo_primitives::AASigned::decode_2718(&mut &final_tx_bytes[..]).map_err(|e| {
+        let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+            .map_err(|e| {
                 VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
             })?;
         let sender = signed.recover_signer().map_err(|e| {
@@ -1249,7 +1249,7 @@ where
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::eips::Encodable2718;
         use alloy::signers::SignerSync;
-        use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
+        use tempo_alloy::primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
         if tx_bytes.is_empty() {
             return Err(VerificationError::new("Empty transaction bytes"));
@@ -1531,6 +1531,7 @@ where
 
                 // Fast path: signer IS the source address (Direct mode).
                 if !proof::verify_proof(
+                    parsed_source.address,
                     expected_chain_id,
                     &credential.challenge.id,
                     &credential.challenge.realm,
@@ -1540,6 +1541,7 @@ where
                     // Keychain fallback: signer may be an access key authorized
                     // for the source wallet. Recover the signer and check on-chain.
                     let recovered = proof::recover_proof_signer(
+                        parsed_source.address,
                         expected_chain_id,
                         &credential.challenge.id,
                         &credential.challenge.realm,
@@ -1746,9 +1748,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
@@ -1770,9 +1778,15 @@ mod tests {
         let other = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&other, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &other,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let payload = crate::protocol::core::PaymentPayload::proof(signature);
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
@@ -1783,6 +1797,7 @@ mod tests {
         let source = credential.source.as_deref().unwrap();
         let parsed = proof::parse_proof_source(source).unwrap();
         assert!(!proof::verify_proof(
+            parsed.address,
             42431,
             &credential.challenge.id,
             &credential.challenge.realm,
@@ -1807,13 +1822,15 @@ mod tests {
     // ==================== Fee payer co-sign unit tests ====================
 
     /// Helper: build a valid TempoTransaction for fee payer tests.
-    fn make_fee_payer_tx(valid_before_secs_from_now: u64) -> tempo_primitives::TempoTransaction {
+    fn make_fee_payer_tx(
+        valid_before_secs_from_now: u64,
+    ) -> tempo_alloy::primitives::TempoTransaction {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        tempo_primitives::TempoTransaction {
+        tempo_alloy::primitives::TempoTransaction {
             chain_id: CHAIN_ID,
             nonce: 0,
             nonce_key: U256::MAX,
@@ -1828,7 +1845,7 @@ mod tests {
             )),
             valid_before: NonZeroU64::new(now + valid_before_secs_from_now),
             valid_after: None,
-            calls: vec![tempo_primitives::transaction::Call {
+            calls: vec![tempo_alloy::primitives::transaction::Call {
                 to: TxKind::Call(Address::repeat_byte(0x20)),
                 value: U256::ZERO,
                 input: Bytes::from(vec![0xa9, 0x05, 0x9c, 0xbb]), // transfer selector
@@ -1868,14 +1885,14 @@ mod tests {
     }
 
     fn encode_signed_tx(
-        calls: Vec<tempo_primitives::transaction::Call>,
+        calls: Vec<tempo_alloy::primitives::transaction::Call>,
         gas_limit: u64,
     ) -> Vec<u8> {
         use alloy::eips::Encodable2718;
         use alloy::signers::SignerSync;
 
         let signer = alloy::signers::local::PrivateKeySigner::random();
-        let tx = tempo_primitives::TempoTransaction {
+        let tx = tempo_alloy::primitives::TempoTransaction {
             chain_id: CHAIN_ID,
             nonce: 0,
             nonce_key: U256::MAX,
@@ -1892,7 +1909,7 @@ mod tests {
             key_authorization: None,
         };
 
-        let signature: tempo_primitives::transaction::TempoSignature =
+        let signature: tempo_alloy::primitives::transaction::TempoSignature =
             signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
 
         tx.into_signed(signature).encoded_2718()
@@ -2305,7 +2322,7 @@ mod tests {
 
     /// Helper: sign a tx and encode as a 0x78 fee payer envelope.
     fn sign_and_encode_0x78(
-        tx: tempo_primitives::TempoTransaction,
+        tx: tempo_alloy::primitives::TempoTransaction,
         signer: &alloy::signers::local::PrivateKeySigner,
     ) -> Vec<u8> {
         use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
@@ -2313,7 +2330,7 @@ mod tests {
 
         let sig_hash = tx.signature_hash();
         let sig = signer.sign_hash_sync(&sig_hash).unwrap();
-        let signature: tempo_primitives::transaction::TempoSignature = sig.into();
+        let signature: tempo_alloy::primitives::transaction::TempoSignature = sig.into();
         let encoded =
             FeePayerEnvelope78::from_signing_tx(tx, signer.address(), signature).encoded_envelope();
         assert_eq!(encoded[0], TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID);
@@ -2339,7 +2356,7 @@ mod tests {
         // Encode as a 0x78 fee payer envelope (sender address in the fee_payer slot).
         let sig_hash = tx.signature_hash();
         let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
-        let signature: tempo_primitives::transaction::TempoSignature = sig.into();
+        let signature: tempo_alloy::primitives::transaction::TempoSignature = sig.into();
 
         let encoded = FeePayerEnvelope78::from_signing_tx(tx, client_signer.address(), signature)
             .encoded_envelope();
@@ -2362,12 +2379,12 @@ mod tests {
         // Result should be a valid 0x76 transaction
         assert_eq!(
             co_signed[0],
-            tempo_primitives::transaction::TEMPO_TX_TYPE_ID,
+            tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID,
             "co-signed output should be 0x76"
         );
 
         // It should be decodable by AASigned
-        let signed = tempo_primitives::AASigned::decode_2718(&mut &co_signed[..])
+        let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &co_signed[..])
             .expect("co-signed tx should be decodable as AASigned");
 
         let decoded_tx = signed.tx();
@@ -2395,12 +2412,12 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(recipient, U256::from(100u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(Address::repeat_byte(0x44)),
                     value: U256::ZERO,
                     input: Bytes::from(vec![0u8; 4]),
@@ -2437,17 +2454,17 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(token_in),
                     value: U256::ZERO,
                     input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
                     value: U256::ZERO,
                     input: make_swap_input(token_in, currency, 100),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(recipient, U256::from(100u64)),
@@ -2487,22 +2504,22 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(token_in),
                     value: U256::ZERO,
                     input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
                     value: U256::ZERO,
                     input: make_swap_input(token_in, currency, 100),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(primary_recipient, U256::from(90u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(split_recipient, U256::from(10u64)),
@@ -2534,12 +2551,12 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
                     value: U256::ZERO,
                     input: make_swap_input(token_in, currency, 100),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(recipient, U256::from(100u64)),
@@ -2576,17 +2593,17 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(token_in),
                     value: U256::ZERO,
                     input: make_approve_input(Address::repeat_byte(0x99), U256::from(100u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
                     value: U256::ZERO,
                     input: make_swap_input(token_in, currency, 100),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(recipient, U256::from(100u64)),
@@ -2620,17 +2637,17 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(Address::repeat_byte(0x99)),
                     value: U256::ZERO,
                     input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
                     value: U256::ZERO,
                     input: make_swap_input(token_in, currency, 100),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(recipient, U256::from(100u64)),
@@ -2666,17 +2683,17 @@ mod tests {
 
         let tx_bytes = encode_signed_tx(
             vec![
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(token_in),
                     value: U256::ZERO,
                     input: make_approve_input(STABLECOIN_DEX_ADDRESS, U256::from(100u64)),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(Address::repeat_byte(0x98)),
                     value: U256::ZERO,
                     input: make_swap_input(token_in, currency, 100),
                 },
-                tempo_primitives::transaction::Call {
+                tempo_alloy::primitives::transaction::Call {
                     to: TxKind::Call(currency),
                     value: U256::ZERO,
                     input: make_transfer_input(recipient, U256::from(100u64)),
@@ -2708,7 +2725,7 @@ mod tests {
         }];
 
         let tx_bytes = encode_signed_tx(
-            vec![tempo_primitives::transaction::Call {
+            vec![tempo_alloy::primitives::transaction::Call {
                 to: TxKind::Call(currency),
                 value: U256::ZERO,
                 input: make_transfer_input(recipient, U256::from(100u64)),
@@ -2732,7 +2749,7 @@ mod tests {
             recipient,
             memo: None,
         }];
-        let calls = vec![tempo_primitives::transaction::Call {
+        let calls = vec![tempo_alloy::primitives::transaction::Call {
             to: TxKind::Call(currency),
             value: U256::ZERO,
             input: make_transfer_input(recipient, U256::from(100u64)),
@@ -3121,9 +3138,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
@@ -3159,9 +3182,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
 
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
@@ -3254,9 +3283,15 @@ mod tests {
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let request = test_charge_request_with_amount("0");
         let challenge = test_proof_challenge(&request);
-        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
-            .await
-            .unwrap();
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
@@ -3698,7 +3733,7 @@ mod tests {
 
         // Honest tx with empty access list, signed by the client.
         let tx = make_fee_payer_tx(60);
-        let signature: tempo_primitives::transaction::TempoSignature = client_signer
+        let signature: tempo_alloy::primitives::transaction::TempoSignature = client_signer
             .sign_hash_sync(&tx.signature_hash())
             .unwrap()
             .into();
@@ -3740,7 +3775,8 @@ mod tests {
             )
             .expect("sponsor must cosign tampered envelope");
 
-        let signed = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let signed =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
         assert!(
             signed.tx().access_list.is_empty(),
             "broadcast tx must have empty access list"
@@ -3764,7 +3800,7 @@ mod tests {
         let tx = make_fee_payer_tx(60);
         let sig_hash = tx.signature_hash();
         let sig = client_signer.sign_hash_sync(&sig_hash).unwrap();
-        let signature: tempo_primitives::transaction::TempoSignature = sig.into();
+        let signature: tempo_alloy::primitives::transaction::TempoSignature = sig.into();
         let envelope = FeePayerEnvelope78::from_signing_tx(tx, client_signer.address(), signature)
             .encoded_envelope();
 
@@ -3786,7 +3822,7 @@ mod tests {
     fn make_keychain_cosigned_fee_payer_tx() -> (Vec<u8>, Address, Address) {
         use super::super::FeePayerEnvelope78;
         use alloy::signers::SignerSync;
-        use tempo_primitives::transaction::{
+        use tempo_alloy::primitives::transaction::{
             KeychainSignature, PrimitiveSignature, TempoSignature,
         };
 
@@ -3844,7 +3880,7 @@ mod tests {
         );
         assert_eq!(
             call.key_type,
-            Some(tempo_primitives::SignatureType::Secp256k1)
+            Some(tempo_alloy::primitives::SignatureType::Secp256k1)
         );
         // Otherwise the assertions above would be vacuous.
         assert_ne!(wallet, access_key);
@@ -3875,7 +3911,7 @@ mod tests {
         assert!(call.key_id.is_none(), "plain EOA tx must not set keyId");
         assert_eq!(
             call.key_type,
-            Some(tempo_primitives::SignatureType::Secp256k1),
+            Some(tempo_alloy::primitives::SignatureType::Secp256k1),
             "primitive tx must advertise its keyType for gas sizing"
         );
         assert!(
@@ -3894,7 +3930,8 @@ mod tests {
         let cosigned = make_cosigned_fee_payer_tx();
 
         // The from we expect is the client sender recovered from the cosigned tx.
-        let signed = tempo_primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let signed =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
         let expected_from = signed.recover_signer().unwrap();
         let expected_calls = signed.tx().calls.clone();
 
@@ -3972,17 +4009,17 @@ mod tests {
         // Three distinct calls so a reordering bug (e.g. moving the first call)
         // would be observable.
         let calls = vec![
-            tempo_primitives::transaction::Call {
+            tempo_alloy::primitives::transaction::Call {
                 to: TxKind::Call(Address::repeat_byte(0x11)),
                 value: U256::ZERO,
                 input: Bytes::from(vec![0xaa]),
             },
-            tempo_primitives::transaction::Call {
+            tempo_alloy::primitives::transaction::Call {
                 to: TxKind::Call(Address::repeat_byte(0x22)),
                 value: U256::from(7u64),
                 input: Bytes::from(vec![0xbb, 0xbb]),
             },
-            tempo_primitives::transaction::Call {
+            tempo_alloy::primitives::transaction::Call {
                 to: TxKind::Call(Address::repeat_byte(0x33)),
                 value: U256::ZERO,
                 input: Bytes::from(vec![0xcc, 0xcc, 0xcc]),
@@ -3991,7 +4028,7 @@ mod tests {
 
         let mut tx = make_fee_payer_tx(60);
         tx.calls = calls.clone();
-        let signature: tempo_primitives::transaction::TempoSignature =
+        let signature: tempo_alloy::primitives::transaction::TempoSignature =
             signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
         let signed_bytes = tx.into_signed(signature).encoded_2718();
 

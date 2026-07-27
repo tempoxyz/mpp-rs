@@ -1,19 +1,16 @@
 //! Fee payer envelope (magic byte 0x78).
 //!
-//! This is a helper encoding used for fee-sponsored transactions.
+//! This is the native sender-signed encoding used for fee-sponsored Tempo
+//! transactions before the sponsor completes them.
 //!
 //! It is **not** a broadcastable Tempo transaction type. Instead, clients send a
 //! `0x78 || rlp([...])` envelope to a sponsoring server, which validates the
 //! envelope, reconstitutes a normal 0x76 Tempo transaction, attaches a
 //! `fee_payer_signature`, and then broadcasts.
 //!
-//! Note: this envelope format is specific to mpp-rs. The TypeScript/Viem SDK
-//! (mppx) achieves fee sponsorship differently — the client sends a standard
-//! `0x76` transaction to a JSON-RPC sidecar (`Handler.feePayer()` in tempo-ts)
-//! via viem's `withFeePayer` transport, which cosigns using
-//! `signTransaction({ feePayer: account })` and returns a complete `0x76`.
-//! The `0x78` envelope exists in mpp-rs because it embeds the fee-payer flow
-//! inline in the MPP credential exchange rather than using a separate RPC hop.
+//! This mirrors MPPx/Tempo's `signTransaction({ feePayer: true })` behavior:
+//! the client submits a pre-cosign `0x78` envelope, and the server or hosted
+//! fee-payer transport validates it before producing the completed transaction.
 
 use std::num::NonZeroU64;
 
@@ -21,7 +18,7 @@ use alloy::eips::eip2930::AccessList;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rlp::{Buf, BufMut, Decodable, Encodable, Error as RlpError, Header, EMPTY_STRING_CODE};
 
-use tempo_primitives::transaction::{
+use tempo_alloy::primitives::transaction::{
     Call, SignedKeyAuthorization, TempoSignature, TempoSignedAuthorization,
 };
 
@@ -30,7 +27,7 @@ use tempo_primitives::transaction::{
 /// Tempo primitives defines this as the fee payer signature domain-separation
 /// magic byte.
 pub const TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID: u8 =
-    tempo_primitives::transaction::tempo_transaction::FEE_PAYER_SIGNATURE_MAGIC_BYTE;
+    tempo_alloy::primitives::transaction::tempo_transaction::FEE_PAYER_SIGNATURE_MAGIC_BYTE;
 
 /// RLP payload sent by a client when requesting fee sponsorship.
 ///
@@ -65,7 +62,7 @@ impl FeePayerEnvelope78 {
     ///
     /// Any `tx.access_list` is dropped; see [`Self::to_recoverable_signed`].
     pub fn from_signing_tx(
-        tx: tempo_primitives::transaction::TempoTransaction,
+        tx: tempo_alloy::primitives::transaction::TempoTransaction,
         sender: Address,
         signature: TempoSignature,
     ) -> Self {
@@ -125,8 +122,8 @@ impl FeePayerEnvelope78 {
     /// the empty shape, so a tampered wire access list is structurally
     /// stripped and a malicious access-list-bound signature fails recovery.
     #[must_use]
-    pub fn to_recoverable_signed(&self) -> tempo_primitives::AASigned {
-        let tx = tempo_primitives::TempoTransaction {
+    pub fn to_recoverable_signed(&self) -> tempo_alloy::primitives::AASigned {
+        let tx = tempo_alloy::primitives::TempoTransaction {
             chain_id: self.chain_id,
             nonce: self.nonce,
             nonce_key: self.nonce_key,
@@ -147,7 +144,7 @@ impl FeePayerEnvelope78 {
             tempo_authorization_list: self.tempo_authorization_list.clone(),
         };
 
-        tempo_primitives::AASigned::new_unhashed(tx, self.signature.clone())
+        tempo_alloy::primitives::AASigned::new_unhashed(tx, self.signature.clone())
     }
 }
 
@@ -311,7 +308,7 @@ mod tests {
     use alloy::primitives::{Bytes, TxKind};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::signers::SignerSync;
-    use tempo_primitives::transaction::{
+    use tempo_alloy::primitives::transaction::{
         Call, KeyAuthorization, PrimitiveSignature, SignatureType, TempoTransaction, TokenLimit,
     };
 
@@ -522,7 +519,7 @@ mod tests {
 
     #[test]
     fn roundtrip_with_keychain_signature() {
-        use tempo_primitives::transaction::KeychainSignature;
+        use tempo_alloy::primitives::transaction::KeychainSignature;
 
         let signer = test_signer();
         let tx = base_fee_payer_tx();

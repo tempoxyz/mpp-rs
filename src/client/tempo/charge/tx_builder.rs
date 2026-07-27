@@ -7,9 +7,9 @@ use std::num::NonZeroU64;
 
 use alloy::primitives::{Address, Signature, U256};
 use alloy::providers::Provider;
+use tempo_alloy::primitives::transaction::{Call, SignedKeyAuthorization, TempoTransaction};
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::{Call, SignedKeyAuthorization, TempoTransaction};
 
 use crate::error::MppError;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
@@ -288,7 +288,9 @@ mod tests {
     #[test]
     fn test_build_tempo_tx_with_key_authorization() {
         use alloy::signers::{local::PrivateKeySigner, SignerSync};
-        use tempo_primitives::transaction::{KeyAuthorization, PrimitiveSignature, SignatureType};
+        use tempo_alloy::primitives::transaction::{
+            KeyAuthorization, PrimitiveSignature, SignatureType,
+        };
 
         let signer: PrivateKeySigner =
             "0x1234567890123456789012345678901234567890123456789012345678901234"

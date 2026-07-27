@@ -1,0 +1,15 @@
+[package]
+name = "catalog-client-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mpp-catalog-client"
+path = "src/main.rs"
+
+[dependencies]
+mpp = { path = "../..", default-features = false, features = ["client", "tempo", "stripe", "sqlite", "reqwest-rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

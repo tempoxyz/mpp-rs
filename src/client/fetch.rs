@@ -2,7 +2,7 @@
 //!
 //! Provides `.send_with_payment()` method for opt-in per-request payment handling.
 
-use reqwest::header::WWW_AUTHENTICATE;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
@@ -11,14 +11,14 @@ use super::events::{
     ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use super::provider::PaymentProvider;
+use super::provider::{commit_payments, rollback_payments, PaymentContext, PaymentProvider};
 use super::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
+    format_authorization, parse_www_authenticate_all, PaymentChallenge, PaymentCredential,
 };
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
@@ -201,6 +201,7 @@ impl PaymentExt for RequestBuilder {
         let ranking_accept = caller_accept.or(provider_accept);
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
+        let mut pending_payments: Vec<(PaymentChallenge, PaymentCredential)> = Vec::new();
         let mut resp = this.send().await?;
 
         for attempt in 0..max_payment_retries {
@@ -223,6 +224,9 @@ impl PaymentExt for RequestBuilder {
                         reason: None,
                     }))
                     .await;
+                rollback_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
                 return Err(HttpError::MissingChallenge);
             }
 
@@ -248,6 +252,9 @@ impl PaymentExt for RequestBuilder {
                             reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(err);
                 }
                 Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
@@ -259,6 +266,9 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(err);
                 }
             };
@@ -271,6 +281,9 @@ impl PaymentExt for RequestBuilder {
                         reason: None,
                     }))
                     .await;
+                rollback_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
                 return Ok(resp);
             }
 
@@ -283,21 +296,46 @@ impl PaymentExt for RequestBuilder {
 
             let credential = match override_credential {
                 Some(credential) => credential,
-                None => match provider.pay(&challenge).await {
-                    Ok(credential) => credential,
-                    Err(err) => {
-                        let http_err = HttpError::Payment(err);
-                        events
-                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                                challenge: Some(challenge),
-                                error: http_err.to_string(),
-                                reason: None,
-                            }))
-                            .await;
-                        return Err(http_err);
+                None => {
+                    let Some(url) = url.clone() else {
+                        rollback_payments(provider, &pending_payments)
+                            .await
+                            .map_err(HttpError::Payment)?;
+                        return Err(HttpError::CloneFailed);
+                    };
+                    match provider
+                        .pay_with_context(
+                            &challenge,
+                            PaymentContext {
+                                url,
+                                headers: peek
+                                    .as_ref()
+                                    .map(|request| request.headers().clone())
+                                    .unwrap_or_default(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(credential) => credential,
+                        Err(err) => {
+                            let http_err = HttpError::Payment(err);
+                            events
+                                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                                    challenge: Some(challenge),
+                                    error: http_err.to_string(),
+                                    reason: None,
+                                }))
+                                .await;
+                            rollback_payments(provider, &pending_payments)
+                                .await
+                                .map_err(HttpError::Payment)?;
+                            return Err(http_err);
+                        }
                     }
-                },
+                }
             };
+
+            pending_payments.push((challenge.clone(), credential.clone()));
 
             events
                 .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
@@ -317,12 +355,42 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             };
 
-            let retry = retry_builder.try_clone().ok_or(HttpError::CloneFailed)?;
-            resp = match retry.header(AUTHORIZATION_HEADER, auth_header).send().await {
+            let auth_header = match HeaderValue::from_str(&auth_header) {
+                Ok(auth_header) => auth_header,
+                Err(err) => {
+                    let http_err = HttpError::InvalidCredential(err.to_string());
+                    events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: http_err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                    return Err(http_err);
+                }
+            };
+            let mut payment_headers = HeaderMap::new();
+            payment_headers.insert(AUTHORIZATION, auth_header);
+            let retry = match retry_builder.try_clone() {
+                Some(retry) => retry.headers(payment_headers),
+                None => {
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                    return Err(HttpError::CloneFailed);
+                }
+            };
+            resp = match retry.send().await {
                 Ok(resp) => resp,
                 Err(err) => {
                     let http_err = HttpError::Request(err);
@@ -333,6 +401,9 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
+                    // The request may have reached the server even though its
+                    // response was lost. Preserve optimistic provider state
+                    // until a later challenge can reconcile it.
                     return Err(http_err);
                 }
             };
@@ -346,17 +417,25 @@ impl PaymentExt for RequestBuilder {
                         status,
                     }))
                     .await;
+                commit_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
                 return Ok(resp);
             }
 
+            // A completed HTTP response is the application's answer, not a
+            // payment flow error. Match MPPx by returning non-402 responses
+            // and the final 402 without emitting `payment.failed`.
             if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == max_payment_retries {
-                events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: Some(challenge),
-                        error: format!("payment retry returned unsuccessful status: {status}"),
-                        reason: None,
-                    }))
-                    .await;
+                if resp.headers().contains_key("payment-receipt") {
+                    commit_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                } else {
+                    rollback_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
+                }
                 return Ok(resp);
             }
         }
@@ -398,6 +477,8 @@ mod tests {
         #[derive(Clone)]
         struct MockProvider {
             pay_count: Arc<AtomicU32>,
+            commit_count: Arc<AtomicU32>,
+            rollback_count: Arc<AtomicU32>,
             challenge_ids: Arc<Mutex<Vec<String>>>,
             fail: bool,
         }
@@ -406,6 +487,8 @@ mod tests {
             fn new() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    commit_count: Arc::new(AtomicU32::new(0)),
+                    rollback_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: false,
                 }
@@ -414,6 +497,8 @@ mod tests {
             fn failing() -> Self {
                 Self {
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    commit_count: Arc::new(AtomicU32::new(0)),
+                    rollback_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: true,
                 }
@@ -425,6 +510,14 @@ mod tests {
 
             fn challenge_ids(&self) -> Vec<String> {
                 self.challenge_ids.lock().unwrap().clone()
+            }
+
+            fn commit_count(&self) -> u32 {
+                self.commit_count.load(Ordering::SeqCst)
+            }
+
+            fn rollback_count(&self) -> u32 {
+                self.rollback_count.load(Ordering::SeqCst)
             }
         }
 
@@ -450,6 +543,24 @@ mod tests {
                     echo,
                     PaymentPayload::hash("0xmockhash"),
                 ))
+            }
+
+            async fn commit_payment(
+                &self,
+                _challenge: &PaymentChallenge,
+                _credential: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.commit_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn rollback_payment(
+                &self,
+                _challenge: &PaymentChallenge,
+                _credential: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.rollback_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
             }
         }
 
@@ -520,6 +631,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_paid_retry_replaces_caller_authorization() {
+            let (_, www_auth) = test_challenge();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        let authorization = req
+                            .headers()
+                            .get_all("authorization")
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .collect::<Vec<_>>();
+                        match authorization.as_slice() {
+                            [value] if value.starts_with("Payment ") => {
+                                (AxumStatusCode::OK, "ok").into_response()
+                            }
+                            ["Bearer upstream-token"] => (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response(),
+                            _ => (AxumStatusCode::BAD_REQUEST, "duplicate authorization")
+                                .into_response(),
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .bearer_auth("upstream-token")
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+        }
+
+        #[tokio::test]
         async fn test_payment_events_fire_on_success() {
             let (_, www_auth) = test_challenge();
 
@@ -587,13 +745,15 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 1);
+            assert_eq!(provider.rollback_count(), 0);
             assert_eq!(challenge_count.load(Ordering::SeqCst), 1);
             assert_eq!(credential_count.load(Ordering::SeqCst), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]
-        async fn test_unsuccessful_paid_retry_emits_payment_failed() {
+        async fn test_unsuccessful_paid_retry_emits_no_payment_outcome() {
             let (_, www_auth) = test_challenge();
 
             let app = Router::new().route(
@@ -631,12 +791,9 @@ mod tests {
             });
             let _failed_sub = events.on_payment_failed({
                 let failed_count = failed_count.clone();
-                move |ctx| {
+                move |_| {
                     failed_count.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        assert!(ctx.challenge.is_some());
-                        assert!(ctx.error.contains("403 Forbidden"));
-                    }
+                    async {}
                 }
             });
 
@@ -648,8 +805,10 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::FORBIDDEN);
             assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 0);
+            assert_eq!(provider.rollback_count(), 1);
             assert_eq!(response_count.load(Ordering::SeqCst), 0);
-            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]
@@ -708,7 +867,7 @@ mod tests {
                 request_count.load(Ordering::SeqCst),
                 DEFAULT_MAX_PAYMENT_RETRIES as u32 + 1
             );
-            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]

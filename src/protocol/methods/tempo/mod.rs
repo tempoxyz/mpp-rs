@@ -8,7 +8,7 @@
 //! - [`TempoMethodDetails`]: Tempo-specific method details (2D nonces, fee payer)
 //! - [`TempoChargeExt`]: Extension trait for ChargeRequest with Tempo-specific accessors
 //! - [`TempoTransactionRequest`]: Transaction request builder (from tempo-alloy)
-//! - [`TempoTransaction`]: Full Tempo transaction type 0x76 (from tempo-primitives)
+//! - [`TempoTransaction`]: Full Tempo transaction type 0x76
 //!
 //! # Constants
 //!

@@ -2,14 +2,83 @@
 
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
-use crate::protocol::methods::tempo::proof::sign_proof;
 
 use super::autoswap::AutoswapConfig;
-use super::charge::SignOptions;
-use super::signing::TempoSigningMode;
+use super::charge::{SignOptions, TempoCharge};
+use super::signing::{TempoPrimitiveSigner, TempoSigningMode};
 use crate::client::PaymentProvider;
 
-/// Tempo payment provider using EVM signing.
+pub(super) fn prepare_charge_request(
+    challenge: &PaymentChallenge,
+    expected_chain_id: Option<u64>,
+    client_id: Option<&str>,
+) -> Result<TempoCharge, MppError> {
+    let mut charge = TempoCharge::from_challenge(challenge)?;
+
+    if let Some(expected) = expected_chain_id {
+        use crate::protocol::methods::tempo::charge::TempoChargeExt;
+        match challenge
+            .request
+            .decode::<crate::protocol::intents::ChargeRequest>()?
+            .chain_id()
+        {
+            Some(got) if got != expected => {
+                return Err(MppError::ChainIdMismatch { expected, got });
+            }
+            None => charge = charge.with_chain_id(expected),
+            _ => {}
+        }
+    }
+
+    if charge.memo().is_none() {
+        charge = charge.with_memo(crate::tempo::attribution::encode(
+            &challenge.id,
+            &challenge.realm,
+            client_id,
+        ));
+    }
+
+    Ok(charge)
+}
+
+pub(super) async fn prepare_charge(
+    challenge: &PaymentChallenge,
+    expected_chain_id: Option<u64>,
+    client_id: Option<&str>,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<TempoCharge, MppError> {
+    let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
+    apply_autoswap(charge, autoswap, provider, from).await
+}
+
+pub(super) async fn apply_autoswap(
+    mut charge: TempoCharge,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<TempoCharge, MppError> {
+    if let Some(config) = autoswap {
+        if let Some(calls) = super::autoswap::resolve_autoswap_calls(
+            provider,
+            from,
+            charge.currency(),
+            charge.amount(),
+            config,
+        )
+        .await?
+        {
+            for call in calls.into_iter().rev() {
+                charge = charge.with_prepended_call(call)?;
+            }
+        }
+    }
+
+    Ok(charge)
+}
+
+/// Tempo payment provider using native primitive signing.
 ///
 /// Signs TIP-20 token transfer transactions for charge requests. The signed
 /// transaction is returned in the credential for the server to broadcast,
@@ -38,8 +107,9 @@ use crate::client::PaymentProvider;
 
 #[derive(Clone)]
 pub struct TempoProvider {
-    signer: alloy::signers::local::PrivateKeySigner,
+    signer: TempoPrimitiveSigner,
     rpc_url: reqwest::Url,
+    rpc_provider: alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
     autoswap: Option<AutoswapConfig>,
@@ -53,13 +123,15 @@ impl TempoProvider {
     ///
     /// Returns an error if the RPC URL is invalid.
     pub fn new(
-        signer: alloy::signers::local::PrivateKeySigner,
+        signer: impl Into<TempoPrimitiveSigner>,
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
-        let url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
+        let rpc_provider = super::rpc_provider(url.clone());
         Ok(Self {
-            signer,
+            signer: signer.into(),
             rpc_url: url,
+            rpc_provider,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
             autoswap: None,
@@ -105,6 +177,10 @@ impl TempoProvider {
         self.autoswap.as_ref()
     }
 
+    fn fee_token(&self) -> Option<alloy::primitives::Address> {
+        self.autoswap.as_ref().map(|config| config.token_in)
+    }
+
     /// Pin the chain ID this provider will pay on. When set, [`pay`] rejects any
     /// challenge whose `methodDetails.chainId` differs, before signing.
     ///
@@ -125,7 +201,7 @@ impl TempoProvider {
     }
 
     /// Get a reference to the signer.
-    pub fn signer(&self) -> &alloy::signers::local::PrivateKeySigner {
+    pub fn signer(&self) -> &TempoPrimitiveSigner {
         &self.signer
     }
 
@@ -142,81 +218,27 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        let mut charge = super::charge::TempoCharge::from_challenge(challenge)?;
-
-        // Chain pinning: resolve the chain to sign on before signing.
-        // - challenge `chainId` present: must match the pin (if any), else reject;
-        // - challenge `chainId` absent: use the pin, signing on it.
-        if let Some(expected) = self.expected_chain_id {
-            use crate::protocol::methods::tempo::charge::TempoChargeExt;
-            let challenge_chain_id = challenge
-                .request
-                .decode::<crate::protocol::intents::ChargeRequest>()?
-                .chain_id();
-            match challenge_chain_id {
-                Some(got) if got != expected => {
-                    return Err(MppError::ChainIdMismatch { expected, got });
-                }
-                None => charge = charge.with_chain_id(expected),
-                _ => {}
-            }
-        }
-
-        if charge.amount().is_zero() {
-            let from = self.signing_mode.from_address(self.signer.address());
-            let signature = sign_proof(
-                &self.signer,
-                charge.chain_id(),
-                &challenge.id,
-                &challenge.realm,
-            )
-            .await?;
-            let source = PaymentCredential::evm_did(charge.chain_id(), &from.to_string());
-
-            return Ok(PaymentCredential::with_source(
-                challenge.to_echo(),
-                source,
-                crate::protocol::core::PaymentPayload::proof(signature),
-            ));
-        }
-
-        // Auto-generate an attribution memo when the server doesn't provide one,
-        // so MPP transactions are identifiable on-chain via `TransferWithMemo` events.
-        if charge.memo().is_none() {
-            let memo = crate::tempo::attribution::encode(
-                &challenge.id,
-                &challenge.realm,
-                self.client_id.as_deref(),
-            );
-            charge = charge.with_memo(memo);
-        }
-
-        // If autoswap is enabled, check balance and prepend a swap call if needed.
-        if let Some(autoswap_config) = &self.autoswap {
-            let from = self.signing_mode.from_address(self.signer.address());
-            let rpc_url: reqwest::Url = self.rpc_url.clone();
-            let provider =
-                alloy::providers::RootProvider::<tempo_alloy::TempoNetwork>::new_http(rpc_url);
-
-            if let Some(swap_call) = super::autoswap::resolve_autoswap(
-                &provider,
-                from,
-                charge.currency(),
-                charge.amount(),
-                autoswap_config,
-            )
-            .await?
-            {
-                charge = charge.with_prepended_call(swap_call)?;
-            }
-        }
+        let from = self
+            .signing_mode
+            .from_address(alloy::signers::Signer::address(&self.signer));
+        let charge = prepare_charge(
+            challenge,
+            self.expected_chain_id,
+            self.client_id.as_deref(),
+            self.autoswap.as_ref(),
+            &self.rpc_provider,
+            from,
+        )
+        .await?;
 
         let options = SignOptions {
-            rpc_url: Some(self.rpc_url.to_string()),
             signing_mode: Some(self.signing_mode.clone()),
+            fee_token: self.fee_token(),
             ..Default::default()
         };
-        let signed = charge.sign_with_options(&self.signer, options).await?;
+        let signed = charge
+            .sign_with_primitive_provider_options(&self.signer, &self.rpc_provider, options)
+            .await?;
         Ok(signed.into_credential())
     }
 }
@@ -224,6 +246,8 @@ impl PaymentProvider for TempoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::providers::Provider;
+    use alloy::signers::Signer;
 
     #[test]
     fn test_tempo_provider_new() {
@@ -232,6 +256,21 @@ mod tests {
 
         assert_eq!(provider.rpc_url().as_str(), "https://rpc.example.com/");
         assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn test_tempo_provider_clones_share_rpc_client() {
+        let provider = TempoProvider::new(
+            alloy::signers::local::PrivateKeySigner::random(),
+            "https://rpc.example.com",
+        )
+        .unwrap();
+        let cloned = provider.clone();
+
+        assert!(std::ptr::eq(
+            provider.rpc_provider.client(),
+            cloned.rpc_provider.client()
+        ));
     }
 
     #[test]
@@ -278,6 +317,17 @@ mod tests {
             provider.signing_mode(),
             TempoSigningMode::Keychain { .. }
         ));
+    }
+
+    #[test]
+    fn autoswap_input_token_is_always_used_for_fees() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let token_in = alloy::primitives::Address::repeat_byte(0x11);
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_autoswap(AutoswapConfig::new(token_in, 100));
+
+        assert_eq!(provider.fee_token(), Some(token_in));
     }
 
     #[test]
@@ -377,6 +427,104 @@ mod tests {
 
         // Sanity: wallet and access key are different addresses.
         assert_ne!(wallet_address, access_key.address());
+    }
+
+    #[tokio::test]
+    async fn test_p256_access_key_signs_wallet_bound_charge_proof() {
+        use crate::client::tempo::signing::{
+            KeychainVersion, TempoP256Signer, TempoPrimitiveSigner,
+        };
+        use crate::protocol::core::Base64UrlJson;
+
+        let access_key = TempoP256Signer::from_slice(&[7_u8; 32]).unwrap();
+        let wallet_address: alloy::primitives::Address =
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+                .parse()
+                .unwrap();
+        let provider = TempoProvider::new(access_key, "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: wallet_address,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            });
+        assert!(matches!(provider.signer(), TempoPrimitiveSigner::P256(_)));
+
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 42431 }
+        }))
+        .unwrap();
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        assert!(credential.charge_payload().unwrap().is_proof());
+        assert_eq!(
+            credential.source,
+            Some(PaymentCredential::evm_did(
+                42431,
+                &wallet_address.to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_p256_access_key_signs_sponsored_charge_transaction() {
+        use crate::client::tempo::signing::{KeychainVersion, TempoP256Signer};
+        use crate::protocol::core::Base64UrlJson;
+
+        let access_key = TempoP256Signer::from_slice(&[9_u8; 32]).unwrap();
+        let wallet_address: alloy::primitives::Address =
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+                .parse()
+                .unwrap();
+        let provider = TempoProvider::new(access_key, "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: wallet_address,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            });
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "100",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 42431, "feePayer": true }
+        }))
+        .unwrap();
+        let challenge = PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+        let payload = credential.charge_payload().unwrap();
+
+        assert!(payload.is_transaction());
+        let transaction = payload.signed_tx().expect("missing signed transaction");
+        assert!(
+            transaction.starts_with("0x78"),
+            "charges use sponsorship envelopes"
+        );
+        assert_eq!(
+            credential.source,
+            Some(PaymentCredential::evm_did(
+                42431,
+                &wallet_address.to_string()
+            ))
+        );
     }
 
     #[test]

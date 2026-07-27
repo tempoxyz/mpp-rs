@@ -1,6 +1,6 @@
 [package]
 name = "mpp"
-version = "0.10.4"
+version = "0.11.0"
 edition = "2021"
 description = "Rust SDK for the Machine Payments Protocol (MPP)"
 license = "MIT OR Apache-2.0"
@@ -17,6 +17,7 @@ members = [
   "crates/alloy-transport-mpp",
   "examples/axum-extractor",
   "examples/basic",
+  "examples/catalog-client",
   "examples/session/multi-fetch",
   "examples/session/sse",
   "examples/stripe",
@@ -26,6 +27,9 @@ default-members = ["."]
 exclude = ["fuzz"]
 resolver = "2"
 
+[workspace.dependencies]
+tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "cf4e08013c0d6c537364f053462807ec42d4056a", default-features = false }
+
 [features]
 default = ["reqwest-default-tls"]
 
@@ -34,15 +38,29 @@ client = ["dep:reqwest"]
 server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
-evm = ["alloy", "dep:alloy-sol-type-parser", "dep:alloy-sol-types", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives", "dep:tempo-contracts", "uuid"]
+evm = ["alloy", "hex", "rand"]
+tempo = [
+  "evm",
+  "tokio",
+  "tempo-alloy",
+  "dep:async-trait",
+  "dep:p256",
+  "uuid",
+]
 stripe = ["dep:reqwest", "reqwest?/form"]
+sqlite = ["tempo", "dep:rusqlite"]
 
 # Utilities
 utils = ["hex", "rand"]
 
 # Middleware support (requires client)
-middleware = ["client", "reqwest-middleware", "async-trait", "anyhow", "http-types"]
+middleware = [
+  "client",
+  "reqwest-middleware",
+  "dep:async-trait",
+  "anyhow",
+  "http-types",
+]
 
 # Tower middleware support (server-side)
 tower = [
@@ -96,14 +114,20 @@ uuid = { version = "1", features = ["v4"], optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
-alloy = { version = "2.1.0", features = ["full"], optional = true }
-alloy-sol-type-parser = { version = "=1.6.0", optional = true }
-alloy-sol-types = { version = "=1.6.0", optional = true }
+alloy = { version = "2.1.0", default-features = false, features = [
+  "contract",
+  "provider-http",
+  "reqwest",
+  "rpc-types",
+  "signer-local",
+  "sol-types",
+  "std",
+], optional = true }
 
 # Tempo dependencies (optional)
-tempo-alloy = { version = "1.8.1", optional = true }
-tempo-primitives = { version = "1.8.1", optional = true }
-tempo-contracts = { version = "1.8.1", optional = true }
+tempo-alloy = { workspace = true, optional = true }
+p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }

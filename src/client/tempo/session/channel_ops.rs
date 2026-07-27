@@ -12,25 +12,28 @@ use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol_types::{SolCall, SolValue};
 use tempo_alloy::contracts::precompiles::{ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS};
+use tempo_alloy::primitives::transaction::{Call, SignatureType, TempoTransaction};
+use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
-use tempo_primitives::transaction::{Call, TempoTransaction};
 
-use crate::client::tempo::charge::tx_builder::{build_tempo_tx, TempoTxOptions};
+use crate::client::tempo::charge::tx_builder::{build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
-    sign_precompile_voucher, sign_precompile_voucher_with_escrow, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
+    sign_precompile_voucher, sign_precompile_voucher_primitive,
+    sign_precompile_voucher_primitive_with_escrow, sign_precompile_voucher_with_escrow,
+    PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::{
     ChannelDescriptor, SessionCredentialPayload, TempoSessionExt,
 };
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
-use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+use crate::protocol::methods::tempo::CHAIN_ID;
 
 #[cfg(feature = "tempo")]
-const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 
 /// Default escrow contract addresses per chain ID.
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
@@ -58,6 +61,10 @@ pub struct ChannelEntry {
     pub salt: B256,
     /// Running cumulative amount of all vouchers issued.
     pub cumulative_amount: u128,
+    /// Latest known channel deposit.
+    pub deposit: u128,
+    /// Full TIP-1034 descriptor. Legacy contract channels do not have one.
+    pub descriptor: Option<ChannelDescriptor>,
     /// Escrow contract address.
     pub escrow_contract: Address,
     /// Chain ID where the escrow contract is deployed.
@@ -69,33 +76,38 @@ pub struct ChannelEntry {
 /// Resolve chain ID from a session challenge's methodDetails.
 pub fn resolve_chain_id(challenge: &PaymentChallenge) -> u64 {
     let session: Result<SessionRequest, _> = challenge.request.decode();
-    session
-        .ok()
-        .and_then(|r| r.chain_id())
-        .unwrap_or(MODERATO_CHAIN_ID)
+    session.ok().and_then(|r| r.chain_id()).unwrap_or(CHAIN_ID)
 }
 
-/// Resolve escrow contract address from challenge methodDetails, an override, or defaults.
+/// Resolve escrow contract address from an override, challenge hints, or defaults.
 pub fn resolve_escrow(
     challenge: &PaymentChallenge,
     chain_id: u64,
     escrow_override: Option<Address>,
 ) -> Result<Address, MppError> {
-    // Try challenge methodDetails first
-    if let Ok(req) = challenge.request.decode::<SessionRequest>() {
-        if let Ok(addr_str) = req.escrow_contract() {
-            if let Ok(addr) = addr_str.parse::<Address>() {
-                return Ok(addr);
-            }
-        }
-    }
-
-    // Then override
+    // Match MPPx: an explicit client override wins over server hints.
     if let Some(addr) = escrow_override {
         return Ok(addr);
     }
 
-    // Then defaults
+    if let Ok(req) = challenge.request.decode::<SessionRequest>() {
+        if let Some(details) = req.method_details.as_ref() {
+            for key in ["escrowContract", "escrow"] {
+                if let Some(addr) = details
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse::<Address>().ok())
+                {
+                    return Ok(addr);
+                }
+            }
+        }
+        if req.is_tip1034_session() {
+            return Ok(TIP20_CHANNEL_RESERVE_ADDRESS);
+        }
+    }
+
+    // Legacy sessions retain their chain-specific escrow fallback.
     default_escrow_contract(chain_id).ok_or_else(|| {
         MppError::InvalidConfig(
             "No escrowContract available. Provide it in parameters or ensure the server challenge includes it.".to_string(),
@@ -159,6 +171,24 @@ pub async fn create_precompile_voucher_payload(
     })
 }
 
+/// Native primitive-signature version of [`create_precompile_voucher_payload`].
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_primitive(
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let signature =
+        sign_precompile_voucher_primitive(signer, channel_id, cumulative_amount, chain_id).await?;
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
+}
+
 /// Voucher payload for TIP-1034 with the descriptor required for recovery.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_voucher_payload_with_descriptor(
@@ -175,6 +205,36 @@ pub async fn create_precompile_voucher_payload_with_descriptor(
         chain_id,
     )
     .await
+}
+
+/// Native primitive-signature voucher payload with the descriptor required for recovery.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    let signature = sign_precompile_voucher_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
+
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
 }
 
 /// Voucher payload for TIP-1034 with an explicit escrow/precompile address.
@@ -251,6 +311,24 @@ pub async fn create_precompile_close_payload(
     })
 }
 
+/// Native primitive-signature version of [`create_precompile_close_payload`].
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_primitive(
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let signature =
+        sign_precompile_voucher_primitive(signer, channel_id, cumulative_amount, chain_id).await?;
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
+}
+
 /// Close payload for TIP-1034 with the descriptor required for recovery.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_close_payload_with_descriptor(
@@ -269,6 +347,43 @@ pub async fn create_precompile_close_payload_with_descriptor(
         chain_id,
     )
     .await
+}
+
+/// Native primitive-signature close payload with the descriptor required for recovery.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_with_descriptor_primitive(
+    signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let expected_channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    if expected_channel_id != channel_id {
+        return Err(MppError::InvalidConfig(
+            "TIP-1034 close descriptor does not match channel_id".to_string(),
+        ));
+    }
+
+    let signature = sign_precompile_voucher_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
+
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
 }
 
 /// Close payload for TIP-1034 with a descriptor and explicit escrow/precompile verifier.
@@ -341,11 +456,10 @@ where
     S: Signer + Clone,
 {
     use alloy::sol;
-    use tempo_primitives::transaction::Call;
+    use tempo_alloy::primitives::transaction::Call;
 
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
-
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
 
     // Generate random salt
@@ -404,28 +518,32 @@ where
         },
     ];
 
-    let nonce = provider
-        .get_transaction_count(payer)
-        .await
-        .mpp_http("failed to get nonce")?;
-
     let gas_price = provider
         .get_gas_price()
         .await
         .mpp_http("failed to get gas price")?;
+
+    let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
+
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        signer.address(),
+    )
+    .await?;
 
     let tempo_tx = build_tempo_tx(TempoTxOptions {
         calls,
         chain_id: options.chain_id,
         fee_token: options.currency,
         nonce,
-        nonce_key: U256::ZERO,
+        nonce_key,
         gas_limit: 2_000_000,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
-        valid_before: None,
-        key_authorization: signing_mode.key_authorization().cloned(),
+        valid_before,
+        key_authorization,
     });
 
     let tx_bytes =
@@ -447,6 +565,8 @@ where
         channel_id,
         salt,
         cumulative_amount: options.initial_amount,
+        deposit: options.deposit,
+        descriptor: None,
         escrow_contract: options.escrow_contract,
         chain_id: options.chain_id,
         opened: true,
@@ -534,11 +654,7 @@ fn parse_precompile_amount(value: u128, label: &str) -> Result<Uint<96, 2>, MppE
 }
 
 #[cfg(feature = "tempo")]
-fn precompile_open_tx_nonce_fields(fee_payer: bool, nonce: u64) -> (u64, U256, Option<u64>) {
-    if !fee_payer {
-        return (nonce, U256::ZERO, None);
-    }
-
+fn session_transaction_nonce_fields() -> (u64, U256, Option<u64>) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -547,8 +663,60 @@ fn precompile_open_tx_nonce_fields(fee_payer: bool, nonce: u64) -> (u64, U256, O
     (
         0,
         U256::MAX,
-        Some(now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS)),
+        Some(now.saturating_add(EXPIRING_NONCE_VALID_BEFORE_SECS)),
     )
+}
+
+/// Returns a random past timestamp for a repeatable transaction.
+///
+/// MPPx adds `validAfter` to top-ups so two otherwise identical expiring
+/// transactions do not serialize to the same replay-protection hash.
+#[cfg(feature = "tempo")]
+fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let latest = now.saturating_sub(60);
+    if latest == 0 {
+        return None;
+    }
+
+    let random = B256::random();
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&random[..8]);
+    let timestamp = (u64::from_be_bytes(prefix) % latest).max(1);
+    std::num::NonZeroU64::new(timestamp)
+}
+
+#[cfg(feature = "tempo")]
+fn session_estimation_request(
+    options: &TempoTxOptions,
+    valid_after: Option<std::num::NonZeroU64>,
+    payer: Address,
+    signer: Address,
+    signature_type: SignatureType,
+    keychain: bool,
+) -> TempoTransactionRequest {
+    let mut request = TempoTransactionRequest {
+        calls: options.calls.clone(),
+        key_authorization: options.key_authorization.clone(),
+        valid_before: options.valid_before.and_then(std::num::NonZeroU64::new),
+        valid_after,
+        ..Default::default()
+    }
+    .with_fee_token(options.fee_token)
+    .with_nonce_key(options.nonce_key);
+    request.inner.from = Some(payer);
+    request.inner.chain_id = Some(options.chain_id);
+    request.inner.nonce = Some(options.nonce);
+    request.inner.max_fee_per_gas = Some(options.max_fee_per_gas);
+    request.inner.max_priority_fee_per_gas = Some(options.max_priority_fee_per_gas);
+    request.key_type = Some(signature_type);
+    if keychain {
+        request.key_id = Some(signer);
+    }
+    request
 }
 
 /// Convert a JSON wire descriptor into the generated precompile ABI tuple.
@@ -715,6 +883,8 @@ pub fn create_precompile_top_up_payload(
 /// (always the precompile) with `operator`. `deposit` and `initial_amount`
 /// must fit `uint96`.
 pub struct OpenPrecompilePayloadOptions {
+    /// Calls executed atomically before the channel open.
+    pub prefix_calls: Vec<Call>,
     /// Optional relayer for `settle`/`close`; `Address::ZERO` = payee-only.
     pub operator: Address,
     /// Voucher signer; defaults to `payer` if `None`.
@@ -727,9 +897,24 @@ pub struct OpenPrecompilePayloadOptions {
     pub fee_payer: bool,
 }
 
-/// Open payload targeting the TIP-1034 reserve precompile. Single-call tx
-/// (no `approve` needed: precompile is on the TIP-1035 implicit approvals
-/// list). Channel id is derived against the unsigned tx's `expiringNonceHash`.
+/// Options for a descriptor-backed TIP-1034 top-up transaction.
+pub struct TopUpPrecompilePayloadOptions<'a> {
+    /// Calls executed atomically before the channel top-up.
+    pub prefix_calls: Vec<Call>,
+    /// Existing channel descriptor.
+    pub descriptor: &'a ChannelDescriptor,
+    /// Amount added to the existing channel deposit.
+    pub additional_deposit: u128,
+    /// Tempo chain ID.
+    pub chain_id: u64,
+    /// Whether the server may sponsor this management transaction.
+    pub fee_payer: bool,
+}
+
+/// Open payload targeting the TIP-1034 reserve precompile. The escrow open
+/// itself needs no approval because the precompile is on the TIP-1035 implicit
+/// approvals list; optional prefix calls may acquire the deposit currency.
+/// Channel id is derived against the complete unsigned tx's `expiringNonceHash`.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_open_payload<P, S>(
     provider: &P,
@@ -740,7 +925,7 @@ pub async fn create_precompile_open_payload<P, S>(
 ) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
 where
     P: Provider<TempoNetwork>,
-    S: Signer + Clone,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
 {
     if options.deposit > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
         return Err(MppError::InvalidConfig(format!(
@@ -757,6 +942,7 @@ where
 
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
+    let primitive_signer = signer.clone().into();
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
     let salt = B256::random();
@@ -771,28 +957,26 @@ where
     ))
     .abi_encode();
 
-    let calls = vec![Call {
+    let mut calls = options.prefix_calls;
+    calls.push(Call {
         to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
         value: U256::ZERO,
         input: Bytes::from(open_data),
-    }];
-
-    let nonce = if options.fee_payer {
-        0
-    } else {
-        provider
-            .get_transaction_count(payer)
-            .await
-            .mpp_http("failed to get nonce")?
-    };
+    });
 
     let gas_price = provider
         .get_gas_price()
         .await
         .mpp_http("failed to get gas price")?;
 
-    let (nonce, nonce_key, valid_before) =
-        precompile_open_tx_nonce_fields(options.fee_payer, nonce);
+    let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
+
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        primitive_signer.address(),
+    )
+    .await?;
 
     let unsigned_tx = build_tempo_tx(TempoTxOptions {
         calls,
@@ -805,9 +989,8 @@ where
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
         valid_before,
-        key_authorization: signing_mode.key_authorization().cloned(),
+        key_authorization,
     });
-
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
     let expiring_nonce_hash = if options.fee_payer {
@@ -836,26 +1019,36 @@ where
     );
 
     let tx_bytes = if options.fee_payer {
-        crate::client::tempo::signing::sign_and_encode_fee_payer_request_async(
+        crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
             unsigned_tx,
-            signer,
+            &primitive_signer,
             signing_mode,
         )
         .await?
     } else {
-        crate::client::tempo::signing::sign_and_encode_async(unsigned_tx, signer, signing_mode)
-            .await?
+        crate::client::tempo::signing::sign_and_encode_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
     };
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
-    let voucher_sig =
-        sign_precompile_voucher(signer, channel_id, options.initial_amount, options.chain_id)
-            .await?;
+    let voucher_sig = sign_precompile_voucher_primitive(
+        &primitive_signer,
+        channel_id,
+        options.initial_amount,
+        options.chain_id,
+    )
+    .await?;
 
     let entry = ChannelEntry {
         channel_id,
         salt,
         cumulative_amount: options.initial_amount,
+        deposit: options.deposit,
+        descriptor: Some(descriptor.clone()),
         escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
         chain_id: options.chain_id,
         opened: true,
@@ -872,6 +1065,121 @@ where
     };
 
     Ok((entry, payload))
+}
+
+/// Prepare and sign a descriptor-backed TIP-1034 top-up transaction.
+///
+/// This mirrors MPPx's `createTopUpPayload`: the returned transaction is sent
+/// to the MPP server as a management credential, and the server broadcasts it
+/// before accepting a voucher that requires the additional headroom.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_top_up_transaction_payload<P, S>(
+    provider: &P,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
+    payer: Address,
+    options: TopUpPrecompilePayloadOptions<'_>,
+) -> Result<SessionCredentialPayload, MppError>
+where
+    P: Provider<TempoNetwork>,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
+{
+    let additional_deposit =
+        parse_precompile_amount(options.additional_deposit, "additional_deposit")?;
+    if additional_deposit.is_zero() {
+        return Err(MppError::InvalidConfig(
+            "top-up amount must be greater than zero".into(),
+        ));
+    }
+
+    let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
+    let signing_mode = signing_mode.unwrap_or(&default_mode);
+    let primitive_signer = signer.clone().into();
+    let signature_type = match &primitive_signer {
+        crate::client::tempo::signing::TempoPrimitiveSigner::Secp256k1(_) => {
+            SignatureType::Secp256k1
+        }
+        crate::client::tempo::signing::TempoPrimitiveSigner::P256(_) => SignatureType::P256,
+    };
+    let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
+    let mut calls = options.prefix_calls;
+    calls.push(Call {
+        to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
+        value: U256::ZERO,
+        input: Bytes::from(
+            ITIP20ChannelReserve::topUpCall::new((descriptor, additional_deposit)).abi_encode(),
+        ),
+    });
+    let gas_price = provider
+        .get_gas_price()
+        .await
+        .mpp_http("failed to get gas price")?;
+    let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
+
+    let key_authorization = crate::client::tempo::signing::keychain::resolve_key_authorization(
+        provider,
+        signing_mode,
+        primitive_signer.address(),
+    )
+    .await?;
+    let fee_token = options
+        .descriptor
+        .token
+        .parse()
+        .mpp_config("invalid TIP-1034 descriptor token")?;
+    let valid_after = random_past_valid_after();
+    let mut transaction_options = TempoTxOptions {
+        calls,
+        chain_id: options.chain_id,
+        fee_token,
+        nonce,
+        nonce_key,
+        gas_limit: 2_000_000,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price,
+        fee_payer: options.fee_payer,
+        valid_before,
+        key_authorization,
+    };
+    if !options.fee_payer {
+        let request = session_estimation_request(
+            &transaction_options,
+            valid_after,
+            payer,
+            primitive_signer.address(),
+            signature_type,
+            matches!(
+                signing_mode,
+                crate::client::tempo::signing::TempoSigningMode::Keychain { .. }
+            ),
+        );
+        transaction_options.gas_limit = estimate_gas(provider, request).await?;
+    }
+    let mut unsigned_tx = build_tempo_tx(transaction_options);
+    unsigned_tx.valid_after = valid_after;
+    let tx_bytes = if options.fee_payer {
+        crate::client::tempo::signing::sign_and_encode_fee_payer_envelope_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
+    } else {
+        crate::client::tempo::signing::sign_and_encode_primitive_async(
+            unsigned_tx,
+            &primitive_signer,
+            signing_mode,
+        )
+        .await?
+    };
+    let channel_id =
+        compute_precompile_channel_id_from_descriptor(options.descriptor, options.chain_id)?;
+    Ok(create_precompile_top_up_payload(
+        channel_id,
+        options.descriptor.clone(),
+        alloy::hex::encode_prefixed(&tx_bytes),
+        options.additional_deposit,
+    ))
 }
 
 /// On-chain channel state returned by the escrow contract.
@@ -987,6 +1295,8 @@ pub async fn try_recover_channel<P: Provider<TempoNetwork>>(
             channel_id,
             salt: B256::ZERO,
             cumulative_amount: on_chain.settled,
+            deposit: on_chain.deposit,
+            descriptor: None,
             escrow_contract,
             chain_id,
             opened: true,
@@ -1033,10 +1343,10 @@ mod tests {
         // (crates/primitives/src/transaction/mod.rs L37-L45).
         use alloy::consensus::SignableTransaction;
         use alloy::primitives::keccak256;
-        use tempo_primitives::transaction::TempoTransaction;
+        use tempo_alloy::primitives::transaction::TempoTransaction;
 
         let payer = Address::repeat_byte(0xAA);
-        let calls = vec![tempo_primitives::transaction::Call {
+        let calls = vec![tempo_alloy::primitives::transaction::Call {
             to: TxKind::Call(Address::repeat_byte(0x11)),
             value: U256::ZERO,
             input: alloy::primitives::Bytes::new(),
@@ -1069,29 +1379,48 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_precompile_open_tx_nonce_fields_for_fee_payer() {
+    fn session_transactions_use_expiring_nonces_without_sponsorship() {
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let (nonce, nonce_key, valid_before) = precompile_open_tx_nonce_fields(true, 7);
+        let (nonce, nonce_key, valid_before) = session_transaction_nonce_fields();
 
         assert_eq!(nonce, 0);
         assert_eq!(nonce_key, U256::MAX);
-        let valid_before = valid_before.expect("fee payer open sets valid_before");
+        let valid_before = valid_before.expect("session transaction sets valid_before");
         assert!(valid_before >= before);
-        assert!(valid_before <= before + FEE_PAYER_VALID_BEFORE_SECS + 1);
+        assert!(valid_before <= before + EXPIRING_NONCE_VALID_BEFORE_SECS + 1);
     }
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_precompile_open_tx_nonce_fields_for_direct_payer() {
-        let (nonce, nonce_key, valid_before) = precompile_open_tx_nonce_fields(false, 7);
+    fn repeatable_top_ups_get_past_valid_after_entropy() {
+        let mut transaction = build_tempo_tx(TempoTxOptions {
+            calls: vec![],
+            chain_id: 4217,
+            fee_token: Address::repeat_byte(0x22),
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 100_000_000,
+            fee_payer: false,
+            valid_before: None,
+            key_authorization: None,
+        });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-        assert_eq!(nonce, 7);
-        assert_eq!(nonce_key, U256::ZERO);
-        assert!(valid_before.is_none());
+        transaction.valid_after = random_past_valid_after();
+        let valid_after = transaction
+            .valid_after
+            .expect("top-ups get transaction entropy");
+
+        assert!(valid_after.get() <= now.saturating_sub(60));
     }
 
     #[cfg(feature = "tempo")]
@@ -1108,6 +1437,7 @@ mod tests {
             .connect_http("http://localhost:1".parse().unwrap());
 
         let opts = OpenPrecompilePayloadOptions {
+            prefix_calls: Vec::new(),
             operator: Address::ZERO,
             authorized_signer: None,
             payee: Address::repeat_byte(0x11),
@@ -1123,12 +1453,61 @@ mod tests {
         assert!(matches!(err, MppError::InvalidConfig(_)));
     }
 
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn top_up_stops_when_preflight_reverts() {
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            signers::local::PrivateKeySigner,
+        };
+
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800");
+        asserter.push_failure_msg("execution reverted: insufficient balance");
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+        let signer = PrivateKeySigner::random();
+        let payer = signer.address();
+        let descriptor = ChannelDescriptor {
+            payer: payer.to_string(),
+            payee: Address::repeat_byte(0x11).to_string(),
+            operator: Address::ZERO.to_string(),
+            token: Address::repeat_byte(0x22).to_string(),
+            salt: B256::repeat_byte(0x33).to_string(),
+            authorized_signer: payer.to_string(),
+            expiring_nonce_hash: B256::repeat_byte(0x44).to_string(),
+        };
+
+        let error = create_precompile_top_up_transaction_payload(
+            &provider,
+            &signer,
+            None,
+            payer,
+            TopUpPrecompilePayloadOptions {
+                prefix_calls: vec![],
+                descriptor: &descriptor,
+                additional_deposit: 5_000_000,
+                chain_id: 4217,
+                fee_payer: false,
+            },
+        )
+        .await
+        .expect_err("a reverting top-up must fail before it is signed");
+
+        assert!(matches!(
+            error,
+            MppError::Tempo(crate::client::tempo::TempoClientError::InsufficientBalance { .. })
+        ));
+    }
+
     #[test]
     fn test_channel_entry_clone() {
         let entry = ChannelEntry {
             channel_id: B256::ZERO,
             salt: B256::ZERO,
             cumulative_amount: 1000,
+            deposit: 0,
+            descriptor: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -1218,6 +1597,59 @@ mod tests {
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
         assert_eq!(result, escrow_addr.parse::<Address>().unwrap());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn tip1034_challenge_without_escrow_uses_canonical_precompile() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": Address::repeat_byte(0x44).to_string(),
+                "methodDetails": { "sessionProtocol": "v2" }
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+        };
+
+        assert_eq!(
+            resolve_escrow(&challenge, 4217, None).unwrap(),
+            TIP20_CHANNEL_RESERVE_ADDRESS
+        );
+    }
+
+    #[test]
+    fn test_resolve_escrow_accepts_legacy_alias_hint() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+        let hinted = Address::repeat_byte(0x22);
+        let challenge = PaymentChallenge {
+            id: "test".to_string(),
+            realm: "test".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": Address::repeat_byte(0x44).to_string(),
+                "methodDetails": { "escrow": hinted.to_string() }
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+        };
+
+        assert_eq!(resolve_escrow(&challenge, 4217, None).unwrap(), hinted);
     }
 
     #[test]
@@ -1418,7 +1850,7 @@ mod tests {
             opaque: None,
         };
 
-        assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
+        assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
     }
 
     #[test]
@@ -1440,8 +1872,8 @@ mod tests {
             opaque: None,
         };
 
-        // Should fall back to MODERATO_CHAIN_ID on decode failure
-        assert_eq!(resolve_chain_id(&challenge), MODERATO_CHAIN_ID);
+        // Match MPPx's default Tempo client: mainnet when no chain is advertised.
+        assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
     }
 
     #[test]
@@ -1650,6 +2082,8 @@ mod tests {
             channel_id: B256::ZERO,
             salt: B256::ZERO,
             cumulative_amount: 0,
+            deposit: 0,
+            descriptor: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
@@ -1660,11 +2094,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_escrow_challenge_priority_order() {
+    fn test_resolve_escrow_override_priority_order() {
         use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
 
-        // Challenge has a valid escrow, override is also present.
-        // Challenge should take priority.
+        // Match MPPx: an explicit caller override wins over a challenge hint.
         let escrow_addr = "0x2222222222222222222222222222222222222222";
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
             .parse()
@@ -1691,9 +2124,8 @@ mod tests {
 
         let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();
         assert_eq!(
-            result,
-            escrow_addr.parse::<Address>().unwrap(),
-            "challenge escrow should take priority over override"
+            result, override_addr,
+            "override should take priority over challenge escrow"
         );
     }
 

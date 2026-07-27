@@ -39,7 +39,7 @@ mod fetch;
 mod middleware;
 
 pub use error::HttpError;
-pub use provider::{MultiProvider, PaymentProvider};
+pub use provider::{MultiProvider, PaymentContext, PaymentProvider};
 
 /// Default number of payment challenge retries after the initial 402 response.
 #[cfg(any(feature = "client", feature = "middleware"))]
@@ -64,7 +64,7 @@ pub use middleware::PaymentMiddleware;
 #[cfg(feature = "tempo")]
 pub use tempo::session::{channel_ops, TempoSessionProvider};
 #[cfg(feature = "tempo")]
-pub use tempo::{AutoswapConfig, TempoClientError, TempoProvider};
+pub use tempo::{AutoswapConfig, TempoAccountsProvider, TempoClientError, TempoProvider};
 #[cfg(feature = "tempo")]
 pub use tempo_alloy::TempoNetwork;
 
