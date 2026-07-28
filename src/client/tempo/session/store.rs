@@ -491,11 +491,29 @@ mod sqlite {
         add_column(connection, "entry_json", "TEXT")?;
         connection
             .execute_batch(
-                "UPDATE channels
+                "WITH ranked AS (
+                     SELECT channel_id,
+                            row_number() OVER (
+                                PARTITION BY origin, lower(payee), lower(token),
+                                             lower(escrow_contract), chain_id
+                                ORDER BY scope_key IS NOT NULL DESC,
+                                         state = 'active' DESC,
+                                         last_used_at DESC,
+                                         created_at DESC,
+                                         channel_id DESC
+                            ) AS scope_rank
+                     FROM channels
+                     WHERE origin <> '' AND session_protocol = 'v2'
+                         AND descriptor_json IS NOT NULL
+                 )
+                 UPDATE channels
                  SET scope_key = origin || char(10) || lower(payee) || ':' || lower(token) || ':' ||
                      lower(escrow_contract) || ':' || chain_id
                  WHERE scope_key IS NULL AND origin <> '' AND session_protocol = 'v2'
-                     AND descriptor_json IS NOT NULL;
+                     AND descriptor_json IS NOT NULL
+                     AND channel_id IN (
+                         SELECT channel_id FROM ranked WHERE scope_rank = 1
+                     );
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_scope_key
                      ON channels(scope_key) WHERE scope_key IS NOT NULL;
                  CREATE INDEX IF NOT EXISTS idx_channels_origin ON channels(origin);",
@@ -689,7 +707,7 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn sqlite_preserves_multiple_unscoped_recovered_sessions() {
+    async fn sqlite_migrates_only_one_of_multiple_sessions_for_the_same_scope() {
         let directory =
             std::env::temp_dir().join(format!("mpp-rs-recovered-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -726,7 +744,8 @@ mod tests {
                             cumulative_amount, challenge_echo, state, close_requested_at,
                             grace_ready_at, created_at, last_used_at, accepted_cumulative,
                             server_spent, session_protocol, descriptor_json
-                         ) VALUES (?1, 1, '', '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ) VALUES (?1, 1, 'https://api.example.com', 'https://api.example.com',
+                            ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                             '{}', 'active', 0, 0, 1, 1, '0', '0', 'v2', ?11)",
                         rusqlite::params![
                             format!("{channel_id:#x}"),
@@ -762,7 +781,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(scoped, 0);
+        assert_eq!(scoped, 1);
+        let total: i64 = connection
+            .query_row("SELECT COUNT(*) FROM channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 2);
         drop(connection);
         std::fs::remove_dir_all(directory).unwrap();
     }
