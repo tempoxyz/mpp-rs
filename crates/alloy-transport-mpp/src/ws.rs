@@ -208,6 +208,57 @@ enum TerminationReason {
     Fatal,
 }
 
+/// A credential whose server acknowledgement is still outstanding.
+///
+/// Dropping this guard releases transient provider state without rolling back
+/// durable state after an ambiguous socket failure.
+struct PendingPayment<P: PaymentProvider> {
+    provider: P,
+    challenge: PaymentChallenge,
+    credential: PaymentCredential,
+    settled: bool,
+}
+
+impl<P: PaymentProvider> PendingPayment<P> {
+    const fn new(provider: P, challenge: PaymentChallenge, credential: PaymentCredential) -> Self {
+        Self {
+            provider,
+            challenge,
+            credential,
+            settled: false,
+        }
+    }
+
+    const fn credential(&self) -> &PaymentCredential {
+        &self.credential
+    }
+
+    async fn commit(mut self) -> Result<(), MppError> {
+        self.provider
+            .commit_payment(&self.challenge, &self.credential)
+            .await?;
+        self.settled = true;
+        Ok(())
+    }
+
+    async fn rollback(mut self) -> Result<(), MppError> {
+        self.provider
+            .rollback_payment(&self.challenge, &self.credential)
+            .await?;
+        self.settled = true;
+        Ok(())
+    }
+}
+
+impl<P: PaymentProvider> Drop for PendingPayment<P> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.provider
+                .abandon_payment(&self.challenge, &self.credential);
+        }
+    }
+}
+
 /// Connection details for an MPP-over-WebSocket transport.
 ///
 /// `MppWsConnect` is a drop-in [`PubSubConnect`] that speaks the
@@ -468,8 +519,9 @@ async fn run_translator<P, V>(
 
     // Off-loop tasks: spawning `pay`/`next_voucher` keeps the keepalive arm
     // responsive while signing/broadcasting takes place.
-    let mut pending_pay: Option<JoinHandle<Result<PaymentCredential, MppError>>> = None;
+    let mut pending_pay: Option<JoinHandle<Result<PendingPayment<P>, MppError>>> = None;
     let mut pending_voucher: Option<JoinHandle<Result<PaymentCredential, MppError>>> = None;
+    let mut payment_awaiting_receipt: Option<PendingPayment<P>> = None;
     // Outbound RPCs queued while not safe to send (handshake/payment).
     // Polling `recv_from_frontend` unconditionally lets shutdown be observed
     // mid-payment.
@@ -509,13 +561,19 @@ async fn run_translator<P, V>(
             res = poll_join(&mut pending_pay), if pending_pay.is_some() => {
                 pending_pay = None;
                 match res {
-                    Ok(Ok(cred)) => {
-                        if let Err(reason) = send_credential(&mut socket, &cred, &events_tx, false).await {
+                    Ok(Ok(payment)) => {
+                        if let Err(reason) = send_credential(
+                            &mut socket,
+                            payment.credential(),
+                            &events_tx,
+                            false,
+                        ).await {
                             termination = Some(reason);
                             break;
                         }
                         handshake_complete = true;
                         credential_awaiting_receipt = true;
+                        payment_awaiting_receipt = Some(payment);
                     }
                     Ok(Err(err)) => {
                         error!(?err, "MPP payment provider failed");
@@ -611,6 +669,7 @@ async fn run_translator<P, V>(
                             &events_tx,
                             &mut pending_pay,
                             &mut pending_voucher,
+                            &mut payment_awaiting_receipt,
                             &mut credential_awaiting_receipt,
                         ).await {
                             Ok(()) => {
@@ -732,8 +791,9 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
     voucher_provider: &V,
     receipt_tx: &watch::Sender<Option<Receipt>>,
     events_tx: &broadcast::Sender<MppEvent>,
-    pending_pay: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
+    pending_pay: &mut Option<JoinHandle<Result<PendingPayment<P>, MppError>>>,
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
+    payment_awaiting_receipt: &mut Option<PendingPayment<P>>,
     credential_awaiting_receipt: &mut bool,
 ) -> Result<(), TerminationReason> {
     match msg {
@@ -747,6 +807,7 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
                 events_tx,
                 pending_pay,
                 pending_voucher,
+                payment_awaiting_receipt,
                 credential_awaiting_receipt,
             )
             .await
@@ -779,8 +840,9 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     voucher_provider: &V,
     receipt_tx: &watch::Sender<Option<Receipt>>,
     events_tx: &broadcast::Sender<MppEvent>,
-    pending_pay: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
+    pending_pay: &mut Option<JoinHandle<Result<PendingPayment<P>, MppError>>>,
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
+    payment_awaiting_receipt: &mut Option<PendingPayment<P>>,
     credential_awaiting_receipt: &mut bool,
 ) -> Result<(), TerminationReason> {
     let server_msg: WsServerMessage = match json_from_str(text) {
@@ -797,13 +859,25 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     match server_msg {
         WsServerMessage::Challenge { challenge, error } => {
             if pending_pay.is_some() {
-                error!("server issued a second challenge while a payment was in flight; closing");
+                error!("server issued a second challenge while a payment was in flight");
                 let _ = events_tx.send(MppEvent::Error(
-                    "server issued a second challenge while a payment was in flight; not \
-                     reconnecting"
+                    "server issued a second challenge while a payment was in flight; not reconnecting"
                         .to_string(),
                 ));
                 return Err(TerminationReason::Fatal);
+            }
+            // A fresh challenge supersedes an unacknowledged credential. The
+            // server has definitively declined to acknowledge it, so undo
+            // optimistic provider state before paying the replacement.
+            if let Some(payment) = payment_awaiting_receipt.take() {
+                if let Err(err) = payment.rollback().await {
+                    error!(%err, "failed to roll back superseded MPP payment");
+                    let _ = events_tx.send(MppEvent::Error(format!(
+                        "failed to roll back superseded MPP payment: {err}; not reconnecting"
+                    )));
+                    return Err(TerminationReason::Fatal);
+                }
+                *credential_awaiting_receipt = false;
             }
             if let Some(err) = error {
                 warn!(%err, "MPP challenge carried error message");
@@ -834,7 +908,10 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             // Spawn `pay()` so the main loop stays responsive (keepalive,
             // socket reads) while the provider signs/broadcasts.
             let provider = payment_provider.clone();
-            *pending_pay = Some(spawn(async move { provider.pay(&parsed).await }));
+            *pending_pay = Some(spawn(async move {
+                let credential = provider.pay(&parsed).await?;
+                Ok(PendingPayment::new(provider, parsed, credential))
+            }));
             Ok(())
         }
         WsServerMessage::Data { data } => {
@@ -894,12 +971,27 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                 }
             };
             debug!(?parsed, "MPP receipt received");
+            if let Some(payment) = payment_awaiting_receipt.take() {
+                if let Err(err) = payment.commit().await {
+                    error!(%err, "failed to commit accepted MPP payment");
+                    let _ = events_tx.send(MppEvent::Error(format!(
+                        "failed to commit accepted MPP payment: {err}; not reconnecting"
+                    )));
+                    return Err(TerminationReason::Fatal);
+                }
+            }
             let _ = receipt_tx.send(Some(parsed.clone()));
             let _ = events_tx.send(MppEvent::Receipt(parsed));
             *credential_awaiting_receipt = false;
             Ok(())
         }
         WsServerMessage::Error { error } => {
+            if let Some(payment) = payment_awaiting_receipt.take() {
+                if let Err(err) = payment.rollback().await {
+                    error!(%err, "failed to roll back rejected MPP payment");
+                }
+            }
+            *credential_awaiting_receipt = false;
             error!(%error, "MPP error frame");
             let _ = events_tx.send(MppEvent::Error(error));
             Err(TerminationReason::Fatal)
