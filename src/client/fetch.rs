@@ -393,7 +393,7 @@ impl PaymentExt for RequestBuilder {
             resp = match retry.send().await {
                 Ok(resp) => resp,
                 Err(err) => {
-                    let http_err = HttpError::Request(err);
+                    let http_err = HttpError::request(err);
                     events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),

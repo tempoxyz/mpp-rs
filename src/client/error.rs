@@ -66,8 +66,18 @@ impl From<MppError> for HttpError {
 }
 
 #[cfg(feature = "client")]
+impl HttpError {
+    pub(crate) fn request(error: reqwest::Error) -> Self {
+        // Request URLs commonly carry API keys in query parameters. Reqwest
+        // includes the complete URL in its Display and source chain, so remove
+        // it before the error can reach logs, reports, or client event hooks.
+        Self::Request(error.without_url())
+    }
+}
+
+#[cfg(feature = "client")]
 impl From<reqwest::Error> for HttpError {
     fn from(e: reqwest::Error) -> Self {
-        Self::Request(e)
+        Self::request(e)
     }
 }
