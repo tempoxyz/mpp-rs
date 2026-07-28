@@ -10,8 +10,6 @@ mod error;
 mod provider;
 pub mod session;
 pub mod signing;
-#[cfg(feature = "sqlite")]
-pub mod wallet;
 
 pub use accounts_provider::TempoAccountsProvider;
 pub use autoswap::AutoswapConfig;

@@ -135,6 +135,15 @@ pub trait PaymentProvider: Clone + Send + Sync {
         async { Ok(()) }
     }
 
+    /// Release transient delivery state when a paid request future is dropped.
+    ///
+    /// This hook is synchronous because cancellation is observed from `Drop`.
+    /// Providers must preserve any durable or ambiguously delivered payment
+    /// state; this is only for resources such as delivery-ordering leases.
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        let _ = (challenge, credential);
+    }
+
     /// Build an `Accept-Payment` header value from this provider's supported methods.
     ///
     /// Returns `None` if the provider does not advertise specific methods.
@@ -163,6 +172,54 @@ pub(crate) async fn rollback_payments<P: PaymentProvider>(
         provider.rollback_payment(challenge, credential).await?;
     }
     Ok(())
+}
+
+pub(crate) struct PendingPayments<P: PaymentProvider> {
+    provider: P,
+    payments: Vec<(PaymentChallenge, PaymentCredential)>,
+}
+
+impl<P: PaymentProvider> PendingPayments<P> {
+    pub(crate) fn new(provider: P) -> Self {
+        Self {
+            provider,
+            payments: Vec::new(),
+        }
+    }
+
+    pub(crate) async fn commit(&mut self) -> Result<(), MppError> {
+        commit_payments(&self.provider, &self.payments).await?;
+        self.payments.clear();
+        Ok(())
+    }
+
+    pub(crate) async fn rollback(&mut self) -> Result<(), MppError> {
+        rollback_payments(&self.provider, &self.payments).await?;
+        self.payments.clear();
+        Ok(())
+    }
+}
+
+impl<P: PaymentProvider> std::ops::Deref for PendingPayments<P> {
+    type Target = Vec<(PaymentChallenge, PaymentCredential)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payments
+    }
+}
+
+impl<P: PaymentProvider> std::ops::DerefMut for PendingPayments<P> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.payments
+    }
+}
+
+impl<P: PaymentProvider> Drop for PendingPayments<P> {
+    fn drop(&mut self) {
+        for (challenge, credential) in &self.payments {
+            self.provider.abandon_payment(challenge, credential);
+        }
+    }
 }
 
 /// A provider that wraps multiple payment providers and picks the right one.
@@ -323,6 +380,18 @@ impl PaymentProvider for MultiProvider {
         )))
     }
 
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                provider.dyn_abandon_payment(challenge, credential);
+                return;
+            }
+        }
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let headers: Vec<String> = self
             .providers
@@ -365,6 +434,7 @@ trait DynPaymentProvider: Send + Sync {
         challenge: &'a PaymentChallenge,
         credential: &'a PaymentCredential,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
+    fn dyn_abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential);
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -418,6 +488,10 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         Box::pin(PaymentProvider::rollback_payment(
             self, challenge, credential,
         ))
+    }
+
+    fn dyn_abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        PaymentProvider::abandon_payment(self, challenge, credential);
     }
 
     fn dyn_accept_payment_header(&self) -> Option<String> {

@@ -67,9 +67,22 @@ pub enum ChannelStoreError {
 /// Result returned by payer channel stores.
 pub type ChannelStoreResult<T> = std::result::Result<T, ChannelStoreError>;
 
+/// Exclusive payment-scope lease held until a credential is committed or rolled back.
+pub trait ChannelStoreLease: Send {}
+
+impl ChannelStoreLease for () {}
+
 /// Store of reusable payer session channels keyed by payment scope.
 #[async_trait::async_trait]
 pub trait ChannelStore: Send + Sync {
+    /// Serialize credential creation and delivery for one payment scope.
+    ///
+    /// Stores shared by multiple processes should override this with a
+    /// cross-process lease. Cumulative vouchers must reach the server in the
+    /// same order they are allocated.
+    async fn acquire(&self, _key: &str) -> ChannelStoreResult<Box<dyn ChannelStoreLease>> {
+        Ok(Box::new(()))
+    }
     /// Return the channel cached for `key`, when present.
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>>;
     /// Insert or replace a channel entry.
@@ -165,12 +178,14 @@ impl TryFrom<JsonChannelEntry> for StoredChannelEntry {
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use std::{
-        fs,
+        fs::{self, File, OpenOptions},
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use fs2::FileExt;
     use rusqlite::{params, Connection, OptionalExtension};
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
@@ -195,6 +210,12 @@ mod sqlite {
         path: PathBuf,
         request_url: String,
     }
+
+    struct SqliteChannelStoreLease {
+        _file: File,
+    }
+
+    impl ChannelStoreLease for SqliteChannelStoreLease {}
 
     impl std::fmt::Debug for SqliteChannelStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,6 +244,7 @@ mod sqlite {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(io_error)?;
             }
+            let _schema_lease = lock_file(&database_lock_path(&path))?;
             let connection = Connection::open(&path).map_err(io_error)?;
             connection
                 .execute_batch(
@@ -292,10 +314,32 @@ mod sqlite {
         fn scoped_key(&self, key: &str) -> String {
             format!("{}\n{}", self.namespace, key)
         }
+
+        fn payment_lock_path(&self, key: &str) -> PathBuf {
+            let digest = Sha256::digest(self.scoped_key(key).as_bytes());
+            let name = self
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("channels.db");
+            self.path
+                .with_file_name(format!("{name}.{}.lock", alloy::hex::encode(digest)))
+        }
     }
 
     #[async_trait::async_trait]
     impl ChannelStore for SqliteChannelStore {
+        async fn acquire(&self, key: &str) -> ChannelStoreResult<Box<dyn ChannelStoreLease>> {
+            let path = self.payment_lock_path(key);
+            tokio::task::spawn_blocking(move || {
+                lock_file(&path).map(|file| {
+                    Box::new(SqliteChannelStoreLease { _file: file }) as Box<dyn ChannelStoreLease>
+                })
+            })
+            .await
+            .map_err(io_error)?
+        }
+
         async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
             let connection = self.connection.lock().unwrap();
             let row = connection
@@ -455,6 +499,27 @@ mod sqlite {
         }
     }
 
+    fn database_lock_path(path: &Path) -> PathBuf {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("channels.db");
+        path.with_file_name(format!("{name}.lock"))
+    }
+
+    fn lock_file(path: &Path) -> ChannelStoreResult<File> {
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path).map_err(io_error)?;
+        file.lock_exclusive().map_err(io_error)?;
+        Ok(file)
+    }
+
     fn ensure_schema(connection: &Connection) -> ChannelStoreResult<()> {
         connection
             .execute_batch(
@@ -491,11 +556,29 @@ mod sqlite {
         add_column(connection, "entry_json", "TEXT")?;
         connection
             .execute_batch(
-                "UPDATE channels
+                "WITH ranked AS (
+                     SELECT channel_id,
+                            row_number() OVER (
+                                PARTITION BY origin, lower(payee), lower(token),
+                                             lower(escrow_contract), chain_id
+                                ORDER BY scope_key IS NOT NULL DESC,
+                                         state = 'active' DESC,
+                                         last_used_at DESC,
+                                         created_at DESC,
+                                         channel_id DESC
+                            ) AS scope_rank
+                     FROM channels
+                     WHERE origin <> '' AND session_protocol = 'v2'
+                         AND descriptor_json IS NOT NULL
+                 )
+                 UPDATE channels
                  SET scope_key = origin || char(10) || lower(payee) || ':' || lower(token) || ':' ||
                      lower(escrow_contract) || ':' || chain_id
                  WHERE scope_key IS NULL AND origin <> '' AND session_protocol = 'v2'
-                     AND descriptor_json IS NOT NULL;
+                     AND descriptor_json IS NOT NULL
+                     AND channel_id IN (
+                         SELECT channel_id FROM ranked WHERE scope_rank = 1
+                     );
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_scope_key
                      ON channels(scope_key) WHERE scope_key IS NOT NULL;
                  CREATE INDEX IF NOT EXISTS idx_channels_origin ON channels(origin);",
@@ -620,6 +703,40 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn sqlite_lease_serializes_delivery_across_store_instances() {
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-store-lock-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("channels.db");
+        let options = SqliteChannelStoreOptions {
+            namespace: "https://api.example.com".into(),
+            path: Some(path),
+            request_url: None,
+        };
+        let first = SqliteChannelStore::open(options.clone()).unwrap();
+        let second = SqliteChannelStore::open(options).unwrap();
+        let first_lease = first.acquire("scope").await.unwrap();
+        let mut waiter = tokio::spawn(async move { second.acquire("scope").await });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+                .await
+                .is_err(),
+            "the second store must wait for the first delivery lease"
+        );
+        drop(first_lease);
+
+        let second_lease = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            waiter.await.unwrap().unwrap()
+        })
+        .await
+        .expect("the second lease should be released");
+        drop(second_lease);
+        drop(first);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn sqlite_migrates_wallet_cli_v2_row_into_mppx_scope() {
         let directory =
             std::env::temp_dir().join(format!("mpp-rs-wallet-store-{}", uuid::Uuid::new_v4()));
@@ -689,7 +806,7 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn sqlite_preserves_multiple_unscoped_recovered_sessions() {
+    async fn sqlite_migrates_only_one_of_multiple_sessions_for_the_same_scope() {
         let directory =
             std::env::temp_dir().join(format!("mpp-rs-recovered-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -726,7 +843,8 @@ mod tests {
                             cumulative_amount, challenge_echo, state, close_requested_at,
                             grace_ready_at, created_at, last_used_at, accepted_cumulative,
                             server_spent, session_protocol, descriptor_json
-                         ) VALUES (?1, 1, '', '', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ) VALUES (?1, 1, 'https://api.example.com', 'https://api.example.com',
+                            ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                             '{}', 'active', 0, 0, 1, 1, '0', '0', 'v2', ?11)",
                         rusqlite::params![
                             format!("{channel_id:#x}"),
@@ -762,7 +880,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(scoped, 0);
+        assert_eq!(scoped, 1);
+        let total: i64 = connection
+            .query_row("SELECT COUNT(*) FROM channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 2);
         drop(connection);
         std::fs::remove_dir_all(directory).unwrap();
     }

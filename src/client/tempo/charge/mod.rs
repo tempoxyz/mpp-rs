@@ -295,10 +295,7 @@ impl TempoCharge {
         signer: &TempoPrimitiveSigner,
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        let signature_type = match signer {
-            TempoPrimitiveSigner::Secp256k1(_) => SignatureType::Secp256k1,
-            TempoPrimitiveSigner::P256(_) => SignatureType::P256,
-        };
+        let signature_type = signer.signature_type();
         self.prepare(
             alloy::signers::Signer::address(signer),
             signature_type,
@@ -315,10 +312,7 @@ impl TempoCharge {
         provider: &impl Provider<tempo_alloy::TempoNetwork>,
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        let signature_type = match signer {
-            TempoPrimitiveSigner::Secp256k1(_) => SignatureType::Secp256k1,
-            TempoPrimitiveSigner::P256(_) => SignatureType::P256,
-        };
+        let signature_type = signer.signature_type();
         self.prepare_with_provider(
             alloy::signers::Signer::address(signer),
             signature_type,

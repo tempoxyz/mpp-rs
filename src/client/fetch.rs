@@ -11,15 +11,13 @@ use super::events::{
     ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use super::provider::{commit_payments, rollback_payments, PaymentContext, PaymentProvider};
+use super::provider::{PaymentContext, PaymentProvider, PendingPayments};
 use super::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
 };
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
-use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, PaymentChallenge, PaymentCredential,
-};
+use crate::protocol::core::{format_authorization, parse_www_authenticate_all};
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -201,7 +199,8 @@ impl PaymentExt for RequestBuilder {
         let ranking_accept = caller_accept.or(provider_accept);
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
-        let mut pending_payments: Vec<(PaymentChallenge, PaymentCredential)> = Vec::new();
+        let mut pending_payments = PendingPayments::new(provider.clone());
+        let mut retried_stale_session = false;
         let mut resp = this.send().await?;
 
         for attempt in 0..max_payment_retries {
@@ -224,7 +223,8 @@ impl PaymentExt for RequestBuilder {
                         reason: None,
                     }))
                     .await;
-                rollback_payments(provider, &pending_payments)
+                pending_payments
+                    .rollback()
                     .await
                     .map_err(HttpError::Payment)?;
                 return Err(HttpError::MissingChallenge);
@@ -252,7 +252,8 @@ impl PaymentExt for RequestBuilder {
                             reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
-                    rollback_payments(provider, &pending_payments)
+                    pending_payments
+                        .rollback()
                         .await
                         .map_err(HttpError::Payment)?;
                     return Err(err);
@@ -266,7 +267,8 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
-                    rollback_payments(provider, &pending_payments)
+                    pending_payments
+                        .rollback()
                         .await
                         .map_err(HttpError::Payment)?;
                     return Err(err);
@@ -281,7 +283,8 @@ impl PaymentExt for RequestBuilder {
                         reason: None,
                     }))
                     .await;
-                rollback_payments(provider, &pending_payments)
+                pending_payments
+                    .rollback()
                     .await
                     .map_err(HttpError::Payment)?;
                 return Ok(resp);
@@ -298,7 +301,8 @@ impl PaymentExt for RequestBuilder {
                 Some(credential) => credential,
                 None => {
                     let Some(url) = url.clone() else {
-                        rollback_payments(provider, &pending_payments)
+                        pending_payments
+                            .rollback()
                             .await
                             .map_err(HttpError::Payment)?;
                         return Err(HttpError::CloneFailed);
@@ -326,7 +330,8 @@ impl PaymentExt for RequestBuilder {
                                     reason: None,
                                 }))
                                 .await;
-                            rollback_payments(provider, &pending_payments)
+                            pending_payments
+                                .rollback()
                                 .await
                                 .map_err(HttpError::Payment)?;
                             return Err(http_err);
@@ -355,7 +360,8 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
-                    rollback_payments(provider, &pending_payments)
+                    pending_payments
+                        .rollback()
                         .await
                         .map_err(HttpError::Payment)?;
                     return Err(http_err);
@@ -373,7 +379,8 @@ impl PaymentExt for RequestBuilder {
                             reason: None,
                         }))
                         .await;
-                    rollback_payments(provider, &pending_payments)
+                    pending_payments
+                        .rollback()
                         .await
                         .map_err(HttpError::Payment)?;
                     return Err(http_err);
@@ -384,7 +391,8 @@ impl PaymentExt for RequestBuilder {
             let retry = match retry_builder.try_clone() {
                 Some(retry) => retry.headers(payment_headers),
                 None => {
-                    rollback_payments(provider, &pending_payments)
+                    pending_payments
+                        .rollback()
                         .await
                         .map_err(HttpError::Payment)?;
                     return Err(HttpError::CloneFailed);
@@ -403,7 +411,12 @@ impl PaymentExt for RequestBuilder {
                         .await;
                     // The request may have reached the server even though its
                     // response was lost. Preserve optimistic provider state
-                    // until a later challenge can reconcile it.
+                    // until a later challenge can reconcile it, while
+                    // releasing any delivery lease held by the provider.
+                    pending_payments
+                        .commit()
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             };
@@ -417,10 +430,34 @@ impl PaymentExt for RequestBuilder {
                         status,
                     }))
                     .await;
-                commit_payments(provider, &pending_payments)
+                pending_payments
+                    .commit()
                     .await
                     .map_err(HttpError::Payment)?;
                 return Ok(resp);
+            }
+
+            // A durable session may outlive the server-side channel record.
+            // Invalidate that local channel and retry the original unpaid
+            // request once through the normal 402 flow so a fresh channel can
+            // be opened without surfacing a recoverable 410 to the caller.
+            if !retried_stale_session
+                && status == StatusCode::GONE
+                && challenge.intent.as_str() == "session"
+            {
+                retried_stale_session = true;
+                pending_payments
+                    .rollback()
+                    .await
+                    .map_err(HttpError::Payment)?;
+                paid_challenge_ids.clear();
+                resp = retry_builder
+                    .try_clone()
+                    .ok_or(HttpError::CloneFailed)?
+                    .send()
+                    .await
+                    .map_err(HttpError::request)?;
+                continue;
             }
 
             // A completed HTTP response is the application's answer, not a
@@ -428,15 +465,29 @@ impl PaymentExt for RequestBuilder {
             // and the final 402 without emitting `payment.failed`.
             if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == max_payment_retries {
                 if resp.headers().contains_key("payment-receipt") {
-                    commit_payments(provider, &pending_payments)
+                    pending_payments
+                        .commit()
                         .await
                         .map_err(HttpError::Payment)?;
                 } else {
-                    rollback_payments(provider, &pending_payments)
+                    pending_payments
+                        .rollback()
                         .await
                         .map_err(HttpError::Payment)?;
                 }
                 return Ok(resp);
+            }
+
+            if resp.headers().contains_key("payment-receipt") {
+                pending_payments
+                    .commit()
+                    .await
+                    .map_err(HttpError::Payment)?;
+            } else {
+                pending_payments
+                    .rollback()
+                    .await
+                    .map_err(HttpError::Payment)?;
             }
         }
 
@@ -472,6 +523,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
+        use tokio::sync::Notify;
 
         /// Mock provider that records calls and returns a fixed credential.
         #[derive(Clone)]
@@ -479,6 +531,7 @@ mod tests {
             pay_count: Arc<AtomicU32>,
             commit_count: Arc<AtomicU32>,
             rollback_count: Arc<AtomicU32>,
+            abandon_count: Arc<AtomicU32>,
             challenge_ids: Arc<Mutex<Vec<String>>>,
             fail: bool,
         }
@@ -489,6 +542,7 @@ mod tests {
                     pay_count: Arc::new(AtomicU32::new(0)),
                     commit_count: Arc::new(AtomicU32::new(0)),
                     rollback_count: Arc::new(AtomicU32::new(0)),
+                    abandon_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: false,
                 }
@@ -499,6 +553,7 @@ mod tests {
                     pay_count: Arc::new(AtomicU32::new(0)),
                     commit_count: Arc::new(AtomicU32::new(0)),
                     rollback_count: Arc::new(AtomicU32::new(0)),
+                    abandon_count: Arc::new(AtomicU32::new(0)),
                     challenge_ids: Arc::new(Mutex::new(Vec::new())),
                     fail: true,
                 }
@@ -518,6 +573,10 @@ mod tests {
 
             fn rollback_count(&self) -> u32 {
                 self.rollback_count.load(Ordering::SeqCst)
+            }
+
+            fn abandon_count(&self) -> u32 {
+                self.abandon_count.load(Ordering::SeqCst)
             }
         }
 
@@ -561,6 +620,14 @@ mod tests {
             ) -> Result<(), MppError> {
                 self.rollback_count.fetch_add(1, Ordering::SeqCst);
                 Ok(())
+            }
+
+            fn abandon_payment(
+                &self,
+                _challenge: &PaymentChallenge,
+                _credential: &PaymentCredential,
+            ) {
+                self.abandon_count.fetch_add(1, Ordering::SeqCst);
             }
         }
 
@@ -628,6 +695,50 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
             assert_eq!(call_count.load(Ordering::SeqCst), 2); // initial 402 + retry
+        }
+
+        #[tokio::test]
+        async fn dropped_paid_request_abandons_transient_provider_state() {
+            let (_, www_auth) = test_challenge();
+            let retry_started = Arc::new(Notify::new());
+            let handler_notify = retry_started.clone();
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    let handler_notify = handler_notify.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            handler_notify.notify_one();
+                            std::future::pending::<axum::response::Response>().await
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "payment required",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            let url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let task_provider = provider.clone();
+            let task = tokio::spawn(async move {
+                reqwest::Client::new()
+                    .get(format!("{url}/paid"))
+                    .send_with_payment(&task_provider)
+                    .await
+            });
+
+            retry_started.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(provider.commit_count(), 0);
+            assert_eq!(provider.rollback_count(), 0);
+            assert_eq!(provider.abandon_count(), 1);
         }
 
         #[tokio::test]
@@ -1191,6 +1302,50 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(err, HttpError::Payment(_)));
+        }
+
+        #[tokio::test]
+        async fn stale_session_channel_is_invalidated_and_reopened_once() {
+            let www_auth = challenge_header("session-1", "tempo", "session");
+            let requests = Arc::new(AtomicU32::new(0));
+            let app = Router::new().route(
+                "/paid",
+                get({
+                    let requests = requests.clone();
+                    move |request: axum::http::Request<axum::body::Body>| {
+                        let www_auth = www_auth.clone();
+                        let requests = requests.clone();
+                        async move {
+                            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                            let paid = request.headers().contains_key("authorization");
+                            match (attempt, paid) {
+                                (0 | 2, false) => (
+                                    AxumStatusCode::PAYMENT_REQUIRED,
+                                    [(WWW_AUTH_NAME, www_auth)],
+                                )
+                                    .into_response(),
+                                (1, true) => AxumStatusCode::GONE.into_response(),
+                                (3, true) => AxumStatusCode::OK.into_response(),
+                                _ => AxumStatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                            }
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let response = reqwest::Client::new()
+                .get(format!("{base_url}/paid"))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(requests.load(Ordering::SeqCst), 4);
+            assert_eq!(provider.call_count(), 2);
+            assert_eq!(provider.rollback_count(), 1);
+            assert_eq!(provider.commit_count(), 1);
         }
 
         #[tokio::test]

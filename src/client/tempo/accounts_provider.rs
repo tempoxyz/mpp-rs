@@ -10,9 +10,14 @@ use tempo_alloy::accounts::{
     TempoAccountsError, TempoAccountsWallet, TempoAuthorizationReservation,
 };
 
-use super::{autoswap::AutoswapConfig, charge::SignOptions};
+use super::{
+    autoswap::AutoswapConfig,
+    charge::SignOptions,
+    session::{store::ChannelStore, TempoSessionProvider},
+    signing::{KeychainVersion, TempoSigningMode},
+};
 use crate::{
-    client::PaymentProvider,
+    client::{PaymentContext, PaymentProvider},
     error::{MppError, ResultExt},
     protocol::core::{PaymentChallenge, PaymentCredential},
     protocol::methods::tempo::network::TempoNetwork as TempoChain,
@@ -31,6 +36,16 @@ pub struct TempoAccountsProvider {
     autoswap: Option<AutoswapConfig>,
     expected_chain_id: Option<u64>,
     pending_authorizations: Arc<Mutex<HashMap<String, TempoAuthorizationReservation>>>,
+    session: Option<AccountsSession>,
+}
+
+#[derive(Clone)]
+struct AccountsSession {
+    store: Arc<dyn ChannelStore>,
+    provider: Arc<Mutex<Option<TempoSessionProvider>>>,
+    default_deposit: Option<u128>,
+    top_up_amount: Option<u128>,
+    max_deposit: Option<u128>,
 }
 
 impl TempoAccountsProvider {
@@ -46,6 +61,7 @@ impl TempoAccountsProvider {
             autoswap: None,
             expected_chain_id: None,
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
+            session: None,
         }
     }
 
@@ -109,6 +125,103 @@ impl TempoAccountsProvider {
     /// Get the explicit settlement RPC override, if configured.
     pub const fn rpc_url(&self) -> Option<&reqwest::Url> {
         self.rpc_url.as_ref()
+    }
+
+    /// Build a matching session provider from the same Accounts wallet.
+    ///
+    /// The returned provider uses the exact access key selected for the pinned
+    /// chain and delegates durable channel persistence to `channel_store`.
+    pub fn session_provider(
+        &self,
+        channel_store: Arc<dyn ChannelStore>,
+    ) -> Result<TempoSessionProvider, MppError> {
+        let chain_id = self.expected_chain_id.ok_or_else(|| {
+            MppError::InvalidConfig(
+                "Tempo Accounts session provider requires an expected chain ID".to_owned(),
+            )
+        })?;
+        let key = self
+            .wallet
+            .clone()
+            .with_chain_id(chain_id)
+            .active_access_key()
+            .mpp_config("failed to select a Tempo Accounts session key")?;
+        let account = key.account();
+        let access_key = key.address();
+        let key_authorization = key.key_authorization().cloned().map(Box::new);
+        let rpc_url = self.settlement_rpc_url(chain_id)?;
+        let mut provider = TempoSessionProvider::new(key, rpc_url.as_str())?
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: account,
+                key_authorization,
+                version: KeychainVersion::V2,
+            })
+            .with_authorized_signer(access_key)
+            .with_channel_store(channel_store);
+        if let Some(config) = &self.autoswap {
+            provider = provider.with_autoswap(config.clone());
+        }
+        Ok(provider)
+    }
+
+    /// Enable durable payment sessions alongside one-time charges.
+    pub fn with_session_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
+        self.session = Some(AccountsSession {
+            store,
+            provider: Arc::new(Mutex::new(None)),
+            default_deposit: None,
+            top_up_amount: None,
+            max_deposit: None,
+        });
+        self
+    }
+
+    /// Set the deposit used when a session challenge does not suggest one.
+    pub fn with_session_default_deposit(mut self, amount: u128) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.default_deposit = Some(amount);
+        }
+        self
+    }
+
+    /// Set the preferred automatic session top-up size in atomic units.
+    pub fn with_session_top_up_amount(mut self, amount: u128) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.top_up_amount = Some(amount);
+        }
+        self
+    }
+
+    /// Cap the deposit that an automatic session may reserve.
+    pub fn with_session_max_deposit(mut self, amount: u128) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.max_deposit = Some(amount);
+        }
+        self
+    }
+
+    fn configured_session_provider(&self) -> Result<TempoSessionProvider, MppError> {
+        let session = self.session.as_ref().ok_or_else(|| {
+            MppError::UnsupportedPaymentMethod("tempo.session is not configured".to_owned())
+        })?;
+        let mut cached = session.provider.lock().map_err(|_| {
+            MppError::InvalidConfig("Tempo Accounts session state is unavailable".to_owned())
+        })?;
+        if let Some(provider) = cached.as_ref() {
+            return Ok(provider.clone());
+        }
+        let mut provider = self.session_provider(session.store.clone())?;
+        if let Some(amount) = session.default_deposit {
+            provider = provider.with_default_deposit(amount);
+        }
+        if let Some(amount) = session.top_up_amount {
+            provider = provider.with_top_up_amount(amount);
+        }
+        if let Some(amount) = session.max_deposit {
+            provider = provider.with_max_deposit(amount);
+        }
+        *cached = Some(provider.clone());
+        Ok(provider)
     }
 
     /// Return whether the Accounts store has a locally signable key covering
@@ -212,10 +325,15 @@ impl TempoAccountsProvider {
 impl PaymentProvider for TempoAccountsProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
         method == crate::protocol::methods::tempo::METHOD_NAME
-            && intent == crate::protocol::methods::tempo::INTENT_CHARGE
+            && (intent == crate::protocol::methods::tempo::INTENT_CHARGE
+                || (intent == crate::protocol::methods::tempo::INTENT_SESSION
+                    && self.session.is_some()))
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            return self.configured_session_provider()?.pay(challenge).await;
+        }
         let from = self
             .wallet
             .active_account()
@@ -252,11 +370,31 @@ impl PaymentProvider for TempoAccountsProvider {
         Ok(credential)
     }
 
+    async fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<PaymentCredential, MppError> {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            return self
+                .configured_session_provider()?
+                .pay_with_context(challenge, context)
+                .await;
+        }
+        self.pay(challenge).await
+    }
+
     async fn commit_payment(
         &self,
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            return self
+                .configured_session_provider()?
+                .commit_payment(challenge, credential)
+                .await;
+        }
         let _ = self.take_authorization(challenge, credential)?;
         Ok(())
     }
@@ -266,12 +404,32 @@ impl PaymentProvider for TempoAccountsProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            return self
+                .configured_session_provider()?
+                .rollback_payment(challenge, credential)
+                .await;
+        }
         if let Some(reservation) = self.take_authorization(challenge, credential)? {
             self.wallet
                 .release_authorization(reservation)
                 .mpp_config("failed to release Tempo key authorization")?;
         }
         Ok(())
+    }
+
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        if challenge.intent.as_str() == "session" {
+            if let Ok(provider) = self.configured_session_provider() {
+                provider.abandon_payment(challenge, credential);
+            }
+        }
+    }
+
+    fn accept_payment_header(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .map(|_| "tempo/session, tempo/charge;q=0.5".to_owned())
     }
 }
 
@@ -287,7 +445,7 @@ mod tests {
         network::NetworkWallet,
         primitives::{Address, Signature},
         rpc::types::TransactionRequest,
-        signers::local::PrivateKeySigner,
+        signers::{local::PrivateKeySigner, Signer},
         sol_types::SolCall,
     };
     use tempo_alloy::primitives::{
@@ -336,6 +494,39 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
         let provider = TempoAccountsProvider::from_store(&path).unwrap();
         (provider, path, account)
+    }
+
+    #[test]
+    fn builds_session_provider_from_the_same_accounts_key() {
+        let (provider, path, _) = provider();
+        let swap_token = Address::repeat_byte(0x33);
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_autoswap(AutoswapConfig::new(swap_token, 100));
+        let expected_key = provider.wallet().active_access_key().unwrap().address();
+        let provider = provider
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ))
+            .with_session_default_deposit(20_000)
+            .with_session_top_up_amount(20_000)
+            .with_session_max_deposit(1_000_000);
+        assert_eq!(
+            provider.session.as_ref().unwrap().top_up_amount,
+            Some(20_000)
+        );
+        let session = provider.configured_session_provider().unwrap();
+
+        assert!(provider.supports("tempo", "charge"));
+        assert!(provider.supports("tempo", "session"));
+        assert_eq!(
+            provider.accept_payment_header().as_deref(),
+            Some("tempo/session, tempo/charge;q=0.5")
+        );
+        assert!(session.supports("tempo", "session"));
+        assert_eq!(session.signer().address(), expected_key);
+        assert_eq!(session.autoswap().unwrap().token_in, swap_token);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn challenge(amount: &str, fee_payer: bool) -> PaymentChallenge {
