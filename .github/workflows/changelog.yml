@@ -14,17 +14,20 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
       - name: Remove repo-local Claude settings
         run: rm -rf .claude/
-      - name: Check changelog
-        uses: tempoxyz/changelogs/check@a160c1637ff9cf1529cddedd17cca47a276423e8 # changelogs@0.6.3
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          ai: "npx -y @anthropic-ai/claude-code@2.1.96 --bare -p"
+          node-version: 22
+      - name: Check changelog
+        uses: tempoxyz/changelogs/check@bd50cca508d81505924dfa3997b1696ac2b7b1aa # v0.9.0
+        with:
+          ai: "npx -y @anthropic-ai/claude-code@2.1.220 --bare -p"
           ecosystem: rust
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
