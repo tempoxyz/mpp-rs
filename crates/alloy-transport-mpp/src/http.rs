@@ -4,7 +4,7 @@ use std::{fmt, sync::Arc, task};
 
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
-use mpp::client::{Fetch, PaymentProvider};
+use mpp::client::{Fetch, HttpError, PaymentProvider};
 use reqwest::Url;
 use tokio::sync::Semaphore;
 use tower_service::Service;
@@ -96,6 +96,7 @@ where
         };
         let body = serde_json::to_vec(&packet).map_err(TransportErrorKind::custom)?;
         let headers = packet.headers();
+        let origin = redact_url(&self.url);
         let response = self
             .client
             .post(self.url)
@@ -104,9 +105,17 @@ where
             .body(body)
             .send_with_payment(&self.provider)
             .await
-            .map_err(TransportErrorKind::custom)?;
+            .map_err(|source| TransportErrorKind::custom(MppHttpRequestError { origin, source }))?;
         decode_response(response).await
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("MPP HTTP request to {origin} failed")]
+struct MppHttpRequestError {
+    origin: String,
+    #[source]
+    source: HttpError,
 }
 
 impl<P> Service<RequestPacket> for MppHttpTransport<P>
@@ -440,6 +449,31 @@ mod tests {
         assert!(!error.contains("secret"));
 
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn request_errors_redact_url_credentials_and_query() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let url = format!("http://user:password@{address}/rpc?api_key=query-secret")
+            .parse()
+            .unwrap();
+        let mut transport = MppHttpTransport::new(client(), url, MockProvider::default());
+
+        let error = transport.call(request()).await.unwrap_err();
+        let report = format!("{error}\n{error:?}");
+        assert!(!report.contains("password"), "password leaked: {report}");
+        assert!(
+            !report.contains("query-secret"),
+            "query secret leaked: {report}"
+        );
+        assert!(!report.contains("api_key"), "query key leaked: {report}");
+        assert!(
+            report.contains(&format!("http://{address}/rpc")),
+            "missing safe origin: {report}"
+        );
     }
 
     #[tokio::test]
