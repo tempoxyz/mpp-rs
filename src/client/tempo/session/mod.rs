@@ -384,34 +384,40 @@ impl TempoSessionProvider {
             return Ok(());
         };
         let _guard = self.payment_lock.lock().await;
-        let pending = {
+        let pending_store_key = {
             let mut pending_opens = self.pending_opens.lock().unwrap();
-            let Some(pending) = pending_opens.get(&channel_id) else {
-                return Ok(());
-            };
-            if pending.challenge_id != challenge.id {
-                return Ok(());
+            match pending_opens.get(&channel_id) {
+                Some(pending) if pending.challenge_id != challenge.id => return Ok(()),
+                Some(_) => pending_opens
+                    .remove(&channel_id)
+                    .map(|pending| pending.store_key),
+                None => None,
             }
-            let Some(pending) = pending_opens.remove(&channel_id) else {
-                return Ok(());
-            };
-            pending
         };
 
         let runtime_key = self.channel_id_to_key.lock().unwrap().remove(&channel_id);
-        if let Some(runtime_key) = runtime_key {
+        let runtime_store_key = if let Some(runtime_key) = runtime_key {
             let mut channels = self.channels.lock().unwrap();
-            if channels
+            let entry = channels
                 .get(&runtime_key)
                 .is_some_and(|entry| entry.channel_id.to_string() == channel_id)
-            {
-                channels.remove(&runtime_key);
-            }
+                .then(|| channels.remove(&runtime_key))
+                .flatten();
+            entry
+                .as_ref()
+                .map(Self::stored_entry)
+                .transpose()?
+                .map(|entry| entry.key())
+        } else {
+            None
+        };
+        if let Some(store_key) = pending_store_key.or(runtime_store_key) {
+            self.channel_store
+                .delete(&store_key)
+                .await
+                .map_err(Self::store_error)?;
         }
-        self.channel_store
-            .delete(&pending.store_key)
-            .await
-            .map_err(Self::store_error)
+        Ok(())
     }
 
     fn channel_entry(entry: StoredChannelEntry) -> Result<ChannelEntry, MppError> {
@@ -2359,7 +2365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_open_rolls_back_unless_server_snapshot_commits_it() {
+    async fn rejected_session_credential_invalidates_its_channel() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
         use crate::protocol::methods::tempo::session::{
@@ -2475,10 +2481,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(provider.channels.lock().unwrap().len(), 1);
-        assert_eq!(provider.channel_id_to_key.lock().unwrap().len(), 1);
+        assert!(provider.channels.lock().unwrap().is_empty());
+        assert!(provider.channel_id_to_key.lock().unwrap().is_empty());
         assert!(provider.pending_opens.lock().unwrap().is_empty());
-        assert!(store.get(&store_key).await.unwrap().is_some());
+        assert!(store.get(&store_key).await.unwrap().is_none());
     }
 
     // --- send_voucher error paths ---

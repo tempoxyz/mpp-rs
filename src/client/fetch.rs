@@ -202,6 +202,7 @@ impl PaymentExt for RequestBuilder {
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
         let mut pending_payments: Vec<(PaymentChallenge, PaymentCredential)> = Vec::new();
+        let mut retried_stale_session = false;
         let mut resp = this.send().await?;
 
         for attempt in 0..max_payment_retries {
@@ -421,6 +422,29 @@ impl PaymentExt for RequestBuilder {
                     .await
                     .map_err(HttpError::Payment)?;
                 return Ok(resp);
+            }
+
+            // A durable session may outlive the server-side channel record.
+            // Invalidate that local channel and retry the original unpaid
+            // request once through the normal 402 flow so a fresh channel can
+            // be opened without surfacing a recoverable 410 to the caller.
+            if !retried_stale_session
+                && status == StatusCode::GONE
+                && challenge.intent.as_str() == "session"
+            {
+                retried_stale_session = true;
+                rollback_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
+                pending_payments.clear();
+                paid_challenge_ids.clear();
+                resp = retry_builder
+                    .try_clone()
+                    .ok_or(HttpError::CloneFailed)?
+                    .send()
+                    .await
+                    .map_err(HttpError::request)?;
+                continue;
             }
 
             // A completed HTTP response is the application's answer, not a
@@ -1191,6 +1215,50 @@ mod tests {
                 .unwrap_err();
 
             assert!(matches!(err, HttpError::Payment(_)));
+        }
+
+        #[tokio::test]
+        async fn stale_session_channel_is_invalidated_and_reopened_once() {
+            let www_auth = challenge_header("session-1", "tempo", "session");
+            let requests = Arc::new(AtomicU32::new(0));
+            let app = Router::new().route(
+                "/paid",
+                get({
+                    let requests = requests.clone();
+                    move |request: axum::http::Request<axum::body::Body>| {
+                        let www_auth = www_auth.clone();
+                        let requests = requests.clone();
+                        async move {
+                            let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                            let paid = request.headers().contains_key("authorization");
+                            match (attempt, paid) {
+                                (0 | 2, false) => (
+                                    AxumStatusCode::PAYMENT_REQUIRED,
+                                    [(WWW_AUTH_NAME, www_auth)],
+                                )
+                                    .into_response(),
+                                (1, true) => AxumStatusCode::GONE.into_response(),
+                                (3, true) => AxumStatusCode::OK.into_response(),
+                                _ => AxumStatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                            }
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let response = reqwest::Client::new()
+                .get(format!("{base_url}/paid"))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(requests.load(Ordering::SeqCst), 4);
+            assert_eq!(provider.call_count(), 2);
+            assert_eq!(provider.rollback_count(), 1);
+            assert_eq!(provider.commit_count(), 1);
         }
 
         #[tokio::test]
