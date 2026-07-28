@@ -93,6 +93,24 @@ pub trait PaymentProvider: Clone + Send + Sync {
         self.pay(challenge)
     }
 
+    /// Prepare a challenge before creating an HTTP payment credential.
+    ///
+    /// Providers that need interactive setup may perform it here. Returning
+    /// `None` asks the client to discard the current challenge and repeat the
+    /// original unauthenticated request, so setup never signs an expired
+    /// challenge. Other providers inherit the challenge unchanged.
+    fn prepare_http_payment_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> impl Future<Output = Result<Option<PaymentChallenge>, MppError>> + Send {
+        let challenge = challenge.clone();
+        async move {
+            let _ = context;
+            Ok(Some(challenge))
+        }
+    }
+
     /// Reconcile a challenge before opening an application WebSocket.
     ///
     /// Session providers may use this hook to refresh persisted state from the
@@ -318,6 +336,28 @@ impl PaymentProvider for MultiProvider {
         )))
     }
 
+    async fn prepare_http_payment_challenge(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<Option<PaymentChallenge>, MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider
+                    .dyn_prepare_http_payment_challenge(challenge, context)
+                    .await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
     async fn prepare_application_websocket_challenge(
         &self,
         challenge: &PaymentChallenge,
@@ -419,6 +459,13 @@ trait DynPaymentProvider: Send + Sync {
         challenge: &'a PaymentChallenge,
         context: PaymentContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
+    fn dyn_prepare_http_payment_challenge<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<PaymentChallenge>, MppError>> + Send + 'a>,
+    >;
     fn dyn_prepare_application_websocket_challenge<'a>(
         &'a self,
         challenge: &'a PaymentChallenge,
@@ -459,6 +506,18 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
     {
         Box::pin(PaymentProvider::pay_with_context(self, challenge, context))
+    }
+
+    fn dyn_prepare_http_payment_challenge<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<PaymentChallenge>, MppError>> + Send + 'a>,
+    > {
+        Box::pin(PaymentProvider::prepare_http_payment_challenge(
+            self, challenge, context,
+        ))
     }
 
     fn dyn_prepare_application_websocket_challenge<'a>(

@@ -47,9 +47,10 @@ impl<P> MppHttpTransport<P> {
     /// Bound concurrent HTTP payment flows.
     ///
     /// This is useful for consumers such as fork databases that can fan out a
-    /// large number of paid reads at once. The permit covers the complete HTTP
-    /// request, including any 402 payment and authenticated replay. A limit of
-    /// zero restores the default unbounded behavior.
+    /// large number of paid reads at once. The initial request remains
+    /// unbounded; the permit is acquired only after a 402 challenge and covers
+    /// payment plus authenticated replay. A limit of zero restores the default
+    /// unbounded behavior.
     pub fn with_max_concurrent_requests(mut self, limit: usize) -> Self {
         self.request_limit = (limit != 0).then(|| (limit, Arc::new(Semaphore::new(limit))));
         self
@@ -88,24 +89,71 @@ where
     P: PaymentProvider,
 {
     async fn request(self, packet: RequestPacket) -> TransportResult<ResponsePacket> {
-        let _permit = match self.request_limit {
-            Some((_, limit)) => Some(limit.acquire_owned().await.map_err(|_| {
-                TransportErrorKind::custom_str("MPP HTTP concurrency limiter is unavailable")
-            })?),
-            None => None,
-        };
         let body = serde_json::to_vec(&packet).map_err(TransportErrorKind::custom)?;
         let headers = packet.headers();
         let origin = redact_url(&self.url);
-        let response = self
+        let request = self
             .client
-            .post(self.url)
+            .post(self.url.clone())
             .headers(headers)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send_with_payment(&self.provider)
-            .await
-            .map_err(|source| TransportErrorKind::custom(MppHttpRequestError { origin, source }))?;
+            .body(body);
+        let response = match self.request_limit {
+            Some((_, limit)) => {
+                let mut initial = request.try_clone().ok_or_else(|| {
+                    TransportErrorKind::custom_str("MPP HTTP request is not cloneable")
+                })?;
+                let has_accept_payment = initial
+                    .try_clone()
+                    .and_then(|request| request.build().ok())
+                    .is_some_and(|request| {
+                        request.headers().contains_key(
+                            mpp::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
+                        )
+                    });
+                if !has_accept_payment {
+                    if let Some(header) = self.provider.accept_payment_header() {
+                        initial = initial.header(
+                            mpp::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
+                            header,
+                        );
+                    }
+                }
+                let response = initial.send().await.map_err(|source| {
+                    TransportErrorKind::custom(MppHttpRequestError {
+                        origin: origin.clone(),
+                        source: source.into(),
+                    })
+                })?;
+                if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+                    response
+                } else {
+                    let _permit = limit.acquire_owned().await.map_err(|_| {
+                        TransportErrorKind::custom_str(
+                            "MPP HTTP concurrency limiter is unavailable",
+                        )
+                    })?;
+                    request
+                        .send_with_payment_from_response(&self.provider, response)
+                        .await
+                        .map_err(|source| {
+                            TransportErrorKind::custom(MppHttpRequestError {
+                                origin: origin.clone(),
+                                source,
+                            })
+                        })?
+                }
+            }
+            None => request
+                .send_with_payment(&self.provider)
+                .await
+                .map_err(|source| {
+                    TransportErrorKind::custom(MppHttpRequestError {
+                        origin: origin.clone(),
+                        source,
+                    })
+                })?,
+        };
         decode_response(response).await
     }
 }
@@ -477,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounds_concurrent_request_flows() {
+    async fn leaves_free_requests_unbounded() {
         #[derive(Clone, Default)]
         struct AppState {
             active: Arc<AtomicUsize>,
@@ -500,6 +548,72 @@ mod tests {
                         "result": "0x2a"
                     }))
                 }),
+            )
+            .with_state(state);
+        let (url, task) = server(app).await;
+        let transport = MppHttpTransport::new(client(), url, MockProvider::default())
+            .with_max_concurrent_requests(2);
+
+        let requests = (0..8).map(|_| {
+            let mut transport = transport.clone();
+            tokio::spawn(async move { transport.call(request()).await.unwrap() })
+        });
+        for result in futures::future::join_all(requests).await {
+            result.unwrap();
+        }
+
+        assert!(
+            observed.maximum.load(Ordering::SeqCst) > 2,
+            "free requests were incorrectly throttled by the paid-flow limit"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bounds_only_paid_request_flows() {
+        #[derive(Clone)]
+        struct AppState {
+            challenge: String,
+            active: Arc<AtomicUsize>,
+            maximum: Arc<AtomicUsize>,
+        }
+
+        let state = AppState {
+            challenge: format_www_authenticate(&challenge()).unwrap(),
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum: Arc::new(AtomicUsize::new(0)),
+        };
+        let observed = state.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                post(
+                    |State(state): State<AppState>,
+                     request: axum::http::Request<axum::body::Body>| async move {
+                        if request.headers().contains_key("authorization") {
+                            let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+                            state.maximum.fetch_max(active, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            state.active.fetch_sub(1, Ordering::SeqCst);
+                            (
+                                AxumStatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "result": "0x2a"
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [("www-authenticate", state.challenge)],
+                                "payment required",
+                            )
+                                .into_response()
+                        }
+                    },
+                ),
             )
             .with_state(state);
         let (url, task) = server(app).await;
