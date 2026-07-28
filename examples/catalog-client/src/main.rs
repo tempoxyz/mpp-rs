@@ -3,12 +3,8 @@ use std::{env, io::Read, sync::Arc};
 use mpp::{
     client::{
         stripe::StripeProvider,
-        tempo::{
-            session::store::{SqliteChannelStore, SqliteChannelStoreOptions},
-            signing::{KeychainVersion, TempoSigningMode},
-            wallet::TempoWallet,
-        },
-        Fetch, MultiProvider, TempoProvider, TempoSessionProvider,
+        tempo::session::store::{SqliteChannelStore, SqliteChannelStoreOptions},
+        Fetch, MultiProvider, TempoAccountsProvider,
     },
     protocol::methods::{stripe::CreateTokenResult, tempo::TempoNetwork},
     MppError,
@@ -37,31 +33,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let target = reqwest::Url::parse(&url)?;
-    let wallet = TempoWallet::load_default()?;
+    let mut charge = TempoAccountsProvider::from_default_store()?;
+    let chain_id = charge.wallet().active_access_key()?.chain_id();
     let rpc_url = env::var("TEMPO_RPC_URL").unwrap_or_else(|_| {
-        TempoNetwork::from_chain_id(wallet.chain_id)
+        TempoNetwork::from_chain_id(chain_id)
             .map(TempoNetwork::default_rpc_url)
             .unwrap_or("https://rpc.tempo.xyz")
             .to_owned()
     });
-    let signing_mode = TempoSigningMode::Keychain {
-        wallet: wallet.account,
-        key_authorization: None,
-        version: KeychainVersion::V2,
-    };
-
-    let charge = TempoProvider::new(wallet.signer.clone(), &rpc_url)?
-        .with_expected_chain_id(wallet.chain_id)
-        .with_signing_mode(signing_mode.clone());
+    charge = charge
+        .with_expected_chain_id(chain_id)
+        .with_rpc_url(rpc_url.parse()?);
     let channel_store = SqliteChannelStore::open(SqliteChannelStoreOptions {
         namespace: target.origin().ascii_serialization(),
         path: env::var_os("MPP_CHANNEL_STORE").map(Into::into),
         request_url: Some(url.clone()),
     })?;
-    let session = TempoSessionProvider::new(wallet.signer, &rpc_url)?
-        .with_signing_mode(signing_mode)
-        .with_authorized_signer(wallet.access_key)
-        .with_channel_store(Arc::new(channel_store))
+    let session = charge
+        .session_provider(Arc::new(channel_store))?
         .with_default_deposit(read_u128("MPP_DEFAULT_DEPOSIT", DEFAULT_DEPOSIT)?)
         .with_max_deposit(read_u128("MPP_MAX_DEPOSIT", DEFAULT_MAX_DEPOSIT)?);
     let client = Client::new();

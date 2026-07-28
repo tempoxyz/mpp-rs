@@ -10,7 +10,12 @@ use tempo_alloy::accounts::{
     TempoAccountsError, TempoAccountsWallet, TempoAuthorizationReservation,
 };
 
-use super::{autoswap::AutoswapConfig, charge::SignOptions};
+use super::{
+    autoswap::AutoswapConfig,
+    charge::SignOptions,
+    session::{store::ChannelStore, TempoSessionProvider},
+    signing::{KeychainVersion, TempoSigningMode},
+};
 use crate::{
     client::PaymentProvider,
     error::{MppError, ResultExt},
@@ -109,6 +114,39 @@ impl TempoAccountsProvider {
     /// Get the explicit settlement RPC override, if configured.
     pub const fn rpc_url(&self) -> Option<&reqwest::Url> {
         self.rpc_url.as_ref()
+    }
+
+    /// Build a matching session provider from the same Accounts wallet.
+    ///
+    /// The returned provider uses the exact access key selected for the pinned
+    /// chain and delegates durable channel persistence to `channel_store`.
+    pub fn session_provider(
+        &self,
+        channel_store: Arc<dyn ChannelStore>,
+    ) -> Result<TempoSessionProvider, MppError> {
+        let chain_id = self.expected_chain_id.ok_or_else(|| {
+            MppError::InvalidConfig(
+                "Tempo Accounts session provider requires an expected chain ID".to_owned(),
+            )
+        })?;
+        let key = self
+            .wallet
+            .clone()
+            .with_chain_id(chain_id)
+            .active_access_key()
+            .mpp_config("failed to select a Tempo Accounts session key")?;
+        let account = key.account();
+        let access_key = key.address();
+        let key_authorization = key.key_authorization().cloned().map(Box::new);
+        let rpc_url = self.settlement_rpc_url(chain_id)?;
+        Ok(TempoSessionProvider::new(key, rpc_url.as_str())?
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: account,
+                key_authorization,
+                version: KeychainVersion::V2,
+            })
+            .with_authorized_signer(access_key)
+            .with_channel_store(channel_store))
     }
 
     /// Return whether the Accounts store has a locally signable key covering
@@ -287,7 +325,7 @@ mod tests {
         network::NetworkWallet,
         primitives::{Address, Signature},
         rpc::types::TransactionRequest,
-        signers::local::PrivateKeySigner,
+        signers::{local::PrivateKeySigner, Signer},
         sol_types::SolCall,
     };
     use tempo_alloy::primitives::{
@@ -336,6 +374,22 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&store).unwrap()).unwrap();
         let provider = TempoAccountsProvider::from_store(&path).unwrap();
         (provider, path, account)
+    }
+
+    #[test]
+    fn builds_session_provider_from_the_same_accounts_key() {
+        let (provider, path, _) = provider();
+        let provider = provider.with_expected_chain_id(4217);
+        let expected_key = provider.wallet().active_access_key().unwrap().address();
+        let session = provider
+            .session_provider(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ))
+            .unwrap();
+
+        assert!(session.supports("tempo", "session"));
+        assert_eq!(session.signer().address(), expected_key);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn challenge(amount: &str, fee_payer: bool) -> PaymentChallenge {

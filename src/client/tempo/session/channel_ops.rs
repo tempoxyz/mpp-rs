@@ -1095,12 +1095,7 @@ where
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
     let primitive_signer = signer.clone().into();
-    let signature_type = match &primitive_signer {
-        crate::client::tempo::signing::TempoPrimitiveSigner::Secp256k1(_) => {
-            SignatureType::Secp256k1
-        }
-        crate::client::tempo::signing::TempoPrimitiveSigner::P256(_) => SignatureType::P256,
-    };
+    let signature_type = primitive_signer.signature_type();
     let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
     let mut calls = options.prefix_calls;
     calls.push(Call {

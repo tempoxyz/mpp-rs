@@ -13,8 +13,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tempo_alloy::accounts::TempoAccessKey;
 use tempo_alloy::primitives::transaction::{
-    derive_p256_address, tt_signature::P256SignatureWithPreHash, PrimitiveSignature,
+    derive_p256_address, tt_signature::P256SignatureWithPreHash, PrimitiveSignature, SignatureType,
 };
 
 /// An extractable P-256 JSON Web Key, as persisted by the Tempo Accounts SDK.
@@ -97,6 +98,8 @@ pub enum TempoPrimitiveSigner {
     Secp256k1(PrivateKeySigner),
     /// Native Tempo P-256 key.
     P256(TempoP256Signer),
+    /// Access key selected and hydrated by Tempo Accounts.
+    Accounts(TempoAccessKey),
 }
 
 impl From<PrivateKeySigner> for TempoPrimitiveSigner {
@@ -111,6 +114,23 @@ impl From<TempoP256Signer> for TempoPrimitiveSigner {
     }
 }
 
+impl From<TempoAccessKey> for TempoPrimitiveSigner {
+    fn from(value: TempoAccessKey) -> Self {
+        Self::Accounts(value)
+    }
+}
+
+impl TempoPrimitiveSigner {
+    /// Cryptographic signature type produced by this signer.
+    pub const fn signature_type(&self) -> SignatureType {
+        match self {
+            Self::Secp256k1(_) => SignatureType::Secp256k1,
+            Self::P256(_) => SignatureType::P256,
+            Self::Accounts(signer) => signer.signature_type(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Signer<PrimitiveSignature> for TempoPrimitiveSigner {
     async fn sign_hash(&self, hash: &B256) -> alloy::signers::Result<PrimitiveSignature> {
@@ -120,6 +140,7 @@ impl Signer<PrimitiveSignature> for TempoPrimitiveSigner {
                 .await
                 .map(PrimitiveSignature::Secp256k1),
             Self::P256(signer) => signer.sign_hash(hash).await,
+            Self::Accounts(signer) => signer.sign_hash(hash).await,
         }
     }
 
@@ -127,6 +148,7 @@ impl Signer<PrimitiveSignature> for TempoPrimitiveSigner {
         match self {
             Self::Secp256k1(signer) => signer.address(),
             Self::P256(signer) => signer.address(),
+            Self::Accounts(signer) => signer.address(),
         }
     }
 
@@ -134,6 +156,7 @@ impl Signer<PrimitiveSignature> for TempoPrimitiveSigner {
         match self {
             Self::Secp256k1(signer) => signer.chain_id(),
             Self::P256(signer) => signer.chain_id(),
+            Self::Accounts(signer) => Some(signer.chain_id()),
         }
     }
 
@@ -141,6 +164,7 @@ impl Signer<PrimitiveSignature> for TempoPrimitiveSigner {
         match self {
             Self::Secp256k1(signer) => signer.set_chain_id(chain_id),
             Self::P256(signer) => signer.set_chain_id(chain_id),
+            Self::Accounts(signer) => signer.set_chain_id(chain_id),
         }
     }
 }
@@ -152,6 +176,7 @@ impl SignerSync<PrimitiveSignature> for TempoPrimitiveSigner {
                 .sign_hash_sync(hash)
                 .map(PrimitiveSignature::Secp256k1),
             Self::P256(signer) => signer.sign_hash_sync(hash),
+            Self::Accounts(signer) => signer.sign_hash_sync(hash),
         }
     }
 

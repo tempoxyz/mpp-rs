@@ -224,9 +224,11 @@ impl TempoSessionProvider {
     fn secp256k1_signer(&self) -> Result<&alloy::signers::local::PrivateKeySigner, MppError> {
         match &self.signer {
             TempoPrimitiveSigner::Secp256k1(signer) => Ok(signer),
-            TempoPrimitiveSigner::P256(_) => Err(MppError::InvalidConfig(
-                "P-256 session keys require the native TIP-1034 precompile".into(),
-            )),
+            TempoPrimitiveSigner::P256(_) | TempoPrimitiveSigner::Accounts(_) => {
+                Err(MppError::InvalidConfig(
+                    "Tempo access keys require the native TIP-1034 precompile".into(),
+                ))
+            }
         }
     }
 
