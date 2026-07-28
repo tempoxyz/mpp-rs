@@ -281,6 +281,12 @@ impl TempoSessionProvider {
         .unwrap_or_default())
     }
 
+    fn fee_token(&self, currency: Address) -> Address {
+        self.autoswap
+            .as_ref()
+            .map_or(currency, |config| config.token_in)
+    }
+
     fn required_top_up(
         &self,
         required_cumulative: u128,
@@ -969,16 +975,12 @@ impl TempoSessionProvider {
             MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
         })?;
         let payer = self.signing_mode.from_address(self.signer.address());
+        let currency = descriptor
+            .token
+            .parse()
+            .mpp_config("invalid TIP-1034 descriptor token")?;
         let prefix_calls = self
-            .autoswap_calls(
-                &self.rpc_provider,
-                payer,
-                descriptor
-                    .token
-                    .parse()
-                    .mpp_config("invalid TIP-1034 descriptor token")?,
-                additional_deposit,
-            )
+            .autoswap_calls(&self.rpc_provider, payer, currency, additional_deposit)
             .await?;
         let payload = create_precompile_top_up_transaction_payload(
             &self.rpc_provider,
@@ -988,6 +990,7 @@ impl TempoSessionProvider {
             TopUpPrecompilePayloadOptions {
                 prefix_calls,
                 descriptor,
+                fee_token: self.fee_token(currency),
                 additional_deposit,
                 chain_id: entry.chain_id,
                 fee_payer: session_req.fee_payer(),
@@ -1728,6 +1731,7 @@ impl TempoSessionProvider {
                     authorized_signer: Some(authorized_signer),
                     payee,
                     currency,
+                    fee_token: self.fee_token(currency),
                     deposit,
                     initial_amount: amount,
                     chain_id,
@@ -1916,6 +1920,7 @@ mod tests {
         assert_eq!(provider.max_deposit, Some(1_000_000));
         assert_eq!(provider.default_deposit, Some(500_000));
         assert_eq!(provider.autoswap().unwrap().token_in, swap_token);
+        assert_eq!(provider.fee_token(Address::repeat_byte(0x44)), swap_token);
     }
 
     #[test]

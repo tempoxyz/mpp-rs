@@ -891,6 +891,8 @@ pub struct OpenPrecompilePayloadOptions {
     pub authorized_signer: Option<Address>,
     pub payee: Address,
     pub currency: Address,
+    /// Token used to pay gas when the open is not sponsored.
+    pub fee_token: Address,
     pub deposit: u128,
     pub initial_amount: u128,
     pub chain_id: u64,
@@ -903,6 +905,8 @@ pub struct TopUpPrecompilePayloadOptions<'a> {
     pub prefix_calls: Vec<Call>,
     /// Existing channel descriptor.
     pub descriptor: &'a ChannelDescriptor,
+    /// Token used to pay gas when the top-up is not sponsored.
+    pub fee_token: Address,
     /// Amount added to the existing channel deposit.
     pub additional_deposit: u128,
     /// Tempo chain ID.
@@ -943,6 +947,7 @@ where
     let default_mode = crate::client::tempo::signing::TempoSigningMode::Direct;
     let signing_mode = signing_mode.unwrap_or(&default_mode);
     let primitive_signer = signer.clone().into();
+    let signature_type = primitive_signer.signature_type();
 
     let authorized_signer = options.authorized_signer.unwrap_or(payer);
     let salt = B256::random();
@@ -978,10 +983,10 @@ where
     )
     .await?;
 
-    let unsigned_tx = build_tempo_tx(TempoTxOptions {
+    let mut transaction_options = TempoTxOptions {
         calls,
         chain_id: options.chain_id,
-        fee_token: options.currency,
+        fee_token: options.fee_token,
         nonce,
         nonce_key,
         gas_limit: 2_000_000,
@@ -990,7 +995,22 @@ where
         fee_payer: options.fee_payer,
         valid_before,
         key_authorization,
-    });
+    };
+    if !options.fee_payer {
+        let request = session_estimation_request(
+            &transaction_options,
+            None,
+            payer,
+            primitive_signer.address(),
+            signature_type,
+            matches!(
+                signing_mode,
+                crate::client::tempo::signing::TempoSigningMode::Keychain { .. }
+            ),
+        );
+        transaction_options.gas_limit = estimate_gas(provider, request).await?;
+    }
+    let unsigned_tx = build_tempo_tx(transaction_options);
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
     let expiring_nonce_hash = if options.fee_payer {
@@ -1117,16 +1137,11 @@ where
         primitive_signer.address(),
     )
     .await?;
-    let fee_token = options
-        .descriptor
-        .token
-        .parse()
-        .mpp_config("invalid TIP-1034 descriptor token")?;
     let valid_after = random_past_valid_after();
     let mut transaction_options = TempoTxOptions {
         calls,
         chain_id: options.chain_id,
-        fee_token,
+        fee_token: options.fee_token,
         nonce,
         nonce_key,
         gas_limit: 2_000_000,
@@ -1437,6 +1452,7 @@ mod tests {
             authorized_signer: None,
             payee: Address::repeat_byte(0x11),
             currency: Address::repeat_byte(0x22),
+            fee_token: Address::repeat_byte(0x22),
             deposit: PRECOMPILE_MAX_CUMULATIVE_AMOUNT + 1,
             initial_amount: 1,
             chain_id: 4217,
@@ -1481,6 +1497,7 @@ mod tests {
             TopUpPrecompilePayloadOptions {
                 prefix_calls: vec![],
                 descriptor: &descriptor,
+                fee_token: Address::repeat_byte(0x22),
                 additional_deposit: 5_000_000,
                 chain_id: 4217,
                 fee_payer: false,

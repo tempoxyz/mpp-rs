@@ -149,14 +149,18 @@ impl TempoAccountsProvider {
         let access_key = key.address();
         let key_authorization = key.key_authorization().cloned().map(Box::new);
         let rpc_url = self.settlement_rpc_url(chain_id)?;
-        Ok(TempoSessionProvider::new(key, rpc_url.as_str())?
+        let mut provider = TempoSessionProvider::new(key, rpc_url.as_str())?
             .with_signing_mode(TempoSigningMode::Keychain {
                 wallet: account,
                 key_authorization,
                 version: KeychainVersion::V2,
             })
             .with_authorized_signer(access_key)
-            .with_channel_store(channel_store))
+            .with_channel_store(channel_store);
+        if let Some(config) = &self.autoswap {
+            provider = provider.with_autoswap(config.clone());
+        }
+        Ok(provider)
     }
 
     /// Enable durable payment sessions alongside one-time charges.
@@ -460,7 +464,10 @@ mod tests {
     #[test]
     fn builds_session_provider_from_the_same_accounts_key() {
         let (provider, path, _) = provider();
-        let provider = provider.with_expected_chain_id(4217);
+        let swap_token = Address::repeat_byte(0x33);
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_autoswap(AutoswapConfig::new(swap_token, 100));
         let expected_key = provider.wallet().active_access_key().unwrap().address();
         let provider = provider
             .with_session_store(Arc::new(
@@ -478,6 +485,7 @@ mod tests {
         );
         assert!(session.supports("tempo", "session"));
         assert_eq!(session.signer().address(), expected_key);
+        assert_eq!(session.autoswap().unwrap().token_in, swap_token);
         std::fs::remove_file(path).unwrap();
     }
 
