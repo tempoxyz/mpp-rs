@@ -44,6 +44,7 @@ struct AccountsSession {
     store: Arc<dyn ChannelStore>,
     provider: Arc<Mutex<Option<TempoSessionProvider>>>,
     default_deposit: Option<u128>,
+    top_up_amount: Option<u128>,
     max_deposit: Option<u128>,
 }
 
@@ -169,6 +170,7 @@ impl TempoAccountsProvider {
             store,
             provider: Arc::new(Mutex::new(None)),
             default_deposit: None,
+            top_up_amount: None,
             max_deposit: None,
         });
         self
@@ -178,6 +180,14 @@ impl TempoAccountsProvider {
     pub fn with_session_default_deposit(mut self, amount: u128) -> Self {
         if let Some(session) = self.session.as_mut() {
             session.default_deposit = Some(amount);
+        }
+        self
+    }
+
+    /// Set the preferred automatic session top-up size in atomic units.
+    pub fn with_session_top_up_amount(mut self, amount: u128) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.top_up_amount = Some(amount);
         }
         self
     }
@@ -203,6 +213,9 @@ impl TempoAccountsProvider {
         let mut provider = self.session_provider(session.store.clone())?;
         if let Some(amount) = session.default_deposit {
             provider = provider.with_default_deposit(amount);
+        }
+        if let Some(amount) = session.top_up_amount {
+            provider = provider.with_top_up_amount(amount);
         }
         if let Some(amount) = session.max_deposit {
             provider = provider.with_max_deposit(amount);
@@ -488,7 +501,12 @@ mod tests {
                 super::super::session::store::MemoryChannelStore::default(),
             ))
             .with_session_default_deposit(20_000)
+            .with_session_top_up_amount(20_000)
             .with_session_max_deposit(1_000_000);
+        assert_eq!(
+            provider.session.as_ref().unwrap().top_up_amount,
+            Some(20_000)
+        );
         let session = provider.configured_session_provider().unwrap();
 
         assert!(provider.supports("tempo", "charge"));
