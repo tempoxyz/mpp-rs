@@ -34,7 +34,8 @@ use self::recovery::{
     recover_stored_channel, RecoveryScope,
 };
 use self::store::{
-    channel_key as persistent_channel_key, ChannelStore, MemoryChannelStore, StoredChannelEntry,
+    channel_key as persistent_channel_key, ChannelStore, ChannelStoreLease, MemoryChannelStore,
+    StoredChannelEntry,
 };
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
@@ -99,12 +100,19 @@ pub struct TempoSessionProvider {
     last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
     /// Serializes channel recovery, cumulative advancement, and credential creation.
     payment_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Keeps the process and durable-store leases until the server response is reconciled.
+    pending_payment_leases: Arc<Mutex<HashMap<String, SessionPaymentLease>>>,
 }
 
 #[derive(Clone, Debug)]
 struct PendingOpen {
     challenge_id: String,
     store_key: String,
+}
+
+struct SessionPaymentLease {
+    _process: tokio::sync::OwnedMutexGuard<()>,
+    _store: Box<dyn ChannelStoreLease>,
 }
 
 struct ApplicationTopUp<'a> {
@@ -143,6 +151,7 @@ impl TempoSessionProvider {
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
+            pending_payment_leases: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -389,7 +398,6 @@ impl TempoSessionProvider {
         let Some(channel_id) = Self::credential_channel_id(credential) else {
             return Ok(());
         };
-        let _guard = self.payment_lock.lock().await;
         let pending_store_key = {
             let mut pending_opens = self.pending_opens.lock().unwrap();
             match pending_opens.get(&channel_id) {
@@ -1511,8 +1519,30 @@ impl TempoSessionProvider {
         challenge: &PaymentChallenge,
         top_up: Option<ApplicationTopUp<'_>>,
     ) -> Result<PaymentCredential, MppError> {
-        let _payment_guard = self.payment_lock.lock().await;
+        challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
+        let process_lease = self.payment_lock.clone().lock_owned().await;
+        let (key, _) = self.expected_channel_key(challenge)?;
+        let store_lease = self
+            .channel_store
+            .acquire(&key)
+            .await
+            .map_err(Self::store_error)?;
+        let credential = self.payment_credential_inner(challenge, top_up).await?;
+        self.pending_payment_leases.lock().unwrap().insert(
+            challenge.id.clone(),
+            SessionPaymentLease {
+                _process: process_lease,
+                _store: store_lease,
+            },
+        );
+        Ok(credential)
+    }
 
+    async fn payment_credential_inner(
+        &self,
+        challenge: &PaymentChallenge,
+        top_up: Option<ApplicationTopUp<'_>>,
+    ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
 
         *self.last_challenge.lock().unwrap() = Some(challenge.clone());
@@ -1819,10 +1849,16 @@ impl PaymentProvider for TempoSessionProvider {
 
     async fn commit_payment(
         &self,
-        _challenge: &PaymentChallenge,
+        challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
+        let lease = self
+            .pending_payment_leases
+            .lock()
+            .unwrap()
+            .remove(&challenge.id);
         self.commit_credential(credential);
+        drop(lease);
         Ok(())
     }
 
@@ -1831,7 +1867,14 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        self.rollback_credential(challenge, credential).await
+        let lease = self
+            .pending_payment_leases
+            .lock()
+            .unwrap()
+            .remove(&challenge.id);
+        let result = self.rollback_credential(challenge, credential).await;
+        drop(lease);
+        result
     }
 }
 
@@ -2886,6 +2929,7 @@ mod tests {
         );
 
         let credential = provider.pay(&challenge).await.expect("pay succeeds");
+        assert_eq!(provider.pending_payment_leases.lock().unwrap().len(), 1);
 
         // Expected: precompile EIP-712 voucher signed over cumulative 1500.
         let expected_sig = sign_precompile_voucher(&signer, channel_id, 1_500, chain_id)
@@ -2917,6 +2961,11 @@ mod tests {
             }
             other => panic!("expected voucher payload, got {other:?}"),
         }
+        provider
+            .commit_payment(&challenge, &credential)
+            .await
+            .unwrap();
+        assert!(provider.pending_payment_leases.lock().unwrap().is_empty());
 
         provider
             .channels
@@ -2939,6 +2988,10 @@ mod tests {
             } => assert_eq!(cumulative_amount, "10000"),
             other => panic!("expected voucher payload, got {other:?}"),
         }
+        provider
+            .commit_payment(&challenge, &socket_credential)
+            .await
+            .unwrap();
         provider
             .channels
             .lock()

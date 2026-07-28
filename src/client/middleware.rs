@@ -376,7 +376,9 @@ where
                         .await;
                     // The request may have reached the server even though its
                     // response was lost. Preserve optimistic provider state
-                    // until a later challenge can reconcile it.
+                    // until a later challenge can reconcile it, while
+                    // releasing any delivery lease held by the provider.
+                    commit_middleware_payments(&self.provider, &pending_payments).await?;
                     return Err(err);
                 }
             };
@@ -405,6 +407,13 @@ where
                 }
                 return Ok(resp);
             }
+
+            if resp.headers().contains_key("payment-receipt") {
+                commit_middleware_payments(&self.provider, &pending_payments).await?;
+            } else {
+                rollback_middleware_payments(&self.provider, &pending_payments).await?;
+            }
+            pending_payments.clear();
         }
 
         Ok(resp)

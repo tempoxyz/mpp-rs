@@ -404,7 +404,11 @@ impl PaymentExt for RequestBuilder {
                         .await;
                     // The request may have reached the server even though its
                     // response was lost. Preserve optimistic provider state
-                    // until a later challenge can reconcile it.
+                    // until a later challenge can reconcile it, while
+                    // releasing any delivery lease held by the provider.
+                    commit_payments(provider, &pending_payments)
+                        .await
+                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             };
@@ -462,6 +466,17 @@ impl PaymentExt for RequestBuilder {
                 }
                 return Ok(resp);
             }
+
+            if resp.headers().contains_key("payment-receipt") {
+                commit_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
+            } else {
+                rollback_payments(provider, &pending_payments)
+                    .await
+                    .map_err(HttpError::Payment)?;
+            }
+            pending_payments.clear();
         }
 
         Ok(resp)
