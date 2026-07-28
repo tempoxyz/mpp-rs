@@ -229,9 +229,9 @@ mod sqlite {
 
     /// Return the database path shared by Tempo command-line applications.
     pub fn default_channel_database_path() -> ChannelStoreResult<PathBuf> {
-        super::super::super::default_wallet_directory()
-            .map(|directory| directory.join("channels.db"))
-            .ok_or_else(|| ChannelStoreError::Io("home directory is unavailable".into()))
+        tempo_alloy::accounts::default_accounts_store_path()
+            .map(|path| path.with_file_name("channels.db"))
+            .map_err(|error| ChannelStoreError::Io(error.to_string()))
     }
 
     impl SqliteChannelStore {
@@ -627,6 +627,23 @@ pub use sqlite::{default_channel_database_path, Options as SqliteChannelStoreOpt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn default_database_path_follows_tempo_home() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-tempo-home-{}", uuid::Uuid::new_v4()));
+        let previous = std::env::var_os("TEMPO_HOME");
+        std::env::set_var("TEMPO_HOME", &directory);
+        let actual = default_channel_database_path().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("TEMPO_HOME", value),
+            None => std::env::remove_var("TEMPO_HOME"),
+        }
+        assert_eq!(actual, directory.join("wallet/channels.db"));
+    }
 
     fn entry() -> StoredChannelEntry {
         StoredChannelEntry {
