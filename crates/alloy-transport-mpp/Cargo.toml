@@ -1,6 +1,6 @@
 [package]
 name = "alloy-transport-mpp"
-description = "Machine Payments Protocol (MPP) transport layer over WebSocket for alloy"
+description = "Machine Payments Protocol (MPP) transports for Alloy HTTP and WebSocket clients"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.91"
@@ -34,6 +34,7 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+tower-service = "0.3"
 tracing = "0.1"
 url = "2"
 

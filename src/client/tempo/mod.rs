@@ -10,31 +10,11 @@ mod error;
 mod provider;
 pub mod session;
 pub mod signing;
-#[cfg(feature = "sqlite")]
-pub mod wallet;
 
 pub use accounts_provider::TempoAccountsProvider;
 pub use autoswap::AutoswapConfig;
 pub use error::TempoClientError;
 
-#[cfg(all(feature = "sqlite", not(windows)))]
-fn default_wallet_directory() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .map(|home| home.join(".tempo").join("wallet"))
-}
-
-#[cfg(all(feature = "sqlite", windows))]
-fn default_wallet_directory() -> Option<std::path::PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE")?;
-            let path = std::env::var_os("HOMEPATH")?;
-            Some(std::path::PathBuf::from(drive).join(path))
-        })
-        .map(|home| home.join(".tempo").join("wallet"))
-}
 pub use provider::TempoProvider;
 
 /// Build the RPC provider used while preparing Tempo payments.

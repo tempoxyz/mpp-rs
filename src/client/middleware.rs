@@ -16,28 +16,27 @@ use crate::client::events::{
     ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
     CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use crate::client::provider::{commit_payments, rollback_payments, PaymentProvider};
+use crate::client::provider::{PaymentProvider, PendingPayments};
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, PaymentChallenge, PaymentCredential,
-    AUTHORIZATION_HEADER,
+    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
 };
 
 async fn commit_middleware_payments<P: PaymentProvider>(
-    provider: &P,
-    payments: &[(PaymentChallenge, PaymentCredential)],
+    payments: &mut PendingPayments<P>,
 ) -> reqwest_middleware::Result<()> {
-    commit_payments(provider, payments)
+    payments
+        .commit()
         .await
         .map_err(|error| reqwest_middleware::Error::Middleware(anyhow::anyhow!(error)))
 }
 
 async fn rollback_middleware_payments<P: PaymentProvider>(
-    provider: &P,
-    payments: &[(PaymentChallenge, PaymentCredential)],
+    payments: &mut PendingPayments<P>,
 ) -> reqwest_middleware::Result<()> {
-    rollback_payments(provider, payments)
+    payments
+        .rollback()
         .await
         .map_err(|error| reqwest_middleware::Error::Middleware(anyhow::anyhow!(error)))
 }
@@ -203,7 +202,7 @@ where
         };
 
         let mut paid_challenge_ids = std::collections::HashSet::new();
-        let mut pending_payments: Vec<(PaymentChallenge, PaymentCredential)> = Vec::new();
+        let mut pending_payments = PendingPayments::new(self.provider.clone());
 
         for attempt in 0..self.max_payment_retries {
             if resp.status() != StatusCode::PAYMENT_REQUIRED {
@@ -225,7 +224,7 @@ where
                         reason: None,
                     }))
                     .await;
-                rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                rollback_middleware_payments(&mut pending_payments).await?;
                 return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                     "402 response missing WWW-Authenticate header"
                 )));
@@ -256,7 +255,7 @@ where
                             reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
-                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                    rollback_middleware_payments(&mut pending_payments).await?;
                     return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                         mpp_error
                     )));
@@ -270,7 +269,7 @@ where
                             reason: None,
                         }))
                         .await;
-                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                    rollback_middleware_payments(&mut pending_payments).await?;
                     return Err(reqwest_middleware::Error::Middleware(err));
                 }
             };
@@ -283,7 +282,7 @@ where
                         reason: None,
                     }))
                     .await;
-                rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                rollback_middleware_payments(&mut pending_payments).await?;
                 return Ok(resp);
             }
 
@@ -308,7 +307,7 @@ where
                                 reason: None,
                             }))
                             .await;
-                        rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                        rollback_middleware_payments(&mut pending_payments).await?;
                         return Err(reqwest_middleware::Error::Middleware(err));
                     }
                 },
@@ -334,7 +333,7 @@ where
                                 reason: None,
                             }))
                             .await;
-                        rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                        rollback_middleware_payments(&mut pending_payments).await?;
                         return Err(reqwest_middleware::Error::Middleware(err));
                     }
                 };
@@ -350,12 +349,12 @@ where
                                 reason: None,
                             }))
                             .await;
-                        rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                        rollback_middleware_payments(&mut pending_payments).await?;
                         return Err(reqwest_middleware::Error::Middleware(err));
                     }
                 };
             let Some(mut retry_req) = base_retry_req.try_clone() else {
-                rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                rollback_middleware_payments(&mut pending_payments).await?;
                 return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
                     "request could not be cloned for payment retry"
                 )));
@@ -376,7 +375,9 @@ where
                         .await;
                     // The request may have reached the server even though its
                     // response was lost. Preserve optimistic provider state
-                    // until a later challenge can reconcile it.
+                    // until a later challenge can reconcile it, while
+                    // releasing any delivery lease held by the provider.
+                    commit_middleware_payments(&mut pending_payments).await?;
                     return Err(err);
                 }
             };
@@ -390,7 +391,7 @@ where
                         status,
                     }))
                     .await;
-                commit_middleware_payments(&self.provider, &pending_payments).await?;
+                commit_middleware_payments(&mut pending_payments).await?;
                 return Ok(resp);
             }
 
@@ -399,11 +400,17 @@ where
             // and the final 402 without emitting `payment.failed`.
             if status != StatusCode::PAYMENT_REQUIRED || attempt + 1 == self.max_payment_retries {
                 if resp.headers().contains_key("payment-receipt") {
-                    commit_middleware_payments(&self.provider, &pending_payments).await?;
+                    commit_middleware_payments(&mut pending_payments).await?;
                 } else {
-                    rollback_middleware_payments(&self.provider, &pending_payments).await?;
+                    rollback_middleware_payments(&mut pending_payments).await?;
                 }
                 return Ok(resp);
+            }
+
+            if resp.headers().contains_key("payment-receipt") {
+                commit_middleware_payments(&mut pending_payments).await?;
+            } else {
+                rollback_middleware_payments(&mut pending_payments).await?;
             }
         }
 

@@ -45,6 +45,48 @@ impl PaymentProvider for StubProvider {
     }
 }
 
+#[derive(Clone, Default)]
+struct LifecycleProvider {
+    commits: Arc<AtomicUsize>,
+    rollbacks: Arc<AtomicUsize>,
+    abandons: Arc<AtomicUsize>,
+}
+
+impl PaymentProvider for LifecycleProvider {
+    fn supports(&self, _: &str, _: &str) -> bool {
+        true
+    }
+
+    async fn pay(&self, ch: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        Ok(PaymentCredential::new(
+            ch.to_echo(),
+            PaymentPayload::hash("0xlifecycle"),
+        ))
+    }
+
+    async fn commit_payment(
+        &self,
+        _: &PaymentChallenge,
+        _: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn rollback_payment(
+        &self,
+        _: &PaymentChallenge,
+        _: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        self.rollbacks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn abandon_payment(&self, _: &PaymentChallenge, _: &PaymentCredential) {
+        self.abandons.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone)]
 struct StubVoucherProvider;
 
@@ -153,6 +195,95 @@ async fn handshake_emits_challenge_credential_and_receipt_events() {
         .unwrap()
         .unwrap();
     assert!(matches!(e3, MppEvent::Receipt(_)));
+}
+
+#[tokio::test]
+async fn receipt_commits_payment_state() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            send_text(&mut ws, receipt_frame()).await;
+            sleep(Duration::from_millis(100)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone());
+    let mut events = connect.mpp_handle().events;
+    let _connection = connect.connect().await.unwrap();
+
+    loop {
+        let event = timeout(TIMEOUT, events.recv()).await.unwrap().unwrap();
+        if matches!(event, MppEvent::Receipt(_)) {
+            break;
+        }
+    }
+
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn server_error_rolls_back_payment_state() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            send_text(
+                &mut ws,
+                json!({ "type": "error", "error": "credential rejected" }),
+            )
+            .await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone());
+    let mut events = connect.mpp_handle().events;
+    let _connection = connect.connect().await.unwrap();
+
+    loop {
+        let event = timeout(TIMEOUT, events.recv()).await.unwrap().unwrap();
+        if matches!(event, MppEvent::Error(_)) {
+            break;
+        }
+    }
+
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn close_before_receipt_abandons_transient_payment_state() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            ws.close(None).await.unwrap();
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone());
+    let _connection = connect.connect().await.unwrap();
+
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
