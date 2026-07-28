@@ -1876,6 +1876,13 @@ impl PaymentProvider for TempoSessionProvider {
         drop(lease);
         result
     }
+
+    fn abandon_payment(&self, challenge: &PaymentChallenge, _credential: &PaymentCredential) {
+        self.pending_payment_leases
+            .lock()
+            .unwrap()
+            .remove(&challenge.id);
+    }
 }
 
 #[cfg(test)]
@@ -2961,10 +2968,7 @@ mod tests {
             }
             other => panic!("expected voucher payload, got {other:?}"),
         }
-        provider
-            .commit_payment(&challenge, &credential)
-            .await
-            .unwrap();
+        provider.abandon_payment(&challenge, &credential);
         assert!(provider.pending_payment_leases.lock().unwrap().is_empty());
 
         provider

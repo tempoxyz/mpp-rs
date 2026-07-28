@@ -418,6 +418,14 @@ impl PaymentProvider for TempoAccountsProvider {
         Ok(())
     }
 
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        if challenge.intent.as_str() == "session" {
+            if let Ok(provider) = self.configured_session_provider() {
+                provider.abandon_payment(challenge, credential);
+            }
+        }
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         self.session
             .as_ref()
