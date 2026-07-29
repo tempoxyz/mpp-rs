@@ -1,0 +1,16 @@
+name: Dependabot
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    permissions:
+      checks: read
+      contents: write
+      pull-requests: write
+    uses: tempoxyz/mpp-tools/.github/workflows/dependabot.yml@b7a4a46ce767748c34d9a02fd221e6245298e4d2
