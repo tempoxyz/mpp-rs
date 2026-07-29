@@ -13,4 +13,4 @@ jobs:
       checks: read
       contents: write
       pull-requests: write
-    uses: tempoxyz/mpp-tools/.github/workflows/dependabot.yml@a3e10e71acb070d4c69c133ea97cb1e29ff24ac6
+    uses: tempoxyz/mpp-tools/.github/workflows/dependabot.yml@b7a4a46ce767748c34d9a02fd221e6245298e4d2
