@@ -1,7 +1,7 @@
 name: Dependabot
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions: {}
@@ -13,4 +13,4 @@ jobs:
       checks: read
       contents: write
       pull-requests: write
-    uses: tempoxyz/mpp-tools/.github/workflows/dependabot.yml@1d20c6f032568c0aea39c0e7e57e4ba350516281
+    uses: tempoxyz/mpp-tools/.github/workflows/dependabot.yml@a3e10e71acb070d4c69c133ea97cb1e29ff24ac6
