@@ -5,7 +5,7 @@ use std::{fmt, sync::Arc, task};
 use alloy_json_rpc::{RequestPacket, ResponsePacket};
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut, TransportResult};
 use mpp::client::{Fetch, HttpError, PaymentProvider};
-use reqwest::Url;
+use reqwest::{header::HeaderMap, Url};
 use tokio::sync::Semaphore;
 use tower_service::Service;
 
@@ -19,6 +19,7 @@ pub struct MppHttpTransport<P> {
     client: reqwest::Client,
     url: Url,
     provider: P,
+    headers: Option<Arc<HeaderMap>>,
     request_limit: Option<(usize, Arc<Semaphore>)>,
 }
 
@@ -40,8 +41,17 @@ impl<P> MppHttpTransport<P> {
             client,
             url,
             provider,
+            headers: None,
             request_limit: None,
         }
+    }
+
+    /// Set headers to include in JSON-RPC and payment management requests.
+    ///
+    /// Per-request JSON-RPC headers override headers with the same name.
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = Some(Arc::new(headers));
+        self
     }
 
     /// Bound concurrent HTTP payment flows.
@@ -90,7 +100,8 @@ where
 {
     async fn request(self, packet: RequestPacket) -> TransportResult<ResponsePacket> {
         let body = serde_json::to_vec(&packet).map_err(TransportErrorKind::custom)?;
-        let headers = packet.headers();
+        let mut headers = self.headers.as_deref().cloned().unwrap_or_default();
+        headers.extend(packet.headers());
         let origin = redact_url(&self.url);
         let request = self
             .client
@@ -254,7 +265,7 @@ mod tests {
         Router,
     };
     use mpp::{
-        client::PaymentProvider,
+        client::{PaymentContext, PaymentProvider},
         format_www_authenticate, parse_authorization,
         protocol::core::{
             Base64UrlJson, IntentName, MethodName, PaymentChallenge, PaymentCredential,
@@ -424,6 +435,115 @@ mod tests {
         assert!(matches!(response, ResponsePacket::Single(response) if response.is_success()));
         assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
         assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn preserves_transport_headers_for_management_requests() {
+        #[derive(Clone)]
+        struct ManagementProvider {
+            client: reqwest::Client,
+        }
+
+        impl PaymentProvider for ManagementProvider {
+            fn supports(&self, method: &str, intent: &str) -> bool {
+                method == "tempo" && intent == "charge"
+            }
+
+            fn pay(
+                &self,
+                challenge: &PaymentChallenge,
+            ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
+                let credential = PaymentCredential::with_source(
+                    challenge.to_echo(),
+                    "test-source".to_owned(),
+                    serde_json::json!({"tx": "0xsigned"}),
+                );
+                async move { Ok(credential) }
+            }
+
+            async fn pay_with_context(
+                &self,
+                challenge: &PaymentChallenge,
+                context: PaymentContext,
+            ) -> Result<PaymentCredential, MppError> {
+                let response = self
+                    .client
+                    .post(context.url)
+                    .headers(context.headers)
+                    .header("x-mpp-management", "top-up")
+                    .send()
+                    .await
+                    .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
+                if !response.status().is_success() {
+                    return Err(MppError::InvalidConfig(format!(
+                        "management request returned {}",
+                        response.status()
+                    )));
+                }
+                self.pay(challenge).await
+            }
+        }
+
+        #[derive(Clone)]
+        struct AppState {
+            challenge: String,
+            management_requests: Arc<AtomicUsize>,
+        }
+
+        let state = AppState {
+            challenge: format_www_authenticate(&challenge()).unwrap(),
+            management_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let observed = state.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                post(
+                    |State(state): State<AppState>,
+                     request: axum::http::Request<axum::body::Body>| async move {
+                        if request.headers().get("x-api-key")
+                            != Some(&HeaderValue::from_static("test-key"))
+                        {
+                            return AxumStatusCode::UNAUTHORIZED.into_response();
+                        }
+                        if request.headers().contains_key("x-mpp-management") {
+                            state.management_requests.fetch_add(1, Ordering::SeqCst);
+                            return AxumStatusCode::NO_CONTENT.into_response();
+                        }
+                        if request.headers().contains_key("authorization") {
+                            (
+                                AxumStatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "result": "0x2a"
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [("www-authenticate", state.challenge)],
+                                "payment required",
+                            )
+                                .into_response()
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let (url, task) = server(app).await;
+        let provider = ManagementProvider { client: client() };
+        let headers = HeaderMap::from_iter([(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("test-key"),
+        )]);
+        let mut transport = MppHttpTransport::new(client(), url, provider).with_headers(headers);
+
+        transport.call(request()).await.unwrap();
+
+        assert_eq!(observed.management_requests.load(Ordering::SeqCst), 1);
         task.abort();
     }
 
