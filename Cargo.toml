@@ -89,6 +89,7 @@ ws = ["server", "client", "dep:tokio-tungstenite", "dep:futures-util"]
 reqwest-default-tls = ["reqwest?/default-tls"]
 reqwest-native-tls = ["reqwest?/native-tls"]
 reqwest-rustls-tls = ["reqwest?/rustls"]
+reqwest-rustls-tls-no-provider = ["reqwest?/rustls-no-provider"]
 
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
