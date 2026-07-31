@@ -443,7 +443,7 @@ mod tests {
     use alloy::{
         eips::eip2718::Decodable2718,
         network::NetworkWallet,
-        primitives::{Address, Signature},
+        primitives::Address,
         rpc::types::TransactionRequest,
         signers::{local::PrivateKeySigner, Signer},
         sol_types::SolCall,
@@ -617,15 +617,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_payment_releases_its_one_time_authorization() {
-        let account = Address::repeat_byte(0x11);
+        let root = PrivateKeySigner::random();
+        let account = root.address();
         let signer = PrivateKeySigner::random();
         let authorization =
-            KeyAuthorization::unrestricted(4217, SignatureType::Secp256k1, signer.address())
-                .into_signed(PrimitiveSignature::Secp256k1(Signature::test_signature()));
+            KeyAuthorization::unrestricted(4217, SignatureType::Secp256k1, signer.address());
+        let signature = root
+            .sign_hash(&authorization.signature_hash())
+            .await
+            .unwrap();
+        let authorization = authorization.into_signed(PrimitiveSignature::Secp256k1(signature));
         let wallet = TempoAccountsWallet::from_secp256k1(account, signer, Some(authorization))
             .with_chain_id(4217);
         let provider = TempoAccountsProvider::new(wallet.clone());
-        let reservation = wallet.authorization_reservation().unwrap();
         let request = TempoTransactionRequest {
             inner: TransactionRequest {
                 to: Some(Address::repeat_byte(0x22).into()),
@@ -638,6 +642,7 @@ mod tests {
             ..Default::default()
         };
         wallet.sign_request(request.clone()).await.unwrap();
+        let reservation = wallet.authorization_reservation().unwrap();
         provider
             .remember_authorization("challenge-123", reservation)
             .unwrap();

@@ -16,7 +16,7 @@ use crate::client::events::{
     ChallengeReceivedContext, ClientEvent, ClientEventSubscription, ClientEvents,
     CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use crate::client::provider::{PaymentProvider, PendingPayments};
+use crate::client::provider::{PaymentContext, PaymentProvider, PendingPayments};
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
@@ -157,6 +157,11 @@ where
         extensions: &mut http_types::Extensions,
         next: Next<'_>,
     ) -> reqwest_middleware::Result<Response> {
+        let payment_context = PaymentContext {
+            url: req.url().clone(),
+            headers: req.headers().clone(),
+        };
+
         // Snapshot any caller-set Accept-Payment header before injection.
         let caller_accept = req
             .headers()
@@ -296,7 +301,11 @@ where
 
             let credential = match override_credential {
                 Some(credential) => credential,
-                None => match self.provider.pay(&challenge).await {
+                None => match self
+                    .provider
+                    .pay_with_context(&challenge, payment_context.clone())
+                    .await
+                {
                     Ok(credential) => credential,
                     Err(err) => {
                         let err = anyhow::anyhow!(err).context("payment failed");
@@ -632,6 +641,98 @@ mod tests {
             assert_eq!(provider.commit_count(), 1);
             assert_eq!(provider.rollback_count(), 0);
             assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_passes_request_context_to_concurrent_payments() {
+            #[derive(Clone)]
+            struct ContextProvider {
+                contexts: Arc<Mutex<Vec<(String, String)>>>,
+            }
+
+            impl PaymentProvider for ContextProvider {
+                fn supports(&self, _method: &str, _intent: &str) -> bool {
+                    true
+                }
+
+                async fn pay(
+                    &self,
+                    _challenge: &PaymentChallenge,
+                ) -> Result<PaymentCredential, MppError> {
+                    panic!("middleware must call pay_with_context")
+                }
+
+                async fn pay_with_context(
+                    &self,
+                    challenge: &PaymentChallenge,
+                    context: PaymentContext,
+                ) -> Result<PaymentCredential, MppError> {
+                    let marker = context
+                        .headers
+                        .get("x-payment-context")
+                        .expect("request marker is present")
+                        .to_str()
+                        .expect("request marker is valid text")
+                        .to_owned();
+                    self.contexts
+                        .lock()
+                        .unwrap()
+                        .push((context.url.path().to_owned(), marker));
+                    Ok(PaymentCredential::new(
+                        challenge.to_echo(),
+                        PaymentPayload::hash("0xcontext"),
+                    ))
+                }
+            }
+
+            let (_, www_auth) = test_challenge();
+            let app = Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+                let www_auth = www_auth.clone();
+                async move {
+                    if req.headers().get("authorization").is_some() {
+                        (AxumStatusCode::OK, "ok").into_response()
+                    } else {
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                            .into_response()
+                    }
+                }
+            });
+
+            let base_url = spawn_server(app).await;
+            let provider = ContextProvider {
+                contexts: Arc::new(Mutex::new(Vec::new())),
+            };
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()))
+                .build();
+
+            let mut requests = tokio::task::JoinSet::new();
+            for index in 0..32 {
+                let client = client.clone();
+                let url = format!("{base_url}/paid/{index}");
+                requests.spawn(async move {
+                    client
+                        .get(url)
+                        .header("x-payment-context", index.to_string())
+                        .send()
+                        .await
+                });
+            }
+            while let Some(response) = requests.join_next().await {
+                assert_eq!(response.unwrap().unwrap().status(), reqwest::StatusCode::OK);
+            }
+
+            let mut actual = provider.contexts.lock().unwrap().clone();
+            actual.sort();
+            let mut expected = (0..32)
+                .map(|index| (format!("/paid/{index}"), index.to_string()))
+                .collect::<Vec<_>>();
+            expected.sort();
+            assert_eq!(actual, expected);
         }
 
         #[tokio::test]

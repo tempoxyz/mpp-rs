@@ -28,7 +28,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.dependencies]
-tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "ddbe8350c5b449a6bb98660e21bb6e9107f3cbe1", default-features = false }
+tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "bdc5c78c155d746d4e7f16d64b41ce791ba24580", default-features = false }
 
 [features]
 default = ["reqwest-default-tls"]
@@ -89,6 +89,7 @@ ws = ["server", "client", "dep:tokio-tungstenite", "dep:futures-util"]
 reqwest-default-tls = ["reqwest?/default-tls"]
 reqwest-native-tls = ["reqwest?/native-tls"]
 reqwest-rustls-tls = ["reqwest?/rustls"]
+reqwest-rustls-tls-no-provider = ["reqwest?/rustls-no-provider"]
 
 # Integration tests (requires a running Tempo localnet)
 integration = ["tempo", "server", "client", "axum"]
