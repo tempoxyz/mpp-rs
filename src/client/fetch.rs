@@ -296,44 +296,46 @@ async fn send_with_payment<P: PaymentProvider>(
             .filter_map(|r| r.ok())
             .collect();
 
-        let challenge =
-            match select_supported_challenge(&challenges, ranking_accept.as_deref(), |challenge| {
-                provider.supports(challenge.method.as_str(), challenge.intent.as_str())
-            }) {
-                Ok(challenge) => challenge.clone(),
-                Err(ChallengeSelectionError::Expired(challenge)) => {
-                    let err = HttpError::Payment(expired_payment_error(&challenge));
-                    let error = err.to_string();
-                    let expires = challenge.expires.clone();
-                    events
-                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                            challenge: Some(*challenge),
-                            error,
-                            reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
-                        }))
-                        .await;
-                    pending_payments
-                        .rollback()
-                        .await
-                        .map_err(HttpError::Payment)?;
-                    return Err(err);
-                }
-                Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
-                    let err = HttpError::NoSupportedChallenge(message);
-                    events
-                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                            challenge: None,
-                            error: err.to_string(),
-                            reason: None,
-                        }))
-                        .await;
-                    pending_payments
-                        .rollback()
-                        .await
-                        .map_err(HttpError::Payment)?;
-                    return Err(err);
-                }
-            };
+        let challenge = match select_supported_challenge(
+            &challenges,
+            ranking_accept.as_deref(),
+            |challenge| provider.supports(challenge.method.as_str(), challenge.intent.as_str()),
+            |challenges| provider.select_challenge(challenges),
+        ) {
+            Ok(challenge) => challenge.clone(),
+            Err(ChallengeSelectionError::Expired(challenge)) => {
+                let err = HttpError::Payment(expired_payment_error(&challenge));
+                let error = err.to_string();
+                let expires = challenge.expires.clone();
+                events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: Some(*challenge),
+                        error,
+                        reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
+                    }))
+                    .await;
+                pending_payments
+                    .rollback()
+                    .await
+                    .map_err(HttpError::Payment)?;
+                return Err(err);
+            }
+            Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
+                let err = HttpError::NoSupportedChallenge(message);
+                events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: None,
+                        error: err.to_string(),
+                        reason: None,
+                    }))
+                    .await;
+                pending_payments
+                    .rollback()
+                    .await
+                    .map_err(HttpError::Payment)?;
+                return Err(err);
+            }
+        };
 
         let Some(url) = url.clone() else {
             pending_payments
