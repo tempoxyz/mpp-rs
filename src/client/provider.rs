@@ -68,6 +68,20 @@ pub trait PaymentProvider: Clone + Send + Sync {
     /// `true` if this provider can handle the combination.
     fn supports(&self, method: &str, intent: &str) -> bool;
 
+    /// Select one challenge from the supported, unexpired candidates.
+    ///
+    /// Candidates have already been ordered by the caller's `Accept-Payment`
+    /// preferences. The default preserves that order. Providers may override
+    /// this to choose between otherwise equivalent offers using complete
+    /// challenge details such as currency, chain, or amount. Returning `None`
+    /// rejects every candidate.
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        challenges.first().copied()
+    }
+
     /// Execute payment for the given challenge and return a credential.
     ///
     /// This method should:
@@ -300,6 +314,25 @@ impl PaymentProvider for MultiProvider {
         self.has_support(method, intent)
     }
 
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        let first = challenges.first()?;
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.dyn_supports(first.method.as_str(), first.intent.as_str()))?;
+        let candidates = challenges
+            .iter()
+            .copied()
+            .filter(|challenge| {
+                provider.dyn_supports(challenge.method.as_str(), challenge.intent.as_str())
+            })
+            .collect::<Vec<_>>();
+        provider.dyn_select_challenge(&candidates)
+    }
+
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         let method = challenge.method.as_str();
         let intent = challenge.intent.as_str();
@@ -450,6 +483,10 @@ impl PaymentProvider for MultiProvider {
 /// Object-safe version of PaymentProvider for use in MultiProvider.
 trait DynPaymentProvider: Send + Sync {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool;
+    fn dyn_select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge>;
     fn dyn_pay<'a>(
         &'a self,
         challenge: &'a PaymentChallenge,
@@ -489,6 +526,13 @@ trait DynPaymentProvider: Send + Sync {
 impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool {
         PaymentProvider::supports(self, method, intent)
+    }
+
+    fn dyn_select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        PaymentProvider::select_challenge(self, challenges)
     }
 
     fn dyn_pay<'a>(

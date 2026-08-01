@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use alloy::primitives::Address;
 use tempo_alloy::accounts::{
     TempoAccountsError, TempoAccountsWallet, TempoAuthorizationReservation,
 };
@@ -20,6 +21,7 @@ use crate::{
     client::{PaymentContext, PaymentProvider},
     error::{MppError, ResultExt},
     protocol::core::{PaymentChallenge, PaymentCredential},
+    protocol::intents::ChargeRequest,
     protocol::methods::tempo::network::TempoNetwork as TempoChain,
 };
 
@@ -34,6 +36,7 @@ pub struct TempoAccountsProvider {
     rpc_url: Option<reqwest::Url>,
     client_id: Option<String>,
     autoswap: Option<AutoswapConfig>,
+    preferred_currency: Option<Address>,
     expected_chain_id: Option<u64>,
     pending_authorizations: Arc<Mutex<HashMap<String, TempoAuthorizationReservation>>>,
     session: Option<AccountsSession>,
@@ -59,6 +62,7 @@ impl TempoAccountsProvider {
             rpc_url: None,
             client_id: None,
             autoswap: None,
+            preferred_currency: None,
             expected_chain_id: None,
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
             session: None,
@@ -100,6 +104,20 @@ impl TempoAccountsProvider {
     /// Get the autoswap configuration, if set.
     pub fn autoswap(&self) -> Option<&AutoswapConfig> {
         self.autoswap.as_ref()
+    }
+
+    /// Prefer Tempo Charge offers denominated in this currency.
+    ///
+    /// The provider falls back to the protocol-ranked first challenge when a
+    /// matching currency is not offered.
+    pub fn with_preferred_currency(mut self, currency: Address) -> Self {
+        self.preferred_currency = Some(currency);
+        self
+    }
+
+    /// Get the preferred Tempo Charge currency, if configured.
+    pub const fn preferred_currency(&self) -> Option<Address> {
+        self.preferred_currency
     }
 
     fn fee_token(&self) -> Option<alloy::primitives::Address> {
@@ -330,6 +348,35 @@ impl PaymentProvider for TempoAccountsProvider {
                     && self.session.is_some()))
     }
 
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        let first = challenges.first().copied()?;
+        let Some(preferred_currency) = self.preferred_currency else {
+            return Some(first);
+        };
+        if first.method.as_str() != crate::protocol::methods::tempo::METHOD_NAME
+            || first.intent.as_str() != crate::protocol::methods::tempo::INTENT_CHARGE
+        {
+            return Some(first);
+        }
+        challenges
+            .iter()
+            .copied()
+            .find(|challenge| {
+                challenge.method.as_str() == first.method.as_str()
+                    && challenge.intent.as_str() == first.intent.as_str()
+                    && challenge
+                        .request
+                        .decode::<ChargeRequest>()
+                        .ok()
+                        .and_then(|request| request.currency.parse::<Address>().ok())
+                        == Some(preferred_currency)
+            })
+            .or(Some(first))
+    }
+
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self.configured_session_provider()?.pay(challenge).await;
@@ -530,20 +577,56 @@ mod tests {
     }
 
     fn challenge(amount: &str, fee_payer: bool) -> PaymentChallenge {
+        challenge_with_currency(
+            "challenge-123",
+            amount,
+            fee_payer,
+            "0x20c0000000000000000000000000000000000000",
+        )
+    }
+
+    fn challenge_with_currency(
+        id: &str,
+        amount: &str,
+        fee_payer: bool,
+        currency: &str,
+    ) -> PaymentChallenge {
         let request = Base64UrlJson::from_value(&serde_json::json!({
             "amount": amount,
-            "currency": "0x20c0000000000000000000000000000000000000",
+            "currency": currency,
             "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
             "methodDetails": {"chainId": 4217, "feePayer": fee_payer},
         }))
         .unwrap();
-        PaymentChallenge::new(
-            "challenge-123",
-            "api.example.com",
-            "tempo",
-            "charge",
-            request,
-        )
+        PaymentChallenge::new(id, "api.example.com", "tempo", "charge", request)
+    }
+
+    #[test]
+    fn selects_the_preferred_charge_currency() {
+        let (provider, path, _) = provider();
+        let preferred_currency = Address::repeat_byte(0x33);
+        let first = challenge_with_currency(
+            "first",
+            "1",
+            false,
+            Address::repeat_byte(0x22).to_string().as_str(),
+        );
+        let preferred = challenge_with_currency(
+            "preferred",
+            "1",
+            false,
+            preferred_currency.to_string().as_str(),
+        );
+        let provider = provider.with_preferred_currency(preferred_currency);
+
+        assert_eq!(provider.preferred_currency(), Some(preferred_currency));
+        assert_eq!(
+            provider
+                .select_challenge(&[&first, &preferred])
+                .map(|challenge| challenge.id.as_str()),
+            Some("preferred")
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     fn assert_accounts_signature(signed: &AASigned, account: Address, key: Address) {

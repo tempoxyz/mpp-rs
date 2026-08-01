@@ -16,6 +16,7 @@ pub(crate) fn select_supported_challenge<'a>(
     challenges: &'a [PaymentChallenge],
     ranking_accept: Option<&str>,
     mut supports: impl FnMut(&PaymentChallenge) -> bool,
+    mut select: impl FnMut(&[&'a PaymentChallenge]) -> Option<&'a PaymentChallenge>,
 ) -> Result<&'a PaymentChallenge, ChallengeSelectionError> {
     let ranking_preferences = ranking_accept.and_then(|header| accept_payment::parse(header).ok());
     let supported: Vec<_> = challenges
@@ -28,11 +29,17 @@ pub(crate) fn select_supported_challenge<'a>(
         .filter(|challenge| !challenge.is_expired())
         .collect();
 
-    if let Some(challenge) = select_ranked_challenge(&payable, ranking_preferences.as_deref()) {
-        return Ok(challenge);
+    let payable = rank_challenges(&payable, ranking_preferences.as_deref());
+    if !payable.is_empty() {
+        return select(&payable).ok_or_else(|| {
+            ChallengeSelectionError::NoSupportedChallenge(
+                "provider rejected all supported payment challenges".to_string(),
+            )
+        });
     }
 
-    if let Some(challenge) = select_ranked_challenge(&supported, ranking_preferences.as_deref()) {
+    let supported = rank_challenges(&supported, ranking_preferences.as_deref());
+    if let Some(challenge) = select(&supported) {
         return Err(ChallengeSelectionError::Expired(Box::new(
             challenge.clone(),
         )));
@@ -48,13 +55,16 @@ pub(crate) fn select_supported_challenge<'a>(
     )))
 }
 
-fn select_ranked_challenge<'a>(
+fn rank_challenges<'a>(
     challenges: &[&'a PaymentChallenge],
     preferences: Option<&[Entry]>,
-) -> Option<&'a PaymentChallenge> {
+) -> Vec<&'a PaymentChallenge> {
     match preferences {
-        Some(preferences) => accept_payment::select(challenges, preferences).copied(),
-        None => challenges.first().copied(),
+        Some(preferences) => accept_payment::rank(challenges, preferences)
+            .into_iter()
+            .copied()
+            .collect(),
+        None => challenges.to_vec(),
     }
 }
 
@@ -82,9 +92,12 @@ mod tests {
     fn select_supported_challenge_fails_closed_for_malformed_expiry() {
         let challenges = vec![challenge_with_expires(Some("not-a-date"))];
 
-        let err = select_supported_challenge(&challenges, None, |challenge| {
-            challenge.method.as_str() == "tempo"
-        })
+        let err = select_supported_challenge(
+            &challenges,
+            None,
+            |challenge| challenge.method.as_str() == "tempo",
+            |candidates| candidates.first().copied(),
+        )
         .unwrap_err();
 
         assert!(matches!(err, ChallengeSelectionError::Expired(_)));
@@ -94,11 +107,38 @@ mod tests {
     fn select_supported_challenge_rejects_past_expiry() {
         let challenges = vec![challenge_with_expires(Some("2020-01-01T00:00:00Z"))];
 
-        let err = select_supported_challenge(&challenges, None, |challenge| {
-            challenge.method.as_str() == "tempo"
-        })
+        let err = select_supported_challenge(
+            &challenges,
+            None,
+            |challenge| challenge.method.as_str() == "tempo",
+            |candidates| candidates.first().copied(),
+        )
         .unwrap_err();
 
         assert!(matches!(err, ChallengeSelectionError::Expired(_)));
+    }
+
+    #[test]
+    fn provider_selects_between_equivalent_supported_challenges() {
+        let challenges = vec![
+            challenge_with_expires(None),
+            PaymentChallenge::new(
+                "challenge-preferred",
+                "api.example.com",
+                "tempo",
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+            ),
+        ];
+
+        let selected = select_supported_challenge(
+            &challenges,
+            None,
+            |_| true,
+            |candidates| candidates.get(1).copied(),
+        )
+        .unwrap();
+
+        assert_eq!(selected.id, "challenge-preferred");
     }
 }

@@ -247,6 +247,7 @@ where
                     self.provider
                         .supports(challenge.method.as_str(), challenge.intent.as_str())
                 },
+                |challenges| self.provider.select_challenge(challenges),
             ) {
                 Ok(challenge) => challenge.clone(),
                 Err(ChallengeSelectionError::Expired(challenge)) => {
