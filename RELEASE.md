@@ -102,7 +102,7 @@ Bump types: `major`, `minor`, `patch`
 
 ## Configuration
 
-See [config.toml](./config.toml) for changelog settings:
+See [config.toml](./.changelog/config.toml) for changelog settings:
 
 - `dependent_bump` - How to bump dependents (default: `patch`)
 - `changelog.format` - `root` for single CHANGELOG.md or `per-crate`
