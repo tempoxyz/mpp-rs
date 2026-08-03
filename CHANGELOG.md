@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.12.0 (2026-08-03)
+
+### Minor Changes
+
+- Added automatic native TIP-1034 channel top-ups before session vouchers exceed the current deposit, with credentials bound to each active WebSocket challenge across reconnects. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Support Tempo Wallet P-256 access keys for charge payments and expose the
+- shared `store.json` loader for native command-line clients. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Add atomic stablecoin auto-swaps for native TIP-1034 session opens and top-ups,
+- including the required Stablecoin DEX approval for charge and session payments. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Add a Charge-only payment provider backed by the canonical Tempo Accounts
+- `store.json`, with lazy access-key selection and no separate signing mode. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+
+### Patch Changes
+
+- Pinned the Tempo dependency to the coordinated 7690815 revision. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Continue retrying distinct charge challenges within the configured payment
+- retry limit, matching MPPx and allowing sponsored servers to rotate challenges
+- that were rejected before settlement. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Match MPPx and Tempo fee sponsorship by encoding P-256 charge and TIP-1034 management credentials as sender-signed `0x78` envelopes. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Authorize canonical application WebSockets with their advertised opening amount,
+- and provide a top-up-aware authorization path for full reusable channels. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Pinned an updated Tempo dependency revision and reworked the one-time authorization test to sign the key authorization with a real root signer. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Resolve persisted Tempo Wallet key authorizations against the Account Keychain before signing. Already-authorized access keys now omit the one-time authorization instead of failing fresh charge or session transactions with `KeyAlreadyExists`. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Update the Tempo SDK revision so fee-payer relays can select the transaction fee token. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+- Load pending Accounts SDK key authorizations from the shared Tempo Wallet store so native Rust clients can provision a fresh access key with their first transaction. Open a fresh session after access-key rotation instead of trying to reuse a channel bound to the previous voucher signer. (by @DerekCofausper, [#372](https://github.com/tempoxyz/mpp-rs/pull/372))
+
 ## 0.11.0 (2026-07-16)
 
 ### Minor Changes
