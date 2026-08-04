@@ -93,6 +93,9 @@ pub use protocol::intents::{
     SessionRequest,
 };
 
+#[cfg(feature = "server")]
+pub use protocol::traits::{ChargeMethod, ChargeValidation, ErrorCode, VerificationError};
+
 // ==================== Alloy Re-exports ====================
 
 #[cfg(feature = "evm")]

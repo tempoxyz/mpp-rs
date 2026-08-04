@@ -51,7 +51,9 @@ mod tempo;
 #[cfg(feature = "stripe")]
 mod stripe;
 
-pub use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
+pub use crate::protocol::traits::{
+    ChargeMethod, ChargeValidation, ErrorCode, SessionMethod, VerificationError,
+};
 pub use amount::{parse_dollar_amount, AmountError};
 pub use compose::{compose, compose_verify, ChargeVerifier};
 pub use events::{
@@ -63,8 +65,8 @@ pub use mpp::{Mpp, SessionVerifyResult};
 #[cfg(feature = "tempo")]
 pub use tempo::{
     tempo, tempo_provider, SessionChannelStore, SessionMethodConfig, TempoBuilder, TempoChargeExt,
-    TempoChargeMethod, TempoConfig, TempoMethodDetails, TempoProvider, TempoSessionMethod,
-    CHAIN_ID, METHOD_NAME,
+    TempoChargeMethod, TempoConfig, TempoMethodDetails, TempoProvider, TempoRelayConfig,
+    TempoRelayErrorCode, TempoSessionMethod, CHAIN_ID, METHOD_NAME,
 };
 
 // Re-export stripe types at server level for backward compatibility
@@ -102,6 +104,8 @@ pub struct ChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Enable fee sponsorship.
     pub fee_payer: bool,
+    /// Credential modes advertised to clients (for example, `&["pull"]`).
+    pub supported_modes: Option<&'a [&'a str]>,
     /// Framework adapter route/resource/query scope.
     pub mppx_scope: Option<&'a serde_json::Value>,
 }
