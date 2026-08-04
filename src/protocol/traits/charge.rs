@@ -4,10 +4,52 @@
 //! ensuring consistent field names (amount, currency, recipient) across all
 //! payment methods.
 
-use crate::protocol::core::{PaymentCredential, Receipt};
+use crate::protocol::core::{ChallengeEcho, IntentName, MethodName, PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::VerificationError;
 use std::future::Future;
+
+/// Result of non-mutating charge credential validation.
+///
+/// Validation proves that the credential is structurally and method-specifically
+/// acceptable without consuming replay state or performing the terminal payment
+/// operation. Use the server acceptance APIs to re-validate and accept payment.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChargeValidation {
+    /// Challenge echoed by the credential.
+    pub challenge: ChallengeEcho,
+    /// Validated credential.
+    pub credential: PaymentCredential,
+    /// Method-specific validation details.
+    pub details: serde_json::Value,
+    /// Validated payment intent.
+    pub intent: IntentName,
+    /// Validated payment method.
+    pub method: MethodName,
+    /// Parsed charge request.
+    pub request: ChargeRequest,
+    /// Optional payer identity.
+    pub source: Option<String>,
+}
+
+impl ChargeValidation {
+    /// Build a validation result from a credential and parsed request.
+    pub fn new(
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            challenge: credential.challenge.clone(),
+            credential: credential.clone(),
+            details,
+            intent: credential.challenge.intent.clone(),
+            method: credential.challenge.method.clone(),
+            request: request.clone(),
+            source: credential.source.clone(),
+        }
+    }
+}
 
 /// Trait for payment methods that implement the "charge" intent.
 ///
@@ -90,7 +132,7 @@ pub trait ChargeMethod: Clone + Send + Sync {
     ///
     /// **Important**: This must be a fast, synchronous, deterministic operation.
     /// Do not perform network I/O here. Any async operations should happen in
-    /// the method constructor or in `verify()`.
+    /// the method constructor or in validation/broadcast hooks.
     ///
     /// # Arguments
     ///
@@ -127,7 +169,51 @@ pub trait ChargeMethod: Clone + Send + Sync {
         request
     }
 
-    /// Verify a charge credential against the typed request.
+    /// Whether this method supports non-mutating validation.
+    ///
+    /// Existing implementations default to the legacy combined verification
+    /// lifecycle. Methods overriding [`Self::validate`] must return `true` so
+    /// server acceptance paths validate before broadcasting.
+    fn supports_validation(&self) -> bool {
+        false
+    }
+
+    /// Validate a credential without consuming or broadcasting it.
+    ///
+    /// This is an advisory pre-check. Implementations must not reserve replay
+    /// keys, sign fee-payer transactions, broadcast, or otherwise mutate payment
+    /// state. The default reports that validation is unsupported.
+    fn validate(
+        &self,
+        _credential: &PaymentCredential,
+        _request: &ChargeRequest,
+    ) -> impl Future<Output = Result<ChargeValidation, VerificationError>> + Send {
+        let method = self.method().to_string();
+        async move {
+            Err(VerificationError::new(format!(
+                "{method}/charge does not support non-mutating credential validation"
+            )))
+        }
+    }
+
+    /// Perform the terminal payment operation.
+    ///
+    /// [`crate::server::Mpp`] calls [`Self::validate`] first for split-lifecycle
+    /// methods. New methods should override this hook. The compatibility default
+    /// invokes the legacy combined [`Self::verify`] hook.
+    fn broadcast(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        self.verify(credential, request)
+    }
+
+    /// Legacy combined verification hook.
+    ///
+    /// Existing methods may implement only this hook. Split-lifecycle methods
+    /// should preserve it for direct consumers by calling validation followed
+    /// by broadcast, while server acceptance paths use those hooks directly.
     ///
     /// # Arguments
     ///
@@ -174,6 +260,21 @@ mod tests {
         assert_eq!(method.method(), "test");
     }
 
+    #[test]
+    fn test_charge_method_prepare_request_defaults_to_identity() {
+        let method = TestChargeMethod;
+        let request = ChargeRequest {
+            amount: "100".into(),
+            currency: "USD".into(),
+            ..Default::default()
+        };
+
+        let prepared = method.prepare_request(request.clone(), None);
+
+        assert_eq!(prepared.amount, request.amount);
+        assert_eq!(prepared.currency, request.currency);
+    }
+
     #[tokio::test]
     async fn test_charge_method_verify() {
         let method = TestChargeMethod;
@@ -198,5 +299,90 @@ mod tests {
         assert!(result.is_ok());
         let receipt = result.unwrap();
         assert_eq!(receipt.reference, "test_ref");
+    }
+
+    #[tokio::test]
+    async fn test_charge_method_broadcast_falls_back_to_legacy_verify() {
+        let method = TestChargeMethod;
+        let echo = ChallengeEcho {
+            id: "test".into(),
+            realm: "test.com".into(),
+            method: "test".into(),
+            intent: "charge".into(),
+            request: crate::protocol::core::Base64UrlJson::from_raw("e30"),
+            expires: None,
+            digest: None,
+            opaque: None,
+        };
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
+
+        let receipt = method
+            .broadcast(&credential, &ChargeRequest::default())
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.reference, "test_ref");
+    }
+
+    #[tokio::test]
+    async fn test_legacy_charge_method_reports_validation_unsupported() {
+        let method = TestChargeMethod;
+        let echo = ChallengeEcho {
+            id: "test".into(),
+            realm: "test.com".into(),
+            method: "test".into(),
+            intent: "charge".into(),
+            request: crate::protocol::core::Base64UrlJson::from_raw("e30"),
+            expires: None,
+            digest: None,
+            opaque: None,
+        };
+        let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
+
+        let error = method
+            .validate(&credential, &ChargeRequest::default())
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("test/charge"));
+        assert!(error.message.contains("does not support non-mutating"));
+    }
+
+    #[test]
+    fn test_charge_validation_serializes_public_contract() {
+        let request = ChargeRequest {
+            amount: "100".into(),
+            currency: "USD".into(),
+            ..Default::default()
+        };
+        let credential = PaymentCredential::with_source(
+            ChallengeEcho {
+                id: "challenge".into(),
+                realm: "test.com".into(),
+                method: "test".into(),
+                intent: "charge".into(),
+                request: crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap(),
+                expires: None,
+                digest: None,
+                opaque: None,
+            },
+            "did:example:payer",
+            PaymentPayload::hash("0x123"),
+        );
+
+        let value = serde_json::to_value(ChargeValidation::new(
+            &credential,
+            &request,
+            serde_json::json!({ "mode": "test" }),
+        ))
+        .unwrap();
+
+        assert_eq!(value["challenge"]["id"], "challenge");
+        assert_eq!(value["credential"]["source"], "did:example:payer");
+        assert_eq!(value["details"]["mode"], "test");
+        assert_eq!(value["intent"], "charge");
+        assert_eq!(value["method"], "test");
+        assert_eq!(value["request"]["amount"], "100");
+        assert_eq!(value["source"], "did:example:payer");
     }
 }

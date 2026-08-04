@@ -21,7 +21,7 @@ use crate::error::Result;
 use crate::protocol::core::PaymentChallenge;
 use crate::protocol::core::{Base64UrlJson, PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::traits::{ChargeMethod, VerificationError};
+use crate::protocol::traits::{ChargeMethod, ChargeValidation, VerificationError};
 use crate::server::events::{
     PaymentSuccessContext, ServerEvent, ServerEventKind, ServerEventSubscription, ServerEvents,
 };
@@ -505,6 +505,9 @@ where
             if let Some(chain_id) = self.chain_id {
                 details.insert("chainId".into(), serde_json::json!(chain_id));
             }
+            if let Some(supported_modes) = options.supported_modes {
+                details.insert("supportedModes".into(), serde_json::json!(supported_modes));
+            }
             if !details.is_empty() {
                 request.method_details = Some(serde_json::Value::Object(details));
             }
@@ -571,83 +574,146 @@ where
         Ok(self.apply_pinned_opaque(challenge))
     }
 
-    /// Verify a payment credential (simple API).
-    ///
-    /// Decodes the charge request from the echoed challenge automatically.
-    /// No need to reconstruct the request manually.
+    fn decode_credential_request(
+        credential: &PaymentCredential,
+    ) -> std::result::Result<ChargeRequest, VerificationError> {
+        credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|e| VerificationError::new(format!("Failed to decode request: {e}")))
+    }
+
+    /// Validate a payment credential without consuming or broadcasting it.
+    pub async fn validate_credential(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<ChargeValidation, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.validate(credential, &request).await
+    }
+
+    /// Validate a credential against the actual request body without accepting payment.
+    pub async fn validate_credential_with_body(
+        &self,
+        credential: &PaymentCredential,
+        body: &[u8],
+    ) -> std::result::Result<ChargeValidation, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.validate_with_body(credential, &request, Some(body))
+            .await
+    }
+
+    /// Validate a credential against expected route values without accepting payment.
+    pub async fn validate_credential_with_expected_request(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+    ) -> std::result::Result<ChargeValidation, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.verify_expected_request_matches(credential, &request, expected)?;
+        self.validate(credential, &request).await
+    }
+
+    /// Validate a credential against expected route values and body bytes.
+    pub async fn validate_credential_with_expected_request_and_body(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+        body: &[u8],
+    ) -> std::result::Result<ChargeValidation, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.verify_expected_request_matches(credential, &request, expected)?;
+        self.validate_with_body(credential, &request, Some(body))
+            .await
+    }
+
+    /// Re-validate and accept a payment credential.
+    pub async fn broadcast_credential(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.broadcast(credential, &request).await
+    }
+
+    /// Re-validate and accept a credential bound to the actual request body.
+    pub async fn broadcast_credential_with_body(
+        &self,
+        credential: &PaymentCredential,
+        body: &[u8],
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.broadcast_with_body(credential, &request, Some(body))
+            .await
+    }
+
+    /// Re-validate and accept a credential matching expected route values.
+    pub async fn broadcast_credential_with_expected_request(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.verify_expected_request_matches(credential, &request, expected)?;
+        self.broadcast(credential, &request).await
+    }
+
+    /// Re-validate and accept a credential matching expected route values and body bytes.
+    pub async fn broadcast_credential_with_expected_request_and_body(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+        body: &[u8],
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.verify_expected_request_matches(credential, &request, expected)?;
+        self.broadcast_with_body(credential, &request, Some(body))
+            .await
+    }
+
+    /// Backwards-compatible alias for [`Self::broadcast_credential`].
     pub async fn verify_credential(
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest = credential
-            .challenge
-            .request
-            .decode()
-            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
-        self.verify(credential, &request).await
+        self.broadcast_credential(credential).await
     }
 
-    /// Verify a payment credential against the actual request body bytes.
-    ///
-    /// Use this when the echoed challenge contains a body digest. The digest is
-    /// recomputed over `body` before method-specific payment verification runs.
+    /// Backwards-compatible alias for [`Self::broadcast_credential_with_body`].
     pub async fn verify_credential_with_body(
         &self,
         credential: &PaymentCredential,
         body: &[u8],
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest = credential
-            .challenge
-            .request
-            .decode()
-            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
-        self.verify_with_body(credential, &request, Some(body))
-            .await
+        self.broadcast_credential_with_body(credential, body).await
     }
 
-    /// Verify a payment credential, ensuring the charge request matches the server's expected values.
-    ///
-    /// This prevents cross-route credential replay attacks where a credential
-    /// obtained from a cheaper endpoint (or different recipient/currency) is
-    /// replayed on another.
+    /// Backwards-compatible alias for [`Self::broadcast_credential_with_expected_request`].
     pub async fn verify_credential_with_expected_request(
         &self,
         credential: &PaymentCredential,
         expected: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest = credential
-            .challenge
-            .request
-            .decode()
-            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
-
-        self.verify_expected_request_matches(credential, &request, expected)?;
-
-        self.verify(credential, &request).await
+        self.broadcast_credential_with_expected_request(credential, expected)
+            .await
     }
 
-    /// Verify a payment credential against expected route values and actual body bytes.
+    /// Backwards-compatible alias for
+    /// [`Self::broadcast_credential_with_expected_request_and_body`].
     pub async fn verify_credential_with_expected_request_and_body(
         &self,
         credential: &PaymentCredential,
         expected: &ChargeRequest,
         body: &[u8],
     ) -> std::result::Result<Receipt, VerificationError> {
-        let request: ChargeRequest = credential
-            .challenge
-            .request
-            .decode()
-            .map_err(|e| VerificationError::new(format!("Failed to decode request: {}", e)))?;
-
-        self.verify_expected_request_matches(credential, &request, expected)?;
-
-        self.verify_with_body(credential, &request, Some(body))
+        self.broadcast_credential_with_expected_request_and_body(credential, expected, body)
             .await
     }
 
     fn verify_expected_request_matches(
         &self,
-        credential: &PaymentCredential,
+        _credential: &PaymentCredential,
         request: &ChargeRequest,
         expected: &ChargeRequest,
     ) -> std::result::Result<(), VerificationError> {
@@ -686,7 +752,7 @@ where
         }
 
         #[cfg(feature = "tempo")]
-        if credential.challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME {
+        if _credential.challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME {
             let req_transfers =
                 crate::protocol::methods::tempo::transfers::get_request_transfers(request)
                     .map_err(|e| {
@@ -715,16 +781,48 @@ where
         Ok(())
     }
 
-    /// Verify a charge credential with an explicit request.
-    pub async fn verify(
+    /// Validate a charge credential with an explicit request without accepting payment.
+    pub async fn validate(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> std::result::Result<ChargeValidation, VerificationError> {
+        self.validate_with_body(credential, request, None).await
+    }
+
+    async fn validate_with_body(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+        body: Option<&[u8]>,
+    ) -> std::result::Result<ChargeValidation, VerificationError> {
+        self.verify_hmac_and_expiry(credential)?;
+        self.verify_body_digest(credential, body)?;
+        self.verify_pinned_fields(credential, request)?;
+        self.method.validate(credential, request).await
+    }
+
+    async fn validate_before_broadcast(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> std::result::Result<(), VerificationError> {
+        if self.method.supports_validation() {
+            self.method.validate(credential, request).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-validate and perform the terminal payment operation.
+    pub async fn broadcast(
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        self.verify_with_body(credential, request, None).await
+        self.broadcast_with_body(credential, request, None).await
     }
 
-    async fn verify_with_body(
+    async fn broadcast_with_body(
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
@@ -735,7 +833,8 @@ where
         self.verify_body_digest(credential, body)?;
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request)?;
-        let receipt = self.method.verify(credential, request).await?;
+        self.validate_before_broadcast(credential, request).await?;
+        let receipt = self.method.broadcast(credential, request).await?;
         self.events
             .emit_payment_success(PaymentSuccessContext {
                 credential: credential.clone(),
@@ -747,6 +846,15 @@ where
             })
             .await;
         Ok(receipt)
+    }
+
+    /// Backwards-compatible alias for [`Self::broadcast`].
+    pub async fn verify(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        self.broadcast(credential, request).await
     }
 
     fn verify_body_digest(
@@ -1069,6 +1177,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(store) = builder.store {
             method = method.with_store(store);
         }
+        if let Some(relay) = builder.relay {
+            method = method.with_relay(relay)?;
+        }
 
         // Resolve currency from chain_id when not explicitly set
         let currency = if builder.currency_explicit {
@@ -1280,7 +1391,10 @@ mod tests {
     use alloy::primitives::Address;
     use std::{
         future::Future,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     #[derive(Clone)]
@@ -1348,6 +1462,74 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct LifecycleMethod {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        reject_broadcast: bool,
+        reject_validation: bool,
+    }
+
+    impl ChargeMethod for LifecycleMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn supports_validation(&self) -> bool {
+            true
+        }
+
+        fn validate(
+            &self,
+            credential: &PaymentCredential,
+            request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<ChargeValidation, VerificationError>> + Send
+        {
+            let calls = Arc::clone(&self.calls);
+            let reject_validation = self.reject_validation;
+            let credential = credential.clone();
+            let request = request.clone();
+            async move {
+                calls.lock().unwrap().push("validate");
+                if reject_validation {
+                    return Err(VerificationError::new("validation rejected"));
+                }
+                Ok(ChargeValidation::new(
+                    &credential,
+                    &request,
+                    serde_json::json!({ "mode": "test" }),
+                ))
+            }
+        }
+
+        fn broadcast(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            let calls = Arc::clone(&self.calls);
+            let reject_broadcast = self.reject_broadcast;
+            async move {
+                calls.lock().unwrap().push("broadcast");
+                if reject_broadcast {
+                    return Err(VerificationError::new("broadcast rejected"));
+                }
+                Ok(Receipt::success("mock", "broadcast_ref"))
+            }
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            let calls = Arc::clone(&self.calls);
+            async move {
+                calls.lock().unwrap().push("verify");
+                Err(VerificationError::new("legacy verify must stay inert"))
+            }
+        }
+    }
+
     fn test_credential(secret_key: &str) -> PaymentCredential {
         let request = "eyJ0ZXN0IjoidmFsdWUifQ";
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
@@ -1387,12 +1569,16 @@ mod tests {
     }
 
     fn test_credential_with_body_digest(secret_key: &str, body: &[u8]) -> PaymentCredential {
+        test_lifecycle_credential(secret_key, Some(body))
+    }
+
+    fn test_lifecycle_credential(secret_key: &str, body: Option<&[u8]>) -> PaymentCredential {
         let request = test_request();
         let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        let digest = crate::body_digest::compute(body);
+        let digest = body.map(crate::body_digest::compute);
         let id = crate::protocol::core::compute_challenge_id(
             secret_key,
             "api.example.com",
@@ -1400,7 +1586,7 @@ mod tests {
             "charge",
             encoded.raw(),
             Some(&expires),
-            Some(&digest),
+            digest.as_deref(),
             None,
         );
 
@@ -1411,10 +1597,395 @@ mod tests {
             intent: "charge".into(),
             request: encoded,
             expires: Some(expires),
-            digest: Some(digest),
+            digest,
             opaque: None,
         };
         PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
+    }
+
+    fn lifecycle_payment(
+        reject_validation: bool,
+    ) -> (Mpp<LifecycleMethod>, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mpp::new(
+                LifecycleMethod {
+                    calls: Arc::clone(&calls),
+                    reject_broadcast: false,
+                    reject_validation,
+                },
+                "api.example.com",
+                "test-secret",
+            ),
+            calls,
+        )
+    }
+
+    fn lifecycle_payment_rejecting_broadcast(
+    ) -> (Mpp<LifecycleMethod>, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Mpp::new(
+                LifecycleMethod {
+                    calls: Arc::clone(&calls),
+                    reject_broadcast: true,
+                    reject_validation: false,
+                },
+                "api.example.com",
+                "test-secret",
+            ),
+            calls,
+        )
+    }
+
+    #[derive(Clone)]
+    struct LegacyLifecycleMethod {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ChargeMethod for LegacyLifecycleMethod {
+        fn method(&self) -> &str {
+            "mock"
+        }
+
+        fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send {
+            let calls = Arc::clone(&self.calls);
+            async move {
+                calls.lock().unwrap().push("verify");
+                Ok(Receipt::success("mock", "legacy_ref"))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_credential_is_non_mutating() {
+        let (payment, calls) = lifecycle_payment(false);
+        let credential = test_credential_with_body_digest("test-secret", b"body");
+
+        let validation = payment
+            .validate_credential_with_body(&credential, b"body")
+            .await
+            .unwrap();
+
+        assert_eq!(validation.details, serde_json::json!({ "mode": "test" }));
+        assert_eq!(*calls.lock().unwrap(), ["validate"]);
+    }
+
+    #[tokio::test]
+    async fn every_validation_entry_point_only_validates() {
+        #[derive(Clone, Copy, Debug)]
+        enum EntryPoint {
+            ValidateCredential,
+            ValidateCredentialWithBody,
+            ValidateCredentialWithExpectedRequest,
+            ValidateCredentialWithExpectedRequestAndBody,
+            Validate,
+        }
+
+        let entry_points = [
+            EntryPoint::ValidateCredential,
+            EntryPoint::ValidateCredentialWithBody,
+            EntryPoint::ValidateCredentialWithExpectedRequest,
+            EntryPoint::ValidateCredentialWithExpectedRequestAndBody,
+            EntryPoint::Validate,
+        ];
+
+        for entry_point in entry_points {
+            let (payment, calls) = lifecycle_payment(false);
+            let uses_body = matches!(
+                entry_point,
+                EntryPoint::ValidateCredentialWithBody
+                    | EntryPoint::ValidateCredentialWithExpectedRequestAndBody
+            );
+            let credential =
+                test_lifecycle_credential("test-secret", uses_body.then_some(b"body".as_slice()));
+            let expected = test_request();
+
+            let validation = match entry_point {
+                EntryPoint::ValidateCredential => payment.validate_credential(&credential).await,
+                EntryPoint::ValidateCredentialWithBody => {
+                    payment
+                        .validate_credential_with_body(&credential, b"body")
+                        .await
+                }
+                EntryPoint::ValidateCredentialWithExpectedRequest => {
+                    payment
+                        .validate_credential_with_expected_request(&credential, &expected)
+                        .await
+                }
+                EntryPoint::ValidateCredentialWithExpectedRequestAndBody => {
+                    payment
+                        .validate_credential_with_expected_request_and_body(
+                            &credential,
+                            &expected,
+                            b"body",
+                        )
+                        .await
+                }
+                EntryPoint::Validate => payment.validate(&credential, &expected).await,
+            }
+            .unwrap_or_else(|error| panic!("{entry_point:?} failed: {error}"));
+
+            assert_eq!(
+                validation.details,
+                serde_json::json!({ "mode": "test" }),
+                "{entry_point:?}"
+            );
+            assert_eq!(*calls.lock().unwrap(), ["validate"], "{entry_point:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_credential_validates_then_broadcasts_without_legacy_verify() {
+        let (payment, calls) = lifecycle_payment(false);
+        let credential = test_credential_with_body_digest("test-secret", b"body");
+
+        let receipt = payment
+            .broadcast_credential_with_body(&credential, b"body")
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.reference, "broadcast_ref");
+        assert_eq!(*calls.lock().unwrap(), ["validate", "broadcast"]);
+    }
+
+    #[tokio::test]
+    async fn verify_credential_is_broadcast_compatibility_alias() {
+        let (payment, calls) = lifecycle_payment(false);
+        let credential = test_credential_with_body_digest("test-secret", b"body");
+
+        let receipt = payment
+            .verify_credential_with_body(&credential, b"body")
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.reference, "broadcast_ref");
+        assert_eq!(*calls.lock().unwrap(), ["validate", "broadcast"]);
+    }
+
+    #[tokio::test]
+    async fn broadcast_credential_stops_when_validation_fails() {
+        let (payment, calls) = lifecycle_payment(true);
+        let credential = test_credential_with_body_digest("test-secret", b"body");
+
+        let error = payment
+            .broadcast_credential_with_body(&credential, b"body")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.message, "validation rejected");
+        assert_eq!(*calls.lock().unwrap(), ["validate"]);
+    }
+
+    #[tokio::test]
+    async fn every_broadcast_and_verify_entry_point_validates_before_broadcast() {
+        #[derive(Clone, Copy, Debug)]
+        enum EntryPoint {
+            BroadcastCredential,
+            BroadcastCredentialWithBody,
+            BroadcastCredentialWithExpectedRequest,
+            BroadcastCredentialWithExpectedRequestAndBody,
+            VerifyCredential,
+            VerifyCredentialWithBody,
+            VerifyCredentialWithExpectedRequest,
+            VerifyCredentialWithExpectedRequestAndBody,
+            Broadcast,
+            Verify,
+        }
+
+        let entry_points = [
+            EntryPoint::BroadcastCredential,
+            EntryPoint::BroadcastCredentialWithBody,
+            EntryPoint::BroadcastCredentialWithExpectedRequest,
+            EntryPoint::BroadcastCredentialWithExpectedRequestAndBody,
+            EntryPoint::VerifyCredential,
+            EntryPoint::VerifyCredentialWithBody,
+            EntryPoint::VerifyCredentialWithExpectedRequest,
+            EntryPoint::VerifyCredentialWithExpectedRequestAndBody,
+            EntryPoint::Broadcast,
+            EntryPoint::Verify,
+        ];
+
+        for entry_point in entry_points {
+            let (payment, calls) = lifecycle_payment(false);
+            let uses_body = matches!(
+                entry_point,
+                EntryPoint::BroadcastCredentialWithBody
+                    | EntryPoint::BroadcastCredentialWithExpectedRequestAndBody
+                    | EntryPoint::VerifyCredentialWithBody
+                    | EntryPoint::VerifyCredentialWithExpectedRequestAndBody
+            );
+            let credential =
+                test_lifecycle_credential("test-secret", uses_body.then_some(b"body".as_slice()));
+            let expected = test_request();
+
+            let receipt = match entry_point {
+                EntryPoint::BroadcastCredential => payment.broadcast_credential(&credential).await,
+                EntryPoint::BroadcastCredentialWithBody => {
+                    payment
+                        .broadcast_credential_with_body(&credential, b"body")
+                        .await
+                }
+                EntryPoint::BroadcastCredentialWithExpectedRequest => {
+                    payment
+                        .broadcast_credential_with_expected_request(&credential, &expected)
+                        .await
+                }
+                EntryPoint::BroadcastCredentialWithExpectedRequestAndBody => {
+                    payment
+                        .broadcast_credential_with_expected_request_and_body(
+                            &credential,
+                            &expected,
+                            b"body",
+                        )
+                        .await
+                }
+                EntryPoint::VerifyCredential => payment.verify_credential(&credential).await,
+                EntryPoint::VerifyCredentialWithBody => {
+                    payment
+                        .verify_credential_with_body(&credential, b"body")
+                        .await
+                }
+                EntryPoint::VerifyCredentialWithExpectedRequest => {
+                    payment
+                        .verify_credential_with_expected_request(&credential, &expected)
+                        .await
+                }
+                EntryPoint::VerifyCredentialWithExpectedRequestAndBody => {
+                    payment
+                        .verify_credential_with_expected_request_and_body(
+                            &credential,
+                            &expected,
+                            b"body",
+                        )
+                        .await
+                }
+                EntryPoint::Broadcast => payment.broadcast(&credential, &expected).await,
+                EntryPoint::Verify => payment.verify(&credential, &expected).await,
+            }
+            .unwrap_or_else(|error| panic!("{entry_point:?} failed: {error}"));
+
+            assert_eq!(receipt.reference, "broadcast_ref", "{entry_point:?}");
+            assert_eq!(
+                *calls.lock().unwrap(),
+                ["validate", "broadcast"],
+                "{entry_point:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_reports_terminal_failure_after_validation() {
+        let (payment, calls) = lifecycle_payment_rejecting_broadcast();
+        let credential = test_lifecycle_credential("test-secret", None);
+
+        let error = payment.broadcast_credential(&credential).await.unwrap_err();
+
+        assert_eq!(error.message, "broadcast rejected");
+        assert_eq!(*calls.lock().unwrap(), ["validate", "broadcast"]);
+    }
+
+    #[tokio::test]
+    async fn failed_validation_or_broadcast_never_emits_payment_success() {
+        for reject_validation in [true, false] {
+            let (payment, _) = if reject_validation {
+                lifecycle_payment(true)
+            } else {
+                lifecycle_payment_rejecting_broadcast()
+            };
+            let success_count = Arc::new(AtomicUsize::new(0));
+            let _subscription = payment.on_payment_success({
+                let success_count = Arc::clone(&success_count);
+                move |_| {
+                    let success_count = Arc::clone(&success_count);
+                    async move {
+                        success_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+            let credential = test_lifecycle_credential("test-secret", None);
+
+            assert!(payment.broadcast_credential(&credential).await.is_err());
+            assert_eq!(success_count.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_prechecks_run_before_method_validation() {
+        let cases = ["invalid-hmac", "body-mismatch", "route-mismatch"];
+
+        for case in cases {
+            let (payment, calls) = lifecycle_payment(false);
+            let mut credential = test_lifecycle_credential("test-secret", Some(b"body"));
+            let result = match case {
+                "invalid-hmac" => {
+                    credential.challenge.id = "invalid".into();
+                    payment
+                        .broadcast_credential_with_body(&credential, b"body")
+                        .await
+                }
+                "body-mismatch" => {
+                    payment
+                        .broadcast_credential_with_body(&credential, b"different")
+                        .await
+                }
+                "route-mismatch" => {
+                    let mut expected = test_request();
+                    expected.amount = "9999".into();
+                    payment
+                        .broadcast_credential_with_expected_request_and_body(
+                            &credential,
+                            &expected,
+                            b"body",
+                        )
+                        .await
+                }
+                _ => unreachable!(),
+            };
+
+            assert!(result.is_err(), "{case}");
+            assert!(calls.lock().unwrap().is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_broadcast_falls_back_to_verify_without_validation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let payment = Mpp::new(
+            LegacyLifecycleMethod {
+                calls: Arc::clone(&calls),
+            },
+            "api.example.com",
+            "test-secret",
+        );
+        let credential = test_lifecycle_credential("test-secret", None);
+
+        let receipt = payment.broadcast_credential(&credential).await.unwrap();
+
+        assert_eq!(receipt.reference, "legacy_ref");
+        assert_eq!(*calls.lock().unwrap(), ["verify"]);
+    }
+
+    #[tokio::test]
+    async fn validation_only_api_rejects_legacy_method_without_verifying() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let payment = Mpp::new(
+            LegacyLifecycleMethod {
+                calls: Arc::clone(&calls),
+            },
+            "api.example.com",
+            "test-secret",
+        );
+        let credential = test_lifecycle_credential("test-secret", None);
+
+        let error = payment.validate_credential(&credential).await.unwrap_err();
+
+        assert!(error.message.contains("does not support non-mutating"));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1846,6 +2417,7 @@ mod tests {
                 "5.50",
                 ChargeOptions {
                     description: Some("API access fee"),
+                    supported_modes: Some(&["pull"]),
                     ..Default::default()
                 },
             )
@@ -1854,6 +2426,10 @@ mod tests {
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "5500000");
         assert_eq!(challenge.description, Some("API access fee".to_string()));
+        assert_eq!(
+            request.method_details.unwrap()["supportedModes"],
+            serde_json::json!(["pull"])
+        );
     }
 
     #[cfg(feature = "tempo")]

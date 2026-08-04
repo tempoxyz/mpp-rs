@@ -10,7 +10,8 @@ pub use crate::protocol::methods::tempo::session_method::{
 };
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 pub use crate::protocol::methods::tempo::{
-    TempoChargeExt, TempoMethodDetails, CHAIN_ID, METHOD_NAME,
+    RelayConfig as TempoRelayConfig, RelayErrorCode as TempoRelayErrorCode, TempoChargeExt,
+    TempoMethodDetails, CHAIN_ID, METHOD_NAME,
 };
 
 /// Configuration for the Tempo payment method.
@@ -37,6 +38,7 @@ pub struct TempoBuilder {
     pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
+    pub(crate) relay: Option<TempoRelayConfig>,
 }
 
 impl TempoBuilder {
@@ -129,6 +131,12 @@ impl TempoBuilder {
         self.store = None;
         self
     }
+
+    /// Delegate Tempo charge validation and finalization to an MPP relay.
+    pub fn relay(mut self, config: TempoRelayConfig) -> Self {
+        self.relay = Some(config);
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -185,6 +193,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer_allowed_fee_tokens: None,
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
+        relay: None,
     }
 }
 

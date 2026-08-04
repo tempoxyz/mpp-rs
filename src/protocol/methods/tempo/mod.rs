@@ -113,6 +113,8 @@ pub mod voucher;
 #[cfg(feature = "server")]
 pub mod method;
 #[cfg(feature = "server")]
+pub mod relay;
+#[cfg(feature = "server")]
 pub mod session_method;
 
 pub use charge::TempoChargeExt;
@@ -146,6 +148,8 @@ pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION}
 
 #[cfg(feature = "server")]
 pub use method::{ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride};
+#[cfg(feature = "server")]
+pub use relay::{RelayConfig, RelayErrorCode};
 #[cfg(feature = "server")]
 pub use session_method::{
     ChannelState, ChannelStore, InMemoryChannelStore, SessionMethod, SessionMethodConfig,

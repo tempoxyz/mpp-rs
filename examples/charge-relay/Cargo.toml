@@ -1,0 +1,15 @@
+[package]
+name = "charge-relay-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "charge-relay-server"
+path = "src/server.rs"
+
+[dependencies]
+mpp = { path = "../..", features = ["server", "tempo"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

@@ -17,6 +17,7 @@ members = [
   "crates/alloy-transport-mpp",
   "examples/axum-extractor",
   "examples/basic",
+  "examples/charge-relay",
   "examples/session/multi-fetch",
   "examples/session/sse",
   "examples/stripe",
@@ -35,7 +36,14 @@ server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
 evm = ["alloy", "dep:alloy-sol-type-parser", "dep:alloy-sol-types", "hex", "rand"]
-tempo = ["evm", "tempo-alloy", "tempo-primitives", "dep:tempo-contracts", "uuid"]
+tempo = [
+  "evm",
+  "tempo-alloy",
+  "tempo-primitives",
+  "dep:tempo-contracts",
+  "dep:reqwest",
+  "uuid",
+]
 stripe = ["dep:reqwest", "reqwest?/form"]
 
 # Utilities

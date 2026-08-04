@@ -40,16 +40,18 @@ use tempo_alloy::TempoNetwork;
 use tempo_primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tokio::sync::OnceCell;
 
-use crate::protocol::core::{PaymentCredential, Receipt};
+use crate::protocol::core::{ChallengeEcho, PaymentCredential, Receipt};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationError};
+use crate::protocol::traits::{
+    ChargeMethod as ChargeMethodTrait, ChargeValidation, VerificationError,
+};
 use crate::store::Store;
 use crate::tempo::attribution;
 
 use super::transfers::{get_request_transfers, Transfer};
 use super::{
-    network::TempoNetwork as KnownTempoNetwork, proof, TempoChargeExt, CHAIN_ID,
-    DEFAULT_CURRENCY_TESTNET, INTENT_CHARGE, METHOD_NAME,
+    network::TempoNetwork as KnownTempoNetwork, proof, relay::Relay, RelayConfig, TempoChargeExt,
+    CHAIN_ID, DEFAULT_CURRENCY_TESTNET, INTENT_CHARGE, METHOD_NAME,
 };
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
@@ -537,6 +539,7 @@ pub struct ChargeMethod<P> {
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
     fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
+    relay: Option<Relay>,
 }
 
 #[derive(Debug, Clone)]
@@ -654,7 +657,17 @@ where
             fee_payer_policy_override: None,
             validate_sender: None,
             fee_payer_allowed_fee_tokens: None,
+            relay: None,
         }
+    }
+
+    /// Delegate credential validation and finalization to a Tempo API relay.
+    ///
+    /// The relay broadcasts pull credentials and finalizes already-broadcast
+    /// push credentials without submitting them again.
+    pub fn with_relay(mut self, config: RelayConfig) -> crate::error::Result<Self> {
+        self.relay = Some(Relay::new(config)?);
+        Ok(self)
     }
 
     /// Set a callback invoked when a hash-credential transfer's sender differs
@@ -731,8 +744,8 @@ where
         charge: &ChargeRequest,
         source: Option<&str>,
         expected_chain_id: u64,
-        challenge_id: &str,
-        realm: &str,
+        challenge: &ChallengeEcho,
+        reserve: bool,
     ) -> Result<Receipt, VerificationError> {
         // Validate the source before reserving the hash.
         let source_address = parse_hash_credential_source(source, expected_chain_id)?;
@@ -783,15 +796,28 @@ where
         )?;
 
         if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
+            assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
         }
 
         if let Some(store) = &self.store {
-            let claimed = store
-                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+            if reserve {
+                let claimed = store
+                    .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+                    .await
+                    .map_err(|e| {
+                        VerificationError::new(format!("Failed to record tx hash: {e}"))
+                    })?;
+                if !claimed {
+                    return Err(VerificationError::new(
+                        "Transaction hash has already been used.",
+                    ));
+                }
+            } else if store
+                .get(&replay_key)
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
-            if !claimed {
+                .map_err(|e| VerificationError::new(format!("Failed to check tx hash: {e}")))?
+                .is_some()
+            {
                 return Err(VerificationError::new(
                     "Transaction hash has already been used.",
                 ));
@@ -995,6 +1021,256 @@ where
         }
 
         Ok(())
+    }
+
+    async fn validate_proof_credential(
+        &self,
+        credential: &PaymentCredential,
+        signature: &str,
+        expected_chain_id: u64,
+    ) -> Result<Address, VerificationError> {
+        let source = credential
+            .source
+            .as_deref()
+            .ok_or_else(|| VerificationError::new("Proof credential must include a source."))?;
+        let parsed_source = proof::parse_proof_source(source)
+            .map_err(|_| VerificationError::new("Proof credential source is invalid."))?;
+
+        if parsed_source.chain_id != expected_chain_id {
+            return Err(VerificationError::new(
+                "Proof credential source is invalid.",
+            ));
+        }
+
+        if !proof::verify_proof(
+            expected_chain_id,
+            &credential.challenge.id,
+            &credential.challenge.realm,
+            signature,
+            parsed_source.address,
+        ) {
+            let recovered = proof::recover_proof_signer(
+                expected_chain_id,
+                &credential.challenge.id,
+                &credential.challenge.realm,
+                signature,
+            )
+            .map_err(|_| VerificationError::new("Proof signature does not match source."))?;
+
+            let keychain = IAccountKeychain::new(ACCOUNT_KEYCHAIN_ADDRESS, &*self.provider);
+            let key_info = keychain
+                .getKey(parsed_source.address, recovered)
+                .call()
+                .await
+                .map_err(|_| VerificationError::new("Proof signature does not match source."))?;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if key_info.expiry == 0 || key_info.isRevoked || key_info.expiry <= now_secs {
+                return Err(VerificationError::new(
+                    "Proof signature does not match source.",
+                ));
+            }
+        }
+
+        Ok(parsed_source.address)
+    }
+
+    async fn reserve_proof_credential(
+        &self,
+        credential: &PaymentCredential,
+        signature: &str,
+        source_address: Address,
+        expected_chain_id: u64,
+    ) -> Result<(), VerificationError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let replay_key =
+            Self::proof_replay_key(credential, signature, source_address, expected_chain_id)?;
+        let reserved = store
+            .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+            .await
+            .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
+        if !reserved {
+            return Err(VerificationError::new(
+                "Proof credential has already been used.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn proof_replay_key(
+        credential: &PaymentCredential,
+        signature: &str,
+        source_address: Address,
+        expected_chain_id: u64,
+    ) -> Result<String, VerificationError> {
+        let fingerprint = proof::proof_fingerprint(
+            &credential.challenge.id,
+            source_address,
+            expected_chain_id,
+            signature,
+        )
+        .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
+        Ok(format!("mpp:proof:{fingerprint:x}"))
+    }
+
+    fn validate_transaction_credential(
+        &self,
+        signed_tx: &str,
+        charge: &ChargeRequest,
+        expected_chain_id: u64,
+    ) -> Result<Address, VerificationError> {
+        use alloy::eips::Encodable2718;
+
+        let tx_bytes = signed_tx
+            .parse::<Bytes>()
+            .map_err(|e| VerificationError::new(format!("Invalid transaction bytes: {e}")))?;
+        let currency = charge.currency_address().map_err(|e| {
+            VerificationError::new(format!("Invalid currency address in request: {e}"))
+        })?;
+        let expected = Self::expected_transfers(charge)?;
+
+        if charge.fee_payer() {
+            if self.fee_payer_signer.is_none() {
+                return Err(VerificationError::new(
+                    "feePayer requested but fee sponsorship is not configured on this server",
+                ));
+            }
+            let (signed, sender) = self.validate_fee_payer_transaction(&tx_bytes, currency)?;
+            self.validate_transaction_transfers(
+                &signed.encoded_2718(),
+                currency,
+                &expected,
+                expected_chain_id,
+                true,
+            )?;
+            return Ok(sender);
+        }
+
+        self.validate_transaction_transfers(
+            &tx_bytes,
+            currency,
+            &expected,
+            expected_chain_id,
+            false,
+        )?;
+        let signed = tempo_primitives::AASigned::decode_2718(&mut &tx_bytes[..])
+            .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {e}")))?;
+        signed
+            .recover_signer()
+            .map_err(|e| VerificationError::new(format!("Failed to recover sender: {e}")))
+    }
+
+    async fn validate_local(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> Result<ChargeValidation, VerificationError> {
+        if credential.challenge.method.as_str() != METHOD_NAME {
+            return Err(VerificationError::credential_mismatch(format!(
+                "Method mismatch: expected {METHOD_NAME}, got {}",
+                credential.challenge.method
+            )));
+        }
+        if credential.challenge.intent.as_str() != INTENT_CHARGE {
+            return Err(VerificationError::credential_mismatch(format!(
+                "Intent mismatch: expected {INTENT_CHARGE}, got {}",
+                credential.challenge.intent
+            )));
+        }
+
+        let expected_chain_id = request.chain_id().unwrap_or(CHAIN_ID);
+        let actual_chain_id = *self
+            .cached_chain_id
+            .get_or_try_init(|| async {
+                self.provider.get_chain_id().await.map_err(|e| {
+                    VerificationError::network_error(format!("Failed to fetch chain ID: {e}"))
+                })
+            })
+            .await?;
+        if actual_chain_id != expected_chain_id {
+            return Err(VerificationError::chain_id_mismatch(format!(
+                "Chain ID mismatch: expected {expected_chain_id}, got {actual_chain_id}"
+            )));
+        }
+
+        let payload = credential.charge_payload().map_err(|e| {
+            VerificationError::with_code(
+                format!("Expected charge payload: {e}"),
+                crate::protocol::traits::ErrorCode::InvalidCredential,
+            )
+        })?;
+        let is_zero_amount = request
+            .amount_u256()
+            .map_err(|e| VerificationError::new(format!("Invalid amount in request: {e}")))?
+            .is_zero();
+        if is_zero_amount && !payload.is_proof() {
+            return Err(VerificationError::new(
+                "Zero-amount challenges require a proof credential.",
+            ));
+        }
+
+        let details = if payload.is_hash() {
+            self.verify_hash(
+                payload.tx_hash().unwrap(),
+                request,
+                credential.source.as_deref(),
+                expected_chain_id,
+                &credential.challenge,
+                false,
+            )
+            .await?;
+            serde_json::json!({ "mode": "push" })
+        } else if payload.is_proof() {
+            if !is_zero_amount {
+                return Err(VerificationError::new(
+                    "Proof credentials are only valid for zero-amount challenges.",
+                ));
+            }
+            let sender = self
+                .validate_proof_credential(
+                    credential,
+                    payload.proof_signature().unwrap(),
+                    expected_chain_id,
+                )
+                .await?;
+            if let Some(store) = &self.store {
+                let replay_key = Self::proof_replay_key(
+                    credential,
+                    payload.proof_signature().unwrap(),
+                    sender,
+                    expected_chain_id,
+                )?;
+                if store
+                    .get(&replay_key)
+                    .await
+                    .map_err(|e| VerificationError::new(format!("Failed to check proof: {e}")))?
+                    .is_some()
+                {
+                    return Err(VerificationError::new(
+                        "Proof credential has already been used.",
+                    ));
+                }
+            }
+            serde_json::json!({ "mode": "proof", "sender": format!("{sender:#x}") })
+        } else {
+            let serialized_transaction = payload.signed_tx().unwrap();
+            let sender = self.validate_transaction_credential(
+                serialized_transaction,
+                request,
+                expected_chain_id,
+            )?;
+            serde_json::json!({
+                "mode": "pull",
+                "sender": format!("{sender:#x}"),
+                "serializedTransaction": serialized_transaction,
+            })
+        };
+
+        Ok(ChargeValidation::new(credential, request, details))
     }
 
     async fn broadcast_transaction(
@@ -1235,20 +1511,12 @@ where
         Ok(())
     }
 
-    /// Co-sign a fee payer transaction.
-    ///
-    /// Accepts a `0x78` fee payer envelope, recovers the sender via
-    /// ecrecover, validates fee-payer invariants, then co-signs and
-    /// returns a complete `0x76` transaction ready for broadcast.
-    fn cosign_fee_payer_transaction(
+    fn validate_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
-        fee_payer_signer: &alloy::signers::local::PrivateKeySigner,
         fee_token: Address,
-    ) -> Result<Vec<u8>, VerificationError> {
+    ) -> Result<(tempo_primitives::AASigned, Address), VerificationError> {
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
-        use alloy::eips::Encodable2718;
-        use alloy::signers::SignerSync;
         use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
         if tx_bytes.is_empty() {
@@ -1374,6 +1642,25 @@ where
             )));
         }
 
+        Ok((signed, sender))
+    }
+
+    /// Co-sign a fee payer transaction.
+    ///
+    /// Accepts a `0x78` fee payer envelope, recovers the sender via
+    /// ecrecover, validates fee-payer invariants, then co-signs and
+    /// returns a complete `0x76` transaction ready for broadcast.
+    fn cosign_fee_payer_transaction(
+        &self,
+        tx_bytes: &[u8],
+        fee_payer_signer: &alloy::signers::local::PrivateKeySigner,
+        fee_token: Address,
+    ) -> Result<Vec<u8>, VerificationError> {
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+
+        let (signed, sender) = self.validate_fee_payer_transaction(tx_bytes, fee_token)?;
+
         // Rebuild the transaction with fee_token set and real fee_payer_signature
         let (tx, client_signature, _hash) = signed.into_parts();
         let mut tx = tx;
@@ -1423,6 +1710,44 @@ where
         METHOD_NAME
     }
 
+    fn supports_validation(&self) -> bool {
+        true
+    }
+
+    fn validate(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> impl Future<Output = Result<ChargeValidation, VerificationError>> + Send {
+        let relay = self.relay.clone();
+        let this = self.clone();
+        let credential = credential.clone();
+        let request = request.clone();
+        async move {
+            match relay {
+                Some(relay) => relay.validate(&credential, &request).await,
+                None => this.validate_local(&credential, &request).await,
+            }
+        }
+    }
+
+    fn broadcast(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        let this = self.clone();
+        let credential = credential.clone();
+        let request = request.clone();
+        async move {
+            if let Some(relay) = &this.relay {
+                relay.broadcast(&credential, METHOD_NAME).await
+            } else {
+                ChargeMethodTrait::verify(&this, &credential, &request).await
+            }
+        }
+    }
+
     fn verify(
         &self,
         credential: &PaymentCredential,
@@ -1437,8 +1762,14 @@ where
         let fee_payer_policy_override = self.fee_payer_policy_override.clone();
         let validate_sender = self.validate_sender.clone();
         let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
+        let relay = self.relay.clone();
 
         async move {
+            if let Some(relay) = relay {
+                relay.validate(&credential, &request).await?;
+                return relay.broadcast(&credential, METHOD_NAME).await;
+            }
+
             let this = ChargeMethod {
                 provider,
                 fee_payer_signer,
@@ -1447,6 +1778,7 @@ where
                 fee_payer_policy_override,
                 validate_sender,
                 fee_payer_allowed_fee_tokens,
+                relay: None,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -1504,8 +1836,8 @@ where
                     &request,
                     credential.source.as_deref(),
                     expected_chain_id,
-                    &credential.challenge.id,
-                    &credential.challenge.realm,
+                    &credential.challenge,
+                    true,
                 )
                 .await
             } else if charge_payload.is_proof() {
@@ -1515,82 +1847,17 @@ where
                     ));
                 }
 
-                let source = credential.source.as_deref().ok_or_else(|| {
-                    VerificationError::new("Proof credential must include a source.")
-                })?;
-                let parsed_source = proof::parse_proof_source(source)
-                    .map_err(|_| VerificationError::new("Proof credential source is invalid."))?;
-
-                if parsed_source.chain_id != expected_chain_id {
-                    return Err(VerificationError::new(
-                        "Proof credential source is invalid.",
-                    ));
-                }
-
                 let sig_hex = charge_payload.proof_signature().unwrap();
-
-                // Fast path: signer IS the source address (Direct mode).
-                if !proof::verify_proof(
-                    expected_chain_id,
-                    &credential.challenge.id,
-                    &credential.challenge.realm,
+                let source_address = this
+                    .validate_proof_credential(&credential, sig_hex, expected_chain_id)
+                    .await?;
+                this.reserve_proof_credential(
+                    &credential,
                     sig_hex,
-                    parsed_source.address,
-                ) {
-                    // Keychain fallback: signer may be an access key authorized
-                    // for the source wallet. Recover the signer and check on-chain.
-                    let recovered = proof::recover_proof_signer(
-                        expected_chain_id,
-                        &credential.challenge.id,
-                        &credential.challenge.realm,
-                        sig_hex,
-                    )
-                    .map_err(|_| {
-                        VerificationError::new("Proof signature does not match source.")
-                    })?;
-
-                    let keychain = IAccountKeychain::new(ACCOUNT_KEYCHAIN_ADDRESS, &*this.provider);
-                    let key_info = keychain
-                        .getKey(parsed_source.address, recovered)
-                        .call()
-                        .await
-                        .map_err(|_| {
-                            VerificationError::new("Proof signature does not match source.")
-                        })?;
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if key_info.expiry == 0 || key_info.isRevoked || key_info.expiry <= now_secs {
-                        return Err(VerificationError::new(
-                            "Proof signature does not match source.",
-                        ));
-                    }
-                }
-
-                // Single-use: atomically reserve a canonical credential
-                // fingerprint after verifying.
-                if let Some(store) = &this.store {
-                    let fingerprint = proof::proof_fingerprint(
-                        &credential.challenge.id,
-                        parsed_source.address,
-                        parsed_source.chain_id,
-                        sig_hex,
-                    )
-                    .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
-                    let replay_key = format!("mpp:proof:{:x}", fingerprint);
-                    let reserved = store
-                        .put_if_absent(&replay_key, serde_json::Value::Bool(true))
-                        .await
-                        .map_err(|e| {
-                            VerificationError::new(format!("Failed to record proof: {e}"))
-                        })?;
-                    if !reserved {
-                        return Err(VerificationError::new(
-                            "Proof credential has already been used.",
-                        ));
-                    }
-                }
+                    source_address,
+                    expected_chain_id,
+                )
+                .await?;
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
             } else {
@@ -3150,6 +3417,148 @@ mod tests {
         // Replaying the identical credential is rejected.
         let err = method.verify(&credential, &request).await.unwrap_err();
         assert!(err.to_string().contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn test_proof_validation_does_not_reserve_replay_state() {
+        use crate::store::{MemoryStore, Store};
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(&signer, 42431, &challenge.id, &challenge.realm)
+            .await
+            .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+        );
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let store = Arc::new(MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store.clone());
+        method.cached_chain_id.set(42431).unwrap();
+
+        let validation = ChargeMethodTrait::validate(&method, &credential, &request)
+            .await
+            .unwrap();
+        assert_eq!(validation.details["mode"], "proof");
+
+        let fingerprint =
+            proof::proof_fingerprint(&challenge.id, signer.address(), 42431, &signature).unwrap();
+        let key = format!("mpp:proof:{:x}", fingerprint);
+        assert!(store.get(&key).await.unwrap().is_none());
+
+        let receipt = ChargeMethodTrait::broadcast(&method, &credential, &request)
+            .await
+            .unwrap();
+        assert_eq!(receipt.reference, challenge.id);
+        assert!(store.get(&key).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_local_validation_rejects_invalid_credentials_before_broadcast() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        method.cached_chain_id.set(42431).unwrap();
+
+        let zero_request = test_charge_request_with_amount("0");
+        let paid_request = test_charge_request_with_amount("1");
+
+        let mut wrong_method = test_proof_challenge(&zero_request).to_echo();
+        wrong_method.method = "stripe".into();
+        let mut wrong_intent = test_proof_challenge(&zero_request).to_echo();
+        wrong_intent.intent = "session".into();
+        let mut wrong_chain_request = zero_request.clone();
+        wrong_chain_request.method_details = Some(serde_json::json!({ "chainId": 1 }));
+
+        let cases = vec![
+            (
+                "method",
+                PaymentCredential::new(
+                    wrong_method,
+                    crate::protocol::core::PaymentPayload::proof("0x00"),
+                ),
+                zero_request.clone(),
+                "Method mismatch",
+            ),
+            (
+                "intent",
+                PaymentCredential::new(
+                    wrong_intent,
+                    crate::protocol::core::PaymentPayload::proof("0x00"),
+                ),
+                zero_request.clone(),
+                "Intent mismatch",
+            ),
+            (
+                "chain",
+                PaymentCredential::new(
+                    test_proof_challenge(&wrong_chain_request).to_echo(),
+                    crate::protocol::core::PaymentPayload::proof("0x00"),
+                ),
+                wrong_chain_request,
+                "Chain ID mismatch",
+            ),
+            (
+                "zero-hash",
+                PaymentCredential::new(
+                    test_proof_challenge(&zero_request).to_echo(),
+                    crate::protocol::core::PaymentPayload::hash("0x00"),
+                ),
+                zero_request.clone(),
+                "Zero-amount challenges require a proof credential",
+            ),
+            (
+                "positive-proof",
+                PaymentCredential::new(
+                    test_proof_challenge(&paid_request).to_echo(),
+                    crate::protocol::core::PaymentPayload::proof("0x00"),
+                ),
+                paid_request.clone(),
+                "Proof credentials are only valid for zero-amount challenges",
+            ),
+            (
+                "proof-source",
+                PaymentCredential::with_source(
+                    test_proof_challenge(&zero_request).to_echo(),
+                    "invalid-source",
+                    crate::protocol::core::PaymentPayload::proof("0x00"),
+                ),
+                zero_request.clone(),
+                "Proof credential source is invalid",
+            ),
+            (
+                "transaction",
+                PaymentCredential::new(
+                    test_proof_challenge(&paid_request).to_echo(),
+                    crate::protocol::core::PaymentPayload::transaction("not-hex"),
+                ),
+                paid_request.clone(),
+                "Invalid transaction bytes",
+            ),
+            (
+                "hash",
+                PaymentCredential::new(
+                    test_proof_challenge(&paid_request).to_echo(),
+                    crate::protocol::core::PaymentPayload::hash("not-hex"),
+                ),
+                paid_request,
+                "Invalid transaction hash",
+            ),
+        ];
+
+        for (name, credential, request, expected) in cases {
+            let error = ChargeMethodTrait::validate(&method, &credential, &request)
+                .await
+                .unwrap_err();
+            assert!(error.message.contains(expected), "{name}: {error}");
+        }
     }
 
     #[tokio::test]
