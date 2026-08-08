@@ -384,16 +384,31 @@ where
 
             let receipt_header = match verifier.verify_with_body(&credential, &body).await {
                 Ok(r) => r,
-                Err(e) => {
-                    return Ok(error_response(
-                        StatusCode::PAYMENT_REQUIRED,
-                        &format!("Payment verification failed: {e}"),
-                    ));
+                Err(_e) => {
+                    return Ok(match verifier.challenge_with_body(&body) {
+                        Ok(challenge) => challenge_response(&challenge),
+                        Err(e) => error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Failed to generate challenge: {e}"),
+                        ),
+                    });
                 }
             };
 
             let req = Request::from_parts(parts, http_body_util::Full::new(body));
             let mut resp = inner.call(req).await?;
+
+            let existing_cc = resp
+                .headers()
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+            if let Ok(val) = HeaderValue::from_str(&cache_control) {
+                resp.headers_mut().insert(header::CACHE_CONTROL, val);
+            }
 
             if let Ok(val) = HeaderValue::from_str(&receipt_header) {
                 resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
@@ -831,6 +846,7 @@ mod tests {
     struct BodyAwareVerifier {
         challenge_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
         verify_body: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        accept: bool,
     }
 
     impl PaymentVerifier for BodyAwareVerifier {
@@ -856,7 +872,14 @@ mod tests {
             body: &[u8],
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
             *self.verify_body.lock().unwrap() = Some(body.to_vec());
-            Box::pin(async { Ok("mock-receipt-token".to_string()) })
+            let accept = self.accept;
+            Box::pin(async move {
+                if accept {
+                    Ok("mock-receipt-token".to_string())
+                } else {
+                    Err("invalid payment".to_string())
+                }
+            })
         }
     }
 
@@ -888,6 +911,7 @@ mod tests {
         let layer = PaymentBodyLayer::new(BodyAwareVerifier {
             challenge_body: challenge_body.clone(),
             verify_body: Arc::new(std::sync::Mutex::new(None)),
+            accept: true,
         });
         let mut svc = layer.layer(BodyEchoService);
 
@@ -911,15 +935,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_body_service_valid_auth_verifies_and_replays_body() {
+    async fn test_body_service_failed_verification_returns_body_bound_challenge() {
+        use tower_service::Service;
+
+        let challenge_body = Arc::new(std::sync::Mutex::new(None));
+        let layer = PaymentBodyLayer::new(BodyAwareVerifier {
+            challenge_body: challenge_body.clone(),
+            verify_body: Arc::new(std::sync::Mutex::new(None)),
+            accept: false,
+        });
+        let mut svc = layer.layer(BodyEchoService);
+
+        let req = Request::builder()
+            .uri("/premium")
+            .header(header::AUTHORIZATION, "Payment eyJmYWtlIjp0cnVlfQ")
+            .body(http_body_util::Full::new(Bytes::from_static(
+                br#"{"query":"paid"}"#,
+            )))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            resp.headers().get(WWW_AUTHENTICATE_HEADER).unwrap(),
+            "Payment id=\"body-bound\""
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            challenge_body.lock().unwrap().as_deref(),
+            Some(br#"{"query":"paid"}"#.as_slice())
+        );
+    }
+
+    #[derive(Clone)]
+    struct CachingBodyEchoService;
+
+    impl tower_service::Service<Request<http_body_util::Full<Bytes>>> for CachingBodyEchoService {
+        type Response = Response<Vec<u8>>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<Vec<u8>>, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<http_body_util::Full<Bytes>>) -> Self::Future {
+            Box::pin(async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let mut resp = Response::new(body.to_vec());
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=60"),
+                );
+                Ok(resp)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_body_service_success_preserves_receipt_and_cache_directives() {
         use tower_service::Service;
 
         let verify_body = Arc::new(std::sync::Mutex::new(None));
         let layer = PaymentBodyLayer::new(BodyAwareVerifier {
             challenge_body: Arc::new(std::sync::Mutex::new(None)),
             verify_body: verify_body.clone(),
+            accept: true,
         });
-        let mut svc = layer.layer(BodyEchoService);
+        let mut svc = layer.layer(CachingBodyEchoService);
 
         let req = Request::builder()
             .uri("/premium")
@@ -936,6 +1022,19 @@ mod tests {
             resp.headers().get(PAYMENT_RECEIPT_HEADER).unwrap(),
             "mock-receipt-token"
         );
+        let cache_control = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let directives: Vec<_> = cache_control
+            .split(',')
+            .map(|directive| directive.trim())
+            .collect();
+        assert!(directives.contains(&"public"));
+        assert!(directives.contains(&"max-age=60"));
+        assert!(directives.contains(&"private"));
         assert_eq!(
             verify_body.lock().unwrap().as_deref(),
             Some(br#"{"query":"paid"}"#.as_slice())
