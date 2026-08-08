@@ -11,7 +11,6 @@
 
 ### Patch Changes
 
-- Rejected payment challenges containing malformed RFC 3339 `expires` timestamps during header parsing. (by @brendanjryan, [#100](https://github.com/tempoxyz/mpp-tools/issues/100))
 - Added configurable incremental 402 challenge retries for HTTP clients. (by @DerekCofausper, [#315](https://github.com/tempoxyz/mpp-rs/pull/315))
 - Rejected oversized `WWW-Authenticate` `request` parameters before decoding payment challenges. (by @DerekCofausper, [#315](https://github.com/tempoxyz/mpp-rs/pull/315))
 - Updated README documentation with an expanded protocol description, added an MPP SDKs table listing official implementations in multiple languages, and cleaned up URLs and prose throughout. (by @DerekCofausper, [#315](https://github.com/tempoxyz/mpp-rs/pull/315))
