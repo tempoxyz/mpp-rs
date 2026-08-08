@@ -173,9 +173,12 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
                 }
                 i += 1;
             }
-            if i < bytes.len() {
-                i += 1;
+            if i >= bytes.len() {
+                return Err(MppError::invalid_challenge_reason(
+                    "Unterminated quoted-string".to_string(),
+                ));
             }
+            i += 1;
             value
         } else {
             let value_start = i;
@@ -276,13 +279,23 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         }
     }
 
+    let expires = params.get("expires").cloned();
+    if let Some(ref e) = expires {
+        if !is_iso8601_timestamp(e) {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Invalid expires timestamp: {}",
+                e
+            )));
+        }
+    }
+
     Ok(PaymentChallenge {
         id,
         realm,
         method,
         intent,
         request,
-        expires: params.get("expires").cloned(),
+        expires,
         description: params.get("description").cloned(),
         digest,
         opaque: params.get("opaque").map(Base64UrlJson::from_raw),
@@ -996,6 +1009,27 @@ mod tests {
         let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", id="b""#;
         let err = parse_www_authenticate(header).unwrap_err();
         assert!(err.to_string().contains("Duplicate parameter"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_unterminated_quoted_param() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="oops"#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Unterminated quoted-string"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_invalid_expires() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", expires="not-a-date""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Invalid expires timestamp"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_accepts_valid_expires() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", expires="2099-01-01T00:00:00Z""#;
+        let challenge = parse_www_authenticate(header).unwrap();
+        assert_eq!(challenge.expires.as_deref(), Some("2099-01-01T00:00:00Z"));
     }
 
     #[test]
