@@ -21,6 +21,9 @@ pub enum HttpError {
     /// Request could not be cloned (required for retry)
     CloneFailed,
 
+    /// A redirect changed the request origin before returning a payment challenge
+    CrossOriginRedirect,
+
     /// Payment provider error
     Payment(MppError),
 
@@ -41,6 +44,9 @@ impl fmt::Display for HttpError {
             Self::InvalidChallenge(msg) => write!(f, "invalid challenge: {}", msg),
             Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),
             Self::CloneFailed => write!(f, "request could not be cloned for retry"),
+            Self::CrossOriginRedirect => {
+                write!(f, "Refusing to send payment credential across redirect")
+            }
             Self::Payment(e) => write!(f, "payment failed: {}", e),
             #[cfg(feature = "client")]
             Self::Request(e) => write!(f, "HTTP request failed: {}", e),
