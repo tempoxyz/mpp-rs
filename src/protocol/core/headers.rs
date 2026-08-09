@@ -252,7 +252,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     }
     let realm = require_param!(params, "realm").clone();
     let method_raw = require_param!(params, "method").clone();
-    if method_raw.is_empty() || !method_raw.bytes().all(|c| c.is_ascii_lowercase()) {
+    if method_raw.is_empty() || !method_raw.chars().all(|c| c.is_ascii_lowercase()) {
         return Err(MppError::invalid_challenge_reason(format!(
             "Invalid method: \"{}\". Must match method-name ABNF.",
             method_raw

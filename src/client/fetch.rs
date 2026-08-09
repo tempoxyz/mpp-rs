@@ -257,11 +257,19 @@ async fn send_with_payment<P: PaymentProvider>(
             .as_ref()
             .is_some_and(|request_url| request_url.origin() != resp.url().origin())
         {
+            let err = HttpError::CrossOriginRedirect;
+            events
+                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                    challenge: None,
+                    error: err.to_string(),
+                    reason: None,
+                }))
+                .await;
             pending_payments
                 .rollback()
                 .await
                 .map_err(HttpError::Payment)?;
-            return Err(HttpError::CrossOriginRedirect);
+            return Err(err);
         }
 
         let www_auth_values: Vec<&str> = resp
@@ -843,10 +851,25 @@ mod tests {
             );
             let source_url = spawn_server(source).await;
             let provider = MockProvider::new();
+            let events = ClientEvents::default();
+            let failed_count = Arc::new(AtomicU32::new(0));
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_none());
+                        assert_eq!(
+                            ctx.error,
+                            "Refusing to send payment credential across redirect"
+                        );
+                    }
+                }
+            });
 
             let err = reqwest::Client::new()
                 .get(format!("{source_url}/paid"))
-                .send_with_payment(&provider)
+                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
                 .await
                 .unwrap_err();
 
@@ -857,6 +880,7 @@ mod tests {
             );
             assert_eq!(provider.call_count(), 0);
             assert_eq!(authorization_observed.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]

@@ -462,6 +462,22 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_challenges_rejects_invalid_method_name() {
+        let mut challenge = serde_json::to_value(test_challenge()).unwrap();
+        challenge["method"] = json!("123");
+        let error = json!({
+            "code": PAYMENT_REQUIRED_CODE,
+            "message": "Payment Required",
+            "data": {
+                "httpStatus": 402,
+                "challenges": [challenge]
+            }
+        });
+
+        assert!(extract_challenges(&error).is_none());
+    }
+
+    #[test]
     fn test_extract_challenges_no_data() {
         let error = json!({
             "code": PAYMENT_REQUIRED_CODE,
