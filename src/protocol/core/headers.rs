@@ -173,9 +173,12 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
                 }
                 i += 1;
             }
-            if i < bytes.len() {
-                i += 1;
+            if i >= bytes.len() {
+                return Err(MppError::invalid_challenge_reason(
+                    "Unterminated quoted-string",
+                ));
             }
+            i += 1;
             value
         } else {
             let value_start = i;
@@ -658,6 +661,14 @@ mod tests {
 
         let parsed = parse_www_authenticate(&header).unwrap();
         assert_eq!(parsed.description, Some("Pay \"here\" now".to_string()));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_unterminated_quoted_string() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="oops"#;
+
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Unterminated quoted-string"));
     }
 
     #[test]
