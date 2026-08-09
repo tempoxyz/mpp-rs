@@ -252,7 +252,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     }
     let realm = require_param!(params, "realm").clone();
     let method_raw = require_param!(params, "method").clone();
-    if method_raw.is_empty() || !method_raw.chars().all(|c| c.is_ascii_lowercase()) {
+    if method_raw.is_empty() || !method_raw.bytes().all(|c| c.is_ascii_lowercase()) {
         return Err(MppError::invalid_challenge_reason(format!(
             "Invalid method: \"{}\". Must match method-name ABNF.",
             method_raw
@@ -1020,6 +1020,17 @@ mod tests {
             r#"Payment id="abc", realm="api", method="1tempo", intent="charge", request="e30""#;
         let err = parse_www_authenticate(header).unwrap_err();
         assert!(err.to_string().contains("Invalid method"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_non_letter_method_names() {
+        for method in ["123", "*", "tempo!"] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
+            );
+            let err = parse_www_authenticate(&header).unwrap_err();
+            assert!(err.to_string().contains("Invalid method"));
+        }
     }
 
     #[test]
