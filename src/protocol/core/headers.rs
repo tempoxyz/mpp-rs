@@ -1052,6 +1052,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_www_authenticate_rejects_non_letter_method_names() {
+        for method in ["123", "*", "tempo!"] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
+            );
+            let err = parse_www_authenticate(&header).unwrap_err();
+            assert!(err.to_string().contains("Invalid method"));
+        }
+    }
+
+    #[test]
     fn test_parse_www_authenticate_rejects_mixed_case_method_name() {
         let header =
             r#"Payment id="abc", realm="api", method="Tempo", intent="charge", request="e30""#;

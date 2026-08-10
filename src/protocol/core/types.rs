@@ -28,7 +28,7 @@ use crate::error::{MppError, Result};
 /// let method2: MethodName = "TEMPO".into();
 /// assert_eq!(method2.as_str(), "tempo");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct MethodName(String);
 
@@ -79,6 +79,22 @@ impl From<&str> for MethodName {
 impl From<String> for MethodName {
     fn from(s: String) -> Self {
         Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for MethodName {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let method = Self(String::deserialize(deserializer)?);
+        if method.is_valid() {
+            Ok(method)
+        } else {
+            Err(serde::de::Error::custom(
+                "invalid method name: must contain only lowercase ASCII letters",
+            ))
+        }
     }
 }
 
@@ -402,6 +418,15 @@ mod tests {
 
         let parsed: MethodName = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, method);
+    }
+
+    #[test]
+    fn test_method_name_deserialization_rejects_invalid_names() {
+        for method in ["", "123", "*", "tempo!", "TEMPO"] {
+            let json = serde_json::to_string(method).unwrap();
+            let error = serde_json::from_str::<MethodName>(&json).unwrap_err();
+            assert!(error.to_string().contains("invalid method name"));
+        }
     }
 
     #[test]

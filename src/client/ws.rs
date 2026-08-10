@@ -182,6 +182,23 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_transport_rejects_invalid_method_name() {
+        let response = WsServerMessage::Challenge {
+            challenge: serde_json::json!({
+                "id": "ch-1",
+                "realm": "test",
+                "method": "123",
+                "intent": "charge",
+                "request": "eyJ0ZXN0IjoidmFsdWUifQ"
+            }),
+            error: None,
+        };
+
+        let error = ws().get_challenge(&response).unwrap_err();
+        assert!(error.to_string().contains("invalid method name"));
+    }
+
+    #[test]
     fn test_ws_server_message_need_voucher() {
         let json = r#"{"type":"needVoucher","channelId":"0xabc","requiredCumulative":"2000","acceptedCumulative":"1000","deposit":"5000"}"#;
         let parsed: WsServerMessage = serde_json::from_str(json).unwrap();

@@ -253,6 +253,25 @@ async fn send_with_payment<P: PaymentProvider>(
             return Ok(resp);
         }
 
+        if url
+            .as_ref()
+            .is_some_and(|request_url| request_url.origin() != resp.url().origin())
+        {
+            let err = HttpError::CrossOriginRedirect;
+            events
+                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                    challenge: None,
+                    error: err.to_string(),
+                    reason: None,
+                }))
+                .await;
+            pending_payments
+                .rollback()
+                .await
+                .map_err(HttpError::Payment)?;
+            return Err(err);
+        }
+
         let www_auth_values: Vec<&str> = resp
             .headers()
             .get_all(WWW_AUTHENTICATE)
@@ -792,6 +811,76 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
             assert_eq!(call_count.load(Ordering::SeqCst), 2); // initial 402 + retry
+        }
+
+        #[tokio::test]
+        async fn cross_origin_redirect_before_402_is_rejected() {
+            let (_, www_auth) = test_challenge();
+            let authorization_observed = Arc::new(AtomicU32::new(0));
+            let observed = authorization_observed.clone();
+            let target = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    let observed = observed.clone();
+                    async move {
+                        if req.headers().contains_key("authorization") {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                    }
+                }),
+            );
+            let target_url = spawn_server(target).await;
+            let source = Router::new().route(
+                "/paid",
+                get(move || {
+                    let target_url = target_url.clone();
+                    async move {
+                        (
+                            AxumStatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, format!("{target_url}/paid"))],
+                            "redirect",
+                        )
+                    }
+                }),
+            );
+            let source_url = spawn_server(source).await;
+            let provider = MockProvider::new();
+            let events = ClientEvents::default();
+            let failed_count = Arc::new(AtomicU32::new(0));
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_none());
+                        assert_eq!(
+                            ctx.error,
+                            "Refusing to send payment credential across redirect"
+                        );
+                    }
+                }
+            });
+
+            let err = reqwest::Client::new()
+                .get(format!("{source_url}/paid"))
+                .send_with_payment_options(&provider, &AcceptPaymentPolicy::Always, events)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, HttpError::CrossOriginRedirect));
+            assert_eq!(
+                err.to_string(),
+                "Refusing to send payment credential across redirect"
+            );
+            assert_eq!(provider.call_count(), 0);
+            assert_eq!(authorization_observed.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]

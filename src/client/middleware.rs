@@ -17,6 +17,7 @@ use crate::client::events::{
     CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
 use crate::client::provider::{PaymentContext, PaymentProvider, PendingPayments};
+use crate::client::HttpError;
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
@@ -212,6 +213,21 @@ where
         for attempt in 0..self.max_payment_retries {
             if resp.status() != StatusCode::PAYMENT_REQUIRED {
                 return Ok(resp);
+            }
+
+            if payment_context.url.origin() != resp.url().origin() {
+                let error = HttpError::CrossOriginRedirect.to_string();
+                self.events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: None,
+                        error: error.clone(),
+                        reason: None,
+                    }))
+                    .await;
+                rollback_middleware_payments(&mut pending_payments).await?;
+                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
+                    error
+                )));
             }
 
             let www_auth_values: Vec<&str> = resp
@@ -642,6 +658,77 @@ mod tests {
             assert_eq!(provider.commit_count(), 1);
             assert_eq!(provider.rollback_count(), 0);
             assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn cross_origin_redirect_before_402_is_rejected() {
+            let (_, www_auth) = test_challenge();
+            let authorization_observed = Arc::new(AtomicU32::new(0));
+            let observed = authorization_observed.clone();
+            let target = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    let observed = observed.clone();
+                    async move {
+                        if req.headers().contains_key("authorization") {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                    }
+                }),
+            );
+            let target_url = spawn_server(target).await;
+            let source = Router::new().route(
+                "/paid",
+                get(move || {
+                    let target_url = target_url.clone();
+                    async move {
+                        (
+                            AxumStatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, format!("{target_url}/paid"))],
+                            "redirect",
+                        )
+                    }
+                }),
+            );
+            let source_url = spawn_server(source).await;
+            let provider = TestProvider::new();
+            let events = ClientEvents::default();
+            let failed_count = Arc::new(AtomicU32::new(0));
+            let _failed_sub = events.on_payment_failed({
+                let failed_count = failed_count.clone();
+                move |ctx| {
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(ctx.challenge.is_none());
+                        assert_eq!(
+                            ctx.error,
+                            "Refusing to send payment credential across redirect"
+                        );
+                    }
+                }
+            });
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+                .build();
+
+            let err = client
+                .get(format!("{source_url}/paid"))
+                .send()
+                .await
+                .unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains("Refusing to send payment credential across redirect"));
+            assert_eq!(provider.call_count(), 0);
+            assert_eq!(authorization_observed.load(Ordering::SeqCst), 0);
+            assert_eq!(failed_count.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]
