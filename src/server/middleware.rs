@@ -389,6 +389,19 @@ where
             let req = Request::from_parts(parts, http_body_util::Full::new(body));
             let mut resp = inner.call(req).await?;
 
+            // Receipt responses MUST be Cache-Control: private (spec §11.10).
+            let existing_cc = resp
+                .headers()
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+            if let Ok(val) = HeaderValue::from_str(&cache_control) {
+                resp.headers_mut().insert(header::CACHE_CONTROL, val);
+            }
+
             if let Ok(val) = HeaderValue::from_str(&receipt_header) {
                 resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
             }
@@ -869,7 +882,12 @@ mod tests {
         fn call(&mut self, req: Request<http_body_util::Full<Bytes>>) -> Self::Future {
             Box::pin(async move {
                 let body = req.into_body().collect().await.unwrap().to_bytes();
-                Ok(Response::new(body.to_vec()))
+                let mut response = Response::new(body.to_vec());
+                response.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("max-age=60"),
+                );
+                Ok(response)
             })
         }
     }
@@ -929,6 +947,10 @@ mod tests {
         assert_eq!(
             resp.headers().get(PAYMENT_RECEIPT_HEADER).unwrap(),
             "mock-receipt-token"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "max-age=60, private"
         );
         assert_eq!(
             verify_body.lock().unwrap().as_deref(),
