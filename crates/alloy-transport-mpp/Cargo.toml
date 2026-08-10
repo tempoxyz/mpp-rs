@@ -42,17 +42,17 @@ url = "2"
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 http = "1"
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
-# Pinned to match the version used by alloy-transport-ws 2.0.x.
-tokio-tungstenite = "0.28"
+# Pinned to match the version used by alloy-transport-ws 2.x.
+tokio-tungstenite = "0.29"
 rustls = { version = "0.23", default-features = false, optional = true }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
-# Pinned to match the version used by alloy-transport-ws 2.0.x so the
+# Pinned to match the version used by alloy-transport-ws 2.x so the
 # WebSocketConfig types align between the integration tests and the crate.
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 
 [features]
 # Ring is the lightweight default. Consumers that require a different TLS
