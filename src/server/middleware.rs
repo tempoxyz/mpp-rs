@@ -369,26 +369,20 @@ where
                             ));
                         }
                     };
-                    let mut resp = Response::new(ResBody::default());
-                    *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
-                    resp.headers_mut().insert(
-                        WWW_AUTHENTICATE_HEADER,
-                        HeaderValue::from_str(&challenge)
-                            .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
-                    );
-                    resp.headers_mut()
-                        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                    return Ok(resp);
+                    return Ok(challenge_response(&challenge));
                 }
             };
 
             let receipt_header = match verifier.verify_with_body(&credential, &body).await {
                 Ok(r) => r,
-                Err(e) => {
-                    return Ok(error_response(
-                        StatusCode::PAYMENT_REQUIRED,
-                        &format!("Payment verification failed: {e}"),
-                    ));
+                Err(_e) => {
+                    return Ok(match verifier.challenge_with_body(&body) {
+                        Ok(challenge) => challenge_response(&challenge),
+                        Err(e) => error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Failed to generate challenge: {e}"),
+                        ),
+                    });
                 }
             };
 
@@ -939,6 +933,66 @@ mod tests {
         assert_eq!(
             verify_body.lock().unwrap().as_deref(),
             Some(br#"{"query":"paid"}"#.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_body_service_invalid_auth_returns_body_bound_challenge() {
+        use tower_service::Service;
+
+        #[derive(Clone)]
+        struct RejectingBodyVerifier;
+
+        impl PaymentVerifier for RejectingBodyVerifier {
+            fn challenge(&self) -> Result<String, String> {
+                unreachable!("body middleware must use challenge_with_body")
+            }
+
+            fn challenge_with_body(&self, body: &[u8]) -> Result<String, String> {
+                assert_eq!(body, br#"{"query":"paid"}"#);
+                Ok(concat!(
+                    "Payment id=\"replacement\", realm=\"test\", method=\"tempo\", ",
+                    "intent=\"charge\", request=\"e30\""
+                )
+                .to_string())
+            }
+
+            fn verify(
+                &self,
+                _credential: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+                unreachable!("body middleware must use verify_with_body")
+            }
+
+            fn verify_with_body(
+                &self,
+                _credential: &str,
+                _body: &[u8],
+            ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+                Box::pin(async { Err("payment rejected".to_string()) })
+            }
+        }
+
+        let layer = PaymentBodyLayer::new(RejectingBodyVerifier);
+        let mut svc = layer.layer(BodyEchoService);
+        let req = Request::builder()
+            .uri("/premium")
+            .header(header::AUTHORIZATION, "Payment invalid")
+            .body(http_body_util::Full::new(Bytes::from_static(
+                br#"{"query":"paid"}"#,
+            )))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        let challenge = resp.headers().get(WWW_AUTHENTICATE_HEADER).unwrap();
+        let parsed =
+            crate::protocol::core::headers::parse_www_authenticate(challenge.to_str().unwrap())
+                .unwrap();
+        assert_eq!(parsed.id, "replacement");
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
         );
     }
 
