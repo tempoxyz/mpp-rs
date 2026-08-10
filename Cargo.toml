@@ -28,7 +28,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.dependencies]
-tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "72974b5b400c340273551152a366870dc5f92bbd", default-features = false }
+tempo-alloy = { version = "1.10.1", git = "https://github.com/tempoxyz/tempo", rev = "c93d08a9b6b26baa3026a4f280e5d82aa2d65643", default-features = false }
 
 [features]
 default = ["reqwest-default-tls"]
