@@ -173,9 +173,12 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
                 }
                 i += 1;
             }
-            if i < bytes.len() {
-                i += 1;
+            if i >= bytes.len() {
+                return Err(MppError::invalid_challenge_reason(
+                    "Unterminated quoted-string",
+                ));
             }
+            i += 1;
             value
         } else {
             let value_start = i;
@@ -276,13 +279,22 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         }
     }
 
+    let expires = params.get("expires").cloned();
+    if let Some(ref timestamp) = expires {
+        if !is_iso8601_timestamp(timestamp) {
+            return Err(MppError::invalid_challenge_reason(
+                "Invalid expires timestamp",
+            ));
+        }
+    }
+
     Ok(PaymentChallenge {
         id,
         realm,
         method,
         intent,
         request,
-        expires: params.get("expires").cloned(),
+        expires,
         description: params.get("description").cloned(),
         digest,
         opaque: params.get("opaque").map(Base64UrlJson::from_raw),
@@ -610,6 +622,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_www_authenticate_rejects_invalid_expires_timestamp() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", expires="not-a-date""#;
+
+        let err = parse_www_authenticate(header).unwrap_err();
+
+        assert!(err.to_string().contains("Invalid expires timestamp"));
+    }
+
+    #[test]
     fn test_parse_www_authenticate_case_insensitive() {
         let header =
             r#"payment id="test", realm="api", method="tempo", intent="charge", request="e30""#;
@@ -640,6 +661,14 @@ mod tests {
 
         let parsed = parse_www_authenticate(&header).unwrap();
         assert_eq!(parsed.description, Some("Pay \"here\" now".to_string()));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_unterminated_quoted_string() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="oops"#;
+
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Unterminated quoted-string"));
     }
 
     #[test]
