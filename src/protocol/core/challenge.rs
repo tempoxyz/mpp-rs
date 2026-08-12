@@ -814,6 +814,10 @@ pub struct Receipt {
     /// subscription intent (activation and renewal).
     #[serde(rename = "subscriptionId", skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<String>,
+
+    /// Method-specific receipt fields not defined by the core protocol.
+    #[serde(flatten)]
+    pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Receipt {
@@ -827,6 +831,7 @@ impl Receipt {
             reference: reference.into(),
             external_id: None,
             subscription_id: None,
+            extensions: serde_json::Map::new(),
         }
     }
 
@@ -1088,6 +1093,7 @@ mod tests {
             reference: "0xabc".to_string(),
             external_id: None,
             subscription_id: None,
+            extensions: serde_json::Map::new(),
         };
         assert!(success.is_success());
         assert!(success.external_id.is_none());

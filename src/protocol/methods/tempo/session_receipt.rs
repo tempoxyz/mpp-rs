@@ -127,6 +127,7 @@ impl SessionReceipt {
             reference: self.reference.clone(),
             external_id: None,
             subscription_id: None,
+            extensions: serde_json::Map::new(),
         }
     }
 }
