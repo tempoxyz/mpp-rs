@@ -76,6 +76,10 @@ impl ChargeMethod {
         &self.payment_method_types
     }
 
+    fn idempotency_key(challenge_id: &str, spt: &str) -> String {
+        format!("mpp_{challenge_id}_{spt}")
+    }
+
     /// Create a Stripe PaymentIntent with the given SPT.
     async fn create_payment_intent(
         &self,
@@ -221,7 +225,7 @@ impl ChargeMethodTrait for ChargeMethod {
                 metadata.extend(user_meta);
             }
 
-            let idempotency_key = format!("mppx_{}_{}", challenge.id, payload.spt);
+            let idempotency_key = Self::idempotency_key(&challenge.id, &payload.spt);
 
             let (pi_id, status) = this
                 .create_payment_intent(
@@ -272,5 +276,13 @@ mod tests {
         );
         assert_eq!(method.network_id(), "my-network");
         assert_eq!(method.payment_method_types(), &["card", "us_bank_account"]);
+    }
+
+    #[test]
+    fn test_idempotency_key_uses_mpp_prefix() {
+        assert_eq!(
+            ChargeMethod::idempotency_key("challenge-id", "spt_test"),
+            "mpp_challenge-id_spt_test"
+        );
     }
 }
