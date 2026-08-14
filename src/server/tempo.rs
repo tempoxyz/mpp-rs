@@ -33,6 +33,7 @@ pub struct TempoBuilder {
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
     pub(crate) fee_payer: bool,
+    pub(crate) machine_token_enabled: bool,
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
@@ -92,6 +93,15 @@ impl TempoBuilder {
     /// that will sponsor transaction fees.
     pub fn fee_payer(mut self, enabled: bool) -> Self {
         self.fee_payer = enabled;
+        self
+    }
+
+    /// Advertise canonical first-party machine-token funding for charges.
+    ///
+    /// Clients that support this hint prefer machineUSD and atomically settle
+    /// the configured challenge currency through the canonical swapper.
+    pub fn machine_token_enabled(mut self, enabled: bool) -> Self {
+        self.machine_token_enabled = enabled;
         self
     }
 
@@ -180,6 +190,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         secret_key: None,
         decimals: 6,
         fee_payer: false,
+        machine_token_enabled: false,
         chain_id: None,
         fee_payer_signer: None,
         fee_payer_allowed_fee_tokens: None,

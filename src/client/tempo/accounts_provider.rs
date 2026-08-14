@@ -272,7 +272,7 @@ impl TempoAccountsProvider {
 
         let rpc_provider = super::rpc_provider(self.settlement_rpc_url(charge.chain_id())?);
         let charge =
-            super::provider::apply_autoswap(charge, self.autoswap.as_ref(), &rpc_provider, from)
+            super::provider::apply_funding(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
         let request = charge.accounts_request(from)?;
         self.wallet
@@ -392,7 +392,7 @@ impl PaymentProvider for TempoAccountsProvider {
         )?;
         let rpc_provider = super::rpc_provider(self.settlement_rpc_url(charge.chain_id())?);
         let charge =
-            super::provider::apply_autoswap(charge, self.autoswap.as_ref(), &rpc_provider, from)
+            super::provider::apply_funding(charge, self.autoswap.as_ref(), &rpc_provider, from)
                 .await?;
 
         let signed = charge

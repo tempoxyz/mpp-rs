@@ -99,6 +99,7 @@
 
 pub mod charge;
 pub mod fee_payer_envelope;
+pub mod machine_token;
 pub mod network;
 #[cfg(feature = "tempo")]
 pub mod precompile_voucher;

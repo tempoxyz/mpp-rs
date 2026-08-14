@@ -40,6 +40,9 @@ pub trait TempoChargeExt {
     /// Check if fee sponsorship is enabled.
     fn fee_payer(&self) -> bool;
 
+    /// Check whether the canonical first-party machine token is enabled.
+    fn machine_token_enabled(&self) -> bool;
+
     /// Get the memo from methodDetails, if present.
     fn memo(&self) -> Option<String>;
 
@@ -89,6 +92,14 @@ impl TempoChargeExt for ChargeRequest {
         self.method_details
             .as_ref()
             .and_then(|v| v.get("feePayer"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn machine_token_enabled(&self) -> bool {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("machineTokenEnabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }

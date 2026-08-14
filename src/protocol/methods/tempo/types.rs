@@ -53,6 +53,7 @@ pub struct Split {
 /// use mpp::protocol::methods::tempo::TempoMethodDetails;
 ///
 /// let details = TempoMethodDetails {
+///     machine_token_enabled: None,
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     memo: None,
@@ -62,6 +63,13 @@ pub struct Split {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TempoMethodDetails {
+    /// Whether clients should prefer the canonical first-party machine token.
+    #[serde(
+        rename = "machineTokenEnabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub machine_token_enabled: Option<bool>,
+
     /// Chain ID (42431 for Tempo Moderato)
     #[serde(rename = "chainId", skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<u64>,
@@ -90,6 +98,11 @@ pub struct TempoMethodDetails {
 }
 
 impl TempoMethodDetails {
+    /// Check whether first-party machine-token funding is enabled.
+    pub fn machine_token_enabled(&self) -> bool {
+        self.machine_token_enabled.unwrap_or(false)
+    }
+
     /// Check if fee sponsorship is enabled.
     pub fn fee_payer(&self) -> bool {
         self.fee_payer.unwrap_or(false)
@@ -113,6 +126,7 @@ mod tests {
     #[test]
     fn test_tempo_method_details_serialization() {
         let details = TempoMethodDetails {
+            machine_token_enabled: Some(true),
             chain_id: Some(42431),
             fee_payer: Some(true),
             memo: None,
@@ -122,10 +136,12 @@ mod tests {
         let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("\"chainId\":42431"));
         assert!(json.contains("\"feePayer\":true"));
+        assert!(json.contains("\"machineTokenEnabled\":true"));
 
         let parsed: TempoMethodDetails = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.chain_id, Some(42431));
         assert!(parsed.fee_payer());
+        assert!(parsed.machine_token_enabled());
         assert!(parsed.is_tempo_moderato());
     }
 
@@ -176,6 +192,7 @@ mod tests {
     #[test]
     fn test_serialization_with_memo() {
         let details = TempoMethodDetails {
+            machine_token_enabled: None,
             chain_id: Some(42431),
             fee_payer: Some(true),
             memo: Some("0xabcdef".to_string()),
