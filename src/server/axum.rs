@@ -1154,6 +1154,7 @@ mod tests {
                         reference: "0xabc".into(),
                         external_id: None,
                         subscription_id: None,
+                        extensions: serde_json::Map::new(),
                     })
                 } else {
                     Err("payment rejected".into())
@@ -1229,6 +1230,7 @@ mod tests {
                 reference: "0xbody-aware".into(),
                 external_id: None,
                 subscription_id: None,
+                extensions: serde_json::Map::new(),
             })))
         }
 
@@ -1337,6 +1339,7 @@ mod tests {
             reference: "0xabc".into(),
             external_id: None,
             subscription_id: None,
+            extensions: serde_json::Map::new(),
         };
 
         let resp = WithReceipt {
@@ -1533,6 +1536,7 @@ mod tests {
                     reference: "0xlegacy".into(),
                     external_id: None,
                     subscription_id: None,
+                    extensions: serde_json::Map::new(),
                 })))
             }
         }
@@ -1724,6 +1728,7 @@ mod tests {
                     reference: "0xroute-aware".into(),
                     external_id: None,
                     subscription_id: None,
+                    extensions: serde_json::Map::new(),
                 })))
             }
 

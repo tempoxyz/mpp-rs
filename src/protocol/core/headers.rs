@@ -765,6 +765,7 @@ mod tests {
             reference: "0xabc123".to_string(),
             external_id: None,
             subscription_id: None,
+            extensions: serde_json::Map::new(),
         };
 
         let header = format_receipt(&receipt).unwrap();
@@ -784,6 +785,7 @@ mod tests {
             reference: "0xabc123".to_string(),
             external_id: None,
             subscription_id: Some("sub_123".to_string()),
+            extensions: serde_json::Map::new(),
         };
 
         let header = format_receipt(&receipt).unwrap();
@@ -802,6 +804,17 @@ mod tests {
         let parsed = parse_receipt(&header).unwrap();
 
         assert_eq!(parsed.subscription_id.as_deref(), Some("sub_123"));
+    }
+
+    #[test]
+    fn test_receipt_preserves_method_extension_fields() {
+        let json = r#"{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc123","originTxHash":"0xdef456"}"#;
+        let parsed = parse_receipt(&base64url_encode(json.as_bytes())).unwrap();
+
+        assert_eq!(parsed.extensions["originTxHash"], "0xdef456");
+
+        let reparsed = parse_receipt(&format_receipt(&parsed).unwrap()).unwrap();
+        assert_eq!(reparsed.extensions["originTxHash"], "0xdef456");
     }
 
     #[test]
