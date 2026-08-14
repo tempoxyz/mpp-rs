@@ -25,6 +25,16 @@ pub struct ChannelDescriptor {
     pub expiring_nonce_hash: String,
 }
 
+/// Route preimage bound into a machine-token channel descriptor salt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettlementRoute {
+    pub adapter: String,
+    pub recipient: String,
+    pub target_token: String,
+    pub route_salt: String,
+}
+
 /// Server-provided reusable TIP-1034 channel state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +46,8 @@ pub struct SessionSnapshot {
     pub close_requested_at: Option<String>,
     pub deposit: String,
     pub descriptor: ChannelDescriptor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_route: Option<SettlementRoute>,
     pub escrow: String,
     /// Highest server-accepted voucher, used to resume into an empty store.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +101,11 @@ where
 ///     min_voucher_delta: Some("1000".to_string()),
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
+///     machine_token_enabled: None,
 ///     operator: None,
+///     settlement_adapter: None,
+///     settlement_recipient: None,
+///     settlement_token: None,
 ///     session_protocol: None,
 ///     session_snapshot: None,
 /// };
@@ -111,6 +127,20 @@ pub struct TempoSessionMethodDetails {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_payer: Option<bool>,
+
+    /// Set when the channel is funded in machineUSD and settles through the
+    /// canonical swapper into the request currency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_token_enabled: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_adapter: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_recipient: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_token: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
@@ -151,6 +181,8 @@ pub enum SessionCredentialPayload {
         transaction: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settlement_route: Option<SettlementRoute>,
         #[serde(rename = "authorizedSigner", skip_serializing_if = "Option::is_none")]
         authorized_signer: Option<String>,
         #[serde(rename = "cumulativeAmount")]
@@ -166,6 +198,8 @@ pub enum SessionCredentialPayload {
         transaction: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settlement_route: Option<SettlementRoute>,
         #[serde(rename = "additionalDeposit")]
         additional_deposit: String,
     },
@@ -175,6 +209,8 @@ pub enum SessionCredentialPayload {
         channel_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settlement_route: Option<SettlementRoute>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
         signature: String,
@@ -185,6 +221,8 @@ pub enum SessionCredentialPayload {
         channel_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settlement_route: Option<SettlementRoute>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
         signature: String,
@@ -229,6 +267,9 @@ pub trait TempoSessionExt {
 
     /// Check if fee sponsorship is enabled.
     fn fee_payer(&self) -> bool;
+
+    /// Whether canonical machine-token session settlement is enabled.
+    fn machine_token_enabled(&self) -> bool;
 
     /// Get the TIP-1034 operator address from methodDetails, if present.
     fn operator(&self) -> Option<String>;
@@ -290,6 +331,14 @@ impl TempoSessionExt for SessionRequest {
         self.method_details
             .as_ref()
             .and_then(|v| v.get("feePayer"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn machine_token_enabled(&self) -> bool {
+        self.method_details
+            .as_ref()
+            .and_then(|v| v.get("machineTokenEnabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
@@ -375,6 +424,10 @@ mod tests {
             min_voucher_delta: Some("1000".to_string()),
             chain_id: Some(42431),
             fee_payer: Some(true),
+            machine_token_enabled: Some(true),
+            settlement_adapter: None,
+            settlement_recipient: None,
+            settlement_token: None,
             operator: Some("0x1111111111111111111111111111111111111111".to_string()),
             session_protocol: Some(SESSION_PROTOCOL_TIP1034.to_string()),
             session_snapshot: None,
@@ -393,6 +446,7 @@ mod tests {
         assert_eq!(parsed.min_voucher_delta.as_deref(), Some("1000"));
         assert_eq!(parsed.chain_id, Some(42431));
         assert_eq!(parsed.fee_payer, Some(true));
+        assert_eq!(parsed.machine_token_enabled, Some(true));
         assert_eq!(
             parsed.operator.as_deref(),
             Some("0x1111111111111111111111111111111111111111")
@@ -411,6 +465,10 @@ mod tests {
             min_voucher_delta: None,
             chain_id: None,
             fee_payer: None,
+            machine_token_enabled: None,
+            settlement_adapter: None,
+            settlement_recipient: None,
+            settlement_token: None,
             operator: None,
             session_protocol: None,
             session_snapshot: None,
@@ -436,6 +494,7 @@ mod tests {
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx456".to_string(),
             descriptor: None,
+            settlement_route: None,
             authorized_signer: Some("0xsigner789".to_string()),
             cumulative_amount: "10000".to_string(),
             signature: "0xsig".to_string(),
@@ -473,6 +532,7 @@ mod tests {
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx456".to_string(),
             descriptor: None,
+            settlement_route: None,
             authorized_signer: None,
             cumulative_amount: "10000".to_string(),
             signature: "0xsig".to_string(),
@@ -499,6 +559,7 @@ mod tests {
             channel_id: "0xchannel123".to_string(),
             transaction: "0xtx789".to_string(),
             descriptor: None,
+            settlement_route: None,
             additional_deposit: "5000".to_string(),
         };
 
@@ -530,6 +591,7 @@ mod tests {
         let payload = SessionCredentialPayload::Voucher {
             channel_id: "0xchannel123".to_string(),
             descriptor: None,
+            settlement_route: None,
             cumulative_amount: "15000".to_string(),
             signature: "0xvouchersig".to_string(),
         };
@@ -549,6 +611,7 @@ mod tests {
                 descriptor,
                 cumulative_amount,
                 signature,
+                ..
             } => {
                 assert_eq!(channel_id, "0xchannel123");
                 assert!(descriptor.is_none());
@@ -564,6 +627,7 @@ mod tests {
         let payload = SessionCredentialPayload::Close {
             channel_id: "0xchannel123".to_string(),
             descriptor: None,
+            settlement_route: None,
             cumulative_amount: "20000".to_string(),
             signature: "0xclosesig".to_string(),
         };
@@ -581,6 +645,7 @@ mod tests {
                 descriptor,
                 cumulative_amount,
                 signature,
+                ..
             } => {
                 assert_eq!(channel_id, "0xchannel123");
                 assert!(descriptor.is_none());
