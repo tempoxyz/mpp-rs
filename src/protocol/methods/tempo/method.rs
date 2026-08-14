@@ -236,6 +236,14 @@ enum ParsedTransferLog {
     },
 }
 
+struct ReceiptSenderPolicy<'a> {
+    expected_sender: Address,
+    source: Option<&'a str>,
+    validate_sender: Option<&'a ValidateSenderCallback>,
+    transaction_sender: Address,
+    settlement_senders: &'a [Address],
+}
+
 impl ParsedTransferLog {
     fn address(&self) -> Address {
         match self {
@@ -354,6 +362,7 @@ fn parse_hash_credential_source(
     Ok(Some(parsed.address))
 }
 
+#[cfg(test)]
 fn match_receipt_transfer_logs(
     logs: &[serde_json::Value],
     expected_sender: Address,
@@ -361,6 +370,26 @@ fn match_receipt_transfer_logs(
     expected: &[Transfer],
     source: Option<&str>,
     validate_sender: Option<&ValidateSenderCallback>,
+) -> Result<Vec<MatchedTransferLog>, VerificationError> {
+    match_receipt_transfer_logs_with_settlement(
+        logs,
+        currency,
+        expected,
+        ReceiptSenderPolicy {
+            expected_sender,
+            source,
+            validate_sender,
+            transaction_sender: expected_sender,
+            settlement_senders: &[],
+        },
+    )
+}
+
+fn match_receipt_transfer_logs_with_settlement(
+    logs: &[serde_json::Value],
+    currency: Address,
+    expected: &[Transfer],
+    sender_policy: ReceiptSenderPolicy<'_>,
 ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
     let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
     sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
@@ -409,14 +438,17 @@ fn match_receipt_transfer_logs(
 
                 // On a sender mismatch, validate_sender may authorize the log.
                 let sender = parsed.from();
-                if sender != expected_sender {
-                    let authorized = validate_sender.is_some_and(|cb| {
-                        cb(SenderValidation {
-                            expected_sender,
-                            sender,
-                            source,
-                        })
-                    });
+                if sender != sender_policy.expected_sender {
+                    let authorized = (sender_policy.transaction_sender
+                        == sender_policy.expected_sender
+                        && sender_policy.settlement_senders.contains(&sender))
+                        || sender_policy.validate_sender.is_some_and(|cb| {
+                            cb(SenderValidation {
+                                expected_sender: sender_policy.expected_sender,
+                                sender,
+                                source: sender_policy.source,
+                            })
+                        });
                     if !authorized {
                         continue;
                     }
@@ -491,6 +523,16 @@ pub struct SenderValidation<'a> {
 /// return `true` to accept.
 pub type ValidateSenderCallback =
     dyn for<'a> Fn(SenderValidation<'a>) -> bool + Send + Sync + 'static;
+
+fn request_settlement_senders(charge: &ChargeRequest, chain_id: u64) -> Vec<Address> {
+    if charge.machine_token_enabled() {
+        super::machine_token::settlement_sender(chain_id)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
 
 /// Tempo charge method for one-time payment verification.
 ///
@@ -775,11 +817,15 @@ where
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
         let matched_logs = self.verify_tip20_transfers(
             &receipt,
-            expected_sender,
             currency,
             &expected,
-            source,
-            self.validate_sender.as_deref(),
+            ReceiptSenderPolicy {
+                expected_sender,
+                source,
+                validate_sender: self.validate_sender.as_deref(),
+                transaction_sender: receipt.from(),
+                settlement_senders: &request_settlement_senders(charge, expected_chain_id),
+            },
         )?;
 
         if charge.memo().is_none() {
@@ -809,11 +855,9 @@ where
     fn verify_tip20_transfers(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
-        expected_sender: Address,
         currency: Address,
         expected: &[Transfer],
-        source: Option<&str>,
-        validate_sender: Option<&ValidateSenderCallback>,
+        sender_policy: ReceiptSenderPolicy<'_>,
     ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
         let receipt_json = serde_json::to_value(receipt)
             .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
@@ -823,19 +867,13 @@ where
             .and_then(|v| v.as_array())
             .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
 
-        match_receipt_transfer_logs(
-            logs,
-            expected_sender,
-            currency,
-            expected,
-            source,
-            validate_sender,
-        )
+        match_receipt_transfer_logs_with_settlement(logs, currency, expected, sender_policy)
     }
 
     /// Validate that a transaction contains all expected payment calls (supports splits).
     ///
     /// Uses order-insensitive matching with memo-specificity sorting.
+    #[cfg(test)]
     fn validate_transaction_transfers(
         &self,
         tx_bytes: &[u8],
@@ -844,6 +882,26 @@ where
         expected_chain_id: u64,
         require_exact_calls: bool,
     ) -> Result<(), VerificationError> {
+        self.validate_transaction_transfers_with_machine_token(
+            tx_bytes,
+            currency,
+            expected,
+            expected_chain_id,
+            require_exact_calls,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    fn validate_transaction_transfers_with_machine_token(
+        &self,
+        tx_bytes: &[u8],
+        currency: Address,
+        expected: &[Transfer],
+        expected_chain_id: u64,
+        require_exact_calls: bool,
+        machine_token_enabled: bool,
+    ) -> Result<Option<Address>, VerificationError> {
         if currency.is_zero() {
             return Err(VerificationError::new(
                 "Invalid currency: currency cannot be the zero address".to_string(),
@@ -878,6 +936,16 @@ where
                 "Fee-sponsored transaction gas limit {} exceeds maximum {}",
                 tx.gas_limit, policy.max_gas
             )));
+        }
+
+        let machine_token_route = machine_token_enabled
+            .then(|| {
+                super::machine_token::match_route(&tx.calls, expected_chain_id, currency, expected)
+            })
+            .flatten();
+
+        if let Some(route) = machine_token_route {
+            return Ok(Some(route.settlement_sender));
         }
 
         let transfer_calls = get_transfer_calls(&tx.calls)?;
@@ -994,7 +1062,7 @@ where
             ));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     async fn broadcast_transaction(
@@ -1029,12 +1097,13 @@ where
             tx_bytes.to_vec()
         };
 
-        self.validate_transaction_transfers(
+        let settlement_sender = self.validate_transaction_transfers_with_machine_token(
             &final_tx_bytes,
             currency,
             &expected,
             expected_chain_id,
             charge.fee_payer(),
+            charge.machine_token_enabled(),
         )?;
 
         // The sponsor pays the gas here, so simulate first and bail if the tx
@@ -1080,8 +1149,19 @@ where
         }
 
         // Verify the receipt contains the expected TIP-20 transfer(s).
-        let matched_logs =
-            self.verify_tip20_transfers(&receipt, receipt.from(), currency, &expected, None, None)?;
+        let settlement_senders = settlement_sender.into_iter().collect::<Vec<_>>();
+        let matched_logs = self.verify_tip20_transfers(
+            &receipt,
+            currency,
+            &expected,
+            ReceiptSenderPolicy {
+                expected_sender: receipt.from(),
+                source: None,
+                validate_sender: None,
+                transaction_sender: receipt.from(),
+                settlement_senders: &settlement_senders,
+            },
+        )?;
         if charge.memo().is_none() {
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
@@ -2016,6 +2096,71 @@ mod tests {
         assert!(matched.contains(&MatchedTransferLog::Transfer));
     }
 
+    #[test]
+    fn test_match_receipt_transfer_logs_accepts_canonical_settlement_sender() {
+        let currency = Address::repeat_byte(0x20);
+        let payer = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let swapper = super::super::machine_token::MACHINE_TOKEN_SWAPPER_MAINNET;
+        let logs = vec![make_transfer_with_memo_log(
+            currency, recipient, recipient, amount, memo,
+        )];
+        let expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: Some(memo),
+        }];
+
+        let rejected = match_receipt_transfer_logs_with_settlement(
+            &logs,
+            currency,
+            &expected,
+            ReceiptSenderPolicy {
+                expected_sender: payer,
+                source: None,
+                validate_sender: None,
+                transaction_sender: payer,
+                settlement_senders: &[swapper],
+            },
+        );
+        assert!(rejected.is_err());
+
+        let logs = vec![make_transfer_with_memo_log(
+            currency, swapper, recipient, amount, memo,
+        )];
+        let matched = match_receipt_transfer_logs_with_settlement(
+            &logs,
+            currency,
+            &expected,
+            ReceiptSenderPolicy {
+                expected_sender: payer,
+                source: None,
+                validate_sender: None,
+                transaction_sender: payer,
+                settlement_senders: &[swapper],
+            },
+        )
+        .unwrap();
+        assert_eq!(matched, vec![MatchedTransferLog::Memo(memo)]);
+
+        let wrong_transaction_sender = Address::repeat_byte(0x44);
+        assert!(match_receipt_transfer_logs_with_settlement(
+            &logs,
+            currency,
+            &expected,
+            ReceiptSenderPolicy {
+                expected_sender: payer,
+                source: None,
+                validate_sender: None,
+                transaction_sender: wrong_transaction_sender,
+                settlement_senders: &[swapper],
+            },
+        )
+        .is_err());
+    }
+
     // ==================== Hash credential source validation ====================
 
     const HASH_SOURCE_INVALID: &str = "Hash credential source is invalid.";
@@ -2476,6 +2621,35 @@ mod tests {
         method
             .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
             .unwrap();
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_accepts_exact_machine_token_route() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        let currency = Address::repeat_byte(0x20);
+        let expected = vec![Transfer {
+            amount: U256::from(100u64),
+            recipient: Address::repeat_byte(0x33),
+            memo: Some([0xab; 32]),
+        }];
+        let route = super::super::machine_token::route(CHAIN_ID, currency, &expected).unwrap();
+        let tx_bytes = encode_signed_tx(route.calls.to_vec(), MAX_FEE_PAYER_GAS_LIMIT);
+
+        let settlement_sender = method
+            .validate_transaction_transfers_with_machine_token(
+                &tx_bytes, currency, &expected, CHAIN_ID, true, true,
+            )
+            .unwrap();
+        assert_eq!(settlement_sender, Some(route.settlement_sender));
+
+        assert!(method
+            .validate_transaction_transfers_with_machine_token(
+                &tx_bytes, currency, &expected, CHAIN_ID, true, false,
+            )
+            .is_err());
     }
 
     #[test]

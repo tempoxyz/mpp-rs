@@ -50,15 +50,35 @@ pub(super) async fn prepare_charge(
     from: alloy::primitives::Address,
 ) -> Result<TempoCharge, MppError> {
     let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
-    apply_autoswap(charge, autoswap, provider, from).await
+    apply_funding(charge, autoswap, provider, from).await
 }
 
-pub(super) async fn apply_autoswap(
+pub(super) async fn apply_funding(
     mut charge: TempoCharge,
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
 ) -> Result<TempoCharge, MppError> {
+    if charge.machine_token_enabled() {
+        let transfers = crate::protocol::methods::tempo::transfers::get_transfers(
+            charge.amount(),
+            charge.recipient(),
+            charge.memo(),
+            charge.splits(),
+        )?;
+        if let Some(route) = crate::protocol::methods::tempo::machine_token::find_route(
+            provider,
+            from,
+            charge.chain_id(),
+            charge.currency(),
+            &transfers,
+        )
+        .await
+        {
+            return Ok(charge.with_calls(route.calls.to_vec()));
+        }
+    }
+
     if let Some(config) = autoswap {
         if let Some(calls) = super::autoswap::resolve_autoswap_calls(
             provider,

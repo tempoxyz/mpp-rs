@@ -119,6 +119,7 @@ pub struct TempoCharge {
     memo: Option<[u8; 32]>,
     chain_id: u64,
     fee_payer: bool,
+    machine_token_enabled: bool,
     splits: Option<Vec<Split>>,
     calls: Option<Vec<Call>>,
 }
@@ -140,6 +141,7 @@ impl TempoCharge {
         let memo = parse_memo_bytes_checked(details.memo.as_deref())?;
         let chain_id = details.chain_id.unwrap_or(CHAIN_ID);
         let fee_payer = details.fee_payer();
+        let machine_token_enabled = details.machine_token_enabled();
         let splits = details.splits;
 
         get_transfers(amount, recipient, memo, splits.as_deref())?;
@@ -152,6 +154,7 @@ impl TempoCharge {
             memo,
             chain_id,
             fee_payer,
+            machine_token_enabled,
             splits,
             calls: None,
         })
@@ -198,6 +201,11 @@ impl TempoCharge {
     /// Whether fee sponsorship is requested.
     pub fn fee_payer(&self) -> bool {
         self.fee_payer
+    }
+
+    /// Whether the challenge enables canonical machine-token funding.
+    pub fn machine_token_enabled(&self) -> bool {
+        self.machine_token_enabled
     }
 
     /// Get the splits, if present.
@@ -251,6 +259,12 @@ impl TempoCharge {
         }
         self.calls.as_mut().unwrap().insert(0, call);
         Ok(self)
+    }
+
+    /// Replace the payment calls with one exact atomic route.
+    pub(crate) fn with_calls(mut self, calls: Vec<Call>) -> Self {
+        self.calls = Some(calls);
+        self
     }
 
     /// Sign the charge with default options.
