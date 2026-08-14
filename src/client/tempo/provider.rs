@@ -2,6 +2,7 @@
 
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::methods::tempo::TempoChargeExt;
 
 use super::autoswap::AutoswapConfig;
 use super::charge::{SignOptions, TempoCharge};
@@ -50,6 +51,37 @@ pub(super) async fn prepare_charge(
     from: alloy::primitives::Address,
 ) -> Result<TempoCharge, MppError> {
     let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
+    let details = challenge
+        .request
+        .decode::<crate::protocol::intents::ChargeRequest>()?
+        .tempo_method_details()?;
+    if details.machine_token_enabled() {
+        let transfers = crate::protocol::methods::tempo::transfers::get_transfers(
+            charge.amount(),
+            charge.recipient(),
+            charge.memo(),
+            charge.splits(),
+        )?;
+        if let Some(calls) = crate::protocol::methods::tempo::machine_token::route(
+            charge.chain_id(),
+            charge.currency(),
+            &transfers,
+        ) {
+            use tempo_alloy::contracts::precompiles::ITIP20;
+            let deployment =
+                crate::protocol::methods::tempo::machine_token::deployment(charge.chain_id())
+                    .unwrap();
+            if ITIP20::new(deployment.token, provider)
+                .balanceOf(from)
+                .call()
+                .await
+                .map(|balance| balance >= charge.amount())
+                .unwrap_or(false)
+            {
+                return Ok(charge.with_calls(calls.to_vec()));
+            }
+        }
+    }
     apply_autoswap(charge, autoswap, provider, from).await
 }
 

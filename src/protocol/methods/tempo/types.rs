@@ -55,8 +55,7 @@ pub struct Split {
 /// let details = TempoMethodDetails {
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
-///     memo: None,
-///     splits: None,
+///     ..Default::default()
 /// };
 /// assert!(details.fee_payer());
 /// ```
@@ -72,6 +71,13 @@ pub struct TempoMethodDetails {
     /// The server adds its fee payer signature before broadcasting.
     #[serde(rename = "feePayer", skip_serializing_if = "Option::is_none")]
     pub fee_payer: Option<bool>,
+
+    /// Whether the client may settle through Tempo's first-party machine-token route.
+    #[serde(
+        rename = "machineTokenEnabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub machine_token_enabled: Option<bool>,
 
     /// Optional memo for `transferWithMemo` calls.
     ///
@@ -95,6 +101,10 @@ impl TempoMethodDetails {
         self.fee_payer.unwrap_or(false)
     }
 
+    pub fn machine_token_enabled(&self) -> bool {
+        self.machine_token_enabled.unwrap_or(false)
+    }
+
     /// Check if this is for the Tempo Moderato network.
     pub fn is_tempo_moderato(&self) -> bool {
         self.chain_id == Some(MODERATO_CHAIN_ID)
@@ -115,6 +125,7 @@ mod tests {
         let details = TempoMethodDetails {
             chain_id: Some(42431),
             fee_payer: Some(true),
+            machine_token_enabled: None,
             memo: None,
             splits: None,
         };
@@ -133,6 +144,19 @@ mod tests {
     fn test_fee_payer_default() {
         let details = TempoMethodDetails::default();
         assert!(!details.fee_payer());
+        assert!(!details.machine_token_enabled());
+    }
+
+    #[test]
+    fn test_machine_token_serialization() {
+        let details = TempoMethodDetails {
+            machine_token_enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(details).unwrap()["machineTokenEnabled"],
+            true
+        );
     }
 
     #[test]
@@ -178,6 +202,7 @@ mod tests {
         let details = TempoMethodDetails {
             chain_id: Some(42431),
             fee_payer: Some(true),
+            machine_token_enabled: None,
             memo: Some("0xabcdef".to_string()),
             splits: None,
         };

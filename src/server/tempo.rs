@@ -33,6 +33,7 @@ pub struct TempoBuilder {
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
     pub(crate) fee_payer: bool,
+    pub(crate) machine_token_enabled: bool,
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<alloy::signers::local::PrivateKeySigner>,
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
@@ -92,6 +93,12 @@ impl TempoBuilder {
     /// that will sponsor transaction fees.
     pub fn fee_payer(mut self, enabled: bool) -> Self {
         self.fee_payer = enabled;
+        self
+    }
+
+    /// Enable first-party machine-token settlement for charge challenges.
+    pub fn machine_token_enabled(mut self, enabled: bool) -> Self {
+        self.machine_token_enabled = enabled;
         self
     }
 
@@ -180,6 +187,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         secret_key: None,
         decimals: 6,
         fee_payer: false,
+        machine_token_enabled: false,
         chain_id: None,
         fee_payer_signer: None,
         fee_payer_allowed_fee_tokens: None,
@@ -261,5 +269,14 @@ mod tests {
             builder.store.is_none(),
             "without_store() should clear the configured store"
         );
+    }
+
+    #[test]
+    fn tempo_builder_enables_machine_tokens() {
+        let builder = tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        })
+        .machine_token_enabled(true);
+        assert!(builder.machine_token_enabled);
     }
 }

@@ -253,6 +253,11 @@ impl TempoCharge {
         Ok(self)
     }
 
+    pub(crate) fn with_calls(mut self, calls: Vec<Call>) -> Self {
+        self.calls = Some(calls);
+        self
+    }
+
     /// Sign the charge with default options.
     ///
     /// This is the simple path — resolves the RPC provider from chain_id,

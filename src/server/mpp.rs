@@ -109,6 +109,7 @@ pub struct Mpp<M, S = ()> {
     recipient: Option<String>,
     decimals: u32,
     fee_payer: bool,
+    machine_token_enabled: bool,
     chain_id: Option<u64>,
     opaque: Option<Base64UrlJson>,
     events: ServerEvents,
@@ -131,6 +132,7 @@ where
             recipient: None,
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -154,6 +156,7 @@ where
             recipient: Some(recipient.into()),
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -176,6 +179,7 @@ where
             recipient: self.recipient,
             decimals: self.decimals,
             fee_payer: self.fee_payer,
+            machine_token_enabled: self.machine_token_enabled,
             chain_id: self.chain_id,
             opaque: self.opaque,
             events: self.events,
@@ -501,6 +505,9 @@ where
             let mut details = serde_json::Map::new();
             if options.fee_payer || self.fee_payer {
                 details.insert("feePayer".into(), serde_json::json!(true));
+            }
+            if self.machine_token_enabled {
+                details.insert("machineTokenEnabled".into(), serde_json::json!(true));
             }
             if let Some(chain_id) = self.chain_id {
                 details.insert("chainId".into(), serde_json::json!(chain_id));
@@ -1041,6 +1048,16 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     /// let challenge = mpp.charge("1.00")?;
     /// ```
     pub fn create(builder: super::TempoBuilder) -> Result<Self> {
+        if builder.machine_token_enabled {
+            let chain_id = builder
+                .chain_id
+                .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
+            if crate::protocol::methods::tempo::machine_token::deployment(chain_id).is_none() {
+                return Err(crate::error::MppError::InvalidConfig(format!(
+                    "machine tokens are not supported on chain ID {chain_id}"
+                )));
+            }
+        }
         let secret_key = builder
             .secret_key
             .or_else(|| std::env::var(SECRET_KEY_ENV_VAR).ok())
@@ -1085,6 +1102,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             recipient: Some(builder.recipient),
             decimals: builder.decimals,
             fee_payer: builder.fee_payer,
+            machine_token_enabled: builder.machine_token_enabled,
             chain_id: builder.chain_id,
             opaque: None,
             events: ServerEvents::default(),
@@ -1245,6 +1263,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             recipient: None,
             decimals: builder.decimals as u32,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -1899,6 +1918,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -2505,6 +2525,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -2582,6 +2603,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -2626,6 +2648,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),
@@ -2728,6 +2751,7 @@ mod tests {
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            machine_token_enabled: false,
             chain_id: None,
             opaque: None,
             events: ServerEvents::default(),

@@ -770,7 +770,21 @@ where
         let expected = Self::expected_transfers(charge)?;
 
         // Use the source address if present, otherwise the receipt sender.
-        let expected_sender = source_address.unwrap_or_else(|| receipt.from());
+        let machine_token_enabled = charge
+            .tempo_method_details()
+            .map_err(|e| VerificationError::new(format!("Invalid charge request: {e}")))?
+            .machine_token_enabled();
+        let expected_sender = if machine_token_enabled {
+            super::machine_token::deployment(expected_chain_id)
+                .ok_or_else(|| {
+                    VerificationError::new(format!(
+                        "Machine tokens are not supported on chain ID {expected_chain_id}"
+                    ))
+                })?
+                .swap
+        } else {
+            source_address.unwrap_or_else(|| receipt.from())
+        };
 
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
         let matched_logs = self.verify_tip20_transfers(
@@ -843,6 +857,7 @@ where
         expected: &[Transfer],
         expected_chain_id: u64,
         require_exact_calls: bool,
+        machine_token_enabled: bool,
     ) -> Result<(), VerificationError> {
         if currency.is_zero() {
             return Err(VerificationError::new(
@@ -878,6 +893,16 @@ where
                 "Fee-sponsored transaction gas limit {} exceeds maximum {}",
                 tx.gas_limit, policy.max_gas
             )));
+        }
+
+        if machine_token_enabled {
+            if super::machine_token::matches_route(&tx.calls, expected_chain_id, currency, expected)
+            {
+                return Ok(());
+            }
+            return Err(VerificationError::new(
+                "Invalid transaction: machine-token route does not match the charge".to_string(),
+            ));
         }
 
         let transfer_calls = get_transfer_calls(&tx.calls)?;
@@ -1035,6 +1060,10 @@ where
             &expected,
             expected_chain_id,
             charge.fee_payer(),
+            charge
+                .tempo_method_details()
+                .map_err(|e| VerificationError::new(format!("Invalid charge request: {e}")))?
+                .machine_token_enabled(),
         )?;
 
         // The sponsor pays the gas here, so simulate first and bail if the tx
@@ -1080,8 +1109,29 @@ where
         }
 
         // Verify the receipt contains the expected TIP-20 transfer(s).
-        let matched_logs =
-            self.verify_tip20_transfers(&receipt, receipt.from(), currency, &expected, None, None)?;
+        let machine_token_enabled = charge
+            .tempo_method_details()
+            .map_err(|e| VerificationError::new(format!("Invalid charge request: {e}")))?
+            .machine_token_enabled();
+        let expected_sender = if machine_token_enabled {
+            super::machine_token::deployment(expected_chain_id)
+                .ok_or_else(|| {
+                    VerificationError::new(format!(
+                        "Machine tokens are not supported on chain ID {expected_chain_id}"
+                    ))
+                })?
+                .swap
+        } else {
+            receipt.from()
+        };
+        let matched_logs = self.verify_tip20_transfers(
+            &receipt,
+            expected_sender,
+            currency,
+            &expected,
+            None,
+            None,
+        )?;
         if charge.memo().is_none() {
             assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
         }
@@ -2427,7 +2477,7 @@ mod tests {
         );
 
         let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap_err();
 
         assert!(
@@ -2474,7 +2524,7 @@ mod tests {
         );
 
         method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap();
     }
 
@@ -2529,7 +2579,7 @@ mod tests {
         );
 
         method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap();
     }
 
@@ -2566,7 +2616,7 @@ mod tests {
         );
 
         let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap_err();
 
         assert!(
@@ -2613,7 +2663,7 @@ mod tests {
         );
 
         let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap_err();
 
         assert!(error.to_string().contains("approve spender is not the DEX"));
@@ -2657,7 +2707,7 @@ mod tests {
         );
 
         let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap_err();
 
         assert!(error
@@ -2703,7 +2753,7 @@ mod tests {
         );
 
         let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap_err();
 
         assert!(error.to_string().contains("swap target is not the DEX"));
@@ -2734,7 +2784,7 @@ mod tests {
         );
 
         let error = method
-            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+            .validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true, false)
             .unwrap_err();
 
         assert!(error.to_string().contains("exceeds maximum"));
@@ -2775,6 +2825,7 @@ mod tests {
                 &expected,
                 CHAIN_ID,
                 true,
+                false,
             )
             .unwrap_err();
         assert!(error.to_string().contains("exceeds maximum 500000"));
@@ -2792,6 +2843,7 @@ mod tests {
                 &expected,
                 CHAIN_ID,
                 true,
+                false,
             )
             .expect("override should raise ceiling above default");
     }
