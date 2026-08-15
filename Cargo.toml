@@ -18,6 +18,7 @@ members = [
   "examples/axum-extractor",
   "examples/basic",
   "examples/catalog-client",
+  "examples/charge-relay",
   "examples/session/multi-fetch",
   "examples/session/sse",
   "examples/stripe",
@@ -45,6 +46,7 @@ tempo = [
   "tempo-alloy",
   "dep:async-trait",
   "dep:p256",
+  "dep:reqwest",
   "uuid",
 ]
 stripe = ["dep:reqwest", "reqwest?/form"]

@@ -11,7 +11,7 @@
 mod charge;
 mod session;
 
-pub use charge::ChargeMethod;
+pub use charge::{ChargeMethod, ChargeValidation};
 pub use session::SessionMethod;
 
 use std::fmt;

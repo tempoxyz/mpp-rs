@@ -1,6 +1,6 @@
 services:
   tempo-node:
-    image: ghcr.io/tempoxyz/tempo:latest
+    image: ghcr.io/tempoxyz/tempo:1.8.1
     container_name: tempo-dev-node
     command: >
       node --dev
