@@ -98,6 +98,8 @@
 //! ```
 
 pub mod charge;
+
+pub(crate) type DynSigner = dyn alloy::signers::Signer + Send + Sync;
 pub mod fee_payer_envelope;
 pub mod machine_token;
 pub mod network;

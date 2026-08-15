@@ -1217,7 +1217,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         let provider = super::tempo_provider(&builder.rpc_url)?;
         let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
         if let Some(signer) = builder.fee_payer_signer {
-            method = method.with_fee_payer(signer);
+            method = method.with_fee_payer_arc(signer);
         }
         if let Some(allowed_fee_tokens) = builder.fee_payer_allowed_fee_tokens {
             method = method.with_fee_payer_allowed_fee_tokens(allowed_fee_tokens);
