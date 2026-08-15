@@ -70,6 +70,8 @@ pub struct RecoveryScope {
     pub authorized_signer: Address,
     /// Protected service payee.
     pub payee: Address,
+    /// Settlement recipient/operator.
+    pub operator: Address,
     /// TIP-20 token.
     pub token: Address,
     /// TIP-1034 escrow/precompile.
@@ -190,6 +192,7 @@ pub fn hydrate_session_snapshot(
         cumulative_amount,
         deposit: state.deposit,
         descriptor: snapshot.descriptor.clone(),
+        settlement_route: snapshot.settlement_route.clone(),
         escrow,
         chain_id: snapshot.chain_id,
         opened: true,
@@ -203,10 +206,12 @@ fn validate_descriptor(
 ) -> Result<(), MppError> {
     let payer = parse_address("descriptor payer", &descriptor.payer)?;
     let payee = parse_address("descriptor payee", &descriptor.payee)?;
+    let operator = parse_address("descriptor operator", &descriptor.operator)?;
     let token = parse_address("descriptor token", &descriptor.token)?;
     let authority = descriptor_authority(descriptor)?;
     if payer != scope.payer
         || payee != scope.payee
+        || operator != scope.operator
         || token != scope.token
         || authority != scope.authorized_signer
     {
@@ -332,6 +337,7 @@ mod tests {
             payer: Address::repeat_byte(0x10),
             authorized_signer: authority,
             payee: Address::repeat_byte(0x20),
+            operator: Address::ZERO,
             token: Address::repeat_byte(0x30),
             escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
             chain_id: 4217,
@@ -354,6 +360,7 @@ mod tests {
                 cumulative_amount: 200,
                 deposit: 900,
                 descriptor,
+                settlement_route: None,
                 escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 4217,
                 opened: true,
@@ -402,6 +409,7 @@ mod tests {
             close_requested_at: None,
             deposit: "1000".into(),
             descriptor,
+            settlement_route: None,
             escrow: format!("{TIP20_CHANNEL_RESERVE_ADDRESS:#x}"),
             highest_voucher: Some(SnapshotVoucher {
                 channel_id: format!("{channel_id:#x}"),

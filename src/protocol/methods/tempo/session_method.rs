@@ -36,6 +36,9 @@ pub struct ChannelState {
     pub payer: Address,
     pub payee: Address,
     pub token: Address,
+    /// Immutable machine-token settlement route accepted at open.
+    #[serde(default)]
+    pub settlement_route: Option<super::session::SettlementRoute>,
     pub authorized_signer: Address,
     pub deposit: u128,
     pub settled_on_chain: u128,
@@ -221,6 +224,104 @@ fn validate_close_amount(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn machine_session_close_calls(
+    chain_id: u64,
+    escrow: Address,
+    descriptor: &super::session::ChannelDescriptor,
+    route: &super::session::SettlementRoute,
+    cumulative_amount: u128,
+    deposit: u128,
+    settled: u128,
+    signature: &[u8],
+) -> Result<Vec<tempo_alloy::primitives::transaction::Call>, VerificationError> {
+    use alloy::{
+        primitives::{Bytes, TxKind, U256},
+        sol_types::SolCall,
+    };
+    if cumulative_amount != deposit {
+        return Err(VerificationError::invalid_payload(
+            "machine-token sessions cannot close with a nonzero refund",
+        ));
+    }
+    let cumulative_amount = alloy::primitives::Uint::<96, 2>::from(cumulative_amount);
+    let parse_address = |value: &str| {
+        value
+            .parse::<Address>()
+            .map_err(|_| VerificationError::invalid_payload("invalid channel descriptor address"))
+    };
+    let descriptor_wire =
+        tempo_alloy::contracts::precompiles::ITIP20ChannelReserve::ChannelDescriptor {
+            payer: parse_address(&descriptor.payer)?,
+            payee: parse_address(&descriptor.payee)?,
+            operator: parse_address(&descriptor.operator)?,
+            token: parse_address(&descriptor.token)?,
+            salt: descriptor
+                .salt
+                .parse()
+                .map_err(|_| VerificationError::invalid_payload("invalid descriptor salt"))?,
+            authorizedSigner: parse_address(&descriptor.authorized_signer)?,
+            expiringNonceHash: descriptor.expiring_nonce_hash.parse().map_err(|_| {
+                VerificationError::invalid_payload("invalid descriptor expiringNonceHash")
+            })?,
+        };
+    let settle = tempo_alloy::contracts::precompiles::ITIP20ChannelReserve::settleCall::new((
+        descriptor_wire.clone(),
+        cumulative_amount,
+        Bytes::copy_from_slice(signature),
+    ));
+    let close = tempo_alloy::contracts::precompiles::ITIP20ChannelReserve::closeCall::new((
+        descriptor_wire,
+        cumulative_amount,
+        cumulative_amount,
+        Bytes::copy_from_slice(signature),
+    ));
+    let swap = crate::protocol::methods::tempo::machine_token::settle_session_call(
+        chain_id, descriptor, route,
+    )
+    .map_err(|error| VerificationError::invalid_payload(error.to_string()))?;
+    let close_call = tempo_alloy::primitives::transaction::Call {
+        to: TxKind::Call(escrow),
+        value: U256::ZERO,
+        input: Bytes::from(close.abi_encode()),
+    };
+    if settled == deposit {
+        return Ok(vec![close_call]);
+    }
+    Ok(vec![
+        tempo_alloy::primitives::transaction::Call {
+            to: TxKind::Call(escrow),
+            value: U256::ZERO,
+            input: Bytes::from(settle.abi_encode()),
+        },
+        swap,
+        close_call,
+    ])
+}
+
+fn validate_settlement_route(
+    channel: &ChannelState,
+    details: &TempoSessionMethodDetails,
+    route: Option<&super::session::SettlementRoute>,
+) -> Result<(), VerificationError> {
+    if details.machine_token_enabled != Some(true) {
+        return Ok(());
+    }
+    let route = route.ok_or_else(|| {
+        VerificationError::invalid_payload("machine-token credential is missing settlementRoute")
+    })?;
+    if channel.settlement_route.as_ref() != Some(route)
+        || details.settlement_adapter.as_deref() != Some(&route.adapter)
+        || details.settlement_recipient.as_deref() != Some(&route.recipient)
+        || details.settlement_token.as_deref() != Some(&route.target_token)
+    {
+        return Err(VerificationError::credential_mismatch(
+            "settlement route does not match the opened channel",
+        ));
+    }
+    Ok(())
+}
+
 // ==================== TempoSessionMethod ====================
 
 /// Configuration for the Tempo session method.
@@ -313,6 +414,10 @@ where
                 channel_id: None,
                 min_voucher_delta: None,
                 fee_payer: None,
+                machine_token_enabled: None,
+                settlement_adapter: None,
+                settlement_recipient: None,
+                settlement_token: None,
                 operator: None,
                 session_protocol: None,
                 session_snapshot: None,
@@ -447,6 +552,8 @@ where
     ) -> Result<Receipt, VerificationError> {
         let (
             channel_id_str,
+            descriptor,
+            settlement_route,
             cumulative_amount_str,
             signature_str,
             _authorized_signer_str,
@@ -454,6 +561,8 @@ where
         ) = match payload {
             SessionCredentialPayload::Open {
                 channel_id,
+                descriptor,
+                settlement_route,
                 cumulative_amount,
                 signature,
                 authorized_signer,
@@ -461,6 +570,8 @@ where
                 ..
             } => (
                 channel_id,
+                descriptor.as_ref(),
+                settlement_route.as_ref(),
                 cumulative_amount,
                 signature,
                 authorized_signer,
@@ -472,6 +583,41 @@ where
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
+
+        if details.machine_token_enabled == Some(true) {
+            let descriptor = descriptor.ok_or_else(|| {
+                VerificationError::invalid_payload(
+                    "machine-token open credential is missing its channel descriptor",
+                )
+            })?;
+            let route = settlement_route.ok_or_else(|| {
+                VerificationError::invalid_payload(
+                    "machine-token open credential is missing its settlement route",
+                )
+            })?;
+            let recipient = Self::parse_address(&route.recipient)?;
+            let target_token = Self::parse_address(&route.target_token)?;
+            let route_salt = route
+                .route_salt
+                .parse()
+                .map_err(|_| VerificationError::invalid_payload("invalid settlement routeSalt"))?;
+            let expected_salt =
+                crate::protocol::methods::tempo::machine_token::compute_session_salt(
+                    recipient,
+                    target_token,
+                    route_salt,
+                );
+            if descriptor.salt != expected_salt.to_string()
+                || details.settlement_adapter.as_deref() != Some(&route.adapter)
+                || details.settlement_recipient.as_deref() != Some(&route.recipient)
+                || details.settlement_token.as_deref() != Some(&route.target_token)
+            {
+                return Err(VerificationError::credential_mismatch(
+                    "machine-token settlement route is not bound to the descriptor",
+                ));
+            }
+        }
+        let accepted_settlement_route = settlement_route.cloned();
 
         // Broadcast the client's signed open transaction (approve + escrow.open).
         let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
@@ -590,6 +736,9 @@ where
                         // Channel already exists — update if higher.
                         if cumulative_amount > existing.highest_voucher_amount {
                             Ok(Some(ChannelState {
+                                settlement_route: existing
+                                    .settlement_route
+                                    .or_else(|| accepted_settlement_route.clone()),
                                 deposit: on_chain.deposit,
                                 settled_on_chain,
                                 spent,
@@ -620,6 +769,7 @@ where
                             payer: on_chain.payer,
                             payee: on_chain.payee,
                             token: on_chain.token,
+                            settlement_route: accepted_settlement_route,
                             authorized_signer,
                             deposit: on_chain.deposit,
                             settled_on_chain: on_chain.settled,
@@ -651,15 +801,22 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, _additional_deposit_str, transaction_str) = match payload {
-            SessionCredentialPayload::TopUp {
-                channel_id,
-                additional_deposit,
-                transaction,
-                ..
-            } => (channel_id, additional_deposit, transaction),
-            _ => unreachable!(),
-        };
+        let (channel_id_str, settlement_route, _additional_deposit_str, transaction_str) =
+            match payload {
+                SessionCredentialPayload::TopUp {
+                    channel_id,
+                    settlement_route,
+                    additional_deposit,
+                    transaction,
+                    ..
+                } => (
+                    channel_id,
+                    settlement_route.as_ref(),
+                    additional_deposit,
+                    transaction,
+                ),
+                _ => unreachable!(),
+            };
 
         let channel = self
             .store
@@ -677,6 +834,7 @@ where
                 "channel token does not match session currency",
             ));
         }
+        validate_settlement_route(&channel, details, settlement_route)?;
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
@@ -749,13 +907,20 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, cumulative_amount_str, signature_str) = match payload {
+        let (channel_id_str, settlement_route, cumulative_amount_str, signature_str) = match payload
+        {
             SessionCredentialPayload::Voucher {
                 channel_id,
+                settlement_route,
                 cumulative_amount,
                 signature,
                 ..
-            } => (channel_id, cumulative_amount, signature),
+            } => (
+                channel_id,
+                settlement_route.as_ref(),
+                cumulative_amount,
+                signature,
+            ),
             _ => unreachable!(),
         };
 
@@ -775,6 +940,7 @@ where
                 "channel token does not match session currency",
             ));
         }
+        validate_settlement_route(&channel, details, settlement_route)?;
 
         if channel.finalized {
             return Err(VerificationError::channel_closed("channel is finalized"));
@@ -867,15 +1033,24 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, cumulative_amount_str, signature_str) = match payload {
-            SessionCredentialPayload::Close {
-                channel_id,
-                cumulative_amount,
-                signature,
-                ..
-            } => (channel_id, cumulative_amount, signature),
-            _ => unreachable!(),
-        };
+        let (channel_id_str, descriptor, settlement_route, cumulative_amount_str, signature_str) =
+            match payload {
+                SessionCredentialPayload::Close {
+                    channel_id,
+                    descriptor,
+                    settlement_route,
+                    cumulative_amount,
+                    signature,
+                    ..
+                } => (
+                    channel_id,
+                    descriptor.as_ref(),
+                    settlement_route.as_ref(),
+                    cumulative_amount,
+                    signature,
+                ),
+                _ => unreachable!(),
+            };
 
         let channel = self
             .store
@@ -893,6 +1068,7 @@ where
                 "channel token does not match session currency",
             ));
         }
+        validate_settlement_route(&channel, details, settlement_route)?;
 
         if channel.finalized {
             return Err(VerificationError::channel_closed(
@@ -996,17 +1172,41 @@ where
                 VerificationError::network_error(format!("failed to get gas price: {}", e))
             })?;
 
+            let mut calls = vec![Call {
+                to: alloy::primitives::TxKind::Call(escrow),
+                value: alloy::primitives::U256::ZERO,
+                input: Bytes::from(close_data),
+            }];
+            if details.machine_token_enabled == Some(true) {
+                let descriptor = descriptor.ok_or_else(|| {
+                    VerificationError::invalid_payload(
+                        "machine-token close credential is missing its channel descriptor",
+                    )
+                })?;
+                let route = settlement_route.ok_or_else(|| {
+                    VerificationError::invalid_payload(
+                        "machine-token close credential is missing its settlement route",
+                    )
+                })?;
+                calls = machine_session_close_calls(
+                    chain_id,
+                    escrow,
+                    descriptor,
+                    route,
+                    cumulative_amount,
+                    on_chain.deposit,
+                    on_chain.settled,
+                    &sig_bytes,
+                )?;
+            }
+
             let tempo_tx = TempoTransaction {
                 chain_id,
                 nonce,
                 gas_limit: 2_000_000,
                 max_fee_per_gas: gas_price,
                 max_priority_fee_per_gas: gas_price,
-                calls: vec![Call {
-                    to: alloy::primitives::TxKind::Call(escrow),
-                    value: alloy::primitives::U256::ZERO,
-                    input: Bytes::from(close_data),
-                }],
+                calls,
                 ..Default::default()
             };
 
@@ -1239,6 +1439,10 @@ where
             min_voucher_delta: Some(self.config.min_voucher_delta.to_string()),
             channel_id: None,
             fee_payer: None,
+            machine_token_enabled: None,
+            settlement_adapter: None,
+            settlement_recipient: None,
+            settlement_token: None,
             operator: None,
             session_protocol: None,
             session_snapshot: None,
@@ -1295,14 +1499,44 @@ where
 
             let details = this.resolve_method_details(&request)?;
 
-            let expected_payee = request
+            let merchant = request
                 .recipient
                 .as_deref()
                 .ok_or_else(|| {
                     VerificationError::invalid_payload("session challenge missing recipient")
                 })
                 .and_then(Self::parse_address)?;
-            let expected_token = Self::parse_address(&request.currency)?;
+            let target_token = Self::parse_address(&request.currency)?;
+            let (expected_payee, expected_token) = if details.machine_token_enabled == Some(true) {
+                let (_, swapper) =
+                    crate::protocol::methods::tempo::machine_token::session_addresses(
+                        this.resolve_chain_id(&details),
+                    )
+                    .ok_or_else(|| {
+                        VerificationError::invalid_payload(
+                            "machine tokens are unsupported on the session chain",
+                        )
+                    })?;
+                if details.settlement_adapter.as_deref() != Some(&swapper.to_string())
+                    || details.settlement_recipient.as_deref() != Some(&merchant.to_string())
+                    || details.settlement_token.as_deref() != Some(&target_token.to_string())
+                {
+                    return Err(VerificationError::credential_mismatch(
+                        "machine-token settlement route does not match the session request",
+                    ));
+                }
+                crate::protocol::methods::tempo::machine_token::session_addresses(
+                    this.resolve_chain_id(&details),
+                )
+                .map(|(token, swapper)| (swapper, token))
+                .ok_or_else(|| {
+                    VerificationError::invalid_payload(
+                        "machine tokens are unsupported on the session chain",
+                    )
+                })?
+            } else {
+                (merchant, target_token)
+            };
 
             let payload: SessionCredentialPayload = credential.payload_as().map_err(|e| {
                 VerificationError::invalid_payload(format!("Expected session payload: {}", e))
@@ -1484,6 +1718,7 @@ mod tests {
             token: "0x3333333333333333333333333333333333333333"
                 .parse()
                 .unwrap(),
+            settlement_route: None,
             authorized_signer: "0x4444444444444444444444444444444444444444"
                 .parse()
                 .unwrap(),
@@ -2303,6 +2538,7 @@ mod tests {
                         payer,
                         payee,
                         token,
+                        settlement_route: None,
                         authorized_signer,
                         deposit: on_chain_deposit,
                         settled_on_chain: on_chain_settled,
@@ -2468,6 +2704,7 @@ mod tests {
                         token: "0x4444444444444444444444444444444444444444"
                             .parse()
                             .unwrap(),
+                        settlement_route: None,
                         authorized_signer: "0x5555555555555555555555555555555555555555"
                             .parse()
                             .unwrap(),
@@ -2812,6 +3049,7 @@ mod tests {
             SessionCredentialPayload::Voucher {
                 channel_id,
                 descriptor: None,
+                settlement_route: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2850,6 +3088,7 @@ mod tests {
             SessionCredentialPayload::Voucher {
                 channel_id,
                 descriptor: None,
+                settlement_route: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2889,6 +3128,7 @@ mod tests {
             SessionCredentialPayload::Voucher {
                 channel_id,
                 descriptor: None,
+                settlement_route: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2926,6 +3166,7 @@ mod tests {
             SessionCredentialPayload::Close {
                 channel_id,
                 descriptor: None,
+                settlement_route: None,
                 cumulative_amount: "1000".to_string(),
                 signature: format!("0x{}", "aa".repeat(65)),
             },
@@ -2964,6 +3205,7 @@ mod tests {
                 payload_type: "transaction".to_string(),
                 channel_id,
                 descriptor: None,
+                settlement_route: None,
                 additional_deposit: "5000".to_string(),
                 transaction: format!("0x{}", "bb".repeat(32)),
             },
@@ -3141,5 +3383,88 @@ mod tests {
     fn test_close_at_exact_deposit() {
         // close at deposit boundary should succeed
         assert!(validate_close_amount(10_000_000, 0, 0, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn machine_session_close_is_settle_swap_close_and_requires_full_consumption() {
+        use alloy::{
+            primitives::{Address, B256},
+            sol_types::SolCall,
+        };
+        use tempo_alloy::contracts::precompiles::ITIP20ChannelReserve;
+        let recipient = Address::repeat_byte(0x22);
+        let target = Address::repeat_byte(0x33);
+        let route_salt = B256::repeat_byte(0x44);
+        let salt = crate::protocol::methods::tempo::machine_token::compute_session_salt(
+            recipient, target, route_salt,
+        );
+        let (_, adapter) =
+            crate::protocol::methods::tempo::machine_token::session_addresses(42431).unwrap();
+        let (token, _) =
+            crate::protocol::methods::tempo::machine_token::session_addresses(42431).unwrap();
+        let descriptor = super::super::session::ChannelDescriptor {
+            payer: Address::repeat_byte(0x11).to_string(),
+            payee: adapter.to_string(),
+            operator: Address::repeat_byte(0x55).to_string(),
+            token: token.to_string(),
+            salt: salt.to_string(),
+            authorized_signer: Address::repeat_byte(0x66).to_string(),
+            expiring_nonce_hash: B256::repeat_byte(0x77).to_string(),
+        };
+        let route = super::super::session::SettlementRoute {
+            adapter: adapter.to_string(),
+            recipient: recipient.to_string(),
+            target_token: target.to_string(),
+            route_salt: route_salt.to_string(),
+        };
+        let calls = machine_session_close_calls(
+            42431,
+            Address::repeat_byte(0x88),
+            &descriptor,
+            &route,
+            100,
+            100,
+            0,
+            &[1; 64],
+        )
+        .unwrap();
+        assert_eq!(
+            &calls[0].input[..4],
+            &ITIP20ChannelReserve::settleCall::SELECTOR
+        );
+        assert_eq!(calls[1].to, alloy::primitives::TxKind::Call(adapter));
+        assert_eq!(
+            &calls[2].input[..4],
+            &ITIP20ChannelReserve::closeCall::SELECTOR
+        );
+        assert!(machine_session_close_calls(
+            42431,
+            Address::repeat_byte(0x88),
+            &descriptor,
+            &route,
+            99,
+            100,
+            0,
+            &[1; 64],
+        )
+        .unwrap_err()
+        .message
+        .contains("nonzero refund"));
+        let already_settled = machine_session_close_calls(
+            42431,
+            Address::repeat_byte(0x88),
+            &descriptor,
+            &route,
+            100,
+            100,
+            100,
+            &[1; 64],
+        )
+        .unwrap();
+        assert_eq!(already_settled.len(), 1);
+        assert_eq!(
+            &already_settled[0].input[..4],
+            &ITIP20ChannelReserve::closeCall::SELECTOR
+        );
     }
 }

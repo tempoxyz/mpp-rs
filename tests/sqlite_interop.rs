@@ -22,6 +22,7 @@ fn interop_entry(cumulative_amount: u128) -> StoredChannelEntry {
             salt: format!("{:#x}", B256::repeat_byte(0x33)),
             token: "0x0000000000000000000000000000000000000004".into(),
         },
+        settlement_route: None,
         escrow: "0x0000000000000000000000000000000000000005"
             .parse()
             .unwrap(),

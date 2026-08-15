@@ -907,6 +907,29 @@ where
             }
         }
 
+        if self.machine_token_enabled {
+            let chain_id = self
+                .chain_id
+                .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
+            let (_, adapter) =
+                crate::protocol::methods::tempo::machine_token::session_addresses(chain_id)
+                    .ok_or_else(|| {
+                        crate::error::MppError::InvalidConfig(format!(
+                            "machine tokens are not supported on chain ID {chain_id}"
+                        ))
+                    })?;
+            let details = method_details.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("machineTokenEnabled".to_string(), serde_json::json!(true));
+                obj.insert("settlementAdapter".to_string(), serde_json::json!(adapter));
+                obj.insert(
+                    "settlementRecipient".to_string(),
+                    serde_json::json!(recipient),
+                );
+                obj.insert("settlementToken".to_string(), serde_json::json!(currency));
+            }
+        }
+
         let request = SessionRequest {
             amount: amount.to_string(),
             unit_type: options.unit_type.map(|s| s.to_string()),

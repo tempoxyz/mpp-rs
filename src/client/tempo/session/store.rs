@@ -22,6 +22,8 @@ pub struct StoredChannelEntry {
     pub deposit: u128,
     /// Full descriptor required to derive the channel ID and sign vouchers.
     pub descriptor: ChannelDescriptor,
+    /// Immutable machine-token settlement route, when enabled.
+    pub settlement_route: Option<crate::protocol::methods::tempo::session::SettlementRoute>,
     /// TIP-1034 escrow/precompile address.
     pub escrow: Address,
     /// EVM chain ID.
@@ -33,6 +35,16 @@ pub struct StoredChannelEntry {
 impl StoredChannelEntry {
     /// Return the MPPx-compatible payment-scope key for this channel.
     pub fn key(&self) -> String {
+        if let Some(route) = &self.settlement_route {
+            return format!(
+                "{}:{}:{}:{:#x}:{}",
+                route.adapter.to_ascii_lowercase(),
+                route.recipient.to_ascii_lowercase(),
+                route.target_token.to_ascii_lowercase(),
+                self.escrow,
+                self.chain_id,
+            );
+        }
         channel_key(
             &self.descriptor.payee,
             &self.descriptor.token,
@@ -130,6 +142,8 @@ struct JsonChannelEntry {
     cumulative_amount: String,
     deposit: String,
     descriptor: ChannelDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settlement_route: Option<crate::protocol::methods::tempo::session::SettlementRoute>,
     escrow: String,
     chain_id: u64,
     opened: bool,
@@ -142,6 +156,7 @@ impl From<&StoredChannelEntry> for JsonChannelEntry {
             cumulative_amount: entry.cumulative_amount.to_string(),
             deposit: entry.deposit.to_string(),
             descriptor: entry.descriptor.clone(),
+            settlement_route: entry.settlement_route.clone(),
             escrow: format!("{:#x}", entry.escrow),
             chain_id: entry.chain_id,
             opened: entry.opened,
@@ -168,6 +183,7 @@ impl TryFrom<JsonChannelEntry> for StoredChannelEntry {
                 .map_err(|e| invalid("cumulativeAmount", e))?,
             deposit: entry.deposit.parse().map_err(|e| invalid("deposit", e))?,
             descriptor: entry.descriptor,
+            settlement_route: entry.settlement_route,
             escrow: entry.escrow.parse().map_err(|e| invalid("escrow", e))?,
             chain_id: entry.chain_id,
             opened: entry.opened,
@@ -387,6 +403,7 @@ mod sqlite {
                 deposit,
                 descriptor: serde_json::from_str(&descriptor)
                     .map_err(|e| ChannelStoreError::InvalidEntry(e.to_string()))?,
+                settlement_route: None,
                 escrow,
                 chain_id,
                 opened: state == "active",
@@ -659,6 +676,7 @@ mod tests {
                 salt: format!("{:#x}", B256::repeat_byte(0x33)),
                 token: "0x0000000000000000000000000000000000000004".into(),
             },
+            settlement_route: None,
             escrow: "0x0000000000000000000000000000000000000005"
                 .parse()
                 .unwrap(),

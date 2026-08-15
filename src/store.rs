@@ -708,6 +708,7 @@ mod adapter_tests {
             payer: Address::ZERO,
             payee: Address::ZERO,
             token: Address::ZERO,
+            settlement_route: None,
             authorized_signer: Address::ZERO,
             deposit: 1000,
             settled_on_chain: 0,

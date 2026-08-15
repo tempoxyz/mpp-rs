@@ -33,10 +33,7 @@ use self::recovery::{
     can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
     recover_stored_channel, RecoveryScope,
 };
-use self::store::{
-    channel_key as persistent_channel_key, ChannelStore, ChannelStoreLease, MemoryChannelStore,
-    StoredChannelEntry,
-};
+use self::store::{ChannelStore, ChannelStoreLease, MemoryChannelStore, StoredChannelEntry};
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
 use crate::client::{PaymentContext, PaymentProvider};
@@ -94,6 +91,8 @@ pub struct TempoSessionProvider {
     channel_id_to_key: Arc<Mutex<HashMap<String, String>>>,
     /// Newly prepared channels awaiting acceptance by the server.
     pending_opens: Arc<Mutex<HashMap<String, PendingOpen>>>,
+    settlement_routes:
+        Arc<Mutex<HashMap<String, crate::protocol::methods::tempo::session::SettlementRoute>>>,
     /// Optional callback for channel state changes.
     on_channel_update: Option<Arc<dyn Fn(&ChannelEntry) + Send + Sync>>,
     /// Last challenge received from the server, used for `close()`.
@@ -148,6 +147,7 @@ impl TempoSessionProvider {
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
             pending_opens: Arc::new(Mutex::new(HashMap::new())),
+            settlement_routes: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -337,6 +337,7 @@ impl TempoSessionProvider {
             cumulative_amount: entry.cumulative_amount,
             deposit: entry.deposit,
             descriptor,
+            settlement_route: entry.settlement_route.clone(),
             escrow: entry.escrow_contract,
             chain_id: entry.chain_id,
             opened: entry.opened,
@@ -444,18 +445,94 @@ impl TempoSessionProvider {
             cumulative_amount: entry.cumulative_amount,
             deposit: entry.deposit,
             descriptor: Some(entry.descriptor),
+            settlement_route: entry.settlement_route,
             escrow_contract: entry.escrow,
             chain_id: entry.chain_id,
             opened: entry.opened,
         })
     }
 
-    /// Cache key identifying the reusable payment scope.
-    ///
-    /// This intentionally matches MPPx: operator is channel identity, not
-    /// payment scope, while chain ID must prevent cross-network reuse.
-    fn channel_key(payee: &Address, currency: &Address, escrow: &Address, chain_id: u64) -> String {
+    /// Cache key identifying the reusable payment and settlement scope.
+    fn channel_key_with_operator(
+        payee: &Address,
+        _operator: &Address,
+        currency: &Address,
+        escrow: &Address,
+        chain_id: u64,
+    ) -> String {
         format!("{:#x}:{:#x}:{:#x}:{chain_id}", payee, currency, escrow)
+    }
+
+    #[cfg(test)]
+    fn channel_key(payee: &Address, currency: &Address, escrow: &Address, chain_id: u64) -> String {
+        Self::channel_key_with_operator(payee, &Address::ZERO, currency, escrow, chain_id)
+    }
+
+    fn payment_route(
+        session_req: &SessionRequest,
+        chain_id: u64,
+    ) -> Result<(Address, Address, Address), MppError> {
+        let merchant: Address = session_req
+            .recipient
+            .as_deref()
+            .ok_or_else(|| MppError::InvalidConfig("session challenge missing recipient".into()))?
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid recipient address".into()))?;
+        let target: Address = session_req
+            .currency
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid currency address".into()))?;
+        if session_req.machine_token_enabled() {
+            let (token, swapper) =
+                crate::protocol::methods::tempo::machine_token::session_addresses(chain_id)
+                    .ok_or_else(|| {
+                        MppError::InvalidConfig(format!(
+                            "machine tokens are not supported on chain ID {chain_id}"
+                        ))
+                    })?;
+            let details = session_req.tempo_session_details()?;
+            if details.settlement_adapter.as_deref() != Some(&swapper.to_string())
+                || details.settlement_recipient.as_deref() != Some(&merchant.to_string())
+                || details.settlement_token.as_deref() != Some(&target.to_string())
+            {
+                return Err(MppError::InvalidConfig(
+                    "machine-token settlement route does not match the session request".into(),
+                ));
+            }
+            Ok((swapper, Self::parse_operator(session_req)?, token))
+        } else {
+            Ok((merchant, Self::parse_operator(session_req)?, target))
+        }
+    }
+
+    fn payment_scope_key(
+        session_req: &SessionRequest,
+        payee: Address,
+        operator: Address,
+        token: Address,
+        escrow: Address,
+        chain_id: u64,
+    ) -> Result<String, MppError> {
+        if session_req.machine_token_enabled() {
+            let details = session_req.tempo_session_details()?;
+            return Ok(format!(
+                "{}:{}:{}:{:#x}:{}",
+                payee,
+                details
+                    .settlement_recipient
+                    .ok_or_else(|| MppError::InvalidConfig("missing settlement recipient".into()))?
+                    .to_ascii_lowercase(),
+                details
+                    .settlement_token
+                    .ok_or_else(|| MppError::InvalidConfig("missing settlement token".into()))?
+                    .to_ascii_lowercase(),
+                escrow,
+                chain_id,
+            ));
+        }
+        Ok(Self::channel_key_with_operator(
+            &payee, &operator, &token, &escrow, chain_id,
+        ))
     }
 
     /// Parse `methodDetails.operator` from a precompile session request.
@@ -487,21 +564,17 @@ impl TempoSessionProvider {
             .request
             .decode()
             .mpp_config("failed to decode session request")?;
-        let payee: Address = session_req
-            .recipient
-            .as_deref()
-            .ok_or_else(|| {
-                MppError::InvalidConfig("session challenge missing recipient".to_string())
-            })?
-            .parse()
-            .map_err(|_| MppError::InvalidConfig("invalid recipient address".to_string()))?;
-        let currency: Address = session_req
-            .currency
-            .parse()
-            .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
+        let (payee, operator, currency) = Self::payment_route(&session_req, chain_id)?;
 
         Ok((
-            Self::channel_key(&payee, &currency, &escrow_contract, chain_id),
+            Self::payment_scope_key(
+                &session_req,
+                payee,
+                operator,
+                currency,
+                escrow_contract,
+                chain_id,
+            )?,
             chain_id,
         ))
     }
@@ -509,6 +582,7 @@ impl TempoSessionProvider {
     async fn restore_precompile_channel<P>(
         &self,
         provider: &P,
+        store_key: &str,
         scope: RecoveryScope,
         snapshot: Option<&crate::protocol::methods::tempo::session::SessionSnapshot>,
         request_amount: u128,
@@ -516,15 +590,9 @@ impl TempoSessionProvider {
     where
         P: alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     {
-        let store_key = persistent_channel_key(
-            &scope.payee.to_string(),
-            &scope.token.to_string(),
-            scope.escrow,
-            scope.chain_id,
-        );
         let stored = self
             .channel_store
-            .get(&store_key)
+            .get(store_key)
             .await
             .map_err(Self::store_error)?;
 
@@ -580,7 +648,7 @@ impl TempoSessionProvider {
         let state = read_on_chain_channel_state(provider, stored.channel_id).await?;
         if state.deposit == 0 || state.close_requested_at != 0 {
             self.channel_store
-                .delete(&store_key)
+                .delete(store_key)
                 .await
                 .map_err(Self::store_error)?;
             return Ok(None);
@@ -818,6 +886,11 @@ impl TempoSessionProvider {
             .payee
             .parse()
             .mpp_config("invalid snapshot payee")?;
+        let operator = snapshot
+            .descriptor
+            .operator
+            .parse()
+            .mpp_config("invalid snapshot operator")?;
         let token = snapshot
             .descriptor
             .token
@@ -838,6 +911,7 @@ impl TempoSessionProvider {
                 payer,
                 authorized_signer,
                 payee,
+                operator,
                 token,
                 escrow,
                 chain_id: snapshot.chain_id,
@@ -850,7 +924,8 @@ impl TempoSessionProvider {
             .map_err(Self::store_error)?;
 
         let entry = Self::channel_entry(recovered.clone())?;
-        let key = Self::channel_key(&payee, &token, &escrow, snapshot.chain_id);
+        let key =
+            Self::channel_key_with_operator(&payee, &operator, &token, &escrow, snapshot.chain_id);
         self.channel_id_to_key
             .lock()
             .unwrap()
@@ -939,7 +1014,7 @@ impl TempoSessionProvider {
             ));
         }
 
-        let payload = if is_precompile_escrow(entry.escrow_contract) {
+        let mut payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_voucher_payload_with_descriptor_primitive(
                 &self.signer,
                 entry.descriptor.clone().ok_or_else(|| {
@@ -959,6 +1034,17 @@ impl TempoSessionProvider {
             )
             .await?
         };
+        if let SessionCredentialPayload::Close {
+            settlement_route, ..
+        } = &mut payload
+        {
+            *settlement_route = self
+                .settlement_routes
+                .lock()
+                .unwrap()
+                .get(channel_id_hex)
+                .cloned();
+        }
 
         // Update the registry only after the voucher has been signed.
         self.persist_channel(&entry).await?;
@@ -1555,30 +1641,45 @@ impl TempoSessionProvider {
             .decode()
             .mpp_config("failed to decode session request")?;
 
-        let payee: Address = session_req
-            .recipient
-            .as_deref()
-            .ok_or_else(|| {
-                MppError::InvalidConfig("session challenge missing recipient".to_string())
-            })?
-            .parse()
-            .map_err(|_| MppError::InvalidConfig("invalid recipient address".to_string()))?;
-
-        let currency: Address = session_req
-            .currency
-            .parse()
-            .map_err(|_| MppError::InvalidConfig("invalid currency address".to_string()))?;
+        let (payee, route_operator, currency) = Self::payment_route(&session_req, chain_id)?;
+        let settlement_route = if session_req.machine_token_enabled() {
+            let target_token: Address = session_req
+                .currency
+                .parse()
+                .map_err(|_| MppError::InvalidConfig("invalid settlement target token".into()))?;
+            let recipient: Address = session_req
+                .recipient
+                .as_deref()
+                .ok_or_else(|| MppError::InvalidConfig("missing settlement recipient".into()))?
+                .parse()
+                .map_err(|_| MppError::InvalidConfig("invalid settlement recipient".into()))?;
+            Some(crate::protocol::methods::tempo::session::SettlementRoute {
+                adapter: payee.to_string(),
+                recipient: recipient.to_string(),
+                target_token: target_token.to_string(),
+                route_salt: B256::random().to_string(),
+            })
+        } else {
+            None
+        };
 
         let amount = session_req.parse_amount()?;
         let payer = self.signing_mode.from_address(self.signer.address());
         let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
         let precompile = is_precompile_escrow(escrow_contract);
         let operator = if precompile {
-            Some(Self::parse_operator(&session_req)?)
+            Some(route_operator)
         } else {
             None
         };
-        let key = Self::channel_key(&payee, &currency, &escrow_contract, chain_id);
+        let key = Self::payment_scope_key(
+            &session_req,
+            payee,
+            route_operator,
+            currency,
+            escrow_contract,
+            chain_id,
+        )?;
         let session_snapshot = session_req.session_snapshot();
         if let Some(snapshot) = &session_snapshot {
             self.commit_referenced_open(&snapshot.channel_id);
@@ -1596,10 +1697,12 @@ impl TempoSessionProvider {
             existing = self
                 .restore_precompile_channel(
                     &self.rpc_provider,
+                    &key,
                     RecoveryScope {
                         payer,
                         authorized_signer,
                         payee,
+                        operator: route_operator,
                         token: currency,
                         escrow: escrow_contract,
                         chain_id,
@@ -1746,7 +1849,7 @@ impl TempoSessionProvider {
             )));
         }
 
-        let (entry, payload) = if precompile {
+        let (mut entry, mut payload) = if precompile {
             let prefix_calls = self
                 .autoswap_calls(&self.rpc_provider, payer, currency, deposit)
                 .await?;
@@ -1766,6 +1869,13 @@ impl TempoSessionProvider {
                     initial_amount: amount,
                     chain_id,
                     fee_payer: session_req.fee_payer(),
+                    salt: settlement_route.as_ref().map(|route| {
+                        crate::protocol::methods::tempo::machine_token::compute_session_salt(
+                            route.recipient.parse().expect("validated recipient"),
+                            route.target_token.parse().expect("validated target token"),
+                            route.route_salt.parse().expect("generated route salt"),
+                        )
+                    }),
                 },
             )
             .await?
@@ -1788,6 +1898,19 @@ impl TempoSessionProvider {
             )
             .await?
         };
+        if let Some(route) = settlement_route {
+            entry.settlement_route = Some(route.clone());
+            match &mut payload {
+                SessionCredentialPayload::Open {
+                    settlement_route, ..
+                } => *settlement_route = Some(route.clone()),
+                _ => unreachable!("new session must produce an open payload"),
+            }
+            self.settlement_routes
+                .lock()
+                .unwrap()
+                .insert(entry.channel_id.to_string(), route);
+        }
 
         self.channel_id_to_key
             .lock()
@@ -2109,6 +2232,7 @@ mod tests {
             cumulative_amount: 1000,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -2142,6 +2266,7 @@ mod tests {
             cumulative_amount: 0,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -2175,6 +2300,7 @@ mod tests {
             cumulative_amount: 42_000,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -2199,6 +2325,7 @@ mod tests {
             cumulative_amount: 99_000,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,
@@ -2324,6 +2451,7 @@ mod tests {
             cumulative_amount: 0,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -2351,6 +2479,7 @@ mod tests {
             cumulative_amount: 0,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -2377,6 +2506,7 @@ mod tests {
             cumulative_amount: cumulative,
             deposit: 0,
             descriptor: None,
+            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened,
@@ -2448,6 +2578,7 @@ mod tests {
             cumulative_amount: 100,
             deposit: 500_000,
             descriptor: Some(descriptor),
+            settlement_route: None,
             escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
             chain_id: 4217,
             opened: true,
@@ -2487,6 +2618,7 @@ mod tests {
             SessionCredentialPayload::Voucher {
                 channel_id: channel_id.to_string(),
                 descriptor: None,
+                settlement_route: None,
                 cumulative_amount: "100".into(),
                 signature: "0x00".into(),
             },
@@ -2574,6 +2706,7 @@ mod tests {
                 chain_id: 42431,
                 opened: true,
                 descriptor: None,
+                settlement_route: None,
             },
         );
 
@@ -2655,6 +2788,7 @@ mod tests {
                 cumulative_amount: 1000,
                 deposit: 0,
                 descriptor: None,
+                settlement_route: None,
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
@@ -2718,6 +2852,7 @@ mod tests {
                 cumulative_amount: 1000,
                 deposit: 0,
                 descriptor: None,
+                settlement_route: None,
                 escrow_contract: escrow,
                 chain_id: 42431,
                 opened: true,
@@ -2905,6 +3040,7 @@ mod tests {
                 cumulative_amount: 1_000,
                 deposit: 10_000,
                 descriptor: Some(descriptor.clone()),
+                settlement_route: None,
                 escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id,
                 opened: true,
@@ -3023,6 +3159,7 @@ mod tests {
                 descriptor: actual_descriptor,
                 cumulative_amount,
                 signature,
+                ..
             } => {
                 assert_eq!(actual_channel_id, channel_id.to_string());
                 assert_eq!(actual_descriptor, Some(descriptor));
@@ -3112,6 +3249,7 @@ mod tests {
                 cumulative_amount: 1_000,
                 deposit: 10_000,
                 descriptor: Some(descriptor),
+                settlement_route: None,
                 escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id,
                 opened: true,
@@ -3200,6 +3338,7 @@ mod tests {
                 cumulative_amount: 1_000,
                 deposit: 10_000,
                 descriptor: descriptor.clone(),
+                settlement_route: None,
                 escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 42431,
                 opened: true,
@@ -3215,6 +3354,10 @@ mod tests {
                 min_voucher_delta: None,
                 chain_id: Some(42431),
                 fee_payer: Some(true),
+                machine_token_enabled: None,
+                settlement_adapter: None,
+                settlement_recipient: None,
+                settlement_token: None,
                 operator: Some(Address::ZERO.to_string()),
                 session_protocol: Some("v2".into()),
                 session_snapshot: Some(SessionSnapshot {
@@ -3224,6 +3367,7 @@ mod tests {
                     close_requested_at: None,
                     deposit: "10000".into(),
                     descriptor: descriptor.clone(),
+                    settlement_route: None,
                     escrow: TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
                     highest_voucher: None,
                     required_cumulative: "3000".into(),
@@ -3311,6 +3455,7 @@ mod tests {
                 cumulative_amount: 1_000,
                 deposit: 10_000,
                 descriptor: Some(descriptor),
+                settlement_route: None,
                 escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 42431,
                 opened: true,
