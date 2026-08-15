@@ -348,7 +348,7 @@ pub struct SessionMethod<P> {
     store: Arc<dyn ChannelStore>,
     config: SessionMethodConfig,
     /// Optional signer for submitting on-chain close transactions.
-    close_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    close_signer: Option<Arc<super::DynSigner>>,
 }
 
 impl<P> SessionMethod<P> {
@@ -389,7 +389,10 @@ where
     }
 
     /// Set the signer used for submitting on-chain close transactions.
-    pub fn with_close_signer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
+    pub fn with_close_signer<S>(mut self, signer: S) -> Self
+    where
+        S: alloy::signers::Signer + Send + Sync + 'static,
+    {
         self.close_signer = Some(Arc::new(signer));
         self
     }
@@ -1143,7 +1146,6 @@ where
         {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
-            use alloy::signers::SignerSync;
             use alloy::sol_types::SolCall;
             use tempo_alloy::primitives::transaction::Call;
             use tempo_alloy::primitives::TempoTransaction;
@@ -1211,7 +1213,7 @@ where
             };
 
             let sig_hash = tempo_tx.signature_hash();
-            let signature = signer.sign_hash_sync(&sig_hash).map_err(|e| {
+            let signature = signer.sign_hash(&sig_hash).await.map_err(|e| {
                 VerificationError::network_error(format!("failed to sign close tx: {}", e))
             })?;
             let signed_tx = tempo_tx.into_signed(signature.into());
@@ -1702,6 +1704,33 @@ mod tests {
     use crate::protocol::methods::tempo::voucher;
     use crate::protocol::traits::ErrorCode;
 
+    struct AsyncOnlyCloseSigner(alloy::signers::local::PrivateKeySigner);
+
+    #[async_trait::async_trait]
+    impl alloy::signers::Signer for AsyncOnlyCloseSigner {
+        async fn sign_hash(
+            &self,
+            hash: &B256,
+        ) -> alloy::signers::Result<alloy::primitives::Signature> {
+            use alloy::signers::SignerSync;
+
+            tokio::task::yield_now().await;
+            self.0.sign_hash_sync(hash)
+        }
+
+        fn address(&self) -> Address {
+            alloy::signers::Signer::address(&self.0)
+        }
+
+        fn chain_id(&self) -> Option<u64> {
+            alloy::signers::Signer::chain_id(&self.0)
+        }
+
+        fn set_chain_id(&mut self, chain_id: Option<u64>) {
+            alloy::signers::Signer::set_chain_id(&mut self.0, chain_id);
+        }
+    }
+
     fn test_channel_state(channel_id: &str) -> ChannelState {
         ChannelState {
             channel_id: channel_id.to_string(),
@@ -2107,6 +2136,16 @@ mod tests {
             min_voucher_delta: 0,
         };
         SessionMethod::new(provider, store, config)
+    }
+
+    #[test]
+    fn test_close_signer_accepts_async_only_alloy_signer() {
+        let signer = AsyncOnlyCloseSigner(alloy::signers::local::PrivateKeySigner::random());
+        let address = alloy::signers::Signer::address(&signer);
+        let method =
+            test_session_method(Arc::new(InMemoryChannelStore::new())).with_close_signer(signer);
+
+        assert_eq!(method.close_signer.as_deref().unwrap().address(), address);
     }
 
     #[tokio::test]

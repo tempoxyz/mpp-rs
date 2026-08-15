@@ -575,7 +575,7 @@ fn request_settlement_senders(charge: &ChargeRequest, chain_id: u64) -> Vec<Addr
 #[derive(Clone)]
 pub struct ChargeMethod<P> {
     provider: Arc<P>,
-    fee_payer_signer: Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    fee_payer_signer: Option<Arc<super::DynSigner>>,
     store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
@@ -764,8 +764,16 @@ where
     ///
     /// When set, requests with `feePayer: true` will be accepted and
     /// broadcast. Without a fee payer signer, such requests are rejected.
-    pub fn with_fee_payer(mut self, signer: alloy::signers::local::PrivateKeySigner) -> Self {
+    pub fn with_fee_payer<S>(mut self, signer: S) -> Self
+    where
+        S: alloy::signers::Signer + Send + Sync + 'static,
+    {
         self.fee_payer_signer = Some(Arc::new(signer));
+        self
+    }
+
+    pub(crate) fn with_fee_payer_arc(mut self, signer: Arc<super::DynSigner>) -> Self {
+        self.fee_payer_signer = Some(signer);
         self
     }
 
@@ -1369,7 +1377,8 @@ where
                 )
             })?;
 
-            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer, currency)?
+            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer.as_ref(), currency)
+                .await?
         } else {
             tx_bytes.to_vec()
         };
@@ -1731,14 +1740,13 @@ where
     /// Accepts a `0x78` fee payer envelope, recovers the sender via
     /// ecrecover, validates fee-payer invariants, then co-signs and
     /// returns a complete `0x76` transaction ready for broadcast.
-    fn cosign_fee_payer_transaction(
+    async fn cosign_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
-        fee_payer_signer: &alloy::signers::local::PrivateKeySigner,
+        fee_payer_signer: &super::DynSigner,
         fee_token: Address,
     ) -> Result<Vec<u8>, VerificationError> {
         use alloy::eips::Encodable2718;
-        use alloy::signers::SignerSync;
 
         let (signed, sender) = self.validate_fee_payer_transaction(tx_bytes, fee_token)?;
 
@@ -1751,7 +1759,8 @@ where
         // Compute the fee payer signature hash and co-sign
         let fp_hash = tx.fee_payer_signature_hash(sender);
         let fp_sig = fee_payer_signer
-            .sign_hash_sync(&fp_hash)
+            .sign_hash(&fp_hash)
+            .await
             .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {e}")))?;
 
         tx.fee_payer_signature = Some(fp_sig);
@@ -1964,11 +1973,43 @@ where
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use alloy::primitives::hex;
 
     use super::{super::MODERATO_CHAIN_ID, *};
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+
+    struct AsyncOnlySigner {
+        inner: alloy::signers::local::PrivateKeySigner,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl alloy::signers::Signer for AsyncOnlySigner {
+        async fn sign_hash(
+            &self,
+            hash: &B256,
+        ) -> alloy::signers::Result<alloy::primitives::Signature> {
+            use alloy::signers::SignerSync;
+
+            tokio::task::yield_now().await;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.sign_hash_sync(hash)
+        }
+
+        fn address(&self) -> Address {
+            alloy::signers::Signer::address(&self.inner)
+        }
+
+        fn chain_id(&self) -> Option<u64> {
+            alloy::signers::Signer::chain_id(&self.inner)
+        }
+
+        fn set_chain_id(&mut self, chain_id: Option<u64>) {
+            alloy::signers::Signer::set_chain_id(&mut self.inner, chain_id);
+        }
+    }
 
     fn test_charge_request_with_amount(amount: &str) -> ChargeRequest {
         ChargeRequest {
@@ -2748,15 +2789,19 @@ mod tests {
         encoded
     }
 
-    /// Round-trip: sign 0x78 envelope → cosign_fee_payer_transaction
-    /// succeeds and produces a valid co-signed 0x76 transaction.
-    #[test]
-    fn test_fee_payer_round_trip_0x78_envelope() {
+    /// Round-trip with a signer that intentionally does not implement
+    /// `SignerSync`, matching remote KMS/HSM signer capabilities.
+    #[tokio::test]
+    async fn test_fee_payer_round_trip_accepts_async_only_signer() {
         use super::super::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use alloy::signers::SignerSync;
 
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
-        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let signer_calls = Arc::new(AtomicUsize::new(0));
+        let fee_payer_signer = AsyncOnlySigner {
+            inner: alloy::signers::local::PrivateKeySigner::random(),
+            calls: Arc::clone(&signer_calls),
+        };
         let fee_token = KnownTempoNetwork::Mainnet
             .default_currency()
             .parse::<Address>()
@@ -2779,13 +2824,16 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let co_signed = result.expect("cosign should succeed for valid 0x78 envelope");
+        assert_eq!(signer_calls.load(Ordering::Relaxed), 1);
 
         // Result should be a valid 0x76 transaction
         assert_eq!(
@@ -3237,8 +3285,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects txs with wrong nonce_key.
-    #[test]
-    fn test_cosign_rejects_wrong_nonce_key() {
+    #[tokio::test]
+    async fn test_cosign_rejects_wrong_nonce_key() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token = KnownTempoNetwork::Mainnet
@@ -3257,11 +3305,13 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let err = result.expect_err("should reject wrong nonce_key");
         assert!(
@@ -3271,8 +3321,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects txs without valid_before.
-    #[test]
-    fn test_cosign_rejects_missing_valid_before() {
+    #[tokio::test]
+    async fn test_cosign_rejects_missing_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token = KnownTempoNetwork::Mainnet
@@ -3291,11 +3341,13 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let err = result.expect_err("should reject missing valid_before");
         assert!(
@@ -3306,8 +3358,8 @@ mod tests {
 
     /// A client that signs over a non-empty access list fails recovery
     /// (sponsor strips before ecrecover → recovered ≠ envelope.sender).
-    #[test]
-    fn test_cosign_rejects_access_list_signed_by_client() {
+    #[tokio::test]
+    async fn test_cosign_rejects_access_list_signed_by_client() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token = KnownTempoNetwork::Mainnet
@@ -3330,11 +3382,13 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let err = result.expect_err("malicious access-list signature must not cosign");
         assert!(
@@ -3344,8 +3398,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects txs with expired valid_before.
-    #[test]
-    fn test_cosign_rejects_expired_valid_before() {
+    #[tokio::test]
+    async fn test_cosign_rejects_expired_valid_before() {
         let client_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token = KnownTempoNetwork::Mainnet
@@ -3371,11 +3425,13 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let err = result.expect_err("should reject expired valid_before");
         assert!(
@@ -3385,8 +3441,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects empty input.
-    #[test]
-    fn test_cosign_rejects_empty_input() {
+    #[tokio::test]
+    async fn test_cosign_rejects_empty_input() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token = KnownTempoNetwork::Mainnet
             .default_currency()
@@ -3399,11 +3455,13 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &[],
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &[],
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let err = result.expect_err("should reject empty input");
         assert!(
@@ -3413,8 +3471,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects non-0x78 type byte.
-    #[test]
-    fn test_cosign_rejects_wrong_type_byte() {
+    #[tokio::test]
+    async fn test_cosign_rejects_wrong_type_byte() {
         let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
         let fee_token = KnownTempoNetwork::Mainnet
             .default_currency()
@@ -3427,11 +3485,13 @@ mod tests {
 
         let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
 
-        let result = method.cosign_fee_payer_transaction(
-            &[0x79, 0xc0], // wrong type byte
-            method.fee_payer_signer.as_ref().unwrap(),
-            fee_token,
-        );
+        let result = method
+            .cosign_fee_payer_transaction(
+                &[0x79, 0xc0], // wrong type byte
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await;
 
         let err = result.expect_err("should reject wrong type");
         assert!(
@@ -4023,8 +4083,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects tx with max_fee_per_gas above policy.
-    #[test]
-    fn test_cosign_rejects_excessive_max_fee_per_gas() {
+    #[tokio::test]
+    async fn test_cosign_rejects_excessive_max_fee_per_gas() {
         let overrides = FeePayerPolicyOverride {
             max_fee_per_gas: Some(500_000_000), // 0.5 gwei ceiling
             ..Default::default()
@@ -4038,16 +4098,17 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect_err("should reject excessive max_fee_per_gas");
         assert!(err.to_string().contains("max_fee_per_gas"), "got: {err}");
     }
 
     /// cosign_fee_payer_transaction rejects tx with max_priority_fee_per_gas above policy.
-    #[test]
-    fn test_cosign_rejects_excessive_max_priority_fee_per_gas() {
+    #[tokio::test]
+    async fn test_cosign_rejects_excessive_max_priority_fee_per_gas() {
         let overrides = FeePayerPolicyOverride {
             max_priority_fee_per_gas: Some(100_000_000), // 0.1 gwei ceiling
             ..Default::default()
@@ -4061,9 +4122,10 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect_err("should reject excessive max_priority_fee_per_gas");
         assert!(
             err.to_string().contains("max_priority_fee_per_gas"),
@@ -4072,8 +4134,8 @@ mod tests {
     }
 
     /// cosign_fee_payer_transaction rejects tx whose total fee exceeds the policy cap.
-    #[test]
-    fn test_cosign_rejects_excessive_total_fee() {
+    #[tokio::test]
+    async fn test_cosign_rejects_excessive_total_fee() {
         // Set a 0.5 gwei max_fee_per_gas ceiling and default gas limit of 1M →
         // total_fee ceiling = 500_000_000_000_000. Build a tx that hits exactly
         // the total_fee limit by using a large gas_limit.
@@ -4093,15 +4155,16 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect_err("should reject excessive total fee");
         assert!(err.to_string().contains("Total fee"), "got: {err}");
     }
 
-    #[test]
-    fn test_cosign_rejects_excessive_total_fee_under_gas_limit_and_fee_per_gas() {
+    #[tokio::test]
+    async fn test_cosign_rejects_excessive_total_fee_under_gas_limit_and_fee_per_gas() {
         let (method, client_signer, fee_token) = make_cosign_method(None);
 
         let mut tx = make_fee_payer_tx(60);
@@ -4114,16 +4177,17 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect_err("should reject excessive total fee");
         assert!(err.to_string().contains("Total fee"), "got: {err}");
     }
 
     /// cosign_fee_payer_transaction rejects tx with valid_before window beyond policy max.
-    #[test]
-    fn test_cosign_rejects_excessive_validity_window() {
+    #[tokio::test]
+    async fn test_cosign_rejects_excessive_validity_window() {
         let overrides = FeePayerPolicyOverride {
             max_validity_window_seconds: Some(30), // 30-second ceiling
             ..Default::default()
@@ -4137,9 +4201,10 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect_err("should reject excessive validity window");
         assert!(
             err.to_string().contains("valid_before window"),
@@ -4148,8 +4213,8 @@ mod tests {
     }
 
     /// All five limit policy override fields are respected when set together.
-    #[test]
-    fn test_policy_override_all_fields_applied() {
+    #[tokio::test]
+    async fn test_policy_override_all_fields_applied() {
         // Generous overrides — tx should pass all checks.
         let overrides = FeePayerPolicyOverride {
             max_gas: Some(2_000_000),
@@ -4169,15 +4234,16 @@ mod tests {
         method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect("cosign should succeed when all fields within override limits");
     }
 
     /// EIP-1559 invariant: priority fee cannot exceed max fee per gas.
-    #[test]
-    fn test_cosign_rejects_priority_fee_above_max_fee() {
+    #[tokio::test]
+    async fn test_cosign_rejects_priority_fee_above_max_fee() {
         let (method, client_signer, fee_token) = make_cosign_method(None);
 
         let mut tx = make_fee_payer_tx(60);
@@ -4189,9 +4255,10 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect_err("priority fee above max fee must be rejected");
         assert!(
             err.to_string()
@@ -4250,8 +4317,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_cosign_rejects_non_allowlisted_fee_token() {
+    #[tokio::test]
+    async fn test_cosign_rejects_non_allowlisted_fee_token() {
         let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
             .default_currency()
             .parse::<Address>()
@@ -4265,12 +4332,13 @@ mod tests {
         let err = method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 KnownTempoNetwork::Moderato
                     .default_currency()
                     .parse::<Address>()
                     .unwrap(),
             )
+            .await
             .expect_err("cosign should reject non-allowlisted fee token");
         assert!(
             err.to_string()
@@ -4279,8 +4347,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cosign_uses_custom_fee_token_allowlist() {
+    #[tokio::test]
+    async fn test_cosign_uses_custom_fee_token_allowlist() {
         let allowed_fee_tokens = vec![KnownTempoNetwork::Mainnet
             .default_currency()
             .parse::<Address>()
@@ -4294,17 +4362,18 @@ mod tests {
         method
             .cosign_fee_payer_transaction(
                 &encoded,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect("cosign should accept a custom allowlisted fee token");
     }
 
     /// Sponsor MUST strip an attacker-injected wire access list: an honest
     /// client signature over an empty-access-list tx is still cosigned, and
     /// the broadcast 0x76 carries an empty access list.
-    #[test]
-    fn test_cosign_strips_tampered_access_list() {
+    #[tokio::test]
+    async fn test_cosign_strips_tampered_access_list() {
         use alloy::eips::eip2930::{AccessList, AccessListItem};
         use alloy::primitives::B256;
         use alloy::signers::local::PrivateKeySigner;
@@ -4358,9 +4427,10 @@ mod tests {
         let cosigned = method
             .cosign_fee_payer_transaction(
                 &envelope_bytes,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect("sponsor must cosign tampered envelope");
 
         let signed =
@@ -4374,7 +4444,7 @@ mod tests {
 
     /// Build a co-signed `0x76` transaction the same way `broadcast_transaction`
     /// does, for exercising `simulate_before_broadcast` against a mocked node.
-    fn make_cosigned_fee_payer_tx() -> Vec<u8> {
+    async fn make_cosigned_fee_payer_tx() -> Vec<u8> {
         use super::super::FeePayerEnvelope78;
         use alloy::signers::SignerSync;
 
@@ -4399,15 +4469,16 @@ mod tests {
         method
             .cosign_fee_payer_transaction(
                 &envelope,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect("cosign should succeed")
     }
 
     /// Co-signed `0x76` tx whose client signature is a keychain (access-key)
     /// signature. Returns `(cosigned bytes, wallet, access key)`.
-    fn make_keychain_cosigned_fee_payer_tx() -> (Vec<u8>, Address, Address) {
+    async fn make_keychain_cosigned_fee_payer_tx() -> (Vec<u8>, Address, Address) {
         use super::super::FeePayerEnvelope78;
         use alloy::signers::SignerSync;
         use tempo_alloy::primitives::transaction::{
@@ -4438,9 +4509,10 @@ mod tests {
         let cosigned = method
             .cosign_fee_payer_transaction(
                 &envelope,
-                method.fee_payer_signer.as_ref().unwrap(),
+                method.fee_payer_signer.as_deref().unwrap(),
                 fee_token,
             )
+            .await
             .expect("cosign should succeed");
 
         (cosigned, wallet, access_key_signer.address())
@@ -4448,9 +4520,9 @@ mod tests {
 
     /// A keychain tx's request sets `from` to the wallet and carries the access
     /// key as `keyId`/`keyType`, serialized onto the wire.
-    #[test]
-    fn test_build_simulate_payload_includes_keychain_fields() {
-        let (cosigned, wallet, access_key) = make_keychain_cosigned_fee_payer_tx();
+    #[tokio::test]
+    async fn test_build_simulate_payload_includes_keychain_fields() {
+        let (cosigned, wallet, access_key) = make_keychain_cosigned_fee_payer_tx().await;
 
         let payload =
             ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
@@ -4485,9 +4557,9 @@ mod tests {
 
     /// A plain EOA tx carries no `keyId` but still advertises its `keyType`
     /// so the node sizes signature gas correctly.
-    #[test]
-    fn test_build_simulate_payload_omits_keychain_for_primitive_sig() {
-        let cosigned = make_cosigned_fee_payer_tx();
+    #[tokio::test]
+    async fn test_build_simulate_payload_omits_keychain_for_primitive_sig() {
+        let cosigned = make_cosigned_fee_payer_tx().await;
 
         let payload =
             ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
@@ -4513,9 +4585,9 @@ mod tests {
     /// the validity window, and `validation: false`. The single payment call is
     /// folded into `to`/`input` (not left in `calls`) so the node does not read
     /// the empty `to` as a CREATE.
-    #[test]
-    fn test_build_simulate_payload_request_abi() {
-        let cosigned = make_cosigned_fee_payer_tx();
+    #[tokio::test]
+    async fn test_build_simulate_payload_request_abi() {
+        let cosigned = make_cosigned_fee_payer_tx().await;
 
         // The from we expect is the client sender recovered from the cosigned tx.
         let signed =
@@ -4646,7 +4718,7 @@ mod tests {
     async fn test_simulate_before_broadcast_rejects_revert() {
         use alloy::providers::mock::Asserter;
 
-        let cosigned = make_cosigned_fee_payer_tx();
+        let cosigned = make_cosigned_fee_payer_tx().await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!({
@@ -4681,7 +4753,7 @@ mod tests {
     async fn test_simulate_before_broadcast_accepts_success() {
         use alloy::providers::mock::Asserter;
 
-        let cosigned = make_cosigned_fee_payer_tx();
+        let cosigned = make_cosigned_fee_payer_tx().await;
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!({
@@ -4711,7 +4783,7 @@ mod tests {
     async fn test_simulate_before_broadcast_fails_closed_on_rpc_error() {
         use alloy::providers::mock::Asserter;
 
-        let cosigned = make_cosigned_fee_payer_tx();
+        let cosigned = make_cosigned_fee_payer_tx().await;
 
         let asserter = Asserter::new();
         asserter.push_failure_msg("tempo_simulateV1 unavailable");
@@ -4738,7 +4810,7 @@ mod tests {
     async fn test_simulate_before_broadcast_skips_when_method_not_found() {
         use alloy::providers::mock::Asserter;
 
-        let cosigned = make_cosigned_fee_payer_tx();
+        let cosigned = make_cosigned_fee_payer_tx().await;
 
         let asserter = Asserter::new();
         asserter.push_failure(alloy_json_rpc::ErrorPayload {
