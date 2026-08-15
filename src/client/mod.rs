@@ -20,7 +20,7 @@
 #[cfg(feature = "client")]
 mod accept_payment_policy;
 #[cfg(feature = "client")]
-mod challenge_selection;
+pub(crate) mod challenge_selection;
 mod error;
 mod events;
 mod provider;

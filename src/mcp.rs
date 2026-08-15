@@ -9,6 +9,7 @@
 //! - [`PAYMENT_REQUIRED_CODE`]: JSON-RPC error code for payment required (-32042)
 //! - [`PAYMENT_VERIFICATION_FAILED_CODE`]: JSON-RPC error code for verification failed (-32043)
 //! - [`CREDENTIAL_META_KEY`]: Metadata key for credentials in `_meta`
+//! - [`PAYMENT_REQUIRED_META_KEY`]: Metadata key for payment-required tool results
 //! - [`RECEIPT_META_KEY`]: Metadata key for receipts in `_meta`
 //!
 //! # Server-side
@@ -22,7 +23,9 @@
 //!
 //! - [`is_payment_required`]: Check if a JSON-RPC error indicates payment required
 //! - [`extract_challenges`]: Extract challenges from a payment-required error
+//! - [`extract_challenges_from_data`]: Extract challenges from a payment-required payload
 //! - [`attach_credential`]: Attach a credential to MCP request params `_meta`
+//! - [`client::McpClient`]: Wrap an MCP SDK adapter with automatic payment handling
 //!
 //! # Example (server)
 //!
@@ -47,7 +50,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::core::challenge::{PaymentChallenge, PaymentCredential, Receipt};
+use crate::{
+    protocol::core::{
+        challenge::{PaymentChallenge, PaymentCredential, Receipt},
+        Base64UrlJson,
+    },
+    MppError,
+};
+
+#[cfg(feature = "client")]
+pub mod client;
 
 // ==================== Constants ====================
 
@@ -59,6 +71,9 @@ pub const PAYMENT_VERIFICATION_FAILED_CODE: i32 = -32043;
 
 /// MCP metadata key for credentials.
 pub const CREDENTIAL_META_KEY: &str = "org.paymentauth/credential";
+
+/// MCP metadata key for payment-required tool results.
+pub const PAYMENT_REQUIRED_META_KEY: &str = "org.paymentauth/payment-required";
 
 /// MCP metadata key for receipts.
 pub const RECEIPT_META_KEY: &str = "org.paymentauth/receipt";
@@ -101,8 +116,9 @@ pub struct McpPaymentErrorData {
 /// Expects the `_meta` object (not the full params). Returns `None` if the
 /// credential key is missing or the value cannot be deserialized.
 pub fn extract_credential(meta: &serde_json::Value) -> Option<PaymentCredential> {
-    let cred_value = meta.get(CREDENTIAL_META_KEY)?;
-    serde_json::from_value(cred_value.clone()).ok()
+    let mut credential = meta.get(CREDENTIAL_META_KEY)?.clone();
+    normalize_wire_challenge(credential.get_mut("challenge")?)?;
+    serde_json::from_value(credential).ok()
 }
 
 /// Create an MCP payment-required error response.
@@ -178,8 +194,81 @@ pub fn is_payment_required(error: &serde_json::Value) -> bool {
 /// Returns `None` if the error has no `data.challenges` array or
 /// if deserialization fails.
 pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    let challenges_value = error.get("data")?.get("challenges")?;
-    serde_json::from_value(challenges_value.clone()).ok()
+    extract_challenges_from_data(error.get("data")?)
+}
+
+/// Extracts challenges from an MCP payment-required data payload.
+///
+/// Accepts MCP's expanded JSON `request` object and normalizes it to the
+/// base64url representation retained by the core protocol types.
+pub fn extract_challenges_from_data(
+    payment_required: &serde_json::Value,
+) -> Option<Vec<PaymentChallenge>> {
+    let challenges_value = payment_required.get("challenges")?;
+    extract_wire_challenges(challenges_value)
+}
+
+/// Extract challenges from an MCP tool result's payment-required metadata.
+///
+/// Expects the result `_meta` object (not the complete tool result). Returns
+/// `None` when the metadata key is absent or its challenge list is invalid.
+pub fn extract_result_challenges(meta: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
+    extract_challenges_from_data(meta.get(PAYMENT_REQUIRED_META_KEY)?)
+}
+
+fn extract_wire_challenges(value: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|challenge| {
+            let mut challenge = challenge.clone();
+            normalize_wire_challenge(&mut challenge)?;
+            serde_json::from_value(challenge).ok()
+        })
+        .collect()
+}
+
+fn normalize_wire_challenge(challenge: &mut serde_json::Value) -> Option<()> {
+    let object = challenge.as_object_mut()?;
+    let request = object.get("request")?;
+    if !request.is_string() {
+        let request = Base64UrlJson::from_value(request).ok()?;
+        object.insert(
+            "request".to_owned(),
+            serde_json::Value::String(request.raw().to_owned()),
+        );
+    }
+    if !object.contains_key("opaque") {
+        if let Some(meta) = object.get("meta") {
+            let opaque = Base64UrlJson::from_value(meta).ok()?;
+            object.insert(
+                "opaque".to_owned(),
+                serde_json::Value::String(opaque.raw().to_owned()),
+            );
+        }
+    }
+    Some(())
+}
+
+/// Encodes a credential for MCP request metadata.
+///
+/// MCP carries the challenge request as expanded JSON, unlike the base64url
+/// representation used by HTTP Payment authentication.
+pub fn credential_value(credential: &PaymentCredential) -> Result<serde_json::Value, MppError> {
+    let mut value = serde_json::to_value(credential)
+        .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
+    let challenge = value
+        .get_mut("challenge")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| MppError::InvalidConfig("credential challenge is invalid".to_owned()))?;
+    challenge.insert(
+        "request".to_owned(),
+        credential.challenge.request.decode_value()?,
+    );
+    if let Some(opaque) = &credential.challenge.opaque {
+        challenge.insert("meta".to_owned(), opaque.decode_value()?);
+    }
+    Ok(value)
 }
 
 /// Attach a credential to MCP request `params._meta`.
@@ -187,8 +276,8 @@ pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChalle
 /// Inserts (or creates) `params._meta` and sets the credential
 /// under [`CREDENTIAL_META_KEY`].
 pub fn attach_credential(params: &mut serde_json::Value, credential: &PaymentCredential) {
-    let cred_value =
-        serde_json::to_value(credential).expect("PaymentCredential must be serializable");
+    let cred_value = credential_value(credential)
+        .expect("PaymentCredential challenge must contain valid base64url JSON");
 
     let meta = params
         .as_object_mut()
@@ -462,6 +551,46 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_challenges_accepts_expanded_mcp_request() {
+        let error = json!({
+            "code": PAYMENT_REQUIRED_CODE,
+            "message": "Payment Required",
+            "data": {
+                "httpStatus": 402,
+                "challenges": [{
+                    "id": "mercator-challenge",
+                    "realm": "mercator.example",
+                    "method": "tempo",
+                    "intent": "charge",
+                    "request": {
+                        "amount": "6000",
+                        "currency": "0x20c000000000000000000000b9537d11c60e8b50",
+                        "methodDetails": {"chainId": 4217}
+                    },
+                    "meta": {"scope": "job:123"}
+                }]
+            }
+        });
+
+        let challenges = extract_challenges(&error).unwrap();
+
+        assert_eq!(challenges[0].id, "mercator-challenge");
+        assert_eq!(
+            challenges[0].request.decode_value().unwrap()["amount"],
+            "6000"
+        );
+        assert_eq!(
+            challenges[0]
+                .opaque
+                .as_ref()
+                .unwrap()
+                .decode_value()
+                .unwrap()["scope"],
+            "job:123"
+        );
+    }
+
+    #[test]
     fn test_extract_challenges_no_data() {
         let error = json!({
             "code": PAYMENT_REQUIRED_CODE,
@@ -509,6 +638,27 @@ mod tests {
         let meta = params.get("_meta").unwrap();
         let cred_value = meta.get(CREDENTIAL_META_KEY).unwrap();
         assert_eq!(cred_value["challenge"]["id"], "ch_test_123");
+        assert_eq!(cred_value["challenge"]["request"]["amount"], "1000");
+    }
+
+    #[test]
+    fn test_mcp_credential_wire_roundtrip_preserves_opaque_meta() {
+        let mut credential = test_credential();
+        credential.challenge.opaque =
+            Some(Base64UrlJson::from_value(&json!({"scope": "job:123"})).unwrap());
+        let encoded = credential_value(&credential).unwrap();
+        assert_eq!(encoded["challenge"]["request"]["amount"], "1000");
+        assert_eq!(encoded["challenge"]["meta"]["scope"], "job:123");
+
+        let decoded = extract_credential(&json!({CREDENTIAL_META_KEY: encoded})).unwrap();
+        assert_eq!(
+            decoded.challenge.request.raw(),
+            credential.challenge.request.raw()
+        );
+        assert_eq!(
+            decoded.challenge.opaque.unwrap().raw(),
+            credential.challenge.opaque.unwrap().raw()
+        );
     }
 
     #[test]
