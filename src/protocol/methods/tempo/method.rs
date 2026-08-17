@@ -1488,22 +1488,29 @@ where
         // node sizes signature gas from `keyType`/`keyData` (primitive
         // p256/webauthn included) and selects the keychain key via `keyId`.
         let (key_id, key_type, key_data) = {
-            let (key_id, primitive_sig) = match signed.signature() {
-                TempoSignature::Keychain(keychain_sig) => {
+            let (key_id, primitive_sig) =
+                if let TempoSignature::Keychain(keychain_sig) = signed.signature() {
                     let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
                         VerificationError::new(format!(
                             "Failed to recover keychain access key for simulation: {e}"
                         ))
                     })?;
-                    (Some(key_id), &keychain_sig.signature)
-                }
-                TempoSignature::Primitive(primitive_sig) => (None, primitive_sig),
+                    (Some(key_id), Some(&keychain_sig.signature))
+                } else if let TempoSignature::Primitive(primitive_sig) = signed.signature() {
+                    (None, Some(primitive_sig))
+                } else {
+                    (None, None)
+                };
+            let (key_type, key_data) = if let Some(primitive_sig) = primitive_sig {
+                let key_data = match primitive_sig {
+                    PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
+                    _ => None,
+                };
+                (Some(primitive_sig.signature_type()), key_data)
+            } else {
+                (None, None)
             };
-            let key_data = match primitive_sig {
-                PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
-                _ => None,
-            };
-            (key_id, primitive_sig.signature_type(), key_data)
+            (key_id, key_type, key_data)
         };
 
         let mut req: TempoTransactionRequest = signed.into();
@@ -1521,7 +1528,7 @@ where
         req.inner.value = Some(tail.value);
         req.inner.input = tail.input.into();
 
-        req.key_type = Some(key_type);
+        req.key_type = key_type;
         req.key_data = key_data;
         if let Some(key_id) = key_id {
             req.key_id = Some(key_id);

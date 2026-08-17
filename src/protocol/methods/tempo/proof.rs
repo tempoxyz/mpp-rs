@@ -160,12 +160,13 @@ pub fn verify_proof(
         Err(_) => return false,
     };
 
-    match signature {
-        TempoSignature::Primitive(signature) => signature
+    if let TempoSignature::Primitive(signature) = &signature {
+        signature
             .recover_signer(&signing_hash(account, chain_id, challenge_id, realm))
-            .is_ok_and(|recovered| recovered == expected_signer),
-        // Keychain envelopes require a separate on-chain authorization check.
-        TempoSignature::Keychain(_) => false,
+            .is_ok_and(|recovered| recovered == expected_signer)
+    } else {
+        // Non-primitive envelopes require a separate on-chain authorization check.
+        false
     }
 }
 
@@ -182,11 +183,14 @@ pub fn recover_proof_signer(
 ) -> Result<Address, crate::error::MppError> {
     let signature = parse_signature(signature_hex)?;
     let hash = signing_hash(account, chain_id, challenge_id, realm);
-    match signature {
-        TempoSignature::Primitive(signature) => signature.recover_signer(&hash),
-        TempoSignature::Keychain(signature) => signature.key_id(&hash),
-    }
-    .map_err(|_| MppError::invalid_payload("proof signature recovery failed"))
+    let recovered = if let TempoSignature::Primitive(signature) = &signature {
+        signature.recover_signer(&hash)
+    } else if let TempoSignature::Keychain(signature) = &signature {
+        signature.key_id(&hash)
+    } else {
+        return Err(MppError::invalid_payload("unsupported proof signature"));
+    };
+    recovered.map_err(|_| MppError::invalid_payload("proof signature recovery failed"))
 }
 
 #[cfg(feature = "evm")]
