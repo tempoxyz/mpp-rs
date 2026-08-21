@@ -27,7 +27,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -67,7 +67,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -96,49 +96,24 @@ jobs:
     permissions:
       contents: read
       packages: read
-    env:
-      TEMPO_TAG: latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo update -p native-tls
 
-      - name: Resolve Tempo image digest
-        id: tempo-digest
-        run: |
-          digest=$(docker buildx imagetools inspect "ghcr.io/tempoxyz/tempo:${TEMPO_TAG}" --raw | sha256sum | cut -d' ' -f1)
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Tempo Docker image
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: docker-cache
-        with:
-          path: /tmp/tempo-image.tar
-          key: tempo-image-${{ steps.tempo-digest.outputs.digest }}
-
-      - name: Load cached Tempo image
-        if: steps.docker-cache.outputs.cache-hit == 'true'
-        run: docker load -i /tmp/tempo-image.tar
-
-      - name: Pull and cache Tempo image
-        if: steps.docker-cache.outputs.cache-hit != 'true'
-        run: |
-          docker pull "ghcr.io/tempoxyz/tempo:${TEMPO_TAG}"
-          docker save "ghcr.io/tempoxyz/tempo:${TEMPO_TAG}" -o /tmp/tempo-image.tar
-
-      - name: Start Tempo devnet
+      - name: Start Tempo localnet
         run: docker compose up -d --wait
 
       - name: Run integration tests
         run: cargo test --features integration --test integration_charge -- --nocapture
 
-      - name: Stop Tempo devnet
+      - name: Stop Tempo localnet
         if: always()
         run: docker compose down
 

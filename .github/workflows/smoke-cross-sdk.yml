@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -31,62 +31,13 @@ jobs:
         with:
           node-version: 22
 
-      - name: Start Tempo node
-        run: docker compose up -d
-
-      - name: Wait for Tempo node
-        run: |
-          echo "Waiting for Tempo node to be ready..."
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:8545 -X POST \
-              -H 'Content-Type: application/json' \
-              -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' > /dev/null 2>&1; then
-              echo "Tempo node ready after ${i}s"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "Tempo node failed to start"
-          docker compose logs
-          exit 1
+      - name: Start Tempo localnet
+        run: docker compose up -d --wait
 
       - name: Run integration tests
         run: cargo test --features integration --test integration_charge -- --nocapture
         env:
           TEMPO_RPC_URL: http://localhost:8545
-
-      - name: Provision AMM liquidity
-        run: |
-          cd .github/smoke-cross-sdk
-          npm ci --no-audit --no-fund
-          node --input-type=module <<'EOF'
-          import { createClient, http, parseUnits } from 'viem'
-          import { privateKeyToAccount } from 'viem/accounts'
-          import { tempoLocalnet } from 'viem/chains'
-          import { Actions, Addresses } from 'viem/tempo'
-
-          // well-known Hardhat dev account[0] (faucet key)
-          const account = privateKeyToAccount(
-            '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
-          )
-          const client = createClient({
-            account,
-            chain: { ...tempoLocalnet, rpcUrls: { default: { http: ['http://localhost:8545'] } } },
-            transport: http('http://localhost:8545'),
-          })
-
-          for (const id of [1n, 2n, 3n]) {
-            await Actions.amm.mintSync(client, {
-              account,
-              feeToken: Addresses.pathUsd,
-              userTokenAddress: id,
-              validatorTokenAddress: Addresses.pathUsd,
-              validatorTokenAmount: parseUnits('1000', 6),
-              to: account.address,
-            })
-          }
-          console.log('AMM liquidity provisioned')
-          EOF
 
       - name: Fund client account # well-known Hardhat dev account[1]
         run: |
