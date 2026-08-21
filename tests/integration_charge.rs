@@ -29,7 +29,6 @@ use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};
 use mpp::server::{tempo, Mpp, TempoConfig};
 use reqwest::Client;
 use tempo_alloy::contracts::precompiles::tip20::ITIP20;
-use tempo_alloy::contracts::precompiles::ITIPFeeAMM;
 use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::primitives::TempoTransaction;
 use tempo_alloy::TempoNetwork;
@@ -40,9 +39,6 @@ const DEV_PRIVATE_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efca
 
 /// PathUSD token address.
 const PATH_USD: Address = address!("0x20c0000000000000000000000000000000000000");
-
-/// Fee manager precompile address.
-const FEE_MANAGER: Address = address!("0xfeec000000000000000000000000000000000000");
 
 /// Default localnet RPC URL (overridable via `TEMPO_RPC_URL` env var).
 const DEFAULT_RPC_URL: &str = "http://localhost:8545";
@@ -68,9 +64,6 @@ fn dev_signer() -> PrivateKeySigner {
 
 /// Serialize dev account transactions to avoid nonce conflicts across parallel tests.
 static DEV_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
-
-/// One-time setup: ensures AMM fee liquidity is minted.
-static SETUP: std::sync::LazyLock<Mutex<bool>> = std::sync::LazyLock::new(|| Mutex::new(false));
 
 /// Send a transaction from the dev account, optionally specifying a fee token.
 /// Acquires DEV_LOCK internally to serialize nonce usage.
@@ -139,58 +132,8 @@ async fn dev_send(rpc: &str, calls: Vec<Call>) -> B256 {
     dev_send_with_fee_token(rpc, calls, None).await
 }
 
-/// Mint AMM fee liquidity for token IDs 1, 2, 3 (matching mppx setup.ts).
-///
-/// Assumes a fresh localnet — if the chain already has liquidity, repeated
-/// mints should still succeed (additive).
-async fn setup_liquidity(rpc: &str) {
-    let mut done = SETUP.lock().await;
-    if *done {
-        return;
-    }
-
-    // Hold DEV_LOCK once for the entire batch of mints.
-    let _dev = DEV_LOCK.lock().await;
-
-    let dev_addr = dev_signer().address();
-
-    // Mint liquidity for fee tokens 1, 2, 3 with pathUSD as validator token.
-    // TokenId.toAddress(n) = 0x20c0 + hex(n, 18 bytes), matching mppx setup.ts.
-    let fee_tokens: [Address; 3] = [
-        address!("0x20c0000000000000000000000000000000000001"),
-        address!("0x20c0000000000000000000000000000000000002"),
-        address!("0x20c0000000000000000000000000000000000003"),
-    ];
-    for user_token in fee_tokens {
-        let mint_data = ITIPFeeAMM::mintCall::new((
-            user_token,
-            PATH_USD,
-            U256::from(1_000_000_000u64), // 1000 pathUSD
-            dev_addr,
-        ))
-        .abi_encode();
-
-        // Use pathUSD as fee token for the mint tx itself (no AMM needed yet).
-        // Use _unlocked variant since we already hold DEV_LOCK.
-        dev_send_with_fee_token_unlocked(
-            rpc,
-            vec![Call {
-                to: TxKind::Call(FEE_MANAGER),
-                value: U256::ZERO,
-                input: Bytes::from(mint_data),
-            }],
-            Some(PATH_USD),
-        )
-        .await;
-    }
-
-    *done = true;
-}
-
 /// Fund an account by transferring pathUSD from the dev account.
 async fn fund_account(rpc: &str, to: Address) {
-    setup_liquidity(rpc).await;
-
     let amount = U256::from(10_000_000_000u64); // 10,000 pathUSD
     let transfer_data = ITIP20::transferCall::new((to, amount)).abi_encode();
 
@@ -207,8 +150,6 @@ async fn fund_account(rpc: &str, to: Address) {
 
 /// Fund an account with an exact amount of pathUSD.
 async fn fund_account_amount(rpc: &str, to: Address, amount: U256) {
-    setup_liquidity(rpc).await;
-
     let transfer_data = ITIP20::transferCall::new((to, amount)).abi_encode();
 
     dev_send(
