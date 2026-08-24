@@ -515,7 +515,10 @@ async fn send_with_payment<P: PaymentProvider>(
                 return Err(HttpError::CloneFailed);
             }
         };
-        resp = match retry.send().await {
+        let (client, retry) = retry.build_split();
+        let mut retry = retry.map_err(HttpError::request)?;
+        *retry.url_mut() = resp.url().clone();
+        resp = match client.execute(retry).await {
             Ok(resp) => resp,
             Err(err) => {
                 let http_err = HttpError::request(err);
@@ -881,6 +884,56 @@ mod tests {
             assert_eq!(provider.call_count(), 0);
             assert_eq!(authorization_observed.load(Ordering::SeqCst), 0);
             assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn paid_retry_targets_final_same_origin_url() {
+            let (_, www_auth) = test_challenge();
+            let app = Router::new()
+                .route(
+                    "/start",
+                    get(|req: axum::http::Request<axum::body::Body>| async move {
+                        if req.headers().contains_key("authorization") {
+                            return AxumStatusCode::BAD_REQUEST.into_response();
+                        }
+                        (
+                            AxumStatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, "/paid")],
+                            "redirect",
+                        )
+                            .into_response()
+                    }),
+                )
+                .route(
+                    "/paid",
+                    get(move |req: axum::http::Request<axum::body::Body>| {
+                        let www_auth = www_auth.clone();
+                        async move {
+                            if req.headers().contains_key("authorization") {
+                                AxumStatusCode::OK.into_response()
+                            } else {
+                                (
+                                    AxumStatusCode::PAYMENT_REQUIRED,
+                                    [(WWW_AUTH_NAME, www_auth)],
+                                    "pay up",
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }),
+                );
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+
+            let resp = reqwest::Client::new()
+                .get(format!("{base_url}/start"))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.url().path(), "/paid");
+            assert_eq!(provider.call_count(), 1);
         }
 
         #[tokio::test]
