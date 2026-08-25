@@ -22,7 +22,7 @@ jobs:
     steps:
       - name: Fetch GitHub token via STS
         id: app-token
-        uses: tempoxyz/gh-actions/actions/github-sts@183a02178c660ce295e9a262edc5857cb7135f06 # main
+        uses: tempoxyz/gh-actions/actions/github-sts@183a02178c660ce295e9a262edc5857cb7135f06
         with:
           policy: release-pr
 
