@@ -6,9 +6,13 @@ on:
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
+# The changelog-release version PR, branch, tags, and GitHub releases are
+# created with a short-lived GitHub App token minted via the github-sts
+# action (authorized by .github/sts/release-pr.sts.yaml); the built-in
+# GITHUB_TOKEN is not allowed to create pull requests. id-token feeds the
+# STS exchange and crates.io trusted publishing.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
   id-token: write
 
 jobs:
@@ -16,8 +20,16 @@ jobs:
     name: Version
     runs-on: ubuntu-latest
     steps:
+      - name: Fetch GitHub token via STS
+        id: app-token
+        uses: tempoxyz/gh-actions/actions/github-sts@183a02178c660ce295e9a262edc5857cb7135f06 # main
+        with:
+          policy: release-pr
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 # zizmor: ignore[artipacked]
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Authenticate with crates.io
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
@@ -29,5 +41,4 @@ jobs:
           ecosystem: rust
           conventional-commit: true
           crate-token: ${{ steps.auth.outputs.token }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
