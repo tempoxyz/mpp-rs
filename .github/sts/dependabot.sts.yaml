@@ -1,0 +1,19 @@
+# Allow the Dependabot auto-merge workflow to mint a short-lived token that
+# approves and squash-merges Dependabot's patch/minor update PRs through the
+# shared tempoxyz/mpp-tools dependabot reusable workflow. Replaces the
+# built-in GITHUB_TOKEN so the org can turn off "Allow GitHub Actions to
+# create and approve pull requests".
+#
+# pull_request runs carry the bare repo:...:pull_request subject, which any
+# pull_request-triggered workflow in this repo can present, so the claim
+# checks below do the narrowing: the run must have been triggered by
+# dependabot[bot] (a human pushing to the PR branch becomes the actor and is
+# denied) and must mint through the shared reusable workflow.
+subject: repo:tempoxyz@211589300/mpp-rs@1141417139:pull_request
+claim_pattern:
+  actor: dependabot\[bot\]
+  actor_id: "49699333"
+  job_workflow_ref: tempoxyz/mpp-tools/\.github/workflows/dependabot\.yml@.+
+permissions:
+  contents: write
+  pull_requests: write
