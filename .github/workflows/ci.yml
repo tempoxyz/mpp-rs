@@ -41,7 +41,7 @@ jobs:
       - name: Pin pnpm for Tempo Lints
         run: corepack prepare pnpm@11.17.0 --activate
       - name: Run Tempo Lints
-        uses: tempoxyz/lints@8c451f192339242ef42dd5801ea67fac3d99666f # @tempoxyz/lints@0.1.1
+        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # main
         with:
           language: rust
           path: "."
@@ -118,7 +118,7 @@ jobs:
         run: docker compose down
 
   deny:
-    uses: tempoxyz/ci/.github/workflows/deny.yml@934b6a6317ac26272eaecf0d265472f4105c99d6 # main
+    uses: tempoxyz/ci/.github/workflows/deny.yml@09f481293feb726bcd5c94853063b224a9b2ff24 # main
     permissions:
       contents: read
 
