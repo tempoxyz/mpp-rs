@@ -115,7 +115,7 @@ impl HttpTransport {
         if self.requires_auth {
             crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER
         } else {
-            "Authorization"
+            http_types::header::AUTHORIZATION.as_str()
         }
     }
 }

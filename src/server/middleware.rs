@@ -72,7 +72,7 @@ pub trait PaymentVerifier: Send + Sync + 'static {
     /// Defaults to `Authorization`. Servers created with `requires_auth`
     /// return `Payment-Authorization`.
     fn credential_header(&self) -> &str {
-        "Authorization"
+        header::AUTHORIZATION.as_str()
     }
 }
 
