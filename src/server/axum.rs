@@ -1082,23 +1082,28 @@ pub struct WithReceipt<T> {
 impl<T: IntoResponse> IntoResponse for WithReceipt<T> {
     fn into_response(self) -> axum_core::response::Response {
         let mut resp = self.body.into_response();
-        if let Ok(header_val) = format_receipt(&self.receipt) {
-            if let Ok(val) = HeaderValue::from_str(&header_val) {
-                resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
+        if !resp.status().is_success() {
+            return resp;
+        }
+        let Ok(header_val) = format_receipt(&self.receipt) else {
+            return resp;
+        };
+        let Ok(val) = HeaderValue::from_str(&header_val) else {
+            return resp;
+        };
+        resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
 
-                // Receipt responses MUST be Cache-Control: private (spec §11.10).
-                let existing_cc = resp
-                    .headers()
-                    .get_all(header::CACHE_CONTROL)
-                    .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
-                if let Ok(cc) = HeaderValue::from_str(&cache_control) {
-                    resp.headers_mut().insert(header::CACHE_CONTROL, cc);
-                }
-            }
+        // Receipt responses MUST be Cache-Control: private (spec §11.10).
+        let existing_cc = resp
+            .headers()
+            .get_all(header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+        if let Ok(cc) = HeaderValue::from_str(&cache_control) {
+            resp.headers_mut().insert(header::CACHE_CONTROL, cc);
         }
         resp
     }
@@ -1354,6 +1359,66 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "private"
+        );
+    }
+
+    #[test]
+    fn test_with_receipt_does_not_attach_header_to_error_response() {
+        use crate::protocol::core::{MethodName, ReceiptStatus};
+
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let receipt = Receipt {
+                status: ReceiptStatus::Success,
+                method: MethodName::new("tempo"),
+                timestamp: "2025-01-01T00:00:00Z".into(),
+                reference: "0xabc".into(),
+                external_id: None,
+                subscription_id: None,
+                extensions: serde_json::Map::new(),
+            };
+            let resp = WithReceipt {
+                receipt,
+                body: (status, "error"),
+            }
+            .into_response();
+
+            assert_eq!(resp.status(), status);
+            assert!(!resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+            assert!(!resp.headers().contains_key(header::CACHE_CONTROL));
+        }
+    }
+
+    #[test]
+    fn test_with_receipt_preserves_existing_cache_control() {
+        use crate::protocol::core::{MethodName, ReceiptStatus};
+
+        let receipt = Receipt {
+            status: ReceiptStatus::Success,
+            method: MethodName::new("tempo"),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            reference: "0xabc".into(),
+            external_id: None,
+            subscription_id: None,
+            extensions: serde_json::Map::new(),
+        };
+        let mut body = "ok".into_response();
+        body.headers_mut()
+            .append(header::CACHE_CONTROL, HeaderValue::from_static("public"));
+        body.headers_mut().append(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=60"),
+        );
+
+        let resp = WithReceipt { receipt, body }.into_response();
+
+        assert!(resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60, private"
         );
     }
 
