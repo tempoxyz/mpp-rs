@@ -250,24 +250,7 @@ where
 
             // Call the inner service.
             let mut resp = inner.call(req).await?;
-
-            // Receipt responses MUST be Cache-Control: private (spec §11.10).
-            let existing_cc = resp
-                .headers()
-                .get_all(header::CACHE_CONTROL)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
-            if let Ok(val) = HeaderValue::from_str(&cache_control) {
-                resp.headers_mut().insert(header::CACHE_CONTROL, val);
-            }
-
-            // Attach the receipt header.
-            if let Ok(val) = HeaderValue::from_str(&receipt_header) {
-                resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
-            }
+            attach_receipt(&mut resp, &receipt_header);
 
             Ok(resp)
         })
@@ -388,23 +371,7 @@ where
 
             let req = Request::from_parts(parts, http_body_util::Full::new(body));
             let mut resp = inner.call(req).await?;
-
-            // Receipt responses MUST be Cache-Control: private (spec §11.10).
-            let existing_cc = resp
-                .headers()
-                .get_all(header::CACHE_CONTROL)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
-            if let Ok(val) = HeaderValue::from_str(&cache_control) {
-                resp.headers_mut().insert(header::CACHE_CONTROL, val);
-            }
-
-            if let Ok(val) = HeaderValue::from_str(&receipt_header) {
-                resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, val);
-            }
+            attach_receipt(&mut resp, &receipt_header);
 
             Ok(resp)
         })
@@ -416,6 +383,30 @@ fn error_response<B: Default>(status: StatusCode, _message: &str) -> Response<B>
     let mut resp = Response::new(B::default());
     *resp.status_mut() = status;
     resp
+}
+
+/// Attach a receipt only to successful responses and prevent shared caching.
+fn attach_receipt<B>(resp: &mut Response<B>, receipt_header: &str) {
+    if !resp.status().is_success() {
+        return;
+    }
+
+    let Ok(receipt) = HeaderValue::from_str(receipt_header) else {
+        return;
+    };
+
+    let existing_cc = resp
+        .headers()
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cache_control = with_private_cache_control(Some(existing_cc.as_str()));
+    if let Ok(value) = HeaderValue::from_str(&cache_control) {
+        resp.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+    resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, receipt);
 }
 
 /// Build a retryable `402 Payment Required` response carrying a fresh
@@ -637,6 +628,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StatusService(StatusCode);
+
+    impl<B: Send + 'static> tower_service::Service<Request<B>> for StatusService {
+        type Response = Response<()>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<()>, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<B>) -> Self::Future {
+            let status = self.0;
+            Box::pin(async move {
+                let mut resp = Response::new(());
+                *resp.status_mut() = status;
+                Ok(resp)
+            })
+        }
+    }
+
     #[test]
     fn test_payment_verifier_challenge() {
         let v = MockVerifier {
@@ -776,6 +789,72 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "private"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_does_not_attach_receipt_to_error_response() {
+        use tower_service::Service;
+
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let layer = PaymentLayer::new(MockVerifier {
+                challenge_value: "Payment id=\"challenge\"".to_string(),
+                accept: true,
+            });
+            let mut svc = layer.layer(StatusService(status));
+            let req = Request::builder()
+                .uri("/premium")
+                .header(header::AUTHORIZATION, "Payment eyJmYWtlIjp0cnVlfQ")
+                .body(())
+                .unwrap();
+
+            let resp = svc.call(req).await.unwrap();
+            assert_eq!(resp.status(), status);
+            assert!(!resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+            assert!(!resp.headers().contains_key(header::CACHE_CONTROL));
+        }
+    }
+
+    #[test]
+    fn test_attach_receipt_preserves_existing_cache_control() {
+        let mut resp = Response::new(());
+        resp.headers_mut()
+            .append(header::CACHE_CONTROL, HeaderValue::from_static("public"));
+        resp.headers_mut().append(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=60"),
+        );
+
+        attach_receipt(&mut resp, "mock-receipt-token");
+
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60, private"
+        );
+        assert_eq!(
+            resp.headers().get(PAYMENT_RECEIPT_HEADER).unwrap(),
+            "mock-receipt-token"
+        );
+    }
+
+    #[test]
+    fn test_attach_receipt_rejects_invalid_header_without_changing_cache_control() {
+        let mut resp = Response::new(());
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
+
+        attach_receipt(&mut resp, "invalid\nreceipt");
+
+        assert!(!resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60"
         );
     }
 
@@ -1016,6 +1095,33 @@ mod tests {
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+    }
+
+    #[tokio::test]
+    async fn test_body_service_does_not_attach_receipt_to_error_response() {
+        use tower_service::Service;
+
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::FORBIDDEN,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let layer = PaymentBodyLayer::new(BodyAwareVerifier {
+                challenge_body: Arc::new(std::sync::Mutex::new(None)),
+                verify_body: Arc::new(std::sync::Mutex::new(None)),
+            });
+            let mut svc = layer.layer(StatusService(status));
+            let req = Request::builder()
+                .uri("/premium")
+                .header(header::AUTHORIZATION, "Payment eyJmYWtlIjp0cnVlfQ")
+                .body(http_body_util::Full::new(Bytes::from_static(b"paid")))
+                .unwrap();
+
+            let resp = svc.call(req).await.unwrap();
+            assert_eq!(resp.status(), status);
+            assert!(!resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+            assert!(!resp.headers().contains_key(header::CACHE_CONTROL));
+        }
     }
 
     // ==================== Real ChargeVerifier tests ====================
