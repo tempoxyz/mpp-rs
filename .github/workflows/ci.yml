@@ -39,7 +39,7 @@ jobs:
         with:
           node-version: 22
       - name: Pin pnpm for Tempo Lints
-        run: corepack prepare pnpm@11.17.0 --activate
+        run: corepack prepare pnpm@10.28.1 --activate
       - name: Run Tempo Lints
         uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # main
         with:
