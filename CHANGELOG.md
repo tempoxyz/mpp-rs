@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.12.0 (2026-08-27)
+
+### Minor Changes
+
+- Accept asynchronous Alloy signers for Tempo fee sponsorship and session closing,
+- enabling remote KMS, HSM, and MPC-backed server keys. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Added automatic native TIP-1034 channel top-ups before session vouchers exceed the current deposit, with credentials bound to each active WebSocket challenge across reconnects. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Support Tempo Wallet P-256 access keys for charge payments and expose the
+- shared `store.json` loader for native command-line clients. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Add route-bound machineUSD session channels and atomic settlement into the
+- merchant's configured stablecoin. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Add atomic stablecoin auto-swaps for native TIP-1034 session opens and top-ups,
+- including the required Stablecoin DEX approval for charge and session payments. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Add a Charge-only payment provider backed by the canonical Tempo Accounts
+- `store.json`, with lazy access-key selection and no separate signing mode. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Add separate non-mutating charge validation and terminal broadcast APIs, retaining verification as a compatibility alias and falling back to legacy method implementations. Add `TempoRelayConfig` and `TempoBuilder::relay` for delegating Tempo charge credential validation and finalization to Tempo API or a compatible MPP relay. Relay requests normalize the echoed challenge request, derive deterministic broadcast idempotency keys, validate returned receipts, and hide private relay failures. Add an Axum charge-relay example dogfooded against Tempo Moderato. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+
+### Patch Changes
+
+- Return a fresh body-bound payment challenge when request-body credential verification fails. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Pinned the Tempo dependency to the coordinated 7690815 revision. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Use the SDK-independent `mpp_` prefix for Stripe PaymentIntent idempotency keys. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Continue retrying distinct charge challenges within the configured payment
+- retry limit, matching MPPx and allowing sponsored servers to rotate challenges
+- that were rejected before settlement. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Match MPPx and Tempo fee sponsorship by encoding P-256 charge and TIP-1034 management credentials as sender-signed `0x78` envelopes. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Authorize canonical application WebSockets with their advertised opening amount,
+- and provide a top-up-aware authorization path for full reusable channels. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Reject payment challenges containing malformed RFC 3339 `expires` timestamps during header parsing. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Pinned an updated Tempo dependency revision and reworked the one-time authorization test to sign the key authorization with a real root signer. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Preserve method-specific receipt fields when parsing and serializing payment receipts. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Mark successful body-bound payment responses as private while preserving existing
+- `Cache-Control` directives, preventing shared caches from storing payment receipts. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Updated the pinned `tempo-alloy` git revision. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Only attach payment receipts to successful responses from Tower middleware and Axum handlers. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Reject payment challenges whose method identifier contains characters other
+- than lowercase ASCII letters. Reject payment challenges reached through a
+- cross-origin redirect before a credential can be created or sent. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Reject Payment challenges containing an unterminated quoted-string parameter. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Resolve persisted Tempo Wallet key authorizations against the Account Keychain before signing. Already-authorized access keys now omit the one-time authorization instead of failing fresh charge or session transactions with `KeyAlreadyExists`. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Send payment credential retries directly to the final same-origin response URL after redirects. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Use the bootstrapped Tempo localnet image for reproducible integration tests. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Allowed Tempo signature variants without primitive key metadata while safely rejecting unsupported proof signatures. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Update the Tempo SDK revision so fee-payer relays can select the transaction fee token. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+- Load pending Accounts SDK key authorizations from the shared Tempo Wallet store so native Rust clients can provision a fresh access key with their first transaction. Open a fresh session after access-key rotation instead of trying to reuse a channel bound to the previous voucher signer. (by @BrendanRyan, [#399](https://github.com/tempoxyz/mpp-rs/pull/399))
+
 ## 0.11.0 (2026-07-16)
 
 ### Minor Changes
