@@ -64,6 +64,15 @@ pub struct PaymentChallenge {
     /// JCS-serialized JSON object. Clients MUST NOT modify.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opaque: Option<Base64UrlJson>,
+
+    /// HTTP field that must carry the Payment credential.
+    ///
+    /// When omitted, clients send the credential in `Authorization`. When
+    /// present, the value is `Payment-Authorization` so `Authorization` can
+    /// remain in use for ordinary application authentication.
+    /// `Authorization` is the implicit default and is never advertised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
 }
 
 impl PaymentChallenge {
@@ -104,6 +113,7 @@ impl PaymentChallenge {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }
     }
 
@@ -162,6 +172,7 @@ impl PaymentChallenge {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }
     }
 
@@ -184,11 +195,13 @@ impl PaymentChallenge {
         digest: Option<&str>,
         description: Option<&str>,
         opaque: Option<Base64UrlJson>,
+        header: Option<&str>,
     ) -> Self {
         let realm = realm.into();
         let method = method.into();
         let intent = intent.into();
-        let id = compute_challenge_id(
+        let header = advertised_credential_header(header);
+        let id = compute_challenge_id_with_header(
             secret_key,
             &realm,
             method.as_str(),
@@ -197,6 +210,7 @@ impl PaymentChallenge {
             expires,
             digest,
             opaque.as_ref().map(|o| o.raw()),
+            header.as_deref(),
         );
         Self {
             id,
@@ -208,6 +222,7 @@ impl PaymentChallenge {
             description: description.map(String::from),
             digest: digest.map(String::from),
             opaque,
+            header,
         }
     }
 
@@ -243,6 +258,25 @@ impl PaymentChallenge {
         self
     }
 
+    /// Set the HTTP field that must carry the Payment credential.
+    ///
+    /// `Authorization` is the implicit default and is stored as `None`.
+    /// Note: When using `with_secret_key`, set header BEFORE creating the
+    /// challenge since it affects the HMAC. Use [`with_secret_key_full`]
+    /// instead if header is needed in the HMAC.
+    pub fn with_header(mut self, header: impl Into<String>) -> Self {
+        let header = header.into();
+        self.header = advertised_credential_header(Some(&header));
+        self
+    }
+
+    /// HTTP field a client must use for the payment credential.
+    ///
+    /// Returns `header` when advertised, otherwise `Authorization`.
+    pub fn credential_header(&self) -> &str {
+        self.header.as_deref().unwrap_or("Authorization")
+    }
+
     /// Get the effective expiration time for this payment challenge.
     ///
     /// Returns `challenge.expires` if set. Expiry is a property of
@@ -262,6 +296,7 @@ impl PaymentChallenge {
             expires: self.expires.clone(),
             digest: self.digest.clone(),
             opaque: self.opaque.clone(),
+            header: self.header.clone(),
         }
     }
 
@@ -305,7 +340,8 @@ impl PaymentChallenge {
 
     /// Verify that this challenge's ID matches the expected HMAC for the given secret key.
     ///
-    /// Recomputes HMAC-SHA256 over `realm|method|intent|request|expires|digest|opaque`
+    /// Recomputes HMAC-SHA256 over `realm|method|intent|request|expires|digest|opaque`,
+    /// inserting `header` immediately before `opaque` when advertised,
     /// and performs a constant-time comparison against the challenge ID.
     ///
     /// This is the Rust equivalent of `Challenge.verify(challenge, { secretKey })` in the TS SDK.
@@ -321,7 +357,7 @@ impl PaymentChallenge {
     /// let is_valid = challenge.verify("my-server-secret");
     /// ```
     pub fn verify(&self, secret_key: &str) -> bool {
-        let expected_id = compute_challenge_id(
+        let expected_id = compute_challenge_id_with_header(
             secret_key,
             &self.realm,
             self.method.as_str(),
@@ -330,6 +366,7 @@ impl PaymentChallenge {
             self.expires.as_deref(),
             self.digest.as_deref(),
             self.opaque.as_ref().map(|o| o.raw()),
+            self.header.as_deref(),
         );
         constant_time_eq(&self.id, &expected_id)
     }
@@ -424,8 +461,9 @@ impl PaymentChallenge {
 /// and challenge creation. The algorithm matches the TypeScript and Python SDKs:
 ///
 /// 1. Concatenate all fields `realm|method|intent|request|expires|digest|opaque` with `|` (empty string for absent optional fields)
-/// 2. Compute HMAC-SHA256 with the secret key
-/// 3. Base64url-encode the result (no padding)
+/// 2. When a credential header is advertised, insert it immediately before the final opaque slot
+/// 3. Compute HMAC-SHA256 with the secret key
+/// 4. Base64url-encode the result (no padding)
 ///
 /// # Examples
 ///
@@ -454,24 +492,51 @@ pub fn compute_challenge_id(
     digest: Option<&str>,
     opaque: Option<&str>,
 ) -> String {
+    compute_challenge_id_with_header(
+        secret_key, realm, method, intent, request, expires, digest, opaque, None,
+    )
+}
+
+/// Compute an HMAC-SHA256 challenge ID, including an advertised credential header.
+///
+/// `Authorization` is the implicit protocol default and is never included in the
+/// HMAC input, matching mppx. An advertised header (typically
+/// `Payment-Authorization`) is inserted immediately before the final opaque slot.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_challenge_id_with_header(
+    secret_key: &str,
+    realm: &str,
+    method: &str,
+    intent: &str,
+    request: &str,
+    expires: Option<&str>,
+    digest: Option<&str>,
+    opaque: Option<&str>,
+    header: Option<&str>,
+) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
 
-    // All fields are always included in the pipe-delimited HMAC input,
-    // with empty string for absent optional fields. This ensures challenges
-    // with vs without expires/digest/opaque produce different HMACs.
-    let hmac_input = [
+    // Legacy slots: realm | method | intent | request | expires | digest | opaque.
+    // Challenges advertising a credential header insert it immediately before
+    // the final opaque slot. Authorization is the implicit default and is never
+    // included, preserving the legacy binding.
+    let mut hmac_input = vec![
         realm,
         method,
         intent,
         request,
         expires.unwrap_or(""),
         digest.unwrap_or(""),
-        opaque.unwrap_or(""),
-    ]
-    .join("|");
+    ];
+    let advertised = advertised_credential_header(header);
+    if let Some(ref header) = advertised {
+        hmac_input.push(header);
+    }
+    hmac_input.push(opaque.unwrap_or(""));
+    let hmac_input = hmac_input.join("|");
 
     let mut mac =
         HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
@@ -479,6 +544,70 @@ pub fn compute_challenge_id(
     let result = mac.finalize();
 
     super::base64url_encode(&result.into_bytes())
+}
+
+/// Returns whether a credential header is omitted or is the implicit Authorization default.
+pub fn is_default_credential_header(header: Option<&str>) -> bool {
+    match header {
+        None => true,
+        Some(h) => h.is_empty() || h.eq_ignore_ascii_case("Authorization"),
+    }
+}
+
+/// RFC 9110 token used as an HTTP field name.
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
+}
+
+/// Returns an advertised credential header, or `None` for the Authorization default.
+///
+/// Invalid HTTP header names are ignored and treated as absent so HMAC
+/// computation cannot panic; parsers reject them separately.
+pub fn advertised_credential_header(header: Option<&str>) -> Option<String> {
+    if is_default_credential_header(header) {
+        return None;
+    }
+    let name = header?;
+    is_valid_http_header_name(name).then(|| name.to_string())
+}
+
+/// Parse an advertised credential header from the wire, rejecting invalid names.
+pub fn parse_advertised_credential_header(
+    header: Option<&str>,
+) -> crate::error::Result<Option<String>> {
+    if is_default_credential_header(header) {
+        return Ok(None);
+    }
+    let name = header.unwrap_or("");
+    if !is_valid_http_header_name(name) {
+        return Err(crate::error::MppError::invalid_challenge_reason(
+            "Invalid HTTP header name",
+        ));
+    }
+    Ok(Some(name.to_string()))
 }
 
 /// Constant-time string comparison to prevent timing attacks.
@@ -525,6 +654,13 @@ pub struct ChallengeEcho {
     /// Server-defined correlation data (base64url-encoded JSON).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opaque: Option<Base64UrlJson>,
+
+    /// HTTP field that must carry the Payment credential.
+    ///
+    /// Echoed from the challenge when present. Omitted when the challenge
+    /// used the default `Authorization` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
 }
 
 /// Payment payload in credential.
@@ -922,6 +1058,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }
     }
 
@@ -1202,6 +1339,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert!(challenge.verify(secret));
@@ -1231,6 +1369,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert!(!challenge.verify("wrong-secret"));
@@ -1250,6 +1389,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert!(!challenge.verify("any-secret"));
@@ -1283,6 +1423,7 @@ mod tests {
             description: Some("test payment".to_string()),
             digest: digest.map(String::from),
             opaque: None,
+            header: None,
         };
 
         assert!(challenge.verify(secret));
@@ -1574,6 +1715,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert!(!challenge.verify(secret));
@@ -1619,6 +1761,7 @@ mod tests {
             Some("2026-01-01T00:00:00Z"),
             Some("sha-256=abc"),
             Some("test payment"),
+            None,
             None,
         );
         assert!(challenge.verify("my-secret"));
@@ -1671,6 +1814,7 @@ mod tests {
             None,
             None,
             Some(opaque),
+            None,
         );
         assert_eq!(challenge.opaque.as_ref().unwrap().raw(), opaque_raw);
         assert!(challenge.verify("my-secret"));
@@ -1691,6 +1835,7 @@ mod tests {
             None,
             None,
             Some(opaque),
+            None,
         );
         let tampered =
             Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_TAMPERED"})).unwrap();
@@ -1714,6 +1859,7 @@ mod tests {
             None,
             None,
             Some(opaque),
+            None,
         );
         let echo = challenge.to_echo();
         assert_eq!(
@@ -1821,6 +1967,7 @@ mod tests {
             None,
             None,
             Some(opaque),
+            None,
         );
         assert!(challenge.verify("test-secret"));
 
@@ -2125,5 +2272,93 @@ mod tests {
 
         let encoded = URL_SAFE_NO_PAD.encode(b"not json");
         assert_eq!(extract_tx_hash(&encoded), None);
+    }
+
+    #[test]
+    fn test_authorization_header_does_not_change_challenge_id() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let implicit = PaymentChallenge::with_secret_key_full(
+            "test-secret-key-12345",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let explicit = PaymentChallenge::with_secret_key_full(
+            "test-secret-key-12345",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            None,
+            Some("Authorization"),
+        );
+
+        assert!(implicit.header.is_none());
+        assert!(explicit.header.is_none());
+        assert_eq!(implicit.id, explicit.id);
+        assert!(!implicit.to_header().unwrap().contains("header="));
+        assert_eq!(implicit.credential_header(), "Authorization");
+    }
+
+    #[test]
+    fn test_payment_authorization_header_is_bound_into_id() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let implicit = PaymentChallenge::with_secret_key_full(
+            "test-secret-key-12345",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let advertised = PaymentChallenge::with_secret_key_full(
+            "test-secret-key-12345",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            None,
+            Some("Payment-Authorization"),
+        );
+
+        assert_ne!(implicit.id, advertised.id);
+        assert_eq!(advertised.header.as_deref(), Some("Payment-Authorization"));
+        assert!(advertised.verify("test-secret-key-12345"));
+        assert_eq!(advertised.credential_header(), "Payment-Authorization");
+        assert!(advertised
+            .to_header()
+            .unwrap()
+            .contains(r#"header="Payment-Authorization""#));
+        assert_eq!(
+            advertised.to_echo().header.as_deref(),
+            Some("Payment-Authorization")
+        );
+    }
+
+    #[test]
+    fn test_header_roundtrip_through_www_authenticate() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_header("Payment-Authorization");
+        let header = challenge.to_header().unwrap();
+        let parsed = PaymentChallenge::from_header(&header).unwrap();
+        assert_eq!(parsed.header.as_deref(), Some("Payment-Authorization"));
+        assert_eq!(parsed.credential_header(), "Payment-Authorization");
     }
 }

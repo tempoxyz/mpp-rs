@@ -168,6 +168,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }
     }
 
@@ -260,6 +261,7 @@ mod tests {
             expires: Some(expires),
             digest: None,
             opaque: None,
+            header: None,
         };
         PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
     }
@@ -328,6 +330,7 @@ mod tests {
             expires: Some(expires),
             digest: None,
             opaque: None,
+            header: None,
         };
         let cred = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 

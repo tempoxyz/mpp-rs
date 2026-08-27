@@ -340,6 +340,7 @@ pub fn charge_challenge_with_options(
         description: description.map(|s| s.to_string()),
         digest: None,
         opaque: None,
+        header: None,
     })
 }
 

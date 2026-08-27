@@ -334,6 +334,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }
     }
 

@@ -1570,6 +1570,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let override_addr: Address = "0x1111111111111111111111111111111111111111"
@@ -1598,6 +1599,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
@@ -1627,6 +1629,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
@@ -1653,6 +1656,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert_eq!(
@@ -1681,6 +1685,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert_eq!(resolve_escrow(&challenge, 4217, None).unwrap(), hinted);
@@ -1705,6 +1710,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let result = resolve_escrow(&challenge, 9999, None);
@@ -1730,6 +1736,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -1861,6 +1868,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert_eq!(resolve_chain_id(&challenge), 4217);
@@ -1885,6 +1893,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
@@ -1907,6 +1916,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         // Match MPPx's default Tempo client: mainnet when no chain is advertised.
@@ -1936,6 +1946,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         // Invalid address in challenge should fall back to default
@@ -1962,6 +1973,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
@@ -2019,6 +2031,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -2159,6 +2172,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();

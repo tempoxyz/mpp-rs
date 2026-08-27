@@ -136,7 +136,12 @@ impl Transport for WsTransport {
         })
     }
 
-    fn set_credential(&self, _request: Self::Request, credential: &str) -> Self::Request {
+    fn set_credential(
+        &self,
+        _request: Self::Request,
+        credential: &str,
+        _challenge: Option<&PaymentChallenge>,
+    ) -> Self::Request {
         WsClientMessage::Credential {
             credential: credential.to_string(),
         }
@@ -233,7 +238,7 @@ mod tests {
             data: serde_json::json!({}),
         };
 
-        let result = transport.set_credential(dummy, "Payment id=\"abc\"");
+        let result = transport.set_credential(dummy, "Payment id=\"abc\"", None);
         match result {
             WsClientMessage::Credential { credential } => {
                 assert_eq!(credential, "Payment id=\"abc\"");

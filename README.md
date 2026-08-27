@@ -76,6 +76,12 @@ let challenge = mpp.stripe_charge("1")?;
 let receipt = mpp.verify_credential(&credential).await?;
 ```
 
+If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`, and clients send the Payment credential in that header instead of `Authorization`.
+
+```rust
+let mpp = Mpp::create(tempo(config).requires_auth(true))?;
+```
+
 ### Client (Tempo)
 
 ```rust

@@ -346,6 +346,14 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         }
         self.verify_payment_for_amount_with_body(credential_str, amount, body)
     }
+
+    /// HTTP field containing the Payment credential.
+    ///
+    /// Defaults to `Authorization`. Servers created with `requires_auth`
+    /// return `Payment-Authorization`.
+    fn credential_header(&self) -> &str {
+        "Authorization"
+    }
 }
 
 #[cfg(feature = "tempo")]
@@ -616,6 +624,10 @@ where
             .map_err(|e| e.to_string())
         })
     }
+
+    fn credential_header(&self) -> &str {
+        super::Mpp::credential_header(self)
+    }
 }
 
 #[cfg(feature = "stripe")]
@@ -885,6 +897,10 @@ where
             .map_err(|e| e.to_string())
         })
     }
+
+    fn credential_header(&self) -> &str {
+        super::Mpp::credential_header(self)
+    }
 }
 
 impl<S, C> FromRequestParts<S> for MppCharge<C>
@@ -903,7 +919,7 @@ where
         let mppx_scope = mppx_scope_from_parts(parts);
         let auth_header = parts
             .headers
-            .get(header::AUTHORIZATION)
+            .get(challenger.credential_header())
             .and_then(|v| v.to_str().ok())
             .and_then(extract_payment_scheme)
             .map(|s| s.to_string());
@@ -964,7 +980,7 @@ where
         let mppx_scope = mppx_scope_from_parts(&parts);
         let auth_header = parts
             .headers
-            .get(header::AUTHORIZATION)
+            .get(challenger.credential_header())
             .and_then(|v| v.to_str().ok())
             .and_then(extract_payment_scheme)
             .map(|s| s.to_string());

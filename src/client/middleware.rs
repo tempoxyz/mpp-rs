@@ -20,9 +20,7 @@ use crate::client::provider::{PaymentContext, PaymentProvider, PendingPayments};
 use crate::client::HttpError;
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
-use crate::protocol::core::{
-    format_authorization, parse_www_authenticate_all, AUTHORIZATION_HEADER,
-};
+use crate::protocol::core::{format_authorization, parse_www_authenticate_all};
 
 async fn commit_middleware_payments<P: PaymentProvider>(
     payments: &mut PendingPayments<P>,
@@ -385,9 +383,10 @@ where
                     "request could not be cloned for payment retry"
                 )));
             };
-            retry_req
-                .headers_mut()
-                .insert(AUTHORIZATION_HEADER, auth_header_value);
+            retry_req.headers_mut().insert(
+                crate::client::payment_credential_header_name(&challenge),
+                auth_header_value,
+            );
 
             resp = match next.clone().run(retry_req, extensions).await {
                 Ok(resp) => resp,
