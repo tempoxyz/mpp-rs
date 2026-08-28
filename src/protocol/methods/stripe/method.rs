@@ -224,6 +224,7 @@ impl ChargeMethodTrait for ChargeMethod {
             if let Some(user_meta) = details.metadata {
                 metadata.extend(user_meta);
             }
+            metadata.insert("machine_payment".into(), "true".into());
 
             let idempotency_key = Self::idempotency_key(&challenge.id, &payload.spt);
 
