@@ -66,6 +66,11 @@ async fn mock_create_payment_intent(
         "confirm must be true"
     );
     assert_eq!(
+        params.get("metadata[machine_payment]").map(|s| s.as_str()),
+        Some("true"),
+        "machine_payment metadata must be true"
+    );
+    assert_eq!(
         params
             .get("automatic_payment_methods[enabled]")
             .map(|s| s.as_str()),
