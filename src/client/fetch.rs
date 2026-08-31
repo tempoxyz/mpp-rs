@@ -2,7 +2,7 @@
 //!
 //! Provides `.send_with_payment()` method for opt-in per-request payment handling.
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
@@ -504,7 +504,10 @@ async fn send_with_payment<P: PaymentProvider>(
             }
         };
         let mut payment_headers = HeaderMap::new();
-        payment_headers.insert(AUTHORIZATION, auth_header);
+        payment_headers.insert(
+            crate::client::payment_credential_header_name(&challenge),
+            auth_header,
+        );
         let retry = match retry_builder.try_clone() {
             Some(retry) => retry.headers(payment_headers),
             None => {
@@ -633,6 +636,7 @@ mod tests {
             format_www_authenticate, Base64UrlJson, PaymentChallenge, PaymentCredential,
             PaymentPayload,
         };
+        use reqwest::header::AUTHORIZATION;
 
         use axum::http::header::WWW_AUTHENTICATE as WWW_AUTH_NAME;
         use axum::http::StatusCode as AxumStatusCode;

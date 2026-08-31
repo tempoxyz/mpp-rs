@@ -287,6 +287,7 @@ mod tests {
             expires: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
         let request = ChargeRequest {
@@ -313,6 +314,7 @@ mod tests {
             expires: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 
@@ -336,6 +338,7 @@ mod tests {
             expires: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 
@@ -365,6 +368,7 @@ mod tests {
                 expires: None,
                 digest: None,
                 opaque: None,
+                header: None,
             },
             "did:example:payer",
             PaymentPayload::hash("0x123"),

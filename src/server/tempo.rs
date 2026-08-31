@@ -40,6 +40,7 @@ pub struct TempoBuilder {
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
     pub(crate) relay: Option<TempoRelayConfig>,
+    pub(crate) requires_auth: bool,
 }
 
 impl TempoBuilder {
@@ -150,6 +151,13 @@ impl TempoBuilder {
         self.relay = Some(config);
         self
     }
+
+    /// Use `Payment-Authorization` for Payment credentials so `Authorization`
+    /// remains available for application authentication.
+    pub fn requires_auth(mut self, enabled: bool) -> Self {
+        self.requires_auth = enabled;
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -208,6 +216,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         relay: None,
+        requires_auth: false,
     }
 }
 

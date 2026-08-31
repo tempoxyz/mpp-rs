@@ -60,8 +60,8 @@ pub use error::STREAM_PROBLEM_TYPE_BASE;
 
 // Core protocol types
 pub use protocol::core::{
-    compute_challenge_id, ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload,
-    Receipt, ReceiptStatus,
+    compute_challenge_id, compute_challenge_id_with_header, ChallengeEcho, PaymentChallenge,
+    PaymentCredential, PaymentPayload, Receipt, ReceiptStatus,
 };
 
 // Header parsing/formatting
@@ -73,8 +73,8 @@ pub use protocol::core::{
 // Schema types
 pub use protocol::core::{
     base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName, PayloadType,
-    PaymentProtocol, AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME,
-    WWW_AUTHENTICATE_HEADER,
+    PaymentProtocol, AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER,
+    PAYMENT_SCHEME, WWW_AUTHENTICATE_HEADER,
 };
 
 // Accept-Payment header

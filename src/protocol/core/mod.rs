@@ -75,14 +75,15 @@ pub mod types;
 #[cfg(feature = "server")]
 pub(crate) use challenge::constant_time_eq;
 pub use challenge::{
-    compute_challenge_id, extract_tx_hash, ChallengeEcho, PaymentChallenge, PaymentCredential,
-    PaymentPayload, Receipt,
+    advertised_credential_header, compute_challenge_id, compute_challenge_id_with_header,
+    extract_tx_hash, is_default_credential_header, parse_advertised_credential_header,
+    ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt,
 };
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
     format_www_authenticate_many, parse_authorization, parse_receipt, parse_www_authenticate,
     parse_www_authenticate_all, with_private_cache_control, AUTHORIZATION_HEADER,
-    PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME, WWW_AUTHENTICATE_HEADER,
+    PAYMENT_AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME, WWW_AUTHENTICATE_HEADER,
 };
 
 pub use types::{

@@ -50,7 +50,7 @@ pub trait PaymentVerifier: Send + Sync + 'static {
 
     /// Verify a credential string and return a `Payment-Receipt` header value.
     ///
-    /// The `credential` is the raw `Authorization` header value
+    /// The `credential` is the raw Payment credential header value
     /// (e.g., `"Payment eyJ..."` including the scheme prefix).
     fn verify(
         &self,
@@ -65,6 +65,14 @@ pub trait PaymentVerifier: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let _ = body;
         self.verify(credential)
+    }
+
+    /// HTTP field containing the Payment credential.
+    ///
+    /// Defaults to `Authorization`. Servers created with `requires_auth`
+    /// return `Payment-Authorization`.
+    fn credential_header(&self) -> &str {
+        header::AUTHORIZATION.as_str()
     }
 }
 
@@ -208,10 +216,10 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            // Extract the Authorization header.
+            // Extract the Payment credential from the header selected by the challenge.
             let auth_header = req
                 .headers()
-                .get(header::AUTHORIZATION)
+                .get(verifier.credential_header())
                 .and_then(|v| v.to_str().ok())
                 .and_then(extract_payment_scheme)
                 .map(|s| s.to_string());
@@ -438,6 +446,8 @@ struct ChargeVerifier {
     challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
     /// Builds a fresh body-bound `WWW-Authenticate` header value per request.
     challenge_with_body_fn: Box<dyn Fn(&[u8]) -> Result<String, String> + Send + Sync>,
+    /// HTTP field containing the Payment credential.
+    credential_header: String,
     /// Shared mpp instance for verification (type-erased).
     verify_fn: Box<
         dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
@@ -474,6 +484,10 @@ impl PaymentVerifier for ChargeVerifier {
         body: &[u8],
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         (self.verify_with_body_fn)(credential.to_string(), body.to_vec())
+    }
+
+    fn credential_header(&self) -> &str {
+        &self.credential_header
     }
 }
 
@@ -572,6 +586,7 @@ impl PaymentLayer<ChargeVerifier> {
         Ok(Self::new(ChargeVerifier {
             challenge_fn,
             challenge_with_body_fn,
+            credential_header: mpp.credential_header().to_string(),
             verify_fn,
             verify_with_body_fn,
         }))

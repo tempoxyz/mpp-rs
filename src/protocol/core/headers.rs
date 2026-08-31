@@ -90,6 +90,10 @@ pub const WWW_AUTHENTICATE_HEADER: &str = "www-authenticate";
 /// Header name for payment credentials (from client)
 pub const AUTHORIZATION_HEADER: &str = "authorization";
 
+/// Alternate header name for payment credentials when `Authorization` is
+/// reserved for ordinary application authentication.
+pub const PAYMENT_AUTHORIZATION_HEADER: &str = "Payment-Authorization";
+
 /// Header name for payment receipts (from server)
 pub const PAYMENT_RECEIPT_HEADER: &str = "payment-receipt";
 
@@ -298,6 +302,9 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         description: params.get("description").cloned(),
         digest,
         opaque: params.get("opaque").map(Base64UrlJson::from_raw),
+        header: super::parse_advertised_credential_header(
+            params.get("header").map(String::as_str),
+        )?,
     })
 }
 
@@ -404,6 +411,7 @@ fn split_payment_challenges(header: &str) -> Vec<&str> {
 ///     description: None,
 ///     digest: None,
 ///     opaque: None,
+///     header: None,
 /// };
 /// let header = format_www_authenticate(&challenge).unwrap();
 /// assert!(header.starts_with("Payment id=\"abc123\""));
@@ -442,6 +450,12 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
         parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
     }
 
+    if let Some(ref header) = challenge.header {
+        if !super::is_default_credential_header(Some(header)) {
+            parts.push(format!("header=\"{}\"", escape_quoted_value(header)?));
+        }
+    }
+
     if let Some(ref opaque) = challenge.opaque {
         parts.push(format!("opaque=\"{}\"", escape_quoted_value(opaque.raw())?));
     }
@@ -469,6 +483,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
 ///     description: None,
 ///     digest: None,
 ///     opaque: None,
+///     header: None,
 /// };
 /// let headers = format_www_authenticate_many(&[challenge]).unwrap();
 /// assert_eq!(headers.len(), 1);
@@ -497,9 +512,12 @@ pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
     }
 
     let decoded = base64url_decode(token)?;
-    let credential: PaymentCredential = serde_json::from_slice(&decoded).map_err(|e| {
+    let mut credential: PaymentCredential = serde_json::from_slice(&decoded).map_err(|e| {
         MppError::invalid_challenge_reason(format!("Invalid credential JSON: {}", e))
     })?;
+
+    credential.challenge.header =
+        super::parse_advertised_credential_header(credential.challenge.header.as_deref())?;
 
     if let Some(ref d) = credential.challenge.digest {
         if !is_valid_digest_format(d) {
@@ -601,6 +619,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }
     }
 
@@ -1178,5 +1197,54 @@ mod tests {
         let results = parse_www_authenticate_all(vec![mixed]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().method.as_str(), "stripe");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_advertises_payment_authorization_header() {
+        let header = concat!(
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
+            r#"request="e30", header="Payment-Authorization""#,
+        );
+        let parsed = parse_www_authenticate(header).unwrap();
+        assert_eq!(parsed.header.as_deref(), Some("Payment-Authorization"));
+        assert_eq!(parsed.credential_header(), "Payment-Authorization");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_omits_default_authorization_header() {
+        let header = concat!(
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
+            r#"request="e30", header="Authorization""#,
+        );
+        let parsed = parse_www_authenticate(header).unwrap();
+        assert!(parsed.header.is_none());
+        assert_eq!(parsed.credential_header(), "Authorization");
+        assert!(!format_www_authenticate(&parsed)
+            .unwrap()
+            .contains("header="));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_invalid_header_name() {
+        let header = concat!(
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
+            r#"request="e30", header="not a header""#,
+        );
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Invalid HTTP header name"));
+    }
+
+    #[test]
+    fn test_credential_echo_roundtrip_includes_header() {
+        let mut challenge = test_challenge();
+        challenge.header = Some("Payment-Authorization".to_string());
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
+        let header = format_authorization(&credential).unwrap();
+        let parsed = parse_authorization(&header).unwrap();
+        assert_eq!(
+            parsed.challenge.header.as_deref(),
+            Some("Payment-Authorization")
+        );
     }
 }

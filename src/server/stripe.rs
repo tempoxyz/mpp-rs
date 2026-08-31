@@ -46,6 +46,7 @@ pub struct StripeBuilder {
     pub(crate) realm: String,
     pub(crate) hmac_secret_key: Option<String>,
     pub(crate) stripe_api_base: Option<String>,
+    pub(crate) requires_auth: bool,
 }
 
 impl StripeBuilder {
@@ -64,6 +65,13 @@ impl StripeBuilder {
     /// Override the Stripe API base URL (for testing with a mock server).
     pub fn stripe_api_base(mut self, url: &str) -> Self {
         self.stripe_api_base = Some(url.to_string());
+        self
+    }
+
+    /// Use `Payment-Authorization` for Payment credentials so `Authorization`
+    /// remains available for application authentication.
+    pub fn requires_auth(mut self, enabled: bool) -> Self {
+        self.requires_auth = enabled;
         self
     }
 }
@@ -102,5 +110,6 @@ pub fn stripe(config: StripeConfig<'_>) -> StripeBuilder {
         realm: detect_realm(),
         hmac_secret_key: None,
         stripe_api_base: None,
+        requires_auth: false,
     }
 }

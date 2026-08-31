@@ -85,16 +85,39 @@ pub trait Transport: Send + Sync {
 
 /// HTTP transport for server-side payment handling.
 ///
-/// - Reads credentials from the `Authorization` header
+/// - Reads credentials from `Authorization`, or from `Payment-Authorization`
+///   when constructed with [`HttpTransport::requires_auth`]
 /// - Issues challenges via `WWW-Authenticate` header with 402 status
 /// - Attaches receipts via `Payment-Receipt` header
 ///
 /// This is the default transport, matching mppx's `Transport.http()`.
-pub struct HttpTransport;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HttpTransport {
+    requires_auth: bool,
+}
 
 /// Create an HTTP transport instance.
 pub fn http() -> HttpTransport {
-    HttpTransport
+    HttpTransport {
+        requires_auth: false,
+    }
+}
+
+impl HttpTransport {
+    /// Use `Payment-Authorization` for Payment credentials so `Authorization`
+    /// remains available for application authentication.
+    pub fn requires_auth(mut self, enabled: bool) -> Self {
+        self.requires_auth = enabled;
+        self
+    }
+
+    fn credential_header(&self) -> &'static str {
+        if self.requires_auth {
+            crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER
+        } else {
+            http_types::header::AUTHORIZATION.as_str()
+        }
+    }
 }
 
 impl Transport for HttpTransport {
@@ -107,7 +130,7 @@ impl Transport for HttpTransport {
     }
 
     fn get_credential(&self, input: &Self::Input) -> Result<Option<PaymentCredential>, MppError> {
-        let Some(header) = input.headers().get(http_types::header::AUTHORIZATION) else {
+        let Some(header) = input.headers().get(self.credential_header()) else {
             return Ok(None);
         };
 
@@ -243,6 +266,43 @@ mod tests {
 
         let result = transport.get_credential(&req).unwrap();
         assert!(result.is_some(), "should parse valid Payment credential");
+        let parsed = result.unwrap();
+        assert_eq!(parsed.challenge.id, "test-id");
+    }
+
+    #[test]
+    fn test_http_get_credential_from_payment_authorization() {
+        let transport = http().requires_auth(true);
+
+        let mut challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        challenge.header = Some("Payment-Authorization".to_string());
+        let credential = crate::protocol::core::PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xdeadbeef"),
+        );
+        let auth_header = crate::protocol::core::format_authorization(&credential).unwrap();
+
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .header("Authorization", "Bearer ordinary-authentication")
+            .header("Payment-Authorization", &auth_header)
+            .body(())
+            .unwrap();
+
+        let result = transport.get_credential(&req).unwrap();
+        assert!(
+            result.is_some(),
+            "should parse Payment-Authorization credential"
+        );
         let parsed = result.unwrap();
         assert_eq!(parsed.challenge.id, "test-id");
     }

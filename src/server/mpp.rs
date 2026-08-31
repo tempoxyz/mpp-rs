@@ -44,6 +44,11 @@ const REALM_ENV_VARS: &[&str] = &[
 
 const DEFAULT_REALM: &str = "MPP Payment";
 
+#[cfg(any(feature = "tempo", feature = "stripe"))]
+fn advertised_builder_credential_header(requires_auth: bool) -> Option<String> {
+    requires_auth.then(|| crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER.to_string())
+}
+
 /// Detect the server realm from environment variables.
 ///
 /// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
@@ -112,6 +117,7 @@ pub struct Mpp<M, S = ()> {
     machine_token_enabled: bool,
     chain_id: Option<u64>,
     opaque: Option<Base64UrlJson>,
+    credential_header: Option<String>,
     events: ServerEvents,
 }
 
@@ -135,6 +141,7 @@ where
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         }
     }
@@ -159,6 +166,7 @@ where
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         }
     }
@@ -182,6 +190,7 @@ where
             machine_token_enabled: self.machine_token_enabled,
             chain_id: self.chain_id,
             opaque: self.opaque,
+            credential_header: self.credential_header,
             events: self.events,
         }
     }
@@ -199,23 +208,51 @@ where
         self
     }
 
-    /// Stamp the configured `opaque` onto an issued challenge and recompute its
-    /// HMAC id. No-op when unconfigured.
+    /// Use `Payment-Authorization` for Payment credentials so `Authorization`
+    /// remains available for application authentication.
+    ///
+    /// Challenges advertise `header="Payment-Authorization"`, and clients send
+    /// the credential in that field instead of `Authorization`.
+    pub fn with_requires_auth(mut self, enabled: bool) -> Self {
+        self.credential_header =
+            enabled.then(|| crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER.to_string());
+        self
+    }
+
+    /// Whether this handler requires ordinary application authentication.
+    ///
+    /// When true, Payment credentials use `Payment-Authorization`.
+    pub fn requires_auth(&self) -> bool {
+        self.credential_header.is_some()
+    }
+
+    /// HTTP field a client must use for Payment credentials issued by this handler.
+    pub fn credential_header(&self) -> &str {
+        self.credential_header.as_deref().unwrap_or("Authorization")
+    }
+
+    /// Stamp configured `opaque` and credential `header` onto an issued
+    /// challenge and recompute its HMAC id. No-op when neither is configured.
     #[cfg(any(feature = "tempo", feature = "stripe"))]
     fn apply_pinned_opaque(&self, mut challenge: PaymentChallenge) -> PaymentChallenge {
+        if self.opaque.is_none() && self.credential_header.is_none() {
+            return challenge;
+        }
         if let Some(opaque) = &self.opaque {
-            challenge.id = crate::protocol::core::compute_challenge_id(
-                &self.secret_key,
-                &challenge.realm,
-                challenge.method.as_str(),
-                challenge.intent.as_str(),
-                challenge.request.raw(),
-                challenge.expires.as_deref(),
-                challenge.digest.as_deref(),
-                Some(opaque.raw()),
-            );
             challenge.opaque = Some(opaque.clone());
         }
+        challenge.header = self.credential_header.clone();
+        challenge.id = crate::protocol::core::compute_challenge_id_with_header(
+            &self.secret_key,
+            &challenge.realm,
+            challenge.method.as_str(),
+            challenge.intent.as_str(),
+            challenge.request.raw(),
+            challenge.expires.as_deref(),
+            challenge.digest.as_deref(),
+            challenge.opaque.as_ref().map(|o| o.raw()),
+            challenge.header.as_deref(),
+        );
         challenge
     }
 
@@ -406,7 +443,7 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
-        let expected_id = crate::protocol::core::compute_challenge_id(
+        let expected_id = crate::protocol::core::compute_challenge_id_with_header(
             &self.secret_key,
             &self.realm,
             credential.challenge.method.as_str(),
@@ -415,6 +452,7 @@ where
             credential.challenge.expires.as_deref(),
             credential.challenge.digest.as_deref(),
             credential.challenge.opaque.as_ref().map(|o| o.raw()),
+            credential.challenge.header.as_deref(),
         );
 
         if !crate::protocol::core::constant_time_eq(&credential.challenge.id, &expected_id) {
@@ -905,7 +943,7 @@ where
     #[cfg(any(feature = "tempo", feature = "stripe"))]
     fn with_body_digest(&self, mut challenge: PaymentChallenge, body: &[u8]) -> PaymentChallenge {
         let digest = crate::body_digest::compute(body);
-        challenge.id = crate::protocol::core::compute_challenge_id(
+        challenge.id = crate::protocol::core::compute_challenge_id_with_header(
             &self.secret_key,
             &challenge.realm,
             challenge.method.as_str(),
@@ -914,6 +952,7 @@ where
             challenge.expires.as_deref(),
             Some(&digest),
             challenge.opaque.as_ref().map(|o| o.raw()),
+            challenge.header.as_deref(),
         );
         challenge.digest = Some(digest);
         challenge
@@ -977,6 +1016,7 @@ where
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         }))
     }
 
@@ -1098,6 +1138,7 @@ where
             description: options.description.map(|s| s.to_string()),
             digest: None,
             opaque: None,
+            header: None,
         }))
     }
 
@@ -1253,6 +1294,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             machine_token_enabled: builder.machine_token_enabled,
             chain_id: builder.chain_id,
             opaque: None,
+            credential_header: advertised_builder_credential_header(builder.requires_auth),
             events: ServerEvents::default(),
         })
     }
@@ -1348,6 +1390,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             description: options.description.map(|s| s.to_string()),
             digest: None,
             opaque: None,
+            header: None,
         }))
     }
 
@@ -1414,6 +1457,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: advertised_builder_credential_header(builder.requires_auth),
             events: ServerEvents::default(),
         })
     }
@@ -1599,6 +1643,7 @@ mod tests {
             expires: Some(expires),
             digest: None,
             opaque: None,
+            header: None,
         };
         PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
     }
@@ -1643,6 +1688,7 @@ mod tests {
             expires: Some(expires),
             digest,
             opaque: None,
+            header: None,
         };
         PaymentCredential::new(echo, PaymentPayload::hash("0x123"))
     }
@@ -2167,6 +2213,7 @@ mod tests {
                 expires: Some(expires),
                 digest: None,
                 opaque: None,
+                header: None,
             },
             PaymentPayload::hash("0x123"),
         );
@@ -2572,6 +2619,7 @@ mod tests {
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         }
     }
@@ -2588,6 +2636,31 @@ mod tests {
         let receipt = mpp.verify_credential(&credential).await.unwrap();
         assert!(receipt.is_success());
         assert_eq!(receipt.reference, "0xtxhash");
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_requires_auth_advertises_payment_authorization_header() {
+        let mpp = create_hmac_test_mpp().with_requires_auth(true);
+        let challenge = mpp.charge("0.10").unwrap();
+
+        assert!(mpp.requires_auth());
+        assert_eq!(mpp.credential_header(), "Payment-Authorization");
+        assert_eq!(challenge.header.as_deref(), Some("Payment-Authorization"));
+        assert!(challenge
+            .to_header()
+            .unwrap()
+            .contains(r#"header="Payment-Authorization""#));
+        assert!(challenge.verify("test-secret"));
+
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+        let receipt = mpp.verify_credential(&credential).await.unwrap();
+        assert!(receipt.is_success());
+
+        let implicit = create_hmac_test_mpp().charge("0.10").unwrap();
+        assert_ne!(implicit.id, challenge.id);
+        assert!(implicit.header.is_none());
     }
 
     #[cfg(feature = "tempo")]
@@ -3179,6 +3252,7 @@ mod tests {
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         }
     }
@@ -3257,6 +3331,7 @@ mod tests {
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         };
 
@@ -3302,6 +3377,7 @@ mod tests {
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         };
 
@@ -3314,6 +3390,7 @@ mod tests {
             expires: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x123"));
 
@@ -3405,6 +3482,7 @@ mod tests {
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
+            credential_header: None,
             events: ServerEvents::default(),
         };
 
@@ -3552,6 +3630,7 @@ mod tests {
             expires: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
 
@@ -3840,6 +3919,7 @@ mod tests {
             expires: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         let credential = PaymentCredential::new(
             echo,

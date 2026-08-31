@@ -118,6 +118,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let request = from_challenge(&challenge).unwrap();
@@ -144,6 +145,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
 
         let decoded: ChargeRequest = from_challenge_typed(&challenge).unwrap();

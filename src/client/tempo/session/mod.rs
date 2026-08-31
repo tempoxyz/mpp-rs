@@ -745,7 +745,13 @@ impl TempoSessionProvider {
                     .parse()
                     .mpp_config("invalid Payment-Session header")?,
             );
-            headers.remove(AUTHORIZATION);
+            if headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Payment "))
+            {
+                headers.remove(AUTHORIZATION);
+            }
             if let Ok(response) = client.get(url).headers(headers.clone()).send().await {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
                     let refreshed = PaymentChallenge::from_headers(
@@ -789,7 +795,13 @@ impl TempoSessionProvider {
             crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
             HeaderValue::from_static("tempo/charge"),
         );
-        headers.remove(AUTHORIZATION);
+        if headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("Payment "))
+        {
+            headers.remove(AUTHORIZATION);
+        }
 
         let challenge_response = client
             .head(url)
@@ -847,7 +859,7 @@ impl TempoSessionProvider {
                 crate::protocol::core::PaymentPayload::proof(signature),
             );
             headers.insert(
-                AUTHORIZATION,
+                crate::client::payment_credential_header_name(&challenge),
                 crate::protocol::core::format_authorization(&credential)?
                     .parse()
                     .mpp_config("invalid bootstrap authorization header")?,
@@ -1129,7 +1141,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
-        use reqwest::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+        use reqwest::header::WWW_AUTHENTICATE;
 
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
@@ -1176,7 +1188,7 @@ impl TempoSessionProvider {
             .top_up_credential_for_challenge(challenge, &entry, additional_deposit)
             .await?;
         headers.insert(
-            AUTHORIZATION,
+            crate::client::payment_credential_header_name(challenge),
             crate::protocol::core::format_authorization(&credential)?
                 .parse()
                 .mpp_config("invalid top-up authorization header")?,
@@ -1212,7 +1224,7 @@ impl TempoSessionProvider {
                     .top_up_credential_for_challenge(&fresh_challenge, &entry, additional_deposit)
                     .await?;
                 headers.insert(
-                    AUTHORIZATION,
+                    crate::client::payment_credential_header_name(&fresh_challenge),
                     crate::protocol::core::format_authorization(&credential)?
                         .parse()
                         .mpp_config("invalid refreshed top-up authorization header")?,
@@ -1443,10 +1455,18 @@ impl TempoSessionProvider {
             .voucher_credential(channel_id_hex, required_cumulative)
             .await?;
         let auth_header = crate::protocol::core::format_authorization(&credential)?;
+        let header_name = self
+            .last_challenge
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .as_ref()
+            .map(crate::client::payment_credential_header_name)
+            .unwrap_or(reqwest::header::AUTHORIZATION);
 
         let resp = client
             .post(url)
-            .header("Authorization", auth_header)
+            .header(header_name, auth_header)
             .send()
             .await
             .mpp_http("voucher POST failed")?;
@@ -1517,7 +1537,10 @@ impl TempoSessionProvider {
 
         let resp = client
             .post(url)
-            .header("Authorization", auth_header)
+            .header(
+                crate::client::payment_credential_header_name(&challenge),
+                auth_header,
+            )
             .send()
             .await
             .mpp_http("close request failed")?;

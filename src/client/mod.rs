@@ -73,3 +73,10 @@ pub use tempo_alloy::TempoNetwork;
 pub mod stripe;
 #[cfg(feature = "stripe")]
 pub use stripe::StripeProvider;
+
+pub(crate) fn payment_credential_header_name(
+    challenge: &crate::protocol::core::PaymentChallenge,
+) -> reqwest::header::HeaderName {
+    reqwest::header::HeaderName::from_bytes(challenge.credential_header().as_bytes())
+        .unwrap_or(reqwest::header::AUTHORIZATION)
+}

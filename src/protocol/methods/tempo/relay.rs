@@ -392,6 +392,7 @@ mod tests {
                 expires: Some("2099-01-01T00:00:00Z".into()),
                 digest: None,
                 opaque: None,
+                header: None,
             },
             payload,
         )
@@ -425,6 +426,7 @@ mod tests {
                 expires: Some(expires.into()),
                 digest: None,
                 opaque: None,
+                header: None,
             },
             payload,
         )

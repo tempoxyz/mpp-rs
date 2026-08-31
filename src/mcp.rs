@@ -320,6 +320,7 @@ mod tests {
                 expires: None,
                 digest: None,
                 opaque: None,
+                header: None,
             },
             "did:pkh:eip155:42161:0xabc",
             PaymentPayload::transaction("0xdeadbeef"),
@@ -788,6 +789,7 @@ mod tests {
             description: None,
             digest: None,
             opaque: None,
+            header: None,
         };
         assert!(echoed_challenge.verify(secret));
 

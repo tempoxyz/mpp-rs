@@ -51,7 +51,16 @@ pub trait Transport: Send + Sync {
     fn get_challenge(&self, response: &Self::Response) -> Result<PaymentChallenge, MppError>;
 
     /// Attach a credential string to a request.
-    fn set_credential(&self, request: Self::Request, credential: &str) -> Self::Request;
+    ///
+    /// When `challenge` is provided, the credential is placed in the HTTP field
+    /// selected by that challenge (`Authorization` by default, or
+    /// `Payment-Authorization` when advertised).
+    fn set_credential(
+        &self,
+        request: Self::Request,
+        credential: &str,
+        challenge: Option<&PaymentChallenge>,
+    ) -> Self::Request;
 }
 
 /// Reqwest HTTP transport for client-side payment handling.
@@ -93,8 +102,16 @@ impl Transport for HttpTransport {
         crate::protocol::core::parse_www_authenticate(header_str)
     }
 
-    fn set_credential(&self, request: Self::Request, credential: &str) -> Self::Request {
-        request.header(reqwest::header::AUTHORIZATION, credential)
+    fn set_credential(
+        &self,
+        request: Self::Request,
+        credential: &str,
+        challenge: Option<&PaymentChallenge>,
+    ) -> Self::Request {
+        let header = challenge
+            .map(PaymentChallenge::credential_header)
+            .unwrap_or("Authorization");
+        request.header(header, credential)
     }
 }
 
