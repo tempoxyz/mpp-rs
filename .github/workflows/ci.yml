@@ -48,7 +48,7 @@ jobs:
           post-comment: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install ast-grep
-        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
+        uses: tempoxyz/gh-actions/vendor/jaxxstorm/action-install-gh-release@b411ce7fe18d0775ae614ad5c4b873c768364979
         with:
           repo: ast-grep/ast-grep
           tag: "0.45.0"
