@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.1 (2026-09-03)
+
+### Patch Changes
+
+- Added a machine-payment metadata field to every Stripe PaymentIntent created by mpp-rs. (by @ShanedaSilva, [#407](https://github.com/tempoxyz/mpp-rs/pull/407))
+- Added a `requires_auth` server option that advertises `header="Payment-Authorization"` so Payment credentials do not collide with ordinary `Authorization`. (by @ShanedaSilva, [#407](https://github.com/tempoxyz/mpp-rs/pull/407))
+
 ## 0.12.0 (2026-08-27)
 
 ### Minor Changes
