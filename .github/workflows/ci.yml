@@ -27,11 +27,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
       - run: cargo update -p native-tls
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -41,7 +41,7 @@ jobs:
       - name: Pin pnpm for Tempo Lints
         run: corepack prepare pnpm@10.28.1 --activate
       - name: Run Tempo Lints
-        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # main
+        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f
         with:
           language: rust
           path: "."
@@ -67,12 +67,12 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
       - run: cargo update -p native-tls
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           tool: cargo-hack
       - name: Tests
@@ -101,10 +101,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
       - run: cargo update -p native-tls
 
       - name: Start Tempo localnet
@@ -118,7 +118,7 @@ jobs:
         run: docker compose down
 
   deny:
-    uses: tempoxyz/ci/.github/workflows/deny.yml@09f481293feb726bcd5c94853063b224a9b2ff24 # main
+    uses: tempoxyz/ci/.github/workflows/deny.yml@09f481293feb726bcd5c94853063b224a9b2ff24
     permissions:
       contents: read
 
