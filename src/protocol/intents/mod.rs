@@ -71,6 +71,16 @@ pub fn parse_units(amount: &str, decimals: u8) -> crate::error::Result<String> {
     let integer_part = parts[0];
     let fraction_part = if parts.len() == 2 { parts[1] } else { "" };
 
+    if (integer_part.is_empty() && fraction_part.is_empty())
+        || !integer_part.chars().all(|c| c.is_ascii_digit())
+        || !fraction_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(crate::error::MppError::InvalidAmount(format!(
+            "Invalid amount format: {}",
+            amount
+        )));
+    }
+
     if fraction_part.len() > decimals as usize {
         return Err(crate::error::MppError::InvalidAmount(format!(
             "Amount {} has more than {} decimal places",
@@ -129,7 +139,25 @@ mod tests {
 
     #[test]
     fn test_parse_units_no_integer_part() {
-        assert_eq!(parse_units("0.5", 6).unwrap(), "500000");
+        assert_eq!(parse_units(".5", 6).unwrap(), "500000");
+    }
+
+    #[test]
+    fn test_parse_units_no_fractional_part() {
+        assert_eq!(parse_units("1.", 6).unwrap(), "1000000");
+    }
+
+    #[test]
+    fn test_parse_units_invalid_format() {
+        for amount in [".", "abc", "1e3", "+1", "-1", "1.2.3"] {
+            assert!(
+                matches!(
+                    parse_units(amount, 6),
+                    Err(crate::error::MppError::InvalidAmount(_))
+                ),
+                "accepted {amount}"
+            );
+        }
     }
 
     #[test]
