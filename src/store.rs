@@ -235,15 +235,44 @@ impl Store for FileStore {
         Box::pin(async move {
             let serialized = serde_json::to_string_pretty(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            // `create_new` is an atomic O_EXCL create: fails if the file exists.
+            // Claim the key with an atomic O_EXCL create so concurrent callers
+            // still observe a single winner. Persist the payload via a temp
+            // file + rename so a mid-write failure cannot leave an empty
+            // "poisoned" key that permanently rejects legitimate retries.
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(mut f) => {
-                    f.write_all(serialized.as_bytes())
-                        .map_err(|e| StoreError::Internal(e.to_string()))?;
+                Ok(_claimed) => {
+                    let mut tmp_path = path.clone().into_os_string();
+                    tmp_path.push(".tmp");
+                    let tmp_path = std::path::PathBuf::from(tmp_path);
+
+                    let persist = (|| -> Result<(), StoreError> {
+                        let mut tmp = std::fs::File::create(&tmp_path).map_err(|e| {
+                            StoreError::Internal(format!("Failed to create temp store file: {e}"))
+                        })?;
+                        tmp.write_all(serialized.as_bytes()).map_err(|e| {
+                            StoreError::Internal(format!("Failed to write temp store file: {e}"))
+                        })?;
+                        tmp.sync_all().map_err(|e| {
+                            StoreError::Internal(format!("Failed to sync temp store file: {e}"))
+                        })?;
+                        drop(tmp);
+                        std::fs::rename(&tmp_path, &path).map_err(|e| {
+                            StoreError::Internal(format!(
+                                "Failed to promote temp store file: {e}"
+                            ))
+                        })?;
+                        Ok(())
+                    })();
+
+                    if let Err(err) = persist {
+                        let _ = std::fs::remove_file(&path);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return Err(err);
+                    }
                     Ok(true)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -579,6 +608,44 @@ mod tests {
             .unwrap());
         assert!(!store
             .put_if_absent("k", serde_json::json!("second"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("k").await.unwrap(),
+            Some(serde_json::json!("first"))
+        );
+        // Successful claim must leave durable JSON, not an empty placeholder or
+        // a leftover temp file (regression for partial-write poisoning).
+        let key_path = tmp.join("k.json");
+        let raw = std::fs::read_to_string(&key_path).unwrap();
+        assert!(!raw.is_empty());
+        assert!(!tmp.join("k.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn file_store_put_if_absent_cleans_up_after_temp_write_failure() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mpp_file_store_pia_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = FileStore::new(&tmp).unwrap();
+
+        // Block temp-file creation by occupying the temp path as a directory.
+        // Claim still succeeds (O_EXCL on k.json), then persist fails and must
+        // remove the placeholder so a retry can succeed.
+        std::fs::create_dir(tmp.join("k.json.tmp")).unwrap();
+        let err = store
+            .put_if_absent("k", serde_json::json!("first"))
+            .await
+            .expect_err("temp path occupied by a directory must fail persist");
+        assert!(matches!(err, StoreError::Internal(_)));
+        assert!(!tmp.join("k.json").exists(), "failed insert must not poison key");
+
+        std::fs::remove_dir(tmp.join("k.json.tmp")).unwrap();
+        assert!(store
+            .put_if_absent("k", serde_json::json!("first"))
             .await
             .unwrap());
         assert_eq!(
