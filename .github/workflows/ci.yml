@@ -118,9 +118,12 @@ jobs:
         run: docker compose down
 
   deny:
-    uses: tempoxyz/ci/.github/workflows/deny.yml@09f481293feb726bcd5c94853063b224a9b2ff24
+    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@22c6f89615298241ee4feeb3195bc22460e9b406
+    with:
+      rust-toolchain: nightly
     permissions:
       contents: read
+      id-token: write
 
   ci-gate:
     name: CI Gate
