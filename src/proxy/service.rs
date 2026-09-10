@@ -256,19 +256,7 @@ impl ProxyConfig {
 
         let service = self.services.iter().find(|s| s.id == service_id)?;
 
-        let route = match match_route(&service.routes, method, &upstream_path) {
-            Some(r) => r,
-            None => {
-                // Fallback: for POST requests, try path-only matching
-                // (management POSTs like session close may target a route
-                // registered for a different HTTP method).
-                if method.eq_ignore_ascii_case("POST") {
-                    match_route_path_only_paid(&service.routes, &upstream_path)?
-                } else {
-                    return None;
-                }
-            }
-        };
+        let route = match_route(&service.routes, method, &upstream_path)?;
 
         Some(ParsedRoute {
             service,
@@ -361,16 +349,6 @@ fn match_route<'a>(routes: &'a [Route], method: &str, path: &str) -> Option<&'a 
         }
         path_matches(&r.path, path)
     })
-}
-
-/// Match a request against routes by path only (ignoring method), excluding Free routes.
-///
-/// This prevents a POST to a free GET endpoint from bypassing payment requirements
-/// via the method-mismatch fallback path.
-fn match_route_path_only_paid<'a>(routes: &'a [Route], path: &str) -> Option<&'a Route> {
-    routes
-        .iter()
-        .find(|r| matches!(r.endpoint, Endpoint::Paid(_)) && path_matches(&r.path, path))
 }
 
 // ---------------------------------------------------------------------------
@@ -660,17 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn test_match_route_method_fallback_skips_free() {
-        let config = test_config();
-
-        // POST to a free GET route should NOT match via fallback
-        // (prevents bypassing payment on free routes)
-        let m = config.match_route("POST", "/openai/v1/models");
-        assert!(m.is_none());
-    }
-
-    #[test]
-    fn test_match_route_method_fallback_matches_paid() {
+    fn test_match_route_rejects_method_mismatch_for_paid_route() {
         let svc = Service::new("api", "https://api.example.com")
             .route(
                 "GET /v1/stream",
@@ -692,9 +660,26 @@ mod tests {
             description: None,
         };
 
-        // POST to a paid GET route should match via fallback
-        let m = config.match_route("POST", "/api/v1/stream");
-        assert!(m.is_some());
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            assert!(
+                config.match_route(method, "/api/v1/stream").is_none(),
+                "{method} must not match a GET-only paid route"
+            );
+        }
+
+        assert!(config.match_route("GET", "/api/v1/stream").is_some());
+    }
+
+    #[test]
+    fn test_match_route_rejects_method_mismatch_for_free_route() {
+        let config = test_config();
+
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            assert!(
+                config.match_route(method, "/openai/v1/models").is_none(),
+                "{method} must not match a GET-only free route"
+            );
+        }
     }
 
     #[test]
