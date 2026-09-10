@@ -9,8 +9,12 @@ This is the Rust port of the TypeScript `session/multi-fetch` example.
 1. **Server** exposes an `/api/scrape` endpoint that costs 0.01 pathUSD per request
 2. **Client** opens a payment channel on the first request (on-chain)
 3. Subsequent requests use off-chain vouchers — no gas, instant settlement
-4. Each voucher is cumulative: request N carries a voucher for `N × 0.01` pathUSD
-5. **Client** closes the channel, triggering on-chain settlement and refund of unused deposit
+4. The server atomically deducts 0.01 pathUSD from the channel before releasing each response
+5. Each voucher is cumulative: request N carries a voucher for `N × 0.01` pathUSD
+6. **Client** closes the channel, triggering on-chain settlement and refund of unused deposit
+
+Voucher verification only increases the channel's authorized balance. Applications must
+separately deduct their server-controlled request price before delivering paid content.
 
 ## Running
 

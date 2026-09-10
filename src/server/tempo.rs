@@ -5,8 +5,8 @@ use alloy::primitives::Address;
 use super::mpp::detect_realm;
 
 pub use crate::protocol::methods::tempo::session_method::{
-    InMemoryChannelStore as SessionChannelStore, SessionMethod as TempoSessionMethod,
-    SessionMethodConfig,
+    deduct_from_channel, InMemoryChannelStore as SessionChannelStore,
+    SessionMethod as TempoSessionMethod, SessionMethodConfig,
 };
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 pub use crate::protocol::methods::tempo::{
