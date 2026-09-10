@@ -64,9 +64,10 @@ pub use mpp::{Mpp, SessionVerifyResult};
 // Re-export tempo types at server level for backward compatibility
 #[cfg(feature = "tempo")]
 pub use tempo::{
-    tempo, tempo_provider, SessionChannelStore, SessionMethodConfig, TempoBuilder, TempoChargeExt,
-    TempoChargeMethod, TempoConfig, TempoMethodDetails, TempoProvider, TempoRelayConfig,
-    TempoRelayErrorCode, TempoSessionMethod, CHAIN_ID, METHOD_NAME,
+    deduct_from_channel, tempo, tempo_provider, SessionChannelStore, SessionMethodConfig,
+    TempoBuilder, TempoChargeExt, TempoChargeMethod, TempoConfig, TempoMethodDetails,
+    TempoProvider, TempoRelayConfig, TempoRelayErrorCode, TempoSessionMethod, CHAIN_ID,
+    METHOD_NAME,
 };
 
 // Re-export stripe types at server level for backward compatibility
