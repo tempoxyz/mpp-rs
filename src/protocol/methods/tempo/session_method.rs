@@ -1407,15 +1407,23 @@ where
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    if cumulative_amount > state.highest_voucher_amount {
-                        Ok(Some(ChannelState {
-                            highest_voucher_amount: cumulative_amount,
-                            highest_voucher_signature: Some(sig_bytes),
-                            ..state
-                        }))
-                    } else {
-                        Ok(Some(state))
+                    if cumulative_amount <= state.highest_voucher_amount {
+                        return Err(VerificationError::delta_too_small(
+                            "voucher does not add new funds",
+                        ));
                     }
+                    let delta = cumulative_amount - state.highest_voucher_amount;
+                    if delta < min_delta {
+                        return Err(VerificationError::delta_too_small(format!(
+                            "voucher delta {} below minimum {}",
+                            delta, min_delta
+                        )));
+                    }
+                    Ok(Some(ChannelState {
+                        highest_voucher_amount: cumulative_amount,
+                        highest_voucher_signature: Some(sig_bytes),
+                        ..state
+                    }))
                 }),
             )
             .await?;
@@ -2285,6 +2293,130 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, Some(ErrorCode::DeltaTooSmall));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_voucher_acceptance_has_one_winner() {
+        use crate::protocol::methods::tempo::voucher::sign_voucher;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let channel_id_b256 = channel_id.parse::<B256>().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let signature = sign_voucher(&signer, channel_id_b256, 2_000, escrow, 42431)
+            .await
+            .unwrap();
+        let signature_bytes = signature.to_vec();
+        let signature = alloy::hex::encode_prefixed(signature);
+
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.deposit = 10_000;
+        store.insert(&channel_id, state.clone());
+
+        let method = test_session_method(store.clone());
+        let verify = || {
+            method.verify_and_accept_voucher(
+                &channel_id,
+                &state,
+                2_000,
+                &signature,
+                escrow,
+                42431,
+                0,
+                10_000,
+                0,
+                false,
+                0,
+            )
+        };
+        let (first, second) = tokio::join!(verify(), verify());
+
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .into_iter()
+                .filter(|accepted| *accepted)
+                .count(),
+            1
+        );
+        let error = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::DeltaTooSmall));
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(stored.highest_voucher_amount, 2_000);
+        assert_eq!(stored.highest_voucher_signature, Some(signature_bytes));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_vouchers_recheck_minimum_delta_atomically() {
+        use crate::protocol::methods::tempo::voucher::sign_voucher;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let channel_id_b256 = channel_id.parse::<B256>().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let lower_signature = sign_voucher(&signer, channel_id_b256, 2_000, escrow, 42431)
+            .await
+            .unwrap();
+        let higher_signature = sign_voucher(&signer, channel_id_b256, 2_500, escrow, 42431)
+            .await
+            .unwrap();
+        let lower_signature = alloy::hex::encode_prefixed(lower_signature);
+        let higher_signature = alloy::hex::encode_prefixed(higher_signature);
+
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.deposit = 10_000;
+        store.insert(&channel_id, state.clone());
+
+        let method = test_session_method(store.clone());
+        let lower = method.verify_and_accept_voucher(
+            &channel_id,
+            &state,
+            2_000,
+            &lower_signature,
+            escrow,
+            42431,
+            1_000,
+            10_000,
+            0,
+            false,
+            0,
+        );
+        let higher = method.verify_and_accept_voucher(
+            &channel_id,
+            &state,
+            2_500,
+            &higher_signature,
+            escrow,
+            42431,
+            1_000,
+            10_000,
+            0,
+            false,
+            0,
+        );
+        let (lower, higher) = tokio::join!(lower, higher);
+
+        assert!(lower.is_ok());
+        assert_eq!(higher.unwrap_err().code, Some(ErrorCode::DeltaTooSmall));
+        assert_eq!(
+            store
+                .get_channel_sync(&channel_id)
+                .unwrap()
+                .highest_voucher_amount,
+            2_000
+        );
     }
 
     #[tokio::test]
