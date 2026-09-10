@@ -1,3 +1,4 @@
+use crate::protocol::core::PaymentCredential;
 use crate::proxy::headers::scrub_request_headers;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -256,19 +257,48 @@ impl ProxyConfig {
 
         let service = self.services.iter().find(|s| s.id == service_id)?;
 
-        let route = match match_route(&service.routes, method, &upstream_path) {
-            Some(r) => r,
-            None => {
-                // Fallback: for POST requests, try path-only matching
-                // (management POSTs like session close may target a route
-                // registered for a different HTTP method).
-                if method.eq_ignore_ascii_case("POST") {
-                    match_route_path_only_paid(&service.routes, &upstream_path)?
-                } else {
-                    return None;
-                }
-            }
-        };
+        let route = match_route(&service.routes, method, &upstream_path)?;
+
+        Some(ParsedRoute {
+            service,
+            route,
+            upstream_path,
+        })
+    }
+
+    /// Match a session credential POST to its paid route for local verification.
+    ///
+    /// Session lifecycle operations and SSE voucher updates POST to the protected
+    /// URL even when its upstream route uses another method. Callers must verify
+    /// the credential and handle this request locally; it must never be forwarded
+    /// to the upstream service.
+    pub fn match_session_credential_route<'a>(
+        &'a self,
+        method: &str,
+        path: &str,
+        credential: &PaymentCredential,
+    ) -> Option<ParsedRoute<'a>> {
+        if !method.eq_ignore_ascii_case("POST") || !credential.challenge.intent.is_session() {
+            return None;
+        }
+
+        match credential.payload.get("action")?.as_str()? {
+            "open" | "topUp" | "voucher" | "close" => {}
+            _ => return None,
+        }
+
+        let stripped = self.strip_base(path)?;
+        let (service_id, upstream_path) = parse_path(stripped)?;
+        let service = self
+            .services
+            .iter()
+            .find(|service| service.id == service_id)?;
+        let route = service.routes.iter().find(|route| {
+            matches!(
+                &route.endpoint,
+                Endpoint::Paid(endpoint) if endpoint.intent.eq_ignore_ascii_case("session")
+            ) && path_matches(&route.path, &upstream_path)
+        })?;
 
         Some(ParsedRoute {
             service,
@@ -361,16 +391,6 @@ fn match_route<'a>(routes: &'a [Route], method: &str, path: &str) -> Option<&'a 
         }
         path_matches(&r.path, path)
     })
-}
-
-/// Match a request against routes by path only (ignoring method), excluding Free routes.
-///
-/// This prevents a POST to a free GET endpoint from bypassing payment requirements
-/// via the method-mismatch fallback path.
-fn match_route_path_only_paid<'a>(routes: &'a [Route], path: &str) -> Option<&'a Route> {
-    routes
-        .iter()
-        .find(|r| matches!(r.endpoint, Endpoint::Paid(_)) && path_matches(&r.path, path))
 }
 
 // ---------------------------------------------------------------------------
@@ -660,17 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_match_route_method_fallback_skips_free() {
-        let config = test_config();
-
-        // POST to a free GET route should NOT match via fallback
-        // (prevents bypassing payment on free routes)
-        let m = config.match_route("POST", "/openai/v1/models");
-        assert!(m.is_none());
-    }
-
-    #[test]
-    fn test_match_route_method_fallback_matches_paid() {
+    fn test_match_route_rejects_method_mismatch_for_paid_route() {
         let svc = Service::new("api", "https://api.example.com")
             .route(
                 "GET /v1/stream",
@@ -692,9 +702,82 @@ mod tests {
             description: None,
         };
 
-        // POST to a paid GET route should match via fallback
-        let m = config.match_route("POST", "/api/v1/stream");
-        assert!(m.is_some());
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            assert!(
+                config.match_route(method, "/api/v1/stream").is_none(),
+                "{method} must not match a GET-only paid route"
+            );
+        }
+
+        assert!(config.match_route("GET", "/api/v1/stream").is_some());
+    }
+
+    #[test]
+    fn test_match_route_rejects_method_mismatch_for_free_route() {
+        let config = test_config();
+
+        for method in ["POST", "PUT", "DELETE", "PATCH"] {
+            assert!(
+                config.match_route(method, "/openai/v1/models").is_none(),
+                "{method} must not match a GET-only free route"
+            );
+        }
+    }
+
+    #[test]
+    fn test_session_credential_posts_use_local_only_route_matcher() {
+        use crate::protocol::core::{
+            Base64UrlJson, ChallengeEcho, IntentName, MethodName, PaymentCredential,
+        };
+
+        let service = Service::new("api", "https://api.example.com")
+            .route(
+                "GET /v1/stream",
+                Endpoint::Paid(PaidEndpoint {
+                    intent: "session".into(),
+                    amount: "1000".into(),
+                    decimals: None,
+                    currency: None,
+                    unit_type: Some("token".into()),
+                    description: None,
+                }),
+            )
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![service],
+            title: None,
+            description: None,
+        };
+        let challenge = ChallengeEcho {
+            id: "challenge".into(),
+            realm: "test".into(),
+            method: MethodName::new("tempo"),
+            intent: IntentName::new("session"),
+            request: Base64UrlJson::default(),
+            expires: None,
+            digest: None,
+            opaque: None,
+            header: None,
+        };
+
+        assert!(config.match_route("POST", "/api/v1/stream").is_none());
+        for action in ["open", "topUp", "voucher", "close"] {
+            let credential =
+                PaymentCredential::new(challenge.clone(), serde_json::json!({ "action": action }));
+            assert!(config
+                .match_session_credential_route("POST", "/api/v1/stream", &credential)
+                .is_some());
+            assert!(config
+                .match_session_credential_route("GET", "/api/v1/stream", &credential)
+                .is_none());
+        }
+
+        let invalid =
+            PaymentCredential::new(challenge, serde_json::json!({ "action": "arbitraryPost" }));
+        assert!(config
+            .match_session_credential_route("POST", "/api/v1/stream", &invalid)
+            .is_none());
     }
 
     #[test]
