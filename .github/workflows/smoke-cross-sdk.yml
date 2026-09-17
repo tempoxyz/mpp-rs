@@ -79,7 +79,12 @@ jobs:
 
       - name: Smoke test — mppx pays /api/ping
         run: |
-          response=$(npm exec --yes --package mppx@0.8.14 -- mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
+          response=$(npm exec --yes \
+            --package mppx@0.8.14 \
+            --package yaml@2.9.0 \
+            --package zod@4.6.1 \
+            --package viem@2.56.3 \
+            -- mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
           echo "$response"
           echo "$response" | grep -q '"pong"' || { echo "Response missing pong field"; exit 1; }
         env:
