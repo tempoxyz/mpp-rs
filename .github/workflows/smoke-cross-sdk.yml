@@ -18,7 +18,12 @@ jobs:
     name: mpp-rs server × mppx CLI
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -26,7 +31,8 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - run: cargo update -p native-tls
+      - name: Resolve Cargo dependencies
+        run: .github/scripts/resolve-cargo-dependencies.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -73,7 +79,12 @@ jobs:
 
       - name: Smoke test — mppx pays /api/ping
         run: |
-          response=$(npm exec --yes --package mppx@0.8.14 -- mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
+          response=$(npm exec --yes \
+            --package mppx@0.8.14 \
+            --package yaml@2.9.0 \
+            --package zod@4.6.1 \
+            --package viem@2.56.3 \
+            -- mppx http://localhost:3000/api/ping --rpc-url http://localhost:8545 --silent --fail)
           echo "$response"
           echo "$response" | grep -q '"pong"' || { echo "Response missing pong field"; exit 1; }
         env:

@@ -20,9 +20,14 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    env:
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
     permissions:
       contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
@@ -32,16 +37,29 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - run: cargo update -p native-tls
+      - name: Resolve Cargo dependencies
+        run: .github/scripts/resolve-cargo-dependencies.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
       - name: Pin pnpm for Tempo Lints
-        run: corepack prepare pnpm@10.28.1 --activate
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if corepack prepare pnpm@10.28.1 --activate 2>&1 | tee "$RUNNER_TEMP/corepack.log"; then
+              exit 0
+            fi
+            if ! grep -q 'Error when performing the request' "$RUNNER_TEMP/corepack.log" || [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Run Tempo Lints
         uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f
+        env:
+          COREPACK_DEFAULT_TO_LATEST: "0"
         with:
           language: rust
           path: "."
@@ -62,7 +80,12 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
@@ -71,7 +94,8 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - run: cargo update -p native-tls
+      - name: Resolve Cargo dependencies
+        run: .github/scripts/resolve-cargo-dependencies.sh
       - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           tool: cargo-hack
@@ -95,8 +119,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       packages: read
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
@@ -105,7 +132,8 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - run: cargo update -p native-tls
+      - name: Resolve Cargo dependencies
+        run: .github/scripts/resolve-cargo-dependencies.sh
 
       - name: Start Tempo localnet
         run: docker compose up -d --wait
@@ -130,7 +158,12 @@ jobs:
     if: always()
     needs: [lint, test, integration, deny]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
       - run: |
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "One or more required jobs failed or were cancelled"
