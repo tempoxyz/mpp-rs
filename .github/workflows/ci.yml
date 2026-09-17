@@ -20,6 +20,8 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    env:
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
     permissions:
       contents: read
       id-token: write
@@ -44,6 +46,7 @@ jobs:
           node-version: 22
       - name: Pin pnpm for Tempo Lints
         run: |
+          set -o pipefail
           for attempt in 1 2 3; do
             if corepack prepare pnpm@10.28.1 --activate 2>&1 | tee "$RUNNER_TEMP/corepack.log"; then
               exit 0
