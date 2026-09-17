@@ -55,6 +55,8 @@ jobs:
           done
       - name: Run Tempo Lints
         uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f
+        env:
+          COREPACK_DEFAULT_TO_LATEST: "0"
         with:
           language: rust
           path: "."
