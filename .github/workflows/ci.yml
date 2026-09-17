@@ -43,7 +43,16 @@ jobs:
         with:
           node-version: 22
       - name: Pin pnpm for Tempo Lints
-        run: corepack prepare pnpm@10.28.1 --activate
+        run: |
+          for attempt in 1 2 3; do
+            if corepack prepare pnpm@10.28.1 --activate 2>&1 | tee "$RUNNER_TEMP/corepack.log"; then
+              exit 0
+            fi
+            if ! grep -q 'Error when performing the request' "$RUNNER_TEMP/corepack.log" || [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
       - name: Run Tempo Lints
         uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f
         with:
