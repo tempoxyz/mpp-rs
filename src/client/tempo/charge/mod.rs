@@ -49,7 +49,7 @@ use crate::client::tempo::signing::{
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, PaymentPayload};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::methods::tempo::charge::{parse_memo_bytes_checked, TempoChargeExt};
+use crate::protocol::methods::tempo::charge::TempoChargeExt;
 use crate::protocol::methods::tempo::network::TempoNetwork as TempoChain;
 use crate::protocol::methods::tempo::proof;
 use crate::protocol::methods::tempo::transfers::get_transfers;
@@ -138,7 +138,11 @@ impl TempoCharge {
         let recipient = charge_req.recipient_address()?;
         let currency = charge_req.currency_address()?;
         let amount = charge_req.amount_u256()?;
-        let memo = parse_memo_bytes_checked(details.memo.as_deref())?;
+        let memo = Some(crate::tempo::attribution::encode(
+            &challenge.id,
+            &challenge.realm,
+            None,
+        ));
         let chain_id = details.chain_id.unwrap_or(CHAIN_ID);
         let fee_payer = details.fee_payer();
         let machine_token_enabled = details.machine_token_enabled();
@@ -853,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_challenge_with_memo() {
+    fn test_from_challenge_generates_bound_memo() {
         let request_json = serde_json::json!({
             "amount": "1000000",
             "currency": "0x20c0000000000000000000000000000000000000",
@@ -868,7 +872,14 @@ mod tests {
             PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
         let charge = TempoCharge::from_challenge(&challenge).unwrap();
 
-        assert!(charge.memo.is_some());
+        assert_eq!(
+            charge.memo(),
+            Some(crate::tempo::attribution::encode(
+                "test-id",
+                "api.example.com",
+                None
+            ))
+        );
     }
 
     #[test]
