@@ -849,9 +849,7 @@ where
             },
         )?;
 
-        if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
-        }
+        assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
 
         if let Some(store) = &self.store {
             if reserve {
@@ -1448,9 +1446,7 @@ where
                 settlement_senders: &settlement_senders,
             },
         )?;
-        if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
-        }
+        assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
 
         // Record the on-chain tx hash for hash-based replay protection. Use the
         // atomic claim so a concurrent hash credential for the same tx cannot

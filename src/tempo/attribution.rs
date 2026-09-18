@@ -1,7 +1,7 @@
 //! MPP attribution memo encoding for TIP-20 `transferWithMemo`.
 //!
-//! When no user-provided memo is present, the SDK auto-generates an
-//! attribution memo so MPP transactions are identifiable on-chain.
+//! The SDK generates a challenge-bound attribution memo for primary charge
+//! transfers so MPP transactions are identifiable on-chain.
 //!
 //! ## Byte Layout (32 bytes)
 //!
