@@ -1,9 +1,9 @@
 name: Scan GitHub Actions
 
 on:
+  # Required checks must report for every PR, including source-only changes.
   pull_request:
-    paths:
-      - ".github/**"
+  merge_group:
   push:
     branches:
       - main
