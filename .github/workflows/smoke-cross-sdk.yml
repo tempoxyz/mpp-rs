@@ -23,14 +23,14 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
+        uses: tempoxyz/gh-actions/actions/secure-runner@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@a9eee5154fef6d6c9b6483bdd95b38862117874d
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - name: Resolve Cargo dependencies
         run: .github/scripts/resolve-cargo-dependencies.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
