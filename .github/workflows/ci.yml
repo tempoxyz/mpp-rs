@@ -27,16 +27,16 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
+        uses: tempoxyz/gh-actions/actions/secure-runner@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@a9eee5154fef6d6c9b6483bdd95b38862117874d
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - name: Resolve Cargo dependencies
         run: .github/scripts/resolve-cargo-dependencies.sh
       - run: cargo fmt --all -- --check
@@ -66,7 +66,7 @@ jobs:
           post-comment: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install ast-grep
-        uses: tempoxyz/gh-actions/vendor/jaxxstorm/action-install-gh-release@b411ce7fe18d0775ae614ad5c4b873c768364979
+        uses: tempoxyz/gh-actions/vendor/jaxxstorm/action-install-gh-release@a9eee5154fef6d6c9b6483bdd95b38862117874d
         with:
           repo: ast-grep/ast-grep
           tag: "0.45.0"
@@ -85,18 +85,18 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
+        uses: tempoxyz/gh-actions/actions/secure-runner@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@a9eee5154fef6d6c9b6483bdd95b38862117874d
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - name: Resolve Cargo dependencies
         run: .github/scripts/resolve-cargo-dependencies.sh
-      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@a9eee5154fef6d6c9b6483bdd95b38862117874d
         with:
           tool: cargo-hack
       - name: Tests
@@ -123,15 +123,15 @@ jobs:
       packages: read
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
+        uses: tempoxyz/gh-actions/actions/secure-runner@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@a9eee5154fef6d6c9b6483bdd95b38862117874d
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - name: Resolve Cargo dependencies
         run: .github/scripts/resolve-cargo-dependencies.sh
 
@@ -146,7 +146,7 @@ jobs:
         run: docker compose down
 
   deny:
-    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@22c6f89615298241ee4feeb3195bc22460e9b406
+    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@a9eee5154fef6d6c9b6483bdd95b38862117874d
     with:
       rust-toolchain: nightly
     permissions:
@@ -163,7 +163,7 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@6a4184039b7a7537d35ace0badc96764d5a1d4d0
+        uses: tempoxyz/gh-actions/actions/secure-runner@a9eee5154fef6d6c9b6483bdd95b38862117874d
       - run: |
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "One or more required jobs failed or were cancelled"
