@@ -161,28 +161,49 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
         let value = if bytes[i] == b'"' {
             i += 1;
             let mut value = String::new();
-            while i < bytes.len() && bytes[i] != b'"' {
-                if key == "request" && value.len() >= MAX_TOKEN_LEN {
+            let mut segment_start = i;
+            let value_end = loop {
+                if i >= bytes.len() {
+                    return Err(MppError::invalid_challenge_reason(
+                        "Unterminated quoted-string",
+                    ));
+                }
+                if key == "request" && value.len() + (i - segment_start) >= MAX_TOKEN_LEN {
                     return Err(MppError::invalid_challenge_reason(format!(
                         "Request parameter exceeds maximum length of {} bytes",
                         MAX_TOKEN_LEN
                     )));
                 }
 
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 1;
-                    value.push(bytes[i] as char);
-                } else {
-                    value.push(bytes[i] as char);
+                match bytes[i] {
+                    b'"' => break i,
+                    b'\\' => {
+                        value.push_str(&params_str[segment_start..i]);
+                        i += 1;
+                        if i >= bytes.len() {
+                            return Err(MppError::invalid_challenge_reason(
+                                "Unterminated quoted-string",
+                            ));
+                        }
+                        if let Some((decoded, next)) = read_unicode_escape(params_str, i) {
+                            value.push(decoded);
+                            i = next;
+                        } else {
+                            // RFC 9110 quoted-pair: the backslash escapes one character.
+                            let escaped = params_str[i..]
+                                .chars()
+                                .next()
+                                .expect("index sits on a character boundary");
+                            value.push(escaped);
+                            i += escaped.len_utf8();
+                        }
+                        segment_start = i;
+                    }
+                    _ => i += 1,
                 }
-                i += 1;
-            }
-            if i >= bytes.len() {
-                return Err(MppError::invalid_challenge_reason(
-                    "Unterminated quoted-string",
-                ));
-            }
-            i += 1;
+            };
+            value.push_str(&params_str[segment_start..value_end]);
+            i = value_end + 1;
             value
         } else {
             let value_start = i;
@@ -208,6 +229,48 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
     }
 
     Ok(params)
+}
+
+/// Decodes the `uXXXX` body of a backslash escape at `at`.
+///
+/// A header value cannot carry characters above Latin-1, so a challenge escapes
+/// them this way. A surrogate is paired with the escape that follows it; an
+/// unpaired surrogate decodes to U+FFFD, the closest value a `str` can hold.
+/// Returns `None` when `at` does not start a unicode escape.
+fn read_unicode_escape(input: &str, at: usize) -> Option<(char, usize)> {
+    let (unit, next) = read_escaped_code_unit(input, at)?;
+
+    if !(0xD800..=0xDFFF).contains(&unit) {
+        return char::from_u32(u32::from(unit)).map(|decoded| (decoded, next));
+    }
+
+    if (0xD800..=0xDBFF).contains(&unit) && input.as_bytes().get(next) == Some(&b'\\') {
+        if let Some((low, after)) = read_escaped_code_unit(input, next + 1) {
+            if (0xDC00..=0xDFFF).contains(&low) {
+                let code =
+                    0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
+                if let Some(decoded) = char::from_u32(code) {
+                    return Some((decoded, after));
+                }
+            }
+        }
+    }
+
+    Some((char::REPLACEMENT_CHARACTER, next))
+}
+
+/// Reads `uXXXX` at `at` and returns the code unit it denotes with the index past it.
+fn read_escaped_code_unit(input: &str, at: usize) -> Option<(u16, usize)> {
+    if input.as_bytes().get(at) != Some(&b'u') {
+        return None;
+    }
+    let digits = input.get(at + 1..at + 5)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(digits, 16)
+        .ok()
+        .map(|unit| (unit, at + 5))
 }
 
 /// Validate ISO 8601 / RFC 3339 timestamp format.
@@ -1091,6 +1154,34 @@ mod tests {
             );
             let err = parse_www_authenticate(&header).unwrap_err();
             assert!(err.to_string().contains("Invalid method"));
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_decodes_unicode_escapes() {
+        // A header value cannot carry characters above Latin-1, so a challenge
+        // escapes them as `\uXXXX`; at or below Latin-1 they travel raw.
+        for (escaped, expected) in [
+            (
+                r"em dash \u2014 and coffee \u2615",
+                "em dash — and coffee ☕",
+            ),
+            (r"grinning \ud83d\ude00 face", "grinning 😀 face"),
+            ("café naïve", "café naïve"),
+            (r"lone \ud83d here", "lone \u{fffd} here"),
+            (r"lone \ude00 here", "lone \u{fffd} here"),
+            (r"not an escape \\u2014", r"not an escape \u2014"),
+            (r"short \u12 tail", "short u12 tail"),
+        ] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="{escaped}""#
+            );
+            let challenge = parse_www_authenticate(&header).unwrap();
+            assert_eq!(
+                challenge.description.as_deref(),
+                Some(expected),
+                "{escaped}"
+            );
         }
     }
 
