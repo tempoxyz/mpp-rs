@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@a9eee5154fef6d6c9b6483bdd95b38862117874d
+        uses: tempoxyz/gh-actions/actions/secure-runner@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
       - name: Fetch GitHub token via STS
         id: app-token
-        uses: tempoxyz/gh-actions/actions/github-sts@a9eee5154fef6d6c9b6483bdd95b38862117874d
+        uses: tempoxyz/gh-actions/actions/github-sts@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
         with:
           policy: release-pr
 
@@ -34,7 +34,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Authenticate with crates.io
-        uses: tempoxyz/gh-actions/vendor/rust-lang/crates-io-auth-action@a9eee5154fef6d6c9b6483bdd95b38862117874d
+        uses: tempoxyz/gh-actions/vendor/rust-lang/crates-io-auth-action@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
         id: auth
 
       - name: Changelogs
