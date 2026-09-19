@@ -222,6 +222,22 @@ fn is_valid_digest_format(d: &str) -> bool {
     d.starts_with("sha-256=")
 }
 
+/// Validate a method identifier against the method-name ABNF.
+///
+/// Matches canonical mppx (`Challenge.ts`'s deserialize validator,
+/// `^[a-z][a-z0-9:_-]*$`): a lowercase letter, followed by any number of
+/// lowercase letters, digits, colons, underscores, or hyphens. This allows
+/// identifiers like `x402` that a first-char-only, letters-only check would
+/// incorrectly reject.
+fn is_valid_method_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => chars
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '_' | '-')),
+        _ => false,
+    }
+}
+
 /// Parse a single WWW-Authenticate header into a PaymentChallenge.
 ///
 /// Format: `Payment id="<id>", realm="<realm>", method="<method>", intent="<intent>", request="<base64url-json>"`
@@ -259,7 +275,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     }
     let realm = require_param!(params, "realm").clone();
     let method_raw = require_param!(params, "method").clone();
-    if method_raw.is_empty() || !method_raw.chars().all(|c| c.is_ascii_lowercase()) {
+    if !is_valid_method_name(&method_raw) {
         return Err(MppError::invalid_challenge_reason(format!(
             "Invalid method: \"{}\". Must match method-name ABNF.",
             method_raw
@@ -1068,11 +1084,29 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_rejects_invalid_method_name_dash() {
+    fn test_parse_www_authenticate_accepts_hyphen_in_method_name() {
+        // Regression test for AGR-2026-092: the method-name ABNF
+        // (^[a-z][a-z0-9:_-]*$) allows digits, colons, underscores, and
+        // hyphens after the first character -- "tempo-v2" is a valid
+        // identifier, not an invalid one.
         let header =
             r#"Payment id="abc", realm="api", method="tempo-v2", intent="charge", request="e30""#;
-        let err = parse_www_authenticate(header).unwrap_err();
-        assert!(err.to_string().contains("Invalid method"));
+        let challenge = parse_www_authenticate(header).unwrap();
+        assert_eq!(challenge.method.as_str(), "tempo-v2");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_accepts_extension_characters_in_method_name() {
+        // Digits, colons, and underscores are all valid after the first
+        // character too -- "x402" specifically is a real, canonical method
+        // identifier per the issue this regresses (AGR-2026-092).
+        for method in ["x402", "a:b", "a_b", "tempo2", "a1:b_2-c"] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
+            );
+            let challenge = parse_www_authenticate(&header).unwrap();
+            assert_eq!(challenge.method.as_str(), method);
+        }
     }
 
     #[test]
