@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.12.1 (2026-09-19)
+
+### Patch Changes
+
+- Added a machine-payment metadata field to every Stripe PaymentIntent created by mpp-rs. (by @ShanedaSilva, [981430c](https://github.com/tempoxyz/mpp-rs/commit/981430c))
+- Export session channel deduction helpers and update the multi-fetch example to
+- atomically charge each request before releasing paid content. (by @ShanedaSilva, [981430c](https://github.com/tempoxyz/mpp-rs/commit/981430c))
+- Enforce configured HTTP methods when matching paid proxy routes, preventing
+- method-mismatched requests from reaching authenticated upstream services. (by @ShanedaSilva, [981430c](https://github.com/tempoxyz/mpp-rs/commit/981430c))
+- Reject a voucher when a concurrent request has already accepted the same or a
+- higher cumulative authorization amount. (by @ShanedaSilva, [981430c](https://github.com/tempoxyz/mpp-rs/commit/981430c))
+- Reject malformed human-readable amounts before converting them to base units,
+- preventing inputs such as `.` from being normalized to zero. (by @ShanedaSilva, [981430c](https://github.com/tempoxyz/mpp-rs/commit/981430c))
+- Added a `requires_auth` server option that advertises `header="Payment-Authorization"` so Payment credentials do not collide with ordinary `Authorization`. (by @ShanedaSilva, [981430c](https://github.com/tempoxyz/mpp-rs/commit/981430c))
+
 ## 0.12.0 (2026-08-27)
 
 ### Minor Changes
