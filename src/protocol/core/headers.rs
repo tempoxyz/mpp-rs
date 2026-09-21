@@ -1180,9 +1180,9 @@ mod tests {
         for (escaped, expected) in [
             (
                 r"em dash \u2014 and coffee \u2615",
-                "em dash — and coffee ☕",
+                "em dash \u{2014} and coffee \u{2615}",
             ),
-            (r"grinning \ud83d\ude00 face", "grinning 😀 face"),
+            (r"grinning \ud83d\ude00 face", "grinning \u{1f600} face"),
             ("café naïve", "café naïve"),
             (r"lone \ud83d here", "lone \u{fffd} here"),
             (r"lone \ude00 here", "lone \u{fffd} here"),
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn test_format_www_authenticate_escapes_unicode_as_utf16() {
         let mut challenge = test_challenge();
-        challenge.description = Some("Payment — coffee ☕ 😀".to_string());
+        challenge.description = Some("Payment \u{2014} coffee \u{2615} \u{1f600}".to_string());
 
         let header = format_www_authenticate(&challenge).unwrap();
 
