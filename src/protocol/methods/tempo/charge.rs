@@ -43,9 +43,6 @@ pub trait TempoChargeExt {
     /// Check whether the canonical first-party machine token is enabled.
     fn machine_token_enabled(&self) -> bool;
 
-    /// Get the memo from methodDetails, if present.
-    fn memo(&self) -> Option<String>;
-
     /// Check if this request is for Tempo Moderato network.
     fn is_tempo_moderato(&self) -> bool;
 
@@ -102,15 +99,6 @@ impl TempoChargeExt for ChargeRequest {
             .and_then(|v| v.get("machineTokenEnabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
-    }
-
-    fn memo(&self) -> Option<String> {
-        self.method_details
-            .as_ref()
-            .and_then(|v| v.get("memo"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
     }
 
     fn is_tempo_moderato(&self) -> bool {
@@ -215,33 +203,6 @@ mod tests {
             ..test_charge_request()
         };
         assert!(!req_other_chain.is_tempo_moderato());
-    }
-
-    #[test]
-    fn test_memo() {
-        let req = test_charge_request();
-        assert!(req.memo().is_none());
-
-        let req_with_memo = ChargeRequest {
-            method_details: Some(serde_json::json!({
-                "chainId": 42431,
-                "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-            })),
-            ..test_charge_request()
-        };
-        assert_eq!(
-            req_with_memo.memo(),
-            Some("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string())
-        );
-
-        let req_with_empty_memo = ChargeRequest {
-            method_details: Some(serde_json::json!({
-                "chainId": 42431,
-                "memo": ""
-            })),
-            ..test_charge_request()
-        };
-        assert!(req_with_empty_memo.memo().is_none());
     }
 
     #[test]

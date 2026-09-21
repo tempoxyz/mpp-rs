@@ -860,9 +860,7 @@ where
             },
         )?;
 
-        if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
-        }
+        assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
 
         if let Some(store) = &self.store {
             if reserve {
@@ -1266,7 +1264,7 @@ where
                 TransactionValidationOptions {
                     require_exact_calls: true,
                     machine_token_enabled: charge.machine_token_enabled(),
-                    challenge_binding: charge.memo().is_none().then_some((challenge_id, realm)),
+                    challenge_binding: Some((challenge_id, realm)),
                 },
             )?;
             return Ok(sender);
@@ -1279,7 +1277,7 @@ where
             expected_chain_id,
             TransactionValidationOptions {
                 machine_token_enabled: charge.machine_token_enabled(),
-                challenge_binding: charge.memo().is_none().then_some((challenge_id, realm)),
+                challenge_binding: Some((challenge_id, realm)),
                 ..Default::default()
             },
         )?;
@@ -1454,7 +1452,7 @@ where
             TransactionValidationOptions {
                 require_exact_calls: charge.fee_payer(),
                 machine_token_enabled: charge.machine_token_enabled(),
-                challenge_binding: charge.memo().is_none().then_some((challenge_id, realm)),
+                challenge_binding: Some((challenge_id, realm)),
             },
         )?;
 
@@ -1514,9 +1512,7 @@ where
                 settlement_senders: &settlement_senders,
             },
         )?;
-        if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
-        }
+        assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
 
         // Record the on-chain tx hash for hash-based replay protection. Use the
         // atomic claim so a concurrent hash credential for the same tx cannot
@@ -3218,7 +3214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_memo_preserves_preflight_compatibility() {
+    fn test_legacy_primary_memo_does_not_disable_challenge_binding() {
         let provider =
             alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
                 .connect_http("http://127.0.0.1:1".parse().unwrap());
@@ -3226,21 +3222,27 @@ mod tests {
         let currency = Address::repeat_byte(0x20);
         let recipient = Address::repeat_byte(0x33);
         let amount = U256::from(100);
-        let tx_bytes = encode_signed_tx(
-            vec![tempo_alloy::primitives::transaction::Call {
-                to: TxKind::Call(currency),
-                value: U256::ZERO,
-                input: make_transfer_with_memo_input(recipient, amount, [0xab; 32]),
-            }],
-            MAX_FEE_PAYER_GAS_LIMIT,
-        );
-        for (memo, should_accept) in [([0xab; 32], true), ([0xcd; 32], false)] {
+        for (memo, should_accept) in [
+            (
+                attribution::encode("challenge-123", "api.example.com", None),
+                true,
+            ),
+            ([0xab; 32], false),
+        ] {
+            let tx_bytes = encode_signed_tx(
+                vec![tempo_alloy::primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_with_memo_input(recipient, amount, memo),
+                }],
+                MAX_FEE_PAYER_GAS_LIMIT,
+            );
             let request = ChargeRequest {
                 amount: amount.to_string(),
                 currency: format!("{currency:#x}"),
                 recipient: Some(format!("{recipient:#x}")),
                 method_details: Some(
-                    serde_json::json!({ "chainId": CHAIN_ID, "memo": alloy::hex::encode_prefixed(memo) }),
+                    serde_json::json!({ "chainId": CHAIN_ID, "memo": alloy::hex::encode_prefixed([0xab; 32]) }),
                 ),
                 ..Default::default()
             };
