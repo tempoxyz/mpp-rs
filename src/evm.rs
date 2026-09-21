@@ -62,7 +62,8 @@ mod tests {
 
     #[test]
     fn test_parse_address() {
-        let addr = parse_address("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2").unwrap();
+        let addr = parse_address("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2")
+            .expect("test address should parse");
         assert_eq!(
             format!("{:?}", addr).to_lowercase(),
             "0x742d35cc6634c0532925a3b844bc9e7595f1b0f2"
@@ -77,13 +78,16 @@ mod tests {
 
     #[test]
     fn test_parse_amount() {
-        assert_eq!(parse_amount("0").unwrap(), U256::ZERO);
-        assert_eq!(parse_amount("1000000").unwrap(), U256::from(1_000_000u64));
+        assert_eq!(parse_amount("0").expect("zero should parse"), U256::ZERO);
+        assert_eq!(
+            parse_amount("1000000").expect("test amount should parse"),
+            U256::from(1_000_000u64)
+        );
         assert_eq!(
             parse_amount(
                 "115792089237316195423570985008687907853269984665640564039457584007913129639935"
             )
-            .unwrap(),
+            .expect("maximum U256 should parse"),
             U256::MAX
         );
     }
