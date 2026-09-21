@@ -2064,3 +2064,149 @@ async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
     handle.abort();
     let _ = handle.await;
 }
+
+/// Reject invalid attribution before settlement, then accept a valid payment
+/// from the same payer to ensure rejection does not prevent legitimate payment.
+#[tokio::test]
+async fn test_unbound_memo_rejected_without_moving_funds() {
+    assert_unbound_memo_rejected_without_moving_funds(false).await;
+}
+
+#[tokio::test]
+async fn test_sponsored_unbound_memo_rejected_without_moving_funds() {
+    assert_unbound_memo_rejected_without_moving_funds(true).await;
+}
+
+async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
+    use mpp::tempo::attribution;
+
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    let merchant = PrivateKeySigner::random();
+    let payer = PrivateKeySigner::random();
+    fund_account(&rpc, merchant.address()).await;
+    fund_account(&rpc, payer.address()).await;
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", merchant.address()),
+        })
+        .rpc_url(&rpc)
+        .chain_id(chain_id)
+        .fee_payer(sponsored)
+        .fee_payer_signer(merchant.clone())
+        .secret_key("prebroadcast-regression"),
+    )
+    .unwrap();
+    let challenge = mpp.charge("1").unwrap();
+    let request: mpp::ChargeRequest = challenge.request.decode().unwrap();
+    let amount: U256 = request.amount.parse().unwrap();
+    let currency: Address = request.currency.parse().unwrap();
+    assert_eq!(currency, PATH_USD);
+    let gas_price = provider.get_gas_price().await.unwrap();
+    let payer_before = tip20_balance(&provider, payer.address()).await;
+    let merchant_before = tip20_balance(&provider, merchant.address()).await;
+    let cases = [
+        (
+            "wrong challenge",
+            Some(attribution::encode(
+                "wrong-challenge",
+                &challenge.realm,
+                None,
+            )),
+            false,
+        ),
+        (
+            "wrong realm",
+            Some(attribution::encode(
+                &challenge.id,
+                "wrong.example.com",
+                None,
+            )),
+            false,
+        ),
+        ("non-MPP memo", Some([0xab; 32]), false),
+        ("plain transfer", None, false),
+        (
+            "valid memo",
+            Some(attribution::encode(&challenge.id, &challenge.realm, None)),
+            true,
+        ),
+    ];
+    for (name, memo, valid) in cases {
+        let input = match memo {
+            Some(memo) => {
+                ITIP20::transferWithMemoCall::new((merchant.address(), amount, memo.into()))
+                    .abi_encode()
+            }
+            None => ITIP20::transferCall::new((merchant.address(), amount)).abi_encode(),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tx = TempoTransaction {
+            chain_id,
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit: 1_000_000,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: gas_price,
+            fee_token: if sponsored { None } else { Some(currency) },
+            fee_payer_signature: sponsored
+                .then(|| alloy::primitives::Signature::new(U256::ZERO, U256::ZERO, false)),
+            valid_before: NonZeroU64::new(now + 25),
+            calls: vec![Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: input.into(),
+            }],
+            ..Default::default()
+        };
+        let signature = payer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let bytes = if sponsored {
+            encode_fee_payer_envelope_for_test(&tx, payer.address(), signature.into())
+        } else {
+            tx.into_signed(signature.into()).encoded_2718()
+        };
+        let credential = mpp::PaymentCredential::with_source(
+            challenge.to_echo(),
+            format!("did:pkh:eip155:{chain_id}:{}", payer.address()),
+            mpp::PaymentPayload::transaction(alloy::hex::encode_prefixed(bytes)),
+        );
+        let result = mpp.verify_credential(&credential).await;
+        if valid {
+            assert!(result.is_ok(), "sponsored={sponsored}, {name}: {result:?}");
+            let payer_after = tip20_balance(&provider, payer.address()).await;
+            if sponsored {
+                assert_eq!(payer_before - payer_after, amount);
+            } else {
+                assert!(payer_before - payer_after >= amount);
+                assert_eq!(
+                    tip20_balance(&provider, merchant.address()).await - merchant_before,
+                    amount
+                );
+            }
+        } else {
+            let error = result.expect_err("invalid memo must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("memo is not bound to this challenge"),
+                "sponsored={sponsored}, {name}: {error}"
+            );
+            assert_eq!(
+                tip20_balance(&provider, payer.address()).await,
+                payer_before,
+                "sponsored={sponsored}, {name}: payer was charged"
+            );
+            assert_eq!(
+                tip20_balance(&provider, merchant.address()).await,
+                merchant_before,
+                "sponsored={sponsored}, {name}: merchant/sponsor balance changed"
+            );
+        }
+    }
+}
