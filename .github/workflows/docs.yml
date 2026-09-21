@@ -20,14 +20,14 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
+        uses: tempoxyz/gh-actions/actions/secure-runner@bce53819ffa60fcdf8f0f349686d807e5a66a71b # 2026-09-21T21-56-41Z-bce53819
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@bce53819ffa60fcdf8f0f349686d807e5a66a71b # 2026-09-21T21-56-41Z-bce53819
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@bce53819ffa60fcdf8f0f349686d807e5a66a71b # 2026-09-21T21-56-41Z-bce53819
       - name: Build docs
         run: cargo doc --no-deps --all-features
         env:
@@ -50,6 +50,6 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@baf48ebcfcb26812085b8351125493b2ef8009ab # 2026-09-21T19-33-30Z-baf48ebc
+        uses: tempoxyz/gh-actions/actions/secure-runner@bce53819ffa60fcdf8f0f349686d807e5a66a71b # 2026-09-21T21-56-41Z-bce53819
       - id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
