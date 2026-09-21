@@ -3809,7 +3809,7 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[tokio::test]
-    async fn test_verify_credential_with_memo_routing_mismatch_rejected() {
+    async fn test_verify_credential_with_split_memo_routing_mismatch_rejected() {
         let mpp = create_hmac_test_mpp();
 
         let challenge = mpp
@@ -3819,7 +3819,11 @@ mod tests {
                     currency: "0x20c0000000000000000000000000000000000000".into(),
                     recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
                     method_details: Some(serde_json::json!({
-                        "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                        "splits": [{
+                            "amount": "10000",
+                            "recipient": "0x0000000000000000000000000000000000000003",
+                            "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                        }]
                     })),
                     ..Default::default()
                 },
@@ -3835,6 +3839,12 @@ mod tests {
             amount: "100000".into(),
             currency: "0x20c0000000000000000000000000000000000000".into(),
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            method_details: Some(serde_json::json!({
+                "splits": [{
+                    "amount": "10000",
+                    "recipient": "0x0000000000000000000000000000000000000003"
+                }]
+            })),
             ..Default::default()
         };
 

@@ -5,7 +5,7 @@
 
 use alloy::primitives::{Address, U256};
 
-use super::charge::{parse_memo_bytes_checked, parse_split_memo_bytes, TempoChargeExt};
+use super::charge::{parse_split_memo_bytes, TempoChargeExt};
 use super::types::Split;
 use crate::error::MppError;
 use crate::evm::{parse_address, parse_amount};
@@ -30,9 +30,7 @@ pub fn get_request_transfers(charge: &ChargeRequest) -> Result<Vec<Transfer>, Mp
     let recipient = charge.recipient_address()?;
     let amount = charge.amount_u256()?;
     let details = charge.tempo_method_details()?;
-    let memo = parse_memo_bytes_checked(details.memo.as_deref())?;
-
-    get_transfers(amount, recipient, memo, details.splits.as_deref())
+    get_transfers(amount, recipient, None, details.splits.as_deref())
 }
 
 /// Compute the ordered list of transfers for a charge.
@@ -334,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_request_transfers_rejects_invalid_top_level_memo() {
+    fn test_get_request_transfers_ignores_legacy_top_level_memo() {
         let request = ChargeRequest {
             amount: "1000000".to_string(),
             currency: format!("{:#x}", addr(0x20)),
@@ -345,8 +343,9 @@ mod tests {
             ..Default::default()
         };
 
-        let error = get_request_transfers(&request).unwrap_err();
-        assert!(error.to_string().contains("Invalid memo"));
+        let transfers = get_request_transfers(&request).unwrap();
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].memo, None);
     }
 
     #[test]

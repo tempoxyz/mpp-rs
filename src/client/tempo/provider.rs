@@ -30,13 +30,11 @@ pub(super) fn prepare_charge_request(
         }
     }
 
-    if charge.memo().is_none() {
-        charge = charge.with_memo(crate::tempo::attribution::encode(
-            &challenge.id,
-            &challenge.realm,
-            client_id,
-        ));
-    }
+    charge = charge.with_memo(crate::tempo::attribution::encode(
+        &challenge.id,
+        &challenge.realm,
+        client_id,
+    ));
 
     Ok(charge)
 }
@@ -683,12 +681,26 @@ mod tests {
     }
 
     #[test]
-    fn test_user_memo_takes_precedence() {
-        let user_memo = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-        let hex_str = user_memo.strip_prefix("0x").unwrap();
-        let bytes = hex::decode(hex_str).unwrap();
-        let memo_bytes: [u8; 32] = bytes.try_into().unwrap();
-
-        assert!(!crate::tempo::attribution::is_mpp_memo(&memo_bytes));
+    fn test_prepare_charge_uses_bound_attribution_with_client_id() {
+        let request = crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1000000",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {
+                "memo": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            }
+        }))
+        .unwrap();
+        let challenge =
+            PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+        let charge = prepare_charge_request(&challenge, None, Some("my-client")).unwrap();
+        assert_eq!(
+            charge.memo(),
+            Some(crate::tempo::attribution::encode(
+                "test-id",
+                "api.example.com",
+                Some("my-client")
+            ))
+        );
     }
 }
