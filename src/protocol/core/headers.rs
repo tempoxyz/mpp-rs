@@ -1188,6 +1188,7 @@ mod tests {
             (r"lone \ude00 here", "lone \u{fffd} here"),
             (r"not an escape \\u2014", r"not an escape \u2014"),
             (r"short \u12 tail", "short u12 tail"),
+            (r"ascii api\u0061", "ascii apia"),
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="{escaped}""#
