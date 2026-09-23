@@ -57,7 +57,7 @@ jobs:
             sleep $((attempt * 5))
           done
       - name: Run Tempo Lints
-        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # 2026-08-25T05-00-01Z-f9268eb2
+        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # 2026-08-25T05-00-01Z-f9268eb2 # zizmor: ignore[ref-version-mismatch]
         env:
           COREPACK_DEFAULT_TO_LATEST: "0"
         with:
