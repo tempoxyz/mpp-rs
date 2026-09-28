@@ -75,6 +75,9 @@ const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 /// TIP-20 transferWithMemo function selector: bytes4(keccak256("transferWithMemo(address,uint256,bytes32)"))
 const TRANSFER_WITH_MEMO_SELECTOR: [u8; 4] = [0x95, 0x77, 0x7d, 0x59];
 
+/// OUSD fee token on Tempo mainnet.
+const OUSD: Address = alloy::primitives::address!("20c0000000000000000000006a37DA5C996874BE");
+
 fn no_matching_payment_call_error() -> VerificationError {
     VerificationError::new("Invalid transaction: no matching payment call found".to_string())
 }
@@ -639,8 +642,8 @@ impl FeePayerPolicy {
 
     /// Return the default sponsor fee-token allowlist for a transaction chain.
     ///
-    /// Known Tempo chains allow their default currency. Unknown chains use the
-    /// mainnet default, matching the server-side charge verifier fallback.
+    /// Known Tempo chains allow their default currency, plus OUSD on mainnet.
+    /// Unknown chains use the testnet default.
     pub fn default_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
         default_fee_payer_allowed_fee_tokens(chain_id)
     }
@@ -671,9 +674,13 @@ fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
     let token = KnownTempoNetwork::from_chain_id(chain_id)
         .map(|network| network.default_currency())
         .unwrap_or(DEFAULT_CURRENCY_TESTNET);
-    vec![token
+    let mut tokens = vec![token
         .parse()
-        .expect("default Tempo fee token is a valid address")]
+        .expect("default Tempo fee token is a valid address")];
+    if chain_id == CHAIN_ID {
+        tokens.push(OUSD);
+    }
+    tokens
 }
 
 fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
@@ -5229,5 +5236,46 @@ mod tests {
             .simulate_before_broadcast(&cosigned)
             .await
             .expect("method-not-found must skip the check, not fail");
+    }
+
+    #[test]
+    fn test_ousd_fee_token_is_mainnet_only() {
+        assert!(FeePayerPolicy::default_allows_fee_token(CHAIN_ID, OUSD));
+        assert!(!FeePayerPolicy::default_allows_fee_token(
+            MODERATO_CHAIN_ID,
+            OUSD
+        ));
+        assert!(!FeePayerPolicy::default_allows_fee_token(31337, OUSD));
+    }
+
+    #[tokio::test]
+    async fn test_cosign_accepts_ousd_fee_token_by_default() {
+        let (method, client_signer, _) = make_cosign_method(None);
+        let encoded = sign_and_encode_0x78(make_fee_payer_tx(60), &client_signer);
+        let cosigned = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                OUSD,
+            )
+            .await
+            .expect("default mainnet policy should sponsor OUSD");
+        let signed =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        assert_eq!(signed.tx().fee_token, Some(OUSD));
+    }
+
+    #[test]
+    fn test_custom_fee_token_policy_can_exclude_ousd() {
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+        let method = method.with_fee_payer_allowed_fee_tokens(vec![fee_token]);
+        let encoded = sign_and_encode_0x78(make_fee_payer_tx(60), &client_signer);
+        let error = method
+            .validate_fee_payer_transaction(&encoded, OUSD)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            format!("Fee token {OUSD:#x} is not allowed by fee payer policy")
+        );
     }
 }

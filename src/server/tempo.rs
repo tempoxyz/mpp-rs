@@ -125,8 +125,8 @@ impl TempoBuilder {
     /// transactions.
     ///
     /// By default, sponsored transactions accept the known default currency for
-    /// the transaction chain ID. Use this when `.currency(...)` points at a
-    /// custom token that the fee payer should sponsor.
+    /// the transaction chain ID, plus OUSD on mainnet. Use this when `.currency(...)`
+    /// points at a custom token that the fee payer should sponsor.
     pub fn fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
         self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
         self
