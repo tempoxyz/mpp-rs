@@ -3,6 +3,9 @@
 use alloy::primitives::Address;
 
 use super::mpp::detect_realm;
+use crate::error::MppError;
+use crate::protocol::methods::tempo::network::TempoNetwork as KnownTempoNetwork;
+use crate::protocol::methods::tempo::PATH_USD;
 
 pub use crate::protocol::methods::tempo::session_method::{
     deduct_from_channel, InMemoryChannelStore as SessionChannelStore,
@@ -28,6 +31,7 @@ pub struct TempoConfig<'a> {
 pub struct TempoBuilder {
     pub(crate) currency: String,
     pub(crate) currency_explicit: bool,
+    pub(crate) currencies: Option<Vec<String>>,
     pub(crate) recipient: String,
     pub(crate) rpc_url: String,
     pub(crate) realm: String,
@@ -38,6 +42,7 @@ pub struct TempoBuilder {
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<std::sync::Arc<crate::protocol::methods::tempo::DynSigner>>,
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
+    pub(crate) fee_payer_fee_token: Option<Address>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
@@ -63,10 +68,30 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the token currency (default: USDC on mainnet, pathUSD on testnet).
+    /// Accept exactly one token currency.
+    ///
+    /// **Deprecated:** use [`currencies`](Self::currencies) with a one-element
+    /// list instead. Setting both `currency` and `currencies` is rejected by
+    /// [`Mpp::create()`](super::Mpp::create).
     pub fn currency(mut self, addr: &str) -> Self {
         self.currency = addr.to_string();
         self.currency_explicit = true;
+        self
+    }
+
+    /// Set the ordered list of accepted token currencies.
+    ///
+    /// The server issues one charge challenge per currency, in this order.
+    /// An explicit list replaces the defaults (see [`tempo()`]). Addresses
+    /// must be valid; duplicates are removed case-insensitively, keeping the
+    /// first occurrence. An empty list is rejected by
+    /// [`Mpp::create()`](super::Mpp::create).
+    pub fn currencies<I, T>(mut self, currencies: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.currencies = Some(currencies.into_iter().map(Into::into).collect());
         self
     }
 
@@ -124,11 +149,24 @@ impl TempoBuilder {
     /// Replace the fee-sponsor token allowlist used when co-signing fee-payer
     /// transactions.
     ///
-    /// By default, sponsored transactions accept the known default currency for
-    /// the transaction chain ID. Use this when `.currency(...)` points at a
-    /// custom token that the fee payer should sponsor.
+    /// By default, the fee payer may pay gas in pathUSD or the known default
+    /// currency for the transaction chain ID (mainnet: pathUSD and USDC.e;
+    /// Moderato: pathUSD). The fee token is independent of the charge
+    /// currency, so charges in any accepted currency (including OUSD) are
+    /// sponsored with one of these tokens.
     pub fn fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
         self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
+        self
+    }
+
+    /// Set the token the local fee payer uses to pay gas.
+    ///
+    /// When unset, the fee payer uses the first allowlisted fee token it holds
+    /// a nonzero balance of, falling back to the first allowlisted token. An
+    /// explicit token must also be in the allowlist (see
+    /// [`fee_payer_allowed_fee_tokens`](Self::fee_payer_allowed_fee_tokens)).
+    pub fn fee_payer_fee_token(mut self, fee_token: Address) -> Self {
+        self.fee_payer_fee_token = Some(fee_token);
         self
     }
 
@@ -172,9 +210,18 @@ impl TempoBuilder {
 ///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
 ///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
-/// - **currency**: pathUSD by default, mainnet USDC with `.chain_id(4217)`,
-///   or pathUSD with `.chain_id(42431)` / a Moderato RPC URL
-/// - **decimals**: `6` (for pathUSD / USDC / standard stablecoins)
+/// - **currencies**: one charge challenge per accepted currency, in order:
+///   - Tempo mainnet (`.chain_id(4217)` or a non-Moderato `.rpc_url(...)`):
+///     OUSD, then USDC.e
+///   - Moderato (`.chain_id(42431)` or a Moderato `.rpc_url(...)`): OUSD, then
+///     pathUSD
+///   - no chain ID or an unknown chain ID: pathUSD only
+///
+///   An explicit `.chain_id(...)` takes precedence over the RPC-inferred chain.
+///   Use `.currencies([...])` to replace the defaults. Sponsored charges pay
+///   gas in an allowlisted fee token independent of the charge currency (see
+///   [`fee_payer_fee_token`](TempoBuilder::fee_payer_fee_token)).
+/// - **decimals**: `6` (for pathUSD / USDC / OUSD / standard stablecoins)
 /// - **expires**: `now + 5 minutes`
 ///
 /// # Example
@@ -182,17 +229,26 @@ impl TempoBuilder {
 /// ```ignore
 /// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
-/// // Minimal — currency defaults to pathUSD
+/// // Minimal — no chain ID, so currency defaults to pathUSD
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     recipient: "0xabc...123",
 /// }))?;
+///
+/// // Mainnet — offers OUSD first, then USDC.e
+/// let mpp = Mpp::create(
+///     tempo(TempoConfig {
+///         recipient: "0xabc...123",
+///     })
+///     .chain_id(4217),
+/// )?;
+/// let offers = mpp.charges("0.10")?;
 ///
 /// // With overrides
 /// let mpp = Mpp::create(
 ///     tempo(TempoConfig {
 ///         recipient: "0xabc...123",
 ///     })
-///     .currency("0xcustom_token_address")
+///     .currencies(["0xcustom_token_address"])
 ///     .rpc_url("https://rpc.moderato.tempo.xyz")
 ///     .realm("my-api.com")
 ///     .secret_key("my-secret")
@@ -203,6 +259,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
     TempoBuilder {
         currency: crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET.to_string(),
         currency_explicit: false,
+        currencies: None,
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: detect_realm(),
@@ -213,6 +270,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         chain_id: None,
         fee_payer_signer: None,
         fee_payer_allowed_fee_tokens: None,
+        fee_payer_fee_token: None,
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         relay: None,
@@ -261,6 +319,52 @@ pub type TempoProvider = alloy::providers::fillers::FillProvider<
     alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
     tempo_alloy::TempoNetwork,
 >;
+
+/// Resolve the ordered, deduplicated currencies a builder accepts.
+///
+/// An explicit `currencies` list replaces the defaults, and the legacy
+/// `currency` option restricts acceptance to that one token. Otherwise the
+/// chain's defaults apply (OUSD first on known Tempo networks, pathUSD on
+/// unknown or unset chains).
+pub(crate) fn resolve_currencies(builder: &TempoBuilder) -> crate::error::Result<Vec<String>> {
+    let candidates = match (&builder.currencies, builder.currency_explicit) {
+        (Some(_), true) => {
+            return Err(MppError::InvalidConfig(
+                "Specify either `currency` or `currencies`, not both.".into(),
+            ));
+        }
+        (Some(currencies), false) => currencies.clone(),
+        (None, true) => vec![builder.currency.clone()],
+        (None, false) => builder
+            .chain_id
+            .and_then(KnownTempoNetwork::from_chain_id)
+            .map_or(&[PATH_USD][..], KnownTempoNetwork::default_currencies)
+            .iter()
+            .map(|currency| currency.to_string())
+            .collect(),
+    };
+
+    let mut resolved = Vec::<String>::with_capacity(candidates.len());
+    for currency in candidates {
+        if currency.parse::<Address>().is_err() {
+            return Err(MppError::InvalidConfig(format!(
+                "Invalid Tempo currency address: {currency}."
+            )));
+        }
+        if !resolved
+            .iter()
+            .any(|seen| seen.eq_ignore_ascii_case(&currency))
+        {
+            resolved.push(currency);
+        }
+    }
+    if resolved.is_empty() {
+        return Err(MppError::InvalidConfig(
+            "No accepted currencies configured; `currencies` must not be empty.".into(),
+        ));
+    }
+    Ok(resolved)
+}
 
 #[cfg(test)]
 mod tests {

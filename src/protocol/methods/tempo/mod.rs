@@ -173,6 +173,10 @@ pub const USDC: &str = "0x20C000000000000000000000b9537d11c60E8b50";
 /// pathUSD currency address.
 pub const PATH_USD: &str = "0x20c0000000000000000000000000000000000000";
 
+/// OpenUSD (OUSD) currency address, deployed at the same address on Tempo
+/// mainnet and Moderato.
+pub const OUSD: &str = "0x20c0000000000000000000006a37DA5C996874BE";
+
 /// Default currency address for Tempo mainnet (USDC).
 pub const DEFAULT_CURRENCY_MAINNET: &str = USDC;
 

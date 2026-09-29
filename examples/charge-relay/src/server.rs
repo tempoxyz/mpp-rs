@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use mpp::protocol::methods::tempo::PATH_USD;
 use mpp::server::{
     tempo, ChargeOptions, Mpp, TempoChargeMethod, TempoConfig, TempoProvider, TempoRelayConfig,
 };
@@ -31,6 +32,7 @@ async fn main() {
             recipient: &recipient,
         })
         .rpc_url(&rpc_url)
+        .currencies([PATH_USD])
         .relay(TempoRelayConfig::new(api_key).api_base_url(api_url))
         .secret_key(
             &std::env::var("MPP_SECRET_KEY")

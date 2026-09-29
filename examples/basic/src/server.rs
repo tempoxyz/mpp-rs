@@ -22,6 +22,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use mpp::protocol::methods::tempo::PATH_USD;
 use mpp::server::{tempo, Mpp, TempoChargeMethod, TempoConfig};
 use mpp::{format_www_authenticate, parse_authorization, PrivateKeySigner};
 use rand::seq::IndexedRandom;
@@ -65,6 +66,8 @@ async fn main() {
         recipient: &recipient,
     })
     .rpc_url(&rpc_url)
+    // The demo client is funded with pathUSD by the testnet faucet.
+    .currencies([PATH_USD])
     // Keep the demo runnable out-of-the-box while honoring required secret key semantics.
     .secret_key(
         &std::env::var("MPP_SECRET_KEY").unwrap_or_else(|_| "basic-example-secret".to_string()),

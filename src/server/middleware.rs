@@ -30,7 +30,7 @@ use http_body_util::BodyExt;
 use http_types::{header, HeaderValue, Request, Response, StatusCode};
 
 use crate::protocol::core::headers::{
-    extract_payment_scheme, format_receipt, format_www_authenticate, parse_authorization,
+    extract_payment_scheme, format_receipt, format_www_authenticate_many, parse_authorization,
     with_private_cache_control, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
 };
 
@@ -522,21 +522,29 @@ impl PaymentLayer<ChargeVerifier> {
 
         let mpp_for_challenge = mpp.clone();
         let charge_amount = amount.to_string();
+        // One challenge per accepted currency, comma-joined into a single
+        // `WWW-Authenticate` value (RFC 9110 §11.6.1).
         let challenge_fn = Box::new(move || {
-            let challenge = mpp_for_challenge
-                .charge(&charge_amount)
+            let challenges = mpp_for_challenge
+                .charges(&charge_amount)
                 .map_err(|e| format!("Failed to generate challenge: {e}"))?;
-            format_www_authenticate(&challenge)
+            format_www_authenticate_many(&challenges)
+                .map(|values| values.join(", "))
                 .map_err(|e| format!("Failed to format challenge: {e}"))
         });
 
         let mpp_for_body_challenge = mpp.clone();
         let charge_amount_for_body = amount.to_string();
         let challenge_with_body_fn = Box::new(move |body: &[u8]| {
-            let challenge = mpp_for_body_challenge
-                .charge_with_body(&charge_amount_for_body, body)
+            let challenges = mpp_for_body_challenge
+                .charges_with_options_and_body(
+                    &charge_amount_for_body,
+                    super::ChargeOptions::default(),
+                    body,
+                )
                 .map_err(|e| format!("Failed to generate challenge: {e}"))?;
-            format_www_authenticate(&challenge)
+            format_www_authenticate_many(&challenges)
+                .map(|values| values.join(", "))
                 .map_err(|e| format!("Failed to format challenge: {e}"))
         });
 
@@ -1150,8 +1158,9 @@ mod tests {
         use super::*;
         use crate::protocol::core::challenge::{PaymentCredential, PaymentPayload, Receipt};
         use crate::protocol::core::headers::{
-            format_authorization, parse_receipt, parse_www_authenticate,
+            format_authorization, parse_receipt, parse_www_authenticate, parse_www_authenticate_all,
         };
+        use crate::protocol::core::PaymentChallenge;
         use crate::protocol::intents::ChargeRequest;
         use crate::protocol::traits::{ChargeMethod, VerificationError};
         use crate::server::Mpp;
@@ -1303,6 +1312,115 @@ mod tests {
 
             assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
             assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        }
+
+        fn create_multi_currency_mpp() -> Mpp<SuccessChargeMethod> {
+            create_mpp_with_mock().with_currencies(vec![
+                crate::protocol::methods::tempo::OUSD.to_string(),
+                crate::protocol::methods::tempo::USDC.to_string(),
+            ])
+        }
+
+        fn offered_challenges<B>(resp: &Response<B>) -> Vec<PaymentChallenge> {
+            let values = resp
+                .headers()
+                .get_all(WWW_AUTHENTICATE_HEADER)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>();
+            parse_www_authenticate_all(values)
+                .into_iter()
+                .map(|challenge| challenge.unwrap())
+                .collect()
+        }
+
+        fn currencies_of(challenges: &[PaymentChallenge]) -> Vec<String> {
+            challenges
+                .iter()
+                .map(|c| c.request.decode::<ChargeRequest>().unwrap().currency)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_no_auth_returns_every_currency_offer_in_order() {
+            use crate::protocol::methods::tempo::{OUSD, USDC};
+
+            let layer = PaymentLayer::charge(&create_multi_currency_mpp(), "0.10").unwrap();
+            let mut svc = layer.layer(OkService);
+            let req = Request::builder().uri("/premium").body(()).unwrap();
+            let resp = svc.call(req).await.unwrap();
+
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            let challenges = offered_challenges(&resp);
+            assert_eq!(currencies_of(&challenges), [OUSD, USDC]);
+            assert!(challenges.iter().all(|c| c.verify("test-secret")));
+        }
+
+        #[tokio::test]
+        async fn test_credential_for_each_offer_returns_200() {
+            use crate::protocol::methods::tempo::{OUSD, USDC};
+
+            let layer = PaymentLayer::charge(&create_multi_currency_mpp(), "0.10").unwrap();
+            let resp = layer
+                .layer(OkService)
+                .call(Request::builder().uri("/premium").body(()).unwrap())
+                .await
+                .unwrap();
+            let challenges = offered_challenges(&resp);
+
+            for (challenge, currency) in challenges.iter().zip([OUSD, USDC]) {
+                let credential =
+                    PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+                let auth_header = format_authorization(&credential).unwrap();
+                let req = Request::builder()
+                    .uri("/premium")
+                    .header(header::AUTHORIZATION, &auth_header)
+                    .body(())
+                    .unwrap();
+                let resp = layer.layer(OkService).call(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{currency} offer rejected");
+                assert!(resp.headers().contains_key(PAYMENT_RECEIPT_HEADER));
+            }
+        }
+
+        #[tokio::test]
+        async fn test_credential_for_non_offered_currency_returns_402() {
+            use crate::protocol::methods::tempo::{OUSD, USDC};
+
+            // pathUSD challenge signed with the same secret/realm but not offered.
+            let foreign = create_mpp_with_mock().charge("0.10").unwrap();
+            let credential =
+                PaymentCredential::new(foreign.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+            let auth_header = format_authorization(&credential).unwrap();
+
+            let layer = PaymentLayer::charge(&create_multi_currency_mpp(), "0.10").unwrap();
+            let req = Request::builder()
+                .uri("/premium")
+                .header(header::AUTHORIZATION, &auth_header)
+                .body(())
+                .unwrap();
+            let resp = layer.layer(OkService).call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(currencies_of(&offered_challenges(&resp)), [OUSD, USDC]);
+        }
+
+        #[tokio::test]
+        async fn test_body_layer_binds_every_currency_offer() {
+            use crate::protocol::methods::tempo::{OUSD, USDC};
+
+            let verifier = PaymentBodyLayer::charge(&create_multi_currency_mpp(), "0.10")
+                .unwrap()
+                .verifier;
+            let header = verifier.challenge_with_body(b"{}").unwrap();
+            let challenges = parse_www_authenticate_all([header.as_str()])
+                .into_iter()
+                .map(|challenge| challenge.unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(currencies_of(&challenges), [OUSD, USDC]);
+            let digest = crate::body_digest::compute(b"{}");
+            assert!(challenges
+                .iter()
+                .all(|c| c.digest.as_deref() == Some(digest.as_str())));
         }
 
         #[tokio::test]
