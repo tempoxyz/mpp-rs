@@ -163,7 +163,9 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
             continue;
         }
 
-        let key = params_str[key_start..i].to_string();
+        // Auth-param names are case-insensitive (RFC 9110 §11.2).
+        let raw_key = &params_str[key_start..i];
+        let key = raw_key.to_ascii_lowercase();
         i += 1;
 
         if i >= bytes.len() {
@@ -233,7 +235,7 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
         if params.contains_key(&key) {
             return Err(MppError::invalid_challenge_reason(format!(
                 "Duplicate parameter: {}",
-                key
+                raw_key
             )));
         }
         params.insert(key, value);
@@ -1133,6 +1135,24 @@ mod tests {
         let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", id="b""#;
         let err = parse_www_authenticate(header).unwrap_err();
         assert!(err.to_string().contains("Duplicate parameter"));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_accepts_mixed_case_param_names() {
+        let header =
+            r#"Payment ID="abc123", Realm="api", Method="tempo", Intent="charge", Request="e30""#;
+        let challenge = parse_www_authenticate(header).unwrap();
+        assert_eq!(challenge.id, "abc123");
+        assert_eq!(challenge.realm, "api");
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "charge");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_case_variant_duplicate_params() {
+        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", ID="b""#;
+        let err = parse_www_authenticate(header).unwrap_err();
+        assert!(err.to_string().contains("Duplicate parameter: ID"));
     }
 
     #[test]
