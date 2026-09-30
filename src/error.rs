@@ -691,10 +691,11 @@ impl PaymentError for MppError {
             Self::ChannelClosed(_) => PaymentErrorDetails::session("channel-finalized")
                 .with_title("ChannelClosedError")
                 .with_status(410),
-            // Non-payment-problem errors get a generic problem type
-            _ => PaymentErrorDetails::core("internal-error")
-                .with_title("InternalError")
-                .with_status(402),
+            // Errors that are not payment problems are the server's own
+            // failures, reported as the spec's internal-payment-error.
+            _ => PaymentErrorDetails::core("internal-payment-error")
+                .with_title("InternalPaymentError")
+                .with_status(500),
         }
         .with_detail(self.to_string());
 
@@ -1153,6 +1154,19 @@ mod tests {
             err.to_string(),
             "Amount increase below minimum voucher delta."
         );
+    }
+
+    #[test]
+    fn test_non_payment_error_problem_details() {
+        let err = MppError::Http("connection refused".to_string());
+        assert!(!err.is_payment_problem());
+        let problem = err.to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            "https://paymentauth.org/problems/internal-payment-error"
+        );
+        assert_eq!(problem.title, "InternalPaymentError");
+        assert_eq!(problem.status, 500);
     }
 
     #[test]
