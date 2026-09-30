@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Async key-value store interface.
 ///
@@ -231,21 +232,30 @@ impl Store for FileStore {
         key: &str,
         value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let path = self.key_path(key);
+        let tmp_path = path.with_extension(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         Box::pin(async move {
             let serialized = serde_json::to_string_pretty(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            // `create_new` is an atomic O_EXCL create: fails if the file exists.
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    f.write_all(serialized.as_bytes())
-                        .map_err(|e| StoreError::Internal(e.to_string()))?;
-                    Ok(true)
-                }
+            // Write the full value to a private temp file, then hard-link it into place.
+            // The link fails with `AlreadyExists` if the key is taken, and the key path
+            // never points at a partially written file, so a failed or interrupted write
+            // cannot poison the key.
+            let result = (|| {
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(serialized.as_bytes())?;
+                f.sync_all()?;
+                std::fs::hard_link(&tmp_path, &path)
+            })();
+            let _ = std::fs::remove_file(&tmp_path);
+            match result {
+                Ok(()) => Ok(true),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
                 Err(e) => Err(StoreError::Internal(e.to_string())),
             }
@@ -585,6 +595,11 @@ mod tests {
             store.get("k").await.unwrap(),
             Some(serde_json::json!("first"))
         );
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["k.json"], "temp files must not be left behind");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
