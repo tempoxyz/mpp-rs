@@ -181,7 +181,11 @@ pub enum SessionCredentialPayload {
         transaction: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "settlementRoute",
+            alias = "settlement_route",
+            skip_serializing_if = "Option::is_none"
+        )]
         settlement_route: Option<SettlementRoute>,
         #[serde(rename = "authorizedSigner", skip_serializing_if = "Option::is_none")]
         authorized_signer: Option<String>,
@@ -198,7 +202,11 @@ pub enum SessionCredentialPayload {
         transaction: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "settlementRoute",
+            alias = "settlement_route",
+            skip_serializing_if = "Option::is_none"
+        )]
         settlement_route: Option<SettlementRoute>,
         #[serde(rename = "additionalDeposit")]
         additional_deposit: String,
@@ -209,7 +217,11 @@ pub enum SessionCredentialPayload {
         channel_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "settlementRoute",
+            alias = "settlement_route",
+            skip_serializing_if = "Option::is_none"
+        )]
         settlement_route: Option<SettlementRoute>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
@@ -221,7 +233,11 @@ pub enum SessionCredentialPayload {
         channel_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         descriptor: Option<ChannelDescriptor>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "settlementRoute",
+            alias = "settlement_route",
+            skip_serializing_if = "Option::is_none"
+        )]
         settlement_route: Option<SettlementRoute>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
@@ -522,6 +538,79 @@ mod tests {
                 assert_eq!(authorized_signer.as_deref(), Some("0xsigner789"));
             }
             _ => panic!("Expected Open variant"),
+        }
+    }
+
+    #[test]
+    fn test_settlement_route_serializes_camel_case() {
+        let route = SettlementRoute {
+            adapter: "0xadapter".to_string(),
+            recipient: "0xrecipient".to_string(),
+            target_token: "0xtoken".to_string(),
+            route_salt: "0xsalt".to_string(),
+        };
+        let payloads = [
+            SessionCredentialPayload::Open {
+                payload_type: "transaction".to_string(),
+                channel_id: "0xchannel".to_string(),
+                transaction: "0xtx".to_string(),
+                descriptor: None,
+                settlement_route: Some(route.clone()),
+                authorized_signer: None,
+                cumulative_amount: "1".to_string(),
+                signature: "0xsig".to_string(),
+            },
+            SessionCredentialPayload::TopUp {
+                payload_type: "transaction".to_string(),
+                channel_id: "0xchannel".to_string(),
+                transaction: "0xtx".to_string(),
+                descriptor: None,
+                settlement_route: Some(route.clone()),
+                additional_deposit: "1".to_string(),
+            },
+            SessionCredentialPayload::Voucher {
+                channel_id: "0xchannel".to_string(),
+                descriptor: None,
+                settlement_route: Some(route.clone()),
+                cumulative_amount: "1".to_string(),
+                signature: "0xsig".to_string(),
+            },
+            SessionCredentialPayload::Close {
+                channel_id: "0xchannel".to_string(),
+                descriptor: None,
+                settlement_route: Some(route.clone()),
+                cumulative_amount: "1".to_string(),
+                signature: "0xsig".to_string(),
+            },
+        ];
+
+        for payload in payloads {
+            let json = serde_json::to_string(&payload).unwrap();
+            assert!(
+                json.contains("\"settlementRoute\":{\"adapter\":\"0xadapter\""),
+                "got: {json}"
+            );
+            assert!(!json.contains("settlement_route"), "got: {json}");
+        }
+    }
+
+    #[test]
+    fn test_settlement_route_deserializes_camel_case_and_legacy_snake_case() {
+        let camel = r#"{"action":"voucher","channelId":"0xabc","settlementRoute":{"adapter":"0xadapter","recipient":"0xrecipient","targetToken":"0xtoken","routeSalt":"0xsalt"},"cumulativeAmount":"300","signature":"0xsig"}"#;
+        let legacy = camel.replace("settlementRoute", "settlement_route");
+
+        for json in [camel, legacy.as_str()] {
+            let parsed: SessionCredentialPayload = serde_json::from_str(json).unwrap();
+            match parsed {
+                SessionCredentialPayload::Voucher {
+                    settlement_route, ..
+                } => {
+                    let route = settlement_route.expect("route should be parsed");
+                    assert_eq!(route.adapter, "0xadapter");
+                    assert_eq!(route.target_token, "0xtoken");
+                }
+                _ => panic!("Expected Voucher variant"),
+            }
         }
     }
 
