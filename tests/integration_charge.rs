@@ -2100,7 +2100,7 @@ async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
         .secret_key("prebroadcast-regression"),
     )
     .unwrap();
-    let challenge = mpp.charge("1").unwrap();
+    let challenge = mpp.charge("1").unwrap().remove(0);
     let request: mpp::ChargeRequest = challenge.request.decode().unwrap();
     let amount: U256 = request.amount.parse().unwrap();
     let currency: Address = request.currency.parse().unwrap();

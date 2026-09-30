@@ -512,7 +512,7 @@ impl PaymentLayer<ChargeVerifier> {
     {
         // Capture route-scoped expected request once so credential verification
         // compares against endpoint configuration, not echoed credential data.
-        let expected_challenge = mpp.charge(amount)?;
+        let expected_challenge = mpp.charge(amount).map(|mut offers| offers.remove(0))?;
         let expected_request: crate::protocol::intents::ChargeRequest =
             expected_challenge.request.decode().map_err(|e| {
                 crate::error::MppError::InvalidConfig(format!(
@@ -526,7 +526,7 @@ impl PaymentLayer<ChargeVerifier> {
         // `WWW-Authenticate` value (RFC 9110 §11.6.1).
         let challenge_fn = Box::new(move || {
             let challenges = mpp_for_challenge
-                .charges(&charge_amount)
+                .charge(&charge_amount)
                 .map_err(|e| format!("Failed to generate challenge: {e}"))?;
             format_www_authenticate_many(&challenges)
                 .map(|values| values.join(", "))
@@ -537,7 +537,7 @@ impl PaymentLayer<ChargeVerifier> {
         let charge_amount_for_body = amount.to_string();
         let challenge_with_body_fn = Box::new(move |body: &[u8]| {
             let challenges = mpp_for_body_challenge
-                .charges_with_options_and_body(
+                .charge_with_options_and_body(
                     &charge_amount_for_body,
                     super::ChargeOptions::default(),
                     body,
@@ -1388,7 +1388,7 @@ mod tests {
             use crate::protocol::methods::tempo::{OUSD, USDC};
 
             // pathUSD challenge signed with the same secret/realm but not offered.
-            let foreign = create_mpp_with_mock().charge("0.10").unwrap();
+            let foreign = create_mpp_with_mock().charge("0.10").unwrap().remove(0);
             let credential =
                 PaymentCredential::new(foreign.to_echo(), PaymentPayload::hash("0xdeadbeef"));
             let auth_header = format_authorization(&credential).unwrap();

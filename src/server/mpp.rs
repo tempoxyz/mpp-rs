@@ -12,7 +12,7 @@
 //!     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 //! }))?;
 //!
-//! let challenge = mpp.charge("0.10")?;
+//! let challenges = mpp.charge("0.10")?;
 //! ```
 
 #[cfg(any(feature = "tempo", feature = "stripe"))]
@@ -90,7 +90,7 @@ pub struct SessionVerifyResult {
 /// }))?;
 ///
 /// // Charge $0.10 — currency, recipient, realm, secret, expires all handled
-/// let challenge = mpp.charge("0.10")?;
+/// let challenges = mpp.charge("0.10")?;
 /// ```
 ///
 /// # Advanced API
@@ -504,57 +504,6 @@ where
         Ok((currency, recipient))
     }
 
-    /// Generate a charge challenge for a dollar amount.
-    ///
-    /// Requires currency and recipient to be bound (via [`Mpp::create()`]).
-    /// The amount is automatically converted from dollars to base units
-    /// using the configured decimals (default: 6).
-    ///
-    /// # Arguments
-    ///
-    /// * `amount` - Amount in dollars (e.g., `"0.10"` for 10 cents)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let challenge = mpp.charge("0.10")?;
-    /// ```
-    #[cfg(feature = "tempo")]
-    pub fn charge(&self, amount: &str) -> Result<PaymentChallenge> {
-        self.charge_with_options(amount, super::ChargeOptions::default())
-    }
-
-    /// Generate a charge challenge and bind it to the actual request body bytes.
-    #[cfg(feature = "tempo")]
-    pub fn charge_with_body(&self, amount: &str, body: &[u8]) -> Result<PaymentChallenge> {
-        self.charge_with_options_and_body(amount, super::ChargeOptions::default(), body)
-    }
-
-    /// Generate a charge challenge with a dollar amount and additional options.
-    ///
-    /// Requires currency and recipient to be bound (via [`Mpp::create()`]).
-    #[cfg(feature = "tempo")]
-    pub fn charge_with_options(
-        &self,
-        amount: &str,
-        options: super::ChargeOptions<'_>,
-    ) -> Result<PaymentChallenge> {
-        let (currency, _) = self.require_bound_config()?;
-        self.charge_for_currency(amount, currency, &options)
-    }
-
-    /// Generate a charge challenge with options and bind it to the actual request body bytes.
-    #[cfg(feature = "tempo")]
-    pub fn charge_with_options_and_body(
-        &self,
-        amount: &str,
-        options: super::ChargeOptions<'_>,
-        body: &[u8],
-    ) -> Result<PaymentChallenge> {
-        let challenge = self.charge_with_options(amount, options)?;
-        Ok(self.with_body_digest(challenge, body))
-    }
-
     /// Generate one charge challenge per accepted currency, in order.
     ///
     /// Servers created with [`Mpp::create()`] on Tempo mainnet or Moderato
@@ -564,17 +513,29 @@ where
     /// so clients can pay with any accepted currency. A credential for any of
     /// these challenges verifies against this handler.
     ///
+    /// `amount` is in dollars (e.g., `"0.10"` for 10 cents), converted using
+    /// the configured decimals (default: 6). Even a single accepted currency
+    /// returns a one-element vector.
+    ///
     /// Requires currency and recipient to be bound (via [`Mpp::create()`]).
     #[cfg(feature = "tempo")]
-    pub fn charges(&self, amount: &str) -> Result<Vec<PaymentChallenge>> {
-        self.charges_with_options(amount, super::ChargeOptions::default())
+    pub fn charge(&self, amount: &str) -> Result<Vec<PaymentChallenge>> {
+        self.charge_with_options(amount, super::ChargeOptions::default())
+    }
+
+    /// Generate one body-bound charge challenge per accepted currency.
+    ///
+    /// See [`charge()`](Self::charge).
+    #[cfg(feature = "tempo")]
+    pub fn charge_with_body(&self, amount: &str, body: &[u8]) -> Result<Vec<PaymentChallenge>> {
+        self.charge_with_options_and_body(amount, super::ChargeOptions::default(), body)
     }
 
     /// Generate one charge challenge per accepted currency with additional options.
     ///
-    /// See [`charges()`](Self::charges).
+    /// See [`charge()`](Self::charge).
     #[cfg(feature = "tempo")]
-    pub fn charges_with_options(
+    pub fn charge_with_options(
         &self,
         amount: &str,
         options: super::ChargeOptions<'_>,
@@ -588,16 +549,16 @@ where
 
     /// Generate one body-bound charge challenge per accepted currency.
     ///
-    /// See [`charges()`](Self::charges).
+    /// See [`charge()`](Self::charge).
     #[cfg(feature = "tempo")]
-    pub fn charges_with_options_and_body(
+    pub fn charge_with_options_and_body(
         &self,
         amount: &str,
         options: super::ChargeOptions<'_>,
         body: &[u8],
     ) -> Result<Vec<PaymentChallenge>> {
         Ok(self
-            .charges_with_options(amount, options)?
+            .charge_with_options(amount, options)?
             .into_iter()
             .map(|challenge| self.with_body_digest(challenge, body))
             .collect())
@@ -1320,7 +1281,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     ///     recipient: "0xabc...123",
     /// }))?;
     ///
-    /// let challenge = mpp.charge("1.00")?;
+    /// let challenges = mpp.charge("1.00")?;
     /// ```
     pub fn create(mut builder: super::TempoBuilder) -> Result<Self> {
         builder
@@ -2439,7 +2400,7 @@ mod tests {
         )
         .unwrap();
 
-        let challenge = mpp.charge("1").unwrap();
+        let challenge = mpp.charge("1").unwrap().remove(0);
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert!(mpp.fee_payer());
         assert!(request.fee_payer());
@@ -2473,7 +2434,7 @@ mod tests {
         )
         .unwrap();
 
-        let challenge = mpp.charge("1").unwrap();
+        let challenge = mpp.charge("1").unwrap().remove(0);
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert!(request.fee_payer());
         assert_eq!(request.chain_id(), Some(chain_id));
@@ -2503,7 +2464,7 @@ mod tests {
         )
         .unwrap();
 
-        let challenge = mpp.charge("1").unwrap();
+        let challenge = mpp.charge("1").unwrap().remove(0);
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert!(request.fee_payer());
         assert_eq!(request.currency_address().unwrap(), custom_token);
@@ -2568,7 +2529,7 @@ mod tests {
     fn test_charge_dollar_amount() {
         let mpp = create_test_mpp();
 
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
         assert_eq!(challenge.method.as_str(), "tempo");
         assert_eq!(challenge.intent.as_str(), "charge");
         assert_eq!(challenge.realm, "MPP Payment");
@@ -2586,7 +2547,7 @@ mod tests {
     #[test]
     fn test_charge_one_dollar() {
         let mpp = create_test_mpp();
-        let challenge = mpp.charge("1").unwrap();
+        let challenge = mpp.charge("1").unwrap().remove(0);
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "1000000");
     }
@@ -2604,7 +2565,7 @@ mod tests {
         )
         .unwrap();
 
-        let challenge = mpp.charge("1").unwrap();
+        let challenge = mpp.charge("1").unwrap().remove(0);
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert!(mpp.machine_token_enabled());
         assert!(request.machine_token_enabled());
@@ -2633,7 +2594,7 @@ mod tests {
     #[test]
     fn test_charge_default_expires() {
         let mpp = create_test_mpp();
-        let challenge = mpp.charge("1").unwrap();
+        let challenge = mpp.charge("1").unwrap().remove(0);
         assert!(challenge.expires.is_some());
     }
 
@@ -2641,7 +2602,7 @@ mod tests {
     #[test]
     fn test_charge_requires_bound_currency() {
         let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-        let result = payment.charge("1.00");
+        let result = payment.charge("1.00").map(|mut offers| offers.remove(0));
         assert!(result.is_err());
     }
 
@@ -2658,7 +2619,8 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap();
+            .unwrap()
+            .remove(0);
 
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "5500000");
@@ -2682,7 +2644,8 @@ mod tests {
                 },
                 body,
             )
-            .unwrap();
+            .unwrap()
+            .remove(0);
 
         let digest = crate::body_digest::compute(body);
         assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
@@ -2736,7 +2699,7 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_verify_happy_path() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -2750,7 +2713,7 @@ mod tests {
     #[tokio::test]
     async fn test_requires_auth_advertises_payment_authorization_header() {
         let mpp = create_hmac_test_mpp().with_requires_auth(true);
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         assert!(mpp.requires_auth());
         assert_eq!(mpp.credential_header(), "Payment-Authorization");
@@ -2766,7 +2729,7 @@ mod tests {
         let receipt = mpp.verify_credential(&credential).await.unwrap();
         assert!(receipt.is_success());
 
-        let implicit = create_hmac_test_mpp().charge("0.10").unwrap();
+        let implicit = create_hmac_test_mpp().charge("0.10").unwrap().remove(0);
         assert_ne!(implicit.id, challenge.id);
         assert!(implicit.header.is_none());
     }
@@ -2776,7 +2739,7 @@ mod tests {
     async fn test_hmac_verify_expected_request_with_body_digest_happy_path() {
         let mpp = create_hmac_test_mpp();
         let body = br#"{"query":"paid"}"#;
-        let challenge = mpp.charge_with_body("0.10", body).unwrap();
+        let challenge = mpp.charge_with_body("0.10", body).unwrap().remove(0);
         let expected_request: ChargeRequest = challenge.request.decode().unwrap();
         let credential =
             PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
@@ -2804,7 +2767,7 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_tampered_request_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let mut echo = challenge.to_echo();
         // Tamper: replace the request with a different amount
@@ -2832,7 +2795,7 @@ mod tests {
         // HMAC (Tier 1) passes because the server recomputes using its own
         // realm, but Tier-2 pinned field verification catches the mismatch.
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let mut echo = challenge.to_echo();
         echo.realm = "evil.example.com".into();
@@ -2850,7 +2813,7 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_tampered_method_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let mut echo = challenge.to_echo();
         echo.method = "evil-method".into();
@@ -2868,7 +2831,7 @@ mod tests {
     #[tokio::test]
     async fn test_hmac_tampered_intent_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let mut echo = challenge.to_echo();
         echo.intent = "session".into();
@@ -2888,7 +2851,7 @@ mod tests {
     #[tokio::test]
     async fn test_pinned_currency_mismatch_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         request.currency = "0xDEAD000000000000000000000000000000000000".into();
         let encoded = Base64UrlJson::from_typed(&request).unwrap();
@@ -2917,7 +2880,7 @@ mod tests {
     #[tokio::test]
     async fn test_pinned_recipient_mismatch_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
         request.recipient = Some("0xDEAD000000000000000000000000000000000000".into());
         let encoded = Base64UrlJson::from_typed(&request).unwrap();
@@ -2946,7 +2909,7 @@ mod tests {
     async fn test_pinned_chain_id_mismatch_rejected() {
         let mut mpp = create_hmac_test_mpp();
         mpp.chain_id = Some(42431);
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         // Tamper chainId in the request, re-sign HMAC
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
@@ -2979,7 +2942,7 @@ mod tests {
         // Server expects chainId but credential omits it entirely (fail-closed)
         let mut mpp = create_hmac_test_mpp();
         mpp.chain_id = Some(42431);
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         // Strip chainId from request, re-sign
         let mut request: ChargeRequest = challenge.request.decode().unwrap();
@@ -3011,7 +2974,7 @@ mod tests {
     #[tokio::test]
     async fn test_pinned_opaque_mismatch_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let mut echo = challenge.to_echo();
         echo.opaque =
@@ -3038,7 +3001,11 @@ mod tests {
     /// recomputed over it (all test handlers share the same realm/secret).
     #[cfg(feature = "tempo")]
     fn opaque_credential(opaque: Option<Base64UrlJson>) -> PaymentCredential {
-        let mut echo = create_hmac_test_mpp().charge("0.10").unwrap().to_echo();
+        let mut echo = create_hmac_test_mpp()
+            .charge("0.10")
+            .unwrap()
+            .remove(0)
+            .to_echo();
         echo.opaque = opaque;
         echo.id = crate::protocol::core::compute_challenge_id(
             "test-secret",
@@ -3093,7 +3060,7 @@ mod tests {
     async fn test_pinned_opaque_charge_helper_roundtrips() {
         // charge() emits the configured opaque, so its credential verifies.
         let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
         assert_eq!(
             challenge.opaque.as_ref().map(|o| o.raw()),
             Some(route_opaque().raw())
@@ -3173,7 +3140,7 @@ mod tests {
     #[tokio::test]
     async fn test_pinned_intent_mismatch_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         // Tamper intent to "session", re-sign so HMAC passes
         let mut echo = challenge.to_echo();
@@ -3199,7 +3166,7 @@ mod tests {
     #[tokio::test]
     async fn test_pinned_method_mismatch_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         // Tamper method to "stripe", re-sign so HMAC passes
         let mut echo = challenge.to_echo();
@@ -3227,7 +3194,7 @@ mod tests {
         // Happy path: all pinned fields match → verification succeeds
         let mut mpp = create_hmac_test_mpp();
         mpp.chain_id = Some(42431);
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
         let receipt = mpp.verify_credential(&credential).await.unwrap();
@@ -3247,7 +3214,8 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap();
+            .unwrap()
+            .remove(0);
 
         // Verify challenge fields
         assert_eq!(challenge.description, Some("Premium access".to_string()));
@@ -3646,7 +3614,8 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
 
@@ -3666,7 +3635,7 @@ mod tests {
     async fn test_non_expired_challenge_accepted() {
         let mpp = create_hmac_test_mpp();
         // Default charge generates an expires 5 minutes in the future
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
         assert!(
             challenge.expires.is_some(),
             "charge should have default expires"
@@ -3693,7 +3662,8 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
 
@@ -3757,7 +3727,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_credential_with_wrong_amount_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap(); // 100000 base units
+        let challenge = mpp.charge("0.10").unwrap().remove(0); // 100000 base units
 
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -3785,7 +3755,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_credential_with_correct_request_accepted() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap(); // 100000 base units
+        let challenge = mpp.charge("0.10").unwrap().remove(0); // 100000 base units
 
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -3806,7 +3776,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_credential_with_wrong_recipient_rejected() {
         let mpp = create_hmac_test_mpp();
-        let challenge = mpp.charge("0.10").unwrap();
+        let challenge = mpp.charge("0.10").unwrap().remove(0);
 
         let echo = challenge.to_echo();
         let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
@@ -4379,6 +4349,55 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
+    fn test_charge_variants_offer_every_currency_and_currency_aliases_first() {
+        use crate::protocol::methods::tempo::{MODERATO_CHAIN_ID, OUSD, PATH_USD, USDC};
+
+        for (chain_id, currencies) in [
+            (CHAIN_ID, vec![OUSD, USDC]),
+            (MODERATO_CHAIN_ID, vec![OUSD, PATH_USD]),
+        ] {
+            for accepted in [currencies, vec![USDC]] {
+                let mpp = Mpp::create(
+                    offers_builder()
+                        .chain_id(chain_id)
+                        .currencies(accepted.clone()),
+                )
+                .unwrap();
+                assert_eq!(mpp.currency(), mpp.currencies().first().map(String::as_str));
+                let body = b"request";
+                for (offers, body_bound) in [
+                    (mpp.charge("1").unwrap(), false),
+                    (
+                        mpp.charge_with_options("1", ChargeOptions::default())
+                            .unwrap(),
+                        false,
+                    ),
+                    (mpp.charge_with_body("1", body).unwrap(), true),
+                    (
+                        mpp.charge_with_options_and_body("1", ChargeOptions::default(), body)
+                            .unwrap(),
+                        true,
+                    ),
+                ] {
+                    assert_eq!(challenge_currencies(&offers), accepted);
+                    for offer in offers {
+                        assert!(offer.verify("test-secret"));
+                        assert_eq!(
+                            offer.digest,
+                            body_bound.then(|| crate::body_digest::compute(body))
+                        );
+                    }
+                }
+            }
+        }
+        let mpp = Mpp::create(offers_builder().currency(USDC)).unwrap();
+        assert_eq!(mpp.currency(), Some(USDC));
+        assert_eq!(mpp.currencies(), [USDC]);
+        assert_eq!(challenge_currencies(&mpp.charge("1").unwrap()), [USDC]);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
     fn test_mainnet_defaults_offer_ousd_then_usdc() {
         use crate::protocol::methods::tempo::{OUSD, USDC};
 
@@ -4388,6 +4407,7 @@ mod tests {
         assert_eq!(
             mpp.charge("1")
                 .unwrap()
+                .remove(0)
                 .request
                 .decode::<ChargeRequest>()
                 .unwrap()
@@ -4395,7 +4415,7 @@ mod tests {
             OUSD
         );
 
-        let challenges = mpp.charges("0.25").unwrap();
+        let challenges = mpp.charge("0.25").unwrap();
         assert_eq!(challenges.len(), 2);
         assert_eq!(challenge_currencies(&challenges), [OUSD, USDC]);
         for challenge in &challenges {
@@ -4417,7 +4437,7 @@ mod tests {
 
         let mpp = Mpp::create(offers_builder().chain_id(MODERATO_CHAIN_ID)).unwrap();
         assert_eq!(mpp.currencies(), [OUSD, PATH_USD]);
-        let challenges = mpp.charges("1").unwrap();
+        let challenges = mpp.charge("1").unwrap();
         assert_eq!(challenge_currencies(&challenges), [OUSD, PATH_USD]);
         for challenge in &challenges {
             let request: ChargeRequest = challenge.request.decode().unwrap();
@@ -4496,7 +4516,7 @@ mod tests {
             let mpp = Mpp::create(builder).unwrap();
             assert_eq!(mpp.chain_id(), Some(chain));
             assert_eq!(
-                challenge_currencies(&mpp.charges("1").unwrap()),
+                challenge_currencies(&mpp.charge("1").unwrap()),
                 [OUSD, fallback]
             );
         }
@@ -4535,7 +4555,7 @@ mod tests {
         );
 
         let mpp = Mpp::create(offers_builder().chain_id(31337)).unwrap();
-        let challenges = mpp.charges("1").unwrap();
+        let challenges = mpp.charge("1").unwrap();
         assert_eq!(challenge_currencies(&challenges), [PATH_USD]);
     }
 
@@ -4553,7 +4573,7 @@ mod tests {
         assert_eq!(mpp.currencies(), [PATH_USD, OUSD, USDC]);
         assert_eq!(mpp.currency(), Some(PATH_USD));
         assert_eq!(
-            challenge_currencies(&mpp.charges("1").unwrap()),
+            challenge_currencies(&mpp.charge("1").unwrap()),
             [PATH_USD, OUSD, USDC]
         );
 
@@ -4581,7 +4601,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mpp.currencies(), [USDC]);
-        assert_eq!(challenge_currencies(&mpp.charges("1").unwrap()), [USDC]);
+        assert_eq!(challenge_currencies(&mpp.charge("1").unwrap()), [USDC]);
     }
 
     #[cfg(feature = "tempo")]
@@ -4592,7 +4612,7 @@ mod tests {
         let mainnet = Mpp::create(offers_builder().chain_id(CHAIN_ID).currency(PATH_USD)).unwrap();
         assert_eq!(mainnet.currencies(), [PATH_USD]);
         assert_eq!(
-            challenge_currencies(&mainnet.charges("1").unwrap()),
+            challenge_currencies(&mainnet.charge("1").unwrap()),
             [PATH_USD]
         );
 
@@ -4649,7 +4669,7 @@ mod tests {
         .unwrap();
         // First occurrence wins, including its spelling.
         assert_eq!(mpp.currencies(), [OUSD.to_string(), USDC.to_lowercase()]);
-        assert_eq!(mpp.charges("1").unwrap().len(), 2);
+        assert_eq!(mpp.charge("1").unwrap().len(), 2);
     }
 
     #[cfg(feature = "tempo")]
@@ -4684,9 +4704,15 @@ mod tests {
         use crate::protocol::methods::tempo::{OUSD, USDC};
 
         let mpp = success_mpp_from(offers_builder().chain_id(CHAIN_ID));
-        let challenges = mpp.charges("0.10").unwrap();
+        let challenges = mpp.charge("0.10").unwrap();
         // The route-level expected request is built from the preferred offer.
-        let expected: ChargeRequest = mpp.charge("0.10").unwrap().request.decode().unwrap();
+        let expected: ChargeRequest = mpp
+            .charge("0.10")
+            .unwrap()
+            .remove(0)
+            .request
+            .decode()
+            .unwrap();
         assert_eq!(expected.currency, OUSD);
 
         for currency in [OUSD, USDC] {
@@ -4732,7 +4758,13 @@ mod tests {
             err.message
         );
 
-        let expected: ChargeRequest = mpp.charge("0.10").unwrap().request.decode().unwrap();
+        let expected: ChargeRequest = mpp
+            .charge("0.10")
+            .unwrap()
+            .remove(0)
+            .request
+            .decode()
+            .unwrap();
         let err = mpp
             .verify_credential_with_expected_request(&credential, &expected)
             .await
@@ -4748,7 +4780,7 @@ mod tests {
         // An expected request that names a currency outside the accepted set
         // (per-request override) still requires an exact currency match.
         let mpp = success_mpp_from(offers_builder().chain_id(CHAIN_ID));
-        let challenges = mpp.charges("0.10").unwrap();
+        let challenges = mpp.charge("0.10").unwrap();
         let credential = offered_credential(&challenges, OUSD);
         let mut expected: ChargeRequest = challenges[0].request.decode().unwrap();
         expected.currency = PATH_USD.into();
@@ -4767,7 +4799,7 @@ mod tests {
 
         let mpp = success_mpp_from(offers_builder().chain_id(CHAIN_ID).currency(USDC));
         let ousd_offer = success_mpp_from(offers_builder().chain_id(CHAIN_ID))
-            .charges("0.10")
+            .charge("0.10")
             .unwrap();
         let credential = offered_credential(&ousd_offer, OUSD);
 
@@ -4778,7 +4810,7 @@ mod tests {
             err.message
         );
 
-        let usdc = offered_credential(&mpp.charges("0.10").unwrap(), USDC);
+        let usdc = offered_credential(&mpp.charge("0.10").unwrap(), USDC);
         assert!(mpp.verify_credential(&usdc).await.is_ok());
     }
 
@@ -4817,7 +4849,7 @@ mod tests {
             .unwrap();
         let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0x01"));
         assert!(unbound.verify_credential(&credential).await.is_ok());
-        assert!(unbound.charges("1").is_err());
+        assert!(unbound.charge("1").is_err());
     }
 
     #[cfg(feature = "tempo")]
@@ -4828,7 +4860,7 @@ mod tests {
         let mpp = success_mpp_from(offers_builder().chain_id(CHAIN_ID));
         let body = br#"{"query":"paid"}"#;
         let challenges = mpp
-            .charges_with_options_and_body(
+            .charge_with_options_and_body(
                 "0.10",
                 ChargeOptions {
                     description: Some("offer"),
@@ -4902,7 +4934,7 @@ mod tests {
 
         let mainnet = Mpp::create(sponsored(CHAIN_ID)).unwrap();
         assert_eq!(mainnet.currencies(), [OUSD, USDC]);
-        let offers = mainnet.charges("1").unwrap();
+        let offers = mainnet.charge("1").unwrap();
         assert_eq!(challenge_currencies(&offers), [OUSD, USDC]);
         assert!(offers
             .iter()
@@ -4910,7 +4942,7 @@ mod tests {
 
         let moderato = Mpp::create(sponsored(MODERATO_CHAIN_ID)).unwrap();
         assert_eq!(
-            challenge_currencies(&moderato.charges("1").unwrap()),
+            challenge_currencies(&moderato.charge("1").unwrap()),
             [OUSD, PATH_USD]
         );
 
@@ -4937,7 +4969,7 @@ mod tests {
         .unwrap();
         assert!(!mpp.fee_payer());
         let offers = mpp
-            .charges_with_options(
+            .charge_with_options(
                 "1",
                 ChargeOptions {
                     fee_payer: true,

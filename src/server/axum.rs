@@ -95,7 +95,7 @@ use crate::protocol::core::{PaymentChallenge, Receipt};
 /// use mpp::server::axum::PaymentRequired;
 ///
 /// async fn handler() -> PaymentRequired {
-///     let challenge = mpp.charge("1.00").unwrap();
+///     let challenge = mpp.charge("1.00").unwrap().remove(0);
 ///     PaymentRequired(challenge)
 /// }
 /// ```
@@ -470,6 +470,7 @@ where
                 ..Default::default()
             },
         )
+        .map(|mut offers| offers.remove(0))
         .map_err(|e| e.to_string())
     }
 
@@ -488,6 +489,7 @@ where
             },
             body,
         )
+        .map(|mut offers| offers.remove(0))
         .map_err(|e| e.to_string())
     }
 
@@ -527,7 +529,7 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount) {
+        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -575,13 +577,16 @@ where
             }
         };
 
-        let expected_challenge = match self.charge_with_options(
-            amount,
-            super::ChargeOptions {
-                mppx_scope: mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        ) {
+        let expected_challenge = match self
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    mppx_scope: mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map(|mut offers| offers.remove(0))
+        {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -629,7 +634,7 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount) {
+        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -680,13 +685,16 @@ where
             }
         };
 
-        let expected_challenge = match self.charge_with_options(
-            amount,
-            super::ChargeOptions {
-                mppx_scope: mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        ) {
+        let expected_challenge = match self
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    mppx_scope: mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map(|mut offers| offers.remove(0))
+        {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -729,7 +737,7 @@ where
         amount: &str,
         options: ChallengeOptions,
     ) -> Result<Vec<PaymentChallenge>, String> {
-        self.charges_with_options(
+        self.charge_with_options(
             amount,
             super::ChargeOptions {
                 description: options.description,
@@ -746,7 +754,7 @@ where
         options: ChallengeOptions,
         body: &[u8],
     ) -> Result<Vec<PaymentChallenge>, String> {
-        self.charges_with_options_and_body(
+        self.charge_with_options_and_body(
             amount,
             super::ChargeOptions {
                 description: options.description,
@@ -2037,6 +2045,7 @@ mod tests {
                             ..Default::default()
                         },
                     )
+                    .map(|mut offers| offers.remove(0))
                     .map_err(|e| e.to_string())
             }
 
@@ -2067,7 +2076,12 @@ mod tests {
                     Ok(c) => c,
                     Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
                 };
-                let expected = match self.mpp.charge(amount).and_then(|c| c.request.decode()) {
+                let expected = match self
+                    .mpp
+                    .charge(amount)
+                    .map(|mut offers| offers.remove(0))
+                    .and_then(|c| c.request.decode())
+                {
                     Ok(req) => req,
                     Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
                 };
@@ -2099,6 +2113,7 @@ mod tests {
                             ..Default::default()
                         },
                     )
+                    .map(|mut offers| offers.remove(0))
                     .and_then(|c| c.request.decode())
                 {
                     Ok(req) => req,
@@ -2265,6 +2280,7 @@ mod tests {
             ) -> Result<PaymentChallenge, String> {
                 self.mpp
                     .charge_with_options(amount, Self::options(&options))
+                    .map(|mut offers| offers.remove(0))
                     .map_err(|e| e.to_string())
             }
 
@@ -2295,6 +2311,7 @@ mod tests {
                 let expected = match self
                     .mpp
                     .charge_with_options(amount, Self::options(&options))
+                    .map(|mut offers| offers.remove(0))
                     .and_then(|c| c.request.decode::<ChargeRequest>())
                 {
                     Ok(req) => req,
@@ -2314,7 +2331,7 @@ mod tests {
                 options: ChallengeOptions,
             ) -> Result<Vec<PaymentChallenge>, String> {
                 self.mpp
-                    .charges_with_options(amount, Self::options(&options))
+                    .charge_with_options(amount, Self::options(&options))
                     .map_err(|e| e.to_string())
             }
         }

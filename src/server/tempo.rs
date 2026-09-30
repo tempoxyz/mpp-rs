@@ -239,7 +239,7 @@ impl TempoBuilder {
 ///     })
 ///     .chain_id(4217),
 /// )?;
-/// let offers = mpp.charges("0.10")?;
+/// let offers = mpp.charge("0.10")?;
 ///
 /// // With overrides
 /// let mpp = Mpp::create(

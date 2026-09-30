@@ -24,7 +24,7 @@ use axum::{
 };
 use mpp::protocol::methods::tempo::PATH_USD;
 use mpp::server::{tempo, Mpp, TempoChargeMethod, TempoConfig};
-use mpp::{format_www_authenticate, parse_authorization, PrivateKeySigner};
+use mpp::{format_www_authenticate_many, parse_authorization, PrivateKeySigner};
 use rand::seq::IndexedRandom;
 use std::sync::Arc;
 use tempo_alloy::TempoNetwork;
@@ -123,19 +123,21 @@ async fn ping(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl I
     }
 
     match payment.charge("0.01") {
-        Ok(challenge) => match format_www_authenticate(&challenge) {
-            Ok(www_auth) => (
-                StatusCode::PAYMENT_REQUIRED,
-                [(header::WWW_AUTHENTICATE, www_auth)],
-                Json(serde_json::json!({ "error": "Payment Required" })),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
-        },
+        Ok(challenges) => {
+            match format_www_authenticate_many(&challenges).map(|values| values.join(", ")) {
+                Ok(www_auth) => (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(header::WWW_AUTHENTICATE, www_auth)],
+                    Json(serde_json::json!({ "error": "Payment Required" })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -173,19 +175,21 @@ async fn fortune(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> imp
 
     // No valid credential — return 402 with challenge
     match payment.charge("1") {
-        Ok(challenge) => match format_www_authenticate(&challenge) {
-            Ok(www_auth) => (
-                StatusCode::PAYMENT_REQUIRED,
-                [(header::WWW_AUTHENTICATE, www_auth)],
-                Json(serde_json::json!({ "error": "Payment Required" })),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
-        },
+        Ok(challenges) => {
+            match format_www_authenticate_many(&challenges).map(|values| values.join(", ")) {
+                Ok(www_auth) => (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(header::WWW_AUTHENTICATE, www_auth)],
+                    Json(serde_json::json!({ "error": "Payment Required" })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
