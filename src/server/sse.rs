@@ -236,7 +236,10 @@ pub struct ServeOptions<G> {
 /// 2. If balance sufficient, yields `event: message\ndata: {value}\n\n`
 /// 3. If balance exhausted, yields `event: payment-need-voucher\n...` and
 ///    waits for the client to top up
-/// 4. On completion, yields a final `event: payment-receipt\n...`
+/// 4. If the deduction fails for any other reason (e.g. the channel is closed
+///    or missing), yields the final `event: payment-receipt\n...` if the
+///    channel is still readable, then stops
+/// 5. On completion, yields a final `event: payment-receipt\n...`
 ///
 /// Returns a [`Stream`](futures_core::Stream) that yields `String` SSE events.
 #[cfg(feature = "tempo")]
@@ -265,22 +268,7 @@ where
             loop {
                 match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                     Ok(_state) => break,
-                    Err(e) if e.code == Some(crate::protocol::traits::ErrorCode::ChannelClosed) => {
-                        // Channel is finalized/closed — emit final receipt, then stop
-                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-                            let mut receipt = SessionReceipt::new(
-                                now_iso8601(),
-                                &challenge_id,
-                                &channel_id,
-                                ch.highest_voucher_amount.to_string(),
-                                ch.spent.to_string(),
-                            );
-                            receipt.units = Some(ch.units);
-                            yield format_receipt_event(&receipt);
-                        }
-                        return;
-                    }
-                    Err(_) => {
+                    Err(e) if e.code == Some(crate::protocol::traits::ErrorCode::InsufficientBalance) => {
                         // Emit need-voucher event
                         if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
                             let event = format_need_voucher_event(&NeedVoucherEvent {
@@ -297,6 +285,22 @@ where
                             _ = store.wait_for_update(&channel_id) => {},
                             _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
                         }
+                    }
+                    Err(_) => {
+                        // Closed, missing, or unreadable channel — no voucher can fix
+                        // that, so emit the final receipt and stop.
+                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
+                            let mut receipt = SessionReceipt::new(
+                                now_iso8601(),
+                                &challenge_id,
+                                &channel_id,
+                                ch.highest_voucher_amount.to_string(),
+                                ch.spent.to_string(),
+                            );
+                            receipt.units = Some(ch.units);
+                            yield format_receipt_event(&receipt);
+                        }
+                        return;
                     }
                 }
             }
@@ -914,6 +918,32 @@ mod tests {
             }
             other => panic!("last event should be a receipt, got: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_missing_channel_stops() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+
+        let gen = Box::pin(async_stream::stream! {
+            yield "a".to_string();
+        });
+
+        let stream = serve(ServeOptions {
+            store: std::sync::Arc::new(InMemoryChannelStore::new()),
+            channel_id: "0xchannel_missing".to_string(),
+            challenge_id: "ch-missing".to_string(),
+            tick_cost: 100,
+            generate: gen,
+            poll_interval_ms: 10,
+        });
+
+        // No voucher can create the channel, so the stream must end instead of polling.
+        let events =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), collect_stream(stream))
+                .await
+                .expect("stream must terminate when the channel does not exist");
+        assert!(events.is_empty(), "unexpected events: {events:?}");
     }
 
     #[test]

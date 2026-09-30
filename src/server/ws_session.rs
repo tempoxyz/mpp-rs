@@ -87,13 +87,7 @@ where
         loop {
             match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                 Ok(_state) => break,
-                Err(e) if e.code == Some(ErrorCode::ChannelClosed) => {
-                    // Channel is finalized/closing — no voucher can reopen it, so
-                    // emit the final receipt and stop instead of waiting forever.
-                    send_receipt(sender, &*store, &channel_id, &challenge_id).await;
-                    return;
-                }
-                Err(_) => {
+                Err(e) if e.code == Some(ErrorCode::InsufficientBalance) => {
                     // Emit needVoucher frame
                     if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
                         let msg = WsResponse::NeedVoucher {
@@ -112,6 +106,12 @@ where
                         _ = store.wait_for_update(&channel_id) => {},
                         _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
                     }
+                }
+                Err(_) => {
+                    // Closed, missing, or unreadable channel — no voucher can fix
+                    // that, so emit the final receipt and stop instead of waiting forever.
+                    send_receipt(sender, &*store, &channel_id, &challenge_id).await;
+                    return;
                 }
             }
         }
@@ -320,6 +320,35 @@ mod tests {
             }
             other => panic!("last frame should be a receipt, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_ws_session_missing_channel_stops() {
+        let (mut sink, frames) = recording_sink();
+        let generate = Box::pin(async_stream::stream! {
+            yield "a".to_string();
+        });
+
+        // No voucher can create the channel, so the session must end instead of polling.
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store: Arc::new(InMemoryChannelStore::new()),
+                    channel_id: "0xchannel_ws_missing".to_string(),
+                    challenge_id: "ch-missing".to_string(),
+                    tick_cost: 100,
+                    generate,
+                    poll_interval_ms: 10,
+                },
+            ),
+        )
+        .await
+        .expect("session must terminate when the channel does not exist");
+
+        let frames = frames.lock().unwrap();
+        assert!(frames.is_empty(), "unexpected frames: {frames:?}");
     }
 
     #[test]
