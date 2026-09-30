@@ -20,9 +20,11 @@ jobs:
     name: Version
     runs-on: ubuntu-latest
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
       - name: Fetch GitHub token via STS
         id: app-token
-        uses: tempoxyz/gh-actions/actions/github-sts@c0292122e255def866c64c55e5844d1e7d5fe7ad
+        uses: tempoxyz/gh-actions/actions/github-sts@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
         with:
           policy: release-pr
 
@@ -32,11 +34,11 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Authenticate with crates.io
-        uses: tempoxyz/gh-actions/vendor/rust-lang/crates-io-auth-action@487be2d19b0ba9ae1903143016444ab752c3e939
+        uses: tempoxyz/gh-actions/vendor/rust-lang/crates-io-auth-action@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9 # main
+        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9 # 2026-09-07T12-57-31Z-83e69646 # zizmor: ignore[artipacked]
         with:
           ecosystem: rust
           conventional-commit: true

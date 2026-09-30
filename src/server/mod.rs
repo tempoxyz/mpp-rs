@@ -10,7 +10,7 @@
 //! }))?;
 //!
 //! // Charge $0.10 — everything else has smart defaults
-//! let challenge = mpp.charge("0.10")?;
+//! let challenges = mpp.charge("0.10")?;
 //! ```
 //!
 //! # Advanced API

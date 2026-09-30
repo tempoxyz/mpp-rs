@@ -34,6 +34,19 @@ impl TempoNetwork {
         }
     }
 
+    /// Returns the ordered currencies a server accepts by default on this
+    /// network: OUSD first, then the network's legacy default currency.
+    ///
+    /// This does not change [`default_currency`](Self::default_currency),
+    /// which remains the single legacy default used elsewhere (for example,
+    /// the default fee-payer fee-token allowlist).
+    pub const fn default_currencies(self) -> &'static [&'static str] {
+        match self {
+            Self::Mainnet => &[super::OUSD, super::DEFAULT_CURRENCY_MAINNET],
+            Self::Moderato => &[super::OUSD, super::DEFAULT_CURRENCY_TESTNET],
+        }
+    }
+
     /// Returns the network for a given chain ID, if known.
     pub fn from_chain_id(chain_id: u64) -> Option<Self> {
         match chain_id {
@@ -148,5 +161,37 @@ mod tests {
     #[test]
     fn from_chain_id_u64_max_returns_none() {
         assert_eq!(TempoNetwork::from_chain_id(u64::MAX), None);
+    }
+
+    #[test]
+    fn default_currencies_offer_ousd_first() {
+        assert_eq!(
+            TempoNetwork::Mainnet.default_currencies(),
+            [
+                "0x20c0000000000000000000006a37DA5C996874BE",
+                "0x20C000000000000000000000b9537d11c60E8b50",
+            ]
+        );
+        assert_eq!(
+            TempoNetwork::Moderato.default_currencies(),
+            [
+                "0x20c0000000000000000000006a37DA5C996874BE",
+                "0x20c0000000000000000000000000000000000000",
+            ]
+        );
+    }
+
+    #[test]
+    fn default_currencies_keep_legacy_default_currency() {
+        for network in [TempoNetwork::Mainnet, TempoNetwork::Moderato] {
+            assert_eq!(network.default_currencies()[0], super::super::OUSD);
+            assert_eq!(network.default_currencies()[1], network.default_currency());
+        }
+        // The single-value default is unchanged by the OUSD-first list.
+        assert_eq!(TempoNetwork::Mainnet.default_currency(), super::super::USDC);
+        assert_eq!(
+            TempoNetwork::Moderato.default_currency(),
+            super::super::PATH_USD
+        );
     }
 }

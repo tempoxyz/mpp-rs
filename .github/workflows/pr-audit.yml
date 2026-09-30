@@ -12,7 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
       - name: Check admin permission
         env:
           GH_TOKEN: ${{ github.token }}
@@ -29,7 +32,10 @@ jobs:
     needs: authorize
     permissions:
       contents: read
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@698fc0aa8d7f86540fabd09f0f27efa3b9109214
+      id-token: write
+      pull-requests: read
+      statuses: write
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
     secrets:
       EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
       EVENTS_CERT: ${{ secrets.EVENTS_CERT }}

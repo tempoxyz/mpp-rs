@@ -95,7 +95,7 @@ use crate::protocol::core::{PaymentChallenge, Receipt};
 /// use mpp::server::axum::PaymentRequired;
 ///
 /// async fn handler() -> PaymentRequired {
-///     let challenge = mpp.charge("1.00").unwrap();
+///     let challenge = mpp.charge("1.00").unwrap().remove(0);
 ///     PaymentRequired(challenge)
 /// }
 /// ```
@@ -130,6 +130,50 @@ impl IntoResponse for PaymentRequired {
             )
                 .into_response(),
         }
+    }
+}
+
+/// A 402 Payment Required response carrying several equivalent offers.
+///
+/// Each [`PaymentChallenge`] is emitted as its own `WWW-Authenticate` header,
+/// in order. Returned by the extractors when the [`ChargeChallenger`] offers
+/// more than one challenge (for example, one per accepted currency).
+#[derive(Debug)]
+pub struct PaymentOffers(pub Vec<PaymentChallenge>);
+
+impl IntoResponse for PaymentOffers {
+    fn into_response(self) -> axum_core::response::Response {
+        let mut values = Vec::with_capacity(self.0.len());
+        for challenge in &self.0 {
+            match format_www_authenticate(challenge) {
+                Ok(www_auth) => values.push(
+                    HeaderValue::from_str(&www_auth)
+                        .unwrap_or_else(|_| HeaderValue::from_static("Payment")),
+                ),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to format challenge: {}", e),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        let mut resp = (
+            StatusCode::PAYMENT_REQUIRED,
+            serde_json::json!({ "error": "Payment Required" }).to_string(),
+        )
+            .into_response();
+        for value in values {
+            resp.headers_mut().append(WWW_AUTHENTICATE_HEADER, value);
+        }
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        resp
     }
 }
 
@@ -241,6 +285,28 @@ pub enum MppChargeRejection {
     VerificationFailed(PaymentRequired),
     /// Internal error generating challenge.
     InternalError(String),
+    /// No credential — return 402 with several offers (one header each).
+    Offers(PaymentOffers),
+    /// Verification failed — return 402 with several offers for retry.
+    VerificationFailedOffers(PaymentOffers),
+}
+
+impl MppChargeRejection {
+    /// Build a 402 rejection from the challenger's offers.
+    ///
+    /// A single offer keeps the [`Challenge`](Self::Challenge) /
+    /// [`VerificationFailed`](Self::VerificationFailed) variants; several
+    /// offers use [`Offers`](Self::Offers) /
+    /// [`VerificationFailedOffers`](Self::VerificationFailedOffers).
+    fn from_offers(mut offers: Vec<PaymentChallenge>, verification_failed: bool) -> Self {
+        match (offers.len(), verification_failed) {
+            (0, _) => Self::InternalError("No payment challenges generated".into()),
+            (1, false) => Self::Challenge(PaymentRequired(offers.remove(0))),
+            (1, true) => Self::VerificationFailed(PaymentRequired(offers.remove(0))),
+            (_, false) => Self::Offers(PaymentOffers(offers)),
+            (_, true) => Self::VerificationFailedOffers(PaymentOffers(offers)),
+        }
+    }
 }
 
 impl IntoResponse for MppChargeRejection {
@@ -251,6 +317,8 @@ impl IntoResponse for MppChargeRejection {
             MppChargeRejection::InternalError(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
+            MppChargeRejection::Offers(offers) => offers.into_response(),
+            MppChargeRejection::VerificationFailedOffers(offers) => offers.into_response(),
         }
     }
 }
@@ -354,6 +422,33 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     fn credential_header(&self) -> &str {
         header::AUTHORIZATION.as_str()
     }
+
+    /// Generate every equivalent charge challenge, in preference order.
+    ///
+    /// The extractors return all of them in the 402 response. Defaults to the
+    /// single [`challenge`](Self::challenge). Tempo servers return one
+    /// challenge per accepted currency.
+    fn challenges(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<Vec<PaymentChallenge>, String> {
+        self.challenge(amount, options)
+            .map(|challenge| vec![challenge])
+    }
+
+    /// Generate every equivalent body-bound charge challenge, in preference order.
+    ///
+    /// Defaults to the single [`challenge_with_body`](Self::challenge_with_body).
+    fn challenges_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<Vec<PaymentChallenge>, String> {
+        self.challenge_with_body(amount, options, body)
+            .map(|challenge| vec![challenge])
+    }
 }
 
 #[cfg(feature = "tempo")]
@@ -375,6 +470,7 @@ where
                 ..Default::default()
             },
         )
+        .map(|mut offers| offers.remove(0))
         .map_err(|e| e.to_string())
     }
 
@@ -393,6 +489,7 @@ where
             },
             body,
         )
+        .map(|mut offers| offers.remove(0))
         .map_err(|e| e.to_string())
     }
 
@@ -432,7 +529,7 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount) {
+        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -480,13 +577,16 @@ where
             }
         };
 
-        let expected_challenge = match self.charge_with_options(
-            amount,
-            super::ChargeOptions {
-                mppx_scope: mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        ) {
+        let expected_challenge = match self
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    mppx_scope: mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map(|mut offers| offers.remove(0))
+        {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -534,7 +634,7 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount) {
+        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -585,13 +685,16 @@ where
             }
         };
 
-        let expected_challenge = match self.charge_with_options(
-            amount,
-            super::ChargeOptions {
-                mppx_scope: mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        ) {
+        let expected_challenge = match self
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    mppx_scope: mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map(|mut offers| offers.remove(0))
+        {
             Ok(challenge) => challenge,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
@@ -627,6 +730,40 @@ where
 
     fn credential_header(&self) -> &str {
         super::Mpp::credential_header(self)
+    }
+
+    fn challenges(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<Vec<PaymentChallenge>, String> {
+        self.charge_with_options(
+            amount,
+            super::ChargeOptions {
+                description: options.description,
+                mppx_scope: options.mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn challenges_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<Vec<PaymentChallenge>, String> {
+        self.charge_with_options_and_body(
+            amount,
+            super::ChargeOptions {
+                description: options.description,
+                mppx_scope: options.mppx_scope.as_ref(),
+                ..Default::default()
+            },
+            body,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -933,10 +1070,10 @@ where
             let credential_str = match auth_header {
                 Some(c) => c,
                 None => {
-                    let challenge = challenger
-                        .challenge(C::amount(), options)
+                    let offers = challenger
+                        .challenges(C::amount(), options)
                         .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::Challenge(PaymentRequired(challenge)));
+                    return Err(MppChargeRejection::from_offers(offers, false));
                 }
             };
 
@@ -946,12 +1083,10 @@ where
             {
                 Ok(r) => r,
                 Err(_) => {
-                    let challenge = challenger
-                        .challenge(C::amount(), options)
+                    let offers = challenger
+                        .challenges(C::amount(), options)
                         .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::VerificationFailed(PaymentRequired(
-                        challenge,
-                    )));
+                    return Err(MppChargeRejection::from_offers(offers, true));
                 }
             };
 
@@ -1001,10 +1136,10 @@ where
             let credential_str = match auth_header {
                 Some(c) => c,
                 None => {
-                    let challenge = challenger
-                        .challenge_with_body(C::amount(), options, &body)
+                    let offers = challenger
+                        .challenges_with_body(C::amount(), options, &body)
                         .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::Challenge(PaymentRequired(challenge)));
+                    return Err(MppChargeRejection::from_offers(offers, false));
                 }
             };
 
@@ -1019,12 +1154,10 @@ where
             {
                 Ok(r) => r,
                 Err(_) => {
-                    let challenge = challenger
-                        .challenge_with_body(C::amount(), options, &body)
+                    let offers = challenger
+                        .challenges_with_body(C::amount(), options, &body)
                         .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::VerificationFailed(PaymentRequired(
-                        challenge,
-                    )));
+                    return Err(MppChargeRejection::from_offers(offers, true));
                 }
             };
 
@@ -1912,6 +2045,7 @@ mod tests {
                             ..Default::default()
                         },
                     )
+                    .map(|mut offers| offers.remove(0))
                     .map_err(|e| e.to_string())
             }
 
@@ -1942,7 +2076,12 @@ mod tests {
                     Ok(c) => c,
                     Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
                 };
-                let expected = match self.mpp.charge(amount).and_then(|c| c.request.decode()) {
+                let expected = match self
+                    .mpp
+                    .charge(amount)
+                    .map(|mut offers| offers.remove(0))
+                    .and_then(|c| c.request.decode())
+                {
                     Ok(req) => req,
                     Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
                 };
@@ -1974,6 +2113,7 @@ mod tests {
                             ..Default::default()
                         },
                     )
+                    .map(|mut offers| offers.remove(0))
                     .and_then(|c| c.request.decode())
                 {
                     Ok(req) => req,
@@ -2070,6 +2210,337 @@ mod tests {
                     .expect_err("same-price cross-resource replay must be rejected");
             assert!(matches!(err, MppChargeRejection::VerificationFailed(_)));
             assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    mod currency_offers {
+        use super::*;
+        use crate::protocol::core::headers::{format_authorization, parse_www_authenticate_all};
+        use crate::protocol::core::{PaymentCredential, PaymentPayload};
+        use crate::protocol::intents::ChargeRequest;
+        use crate::protocol::methods::tempo::{CHAIN_ID, OUSD, PATH_USD, USDC};
+        use crate::protocol::traits::VerificationError;
+        use crate::server::{tempo, ChargeMethod, Mpp, TempoConfig};
+        use std::future::Future;
+
+        const RECIPIENT: &str = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2";
+
+        #[derive(Clone)]
+        struct SuccessMethod;
+
+        #[allow(clippy::manual_async_fn)]
+        impl ChargeMethod for SuccessMethod {
+            fn method(&self) -> &str {
+                "tempo"
+            }
+            fn verify(
+                &self,
+                _credential: &PaymentCredential,
+                _request: &ChargeRequest,
+            ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+                async { Ok(Receipt::success("tempo", "0xtxhash")) }
+            }
+        }
+
+        /// RPC-free challenger mirroring the Tempo `ChargeChallenger` binding.
+        #[derive(Clone)]
+        struct OffersChallenger {
+            mpp: Mpp<SuccessMethod>,
+        }
+
+        impl OffersChallenger {
+            fn new(currencies: &[&str]) -> Self {
+                Self {
+                    mpp: Mpp::new_with_config(
+                        SuccessMethod,
+                        "MPP Payment",
+                        "test-secret",
+                        "",
+                        RECIPIENT,
+                    )
+                    .with_currencies(currencies.iter().map(|c| c.to_string()).collect()),
+                }
+            }
+
+            fn options(options: &ChallengeOptions) -> crate::server::ChargeOptions<'_> {
+                crate::server::ChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        impl ChargeChallenger for OffersChallenger {
+            fn challenge(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                self.mpp
+                    .charge_with_options(amount, Self::options(&options))
+                    .map(|mut offers| offers.remove(0))
+                    .map_err(|e| e.to_string())
+            }
+
+            fn verify_payment(
+                &self,
+                credential_str: &str,
+            ) -> std::pin::Pin<Box<dyn Future<Output = Result<Receipt, String>> + Send>>
+            {
+                self.verify_payment_for_amount_and_scope(credential_str, "0.01", None)
+            }
+
+            fn verify_payment_for_amount_and_scope(
+                &self,
+                credential_str: &str,
+                amount: &str,
+                mppx_scope: Option<serde_json::Value>,
+            ) -> std::pin::Pin<Box<dyn Future<Output = Result<Receipt, String>> + Send>>
+            {
+                let credential = match parse_authorization(credential_str) {
+                    Ok(c) => c,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                // Same as the Tempo binding: expected request from the preferred offer.
+                let options = ChallengeOptions {
+                    mppx_scope,
+                    ..Default::default()
+                };
+                let expected = match self
+                    .mpp
+                    .charge_with_options(amount, Self::options(&options))
+                    .map(|mut offers| offers.remove(0))
+                    .and_then(|c| c.request.decode::<ChargeRequest>())
+                {
+                    Ok(req) => req,
+                    Err(e) => return Box::pin(std::future::ready(Err(e.to_string()))),
+                };
+                let mpp = self.mpp.clone();
+                Box::pin(async move {
+                    mpp.verify_credential_with_expected_request(&credential, &expected)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            }
+
+            fn challenges(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+            ) -> Result<Vec<PaymentChallenge>, String> {
+                self.mpp
+                    .charge_with_options(amount, Self::options(&options))
+                    .map_err(|e| e.to_string())
+            }
+        }
+
+        fn currencies_of(challenges: &[PaymentChallenge]) -> Vec<String> {
+            challenges
+                .iter()
+                .map(|c| c.request.decode::<ChargeRequest>().unwrap().currency)
+                .collect()
+        }
+
+        fn response_offers(rejection: MppChargeRejection) -> Vec<PaymentChallenge> {
+            let resp = rejection.into_response();
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            let values: Vec<&str> = resp
+                .headers()
+                .get_all(WWW_AUTHENTICATE_HEADER)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect();
+            let challenges: Vec<PaymentChallenge> = parse_www_authenticate_all(values.clone())
+                .into_iter()
+                .map(|r| r.unwrap())
+                .collect();
+            // One header per offer.
+            assert_eq!(values.len(), challenges.len());
+            challenges
+        }
+
+        fn scoped_auth(challenger: &OffersChallenger, currency: &str) -> String {
+            let req = http_types::Request::builder()
+                .uri("/test")
+                .body(())
+                .unwrap();
+            let (parts, _body) = req.into_parts();
+            let challenges = challenger
+                .challenges(
+                    OneCent::amount(),
+                    ChallengeOptions {
+                        mppx_scope: mppx_scope_from_parts(&parts),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let challenge = challenges
+                .iter()
+                .find(|c| c.request.decode::<ChargeRequest>().unwrap().currency == currency)
+                .unwrap();
+            let credential =
+                PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+            format_authorization(&credential).unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_extractor_returns_every_offer_in_order() {
+            let err = run_extractor::<OneCent>(OffersChallenger::new(&[OUSD, USDC]), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MppChargeRejection::Offers(_)));
+            let offers = response_offers(err);
+            assert_eq!(currencies_of(&offers), [OUSD, USDC]);
+            assert!(offers.iter().all(|c| c.verify("test-secret")));
+        }
+
+        #[tokio::test]
+        async fn test_extractor_single_offer_keeps_challenge_variant() {
+            let err = run_extractor::<OneCent>(OffersChallenger::new(&[PATH_USD]), None)
+                .await
+                .unwrap_err();
+            let MppChargeRejection::Challenge(PaymentRequired(challenge)) = err else {
+                panic!("single offer should use the Challenge variant: {err:?}");
+            };
+            assert_eq!(currencies_of(&[challenge]), [PATH_USD]);
+        }
+
+        #[tokio::test]
+        async fn test_extractor_accepts_credential_for_each_offer() {
+            let challenger = OffersChallenger::new(&[OUSD, USDC]);
+            for currency in [OUSD, USDC] {
+                let auth = scoped_auth(&challenger, currency);
+                let charge = run_extractor::<OneCent>(challenger.clone(), Some(&auth))
+                    .await
+                    .unwrap_or_else(|err| panic!("{currency} credential rejected: {err:?}"));
+                assert_eq!(charge.receipt.reference, "0xtxhash");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_extractor_rejects_non_offered_currency_with_all_offers() {
+            // Credential minted by a server that offered pathUSD, replayed against
+            // a server (same secret/realm) that only accepts OUSD and USDC.e.
+            let auth = scoped_auth(&OffersChallenger::new(&[PATH_USD]), PATH_USD);
+            let err = run_extractor::<OneCent>(OffersChallenger::new(&[OUSD, USDC]), Some(&auth))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                MppChargeRejection::VerificationFailedOffers(_)
+            ));
+            assert_eq!(currencies_of(&response_offers(err)), [OUSD, USDC]);
+        }
+
+        #[tokio::test]
+        async fn test_tempo_challenger_offers_mainnet_defaults() {
+            let mpp = Mpp::create(
+                tempo(TempoConfig {
+                    recipient: RECIPIENT,
+                })
+                .chain_id(CHAIN_ID)
+                .secret_key("test-secret"),
+            )
+            .unwrap();
+            let challenger: Arc<dyn ChargeChallenger> = Arc::new(mpp);
+
+            let offers = challenger
+                .challenges("0.01", ChallengeOptions::default())
+                .unwrap();
+            assert_eq!(currencies_of(&offers), [OUSD, USDC]);
+            let single = challenger
+                .challenge("0.01", ChallengeOptions::default())
+                .unwrap();
+            assert_eq!(currencies_of(&[single]), [OUSD]);
+
+            let body_offers = challenger
+                .challenges_with_body("0.01", ChallengeOptions::default(), b"{}")
+                .unwrap();
+            assert_eq!(currencies_of(&body_offers), [OUSD, USDC]);
+            let digest = crate::body_digest::compute(b"{}");
+            assert!(body_offers
+                .iter()
+                .all(|c| c.digest.as_deref() == Some(digest.as_str())));
+
+            let err = run_extractor::<OneCent>(ArcChallenger(challenger.clone()), None)
+                .await
+                .unwrap_err();
+            assert_eq!(currencies_of(&response_offers(err)), [OUSD, USDC]);
+
+            let err = run_body_extractor::<OneCent>(ArcChallenger(challenger), None, "{}")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MppChargeRejection::Offers(_)));
+            let offers = response_offers(err);
+            assert_eq!(currencies_of(&offers), [OUSD, USDC]);
+            assert!(offers
+                .iter()
+                .all(|c| c.digest.as_deref() == Some(digest.as_str())));
+        }
+
+        #[test]
+        fn test_payment_offers_response_headers() {
+            let challenger = OffersChallenger::new(&[OUSD, USDC]);
+            let offers = challenger
+                .challenges("0.01", ChallengeOptions::default())
+                .unwrap();
+            let resp = PaymentOffers(offers).into_response();
+            assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(
+                resp.headers()
+                    .get_all(WWW_AUTHENTICATE_HEADER)
+                    .iter()
+                    .count(),
+                2
+            );
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+        }
+
+        /// Forwards to a shared challenger so tests can reuse one `Arc`.
+        struct ArcChallenger(Arc<dyn ChargeChallenger>);
+
+        impl ChargeChallenger for ArcChallenger {
+            fn challenge(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+            ) -> Result<PaymentChallenge, String> {
+                self.0.challenge(amount, options)
+            }
+
+            fn verify_payment(
+                &self,
+                credential_str: &str,
+            ) -> std::pin::Pin<Box<dyn Future<Output = Result<Receipt, String>> + Send>>
+            {
+                self.0.verify_payment(credential_str)
+            }
+
+            fn challenges(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+            ) -> Result<Vec<PaymentChallenge>, String> {
+                self.0.challenges(amount, options)
+            }
+
+            fn challenges_with_body(
+                &self,
+                amount: &str,
+                options: ChallengeOptions,
+                body: &[u8],
+            ) -> Result<Vec<PaymentChallenge>, String> {
+                self.0.challenges_with_body(amount, options, body)
+            }
         }
     }
 }

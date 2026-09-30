@@ -305,7 +305,8 @@ mod tests {
             "api.example.com",
             "tempo",
             "charge",
-            Base64UrlJson::from_value(&json!({"amount": "1000", "currency": "USD"})).unwrap(),
+            Base64UrlJson::from_value(&json!({"amount": "1000", "currency": "USD"}))
+                .expect("test request should serialize"),
         )
     }
 
@@ -338,12 +339,13 @@ mod tests {
         let challenge = test_challenge();
         let error = payment_required_error(&challenge);
 
-        let json = serde_json::to_string(&error).unwrap();
-        let parsed: McpPaymentError = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&error).expect("test error should serialize");
+        let parsed: McpPaymentError =
+            serde_json::from_str(&json).expect("test error should deserialize");
 
         assert_eq!(parsed.code, PAYMENT_REQUIRED_CODE);
         assert_eq!(parsed.message, "Payment Required");
-        let data = parsed.data.unwrap();
+        let data = parsed.data.expect("test error should contain data");
         assert_eq!(data.http_status, 402);
         assert_eq!(data.challenges.len(), 1);
         assert_eq!(data.challenges[0].id, "ch_test_123");
@@ -356,8 +358,9 @@ mod tests {
             message: "Payment Required".to_string(),
             data: None,
         };
-        let json = serde_json::to_string(&error).unwrap();
-        let parsed: McpPaymentError = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&error).expect("test error should serialize");
+        let parsed: McpPaymentError =
+            serde_json::from_str(&json).expect("test error should deserialize");
         assert!(parsed.data.is_none());
     }
 
@@ -379,15 +382,18 @@ mod tests {
         assert_eq!(error.message, "Payment verification failed: bad signature.");
 
         // Survives JSON round-trip (matches mppx McpError wire format).
-        let json = serde_json::to_string(&error).unwrap();
-        let parsed: McpPaymentError = serde_json::from_str(&json).unwrap();
-        let data = parsed.data.unwrap();
+        let json = serde_json::to_string(&error).expect("test error should serialize");
+        let parsed: McpPaymentError =
+            serde_json::from_str(&json).expect("test error should deserialize");
+        let data = parsed.data.expect("test error should contain data");
 
         // Challenge is present in data.challenges.
         assert_eq!(data.challenges[0].id, "ch_test_123");
 
         // Problem details: type URI, title, status, detail, and auto-bound challengeId.
-        let p = data.problem.unwrap();
+        let p = data
+            .problem
+            .expect("test error should contain problem details");
         assert_eq!(
             p.problem_type,
             "https://paymentauth.org/problems/verification-failed"

@@ -66,7 +66,7 @@ pub trait Transport: Send + Sync {
 /// Reqwest HTTP transport for client-side payment handling.
 ///
 /// - Detects payment required via 402 status
-/// - Extracts challenges from `WWW-Authenticate` header
+/// - Selects the first valid Payment challenge across repeated or combined headers
 /// - Sends credentials via `Authorization` header
 ///
 /// This is the default transport, matching mppx's `Transport.http()`.
@@ -90,16 +90,23 @@ impl Transport for HttpTransport {
     }
 
     fn get_challenge(&self, response: &Self::Response) -> Result<PaymentChallenge, MppError> {
-        let header = response
+        let headers = response
             .headers()
-            .get(reqwest::header::WWW_AUTHENTICATE)
-            .ok_or_else(|| MppError::MissingHeader("WWW-Authenticate".to_string()))?;
-
-        let header_str = header.to_str().map_err(|e| {
-            MppError::MalformedCredential(Some(format!("invalid WWW-Authenticate header: {e}")))
-        })?;
-
-        crate::protocol::core::parse_www_authenticate(header_str)
+            .get_all(reqwest::header::WWW_AUTHENTICATE);
+        if headers.iter().next().is_none() {
+            return Err(MppError::MissingHeader("WWW-Authenticate".to_string()));
+        }
+        let values = headers
+            .iter()
+            .map(|header| header.to_str())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                MppError::MalformedCredential(Some(format!("invalid WWW-Authenticate header: {e}")))
+            })?;
+        crate::protocol::core::parse_www_authenticate_all(values)
+            .into_iter()
+            .find_map(Result::ok)
+            .ok_or_else(|| MppError::MalformedCredential(Some("no valid Payment challenge".into())))
     }
 
     fn set_credential(
@@ -123,5 +130,37 @@ mod tests {
     fn test_http_transport_name() {
         let transport = http();
         assert_eq!(transport.name(), "http");
+    }
+    #[test]
+    fn test_http_transport_selects_first_valid_payment_offer() {
+        let first =
+            r#"Payment id="first", realm="api", method="tempo", intent="charge", request="e30""#;
+        let second = first.replace("first", "second");
+        for values in [
+            vec![first.to_string()],
+            vec![format!("{first}, {second}")],
+            vec![first.to_string(), second.clone()],
+            vec!["Bearer realm=api".into(), first.to_string()],
+            vec![format!("Payment id=broken, {first}")],
+        ] {
+            let mut response = axum::http::Response::builder().status(402);
+            for value in values {
+                response = response.header("WWW-Authenticate", value);
+            }
+            let response = reqwest::Response::from(response.body("").unwrap());
+            assert_eq!(http().get_challenge(&response).unwrap().id, "first");
+        }
+    }
+
+    #[test]
+    fn test_http_transport_rejects_missing_or_invalid_offers() {
+        for value in [None, Some("Bearer realm=api"), Some("Payment id=broken")] {
+            let mut response = axum::http::Response::builder().status(402);
+            if let Some(value) = value {
+                response = response.header("WWW-Authenticate", value);
+            }
+            let response = reqwest::Response::from(response.body("").unwrap());
+            assert!(http().get_challenge(&response).is_err());
+        }
     }
 }

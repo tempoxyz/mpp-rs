@@ -51,7 +51,7 @@ use crate::tempo::attribution;
 use super::transfers::{get_request_transfers, Transfer};
 use super::{
     network::TempoNetwork as KnownTempoNetwork, proof, relay::Relay, RelayConfig, TempoChargeExt,
-    CHAIN_ID, DEFAULT_CURRENCY_TESTNET, INTENT_CHARGE, METHOD_NAME,
+    CHAIN_ID, INTENT_CHARGE, METHOD_NAME, PATH_USD,
 };
 
 const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
@@ -495,19 +495,30 @@ fn assert_challenge_bound_memo(
 ) -> Result<(), VerificationError> {
     let bound = matched_logs.iter().any(|log| match log {
         MatchedTransferLog::Transfer => false,
-        MatchedTransferLog::Memo(memo) => {
-            attribution::verify_server(memo, realm)
-                && attribution::verify_challenge_binding(memo, challenge_id)
-        }
+        MatchedTransferLog::Memo(memo) => is_challenge_bound_memo(memo, challenge_id, realm),
     });
 
     if bound {
         Ok(())
     } else {
-        Err(VerificationError::new(
-            "Payment verification failed: memo is not bound to this challenge.",
-        ))
+        Err(challenge_bound_memo_error())
     }
+}
+
+fn is_challenge_bound_memo(memo: &[u8; 32], challenge_id: &str, realm: &str) -> bool {
+    attribution::verify_server(memo, realm)
+        && attribution::verify_challenge_binding(memo, challenge_id)
+}
+
+fn challenge_bound_memo_error() -> VerificationError {
+    VerificationError::new("Payment verification failed: memo is not bound to this challenge.")
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TransactionValidationOptions<'a> {
+    require_exact_calls: bool,
+    machine_token_enabled: bool,
+    challenge_binding: Option<(&'a str, &'a str)>,
 }
 
 /// Arguments passed to a [`ValidateSenderCallback`] on a sender mismatch.
@@ -582,6 +593,7 @@ pub struct ChargeMethod<P> {
     validate_sender: Option<Arc<ValidateSenderCallback>>,
     fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     relay: Option<Relay>,
+    fee_payer_fee_token: Option<Address>,
 }
 
 #[derive(Debug, Clone)]
@@ -628,8 +640,10 @@ impl FeePayerPolicy {
 
     /// Return the default sponsor fee-token allowlist for a transaction chain.
     ///
-    /// Known Tempo chains allow their default currency. Unknown chains use the
-    /// mainnet default, matching the server-side charge verifier fallback.
+    /// pathUSD, then the chain's default currency when known (mainnet:
+    /// pathUSD and USDC.e; Moderato and unknown chains: pathUSD), matching
+    /// mppx. The allowlist is independent of the charge currency, so charges
+    /// in other tokens (for example OUSD) are sponsored with one of these.
     pub fn default_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
         default_fee_payer_allowed_fee_tokens(chain_id)
     }
@@ -657,12 +671,19 @@ impl FeePayerPolicy {
 }
 
 fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
-    let token = KnownTempoNetwork::from_chain_id(chain_id)
-        .map(|network| network.default_currency())
-        .unwrap_or(DEFAULT_CURRENCY_TESTNET);
-    vec![token
-        .parse()
-        .expect("default Tempo fee token is a valid address")]
+    let mut tokens = vec![PATH_USD
+        .parse::<Address>()
+        .expect("pathUSD is a valid address")];
+    if let Some(network) = KnownTempoNetwork::from_chain_id(chain_id) {
+        let token = network
+            .default_currency()
+            .parse()
+            .expect("default Tempo fee token is a valid address");
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    tokens
 }
 
 fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
@@ -700,6 +721,7 @@ where
             validate_sender: None,
             fee_payer_allowed_fee_tokens: None,
             relay: None,
+            fee_payer_fee_token: None,
         }
     }
 
@@ -734,9 +756,10 @@ where
 
     /// Replace the default sponsor fee-token allowlist.
     ///
-    /// By default, fee-payer co-signing accepts the known default currency for
-    /// the transaction chain ID. Use this to restrict or widen the accepted
-    /// fee tokens for a server.
+    /// By default, fee-payer co-signing accepts pathUSD and the known default
+    /// currency for the transaction chain ID (see
+    /// [`FeePayerPolicy::default_allowed_fee_tokens`]). Use this to restrict
+    /// or widen the accepted fee tokens for a server.
     pub fn with_fee_payer_allowed_fee_tokens(mut self, allowed_fee_tokens: Vec<Address>) -> Self {
         self.fee_payer_allowed_fee_tokens = Some(allowed_fee_tokens);
         self
@@ -745,6 +768,16 @@ where
     #[cfg(test)]
     pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
         self.fee_payer_allowed_fee_tokens.as_deref()
+    }
+
+    /// Set the token the local fee payer uses to pay gas.
+    ///
+    /// When unset, the fee payer uses the first token in the fee-token
+    /// allowlist it holds a nonzero balance of, falling back to the first
+    /// allowed token. An explicit token must also be in the allowlist.
+    pub fn with_fee_payer_fee_token(mut self, fee_token: Address) -> Self {
+        self.fee_payer_fee_token = Some(fee_token);
+        self
     }
 
     /// Configure a store for replay deduplication.
@@ -849,9 +882,7 @@ where
             },
         )?;
 
-        if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
-        }
+        assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
 
         if let Some(store) = &self.store {
             if reserve {
@@ -907,6 +938,7 @@ where
     /// Validate that a transaction contains all expected payment calls (supports splits).
     ///
     /// Uses order-insensitive matching with memo-specificity sorting.
+    #[cfg(test)]
     fn validate_transaction_transfers(
         &self,
         tx_bytes: &[u8],
@@ -920,8 +952,10 @@ where
             currency,
             expected,
             expected_chain_id,
-            require_exact_calls,
-            false,
+            TransactionValidationOptions {
+                require_exact_calls,
+                ..Default::default()
+            },
         )
         .map(|_| ())
     }
@@ -932,9 +966,14 @@ where
         currency: Address,
         expected: &[Transfer],
         expected_chain_id: u64,
-        require_exact_calls: bool,
-        machine_token_enabled: bool,
+        options: TransactionValidationOptions<'_>,
     ) -> Result<Option<Address>, VerificationError> {
+        let TransactionValidationOptions {
+            require_exact_calls,
+            machine_token_enabled,
+            challenge_binding,
+        } = options;
+
         if currency.is_zero() {
             return Err(VerificationError::new(
                 "Invalid currency: currency cannot be the zero address".to_string(),
@@ -978,6 +1017,12 @@ where
             .flatten();
 
         if let Some(route) = machine_token_route {
+            if let Some((challenge_id, realm)) = challenge_binding {
+                let memo = route.transfer.memo.ok_or_else(challenge_bound_memo_error)?;
+                if !is_challenge_bound_memo(&memo, challenge_id, realm) {
+                    return Err(challenge_bound_memo_error());
+                }
+            }
             return Ok(Some(route.settlement_sender));
         }
 
@@ -992,6 +1037,7 @@ where
         sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
         let mut used_calls: Vec<bool> = vec![false; transfer_calls.len()];
+        let mut has_challenge_bound_memo = challenge_binding.is_none();
 
         if require_exact_calls && transfer_calls.len() != expected.len() {
             return Err(VerificationError::new(format!(
@@ -1046,6 +1092,10 @@ where
                             && memo_bytes == B256::from(*exp_memo)
                         {
                             used_calls[call_idx] = true;
+                            if let Some((challenge_id, realm)) = challenge_binding {
+                                has_challenge_bound_memo |=
+                                    is_challenge_bound_memo(exp_memo, challenge_id, realm);
+                            }
                             found = true;
                             break;
                         }
@@ -1065,9 +1115,14 @@ where
                     if !found && selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
                         let to = Address::from_slice(&data[16..36]);
                         let amount = U256::from_be_slice(&data[36..68]);
+                        let memo = B256::from_slice(&data[68..100]);
 
                         if to == transfer.recipient && amount == transfer.amount {
                             used_calls[call_idx] = true;
+                            if let Some((challenge_id, realm)) = challenge_binding {
+                                has_challenge_bound_memo |=
+                                    is_challenge_bound_memo(&memo.0, challenge_id, realm);
+                            }
                             found = true;
                             break;
                         }
@@ -1093,6 +1148,10 @@ where
             return Err(VerificationError::new(
                 "Fee-sponsored transaction contains unexpected calls".to_string(),
             ));
+        }
+
+        if !has_challenge_bound_memo {
+            return Err(challenge_bound_memo_error());
         }
 
         Ok(None)
@@ -1199,6 +1258,8 @@ where
         signed_tx: &str,
         charge: &ChargeRequest,
         expected_chain_id: u64,
+        challenge_id: &str,
+        realm: &str,
     ) -> Result<Address, VerificationError> {
         use alloy::eips::Encodable2718;
 
@@ -1216,23 +1277,34 @@ where
                     "feePayer requested but fee sponsorship is not configured on this server",
                 ));
             }
-            let (signed, sender) = self.validate_fee_payer_transaction(&tx_bytes, currency)?;
-            self.validate_transaction_transfers(
+            // The sponsor fee token is chosen at co-sign time and is independent
+            // of the charge currency; only a configured fee token is known here.
+            let (signed, sender) =
+                self.validate_fee_payer_transaction(&tx_bytes, self.fee_payer_fee_token)?;
+            self.validate_transaction_transfers_with_machine_token(
                 &signed.encoded_2718(),
                 currency,
                 &expected,
                 expected_chain_id,
-                true,
+                TransactionValidationOptions {
+                    require_exact_calls: true,
+                    machine_token_enabled: charge.machine_token_enabled(),
+                    challenge_binding: Some((challenge_id, realm)),
+                },
             )?;
             return Ok(sender);
         }
 
-        self.validate_transaction_transfers(
+        self.validate_transaction_transfers_with_machine_token(
             &tx_bytes,
             currency,
             &expected,
             expected_chain_id,
-            false,
+            TransactionValidationOptions {
+                machine_token_enabled: charge.machine_token_enabled(),
+                challenge_binding: Some((challenge_id, realm)),
+                ..Default::default()
+            },
         )?;
         let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..])
             .map_err(|e| VerificationError::new(format!("Failed to decode transaction: {e}")))?;
@@ -1339,6 +1411,8 @@ where
                 serialized_transaction,
                 request,
                 expected_chain_id,
+                &credential.challenge.id,
+                &credential.challenge.realm,
             )?;
             serde_json::json!({
                 "mode": "pull",
@@ -1367,6 +1441,18 @@ where
         })?;
         let expected = Self::expected_transfers(charge)?;
 
+        // Reject an invalid client envelope before adding the server's sponsor
+        // signature. The final signed transaction is validated again below.
+        if charge.fee_payer() {
+            self.validate_transaction_credential(
+                signed_tx,
+                charge,
+                expected_chain_id,
+                challenge_id,
+                realm,
+            )?;
+        }
+
         // Fee payer co-signing replaces the placeholder fee_payer_signature
         // with a real co-signature and sets the fee_token.
         let final_tx_bytes = if charge.fee_payer() {
@@ -1377,7 +1463,10 @@ where
                 )
             })?;
 
-            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer.as_ref(), currency)
+            let fee_token = self
+                .resolve_fee_payer_fee_token(expected_chain_id, fee_payer_signer.address())
+                .await?;
+            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer.as_ref(), fee_token)
                 .await?
         } else {
             tx_bytes.to_vec()
@@ -1388,8 +1477,11 @@ where
             currency,
             &expected,
             expected_chain_id,
-            charge.fee_payer(),
-            charge.machine_token_enabled(),
+            TransactionValidationOptions {
+                require_exact_calls: charge.fee_payer(),
+                machine_token_enabled: charge.machine_token_enabled(),
+                challenge_binding: Some((challenge_id, realm)),
+            },
         )?;
 
         // The sponsor pays the gas here, so simulate first and bail if the tx
@@ -1448,9 +1540,7 @@ where
                 settlement_senders: &settlement_senders,
             },
         )?;
-        if charge.memo().is_none() {
-            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
-        }
+        assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
 
         // Record the on-chain tx hash for hash-based replay protection. Use the
         // atomic claim so a concurrent hash credential for the same tx cannot
@@ -1611,7 +1701,7 @@ where
     fn validate_fee_payer_transaction(
         &self,
         tx_bytes: &[u8],
-        fee_token: Address,
+        fee_token: Option<Address>,
     ) -> Result<(tempo_alloy::primitives::AASigned, Address), VerificationError> {
         use super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
         use tempo_alloy::primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
@@ -1688,15 +1778,13 @@ where
 
         let policy = FeePayerPolicy::resolve(tx.chain_id, self.fee_payer_policy_override.as_ref());
 
-        let allowed_fee_tokens = self
-            .fee_payer_allowed_fee_tokens
-            .clone()
-            .unwrap_or_else(|| FeePayerPolicy::default_allowed_fee_tokens(tx.chain_id));
-        if !fee_token_allowed(&allowed_fee_tokens, fee_token) {
-            return Err(VerificationError::new(format!(
-                "Fee token {:#x} is not allowed by fee payer policy",
-                fee_token
-            )));
+        if let Some(fee_token) = fee_token {
+            if !fee_token_allowed(&self.allowed_fee_tokens(tx.chain_id), fee_token) {
+                return Err(VerificationError::new(format!(
+                    "Fee token {:#x} is not allowed by fee payer policy",
+                    fee_token
+                )));
+            }
         }
 
         if tx.max_fee_per_gas > policy.max_fee_per_gas {
@@ -1755,7 +1843,7 @@ where
     ) -> Result<Vec<u8>, VerificationError> {
         use alloy::eips::Encodable2718;
 
-        let (signed, sender) = self.validate_fee_payer_transaction(tx_bytes, fee_token)?;
+        let (signed, sender) = self.validate_fee_payer_transaction(tx_bytes, Some(fee_token))?;
 
         // Rebuild the transaction with fee_token set and real fee_payer_signature
         let (tx, client_signature, _hash) = signed.into_parts();
@@ -1774,6 +1862,47 @@ where
 
         let signed_tx = tx.into_signed(client_signature);
         Ok(signed_tx.encoded_2718())
+    }
+
+    /// Sponsor fee-token allowlist: the configured list, else the chain default.
+    fn allowed_fee_tokens(&self, chain_id: u64) -> Vec<Address> {
+        self.fee_payer_allowed_fee_tokens
+            .clone()
+            .unwrap_or_else(|| FeePayerPolicy::default_allowed_fee_tokens(chain_id))
+    }
+
+    /// Choose the token a local fee payer uses to pay gas, matching mppx.
+    ///
+    /// Returns the configured fee token when set. Otherwise returns the first
+    /// allowlisted token the fee payer holds a nonzero balance of (in
+    /// allowlist order), falling back to the first allowlisted token. Balance
+    /// lookups that fail count as zero. The result is still checked against
+    /// the allowlist when co-signing.
+    async fn resolve_fee_payer_fee_token(
+        &self,
+        chain_id: u64,
+        fee_payer: Address,
+    ) -> Result<Address, VerificationError> {
+        if let Some(fee_token) = self.fee_payer_fee_token {
+            return Ok(fee_token);
+        }
+        let allowed_fee_tokens = self.allowed_fee_tokens(chain_id);
+        let Some(&first) = allowed_fee_tokens.first() else {
+            return Err(VerificationError::new(
+                "Fee payer policy does not allow any fee tokens",
+            ));
+        };
+        for &token in &allowed_fee_tokens {
+            let balance = ITIP20::new(token, &*self.provider)
+                .balanceOf(fee_payer)
+                .call()
+                .await
+                .unwrap_or_default();
+            if !balance.is_zero() {
+                return Ok(token);
+            }
+        }
+        Ok(first)
     }
 }
 
@@ -1860,6 +1989,7 @@ where
         let validate_sender = self.validate_sender.clone();
         let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
         let relay = self.relay.clone();
+        let fee_payer_fee_token = self.fee_payer_fee_token;
 
         async move {
             if let Some(relay) = relay {
@@ -1876,6 +2006,7 @@ where
                 validate_sender,
                 fee_payer_allowed_fee_tokens,
                 relay: None,
+                fee_payer_fee_token,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -1984,7 +2115,10 @@ mod tests {
 
     use alloy::primitives::hex;
 
-    use super::{super::MODERATO_CHAIN_ID, *};
+    use super::{
+        super::{DEFAULT_CURRENCY_TESTNET, MODERATO_CHAIN_ID, OUSD, USDC},
+        *,
+    };
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
 
     struct AsyncOnlySigner {
@@ -2260,6 +2394,17 @@ mod tests {
         amount.to_be_bytes::<32>().clone_into(&mut amount_bytes);
         data.extend_from_slice(&amount_bytes);
         Bytes::from(data)
+    }
+
+    fn make_transfer_with_memo_input(recipient: Address, amount: U256, memo: [u8; 32]) -> Bytes {
+        Bytes::from(
+            ITIP20::transferWithMemoCall {
+                to: recipient,
+                amount,
+                memo: memo.into(),
+            }
+            .abi_encode(),
+        )
     }
 
     fn make_approve_input(spender: Address, amount: U256) -> Bytes {
@@ -2961,16 +3106,337 @@ mod tests {
 
         let settlement_sender = method
             .validate_transaction_transfers_with_machine_token(
-                &tx_bytes, currency, &expected, CHAIN_ID, true, true,
+                &tx_bytes,
+                currency,
+                &expected,
+                CHAIN_ID,
+                TransactionValidationOptions {
+                    require_exact_calls: true,
+                    machine_token_enabled: true,
+                    challenge_binding: None,
+                },
             )
             .unwrap();
         assert_eq!(settlement_sender, Some(route.settlement_sender));
 
         assert!(method
             .validate_transaction_transfers_with_machine_token(
-                &tx_bytes, currency, &expected, CHAIN_ID, true, false,
+                &tx_bytes,
+                currency,
+                &expected,
+                CHAIN_ID,
+                TransactionValidationOptions {
+                    require_exact_calls: true,
+                    ..Default::default()
+                },
             )
             .is_err());
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_checks_challenge_bound_memo() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let bound = attribution::encode("challenge-123", "api.example.com", None);
+        let cases = [
+            ("matching challenge", Some(bound), true),
+            (
+                "wrong challenge",
+                Some(attribution::encode(
+                    "challenge-456",
+                    "api.example.com",
+                    None,
+                )),
+                false,
+            ),
+            (
+                "wrong realm",
+                Some(attribution::encode(
+                    "challenge-123",
+                    "other.example.com",
+                    None,
+                )),
+                false,
+            ),
+            ("non-MPP memo", Some([0xab; 32]), false),
+            ("plain transfer", None, false),
+        ];
+
+        for require_exact_calls in [false, true] {
+            for (name, memo, should_accept) in cases {
+                for split in [false, true] {
+                    for reverse in [false, true] {
+                        let mut expected = vec![Transfer {
+                            amount,
+                            recipient,
+                            memo: None,
+                        }];
+                        let input = match memo {
+                            Some(memo) => make_transfer_with_memo_input(recipient, amount, memo),
+                            None => make_transfer_input(recipient, amount),
+                        };
+                        let mut calls = vec![tempo_alloy::primitives::transaction::Call {
+                            to: TxKind::Call(currency),
+                            value: U256::ZERO,
+                            input,
+                        }];
+                        if split {
+                            let split_recipient = Address::repeat_byte(0x44);
+                            expected.push(Transfer {
+                                amount,
+                                recipient: split_recipient,
+                                memo: Some([0xcd; 32]),
+                            });
+                            calls.push(tempo_alloy::primitives::transaction::Call {
+                                to: TxKind::Call(currency),
+                                value: U256::ZERO,
+                                input: make_transfer_with_memo_input(
+                                    split_recipient,
+                                    amount,
+                                    [0xcd; 32],
+                                ),
+                            });
+                        }
+                        if reverse {
+                            calls.reverse();
+                        }
+                        let tx_bytes = encode_signed_tx(calls, MAX_FEE_PAYER_GAS_LIMIT);
+                        let result = method.validate_transaction_transfers_with_machine_token(
+                            &tx_bytes,
+                            currency,
+                            &expected,
+                            CHAIN_ID,
+                            TransactionValidationOptions {
+                                require_exact_calls,
+                                challenge_binding: Some(("challenge-123", "api.example.com")),
+                                ..Default::default()
+                            },
+                        );
+                        assert_eq!(result.is_ok(), should_accept,
+                            "case: {name}, exact: {require_exact_calls}, split: {split}, reverse: {reverse}");
+                        if let Err(error) = result {
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("memo is not bound to this challenge"),
+                                "case: {name}; unexpected error: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_machine_token_route_checks_challenge_binding() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        let currency = Address::repeat_byte(0x20);
+        let expected = vec![Transfer {
+            amount: U256::from(100),
+            recipient: Address::repeat_byte(0x33),
+            memo: None,
+        }];
+        for (memo, should_accept) in [
+            (
+                attribution::encode("challenge-123", "api.example.com", None),
+                true,
+            ),
+            (
+                attribution::encode("challenge-456", "api.example.com", None),
+                false,
+            ),
+            (
+                attribution::encode("challenge-123", "other.example.com", None),
+                false,
+            ),
+            ([0xab; 32], false),
+        ] {
+            let mut actual = expected.clone();
+            actual[0].memo = Some(memo);
+            let route = super::super::machine_token::route(CHAIN_ID, currency, &actual).unwrap();
+            let tx_bytes = encode_signed_tx(route.calls.to_vec(), MAX_FEE_PAYER_GAS_LIMIT);
+            let result = method.validate_transaction_transfers_with_machine_token(
+                &tx_bytes,
+                currency,
+                &expected,
+                CHAIN_ID,
+                TransactionValidationOptions {
+                    require_exact_calls: true,
+                    machine_token_enabled: true,
+                    challenge_binding: Some(("challenge-123", "api.example.com")),
+                },
+            );
+            assert_eq!(result.is_ok(), should_accept);
+            match result {
+                Ok(sender) => assert_eq!(sender, Some(route.settlement_sender)),
+                Err(error) => assert!(error
+                    .to_string()
+                    .contains("memo is not bound to this challenge")),
+            }
+        }
+    }
+
+    #[test]
+    fn test_legacy_primary_memo_does_not_disable_challenge_binding() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100);
+        for (memo, should_accept) in [
+            (
+                attribution::encode("challenge-123", "api.example.com", None),
+                true,
+            ),
+            ([0xab; 32], false),
+        ] {
+            let tx_bytes = encode_signed_tx(
+                vec![tempo_alloy::primitives::transaction::Call {
+                    to: TxKind::Call(currency),
+                    value: U256::ZERO,
+                    input: make_transfer_with_memo_input(recipient, amount, memo),
+                }],
+                MAX_FEE_PAYER_GAS_LIMIT,
+            );
+            let request = ChargeRequest {
+                amount: amount.to_string(),
+                currency: format!("{currency:#x}"),
+                recipient: Some(format!("{recipient:#x}")),
+                method_details: Some(
+                    serde_json::json!({ "chainId": CHAIN_ID, "memo": alloy::hex::encode_prefixed([0xab; 32]) }),
+                ),
+                ..Default::default()
+            };
+            let result = method.validate_transaction_credential(
+                &alloy::hex::encode_prefixed(&tx_bytes),
+                &request,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+            );
+            assert_eq!(result.is_ok(), should_accept);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_rejects_unbound_memo_before_rpc() {
+        use alloy::providers::mock::Asserter;
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let wrong_memo = attribution::encode("challenge-456", "api.example.com", None);
+        let tx_bytes = encode_signed_tx(
+            vec![tempo_alloy::primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_with_memo_input(recipient, amount, wrong_memo),
+            }],
+            MAX_FEE_PAYER_GAS_LIMIT,
+        );
+        let request = ChargeRequest {
+            amount: amount.to_string(),
+            currency: format!("{currency:#x}"),
+            recipient: Some(format!("{recipient:#x}")),
+            method_details: Some(serde_json::json!({ "chainId": CHAIN_ID })),
+            ..Default::default()
+        };
+
+        // No mock responses are queued: reaching the provider would produce a
+        // different error and fail the assertion below.
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(Asserter::new());
+        let method = ChargeMethod::new(provider);
+
+        let error = method
+            .broadcast_transaction(
+                &alloy::hex::encode_prefixed(tx_bytes),
+                &request,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+            )
+            .await
+            .expect_err("unbound memo must be rejected before broadcast");
+
+        assert!(
+            error
+                .to_string()
+                .contains("memo is not bound to this challenge"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fee_payer_rejects_unbound_memo_before_cosign_or_rpc() {
+        use alloy::providers::mock::Asserter;
+
+        let currency = KnownTempoNetwork::Mainnet
+            .default_currency()
+            .parse::<Address>()
+            .unwrap();
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(100u64);
+        let wrong_memo = attribution::encode("challenge-456", "api.example.com", None);
+        let mut tx = make_fee_payer_tx(60);
+        tx.calls = vec![tempo_alloy::primitives::transaction::Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: make_transfer_with_memo_input(recipient, amount, wrong_memo),
+        }];
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let tx_bytes = sign_and_encode_0x78(tx, &client_signer);
+        let request = ChargeRequest {
+            amount: amount.to_string(),
+            currency: format!("{currency:#x}"),
+            recipient: Some(format!("{recipient:#x}")),
+            method_details: Some(serde_json::json!({
+                "chainId": CHAIN_ID,
+                "feePayer": true,
+            })),
+            ..Default::default()
+        };
+
+        let signer_calls = Arc::new(AtomicUsize::new(0));
+        let fee_payer_signer = AsyncOnlySigner {
+            inner: alloy::signers::local::PrivateKeySigner::random(),
+            calls: Arc::clone(&signer_calls),
+        };
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(Asserter::new());
+        let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+        let error = method
+            .broadcast_transaction(
+                &alloy::hex::encode_prefixed(tx_bytes),
+                &request,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+            )
+            .await
+            .expect_err("unbound memo must be rejected before sponsorship");
+
+        assert!(
+            error
+                .to_string()
+                .contains("memo is not bound to this challenge"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(signer_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -4297,7 +4763,8 @@ mod tests {
                 .parse::<Address>()
                 .unwrap()
         ));
-        assert!(!FeePayerPolicy::default_allows_fee_token(
+        // Mainnet also allows pathUSD, matching mppx's default fee tokens.
+        assert!(FeePayerPolicy::default_allows_fee_token(
             CHAIN_ID,
             KnownTempoNetwork::Moderato
                 .default_currency()
@@ -4835,5 +5302,294 @@ mod tests {
             .simulate_before_broadcast(&cosigned)
             .await
             .expect("method-not-found must skip the check, not fail");
+    }
+
+    // ==================== Sponsor fee-token selection ====================
+
+    fn fee_token_method(
+        asserter: alloy::providers::mock::Asserter,
+    ) -> ChargeMethod<impl alloy::providers::Provider<TempoNetwork> + Clone + 'static> {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        ChargeMethod::new(provider)
+    }
+
+    fn push_balance(asserter: &alloy::providers::mock::Asserter, balance: u64) {
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            &U256::from(balance),
+        )));
+    }
+
+    fn token(address: &str) -> Address {
+        address.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fee_token_first_funded_allowlisted_token_wins() {
+        use alloy::providers::mock::Asserter;
+
+        let fee_payer = Address::repeat_byte(0xfe);
+
+        // Mainnet defaults [pathUSD, USDC.e]: pathUSD empty, USDC.e funded.
+        let asserter = Asserter::new();
+        push_balance(&asserter, 0);
+        push_balance(&asserter, 5);
+        let method = fee_token_method(asserter.clone());
+        let fee_token = method
+            .resolve_fee_payer_fee_token(CHAIN_ID, fee_payer)
+            .await
+            .unwrap();
+        assert_eq!(fee_token, token(USDC));
+        assert!(asserter.read_q().is_empty());
+
+        // Both funded: the first allowlisted token wins after one lookup.
+        let asserter = Asserter::new();
+        push_balance(&asserter, 7);
+        let method = fee_token_method(asserter.clone());
+        let fee_token = method
+            .resolve_fee_payer_fee_token(CHAIN_ID, fee_payer)
+            .await
+            .unwrap();
+        assert_eq!(fee_token, token(PATH_USD));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fee_token_falls_back_to_first_allowed_when_none_funded() {
+        use alloy::providers::mock::Asserter;
+
+        let fee_payer = Address::repeat_byte(0xfe);
+
+        let asserter = Asserter::new();
+        push_balance(&asserter, 0);
+        push_balance(&asserter, 0);
+        let method = fee_token_method(asserter);
+        assert_eq!(
+            method
+                .resolve_fee_payer_fee_token(CHAIN_ID, fee_payer)
+                .await
+                .unwrap(),
+            token(PATH_USD)
+        );
+
+        // Failed balance lookups count as unfunded.
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("rpc down");
+        let method = fee_token_method(asserter);
+        assert_eq!(
+            method
+                .resolve_fee_payer_fee_token(MODERATO_CHAIN_ID, fee_payer)
+                .await
+                .unwrap(),
+            token(PATH_USD)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fee_token_prefers_configured_token_without_rpc() {
+        use alloy::providers::mock::Asserter;
+
+        // No responses queued: any balance lookup would fail the call count below.
+        let asserter = Asserter::new();
+        let method = fee_token_method(asserter.clone()).with_fee_payer_fee_token(token(USDC));
+        assert_eq!(
+            method
+                .resolve_fee_payer_fee_token(CHAIN_ID, Address::repeat_byte(0xfe))
+                .await
+                .unwrap(),
+            token(USDC)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fee_token_respects_explicit_allowlist() {
+        use alloy::providers::mock::Asserter;
+
+        let fee_payer = Address::repeat_byte(0xfe);
+        let custom = Address::repeat_byte(0x99);
+
+        // Only allowlisted tokens are queried, in allowlist order.
+        let asserter = Asserter::new();
+        push_balance(&asserter, 0);
+        push_balance(&asserter, 1);
+        let method = fee_token_method(asserter.clone())
+            .with_fee_payer_allowed_fee_tokens(vec![token(USDC), custom]);
+        assert_eq!(
+            method
+                .resolve_fee_payer_fee_token(CHAIN_ID, fee_payer)
+                .await
+                .unwrap(),
+            custom
+        );
+        assert!(asserter.read_q().is_empty());
+
+        let method = fee_token_method(Asserter::new()).with_fee_payer_allowed_fee_tokens(vec![]);
+        let err = method
+            .resolve_fee_payer_fee_token(CHAIN_ID, fee_payer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not allow any fee tokens"));
+    }
+
+    #[tokio::test]
+    async fn test_configured_fee_token_outside_allowlist_is_rejected() {
+        let (method, client_signer, _) = make_cosign_method(None);
+        let method = method.with_fee_payer_fee_token(token(OUSD));
+        let encoded = sign_and_encode_0x78(make_fee_payer_tx(60), &client_signer);
+
+        // OUSD is never a default fee token, so co-signing refuses it...
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                token(OUSD),
+            )
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("is not allowed by fee payer policy"));
+
+        // ...and validation rejects the configured fee token before broadcast.
+        let err = method
+            .validate_fee_payer_transaction(&encoded, method.fee_payer_fee_token)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("is not allowed by fee payer policy"));
+
+        // Without a configured fee token, validation does not tie the fee token
+        // to the charge currency.
+        let (method, client_signer, _) = make_cosign_method(None);
+        let encoded = sign_and_encode_0x78(make_fee_payer_tx(60), &client_signer);
+        assert!(method
+            .validate_fee_payer_transaction(&encoded, None)
+            .is_ok());
+    }
+
+    /// Sponsored OUSD charge with default settings: the fee payer pays gas in
+    /// the first funded allowlisted token and the payment settles in OUSD.
+    async fn assert_sponsored_ousd_charge_succeeds(
+        chain_id: u64,
+        balances: &[u64],
+        expected_fee_token: Address,
+    ) {
+        use alloy::providers::mock::Asserter;
+
+        let ousd = token(OUSD);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(1_000_000u64);
+        let challenge_id = "challenge-123";
+        let realm = "api.example.com";
+        let memo = attribution::encode(challenge_id, realm, None);
+
+        let client_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut tx = make_fee_payer_tx(60);
+        tx.chain_id = chain_id;
+        tx.calls = vec![tempo_alloy::primitives::transaction::Call {
+            to: TxKind::Call(ousd),
+            value: U256::ZERO,
+            input: make_transfer_with_memo_input(recipient, amount, memo),
+        }];
+        let envelope = sign_and_encode_0x78(tx, &client_signer);
+        let request = ChargeRequest {
+            amount: amount.to_string(),
+            currency: OUSD.to_string(),
+            recipient: Some(format!("{recipient:#x}")),
+            method_details: Some(serde_json::json!({ "chainId": chain_id, "feePayer": true })),
+            ..Default::default()
+        };
+
+        let asserter = Asserter::new();
+        for &balance in balances {
+            push_balance(&asserter, balance);
+        }
+        asserter.push_success(&serde_json::json!({
+            "blocks": [{ "calls": [{ "returnData": "0x", "gasUsed": "0x5208", "status": "0x1" }] }]
+        }));
+        let tx_hash = B256::repeat_byte(0x11);
+        let block_hash = B256::repeat_byte(0x22);
+        let mut log =
+            make_transfer_with_memo_log(ousd, client_signer.address(), recipient, amount, memo);
+        log.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "blockHash": format!("{block_hash:#x}"),
+                "blockNumber": "0x1",
+                "transactionHash": format!("{tx_hash:#x}"),
+                "transactionIndex": "0x0",
+                "logIndex": "0x0",
+                "removed": false,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        asserter.push_success(&serde_json::json!({
+            "type": "0x76",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x5208",
+            "logs": [log],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "from": format!("{:#x}", client_signer.address()),
+            "to": format!("{ousd:#x}"),
+            "contractAddress": null,
+            "feePayer": format!("{:#x}", fee_payer_signer.address()),
+            "feeToken": format!("{expected_fee_token:#x}"),
+        }));
+
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let method = fee_token_method(asserter.clone())
+            .with_fee_payer(fee_payer_signer.clone())
+            .with_store(store.clone());
+
+        let hash = method
+            .broadcast_transaction(
+                &alloy::hex::encode_prefixed(&envelope),
+                &request,
+                chain_id,
+                challenge_id,
+                realm,
+            )
+            .await
+            .expect("sponsored OUSD charge must succeed");
+        assert_eq!(hash, tx_hash);
+        assert!(
+            asserter.read_q().is_empty(),
+            "all mocked RPC calls consumed"
+        );
+
+        // The broadcast bytes are exactly the envelope co-signed with the
+        // selected fee token (ECDSA signing is deterministic).
+        let expected = method
+            .cosign_fee_payer_transaction(&envelope, &fee_payer_signer, expected_fee_token)
+            .await
+            .unwrap();
+        let decoded = tempo_alloy::primitives::AASigned::decode_2718(&mut &expected[..]).unwrap();
+        assert_eq!(decoded.tx().fee_token, Some(expected_fee_token));
+        let key = format!("mpp:charge:submission:{:#x}", keccak256(&expected));
+        assert!(store.get(&key).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sponsored_ousd_charge_on_mainnet_pays_gas_in_funded_allowlisted_token() {
+        // pathUSD unfunded, USDC.e funded.
+        assert_sponsored_ousd_charge_succeeds(CHAIN_ID, &[0, 42], token(USDC)).await;
+        // pathUSD funded: first allowlisted token wins.
+        assert_sponsored_ousd_charge_succeeds(CHAIN_ID, &[42], token(PATH_USD)).await;
+    }
+
+    #[tokio::test]
+    async fn test_sponsored_ousd_charge_on_moderato_pays_gas_in_path_usd() {
+        assert_sponsored_ousd_charge_succeeds(MODERATO_CHAIN_ID, &[42], token(PATH_USD)).await;
+        // Nothing funded: fall back to the first allowlisted token.
+        assert_sponsored_ousd_charge_succeeds(MODERATO_CHAIN_ID, &[0], token(PATH_USD)).await;
     }
 }

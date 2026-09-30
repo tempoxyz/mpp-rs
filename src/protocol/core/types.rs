@@ -48,11 +48,15 @@ impl MethodName {
         self.0.eq_ignore_ascii_case(other)
     }
 
-    /// Check if the method name contains only valid ASCII lowercase characters.
-    ///
-    /// Per spec: `method-name = 1*LOWERALPHA` (a-z only).
+    /// Check whether this method name matches the canonical mppx grammar.
     pub fn is_valid(&self) -> bool {
-        !self.0.is_empty() && self.0.chars().all(|c| c.is_ascii_lowercase())
+        let mut chars = self.0.chars();
+        matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+            && chars.all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, ':' | '_' | '-')
+            })
     }
 }
 
@@ -92,7 +96,7 @@ impl<'de> Deserialize<'de> for MethodName {
             Ok(method)
         } else {
             Err(serde::de::Error::custom(
-                "invalid method name: must contain only lowercase ASCII letters",
+                "invalid method name: must start with a lowercase ASCII letter and contain only lowercase letters, digits, colons, underscores, or hyphens",
             ))
         }
     }
@@ -412,17 +416,19 @@ mod tests {
 
     #[test]
     fn test_method_name_serde() {
-        let method = MethodName::new("base");
-        let json = serde_json::to_string(&method).unwrap();
-        assert_eq!(json, "\"base\"");
-
-        let parsed: MethodName = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, method);
+        for value in ["base", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+            let method = MethodName::new(value);
+            let json = serde_json::to_string(&method).unwrap();
+            let parsed: MethodName = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, method);
+        }
     }
 
     #[test]
     fn test_method_name_deserialization_rejects_invalid_names() {
-        for method in ["", "123", "*", "tempo!", "TEMPO"] {
+        for method in [
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "TEMPO",
+        ] {
             let json = serde_json::to_string(method).unwrap();
             let error = serde_json::from_str::<MethodName>(&json).unwrap_err();
             assert!(error.to_string().contains("invalid method name"));

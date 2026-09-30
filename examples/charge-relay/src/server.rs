@@ -7,10 +7,11 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use mpp::protocol::methods::tempo::PATH_USD;
 use mpp::server::{
     tempo, ChargeOptions, Mpp, TempoChargeMethod, TempoConfig, TempoProvider, TempoRelayConfig,
 };
-use mpp::{format_www_authenticate, parse_authorization, PrivateKeySigner};
+use mpp::{format_www_authenticate_many, parse_authorization, PrivateKeySigner};
 use std::sync::Arc;
 
 type Payment = Mpp<TempoChargeMethod<TempoProvider>>;
@@ -31,6 +32,7 @@ async fn main() {
             recipient: &recipient,
         })
         .rpc_url(&rpc_url)
+        .currencies([PATH_USD])
         .relay(TempoRelayConfig::new(api_key).api_base_url(api_url))
         .secret_key(
             &std::env::var("MPP_SECRET_KEY")
@@ -88,19 +90,21 @@ async fn photo(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl 
             ..Default::default()
         },
     ) {
-        Ok(challenge) => match format_www_authenticate(&challenge) {
-            Ok(value) => (
-                StatusCode::PAYMENT_REQUIRED,
-                [(header::WWW_AUTHENTICATE, value)],
-                Json(serde_json::json!({ "error": "Payment Required" })),
-            )
-                .into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-                .into_response(),
-        },
+        Ok(challenges) => {
+            match format_www_authenticate_many(&challenges).map(|values| values.join(", ")) {
+                Ok(value) => (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(header::WWW_AUTHENTICATE, value)],
+                    Json(serde_json::json!({ "error": "Payment Required" })),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error.to_string() })),

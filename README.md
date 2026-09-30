@@ -55,7 +55,7 @@ let mpp = Mpp::create(tempo(TempoConfig {
     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
 }))?;
 
-let challenge = mpp.charge("1")?;
+let challenges = mpp.charge("1")?; // OUSD, then USDC.e on mainnet
 let receipt = mpp.verify_credential(&credential).await?;
 ```
 

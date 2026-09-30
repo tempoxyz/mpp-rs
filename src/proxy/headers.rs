@@ -194,7 +194,10 @@ mod tests {
     #[test]
     fn test_scrub_request_drops_multiple_connection_nominated_case_insensitive() {
         let mut headers = vec![
-            ("Connection".into(), " keep-alive, X-Debug ,, ".into()),
+            (
+                "Connection".into(),
+                format!("{}keep-alive, X-Debug ,, ", ' '),
+            ),
             ("connection".into(), "x-trace".into()),
             ("x-debug".into(), "1".into()),
             ("X-Trace".into(), "2".into()),

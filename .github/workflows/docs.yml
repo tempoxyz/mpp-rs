@@ -15,14 +15,19 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
       - name: Build docs
         run: cargo doc --no-deps --all-features
         env:
@@ -37,11 +42,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
       - id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

@@ -79,7 +79,7 @@ mod tests {
         assert!(digest.starts_with("sha-256="));
 
         // Should match computing from the raw JSON bytes
-        let json = serde_json::to_vec(&body).unwrap();
+        let json = serde_json::to_vec(&body).expect("test body should serialize");
         assert!(verify(&digest, &json));
     }
 

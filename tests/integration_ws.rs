@@ -41,7 +41,10 @@ async fn start_ws_server() -> (String, tokio::task::JoinHandle<()>) {
                         use axum::extract::ws::Message;
 
                         // Send challenge
-                        let challenge = mpp.charge("0.01").expect("challenge");
+                        let challenge = mpp
+                            .charge("0.01")
+                            .map(|mut offers| offers.remove(0))
+                            .expect("challenge");
                         let challenge_resp = WsResponse::Challenge {
                             challenge: serde_json::to_value(&challenge).unwrap(),
                             error: None,

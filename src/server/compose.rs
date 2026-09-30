@@ -11,12 +11,12 @@
 //! use mpp::server::{compose, compose_verify};
 //! use mpp::format_www_authenticate_many;
 //!
-//! let tempo_challenge = tempo_mpp.charge("0.10")?;
-//! let stripe_challenge = stripe_mpp.stripe_charge("0.10")?;
+//! let mut challenges = tempo_mpp.charge("0.10")?;
+//! challenges.push(stripe_mpp.stripe_charge("0.10")?);
 //!
 //! // Challenge path: rank and format multiple WWW-Authenticate headers
 //! let ranked = compose(
-//!     vec![tempo_challenge, stripe_challenge],
+//!     challenges,
 //!     req.headers().get("Accept-Payment").and_then(|h| h.to_str().ok()),
 //! );
 //! let headers = format_www_authenticate_many(&ranked)?;
