@@ -1322,7 +1322,24 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     ///
     /// let challenge = mpp.charge("1.00")?;
     /// ```
-    pub fn create(builder: super::TempoBuilder) -> Result<Self> {
+    pub fn create(mut builder: super::TempoBuilder) -> Result<Self> {
+        builder
+            .chain_id
+            .get_or_insert_with(|| super::tempo::chain_id_from_rpc_url(&builder.rpc_url));
+        if builder.fee_payer_fee_token.is_some() && builder.fee_payer_signer.is_none() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "fee_payer_fee_token requires a local fee payer signer".into(),
+            ));
+        }
+        if builder
+            .fee_payer_allowed_fee_tokens
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err(crate::error::MppError::InvalidConfig(
+                "fee_payer_allowed_fee_tokens must contain at least one token".into(),
+            ));
+        }
         if builder.machine_token_enabled {
             let chain_id = builder
                 .chain_id
@@ -2396,8 +2413,8 @@ mod tests {
     fn test_mpp_create() {
         let mpp = create_test_mpp();
         assert_eq!(mpp.realm(), "MPP Payment");
-        // No chain_id set follows the existing local/dev fallback.
-        assert_eq!(mpp.currency(), Some(DEFAULT_CURRENCY_TESTNET));
+        assert_eq!(mpp.currency(), Some(crate::protocol::methods::tempo::OUSD));
+        assert_eq!(mpp.chain_id(), Some(CHAIN_ID));
         assert_eq!(
             mpp.recipient(),
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2")
@@ -2558,7 +2575,7 @@ mod tests {
 
         let request: ChargeRequest = challenge.request.decode().unwrap();
         assert_eq!(request.amount, "100000");
-        assert_eq!(request.currency, DEFAULT_CURRENCY_TESTNET);
+        assert_eq!(request.currency, crate::protocol::methods::tempo::OUSD);
         assert_eq!(
             request.recipient,
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".to_string())
@@ -4456,10 +4473,54 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
-    fn test_unknown_or_unset_chain_keeps_single_legacy_default() {
+    fn test_default_builder_and_last_rpc_select_network_offers() {
+        use crate::protocol::methods::tempo::{MODERATO_CHAIN_ID, OUSD, PATH_USD, USDC};
+
+        for (builder, chain, fallback) in [
+            (offers_builder(), CHAIN_ID, USDC),
+            (
+                offers_builder()
+                    .rpc_url("https://rpc.tempo.xyz")
+                    .rpc_url("https://rpc.moderato.tempo.xyz"),
+                MODERATO_CHAIN_ID,
+                PATH_USD,
+            ),
+            (
+                offers_builder()
+                    .rpc_url("https://rpc.moderato.tempo.xyz")
+                    .rpc_url("https://rpc.tempo.xyz"),
+                CHAIN_ID,
+                USDC,
+            ),
+        ] {
+            let mpp = Mpp::create(builder).unwrap();
+            assert_eq!(mpp.chain_id(), Some(chain));
+            assert_eq!(
+                challenge_currencies(&mpp.charges("1").unwrap()),
+                [OUSD, fallback]
+            );
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_fee_token_requires_local_signer_and_nonempty_allowlist() {
+        use crate::protocol::methods::tempo::USDC;
+        assert!(
+            create_error(offers_builder().fee_payer_fee_token(USDC.parse().unwrap()))
+                .contains("local fee payer signer")
+        );
+        assert!(
+            create_error(offers_builder().fee_payer_allowed_fee_tokens(vec![]))
+                .contains("at least one token")
+        );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_unknown_chain_keeps_single_legacy_default() {
         use crate::protocol::methods::tempo::PATH_USD;
 
-        assert_eq!(created_currencies(offers_builder()), [PATH_USD]);
         assert_eq!(
             created_currencies(offers_builder().chain_id(31337)),
             [PATH_USD]

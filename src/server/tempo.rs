@@ -56,9 +56,6 @@ impl TempoBuilder {
     /// - Otherwise → chain ID 4217 (Tempo mainnet)
     pub fn rpc_url(mut self, url: &str) -> Self {
         self.rpc_url = url.to_string();
-        if self.chain_id.is_none() {
-            self.chain_id = Some(chain_id_from_rpc_url(url));
-        }
         self
     }
 
@@ -215,7 +212,8 @@ impl TempoBuilder {
 ///     OUSD, then USDC.e
 ///   - Moderato (`.chain_id(42431)` or a Moderato `.rpc_url(...)`): OUSD, then
 ///     pathUSD
-///   - no chain ID or an unknown chain ID: pathUSD only
+///   - omitted chain ID: inferred from the RPC URL (mainnet by default)
+///   - an unknown chain ID: pathUSD only
 ///
 ///   An explicit `.chain_id(...)` takes precedence over the RPC-inferred chain.
 ///   Use `.currencies([...])` to replace the defaults. Sponsored charges pay
@@ -229,7 +227,7 @@ impl TempoBuilder {
 /// ```ignore
 /// use mpp::server::{Mpp, tempo, TempoConfig};
 ///
-/// // Minimal — no chain ID, so currency defaults to pathUSD
+/// // Minimal — mainnet, offering OUSD then USDC.e
 /// let mpp = Mpp::create(tempo(TempoConfig {
 ///     recipient: "0xabc...123",
 /// }))?;
@@ -282,7 +280,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
 ///
 /// Returns `MODERATO_CHAIN_ID` (42431) for URLs containing "moderato",
 /// otherwise returns `CHAIN_ID` (4217).
-fn chain_id_from_rpc_url(url: &str) -> u64 {
+pub(crate) fn chain_id_from_rpc_url(url: &str) -> u64 {
     if url.contains("moderato") {
         crate::protocol::methods::tempo::MODERATO_CHAIN_ID
     } else {
@@ -325,7 +323,7 @@ pub type TempoProvider = alloy::providers::fillers::FillProvider<
 /// An explicit `currencies` list replaces the defaults, and the legacy
 /// `currency` option restricts acceptance to that one token. Otherwise the
 /// chain's defaults apply (OUSD first on known Tempo networks, pathUSD on
-/// unknown or unset chains).
+/// unknown chains).
 pub(crate) fn resolve_currencies(builder: &TempoBuilder) -> crate::error::Result<Vec<String>> {
     let candidates = match (&builder.currencies, builder.currency_explicit) {
         (Some(_), true) => {
