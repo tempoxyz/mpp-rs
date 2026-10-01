@@ -1335,6 +1335,13 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 "fee_payer_fee_token requires a local fee payer signer".into(),
             ));
         }
+        // Without a sponsor every challenge would advertise `feePayer: true`
+        // and every credential built for it would then be rejected.
+        if builder.fee_payer && builder.fee_payer_signer.is_none() && builder.relay.is_none() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "fee_payer(true) requires fee_payer_signer(...) or relay(...)".into(),
+            ));
+        }
         if builder
             .fee_payer_allowed_fee_tokens
             .as_ref()
@@ -2526,6 +2533,29 @@ mod tests {
             mpp.method.fee_payer_allowed_fee_tokens(),
             Some([custom_token].as_slice())
         );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_mpp_create_rejects_fee_payer_without_sponsor() {
+        let builder = || {
+            tempo(TempoConfig {
+                recipient: TEST_RECIPIENT,
+            })
+            .secret_key("fee-payer-test-secret-key-32-bytes")
+            .fee_payer(true)
+        };
+
+        let err = Mpp::create(builder()).err().expect("no signer or relay");
+        assert!(
+            matches!(&err, crate::error::MppError::InvalidConfig(msg) if msg.contains("fee_payer")),
+            "{err}"
+        );
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        assert!(Mpp::create(builder().fee_payer_signer(signer)).is_ok());
+        let relay = crate::server::TempoRelayConfig::new("test-api-key");
+        assert!(Mpp::create(builder().relay(relay)).is_ok());
     }
 
     #[cfg(feature = "tempo")]

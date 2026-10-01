@@ -1045,20 +1045,16 @@ async fn test_e2e_charge_with_fee_payer() {
     let _ = handle.await;
 }
 
-/// Fee payer requested but server has no signer configured → 402.
+/// Fee payer requested but server has no signer configured → rejected at build time.
 #[tokio::test]
-async fn test_fee_payer_requested_but_no_signer_returns_402() {
+async fn test_fee_payer_requested_but_no_signer_is_rejected() {
     let rpc = rpc_url();
     let chain_id = get_chain_id(&rpc).await;
 
     let server_signer = PrivateKeySigner::random();
-    let client_signer = PrivateKeySigner::random();
-
-    fund_account(&rpc, server_signer.address()).await;
-    fund_account(&rpc, client_signer.address()).await;
 
     // Enable fee_payer in challenges but do NOT set a fee_payer_signer
-    let mpp = Mpp::create(
+    let err = Mpp::create(
         tempo(TempoConfig {
             recipient: &format!("{}", server_signer.address()),
         })
@@ -1067,30 +1063,10 @@ async fn test_fee_payer_requested_but_no_signer_returns_402() {
         .fee_payer(true)
         .secret_key(TEST_SECRET),
     )
-    .expect("failed to create Mpp");
+    .err()
+    .expect("fee payer without a signer or relay must not build");
 
-    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
-
-    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
-
-    let resp = Client::new()
-        .get(format!("{url}/paid"))
-        .send_with_payment(&provider)
-        .await
-        .expect("request failed");
-
-    assert_eq!(
-        resp.status(),
-        402,
-        "fee payer requested without signer should return 402"
-    );
-    assert!(
-        resp.headers().contains_key("www-authenticate"),
-        "should return a fresh challenge for retry"
-    );
-
-    handle.abort();
-    let _ = handle.await;
+    assert!(err.to_string().contains("fee_payer"), "{err}");
 }
 
 /// Fee payer with malicious 0x78 envelope (wrong recipient) → server rejects with 402.
