@@ -36,7 +36,7 @@ fn mpp() -> Mpp<MockMethod> {
     Mpp::new_with_config(
         MockMethod,
         "test-realm",
-        "test-secret",
+        "test-secret-key-at-least-32-bytes",
         "0x20c0000000000000000000000000000000000000",
         "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
     )

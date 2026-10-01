@@ -14,6 +14,7 @@ use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
 use super::session::{SessionCredentialPayload, TempoSessionMethodDetails};
+use super::session_receipt::SessionReceipt;
 use super::voucher::{canonical_voucher_signature, verify_voucher};
 use super::{INTENT_SESSION, METHOD_NAME};
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -353,6 +354,10 @@ pub struct SessionMethodConfig {
 /// - `topUp`: broadcast topUp tx, update deposit in store
 /// - `voucher`: verify voucher signature, check monotonicity/bounds/delta, update store
 /// - `close`: verify final voucher, close on-chain, finalize in store
+///
+/// Every action returns a session receipt: the [`Receipt`] references the
+/// channel and carries the [`SessionReceipt`] fields (`challengeId`,
+/// `acceptedCumulative`, `spent`, `txHash`, ...) as extension fields.
 #[derive(Clone)]
 pub struct SessionMethod<P> {
     provider: Arc<P>,
@@ -573,7 +578,7 @@ where
     /// Handle 'open' action.
     async fn handle_open(
         &self,
-        _credential: &PaymentCredential,
+        credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
         expected_payee: Address,
@@ -817,15 +822,19 @@ where
             )
             .await?;
 
-        let _state = updated.ok_or_else(|| VerificationError::new("failed to create channel"))?;
+        let state = updated.ok_or_else(|| VerificationError::new("failed to create channel"))?;
 
-        Ok(Receipt::success(METHOD_NAME, &open_tx_hash))
+        Ok(session_receipt(
+            &credential.challenge.id,
+            &state,
+            Some(open_tx_hash),
+        ))
     }
 
     /// Handle 'topUp' action.
     async fn handle_top_up(
         &self,
-        _credential: &PaymentCredential,
+        credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
         expected_payee: Address,
@@ -890,6 +899,7 @@ where
                 "topUp transaction reverted",
             ));
         }
+        let top_up_tx_hash = tx_receipt.transaction_hash().to_string();
 
         // Re-read on-chain state after topUp tx is broadcast.
         let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
@@ -926,13 +936,17 @@ where
             .await?;
 
         let state = updated.unwrap_or(channel);
-        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+        Ok(session_receipt(
+            &credential.challenge.id,
+            &state,
+            Some(top_up_tx_hash),
+        ))
     }
 
     /// Handle 'voucher' action.
     async fn handle_voucher(
         &self,
-        _credential: &PaymentCredential,
+        credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
         expected_payee: Address,
@@ -1040,26 +1054,29 @@ where
             .await?
             .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
 
-        self.verify_and_accept_voucher(
-            channel_id_str,
-            &refreshed,
-            cumulative_amount,
-            signature_str,
-            escrow,
-            chain_id,
-            min_delta,
-            refreshed.deposit,
-            refreshed.settled_on_chain,
-            refreshed.finalized,
-            refreshed.close_requested_at,
-        )
-        .await
+        let state = self
+            .verify_and_accept_voucher(
+                channel_id_str,
+                &refreshed,
+                cumulative_amount,
+                signature_str,
+                escrow,
+                chain_id,
+                min_delta,
+                refreshed.deposit,
+                refreshed.settled_on_chain,
+                refreshed.finalized,
+                refreshed.close_requested_at,
+            )
+            .await?;
+
+        Ok(session_receipt(&credential.challenge.id, &state, None))
     }
 
     /// Handle 'close' action.
     async fn handle_close(
         &self,
-        _credential: &PaymentCredential,
+        credential: &PaymentCredential,
         payload: &SessionCredentialPayload,
         details: &TempoSessionMethodDetails,
         expected_payee: Address,
@@ -1303,7 +1320,8 @@ where
 
         // Finalize in store.
         let channel_id_owned = channel_id_str.clone();
-        self.store
+        let finalized = self
+            .store
             .update_channel(
                 &channel_id_owned,
                 Box::new(move |current| {
@@ -1332,10 +1350,16 @@ where
             )
             .await?;
 
-        Ok(Receipt::success(METHOD_NAME, &close_tx_hash))
+        Ok(session_receipt(
+            &credential.challenge.id,
+            finalized.as_ref().unwrap_or(&channel),
+            Some(close_tx_hash),
+        ))
     }
 
     /// Shared logic for verifying an incremental voucher and updating channel state.
+    ///
+    /// Returns the channel state with the voucher applied.
     #[allow(clippy::too_many_arguments)]
     async fn verify_and_accept_voucher(
         &self,
@@ -1350,7 +1374,7 @@ where
         settled: u128,
         finalized: bool,
         close_requested_at: u64,
-    ) -> Result<Receipt, VerificationError> {
+    ) -> Result<ChannelState, VerificationError> {
         if finalized {
             return Err(VerificationError::channel_closed(
                 "channel is finalized on-chain",
@@ -1462,9 +1486,7 @@ where
             )
             .await?;
 
-        let state =
-            updated.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-        Ok(Receipt::success(METHOD_NAME, &state.channel_id))
+        updated.ok_or_else(|| VerificationError::channel_not_found("channel not found"))
     }
 }
 
@@ -1630,6 +1652,21 @@ where
             }
         }
     }
+}
+
+/// Build the receipt of a session action from the channel state it left
+/// behind. `tx_hash` is the transaction the action settled on-chain, if any.
+fn session_receipt(challenge_id: &str, state: &ChannelState, tx_hash: Option<String>) -> Receipt {
+    let mut receipt = SessionReceipt::new(
+        now_iso8601(),
+        challenge_id,
+        &state.channel_id,
+        state.highest_voucher_amount.to_string(),
+        state.spent.to_string(),
+    );
+    receipt.units = Some(state.units);
+    receipt.tx_hash = tx_hash;
+    receipt.to_base_receipt()
 }
 
 fn now_iso8601() -> String {
@@ -3697,6 +3734,19 @@ mod tests {
         )
     }
 
+    /// Decodes the `Payment-Receipt` header a server would send for `receipt`,
+    /// checking on the way that it parses as a [`SessionReceipt`].
+    fn receipt_json(receipt: &Receipt) -> serde_json::Value {
+        use crate::protocol::core::types::base64url_decode;
+
+        let header = receipt.to_header().unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&base64url_decode(&header).unwrap()).unwrap();
+        let session = SessionReceipt::from_header(&header).unwrap();
+        assert_eq!(serde_json::to_value(session).unwrap(), json);
+        json
+    }
+
     /// Without a close signer nothing can be settled on-chain, so a close must
     /// not report success or finalize the channel in the store.
     #[tokio::test]
@@ -3762,11 +3812,97 @@ mod tests {
             .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
 
         let receipt = method.verify_session(&credential, &request).await.unwrap();
-        assert_eq!(receipt.reference, tx_hash.to_string());
+        assert_eq!(
+            receipt_json(&receipt),
+            serde_json::json!({
+                "method": "tempo",
+                "intent": "session",
+                "status": "success",
+                "timestamp": receipt.timestamp,
+                "reference": channel_id,
+                "challengeId": "test-id",
+                "channelId": channel_id,
+                "acceptedCumulative": "1000",
+                "spent": "500",
+                "units": 0,
+                "txHash": tx_hash.to_string(),
+            })
+        );
 
         let stored = store.get_channel_sync(&channel_id).unwrap();
         assert!(stored.finalized);
         assert!(!stored.closing);
+    }
+
+    /// A voucher receipt reports the channel's balance and carries no
+    /// transaction hash.
+    #[tokio::test]
+    async fn test_voucher_returns_session_receipt() {
+        use alloy::sol_types::SolValue;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.spent = 400;
+        state.units = 4;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id, state.clone());
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&Bytes::from(
+            (
+                false,
+                0u64,
+                state.payer,
+                state.payee,
+                state.token,
+                state.authorized_signer,
+                state.deposit,
+                0u128,
+            )
+                .abi_encode_params(),
+        ));
+        let method = mocked_session_method(store, asserter);
+
+        let signature = voucher::sign_voucher(
+            &signer,
+            channel_id.parse().unwrap(),
+            2_000,
+            state.escrow_contract,
+            state.chain_id,
+        )
+        .await
+        .unwrap();
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Voucher {
+                channel_id: channel_id.clone(),
+                descriptor: None,
+                settlement_route: None,
+                cumulative_amount: "2000".to_string(),
+                signature: alloy::hex::encode_prefixed(signature),
+            },
+        );
+
+        let receipt = method.verify_session(&credential, &request).await.unwrap();
+        assert_eq!(
+            receipt_json(&receipt),
+            serde_json::json!({
+                "method": "tempo",
+                "intent": "session",
+                "status": "success",
+                "timestamp": receipt.timestamp,
+                "reference": channel_id,
+                "challengeId": "test-id",
+                "channelId": channel_id,
+                "acceptedCumulative": "2000",
+                "spent": "400",
+                "units": 4,
+            })
+        );
     }
 
     /// A mined-but-reverted close leaves the channel open on-chain, so it must

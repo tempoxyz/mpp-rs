@@ -23,6 +23,9 @@ use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationErr
 use super::types::{StripeCredentialPayload, StripeMethodDetails};
 use super::{DEFAULT_STRIPE_API_BASE, METHOD_NAME};
 
+/// Stripe's limit for a metadata value, in characters.
+const MAX_METADATA_VALUE_CHARS: usize = 500;
+
 /// Minimal Stripe PaymentIntent response fields.
 #[derive(serde::Deserialize)]
 struct PaymentIntentResponse {
@@ -37,6 +40,7 @@ pub struct ChargeMethod {
     network_id: String,
     payment_method_types: Vec<String>,
     api_base: String,
+    client: reqwest::Client,
 }
 
 impl ChargeMethod {
@@ -57,6 +61,7 @@ impl ChargeMethod {
             network_id: network_id.into(),
             payment_method_types,
             api_base: DEFAULT_STRIPE_API_BASE.to_string(),
+            client: reqwest::Client::new(),
         }
     }
 
@@ -110,8 +115,8 @@ impl ChargeMethod {
             params.push((format!("metadata[{key}]"), value.clone()));
         }
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header(
@@ -164,17 +169,28 @@ impl ChargeMethod {
         Ok((pi.id, pi.status))
     }
 
-    /// Build analytics metadata matching mppx's buildAnalytics().
+    /// Build analytics metadata for the PaymentIntent. Values are truncated
+    /// to Stripe's metadata value limit so a long client-supplied `source`
+    /// cannot make the request fail.
     fn build_analytics(credential: &PaymentCredential) -> HashMap<String, String> {
         let challenge = &credential.challenge;
-        let mut meta = HashMap::new();
-        meta.insert("mpp_version".into(), "1".into());
-        meta.insert("mpp_is_mpp".into(), "true".into());
-        meta.insert("mpp_intent".into(), challenge.intent.as_str().to_string());
-        meta.insert("mpp_challenge_id".into(), challenge.id.clone());
-        meta.insert("mpp_server_id".into(), challenge.realm.clone());
+        let mut meta: HashMap<String, String> = [
+            ("mpp_version", "1"),
+            ("mpp_is_mpp", "true"),
+            ("mpp_intent", challenge.intent.as_str()),
+            ("mpp_challenge_id", challenge.id.as_str()),
+            ("mpp_server_id", challenge.realm.as_str()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
         if let Some(ref source) = credential.source {
             meta.insert("mpp_client_id".into(), source.clone());
+        }
+        for value in meta.values_mut() {
+            if let Some((end, _)) = value.char_indices().nth(MAX_METADATA_VALUE_CHARS) {
+                value.truncate(end);
+            }
         }
         meta
     }
@@ -212,6 +228,15 @@ impl ChargeMethodTrait for ChargeMethod {
                 VerificationError::new(format!("Failed to decode challenge request: {e}"))
             })?;
 
+            // A request-bound externalId must be echoed by the credential.
+            if let Some(expected) = charge_request.external_id.as_deref() {
+                if payload.external_id.as_deref() != Some(expected) {
+                    return Err(VerificationError::credential_mismatch(
+                        "credential externalId does not match this route request",
+                    ));
+                }
+            }
+
             // Build metadata: analytics + user metadata from methodDetails
             let mut metadata = Self::build_analytics(&credential);
             let details: StripeMethodDetails = charge_request
@@ -239,7 +264,13 @@ impl ChargeMethodTrait for ChargeMethod {
                 .await?;
 
             match status.as_str() {
-                "succeeded" => Ok(Receipt::success(METHOD_NAME, &pi_id)),
+                "succeeded" => {
+                    let receipt = Receipt::success(METHOD_NAME, &pi_id);
+                    Ok(match charge_request.external_id {
+                        Some(external_id) => receipt.with_external_id(external_id),
+                        None => receipt,
+                    })
+                }
                 "requires_action" => Err(VerificationError::new(
                     "Stripe PaymentIntent requires action (e.g., 3DS)",
                 )),
@@ -277,6 +308,34 @@ mod tests {
         );
         assert_eq!(method.network_id(), "my-network");
         assert_eq!(method.payment_method_types(), &["card", "us_bank_account"]);
+    }
+
+    #[test]
+    fn test_build_analytics_truncates_values() {
+        let challenge = crate::protocol::core::ChallengeEcho {
+            id: "i".repeat(501),
+            realm: "test".into(),
+            method: METHOD_NAME.into(),
+            intent: "é".repeat(501).into(),
+            request: Default::default(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+            header: None,
+        };
+        let credential = PaymentCredential::with_source(
+            challenge,
+            "s".repeat(501),
+            StripeCredentialPayload {
+                spt: "spt".into(),
+                external_id: None,
+            },
+        );
+        let metadata = ChargeMethod::build_analytics(&credential);
+        assert_eq!(metadata["mpp_challenge_id"], "i".repeat(500));
+        assert_eq!(metadata["mpp_intent"], "é".repeat(500));
+        assert_eq!(metadata["mpp_client_id"], "s".repeat(500));
     }
 
     #[test]

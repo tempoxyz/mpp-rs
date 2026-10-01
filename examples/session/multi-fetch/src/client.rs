@@ -115,7 +115,7 @@ async fn main() {
                     {
                         println!(
                             "  Open channel tx: https://explore.moderato.tempo.xyz/tx/{}",
-                            r.reference
+                            tx_hash(&r)
                         );
                     }
                 }
@@ -142,7 +142,7 @@ async fn main() {
         Ok(Some(receipt)) => {
             println!(
                 "  Channel settled: https://explore.moderato.tempo.xyz/tx/{}",
-                receipt.reference
+                tx_hash(&receipt)
             );
         }
         Ok(None) => {
@@ -181,4 +181,13 @@ fn urlencoding(s: &str) -> String {
         .replace('#', "%23")
         .replace('&', "%26")
         .replace('=', "%3D")
+}
+
+/// The transaction a session receipt reports, falling back to its reference.
+fn tx_hash(receipt: &mpp::Receipt) -> &str {
+    receipt
+        .extensions
+        .get("txHash")
+        .and_then(|hash| hash.as_str())
+        .unwrap_or(&receipt.reference)
 }

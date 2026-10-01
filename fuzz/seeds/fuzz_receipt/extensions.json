@@ -1,0 +1,1 @@
+{"status":"success","method":"tempo","timestamp":"2026-01-29T12:00:30.5+01:00","reference":"0xabc","externalId":"order-1","subscriptionId":"sub-1","challengeId":"ch_1","channelId":"0x11","units":3,"nested":{"a":[1,2.5,null]}}

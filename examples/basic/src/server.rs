@@ -70,7 +70,8 @@ async fn main() {
     .currencies([PATH_USD])
     // Keep the demo runnable out-of-the-box while honoring required secret key semantics.
     .secret_key(
-        &std::env::var("MPP_SECRET_KEY").unwrap_or_else(|_| "basic-example-secret".to_string()),
+        &std::env::var("MPP_SECRET_KEY")
+            .unwrap_or_else(|_| "mpp-rs-demo-basic-example-secret-key".to_string()),
     );
 
     if let Ok(id) = std::env::var("CHAIN_ID") {

@@ -1,0 +1,1 @@
+Payment id="ch_unicode_astral", realm="api.example.com", method="tempo", intent="charge", request="e30", description="Pay with \ud83d\ude00"

@@ -1426,7 +1426,7 @@ mod tests {
             Mpp::new_with_config(
                 SuccessChargeMethod,
                 "test-realm",
-                "test-secret",
+                "test-secret-key-at-least-32-bytes",
                 "0x20c0000000000000000000000000000000000000",
                 "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
             )
@@ -1591,7 +1591,9 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
             let challenges = offered_challenges(&resp);
             assert_eq!(currencies_of(&challenges), [OUSD, USDC]);
-            assert!(challenges.iter().all(|c| c.verify("test-secret")));
+            assert!(challenges
+                .iter()
+                .all(|c| c.verify("test-secret-key-at-least-32-bytes")));
         }
 
         #[tokio::test]
