@@ -260,7 +260,9 @@ impl PaymentChallenge {
 
     /// Set the HTTP field that must carry the Payment credential.
     ///
-    /// `Authorization` is the implicit default and is stored as `None`.
+    /// `Payment-Authorization` is the only field a challenge can select.
+    /// `Authorization` is the implicit default and is stored as `None`, as is
+    /// any other value.
     /// Note: When using `with_secret_key`, set header BEFORE creating the
     /// challenge since it affects the HMAC. Use [`with_secret_key_full`]
     /// instead if header is needed in the HMAC.
@@ -272,9 +274,13 @@ impl PaymentChallenge {
 
     /// HTTP field a client must use for the payment credential.
     ///
-    /// Returns `header` when advertised, otherwise `Authorization`.
+    /// Returns `header` when it selects `Payment-Authorization`, otherwise
+    /// `Authorization`.
     pub fn credential_header(&self) -> &str {
-        self.header.as_deref().unwrap_or("Authorization")
+        match self.header.as_deref() {
+            Some(header) if is_payment_authorization_header(header) => header,
+            _ => "Authorization",
+        }
     }
 
     /// Get the effective expiration time for this payment challenge.
@@ -500,8 +506,8 @@ pub fn compute_challenge_id(
 /// Compute an HMAC-SHA256 challenge ID, including an advertised credential header.
 ///
 /// `Authorization` is the implicit protocol default and is never included in the
-/// HMAC input, matching mppx. An advertised header (typically
-/// `Payment-Authorization`) is inserted immediately before the final opaque slot.
+/// HMAC input, matching mppx. An advertised header (`Payment-Authorization`)
+/// is inserted immediately before the final opaque slot.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_challenge_id_with_header(
     secret_key: &str,
@@ -554,47 +560,22 @@ pub fn is_default_credential_header(header: Option<&str>) -> bool {
     }
 }
 
-/// RFC 9110 token used as an HTTP field name.
-fn is_valid_http_header_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| {
-            matches!(
-                b,
-                b'0'..=b'9'
-                    | b'A'..=b'Z'
-                    | b'a'..=b'z'
-                    | b'!'
-                    | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-        })
+/// Returns whether a credential header selects `Payment-Authorization`.
+fn is_payment_authorization_header(header: &str) -> bool {
+    header.eq_ignore_ascii_case(super::PAYMENT_AUTHORIZATION_HEADER)
 }
 
 /// Returns an advertised credential header, or `None` for the Authorization default.
 ///
-/// Invalid HTTP header names are ignored and treated as absent so HMAC
-/// computation cannot panic; parsers reject them separately.
+/// `Payment-Authorization` is the only field a challenge may select. Other
+/// values are ignored and treated as absent; parsers reject them separately.
 pub fn advertised_credential_header(header: Option<&str>) -> Option<String> {
-    if is_default_credential_header(header) {
-        return None;
-    }
     let name = header?;
-    is_valid_http_header_name(name).then(|| name.to_string())
+    is_payment_authorization_header(name).then(|| name.to_string())
 }
 
-/// Parse an advertised credential header from the wire, rejecting invalid names.
+/// Parse an advertised credential header from the wire, rejecting any value
+/// other than `Payment-Authorization`.
 pub fn parse_advertised_credential_header(
     header: Option<&str>,
 ) -> crate::error::Result<Option<String>> {
@@ -602,9 +583,9 @@ pub fn parse_advertised_credential_header(
         return Ok(None);
     }
     let name = header.unwrap_or("");
-    if !is_valid_http_header_name(name) {
+    if !is_payment_authorization_header(name) {
         return Err(crate::error::MppError::invalid_challenge_reason(
-            "Invalid HTTP header name",
+            "Unsupported credential header: must be Payment-Authorization",
         ));
     }
     Ok(Some(name.to_string()))
@@ -2349,6 +2330,67 @@ mod tests {
             advertised.to_echo().header.as_deref(),
             Some("Payment-Authorization")
         );
+    }
+
+    #[test]
+    fn test_credential_header_spelling_is_bound_as_given() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let build = |header| {
+            PaymentChallenge::with_secret_key_full(
+                "test-secret-key-12345",
+                "api.example.com",
+                "tempo",
+                "charge",
+                request.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(header),
+            )
+        };
+        let canonical = build("Payment-Authorization");
+        let lowercase = build("payment-authorization");
+
+        assert_eq!(lowercase.header.as_deref(), Some("payment-authorization"));
+        assert_ne!(lowercase.id, canonical.id);
+        assert!(lowercase.verify("test-secret-key-12345"));
+    }
+
+    #[test]
+    fn test_unsupported_credential_header_is_never_advertised() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
+        let implicit = PaymentChallenge::with_secret_key(
+            "test-secret-key-12345",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request.clone(),
+        );
+        let bound = PaymentChallenge::with_secret_key_full(
+            "test-secret-key-12345",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some("Cookie"),
+        );
+        assert!(bound.header.is_none());
+        assert_eq!(bound.id, implicit.id);
+
+        let built = PaymentChallenge::new("id", "api", "tempo", "charge", request)
+            .with_header("X-Anything");
+        assert!(built.header.is_none());
+        assert!(!built.to_header().unwrap().contains("header="));
+
+        let mut assigned = built;
+        assigned.header = Some("Cookie".to_string());
+        assert_eq!(assigned.credential_header(), "Authorization");
+        assert!(assigned.to_header().is_err());
     }
 
     #[test]
