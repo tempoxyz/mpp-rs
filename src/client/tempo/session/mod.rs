@@ -26,8 +26,8 @@ use self::channel_ops::{
     create_precompile_close_payload_with_descriptor_primitive, create_precompile_open_payload,
     create_precompile_top_up_transaction_payload,
     create_precompile_voucher_payload_with_descriptor_primitive, create_voucher_payload,
-    is_precompile_escrow, resolve_chain_id, resolve_escrow, try_recover_channel, ChannelEntry,
-    OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
+    is_precompile_escrow, resolve_chain_id, resolve_escrow_with_policy, try_recover_channel,
+    ChannelEntry, OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
 };
 use self::recovery::{
     can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
@@ -69,8 +69,10 @@ pub struct TempoSessionProvider {
     signer: TempoPrimitiveSigner,
     rpc_url: reqwest::Url,
     rpc_provider: alloy::providers::RootProvider<TempoNetwork>,
-    /// Escrow contract address override. If None, resolved from challenge or defaults.
+    /// Escrow contract address pin. If None, the canonical escrow for the challenge is used.
     escrow_contract: Option<Address>,
+    /// Accept a non-canonical escrow advertised by the server.
+    allow_custom_escrow: bool,
     /// Address authorized to sign vouchers. Defaults to signer address.
     authorized_signer: Option<Address>,
     /// Signing mode (direct or keychain).
@@ -137,6 +139,7 @@ impl TempoSessionProvider {
             rpc_url: url,
             rpc_provider,
             escrow_contract: None,
+            allow_custom_escrow: false,
             authorized_signer: None,
             signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
             max_deposit: None,
@@ -155,9 +158,23 @@ impl TempoSessionProvider {
         })
     }
 
-    /// Set the escrow contract address override.
+    /// Pin the escrow contract address.
+    ///
+    /// Challenges that advertise a different escrow are rejected. Takes
+    /// precedence over [`Self::with_allow_custom_escrow`].
     pub fn with_escrow_contract(mut self, addr: Address) -> Self {
         self.escrow_contract = Some(addr);
+        self
+    }
+
+    /// Accept a non-canonical escrow contract advertised by the server.
+    ///
+    /// Disabled by default: only the canonical escrow for the challenge's
+    /// chain and session protocol is accepted, because opening a legacy
+    /// channel approves the deposit to the escrow. Enable this only for
+    /// servers you trust, e.g. against a local deployment.
+    pub fn with_allow_custom_escrow(mut self, allow: bool) -> Self {
+        self.allow_custom_escrow = allow;
         self
     }
 
@@ -559,7 +576,12 @@ impl TempoSessionProvider {
         challenge: &PaymentChallenge,
     ) -> Result<(String, u64), MppError> {
         let chain_id = resolve_chain_id(challenge);
-        let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;
+        let escrow_contract = resolve_escrow_with_policy(
+            challenge,
+            chain_id,
+            self.escrow_contract,
+            self.allow_custom_escrow,
+        )?;
         let session_req: SessionRequest = challenge
             .request
             .decode()
@@ -1657,7 +1679,12 @@ impl TempoSessionProvider {
         *self.last_challenge.lock().unwrap() = Some(challenge.clone());
 
         let chain_id = resolve_chain_id(challenge);
-        let escrow_contract = resolve_escrow(challenge, chain_id, self.escrow_contract)?;
+        let escrow_contract = resolve_escrow_with_policy(
+            challenge,
+            chain_id,
+            self.escrow_contract,
+            self.allow_custom_escrow,
+        )?;
 
         let session_req: SessionRequest = challenge
             .request
@@ -2096,6 +2123,25 @@ mod tests {
         assert!(matches!(err, MppError::PaymentExpired(_)));
         assert!(provider.last_challenge.lock().unwrap().is_none());
         assert!(provider.channels.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pay_rejects_untrusted_escrow_from_challenge() {
+        let provider = make_test_provider();
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x66),
+        );
+
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            MppError::InvalidConfig(ref msg) if msg.contains("does not match client escrow")
+        ));
+        assert!(provider.channels.lock().unwrap().is_empty());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2710,7 +2756,7 @@ mod tests {
     async fn test_voucher_credential_returns_signed_cumulative_voucher() {
         use crate::protocol::methods::tempo::session::SessionCredentialPayload;
 
-        let provider = make_test_provider();
+        let provider = make_test_provider().with_allow_custom_escrow(true);
         let payee = Address::repeat_byte(0x11);
         let currency = Address::repeat_byte(0x22);
         let escrow = Address::repeat_byte(0x33);
@@ -2794,7 +2840,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_voucher_rejects_channel_from_different_session() {
-        let provider = make_test_provider();
+        let provider = make_test_provider().with_allow_custom_escrow(true);
         let expected_payee = Address::repeat_byte(0x11);
         let other_payee = Address::repeat_byte(0x22);
         let currency = Address::repeat_byte(0x33);
@@ -2864,7 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_ignores_unrelated_open_channel() {
-        let provider = make_test_provider();
+        let provider = make_test_provider().with_allow_custom_escrow(true);
         let expected_payee = Address::repeat_byte(0x11);
         let other_payee = Address::repeat_byte(0x22);
         let currency = Address::repeat_byte(0x33);
