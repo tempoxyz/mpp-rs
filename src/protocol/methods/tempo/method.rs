@@ -982,7 +982,7 @@ where
                     .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                     .await
                     .map_err(|e| {
-                        VerificationError::new(format!("Failed to record tx hash: {e}"))
+                        VerificationError::internal(format!("Failed to record tx hash: {e}"))
                     })?;
                 if !claimed {
                     return Err(VerificationError::new(
@@ -992,7 +992,7 @@ where
             } else if store
                 .get(&replay_key)
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to check tx hash: {e}")))?
+                .map_err(|e| VerificationError::internal(format!("Failed to check tx hash: {e}")))?
                 .is_some()
             {
                 return Err(VerificationError::new(
@@ -1016,8 +1016,9 @@ where
         expected: &[Transfer],
         sender_policy: ReceiptSenderPolicy<'_>,
     ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
-        let receipt_json = serde_json::to_value(receipt)
-            .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
+        let receipt_json = serde_json::to_value(receipt).map_err(|e| {
+            VerificationError::internal(format!("Failed to serialize receipt: {}", e))
+        })?;
 
         let logs = receipt_json
             .get("logs")
@@ -1312,7 +1313,7 @@ where
                 serde_json::Value::Bool(true),
             )
             .await
-            .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
+            .map_err(|e| VerificationError::internal(format!("Failed to record proof: {e}")))?;
         if !reserved {
             return Err(VerificationError::new(
                 "Proof credential has already been used.",
@@ -1465,7 +1466,9 @@ where
                 if store
                     .get(&Self::proof_replay_key(credential))
                     .await
-                    .map_err(|e| VerificationError::new(format!("Failed to check proof: {e}")))?
+                    .map_err(|e| {
+                        VerificationError::internal(format!("Failed to check proof: {e}"))
+                    })?
                     .is_some()
                 {
                     return Err(VerificationError::new(
@@ -1569,7 +1572,7 @@ where
             let claimed = store
                 .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+                .map_err(|e| VerificationError::internal(format!("Failed to record tx: {e}")))?;
             if !claimed {
                 return Err(VerificationError::new(
                     "Transaction has already been submitted.",
@@ -1619,7 +1622,9 @@ where
             let claimed = store
                 .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+                .map_err(|e| {
+                    VerificationError::internal(format!("Failed to record tx hash: {e}"))
+                })?;
             if !claimed {
                 return Err(VerificationError::new(
                     "Transaction hash has already been used.",
@@ -1745,7 +1750,7 @@ where
             .first()
             .and_then(|block| block.calls.first())
             .ok_or_else(|| {
-                VerificationError::new("Pre-broadcast simulation returned no call results")
+                VerificationError::internal("Pre-broadcast simulation returned no call results")
             })?;
 
         if !call.status {
@@ -1826,7 +1831,7 @@ where
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| VerificationError::new(format!("System clock error: {e}")))?
+            .map_err(|e| VerificationError::internal(format!("System clock error: {e}")))?
             .as_secs();
 
         let valid_before = match tx.valid_before {
@@ -1922,10 +1927,9 @@ where
 
         // Compute the fee payer signature hash and co-sign
         let fp_hash = tx.fee_payer_signature_hash(sender);
-        let fp_sig = fee_payer_signer
-            .sign_hash(&fp_hash)
-            .await
-            .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {e}")))?;
+        let fp_sig = fee_payer_signer.sign_hash(&fp_hash).await.map_err(|e| {
+            VerificationError::internal(format!("Failed to co-sign transaction: {e}"))
+        })?;
 
         tx.fee_payer_signature = Some(fp_sig);
 
@@ -4753,6 +4757,70 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.reference, challenge.id);
         assert!(store.get(&key).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_and_store_failures_are_internal_errors() {
+        use crate::error::PaymentError;
+        use crate::store::{Store, StoreError};
+        use std::pin::Pin;
+
+        // Has no atomic claim, so recording the proof fails.
+        struct NonAtomicStore;
+        impl Store for NonAtomicStore {
+            fn get(
+                &self,
+                _key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(
+                &self,
+                _key: &str,
+                _value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn delete(
+                &self,
+                _key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        // The chain ID lookup hits an unreachable RPC.
+        let method = ChargeMethod::new(provider.clone());
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert_eq!(err.to_problem_details(None).status, 500, "{err}");
+
+        let method = ChargeMethod::new(provider).with_store(Arc::new(NonAtomicStore));
+        method.cached_chain_id.set(42431).unwrap();
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert_eq!(err.to_problem_details(None).status, 500, "{err}");
     }
 
     #[tokio::test]

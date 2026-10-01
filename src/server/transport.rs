@@ -143,9 +143,7 @@ impl Transport for HttpTransport {
         };
 
         // extract_payment_scheme returns the full "Payment ..." fragment
-        let credential = crate::protocol::core::parse_authorization(payment).map_err(|e| {
-            MppError::MalformedCredential(Some(format!("failed to parse credential: {e}")))
-        })?;
+        let credential = crate::protocol::core::parse_authorization(payment)?;
 
         Ok(Some(credential))
     }
