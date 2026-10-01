@@ -19,7 +19,7 @@ use mpp::PaymentPayload;
 use mpp::{
     client::{
         ws::{WsClientMessage, WsServerMessage},
-        PaymentProvider, DEFAULT_MAX_PAYMENT_RETRIES,
+        PaymentProvider, PendingPayment, DEFAULT_MAX_PAYMENT_RETRIES,
     },
     format_authorization, MppError, PaymentChallenge, PaymentCredential, Receipt,
 };
@@ -206,61 +206,6 @@ enum TerminationReason {
     /// Deterministic MPP failure (provider error, server `error` frame,
     /// malformed/unexpected frame). Do not reconnect.
     Fatal,
-}
-
-/// A credential whose server acknowledgement is still outstanding.
-///
-/// Dropping this guard releases transient provider state without rolling back
-/// durable state after an ambiguous socket failure.
-pub(crate) struct PendingPayment<P: PaymentProvider> {
-    provider: P,
-    challenge: PaymentChallenge,
-    credential: PaymentCredential,
-    settled: bool,
-}
-
-impl<P: PaymentProvider> PendingPayment<P> {
-    pub(crate) const fn new(
-        provider: P,
-        challenge: PaymentChallenge,
-        credential: PaymentCredential,
-    ) -> Self {
-        Self {
-            provider,
-            challenge,
-            credential,
-            settled: false,
-        }
-    }
-
-    pub(crate) const fn credential(&self) -> &PaymentCredential {
-        &self.credential
-    }
-
-    pub(crate) async fn commit(mut self) -> Result<(), MppError> {
-        self.provider
-            .commit_payment(&self.challenge, &self.credential)
-            .await?;
-        self.settled = true;
-        Ok(())
-    }
-
-    pub(crate) async fn rollback(mut self) -> Result<(), MppError> {
-        self.provider
-            .rollback_payment(&self.challenge, &self.credential)
-            .await?;
-        self.settled = true;
-        Ok(())
-    }
-}
-
-impl<P: PaymentProvider> Drop for PendingPayment<P> {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.provider
-                .abandon_payment(&self.challenge, &self.credential);
-        }
-    }
 }
 
 /// Connection details for an MPP-over-WebSocket transport.

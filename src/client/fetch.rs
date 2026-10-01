@@ -11,7 +11,7 @@ use super::events::{
     ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
 };
-use super::provider::{PaymentContext, PaymentProvider, PendingPayments};
+use super::provider::{PaymentContext, PaymentProvider, PendingPayment};
 use super::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::client::challenge_selection::{
     expired_payment_error, select_supported_challenge, ChallengeSelectionError,
@@ -239,7 +239,6 @@ async fn send_with_payment<P: PaymentProvider>(
     let ranking_accept = caller_accept.or(provider_accept);
 
     let mut paid_challenge_ids = std::collections::HashSet::new();
-    let mut pending_payments = PendingPayments::new(provider.clone());
     let mut retried_stale_session = false;
     let mut refreshed_after_provider_setup = false;
     let mut resp = match initial_response {
@@ -265,10 +264,6 @@ async fn send_with_payment<P: PaymentProvider>(
                     reason: None,
                 }))
                 .await;
-            pending_payments
-                .rollback()
-                .await
-                .map_err(HttpError::Payment)?;
             return Err(err);
         }
 
@@ -281,19 +276,6 @@ async fn send_with_payment<P: PaymentProvider>(
 
         if www_auth_values.is_empty() {
             if !paid_challenge_ids.is_empty() {
-                if !pending_payments.is_empty() {
-                    if resp.headers().contains_key("payment-receipt") {
-                        pending_payments
-                            .commit()
-                            .await
-                            .map_err(HttpError::Payment)?;
-                    } else {
-                        pending_payments
-                            .rollback()
-                            .await
-                            .map_err(HttpError::Payment)?;
-                    }
-                }
                 return Ok(resp);
             }
             events
@@ -303,10 +285,6 @@ async fn send_with_payment<P: PaymentProvider>(
                     reason: None,
                 }))
                 .await;
-            pending_payments
-                .rollback()
-                .await
-                .map_err(HttpError::Payment)?;
             return Err(HttpError::MissingChallenge);
         }
 
@@ -333,10 +311,6 @@ async fn send_with_payment<P: PaymentProvider>(
                         reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                     }))
                     .await;
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
                 return Err(err);
             }
             Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
@@ -348,19 +322,11 @@ async fn send_with_payment<P: PaymentProvider>(
                         reason: None,
                     }))
                     .await;
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
                 return Err(err);
             }
         };
 
         let Some(url) = url.clone() else {
-            pending_payments
-                .rollback()
-                .await
-                .map_err(HttpError::Payment)?;
             return Err(HttpError::CloneFailed);
         };
         let payment_context = PaymentContext {
@@ -382,10 +348,6 @@ async fn send_with_payment<P: PaymentProvider>(
                     )));
                 }
                 refreshed_after_provider_setup = true;
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
                 paid_challenge_ids.clear();
                 resp = retry_builder
                     .try_clone()
@@ -404,10 +366,6 @@ async fn send_with_payment<P: PaymentProvider>(
                         reason: None,
                     }))
                     .await;
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
                 return Err(http_err);
             }
         };
@@ -421,10 +379,6 @@ async fn send_with_payment<P: PaymentProvider>(
                     reason: None,
                 }))
                 .await;
-            pending_payments
-                .rollback()
-                .await
-                .map_err(HttpError::Payment)?;
             return Ok(resp);
         }
 
@@ -448,16 +402,12 @@ async fn send_with_payment<P: PaymentProvider>(
                             reason: None,
                         }))
                         .await;
-                    pending_payments
-                        .rollback()
-                        .await
-                        .map_err(HttpError::Payment)?;
                     return Err(http_err);
                 }
             },
         };
 
-        pending_payments.push((challenge.clone(), credential.clone()));
+        let pending = PendingPayment::new(provider.clone(), challenge.clone(), credential.clone());
 
         events
             .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
@@ -477,10 +427,7 @@ async fn send_with_payment<P: PaymentProvider>(
                         reason: None,
                     }))
                     .await;
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
+                pending.rollback().await.map_err(HttpError::Payment)?;
                 return Err(http_err);
             }
         };
@@ -496,10 +443,7 @@ async fn send_with_payment<P: PaymentProvider>(
                         reason: None,
                     }))
                     .await;
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
+                pending.rollback().await.map_err(HttpError::Payment)?;
                 return Err(http_err);
             }
         };
@@ -511,10 +455,7 @@ async fn send_with_payment<P: PaymentProvider>(
         let retry = match retry_builder.try_clone() {
             Some(retry) => retry.headers(payment_headers),
             None => {
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
+                pending.rollback().await.map_err(HttpError::Payment)?;
                 return Err(HttpError::CloneFailed);
             }
         };
@@ -536,10 +477,7 @@ async fn send_with_payment<P: PaymentProvider>(
                 // response was lost. Preserve optimistic provider state
                 // until a later challenge can reconcile it, while
                 // releasing any delivery lease held by the provider.
-                pending_payments
-                    .commit()
-                    .await
-                    .map_err(HttpError::Payment)?;
+                pending.commit().await.map_err(HttpError::Payment)?;
                 return Err(http_err);
             }
         };
@@ -553,10 +491,7 @@ async fn send_with_payment<P: PaymentProvider>(
                     status,
                 }))
                 .await;
-            pending_payments
-                .commit()
-                .await
-                .map_err(HttpError::Payment)?;
+            pending.commit().await.map_err(HttpError::Payment)?;
             return Ok(resp);
         }
 
@@ -569,10 +504,7 @@ async fn send_with_payment<P: PaymentProvider>(
             && challenge.intent.as_str() == "session"
         {
             retried_stale_session = true;
-            pending_payments
-                .invalidate()
-                .await
-                .map_err(HttpError::Payment)?;
+            pending.invalidate().await.map_err(HttpError::Payment)?;
             paid_challenge_ids.clear();
             resp = retry_builder
                 .try_clone()
@@ -588,29 +520,17 @@ async fn send_with_payment<P: PaymentProvider>(
         // and the final 402 without emitting `payment.failed`.
         if status != StatusCode::PAYMENT_REQUIRED || payment_attempt == max_payment_retries {
             if resp.headers().contains_key("payment-receipt") {
-                pending_payments
-                    .commit()
-                    .await
-                    .map_err(HttpError::Payment)?;
+                pending.commit().await.map_err(HttpError::Payment)?;
             } else {
-                pending_payments
-                    .rollback()
-                    .await
-                    .map_err(HttpError::Payment)?;
+                pending.rollback().await.map_err(HttpError::Payment)?;
             }
             return Ok(resp);
         }
 
         if resp.headers().contains_key("payment-receipt") {
-            pending_payments
-                .commit()
-                .await
-                .map_err(HttpError::Payment)?;
+            pending.commit().await.map_err(HttpError::Payment)?;
         } else {
-            pending_payments
-                .rollback()
-                .await
-                .map_err(HttpError::Payment)?;
+            pending.rollback().await.map_err(HttpError::Payment)?;
         }
     }
 

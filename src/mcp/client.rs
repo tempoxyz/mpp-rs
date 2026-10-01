@@ -8,6 +8,7 @@ use std::future::Future;
 
 use thiserror::Error;
 
+pub use crate::client::PendingPayment;
 use crate::{
     client::{
         challenge_selection::{
@@ -139,64 +140,11 @@ where
             .provider
             .pay_with_context(&challenge, self.context.clone())
             .await?;
-        Ok(Some(PendingPayment {
-            provider: self.provider.clone(),
+        Ok(Some(PendingPayment::new(
+            self.provider.clone(),
             challenge,
             credential,
-            active: true,
-        }))
-    }
-}
-
-/// A prepared MCP payment awaiting a definitive delivery outcome.
-///
-/// Dropping an active payment invokes [`PaymentProvider::abandon_payment`],
-/// which is the cancellation and ambiguous-delivery path. Call [`Self::commit`]
-/// after acceptance or [`Self::rollback`] when the credential was not sent or
-/// was definitively rejected.
-pub struct PendingPayment<P: PaymentProvider> {
-    provider: P,
-    challenge: PaymentChallenge,
-    credential: PaymentCredential,
-    active: bool,
-}
-
-impl<P: PaymentProvider> PendingPayment<P> {
-    /// Returns the selected challenge.
-    pub fn challenge(&self) -> &PaymentChallenge {
-        &self.challenge
-    }
-
-    /// Returns the credential to attach to MCP request metadata.
-    pub fn credential(&self) -> &PaymentCredential {
-        &self.credential
-    }
-
-    /// Commits provider state after the server accepts the credential.
-    pub async fn commit(mut self) -> Result<(), MppError> {
-        self.provider
-            .commit_payment(&self.challenge, &self.credential)
-            .await?;
-        self.active = false;
-        Ok(())
-    }
-
-    /// Rolls back provider state after definitive non-delivery or rejection.
-    pub async fn rollback(mut self) -> Result<(), MppError> {
-        self.provider
-            .rollback_payment(&self.challenge, &self.credential)
-            .await?;
-        self.active = false;
-        Ok(())
-    }
-}
-
-impl<P: PaymentProvider> Drop for PendingPayment<P> {
-    fn drop(&mut self) {
-        if self.active {
-            self.provider
-                .abandon_payment(&self.challenge, &self.credential);
-        }
+        )))
     }
 }
 

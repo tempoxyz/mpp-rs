@@ -39,7 +39,7 @@ mod fetch;
 mod middleware;
 
 pub use error::HttpError;
-pub use provider::{MultiProvider, PaymentContext, PaymentProvider};
+pub use provider::{MultiProvider, PaymentContext, PaymentProvider, PendingPayment};
 
 /// Default number of payment challenge retries after the initial 402 response.
 #[cfg(any(feature = "client", feature = "middleware"))]
