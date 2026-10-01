@@ -50,40 +50,6 @@ impl<E> From<HttpError> for FlowError<E> {
     }
 }
 
-/// Behaviour in which `Fetch` and `PaymentMiddleware` have always differed.
-#[derive(Clone, Copy)]
-pub(crate) struct Quirks {
-    /// `Fetch` retries the request as the caller built it, without the
-    /// `Accept-Payment` header injected into the first attempt.
-    pub(crate) accept_payment_on_retry: bool,
-    /// `PaymentMiddleware` does not call
-    /// [`PaymentProvider::prepare_http_payment_challenge`].
-    pub(crate) prepare_challenge: bool,
-    /// `PaymentMiddleware` returns the `410 Gone` of a stale session instead
-    /// of repeating the request once.
-    pub(crate) retry_stale_session: bool,
-    /// `PaymentMiddleware` fails on a 402 without a challenge even when it
-    /// answers a paid request.
-    pub(crate) return_unchallenged_paid_response: bool,
-}
-
-impl Quirks {
-    pub(crate) const FETCH: Self = Self {
-        accept_payment_on_retry: false,
-        prepare_challenge: true,
-        retry_stale_session: true,
-        return_unchallenged_paid_response: true,
-    };
-
-    #[cfg(feature = "middleware")]
-    pub(crate) const MIDDLEWARE: Self = Self {
-        accept_payment_on_retry: true,
-        prepare_challenge: false,
-        retry_stale_session: false,
-        return_unchallenged_paid_response: false,
-    };
-}
-
 /// Answers `402 Payment Required` responses by paying a challenge and
 /// repeating the request with the credential.
 pub(crate) struct PaymentFlow<'a, P> {
@@ -91,7 +57,6 @@ pub(crate) struct PaymentFlow<'a, P> {
     pub(crate) policy: &'a AcceptPaymentPolicy,
     pub(crate) events: &'a ClientEvents,
     pub(crate) max_payment_retries: usize,
-    pub(crate) quirks: Quirks,
 }
 
 impl<P: PaymentProvider> PaymentFlow<'_, P> {
@@ -111,8 +76,6 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             .map(String::from);
         let provider_accept = self.provider.accept_payment_header();
 
-        let caller_request = (!self.quirks.accept_payment_on_retry).then(|| request.try_clone());
-
         // Inject only if the caller didn't set their own header AND the
         // policy permits it. Caller-set headers are never overwritten.
         let mut injected = false;
@@ -130,7 +93,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         // otherwise fall back to the provider's preferences.
         let ranking_accept = caller_accept.or(provider_accept);
 
-        let retry = caller_request.unwrap_or_else(|| request.try_clone());
+        let retry = request.try_clone();
         let mut resp = match initial_response {
             Some(response) => response,
             None => exchange.send(request).await.map_err(FlowError::Send)?,
@@ -146,7 +109,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
         // The provider sees the request as the caller built it.
         let mut headers = retry.headers().clone();
-        if injected && self.quirks.accept_payment_on_retry {
+        if injected {
             headers.remove(ACCEPT_PAYMENT_HEADER);
         }
         let payment_context = PaymentContext {
@@ -175,7 +138,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 .collect();
 
             if www_auth_values.is_empty() {
-                if !paid_challenge_ids.is_empty() && self.quirks.return_unchallenged_paid_response {
+                if !paid_challenge_ids.is_empty() {
                     return Ok(resp);
                 }
                 return Err(self.fail(None, HttpError::MissingChallenge).await);
@@ -215,14 +178,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 }
             };
 
-            let prepared = if self.quirks.prepare_challenge {
-                self.provider
-                    .prepare_http_payment_challenge(&challenge, payment_context.clone())
-                    .await
-            } else {
-                Ok(Some(challenge.clone()))
-            };
-            let challenge = match prepared {
+            let challenge = match self
+                .provider
+                .prepare_http_payment_challenge(&challenge, payment_context.clone())
+                .await
+            {
                 Ok(Some(challenge)) => challenge,
                 Ok(None) => {
                     if refreshed_after_provider_setup {
@@ -342,23 +302,16 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Ok(resp);
             }
 
-            let stale_session =
-                status == StatusCode::GONE && challenge.intent.as_str() == "session";
-
-            // The server no longer has the session channel. Let the provider
-            // forget it so the next request can open a fresh one.
-            if stale_session && !self.quirks.retry_stale_session {
-                pending.invalidate().await.map_err(HttpError::Payment)?;
-                return Ok(resp);
-            }
-
             // A durable session may outlive the server-side channel record.
             // Invalidate that local channel and retry the original unpaid
             // request once through the normal 402 flow so a fresh channel can
             // be opened without surfacing a recoverable 410 to the caller.
-            if stale_session && !retried_stale_session {
-                retried_stale_session = true;
+            if status == StatusCode::GONE && challenge.intent.as_str() == "session" {
                 pending.invalidate().await.map_err(HttpError::Payment)?;
+                if retried_stale_session {
+                    return Ok(resp);
+                }
+                retried_stale_session = true;
                 paid_challenge_ids.clear();
                 resp = exchange
                     .send(retry.try_clone().ok_or(HttpError::CloneFailed)?)
@@ -403,3 +356,6 @@ fn authorization_value(credential: &PaymentCredential) -> Result<HeaderValue, Ht
         .map_err(|err| HttpError::InvalidCredential(err.to_string()))?;
     HeaderValue::from_str(&header).map_err(|err| HttpError::InvalidCredential(err.to_string()))
 }
+
+#[cfg(all(test, feature = "middleware"))]
+mod tests;

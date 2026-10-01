@@ -920,6 +920,17 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn test_invalid_request_reports_the_builder_error() {
+        let err = reqwest::Client::new()
+            .get("not a url")
+            .send_with_payment(&MockProvider::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HttpError::Request(err) if err.is_builder()));
+    }
+
+    #[tokio::test]
     async fn test_402_missing_www_authenticate() {
         let app = Router::new().route(
             "/no-header",

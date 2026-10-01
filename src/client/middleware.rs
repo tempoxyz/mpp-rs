@@ -11,7 +11,7 @@ use crate::client::events::{
     ChallengeReceivedContext, ClientEventSubscription, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentResponseContext,
 };
-use crate::client::flow::{Exchange, FlowError, PaymentFlow, Quirks};
+use crate::client::flow::{Exchange, FlowError, PaymentFlow};
 use crate::client::provider::PaymentProvider;
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 
@@ -140,7 +140,6 @@ where
             policy: &self.accept_payment_policy,
             events: &self.events,
             max_payment_retries: self.max_payment_retries,
-            quirks: Quirks::MIDDLEWARE,
         };
         flow.run(&mut NextExchange { next, extensions }, req, None)
             .await
