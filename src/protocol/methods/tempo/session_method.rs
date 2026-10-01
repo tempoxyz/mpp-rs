@@ -347,7 +347,8 @@ pub struct SessionMethod<P> {
     provider: Arc<P>,
     store: Arc<dyn ChannelStore>,
     config: SessionMethodConfig,
-    /// Optional signer for submitting on-chain close transactions.
+    /// Signer for submitting on-chain close transactions. `close` is rejected
+    /// when unset.
     close_signer: Option<Arc<super::DynSigner>>,
 }
 
@@ -387,6 +388,9 @@ where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
     /// Create a new Tempo session method.
+    ///
+    /// Call [`with_close_signer`](Self::with_close_signer) to let the method
+    /// settle `close` credentials on-chain; without it they are rejected.
     pub fn new(provider: P, store: Arc<dyn ChannelStore>, config: SessionMethodConfig) -> Self {
         Self {
             provider: Arc::new(provider),
@@ -397,6 +401,9 @@ where
     }
 
     /// Set the signer used for submitting on-chain close transactions.
+    ///
+    /// Required to accept `close` credentials: a channel is only finalized
+    /// once its close transaction succeeded on-chain.
     pub fn with_close_signer<S>(mut self, signer: S) -> Self
     where
         S: alloy::signers::Signer + Send + Sync + 'static,
@@ -1127,6 +1134,12 @@ where
             ));
         }
 
+        let signer = self.close_signer.as_ref().ok_or_else(|| {
+            VerificationError::new(
+                "cannot close channel: no close signer configured (see `with_close_signer`)",
+            )
+        })?;
+
         let channel_id_for_lock = channel_id_str.clone();
         self.store
             .update_channel(
@@ -1148,10 +1161,9 @@ where
             )
             .await?;
 
-        // Submit close transaction on-chain if we have a signer.
-        let close_tx_result: Result<Option<String>, VerificationError> = if let Some(ref signer) =
-            self.close_signer
-        {
+        // Submit the close transaction on-chain. Failures are collected so the
+        // `closing` flag can be reset below.
+        let close_tx_result: Result<String, VerificationError> = async {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
             use alloy::sol_types::SolCall;
@@ -1238,11 +1250,16 @@ where
                 .get_receipt()
                 .await
                 .map_err(|e| VerificationError::network_error(format!("close tx failed: {}", e)))?;
+            if !receipt.status() {
+                return Err(VerificationError::transaction_failed(format!(
+                    "close transaction reverted (tx: {})",
+                    receipt.transaction_hash()
+                )));
+            }
 
-            Ok(Some(receipt.transaction_hash.to_string()))
-        } else {
-            Ok(None)
-        };
+            Ok(receipt.transaction_hash().to_string())
+        }
+        .await;
 
         let close_tx_hash = match close_tx_result {
             Ok(hash) => hash,
@@ -1271,8 +1288,7 @@ where
 
         // Finalize in store.
         let channel_id_owned = channel_id_str.clone();
-        let updated = self
-            .store
+        self.store
             .update_channel(
                 &channel_id_owned,
                 Box::new(move |current| {
@@ -1301,12 +1317,7 @@ where
             )
             .await?;
 
-        let reference = close_tx_hash.unwrap_or_else(|| {
-            updated
-                .map(|s| s.channel_id)
-                .unwrap_or_else(|| channel.channel_id.clone())
-        });
-        Ok(Receipt::success(METHOD_NAME, &reference))
+        Ok(Receipt::success(METHOD_NAME, &close_tx_hash))
     }
 
     /// Shared logic for verifying an incremental voucher and updating channel state.
@@ -3459,6 +3470,198 @@ mod tests {
             "expected token mismatch error, got: {}",
             err.message
         );
+    }
+
+    /// Stores an open channel, queues its on-chain `getChannel` state on the
+    /// mocked provider and returns a valid close credential for it.
+    async fn close_setup(
+        store: &InMemoryChannelStore,
+        asserter: &alloy::providers::mock::Asserter,
+    ) -> (
+        String,
+        crate::protocol::intents::SessionRequest,
+        crate::protocol::core::PaymentCredential,
+    ) {
+        use alloy::sol_types::SolValue;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.spent = 500;
+        store.insert(&channel_id, state.clone());
+
+        asserter.push_success(&Bytes::from(
+            (
+                false,
+                0u64,
+                state.payer,
+                state.payee,
+                state.token,
+                state.authorized_signer,
+                state.deposit,
+                0u128,
+            )
+                .abi_encode_params(),
+        ));
+
+        let signature = voucher::sign_voucher(
+            &signer,
+            channel_id.parse().unwrap(),
+            1_000,
+            state.escrow_contract,
+            state.chain_id,
+        )
+        .await
+        .unwrap();
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Close {
+                channel_id: channel_id.clone(),
+                descriptor: None,
+                settlement_route: None,
+                cumulative_amount: "1000".to_string(),
+                signature: alloy::hex::encode_prefixed(signature),
+            },
+        );
+        (channel_id, request, credential)
+    }
+
+    fn mocked_session_method(
+        store: Arc<InMemoryChannelStore>,
+        asserter: alloy::providers::mock::Asserter,
+    ) -> SessionMethod<impl Provider<TempoNetwork> + Clone + 'static> {
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter);
+        SessionMethod::new(
+            provider,
+            store,
+            SessionMethodConfig {
+                escrow_contract: "0x5555555555555555555555555555555555555555"
+                    .parse()
+                    .unwrap(),
+                chain_id: 42431,
+                min_voucher_delta: 0,
+            },
+        )
+    }
+
+    /// Without a close signer nothing can be settled on-chain, so a close must
+    /// not report success or finalize the channel in the store.
+    #[tokio::test]
+    async fn test_close_without_close_signer_is_rejected() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store, &asserter).await;
+        let method = mocked_session_method(store.clone(), asserter);
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("close signer"),
+            "expected missing close signer error, got: {}",
+            err.message
+        );
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert!(!stored.finalized);
+        assert!(!stored.closing);
+    }
+
+    /// Queues the RPC responses for a close transaction that is mined with the
+    /// given receipt status, and returns its hash.
+    fn push_close_transaction(asserter: &alloy::providers::mock::Asserter, success: bool) -> B256 {
+        use alloy::primitives::{U128, U64};
+
+        let tx_hash = B256::repeat_byte(0xcc);
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0xdd),
+            "blockNumber": "0x1",
+            "from": Address::repeat_byte(0x22),
+            "to": Address::repeat_byte(0x55),
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": alloy::primitives::Bloom::ZERO,
+            "status": if success { "0x1" } else { "0x0" },
+            "type": "0x76",
+            "feePayer": Address::repeat_byte(0x22),
+        });
+        asserter.push_success(&U64::ZERO); // eth_getTransactionCount
+        asserter.push_success(&U128::from(1)); // eth_gasPrice
+        asserter.push_success(&tx_hash); // eth_sendRawTransaction
+        asserter.push_success(&receipt); // receipt lookup when registering the watcher
+        asserter.push_success(&receipt); // receipt fetch
+        tx_hash
+    }
+
+    #[tokio::test]
+    async fn test_close_finalizes_after_successful_transaction() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store, &asserter).await;
+        let tx_hash = push_close_transaction(&asserter, true);
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let receipt = method.verify_session(&credential, &request).await.unwrap();
+        assert_eq!(receipt.reference, tx_hash.to_string());
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert!(stored.finalized);
+        assert!(!stored.closing);
+    }
+
+    /// A mined-but-reverted close leaves the channel open on-chain, so it must
+    /// stay open in the store too.
+    #[tokio::test]
+    async fn test_close_with_reverted_transaction_is_not_finalized() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store, &asserter).await;
+        push_close_transaction(&asserter, false);
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::TransactionFailed));
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert!(!stored.finalized);
+        assert!(!stored.closing);
+    }
+
+    /// A close that fails before the transaction is mined must not leave the
+    /// channel stuck in `closing`.
+    #[tokio::test]
+    async fn test_close_resets_closing_when_submission_fails() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store, &asserter).await;
+        // No further responses queued: the nonce lookup fails.
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::NetworkError));
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert!(!stored.finalized);
+        assert!(!stored.closing);
     }
 
     #[tokio::test]
