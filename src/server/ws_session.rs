@@ -11,7 +11,7 @@
 //! 2. Client sends open credential (with deposit transaction)
 //! 3. Server verifies, begins streaming data
 //! 4. Per tick: deduct from channel balance
-//! 5. When exhausted: send `needVoucher`, wait for voucher frame
+//! 5. When exhausted: send `needVoucher` once, wait for voucher frame
 //! 6. Client sends voucher credential → server verifies, replies with a
 //!    receipt and resumes (or replies with an error and ends the session)
 //! 7. On completion: send session receipt, close
@@ -29,6 +29,7 @@
 //!     tick_cost: 1000,
 //!     generate: my_stream,
 //!     poll_interval_ms: 100,
+//!     min_voucher_delta: 0,
 //! }).await;
 //! ```
 
@@ -38,6 +39,7 @@ use futures_util::{SinkExt, StreamExt};
 use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
 
+use super::sse::required_cumulative;
 use super::ws::{WsMessage, WsResponse};
 use crate::protocol::core::parse_authorization;
 use crate::protocol::methods::tempo::session_method::{
@@ -60,6 +62,12 @@ pub struct WsSessionOptions<G> {
     pub generate: G,
     /// Polling interval in ms when `wait_for_update` is not available. Default: 100.
     pub poll_interval_ms: u64,
+    /// Minimum voucher delta the session method enforces, in base units
+    /// (`SessionMethodConfig::min_voucher_delta`, or the challenge's
+    /// `minVoucherDelta`). `needVoucher` frames ask for at least this much on
+    /// top of the accepted amount, so the requested voucher is not rejected
+    /// as too small. Use `0` if no minimum is enforced.
+    pub min_voucher_delta: u128,
 }
 
 /// Run a metered session over a split WebSocket connection.
@@ -81,6 +89,7 @@ where
         tick_cost,
         generate,
         poll_interval_ms,
+        min_voucher_delta,
     } = options;
     let channel_id = normalize_channel_id(&channel_id);
 
@@ -88,20 +97,26 @@ where
 
     while let Some(value) = stream.next().await {
         // Deduct, waiting for voucher top-up if insufficient
+        let mut need_voucher_sent = false;
         loop {
             match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                 Ok(_state) => break,
                 Err(e) if e.code == Some(ErrorCode::InsufficientBalance) => {
-                    // Emit needVoucher frame
-                    if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-                        let msg = WsResponse::NeedVoucher {
-                            channel_id: channel_id.clone(),
-                            required_cumulative: (ch.spent + tick_cost).to_string(),
-                            accepted_cumulative: ch.highest_voucher_amount.to_string(),
-                            deposit: ch.deposit.to_string(),
-                        };
-                        if sender.send(msg.to_text()).await.is_err() {
-                            return; // client disconnected
+                    // Ask once per exhaustion: clients answer every needVoucher
+                    // frame, so a repeat makes them sign a duplicate voucher.
+                    if !need_voucher_sent {
+                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
+                            need_voucher_sent = true;
+                            let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
+                            let msg = WsResponse::NeedVoucher {
+                                channel_id: channel_id.clone(),
+                                required_cumulative: required.to_string(),
+                                accepted_cumulative: ch.highest_voucher_amount.to_string(),
+                                deposit: ch.deposit.to_string(),
+                            };
+                            if sender.send(msg.to_text()).await.is_err() {
+                                return; // client disconnected
+                            }
                         }
                     }
 
@@ -315,6 +330,151 @@ mod tests {
         (Box::pin(sink), frames)
     }
 
+    /// Sink that forwards every frame sent over the session to a channel.
+    fn channel_sink() -> (
+        impl futures_util::Sink<String, Error = Box<dyn std::error::Error + Send + Sync>> + Send + Unpin,
+        tokio::sync::mpsc::UnboundedReceiver<WsResponse>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = futures_util::sink::unfold(tx, |tx, text: String| async move {
+            tx.send(serde_json::from_str::<WsResponse>(&text)?)?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(tx)
+        });
+        (Box::pin(sink), rx)
+    }
+
+    /// While a session stays exhausted, neither poll ticks nor channel writes
+    /// may repeat the needVoucher frame; the next exhaustion asks again.
+    #[tokio::test]
+    async fn test_ws_session_need_voucher_once_per_exhaustion() {
+        use tokio::time::{timeout, Duration};
+
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_ws_once";
+        store.insert(channel_id, test_channel_state(channel_id, 100, 5000));
+
+        let (mut sink, mut frames) = channel_sink();
+        let session_store = store.clone();
+        let session = tokio::spawn(async move {
+            ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store: session_store,
+                    channel_id: channel_id.to_string(),
+                    challenge_id: "ch-once".to_string(),
+                    tick_cost: 100,
+                    generate: futures_util::stream::iter(["a", "b", "c"].map(String::from)),
+                    poll_interval_ms: 10,
+                    min_voucher_delta: 0,
+                },
+            )
+            .await;
+        });
+
+        let accept_voucher = |amount: Option<u128>| {
+            store.update_channel(
+                channel_id,
+                Box::new(move |current: Option<ChannelState>| {
+                    let state = current.unwrap();
+                    Ok(Some(ChannelState {
+                        highest_voucher_amount: amount.unwrap_or(state.highest_voucher_amount),
+                        ..state
+                    }))
+                }),
+            )
+        };
+        let quiet = Duration::from_millis(100);
+
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::Data { data }) if data == "a"
+        ));
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::NeedVoucher { required_cumulative, accepted_cumulative, .. })
+                if required_cumulative == "200" && accepted_cumulative == "100"
+        ));
+
+        // Ten poll ticks.
+        let repeated = timeout(quiet, frames.recv()).await;
+        assert!(repeated.is_err(), "repeated on a poll tick: {repeated:?}");
+        // A write that leaves the balance exhausted wakes the session.
+        accept_voucher(None).await.unwrap();
+        let repeated = timeout(quiet, frames.recv()).await;
+        assert!(repeated.is_err(), "repeated on a write: {repeated:?}");
+
+        accept_voucher(Some(200)).await.unwrap();
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::Data { data }) if data == "b"
+        ));
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::NeedVoucher { required_cumulative, accepted_cumulative, .. })
+                if required_cumulative == "300" && accepted_cumulative == "200"
+        ));
+
+        accept_voucher(Some(300)).await.unwrap();
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::Data { data }) if data == "c"
+        ));
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::Receipt { .. })
+        ));
+        session.await.unwrap();
+        assert!(frames.recv().await.is_none());
+    }
+
+    /// The requested voucher must clear the server's minimum delta as well
+    /// as the next tick, otherwise the server rejects the voucher it asked for.
+    #[tokio::test]
+    async fn test_ws_session_need_voucher_honours_min_voucher_delta() {
+        // accepted 1000, spent 950, tick 75: the next tick needs 1025.
+        for (min_voucher_delta, required) in [(0, "1025"), (10, "1025"), (10_000, "11000")] {
+            let store = Arc::new(InMemoryChannelStore::new());
+            let channel_id = "0xchannel_ws_min_delta";
+            store.insert(
+                channel_id,
+                ChannelState {
+                    spent: 950,
+                    ..test_channel_state(channel_id, 1000, 50_000)
+                },
+            );
+
+            let (mut sink, mut frames) = channel_sink();
+            let session = ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store,
+                    channel_id: channel_id.to_string(),
+                    challenge_id: "ch-min-delta".to_string(),
+                    tick_cost: 75,
+                    generate: futures_util::stream::iter(["a".to_string()]),
+                    poll_interval_ms: 10,
+                    min_voucher_delta,
+                },
+            );
+            let frame = tokio::select! {
+                _ = session => panic!("session must wait for the voucher"),
+                frame = frames.recv() => frame,
+            };
+
+            match frame {
+                Some(WsResponse::NeedVoucher {
+                    required_cumulative,
+                    accepted_cumulative,
+                    ..
+                }) => {
+                    assert_eq!(required_cumulative, required);
+                    assert_eq!(accepted_cumulative, "1000");
+                }
+                other => panic!("expected a needVoucher frame, got: {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_ws_session_finalized_channel_emits_receipt_and_stops() {
         let store = Arc::new(InMemoryChannelStore::new());
@@ -340,6 +500,7 @@ mod tests {
                     tick_cost: 100,
                     generate,
                     poll_interval_ms: 10,
+                    min_voucher_delta: 0,
                 },
             )
             .await;
@@ -414,6 +575,7 @@ mod tests {
                 tick_cost: 100,
                 generate: Box::pin(async_stream::stream! { yield "a".to_string(); }),
                 poll_interval_ms: 10,
+                min_voucher_delta: 0,
             },
         )
         .await;
@@ -445,6 +607,7 @@ mod tests {
                     tick_cost: 100,
                     generate,
                     poll_interval_ms: 10,
+                    min_voucher_delta: 0,
                 },
             ),
         )
@@ -599,6 +762,7 @@ mod tests {
             tick_cost: 1000,
             generate: futures_util::stream::empty::<String>(),
             poll_interval_ms: 100,
+            min_voucher_delta: 0,
         };
     }
 }

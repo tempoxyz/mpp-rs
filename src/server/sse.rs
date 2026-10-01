@@ -250,6 +250,12 @@ pub struct ServeOptions<G> {
     pub generate: G,
     /// Polling interval in ms when `wait_for_update` is not available. Default: 100.
     pub poll_interval_ms: u64,
+    /// Minimum voucher delta the session method enforces, in base units
+    /// (`SessionMethodConfig::min_voucher_delta`, or the challenge's
+    /// `minVoucherDelta`). Need-voucher events ask for at least this much on
+    /// top of the accepted amount, so the requested voucher is not rejected
+    /// as too small. Use `0` if no minimum is enforced.
+    pub min_voucher_delta: u128,
 }
 
 /// Wrap an async stream with payment metering, producing SSE event bytes.
@@ -257,8 +263,8 @@ pub struct ServeOptions<G> {
 /// For each value from `generate`:
 /// 1. Deducts `tick_cost` from the channel balance atomically
 /// 2. If balance sufficient, yields `event: message\ndata: {value}\n\n`
-/// 3. If balance exhausted, yields `event: payment-need-voucher\n...` and
-///    waits for the client to top up
+/// 3. If balance exhausted, yields `event: payment-need-voucher\n...` once
+///    and waits for the client to top up
 /// 4. If the deduction fails for any other reason (e.g. the channel is closed
 ///    or missing), yields the final `event: payment-receipt\n...` if the
 ///    channel is still readable, then stops
@@ -283,6 +289,7 @@ where
         tick_cost,
         generate,
         poll_interval_ms,
+        min_voucher_delta,
     } = options;
     let channel_id = normalize_channel_id(&channel_id);
 
@@ -291,19 +298,25 @@ where
 
         while let Some(value) = next_item(&mut stream).await {
             // Try to charge, waiting for top-up if insufficient
+            let mut need_voucher_sent = false;
             loop {
                 match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                     Ok(_state) => break,
                     Err(e) if e.code == Some(crate::protocol::traits::ErrorCode::InsufficientBalance) => {
-                        // Emit need-voucher event
-                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-                            let event = format_need_voucher_event(&NeedVoucherEvent {
-                                channel_id: channel_id.clone(),
-                                required_cumulative: (ch.spent + tick_cost).to_string(),
-                                accepted_cumulative: ch.highest_voucher_amount.to_string(),
-                                deposit: ch.deposit.to_string(),
-                            });
-                            yield event;
+                        // Ask once per exhaustion: clients answer every need-voucher
+                        // event, so a repeat makes them sign a duplicate voucher.
+                        if !need_voucher_sent {
+                            if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
+                                need_voucher_sent = true;
+                                let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
+                                let event = format_need_voucher_event(&NeedVoucherEvent {
+                                    channel_id: channel_id.clone(),
+                                    required_cumulative: required.to_string(),
+                                    accepted_cumulative: ch.highest_voucher_amount.to_string(),
+                                    deposit: ch.deposit.to_string(),
+                                });
+                                yield event;
+                            }
                         }
 
                         // Wait for channel update or poll interval
@@ -349,6 +362,21 @@ where
             yield event;
         }
     })
+}
+
+/// Cumulative amount a need-voucher event asks for: enough to pay for the
+/// next tick, and at least `min_voucher_delta` above the accepted amount.
+#[cfg(feature = "tempo")]
+pub(crate) fn required_cumulative(
+    channel: &crate::protocol::methods::tempo::session_method::ChannelState,
+    tick_cost: u128,
+    min_voucher_delta: u128,
+) -> u128 {
+    let next_tick = channel.spent.saturating_add(tick_cost);
+    let min_accepted = channel
+        .highest_voucher_amount
+        .saturating_add(min_voucher_delta);
+    next_tick.max(min_accepted)
 }
 
 /// Poll the next item from a stream (avoids depending on StreamExt).
@@ -726,6 +754,7 @@ mod tests {
             tick_cost: 100,
             generate: Box::pin(async_stream::stream! { yield "hello".to_string(); }),
             poll_interval_ms: 10,
+            min_voucher_delta: 0,
         });
 
         let events = collect_stream(stream).await;
@@ -762,6 +791,7 @@ mod tests {
             tick_cost: 100,
             generate: gen,
             poll_interval_ms: 10,
+            min_voucher_delta: 0,
         });
 
         let events = collect_stream(stream).await;
@@ -824,6 +854,7 @@ mod tests {
             tick_cost: 100,
             generate: gen,
             poll_interval_ms: 10,
+            min_voucher_delta: 0,
         });
 
         let events = collect_stream(stream).await;
@@ -872,6 +903,7 @@ mod tests {
                 tick_cost: 100,
                 generate: gen,
                 poll_interval_ms: 10,
+                min_voucher_delta: 0,
             });
             collect_stream(stream).await
         });
@@ -907,7 +939,6 @@ mod tests {
         let events = handle.await.unwrap();
 
         // Verify event sequence: msg(a), msg(b), need-voucher, msg(c), msg(d), receipt
-        // There may be multiple need-voucher events if poll fires before top-up
         let mut messages = Vec::new();
         let mut need_vouchers = Vec::new();
         let mut receipts = Vec::new();
@@ -921,10 +952,7 @@ mod tests {
         }
 
         assert_eq!(messages, vec!["a", "b", "c", "d"]);
-        assert!(
-            !need_vouchers.is_empty(),
-            "should have emitted at least one need-voucher event"
-        );
+        assert_eq!(need_vouchers.len(), 1);
         // Verify need-voucher content
         let nv = &need_vouchers[0];
         assert_eq!(nv.channel_id, channel_id);
@@ -935,6 +963,125 @@ mod tests {
         assert_eq!(r.challenge_id, "ch-exhaust");
         assert_eq!(r.spent, "400"); // 4 messages × 100
         assert_eq!(r.units, Some(4));
+    }
+
+    /// While a stream stays exhausted, neither poll ticks nor channel writes
+    /// may repeat the need-voucher event; the next exhaustion asks again.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_need_voucher_once_per_exhaustion() {
+        use crate::protocol::methods::tempo::session_method::{
+            ChannelState, ChannelStore, InMemoryChannelStore,
+        };
+        use tokio::time::{timeout, Duration};
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_once";
+        store.insert(channel_id, test_channel_state(channel_id, 100, 5000));
+
+        let mut stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: channel_id.to_string(),
+            challenge_id: "ch-once".to_string(),
+            tick_cost: 100,
+            generate: Box::pin(async_stream::stream! {
+                for value in ["a", "b", "c"] {
+                    yield value.to_string();
+                }
+            }),
+            poll_interval_ms: 10,
+            min_voucher_delta: 0,
+        });
+
+        let accept_voucher = |amount: Option<u128>| {
+            store.update_channel(
+                channel_id,
+                Box::new(move |current: Option<ChannelState>| {
+                    let state = current.unwrap();
+                    Ok(Some(ChannelState {
+                        highest_voucher_amount: amount.unwrap_or(state.highest_voucher_amount),
+                        ..state
+                    }))
+                }),
+            )
+        };
+        let need_voucher = |required: &str, accepted: &str| {
+            Some(SseEvent::PaymentNeedVoucher(NeedVoucherEvent {
+                channel_id: channel_id.to_string(),
+                required_cumulative: required.to_string(),
+                accepted_cumulative: accepted.to_string(),
+                deposit: "5000".to_string(),
+            }))
+        };
+        let quiet = Duration::from_millis(100);
+
+        let event = next_item(&mut stream).await.unwrap();
+        assert_eq!(parse_event(&event), Some(SseEvent::Message("a".into())));
+        let event = next_item(&mut stream).await.unwrap();
+        assert_eq!(parse_event(&event), need_voucher("200", "100"));
+
+        // Ten poll ticks.
+        let repeated = timeout(quiet, next_item(&mut stream)).await;
+        assert!(repeated.is_err(), "repeated on a poll tick: {repeated:?}");
+        // A write that leaves the balance exhausted wakes the stream.
+        accept_voucher(None).await.unwrap();
+        let repeated = timeout(quiet, next_item(&mut stream)).await;
+        assert!(repeated.is_err(), "repeated on a write: {repeated:?}");
+
+        accept_voucher(Some(200)).await.unwrap();
+        let event = next_item(&mut stream).await.unwrap();
+        assert_eq!(parse_event(&event), Some(SseEvent::Message("b".into())));
+        let event = next_item(&mut stream).await.unwrap();
+        assert_eq!(parse_event(&event), need_voucher("300", "200"));
+
+        accept_voucher(Some(300)).await.unwrap();
+        let event = next_item(&mut stream).await.unwrap();
+        assert_eq!(parse_event(&event), Some(SseEvent::Message("c".into())));
+        let event = next_item(&mut stream).await.unwrap();
+        assert!(matches!(
+            parse_event(&event),
+            Some(SseEvent::PaymentReceipt(_))
+        ));
+        assert_eq!(next_item(&mut stream).await, None);
+    }
+
+    /// The requested voucher must clear the server's minimum delta as well
+    /// as the next tick, otherwise the server rejects the voucher it asked for.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_need_voucher_honours_min_voucher_delta() {
+        use crate::protocol::methods::tempo::session_method::{ChannelState, InMemoryChannelStore};
+
+        // accepted 1000, spent 950, tick 75: the next tick needs 1025.
+        for (min_voucher_delta, required) in [(0, "1025"), (10, "1025"), (10_000, "11000")] {
+            let store = std::sync::Arc::new(InMemoryChannelStore::new());
+            let channel_id = "0xchannel_min_delta";
+            store.insert(
+                channel_id,
+                ChannelState {
+                    spent: 950,
+                    ..test_channel_state(channel_id, 1000, 50_000)
+                },
+            );
+
+            let mut stream = serve(ServeOptions {
+                store,
+                channel_id: channel_id.to_string(),
+                challenge_id: "ch-min-delta".to_string(),
+                tick_cost: 75,
+                generate: Box::pin(async_stream::stream! { yield "a".to_string(); }),
+                poll_interval_ms: 10,
+                min_voucher_delta,
+            });
+
+            match parse_event(&next_item(&mut stream).await.unwrap()) {
+                Some(SseEvent::PaymentNeedVoucher(event)) => {
+                    assert_eq!(event.required_cumulative, required);
+                    assert_eq!(event.accepted_cumulative, "1000");
+                }
+                other => panic!("expected a need-voucher event, got: {other:?}"),
+            }
+        }
     }
 
     #[cfg(feature = "tempo")]
@@ -959,6 +1106,7 @@ mod tests {
             tick_cost: 250,
             generate: gen,
             poll_interval_ms: 10,
+            min_voucher_delta: 0,
         });
 
         let events = collect_stream(stream).await;
@@ -1010,6 +1158,7 @@ mod tests {
                 tick_cost: 100,
                 generate: gen,
                 poll_interval_ms: 10,
+                min_voucher_delta: 0,
             });
             collect_stream(stream).await
         });
@@ -1078,6 +1227,7 @@ mod tests {
             tick_cost: 100,
             generate: gen,
             poll_interval_ms: 10,
+            min_voucher_delta: 0,
         });
 
         // No voucher can create the channel, so the stream must end instead of polling.
