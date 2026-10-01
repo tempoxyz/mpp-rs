@@ -219,7 +219,10 @@ impl Relay {
             request = request.header("idempotency-key", idempotency_key);
         }
 
-        let response = request.send().await.map_err(|_| failure(None))?;
+        let response = request.send().await.map_err(|_| unavailable())?;
+        if response.status().is_server_error() {
+            return Err(unavailable());
+        }
         if !response.status().is_success() {
             return Err(failure(None));
         }
@@ -318,15 +321,19 @@ fn failure(value: Option<&serde_json::Value>) -> VerificationError {
     let code = value.and_then(relay_error_code);
     match code {
         Some(RelayErrorCode::Expired) => VerificationError::expired("Payment has expired."),
-        Some(RelayErrorCode::TemporarilyUnavailable) => {
-            VerificationError::network_error("Tempo API relay temporarily unavailable")
-        }
+        Some(RelayErrorCode::TemporarilyUnavailable) => unavailable(),
         Some(code) if code.is_safe() => VerificationError::new(format!(
             "Tempo API relay rejected credential ({})",
             code.as_str()
         )),
         _ => VerificationError::new("Tempo API relay rejected credential"),
     }
+}
+
+/// The relay could not be reached or could not serve the request: a
+/// server-side failure, not a rejection of the credential.
+fn unavailable() -> VerificationError {
+    VerificationError::network_error("Tempo API relay temporarily unavailable")
 }
 
 fn idempotency_key(input: &RelayInput<'_>) -> Result<String, VerificationError> {
@@ -831,9 +838,32 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error.message, "Tempo API relay rejected credential");
+        assert_eq!(
+            error.code,
+            Some(crate::protocol::traits::ErrorCode::NetworkError)
+        );
         assert!(!error.message.contains("top-secret-key"));
         assert!(!error.message.contains(&base_url));
+    }
+
+    #[tokio::test]
+    async fn relay_server_error_is_not_a_credential_rejection() {
+        let (base_url, _calls) =
+            spawn_relay([(StatusCode::BAD_GATEWAY, serde_json::json!({}))]).await;
+        let relay = Relay::new(RelayConfig::new("key").api_base_url(base_url)).unwrap();
+
+        let error = relay
+            .validate(
+                &credential(PaymentPayload::transaction("0x1234")),
+                &ChargeRequest::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            Some(crate::protocol::traits::ErrorCode::NetworkError)
+        );
     }
 
     #[tokio::test]

@@ -634,32 +634,37 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 ///
 /// Format: `Payment <base64url-json>`
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
-    let payment_part = extract_payment_scheme(header).ok_or_else(|| {
-        MppError::invalid_challenge_reason("Expected 'Payment' scheme".to_string())
-    })?;
+    let payment_part = extract_payment_scheme(header)
+        .ok_or_else(|| MppError::malformed_credential("Expected 'Payment' scheme"))?;
 
     // Strip "Payment " prefix to get the token
     let token = payment_part.get(8..).unwrap_or("").trim();
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::invalid_challenge_reason(format!(
+        return Err(MppError::malformed_credential(format!(
             "Token exceeds maximum length of {} bytes",
             MAX_TOKEN_LEN
         )));
     }
 
-    let decoded = base64url_decode(token)?;
-    let mut credential: PaymentCredential = serde_json::from_slice(&decoded).map_err(|e| {
-        MppError::invalid_challenge_reason(format!("Invalid credential JSON: {}", e))
-    })?;
+    let decoded =
+        base64url_decode(token).map_err(|_| MppError::malformed_credential("Invalid base64url"))?;
+    let mut credential: PaymentCredential = serde_json::from_slice(&decoded)
+        .map_err(|e| MppError::malformed_credential(format!("Invalid credential JSON: {}", e)))?;
 
-    credential.challenge.header =
-        super::parse_advertised_credential_header(credential.challenge.header.as_deref())?;
+    credential.challenge.header = super::parse_advertised_credential_header(
+        credential.challenge.header.as_deref(),
+    )
+    .map_err(|_| {
+        MppError::malformed_credential(
+            "Unsupported credential header: must be Payment-Authorization",
+        )
+    })?;
 
     if let Some(ref d) = credential.challenge.digest {
         if !is_valid_digest_format(d) {
-            return Err(MppError::invalid_challenge_reason("Invalid digest format"));
+            return Err(MppError::malformed_credential("Invalid digest format"));
         }
     }
 
@@ -683,7 +688,7 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::invalid_challenge_reason(format!(
+        return Err(MppError::InvalidReceipt(format!(
             "Receipt exceeds maximum length of {} bytes",
             MAX_TOKEN_LEN
         )));
@@ -691,10 +696,10 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
 
     let decoded = base64url_decode(token)?;
     let receipt: Receipt = serde_json::from_slice(&decoded)
-        .map_err(|e| MppError::invalid_challenge_reason(format!("Invalid receipt JSON: {}", e)))?;
+        .map_err(|e| MppError::InvalidReceipt(format!("Invalid receipt JSON: {}", e)))?;
 
     if !is_iso8601_timestamp(&receipt.timestamp) {
-        return Err(MppError::invalid_challenge_reason(
+        return Err(MppError::InvalidReceipt(
             "Invalid timestamp format: expected ISO 8601".to_string(),
         ));
     }
@@ -989,20 +994,20 @@ mod tests {
     #[test]
     fn test_parse_authorization_missing_payment_scheme() {
         let result = parse_authorization("Bearer abc123");
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
     fn test_parse_authorization_invalid_base64url() {
         let result = parse_authorization("Payment !");
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
     fn test_parse_authorization_invalid_json() {
         let token = base64url_encode(b"not valid json");
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1010,7 +1015,7 @@ mod tests {
         let json = r#"{"challenge":{"id":"abc"},"payload":{}}"#;
         let token = base64url_encode(json.as_bytes());
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1052,7 +1057,7 @@ mod tests {
         let json = r#"{"status":"failed","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc"}"#;
         let token = base64url_encode(json.as_bytes());
         let result = parse_receipt(&token);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::InvalidReceipt(_))));
     }
 
     #[test]
@@ -1070,7 +1075,7 @@ mod tests {
         let json = serde_json::to_string(&credential).unwrap();
         let token = base64url_encode(json.as_bytes());
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1087,7 +1092,7 @@ mod tests {
         let json = serde_json::to_string(&credential).unwrap();
         let token = base64url_encode(json.as_bytes());
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1396,6 +1401,7 @@ mod tests {
         // base64url encoded
         let wire = "eyJtZXRob2QiOiJ0ZW1wbyIsInJlZmVyZW5jZSI6IjB4YWJjIiwic3RhdHVzIjoic3VjY2VzcyIsInRpbWVzdGFtcCI6IkphbiAyOSAyMDI2IDEyOjAwIn0";
         let err = parse_receipt(wire).unwrap_err();
+        assert!(matches!(err, MppError::InvalidReceipt(_)));
         assert!(err.to_string().contains("timestamp"));
     }
 
@@ -1619,7 +1625,10 @@ mod tests {
         let credential =
             PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
         let header = format_authorization(&credential).unwrap();
-        assert!(parse_authorization(&header).is_err());
+        assert!(matches!(
+            parse_authorization(&header),
+            Err(MppError::MalformedCredential(_))
+        ));
     }
 
     #[test]

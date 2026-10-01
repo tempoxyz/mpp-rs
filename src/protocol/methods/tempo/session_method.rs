@@ -817,7 +817,8 @@ where
             )
             .await?;
 
-        let _state = updated.ok_or_else(|| VerificationError::new("failed to create channel"))?;
+        let _state =
+            updated.ok_or_else(|| VerificationError::internal("failed to create channel"))?;
 
         Ok(Receipt::success(METHOD_NAME, &open_tx_hash))
     }

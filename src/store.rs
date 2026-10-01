@@ -340,15 +340,14 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
     > {
         let key = self.channel_key(channel_id);
         Box::pin(async move {
-            let value = self
-                .store
-                .get(&key)
-                .await
-                .map_err(|e| crate::protocol::traits::VerificationError::new(e.to_string()))?;
+            let value =
+                self.store.get(&key).await.map_err(|e| {
+                    crate::protocol::traits::VerificationError::internal(e.to_string())
+                })?;
             match value {
                 Some(v) => {
                     let state = serde_json::from_value(v).map_err(|e| {
-                        crate::protocol::traits::VerificationError::new(format!(
+                        crate::protocol::traits::VerificationError::internal(format!(
                             "Failed to deserialize channel state: {}",
                             e
                         ))
@@ -386,16 +385,15 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
         let channel_lock = self.channel_lock(&key);
         Box::pin(async move {
             let _guard = channel_lock.lock().await;
-            let current_value = self
-                .store
-                .get(&key)
-                .await
-                .map_err(|e| crate::protocol::traits::VerificationError::new(e.to_string()))?;
+            let current_value =
+                self.store.get(&key).await.map_err(|e| {
+                    crate::protocol::traits::VerificationError::internal(e.to_string())
+                })?;
             let current_state: Option<
                 crate::protocol::methods::tempo::session_method::ChannelState,
             > = match current_value {
                 Some(v) => Some(serde_json::from_value(v).map_err(|e| {
-                    crate::protocol::traits::VerificationError::new(format!(
+                    crate::protocol::traits::VerificationError::internal(format!(
                         "Failed to deserialize channel state: {}",
                         e
                     ))
@@ -408,18 +406,18 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
             match &result {
                 Some(state) => {
                     let value = serde_json::to_value(state).map_err(|e| {
-                        crate::protocol::traits::VerificationError::new(format!(
+                        crate::protocol::traits::VerificationError::internal(format!(
                             "Failed to serialize channel state: {}",
                             e
                         ))
                     })?;
                     self.store.put(&key, value).await.map_err(|e| {
-                        crate::protocol::traits::VerificationError::new(e.to_string())
+                        crate::protocol::traits::VerificationError::internal(e.to_string())
                     })?;
                 }
                 None => {
                     self.store.delete(&key).await.map_err(|e| {
-                        crate::protocol::traits::VerificationError::new(e.to_string())
+                        crate::protocol::traits::VerificationError::internal(e.to_string())
                     })?;
                     // Evict the per-channel lock so the map doesn't grow unboundedly.
                     if let Ok(mut locks) = self.channel_locks.lock() {
@@ -848,6 +846,24 @@ mod adapter_tests {
             .unwrap();
         assert!(result.is_none());
         assert!(adapter.get_channel("ch1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_store_adapter_reports_store_failures_as_internal() {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put("channels:ch1", serde_json::json!("not a channel"))
+            .await
+            .unwrap();
+        let adapter = ChannelStoreAdapter::new(store, "channels:");
+
+        let err = adapter.get_channel("ch1").await.unwrap_err();
+        assert_eq!(err.code, Some(crate::protocol::traits::ErrorCode::Internal));
+        let err = adapter
+            .update_channel("ch1", Box::new(Ok))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(crate::protocol::traits::ErrorCode::Internal));
     }
 
     #[tokio::test]

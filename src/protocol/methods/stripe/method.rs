@@ -139,9 +139,12 @@ impl ChargeMethod {
                 .ok()
                 .and_then(|v| v["error"]["message"].as_str().map(String::from))
                 .unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(VerificationError::new(format!(
-                "Stripe PaymentIntent creation failed: {message}"
-            )));
+            let message = format!("Stripe PaymentIntent creation failed: {message}");
+            return Err(if status.is_server_error() {
+                VerificationError::internal(message)
+            } else {
+                VerificationError::new(message)
+            });
         }
 
         // https://docs.stripe.com/error-low-level#idempotency
@@ -156,10 +159,9 @@ impl ChargeMethod {
             ));
         }
 
-        let pi: PaymentIntentResponse = response
-            .json()
-            .await
-            .map_err(|e| VerificationError::new(format!("Failed to parse Stripe response: {e}")))?;
+        let pi: PaymentIntentResponse = response.json().await.map_err(|e| {
+            VerificationError::internal(format!("Failed to parse Stripe response: {e}"))
+        })?;
 
         Ok((pi.id, pi.status))
     }
@@ -277,6 +279,19 @@ mod tests {
         );
         assert_eq!(method.network_id(), "my-network");
         assert_eq!(method.payment_method_types(), &["card", "us_bank_account"]);
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_api_is_an_internal_error() {
+        use crate::error::PaymentError;
+
+        let method = ChargeMethod::new("sk_test", "internal", vec!["card".into()])
+            .with_api_base("http://127.0.0.1:1");
+        let err = method
+            .create_payment_intent("spt_test", "100", "usd", "key", &HashMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_problem_details(None).status, 500, "{err}");
     }
 
     #[test]
