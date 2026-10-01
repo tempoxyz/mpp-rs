@@ -39,6 +39,9 @@ pub trait ToolCaller: Send + Sync {
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send;
 
     /// Extracts valid payment challenges from a JSON-RPC error.
+    ///
+    /// Both payment-required (`-32042`) and verification-failed (`-32043`)
+    /// errors carry challenges; see [`is_payment_required`](super::is_payment_required).
     fn payment_challenges_from_error(&self, error: &Self::Error) -> Option<Vec<PaymentChallenge>>;
 
     /// Extracts valid payment challenges from tool-result metadata.
