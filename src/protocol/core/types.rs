@@ -318,8 +318,7 @@ impl PaymentProtocol {
     pub fn detect(www_authenticate: Option<&str>) -> Option<Self> {
         match www_authenticate {
             Some(header) => {
-                let trimmed = header.trim_start();
-                if super::auth_params::starts_with_payment_scheme(trimmed.as_bytes()) {
+                if super::auth_params::starts_with_payment_scheme(header) {
                     Some(Self::WebPaymentAuth)
                 } else {
                     None
