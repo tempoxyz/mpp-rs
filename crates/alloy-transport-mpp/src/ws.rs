@@ -212,7 +212,7 @@ enum TerminationReason {
 ///
 /// Dropping this guard releases transient provider state without rolling back
 /// durable state after an ambiguous socket failure.
-struct PendingPayment<P: PaymentProvider> {
+pub(crate) struct PendingPayment<P: PaymentProvider> {
     provider: P,
     challenge: PaymentChallenge,
     credential: PaymentCredential,
@@ -220,7 +220,11 @@ struct PendingPayment<P: PaymentProvider> {
 }
 
 impl<P: PaymentProvider> PendingPayment<P> {
-    const fn new(provider: P, challenge: PaymentChallenge, credential: PaymentCredential) -> Self {
+    pub(crate) const fn new(
+        provider: P,
+        challenge: PaymentChallenge,
+        credential: PaymentCredential,
+    ) -> Self {
         Self {
             provider,
             challenge,
@@ -229,11 +233,11 @@ impl<P: PaymentProvider> PendingPayment<P> {
         }
     }
 
-    const fn credential(&self) -> &PaymentCredential {
+    pub(crate) const fn credential(&self) -> &PaymentCredential {
         &self.credential
     }
 
-    async fn commit(mut self) -> Result<(), MppError> {
+    pub(crate) async fn commit(mut self) -> Result<(), MppError> {
         self.provider
             .commit_payment(&self.challenge, &self.credential)
             .await?;
@@ -241,7 +245,7 @@ impl<P: PaymentProvider> PendingPayment<P> {
         Ok(())
     }
 
-    async fn rollback(mut self) -> Result<(), MppError> {
+    pub(crate) async fn rollback(mut self) -> Result<(), MppError> {
         self.provider
             .rollback_payment(&self.challenge, &self.credential)
             .await?;

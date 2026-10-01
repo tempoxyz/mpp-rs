@@ -21,11 +21,11 @@ use mpp::{
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Notify, OwnedMutexGuard};
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 
 #[derive(Clone)]
@@ -137,10 +137,21 @@ impl CloseProvider for StubProvider {
     }
 }
 
+/// Like the Tempo session provider, serializes payments with a lease that is
+/// held from `pay` until the payment is committed, rolled back or abandoned.
 #[derive(Clone, Default)]
 struct TrackingProvider {
     commits: Arc<AtomicUsize>,
     rollbacks: Arc<AtomicUsize>,
+    abandons: Arc<AtomicUsize>,
+    payment_lock: Arc<Mutex<()>>,
+    lease: Arc<StdMutex<Option<OwnedMutexGuard<()>>>>,
+}
+
+impl TrackingProvider {
+    fn release_lease(&self) {
+        self.lease.lock().unwrap().take();
+    }
 }
 
 impl PaymentProvider for TrackingProvider {
@@ -149,6 +160,8 @@ impl PaymentProvider for TrackingProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        let lease = Arc::clone(&self.payment_lock).lock_owned().await;
+        *self.lease.lock().unwrap() = Some(lease);
         Ok(PaymentCredential::new(
             challenge.to_echo(),
             PaymentPayload::hash("0xopen"),
@@ -161,6 +174,7 @@ impl PaymentProvider for TrackingProvider {
         _: &PaymentCredential,
     ) -> Result<(), MppError> {
         self.commits.fetch_add(1, Ordering::SeqCst);
+        self.release_lease();
         Ok(())
     }
 
@@ -170,7 +184,13 @@ impl PaymentProvider for TrackingProvider {
         _: &PaymentCredential,
     ) -> Result<(), MppError> {
         self.rollbacks.fetch_add(1, Ordering::SeqCst);
+        self.release_lease();
         Ok(())
+    }
+
+    fn abandon_payment(&self, _: &PaymentChallenge, _: &PaymentCredential) {
+        self.abandons.fetch_add(1, Ordering::SeqCst);
+        self.release_lease();
     }
 }
 
@@ -498,6 +518,61 @@ async fn rejection_route(upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejec
         .into_response()
 }
 
+#[derive(Clone, Default)]
+struct StallState {
+    sockets: Arc<AtomicUsize>,
+    authorized: Arc<Notify>,
+}
+
+/// Leaves the first socket's credential unanswered; later sockets get a receipt.
+async fn stall_first_route(
+    State(state): State<StallState>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let Ok(upgrade) = upgrade else {
+        let header = HeaderValue::from_str(&challenge().to_header().unwrap()).unwrap();
+        return (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, header)]).into_response();
+    };
+
+    upgrade
+        .on_upgrade(|mut socket| async move {
+            let authorization = socket.next().await.unwrap().unwrap();
+            assert!(matches!(authorization, Message::Text(_)));
+            if state.sockets.fetch_add(1, Ordering::SeqCst) == 0 {
+                state.authorized.notify_one();
+                while socket.next().await.is_some() {}
+                return;
+            }
+            socket
+                .send(Message::Text(
+                    json!({ "mpp": "payment-receipt", "data": receipt() })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+        })
+        .into_response()
+}
+
+async fn spawn_stall_first_server() -> (String, StallState) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = StallState::default();
+    let server_state = state.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/", get(stall_first_route))
+                .with_state(server_state),
+        )
+        .await
+        .unwrap();
+    });
+    (format!("ws://{address}/"), state)
+}
+
 #[tokio::test]
 async fn probes_then_authorizes_and_translates_application_messages() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -639,4 +714,44 @@ async fn rejected_initial_credential_rolls_back_provider_state() {
     assert!(error.to_string().contains("session/channel-not-found"));
     assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
     assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn handshake_timeout_releases_pending_payment() {
+    let (url, _state) = spawn_stall_first_server().await;
+    let provider = TrackingProvider::default();
+    let connector = MppApplicationWsConnect::new(url, provider.clone(), provider.clone())
+        .with_handshake_timeout(std::time::Duration::from_secs(5));
+
+    let error = connector
+        .clone()
+        .with_handshake_timeout(std::time::Duration::from_millis(250))
+        .connect()
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+
+    connector.connect().await.unwrap();
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn dropped_connect_releases_pending_payment() {
+    let (url, state) = spawn_stall_first_server().await;
+    let provider = TrackingProvider::default();
+    let connector = MppApplicationWsConnect::new(url, provider.clone(), provider.clone())
+        .with_handshake_timeout(std::time::Duration::from_secs(5));
+
+    tokio::select! {
+        _ = connector.connect() => panic!("handshake completed without a receipt"),
+        () = state.authorized.notified() => {}
+    }
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+
+    connector.connect().await.unwrap();
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
 }
