@@ -16,15 +16,15 @@
 //!
 //! - [`extract_credential`]: Extract a payment credential from MCP request `_meta`
 //! - [`payment_required_error`]: Create an MCP payment-required error
-//! - [`payment_required_error_with_problem`]: Create an MCP payment-required error with RFC 9457 problem details
-//! - [`attach_receipt`]: Attach a receipt to an MCP result's `_meta`
+//! - [`payment_required_error_with_problem`]: Create an MCP payment error with RFC 9457 problem details
+//! - [`attach_receipt`] / [`try_attach_receipt`]: Attach a receipt to an MCP result's `_meta`
 //!
 //! # Client-side
 //!
-//! - [`is_payment_required`]: Check if a JSON-RPC error indicates payment required
+//! - [`is_payment_required`]: Check if a JSON-RPC error requires a (new) payment attempt
 //! - [`extract_challenges`]: Extract challenges from a payment-required error
 //! - [`extract_challenges_from_data`]: Extract challenges from a payment-required payload
-//! - [`attach_credential`]: Attach a credential to MCP request params `_meta`
+//! - [`attach_credential`] / [`try_attach_credential`]: Attach a credential to MCP request params `_meta`
 //! - [`client::McpClient`]: Wrap an MCP SDK adapter with automatic payment handling
 //!
 //! # Example (server)
@@ -48,7 +48,7 @@
 //! assert_eq!(error.code, mcp::PAYMENT_REQUIRED_CODE);
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     protocol::core::{
@@ -68,6 +68,12 @@ pub const PAYMENT_REQUIRED_CODE: i32 = -32042;
 
 /// MCP JSON-RPC error code for payment verification failed.
 pub const PAYMENT_VERIFICATION_FAILED_CODE: i32 = -32043;
+
+/// JSON-RPC error code for invalid params, used for malformed credentials.
+const INVALID_PARAMS_CODE: i32 = -32602;
+
+/// JSON-RPC error code for internal errors, used for internal payment errors.
+const INTERNAL_ERROR_CODE: i32 = -32603;
 
 /// MCP metadata key for credentials.
 pub const CREDENTIAL_META_KEY: &str = "org.paymentauth/credential";
@@ -103,6 +109,13 @@ pub struct McpPaymentError {
 pub struct McpPaymentErrorData {
     #[serde(rename = "httpStatus")]
     pub http_status: u16,
+    /// Serialized with `request` as a native JSON object, as the MCP
+    /// transport requires. Deserialization also accepts the base64url form
+    /// and skips malformed entries.
+    #[serde(
+        serialize_with = "serialize_wire_challenges",
+        deserialize_with = "deserialize_wire_challenges"
+    )]
     pub challenges: Vec<PaymentChallenge>,
     /// RFC 9457 Problem Details for rich error context.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,19 +151,38 @@ pub fn payment_required_error(challenge: &PaymentChallenge) -> McpPaymentError {
 ///
 /// Use when a credential was rejected. Sets `message` to `problem.detail`
 /// and automatically binds `problem.challenge_id` to the challenge ID.
+///
+/// The JSON-RPC code follows the problem type: [`PAYMENT_REQUIRED_CODE`] for
+/// `payment-required`, `-32602` for `malformed-credential` and
+/// `invalid-payload`, `-32603` for `internal-payment-error`, and
+/// [`PAYMENT_VERIFICATION_FAILED_CODE`] for every other problem. `httpStatus`
+/// is taken from `problem.status`.
 pub fn payment_required_error_with_problem(
     challenge: &PaymentChallenge,
     mut problem: crate::error::PaymentErrorDetails,
 ) -> McpPaymentError {
     problem.challenge_id = Some(challenge.id.clone());
     McpPaymentError {
-        code: PAYMENT_REQUIRED_CODE,
+        code: error_code(&problem),
         message: problem.detail.clone(),
         data: Some(McpPaymentErrorData {
-            http_status: 402,
+            http_status: problem.status,
             challenges: vec![challenge.clone()],
             problem: Some(problem),
         }),
+    }
+}
+
+fn error_code(problem: &crate::error::PaymentErrorDetails) -> i32 {
+    let core_problem = problem
+        .problem_type
+        .strip_prefix(crate::error::CORE_PROBLEM_TYPE_BASE)
+        .and_then(|suffix| suffix.strip_prefix('/'));
+    match core_problem {
+        Some("payment-required") => PAYMENT_REQUIRED_CODE,
+        Some("malformed-credential" | "invalid-payload") => INVALID_PARAMS_CODE,
+        Some("internal-payment-error") => INTERNAL_ERROR_CODE,
+        _ => PAYMENT_VERIFICATION_FAILED_CODE,
     }
 }
 
@@ -158,41 +190,65 @@ pub fn payment_required_error_with_problem(
 ///
 /// Inserts (or creates) the `_meta` object on `result` and sets
 /// the receipt under [`RECEIPT_META_KEY`].
+///
+/// Leaves `result` unchanged if it or its `_meta` is not a JSON object. Use
+/// [`try_attach_receipt`] to observe that failure.
 pub fn attach_receipt(result: &mut serde_json::Value, receipt: &Receipt, challenge_id: &str) {
+    let _ = try_attach_receipt(result, receipt, challenge_id);
+}
+
+/// Attach a receipt to an MCP result's `_meta`.
+///
+/// Like [`attach_receipt`], but returns an error and leaves `result`
+/// unchanged if it or its `_meta` is not a JSON object.
+pub fn try_attach_receipt(
+    result: &mut serde_json::Value,
+    receipt: &Receipt,
+    challenge_id: &str,
+) -> Result<(), MppError> {
     let mcp_receipt = McpReceipt {
         receipt: receipt.clone(),
         challenge_id: challenge_id.to_string(),
     };
-    let receipt_value =
-        serde_json::to_value(&mcp_receipt).expect("McpReceipt must be serializable");
+    let receipt_value = serde_json::to_value(&mcp_receipt)
+        .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
+    insert_meta(result, "result", RECEIPT_META_KEY, receipt_value)
+}
 
-    let meta = result
+fn insert_meta(
+    target: &mut serde_json::Value,
+    name: &str,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), MppError> {
+    target
         .as_object_mut()
-        .expect("result must be a JSON object")
+        .ok_or_else(|| MppError::InvalidConfig(format!("{name} must be a JSON object")))?
         .entry("_meta")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    meta.as_object_mut()
-        .expect("_meta must be a JSON object")
-        .insert(RECEIPT_META_KEY.to_string(), receipt_value);
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| MppError::InvalidConfig(format!("{name}._meta must be a JSON object")))?
+        .insert(key.to_owned(), value);
+    Ok(())
 }
 
 // ==================== Client-side helpers ====================
 
 /// Check if an MCP JSON-RPC error response indicates payment required.
 ///
-/// Returns `true` if `error.code` equals [`PAYMENT_REQUIRED_CODE`].
+/// Returns `true` if `error.code` equals [`PAYMENT_REQUIRED_CODE`] or
+/// [`PAYMENT_VERIFICATION_FAILED_CODE`]: a failed verification carries a
+/// fresh challenge and requires a new payment attempt.
 pub fn is_payment_required(error: &serde_json::Value) -> bool {
-    error
-        .get("code")
-        .and_then(|c| c.as_i64())
-        .is_some_and(|c| c == PAYMENT_REQUIRED_CODE as i64)
+    error.get("code").and_then(|c| c.as_i64()).is_some_and(|c| {
+        c == PAYMENT_REQUIRED_CODE as i64 || c == PAYMENT_VERIFICATION_FAILED_CODE as i64
+    })
 }
 
 /// Extract challenges from an MCP payment-required error.
 ///
 /// Returns `None` if the error has no `data.challenges` array or
-/// if deserialization fails.
+/// none of its entries is a valid challenge.
 pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
     extract_challenges_from_data(error.get("data")?)
 }
@@ -200,7 +256,8 @@ pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChalle
 /// Extracts challenges from an MCP payment-required data payload.
 ///
 /// Accepts MCP's expanded JSON `request` object and normalizes it to the
-/// base64url representation retained by the core protocol types.
+/// base64url representation retained by the core protocol types. Malformed
+/// entries are skipped so that the remaining alternatives stay usable.
 pub fn extract_challenges_from_data(
     payment_required: &serde_json::Value,
 ) -> Option<Vec<PaymentChallenge>> {
@@ -211,21 +268,53 @@ pub fn extract_challenges_from_data(
 /// Extract challenges from an MCP tool result's payment-required metadata.
 ///
 /// Expects the result `_meta` object (not the complete tool result). Returns
-/// `None` when the metadata key is absent or its challenge list is invalid.
+/// `None` when the metadata key is absent or it lists no valid challenge.
 pub fn extract_result_challenges(meta: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
     extract_challenges_from_data(meta.get(PAYMENT_REQUIRED_META_KEY)?)
 }
 
 fn extract_wire_challenges(value: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    value
+    let challenges: Vec<_> = value
         .as_array()?
         .iter()
-        .map(|challenge| {
-            let mut challenge = challenge.clone();
-            normalize_wire_challenge(&mut challenge)?;
-            serde_json::from_value(challenge).ok()
-        })
-        .collect()
+        .cloned()
+        .filter_map(parse_wire_challenge)
+        .collect();
+    (!challenges.is_empty()).then_some(challenges)
+}
+
+fn parse_wire_challenge(mut challenge: serde_json::Value) -> Option<PaymentChallenge> {
+    normalize_wire_challenge(&mut challenge)?;
+    serde_json::from_value(challenge).ok()
+}
+
+fn deserialize_wire_challenges<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<PaymentChallenge>, D::Error> {
+    let challenges = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(challenges
+        .into_iter()
+        .filter_map(parse_wire_challenge)
+        .collect())
+}
+
+fn serialize_wire_challenges<S: Serializer>(
+    challenges: &[PaymentChallenge],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    challenges
+        .iter()
+        .map(wire_challenge)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn wire_challenge(challenge: &PaymentChallenge) -> Result<serde_json::Value, MppError> {
+    let mut value = serde_json::to_value(challenge)
+        .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
+    value["request"] = challenge.request.decode_value()?;
+    Ok(value)
 }
 
 fn normalize_wire_challenge(challenge: &mut serde_json::Value) -> Option<()> {
@@ -275,19 +364,25 @@ pub fn credential_value(credential: &PaymentCredential) -> Result<serde_json::Va
 ///
 /// Inserts (or creates) `params._meta` and sets the credential
 /// under [`CREDENTIAL_META_KEY`].
+///
+/// Leaves `params` unchanged if it or its `_meta` is not a JSON object, or if
+/// the credential's challenge is not valid base64url JSON. Use
+/// [`try_attach_credential`] to observe that failure.
 pub fn attach_credential(params: &mut serde_json::Value, credential: &PaymentCredential) {
-    let cred_value = credential_value(credential)
-        .expect("PaymentCredential challenge must contain valid base64url JSON");
+    let _ = try_attach_credential(params, credential);
+}
 
-    let meta = params
-        .as_object_mut()
-        .expect("params must be a JSON object")
-        .entry("_meta")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    meta.as_object_mut()
-        .expect("_meta must be a JSON object")
-        .insert(CREDENTIAL_META_KEY.to_string(), cred_value);
+/// Attach a credential to MCP request `params._meta`.
+///
+/// Like [`attach_credential`], but returns an error and leaves `params`
+/// unchanged if it or its `_meta` is not a JSON object, or if the
+/// credential's challenge is not valid base64url JSON.
+pub fn try_attach_credential(
+    params: &mut serde_json::Value,
+    credential: &PaymentCredential,
+) -> Result<(), MppError> {
+    let cred_value = credential_value(credential)?;
+    insert_meta(params, "params", CREDENTIAL_META_KEY, cred_value)
 }
 
 // ==================== Tests ====================
@@ -377,8 +472,8 @@ mod tests {
 
         let error = payment_required_error_with_problem(&challenge, problem);
 
-        // Top-level: code is -32042, message mirrors problem.detail.
-        assert_eq!(error.code, PAYMENT_REQUIRED_CODE);
+        // Top-level: code is -32043, message mirrors problem.detail.
+        assert_eq!(error.code, PAYMENT_VERIFICATION_FAILED_CODE);
         assert_eq!(error.message, "Payment verification failed: bad signature.");
 
         // Survives JSON round-trip (matches mppx McpError wire format).
@@ -402,6 +497,48 @@ mod tests {
         assert_eq!(p.status, 402);
         assert_eq!(p.detail, "Payment verification failed: bad signature.");
         assert_eq!(p.challenge_id.as_deref(), Some("ch_test_123"));
+    }
+
+    #[test]
+    fn test_payment_required_error_with_problem_maps_error_code() {
+        use crate::error::PaymentErrorDetails;
+
+        let cases = [
+            (PaymentErrorDetails::core("payment-required"), -32042, 402),
+            (
+                PaymentErrorDetails::core("verification-failed"),
+                -32043,
+                402,
+            ),
+            (PaymentErrorDetails::core("payment-expired"), -32043, 402),
+            (
+                PaymentErrorDetails::session("invalid-signature"),
+                -32043,
+                402,
+            ),
+            (
+                PaymentErrorDetails::core("malformed-credential"),
+                -32602,
+                402,
+            ),
+            (PaymentErrorDetails::core("invalid-payload"), -32602, 402),
+            (
+                PaymentErrorDetails::core("internal-payment-error").with_status(500),
+                -32603,
+                500,
+            ),
+        ];
+
+        for (problem, code, http_status) in cases {
+            let problem_type = problem.problem_type.clone();
+            let error = payment_required_error_with_problem(&test_challenge(), problem);
+            assert_eq!(error.code, code, "{problem_type}");
+            assert_eq!(
+                error.data.unwrap().http_status,
+                http_status,
+                "{problem_type}"
+            );
+        }
     }
 
     // ---- extract_credential ----
@@ -456,6 +593,32 @@ mod tests {
         assert_eq!(data.challenges.len(), 1);
         assert_eq!(data.challenges[0].method.as_str(), "tempo");
         assert_eq!(data.challenges[0].intent.as_str(), "charge");
+    }
+
+    #[test]
+    fn test_payment_required_error_serializes_expanded_request() {
+        let challenge = test_challenge()
+            .with_opaque(Base64UrlJson::from_value(&json!({"scope": "job:123"})).unwrap());
+        let error = serde_json::to_value(payment_required_error(&challenge)).unwrap();
+
+        let wire = &error["data"]["challenges"][0];
+        assert_eq!(
+            wire["request"],
+            json!({"amount": "1000", "currency": "USD"})
+        );
+        assert_eq!(wire["opaque"], challenge.opaque.as_ref().unwrap().raw());
+
+        let extracted = extract_challenges(&error).unwrap();
+        assert_eq!(extracted[0].request.raw(), challenge.request.raw());
+        assert_eq!(extracted[0].opaque, challenge.opaque);
+    }
+
+    #[test]
+    fn test_payment_required_error_rejects_undecodable_request() {
+        let mut challenge = test_challenge();
+        challenge.request = Base64UrlJson::from_raw("not json");
+
+        assert!(serde_json::to_value(payment_required_error(&challenge)).is_err());
     }
 
     // ---- attach_receipt ----
@@ -530,7 +693,7 @@ mod tests {
             "code": PAYMENT_VERIFICATION_FAILED_CODE,
             "message": "Payment Verification Failed"
         });
-        assert!(!is_payment_required(&error));
+        assert!(is_payment_required(&error));
     }
 
     #[test]
@@ -610,6 +773,40 @@ mod tests {
             }
         });
 
+        assert!(extract_challenges(&error).is_none());
+    }
+
+    #[test]
+    fn test_extract_challenges_skips_malformed_entries() {
+        let mut invalid_method = serde_json::to_value(test_challenge()).unwrap();
+        invalid_method["method"] = json!("123");
+        let mut second = test_challenge();
+        second.id = "ch_test_456".to_string();
+        let data = json!({
+            "httpStatus": 402,
+            "challenges": [
+                test_challenge(),
+                invalid_method,
+                {"id": "missing-fields"},
+                "not-an-object",
+                second
+            ]
+        });
+
+        let challenges = extract_challenges_from_data(&data).unwrap();
+        let ids: Vec<_> = challenges.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["ch_test_123", "ch_test_456"]);
+
+        let typed: McpPaymentErrorData = serde_json::from_value(data).unwrap();
+        assert_eq!(typed.challenges.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_challenges_empty_list() {
+        let error = json!({
+            "code": PAYMENT_REQUIRED_CODE,
+            "data": {"httpStatus": 402, "challenges": []}
+        });
         assert!(extract_challenges(&error).is_none());
     }
 
@@ -822,18 +1019,161 @@ mod tests {
     // ---- Verification-failed error code ----
 
     #[test]
-    fn test_verification_failed_code_not_payment_required() {
+    fn test_verification_failed_error_carries_fresh_challenge() {
+        // Example from the MCP transport spec, "Payment Verification Failure".
         let error = json!({
-            "code": PAYMENT_VERIFICATION_FAILED_CODE,
+            "code": -32043,
             "message": "Payment Verification Failed",
             "data": {
-                "httpStatus": 403,
-                "reason": "invalid signature"
+                "httpStatus": 402,
+                "challenges": [{
+                    "id": "retry-challenge-abc",
+                    "realm": "api.example.com",
+                    "method": "tempo",
+                    "intent": "charge",
+                    "request": {"amount": "1000", "currency": "usd"}
+                }],
+                "failure": {
+                    "reason": "signature-invalid",
+                    "detail": "Signature verification failed"
+                }
             }
         });
-        // -32043 is NOT -32042, so is_payment_required must return false
-        assert!(!is_payment_required(&error));
-        // extract_challenges should still work if data.challenges is present
-        assert!(extract_challenges(&error).is_none());
+
+        assert!(is_payment_required(&error));
+        let challenges = extract_challenges(&error).unwrap();
+        assert_eq!(challenges[0].id, "retry-challenge-abc");
+    }
+
+    // ---- mppx interop ----
+
+    // `Transport.mcp().respondChallenge` output for the challenge in mppx's
+    // `src/server/Transport.test.ts`.
+    const MPPX_SECRET_KEY: &str = "test-secret-key-test-secret-key-32";
+    const MPPX_CHALLENGE_ID: &str = "ITdnfSy5EVxmsDHMll-mcEbGENBvnz3jfySVS8uFS7Y";
+    const MPPX_REQUEST: &str = "eyJhbW91bnQiOiIxMDAwMDAwMDAwIiwiY3VycmVuY3kiOiIweDIwYzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDEiLCJyZWNpcGllbnQiOiIweDc0MmQzNUNjNjYzNEMwNTMyOTI1YTNiODQ0QmM5ZTc1OTVmOGZFMDAifQ";
+
+    fn mppx_challenge() -> serde_json::Value {
+        json!({
+            "expires": "2025-01-01T00:00:00.000Z",
+            "id": MPPX_CHALLENGE_ID,
+            "intent": "charge",
+            "method": "tempo",
+            "realm": "api.example.com",
+            "request": {
+                "amount": "1000000000",
+                "currency": "0x20c0000000000000000000000000000000000001",
+                "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f8fE00"
+            }
+        })
+    }
+
+    #[test]
+    fn test_mppx_payment_required_error_roundtrip() {
+        let wire = json!({
+            "code": -32042,
+            "message": "Payment Required",
+            "data": {
+                "httpStatus": 402,
+                "challenges": [mppx_challenge()]
+            }
+        });
+
+        assert!(is_payment_required(&wire));
+        let challenges = extract_challenges(&wire).unwrap();
+        assert_eq!(challenges.len(), 1);
+        assert_eq!(challenges[0].request.raw(), MPPX_REQUEST);
+        assert!(challenges[0].verify(MPPX_SECRET_KEY));
+
+        assert_eq!(
+            serde_json::to_value(payment_required_error(&challenges[0])).unwrap(),
+            wire
+        );
+        let typed: McpPaymentError = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(typed).unwrap(), wire);
+    }
+
+    #[test]
+    fn test_mppx_verification_failed_error_roundtrip() {
+        let wire = json!({
+            "code": -32043,
+            "message": "Payment verification failed: bad signature.",
+            "data": {
+                "httpStatus": 402,
+                "challenges": [mppx_challenge()],
+                "problem": {
+                    "type": "https://paymentauth.org/problems/verification-failed",
+                    "title": "Verification Failed",
+                    "status": 402,
+                    "detail": "Payment verification failed: bad signature.",
+                    "challengeId": MPPX_CHALLENGE_ID
+                }
+            }
+        });
+
+        assert!(is_payment_required(&wire));
+        let challenges = extract_challenges(&wire).unwrap();
+        assert!(challenges[0].verify(MPPX_SECRET_KEY));
+
+        let problem = crate::error::PaymentErrorDetails::core("verification-failed")
+            .with_title("Verification Failed")
+            .with_detail("Payment verification failed: bad signature.");
+        assert_eq!(
+            serde_json::to_value(payment_required_error_with_problem(&challenges[0], problem))
+                .unwrap(),
+            wire
+        );
+        let typed: McpPaymentError = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(typed).unwrap(), wire);
+    }
+
+    #[test]
+    fn test_mppx_challenge_with_meta_keeps_raw_opaque() {
+        // mppx emits both the parsed `meta` and the raw `opaque` it is bound to.
+        let mut challenge = mppx_challenge();
+        challenge["meta"] = json!({"scope": "job:123"});
+        challenge["opaque"] = json!("eyJzY29wZSI6ImpvYjoxMjMifQ");
+        let data = json!({"httpStatus": 402, "challenges": [challenge]});
+
+        let challenges = extract_challenges_from_data(&data).unwrap();
+
+        let opaque = challenges[0].opaque.as_ref().unwrap();
+        assert_eq!(opaque.raw(), "eyJzY29wZSI6ImpvYjoxMjMifQ");
+        assert_eq!(opaque.decode_value().unwrap(), json!({"scope": "job:123"}));
+    }
+
+    // ---- attach helpers on non-object input ----
+
+    #[test]
+    fn test_attach_credential_rejects_non_object_params() {
+        for params in [json!(["latest", false]), json!(null), json!({"_meta": "x"})] {
+            let mut attached = params.clone();
+            attach_credential(&mut attached, &test_credential());
+            assert_eq!(attached, params);
+            assert!(try_attach_credential(&mut attached, &test_credential()).is_err());
+            assert_eq!(attached, params);
+        }
+    }
+
+    #[test]
+    fn test_attach_credential_rejects_undecodable_challenge() {
+        let mut credential = test_credential();
+        credential.challenge.request = Base64UrlJson::from_raw("not json");
+        let mut params = json!({"name": "tool"});
+
+        attach_credential(&mut params, &credential);
+        assert!(try_attach_credential(&mut params, &credential).is_err());
+        assert_eq!(params, json!({"name": "tool"}));
+    }
+
+    #[test]
+    fn test_attach_receipt_rejects_non_object_result() {
+        for result in [json!("0x1"), json!([1, 2]), json!({"_meta": []})] {
+            let mut attached = result.clone();
+            attach_receipt(&mut attached, &test_receipt(), "ch_test_123");
+            assert_eq!(attached, result);
+            assert!(try_attach_receipt(&mut attached, &test_receipt(), "ch_test_123").is_err());
+            assert_eq!(attached, result);
+        }
     }
 }
