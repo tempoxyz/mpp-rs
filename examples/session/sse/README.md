@@ -14,6 +14,11 @@ This mirrors the TypeScript `session/sse` example from the mpp SDK.
 6. **Server** begins streaming tokens as SSE events, charging per token
 7. Mid-stream, if the channel balance is exhausted, the server emits
    `payment-need-voucher` events and the client sends updated vouchers
+   with a POST to the same URL
+
+The server answers a POST (voucher, top-up, close) with a receipt and never
+with a stream: a voucher that started a second stream would compete for the
+balance with the stream that asked for it.
 
 ## Running
 
