@@ -8,7 +8,7 @@
 //!   (402) unless the failure is the server's own (500)
 //! - Valid credential → extracts the [`Receipt`] for the handler
 //!
-//! Also provides [`IntoResponse`](axum_core::response::IntoResponse)
+//! Also provides [`IntoResponse`]
 //! implementations for [`PaymentChallenge`] (402 response) and
 //! [`Receipt`] (response header).
 //!
@@ -43,7 +43,7 @@
 //! # State setup
 //!
 //! The extractors require `Arc<dyn ChargeChallenger>` in the router state
-//! (either directly or via [`FromRef`](axum_core::extract::FromRef)):
+//! (either directly or via [`FromRef`]):
 //!
 //! ```ignore
 //! use axum::{routing::get, Router, Json};
@@ -261,7 +261,7 @@ pub struct ChallengeOptions {
 /// # State Requirements
 ///
 /// Requires `Arc<dyn ChargeChallenger>` in the router state, either directly or
-/// via [`FromRef`](axum_core::extract::FromRef).
+/// via [`FromRef`].
 ///
 /// # Example
 ///

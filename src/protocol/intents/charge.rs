@@ -98,7 +98,7 @@ impl ChargeRequest {
     /// Parse the amount as U256 when EVM support is enabled.
     ///
     /// This matches bigint semantics in the TypeScript SDK and avoids the
-    /// `u128` ceiling of [`parse_amount`].
+    /// `u128` ceiling of [`Self::parse_amount`].
     #[cfg(feature = "evm")]
     pub fn parse_amount_u256(&self) -> Result<U256> {
         crate::evm::parse_amount(&self.amount)

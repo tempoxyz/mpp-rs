@@ -3,7 +3,7 @@
 //! This module provides traits for payment methods organized by intent:
 //!
 //! - [`ChargeMethod`]: One-time payment verification
-//! - [`AuthorizeMethod`]: Payment authorization with capture (stub)
+//! - [`SessionMethod`]: Pay-as-you-go session verification
 //!
 //! Each trait enforces a typed request schema, ensuring consistent
 //! field names across all implementations.

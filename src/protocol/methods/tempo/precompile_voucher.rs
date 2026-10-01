@@ -139,7 +139,7 @@ pub fn precompile_voucher_signing_hash_with_escrow(
 
 /// Sign a TIP-1034 voucher (EIP-712). Returns 65-byte ECDSA signature.
 /// Rejects `cumulative_amount > PRECOMPILE_MAX_CUMULATIVE_AMOUNT` with
-/// [`MppError::InvalidConfig`](crate::error::MppError::InvalidConfig).
+/// [`MppError::InvalidConfig`].
 #[cfg(feature = "tempo")]
 pub async fn sign_precompile_voucher(
     signer: &impl Signer,
