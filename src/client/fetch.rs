@@ -1647,6 +1647,46 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_402_unsupported_credential_header_is_not_paid() {
+            let app = Router::new().route(
+                "/paid",
+                get(|req: axum::http::Request<axum::body::Body>| async move {
+                    let paid = req
+                        .headers()
+                        .get("cookie")
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.starts_with("Payment "));
+                    if paid {
+                        (AxumStatusCode::OK, "ok").into_response()
+                    } else {
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(
+                                WWW_AUTH_NAME,
+                                r#"Payment id="cookie-1", realm="test.example.com", method="tempo", intent="charge", request="e30", header="Cookie""#,
+                            )],
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let client = reqwest::Client::new();
+
+            let err = client
+                .get(format!("{}/paid", base_url))
+                .header("cookie", "session=user-secret")
+                .send_with_payment(&provider)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, HttpError::NoSupportedChallenge(_)));
+            assert_eq!(provider.call_count(), 0);
+        }
+
+        #[tokio::test]
         async fn test_provider_failure_bubbles_up() {
             let (_, www_auth) = test_challenge();
 

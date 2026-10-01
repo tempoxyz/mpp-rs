@@ -528,10 +528,8 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
         parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
     }
 
-    if let Some(ref header) = challenge.header {
-        if !super::is_default_credential_header(Some(header)) {
-            parts.push(format!("header=\"{}\"", escape_quoted_value(header)?));
-        }
+    if let Some(header) = super::parse_advertised_credential_header(challenge.header.as_deref())? {
+        parts.push(format!("header=\"{}\"", escape_quoted_value(&header)?));
     }
 
     if let Some(ref opaque) = challenge.opaque {
@@ -1360,13 +1358,51 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_rejects_invalid_header_name() {
+    fn test_parse_www_authenticate_rejects_unsupported_credential_header() {
+        for name in [
+            "not a header",
+            "Cookie",
+            "Proxy-Authorization",
+            "Content-Length",
+            "X-Payment-Authorization",
+        ] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", header="{name}""#,
+            );
+            let err = parse_www_authenticate(&header).unwrap_err();
+            assert!(
+                err.to_string().contains("Unsupported credential header"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_keeps_credential_header_spelling() {
         let header = concat!(
             r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
-            r#"request="e30", header="not a header""#,
+            r#"request="e30", header="payment-authorization""#,
         );
-        let err = parse_www_authenticate(header).unwrap_err();
-        assert!(err.to_string().contains("Invalid HTTP header name"));
+        let parsed = parse_www_authenticate(header).unwrap();
+        assert_eq!(parsed.header.as_deref(), Some("payment-authorization"));
+        assert_eq!(parsed.credential_header(), "payment-authorization");
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_unsupported_credential_header() {
+        let mut challenge = test_challenge();
+        challenge.header = Some("Cookie".to_string());
+        assert!(format_www_authenticate(&challenge).is_err());
+    }
+
+    #[test]
+    fn test_parse_authorization_rejects_unsupported_credential_header() {
+        let mut challenge = test_challenge();
+        challenge.header = Some("Cookie".to_string());
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
+        let header = format_authorization(&credential).unwrap();
+        assert!(parse_authorization(&header).is_err());
     }
 
     #[test]
