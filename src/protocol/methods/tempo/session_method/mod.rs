@@ -10,6 +10,7 @@ mod close;
 mod open;
 mod payload;
 mod receipt;
+mod state;
 mod store;
 mod top_up;
 mod voucher;

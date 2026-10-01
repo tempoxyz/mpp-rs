@@ -107,25 +107,7 @@ pub async fn deduct_from_channel(
             Box::new(move |current| {
                 let state = current
                     .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                if state.finalized {
-                    return Err(VerificationError::channel_closed("channel is finalized"));
-                }
-                if state.closing {
-                    return Err(VerificationError::channel_closed("channel is closing"));
-                }
-                let available = state.highest_voucher_amount.saturating_sub(state.spent);
-                if available >= amount {
-                    Ok(Some(ChannelState {
-                        spent: state.spent + amount,
-                        units: state.units + 1,
-                        ..state
-                    }))
-                } else {
-                    Err(VerificationError::insufficient_balance(format!(
-                        "requested {}, available {}",
-                        amount, available
-                    )))
-                }
+                state.deduct(amount).map(Some)
             }),
         )
         .await?;
