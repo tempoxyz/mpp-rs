@@ -94,7 +94,8 @@ pub struct TempoSessionProvider {
     authorized_signer: Option<Address>,
     /// Signing mode (direct or keychain).
     signing_mode: crate::client::tempo::signing::TempoSigningMode,
-    /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`.
+    /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`
+    /// and the cumulative amount any voucher may authorize.
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
     default_deposit: Option<u128>,
@@ -214,6 +215,9 @@ impl TempoSessionProvider {
     }
 
     /// Set the maximum deposit in atomic units.
+    ///
+    /// Also the highest cumulative amount a voucher may authorize, so a channel
+    /// holding a larger deposit is not spent past it.
     pub fn with_max_deposit(mut self, amount: u128) -> Self {
         self.max_deposit = Some(amount);
         self
@@ -1851,8 +1855,8 @@ impl TempoSessionProvider {
                             MppError::InvalidConfig("session cumulative amount overflowed".into())
                         })?;
                 }
+                self.assert_within_max_deposit(entry.cumulative_amount)?;
                 if entry.cumulative_amount > entry.deposit {
-                    self.assert_within_max_deposit(entry.cumulative_amount)?;
                     let Some(top_up) = top_up else {
                         return Err(MppError::InvalidConfig(
                             "session cumulative amount exceeds channel deposit".into(),
@@ -1936,6 +1940,7 @@ impl TempoSessionProvider {
                     {
                         // Start from recovered settled amount + request amount
                         recovered.cumulative_amount += amount;
+                        self.assert_within_max_deposit(recovered.cumulative_amount)?;
 
                         let payload = create_voucher_payload(
                             self.secp256k1_signer()?,
@@ -2710,6 +2715,69 @@ mod tests {
         )
     }
 
+    /// Tracks an open TIP-1034 channel on chain 42431 paid by the provider's
+    /// signer and returns its id.
+    fn seed_precompile_channel(
+        provider: &TempoSessionProvider,
+        payee: Address,
+        currency: Address,
+        cumulative_amount: u128,
+        deposit: u128,
+    ) -> B256 {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::channel_ops::build_channel_descriptor;
+        use crate::protocol::methods::tempo::precompile_voucher::compute_precompile_channel_id;
+
+        let payer = provider.signer.address();
+        let salt = B256::repeat_byte(0x44);
+        let nonce_hash = B256::repeat_byte(0x55);
+        let channel_id = compute_precompile_channel_id(
+            payer,
+            payee,
+            Address::ZERO,
+            currency,
+            salt,
+            payer,
+            nonce_hash,
+            42431,
+        );
+        let key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+        provider.channels.lock().unwrap().insert(
+            key.clone(),
+            ChannelEntry {
+                channel_id,
+                salt,
+                cumulative_amount,
+                deposit,
+                descriptor: Some(build_channel_descriptor(
+                    payer,
+                    payee,
+                    Address::ZERO,
+                    currency,
+                    salt,
+                    payer,
+                    nonce_hash,
+                )),
+                settlement_route: None,
+                escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), key);
+        channel_id
+    }
+
     #[tokio::test]
     async fn rollback_forgets_pending_open_and_keeps_established_channel() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
@@ -3346,6 +3414,79 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceeds locally authorized cumulative amount"));
+    }
+
+    #[tokio::test]
+    async fn pay_enforces_max_deposit_on_every_voucher() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider().with_max_deposit(1_200);
+        // The channel holds a larger deposit than this provider may authorize.
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("exceeds local max_deposit"),
+            "{err}"
+        );
+        assert_eq!(provider.cumulative(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn pay_enforces_max_deposit_on_a_recovered_legacy_channel() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+        use alloy::sol_types::SolValue;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = Address::repeat_byte(0x33);
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_max_deposit(1_200);
+        let payer = provider.signer.address();
+        let asserter = Asserter::new();
+        let on_chain = (
+            false,
+            0u64,
+            payer,
+            payee,
+            currency,
+            Address::ZERO,
+            10_000u128,
+            1_000u128,
+        );
+        asserter.push_success(&alloy::primitives::Bytes::from(on_chain.abi_encode()));
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": format!("{currency:#x}"),
+                "recipient": format!("{payee:#x}"),
+                "methodDetails": {
+                    "escrowContract": format!("{escrow:#x}"),
+                    "channelId": B256::repeat_byte(0x44).to_string(),
+                    "chainId": 42431
+                }
+            }))
+            .unwrap(),
+        );
+
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("exceeds local max_deposit"),
+            "{err}"
+        );
+        assert!(provider.channels().is_empty());
     }
 
     #[tokio::test]
