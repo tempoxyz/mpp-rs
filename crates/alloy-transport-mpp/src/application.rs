@@ -10,7 +10,7 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 use futures::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use mpp::{
-    client::{PaymentContext, PaymentProvider},
+    client::{PaymentContext, PaymentProvider, PendingPayment},
     format_authorization, parse_www_authenticate_all_bytes, MppError, PaymentChallenge,
     PaymentCredential,
 };
@@ -27,7 +27,7 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::{ws::PendingPayment, CloseProvider, CloseRequest, VoucherProvider, VoucherRequest};
+use crate::{CloseProvider, CloseRequest, VoucherProvider, VoucherRequest};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

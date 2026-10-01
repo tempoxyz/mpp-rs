@@ -203,80 +203,73 @@ pub trait PaymentProvider: Clone + Send + Sync {
     }
 }
 
-pub(crate) async fn commit_payments<P: PaymentProvider>(
-    provider: &P,
-    payments: &[(PaymentChallenge, PaymentCredential)],
-) -> Result<(), MppError> {
-    for (challenge, credential) in payments {
-        provider.commit_payment(challenge, credential).await?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn rollback_payments<P: PaymentProvider>(
-    provider: &P,
-    payments: &[(PaymentChallenge, PaymentCredential)],
-) -> Result<(), MppError> {
-    for (challenge, credential) in payments {
-        provider.rollback_payment(challenge, credential).await?;
-    }
-    Ok(())
-}
-
-pub(crate) struct PendingPayments<P: PaymentProvider> {
+/// A payment credential awaiting a definitive delivery outcome.
+///
+/// Dropping an active payment invokes [`PaymentProvider::abandon_payment`],
+/// which is the cancellation and ambiguous-delivery path. Call [`Self::commit`]
+/// after acceptance or [`Self::rollback`] when the credential was not sent or
+/// was definitively rejected.
+pub struct PendingPayment<P: PaymentProvider> {
     provider: P,
-    payments: Vec<(PaymentChallenge, PaymentCredential)>,
+    challenge: PaymentChallenge,
+    credential: PaymentCredential,
+    active: bool,
 }
 
-impl<P: PaymentProvider> PendingPayments<P> {
-    pub(crate) fn new(provider: P) -> Self {
+impl<P: PaymentProvider> PendingPayment<P> {
+    /// Tracks a credential the provider created for `challenge`.
+    pub fn new(provider: P, challenge: PaymentChallenge, credential: PaymentCredential) -> Self {
         Self {
             provider,
-            payments: Vec::new(),
+            challenge,
+            credential,
+            active: true,
         }
     }
 
-    pub(crate) async fn commit(&mut self) -> Result<(), MppError> {
-        commit_payments(&self.provider, &self.payments).await?;
-        self.payments.clear();
+    /// Returns the selected challenge.
+    pub fn challenge(&self) -> &PaymentChallenge {
+        &self.challenge
+    }
+
+    /// Returns the credential to send to the server.
+    pub fn credential(&self) -> &PaymentCredential {
+        &self.credential
+    }
+
+    /// Commits provider state after the server accepts the credential.
+    pub async fn commit(mut self) -> Result<(), MppError> {
+        self.provider
+            .commit_payment(&self.challenge, &self.credential)
+            .await?;
+        self.active = false;
         Ok(())
     }
 
-    pub(crate) async fn rollback(&mut self) -> Result<(), MppError> {
-        rollback_payments(&self.provider, &self.payments).await?;
-        self.payments.clear();
+    /// Rolls back provider state after definitive non-delivery or rejection.
+    pub async fn rollback(mut self) -> Result<(), MppError> {
+        self.provider
+            .rollback_payment(&self.challenge, &self.credential)
+            .await?;
+        self.active = false;
         Ok(())
     }
 
-    pub(crate) async fn invalidate(&mut self) -> Result<(), MppError> {
-        for (challenge, credential) in &self.payments {
-            self.provider
-                .invalidate_payment(challenge, credential)
-                .await?;
-        }
-        self.payments.clear();
+    /// Discards provider state the server reported as permanently unusable.
+    pub async fn invalidate(mut self) -> Result<(), MppError> {
+        self.provider
+            .invalidate_payment(&self.challenge, &self.credential)
+            .await?;
+        self.active = false;
         Ok(())
     }
 }
 
-impl<P: PaymentProvider> std::ops::Deref for PendingPayments<P> {
-    type Target = Vec<(PaymentChallenge, PaymentCredential)>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.payments
-    }
-}
-
-impl<P: PaymentProvider> std::ops::DerefMut for PendingPayments<P> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.payments
-    }
-}
-
-impl<P: PaymentProvider> Drop for PendingPayments<P> {
+impl<P: PaymentProvider> Drop for PendingPayment<P> {
     fn drop(&mut self) {
-        for (challenge, credential) in &self.payments {
-            self.provider.abandon_payment(challenge, credential);
+        if self.active {
+            self.provider
+                .abandon_payment(&self.challenge, &self.credential);
         }
     }
 }
