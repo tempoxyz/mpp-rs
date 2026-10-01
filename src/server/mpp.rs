@@ -30,12 +30,14 @@ const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;
 
 /// Environment variables checked (in order) to auto-detect the server realm.
+///
+/// `HOST` and `HOSTNAME` are deliberately absent: container runtimes set them
+/// per replica, and the realm is part of the challenge HMAC, so a credential
+/// for a challenge issued by one replica would be rejected by the others.
 const REALM_ENV_VARS: &[&str] = &[
     "MPP_REALM",
     "FLY_APP_NAME",
     "HEROKU_APP_NAME",
-    "HOST",
-    "HOSTNAME",
     "RAILWAY_PUBLIC_DOMAIN",
     "RENDER_EXTERNAL_HOSTNAME",
     "VERCEL_URL",
@@ -68,14 +70,14 @@ fn validate_charge_modes(modes: &[&str]) -> Result<()> {
 /// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
 /// falling back to `"MPP Payment"`.
 pub(crate) fn detect_realm() -> String {
-    for name in REALM_ENV_VARS {
-        if let Ok(value) = std::env::var(name) {
-            if !value.is_empty() {
-                return value;
-            }
-        }
-    }
-    DEFAULT_REALM.to_string()
+    realm_from_env(|name| std::env::var(name).ok())
+}
+
+fn realm_from_env(lookup: impl Fn(&str) -> Option<String>) -> String {
+    REALM_ENV_VARS
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| DEFAULT_REALM.to_string())
 }
 
 /// Result of session verification, including optional management response.
@@ -2431,6 +2433,36 @@ mod tests {
             Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2")
         );
         assert_eq!(mpp.decimals(), 6);
+    }
+
+    #[test]
+    fn test_realm_detection_ignores_host_and_hostname() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+
+        assert_eq!(
+            realm_from_env(env(&[
+                ("HOST", "0.0.0.0"),
+                ("HOSTNAME", "pod-7f9c5d-abcde")
+            ])),
+            DEFAULT_REALM
+        );
+        assert_eq!(
+            realm_from_env(env(&[
+                ("HOSTNAME", "pod-7f9c5d-abcde"),
+                ("VERCEL_URL", "app.vercel.app"),
+            ])),
+            "app.vercel.app"
+        );
+        assert_eq!(
+            realm_from_env(env(&[("MPP_REALM", ""), ("FLY_APP_NAME", "my-app")])),
+            "my-app"
+        );
     }
 
     #[cfg(feature = "tempo")]
