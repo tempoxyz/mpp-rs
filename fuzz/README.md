@@ -113,11 +113,9 @@ the place:
 - `parse_www_authenticate` trims Unicode whitespace before the scheme and
   `parse_www_authenticate_all` only SP and HTAB; an auth-param named
   `Payment` splits a challenge in the list parser (`fuzz_www_authenticate`).
-- `accept_payment::parse` accepts exponent q-values such as `q=1e-5`, which
-  the serializer writes as `q=0` (`fuzz_accept_payment`).
-- The `u128` and `U256` amount parsers disagree outside plain digit strings
-  (`+1`, `0x10`, `1_000`, the empty string). `--features strict-amounts`
-  asserts that both accept only `0|[1-9][0-9]*` (`fuzz_amount`).
+- The amount parsers accept leading zeros (`007`), as mppx does.
+  `--features strict-amounts` asserts that they accept only `0|[1-9][0-9]*`
+  (`fuzz_amount`).
 - JCS rounds integers beyond 2^53 (`fuzz_base64url_json`).
 
 ## Coverage
