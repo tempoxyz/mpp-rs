@@ -29,6 +29,7 @@ use alloy::network::ReceiptResponse;
 use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::simulate::{SimBlock, SimCallResult, SimulatePayload};
+use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use std::future::Future;
 use std::sync::Arc;
@@ -1706,10 +1707,10 @@ where
         })
     }
 
-    /// Simulate a co-signed `0x76` tx and error if it would revert. Generally
-    /// fails closed: an RPC error is treated as a failed check, not a pass.
-    /// Exception: nodes without `tempo_simulateV1` (JSON-RPC -32601) skip the
-    /// check rather than reject every sponsored payment.
+    /// Simulate a co-signed `0x76` tx and error if it would revert. Fails
+    /// closed: an RPC error is treated as a failed check, not a pass. Nodes
+    /// without `tempo_simulateV1` (JSON-RPC -32601) are asked to `eth_call`
+    /// the transaction's calls instead.
     async fn simulate_before_broadcast(
         &self,
         final_tx_bytes: &[u8],
@@ -1722,17 +1723,15 @@ where
         // tempo_simulateV1(payload, block?) — omit block to use the latest state.
         let response: TempoSimulateResponse = match self
             .provider
-            .raw_request("tempo_simulateV1".into(), (payload,))
+            .raw_request("tempo_simulateV1".into(), (&payload,))
             .await
         {
             Ok(response) => response,
             Err(e) => {
-                // Node doesn't support pre-simulation: skip the check rather
-                // than failing the payment.
                 if e.as_error_resp()
                     .is_some_and(|err| err.code == JSONRPC_METHOD_NOT_FOUND)
                 {
-                    return Ok(());
+                    return self.simulate_with_eth_call(payload).await;
                 }
                 return Err(VerificationError::network_error(format!(
                     "Pre-broadcast simulation failed: {e}"
@@ -1762,6 +1761,54 @@ where
             return Err(VerificationError::transaction_failed(format!(
                 "Sponsored transaction would revert in pre-broadcast simulation: {detail}"
             )));
+        }
+
+        Ok(())
+    }
+
+    /// Reduce a simulation request to its sender and calls. Without fee
+    /// fields or signatures the node only checks call execution, so the
+    /// sender does not need to hold a fee token (mppx simulates the same way).
+    fn sender_call_request(request: TempoTransactionRequest) -> TempoTransactionRequest {
+        TempoTransactionRequest {
+            inner: TransactionRequest {
+                from: request.inner.from,
+                to: request.inner.to,
+                value: request.inner.value,
+                input: request.inner.input,
+                ..Default::default()
+            },
+            calls: request.calls,
+            ..Default::default()
+        }
+    }
+
+    /// `eth_call` fallback for [`Self::simulate_before_broadcast`].
+    async fn simulate_with_eth_call(
+        &self,
+        payload: SimulatePayload<TempoTransactionRequest>,
+    ) -> Result<(), VerificationError> {
+        // JSON-RPC error code nodes return for a reverted call.
+        const JSONRPC_EXECUTION_REVERTED: i64 = 3;
+
+        let requests = payload
+            .block_state_calls
+            .into_iter()
+            .flat_map(|block| block.calls);
+        for request in requests {
+            if let Err(e) = self.provider.call(Self::sender_call_request(request)).await {
+                return Err(match e.as_error_resp() {
+                    Some(err) if err.code == JSONRPC_EXECUTION_REVERTED => {
+                        VerificationError::transaction_failed(format!(
+                            "Sponsored transaction would revert in pre-broadcast simulation: {} (code {})",
+                            err.message, err.code
+                        ))
+                    }
+                    _ => VerificationError::network_error(format!(
+                        "Pre-broadcast simulation failed: {e}"
+                    )),
+                });
+            }
         }
 
         Ok(())
@@ -5839,30 +5886,101 @@ mod tests {
     }
 
     /// A node that doesn't implement `tempo_simulateV1` (JSON-RPC "method not
-    /// found", -32601) has nothing to simulate against, so the check is skipped
-    /// and the broadcast proceeds rather than rejecting the payment.
+    /// found", -32601) is asked to `eth_call` the calls from the sender, so a
+    /// reverting transaction is still caught before the sponsor pays for it.
     #[tokio::test]
-    async fn test_simulate_before_broadcast_skips_when_method_not_found() {
+    async fn test_simulate_before_broadcast_falls_back_to_eth_call() {
         use alloy::providers::mock::Asserter;
 
         let cosigned = make_cosigned_fee_payer_tx().await;
 
-        let asserter = Asserter::new();
-        asserter.push_failure(alloy_json_rpc::ErrorPayload {
-            code: -32601,
-            message: "the method tempo_simulateV1 does not exist/is not available".into(),
-            data: None,
-        });
+        let method_with = |eth_call: Result<Bytes, alloy_json_rpc::ErrorPayload>| {
+            let asserter = Asserter::new();
+            asserter.push_failure(alloy_json_rpc::ErrorPayload {
+                code: -32601,
+                message: "the method tempo_simulateV1 does not exist/is not available".into(),
+                data: None,
+            });
+            match eth_call {
+                Ok(output) => asserter.push_success(&output),
+                Err(error) => asserter.push_failure(error),
+            }
+            let provider =
+                alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                    .connect_mocked_client(asserter.clone());
+            (ChargeMethod::new(provider), asserter)
+        };
 
-        let provider =
-            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
-                .connect_mocked_client(asserter);
-        let method = ChargeMethod::new(provider);
-
+        let (method, asserter) = method_with(Ok(Bytes::from(U256::from(1).to_be_bytes::<32>())));
         method
             .simulate_before_broadcast(&cosigned)
             .await
-            .expect("method-not-found must skip the check, not fail");
+            .expect("successful eth_call must pass");
+        assert!(asserter.read_q().is_empty(), "eth_call must be issued");
+
+        let (method, _) = method_with(Err(alloy_json_rpc::ErrorPayload {
+            code: 3,
+            message: "execution reverted: InsufficientBalance".into(),
+            data: None,
+        }));
+        let err = method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect_err("reverting eth_call must be rejected");
+        assert!(err.to_string().contains("would revert"), "got: {err}");
+        assert!(err.to_string().contains("InsufficientBalance"));
+
+        let (method, _) = method_with(Err(alloy_json_rpc::ErrorPayload {
+            code: -32601,
+            message: "the method eth_call does not exist/is not available".into(),
+            data: None,
+        }));
+        let err = method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect_err("a node that cannot simulate at all must fail closed");
+        assert!(
+            err.to_string().contains("Pre-broadcast simulation failed"),
+            "got: {err}"
+        );
+    }
+
+    /// The `eth_call` fallback runs the calls from the sender without fee
+    /// fields, so it does not depend on the sender holding a fee token.
+    #[tokio::test]
+    async fn test_sender_call_request_keeps_only_sender_and_calls() {
+        let cosigned = make_cosigned_fee_payer_tx().await;
+        let signed =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let sender = signed.recover_signer().unwrap();
+
+        let mut payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .unwrap();
+        let request =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::sender_call_request(
+                payload.block_state_calls.remove(0).calls.remove(0),
+            );
+
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            wire["from"].as_str().unwrap().to_lowercase(),
+            format!("{sender:#x}")
+        );
+        assert!(wire["to"].is_string() && wire["input"].is_string());
+        for field in [
+            "feePayerSignature",
+            "nonceKey",
+            "validBefore",
+            "gas",
+            "maxFeePerGas",
+            "maxPriorityFeePerGas",
+        ] {
+            assert!(wire.get(field).is_none(), "{field} must be omitted: {wire}");
+        }
+        assert!(wire["feeToken"].is_null());
     }
 
     // ==================== Sponsor fee-token selection ====================
