@@ -350,8 +350,8 @@ pub struct SessionMethodConfig {
 /// Tempo session method for server-side session payment verification.
 ///
 /// Handles four channel lifecycle actions:
-/// - `open`: broadcast open tx, verify initial voucher, create channel in store
-/// - `topUp`: broadcast topUp tx, update deposit in store
+/// - `open`: verify open tx and initial voucher, broadcast, create channel in store
+/// - `topUp`: verify topUp tx, broadcast, update deposit in store
 /// - `voucher`: verify voucher signature, check monotonicity/bounds/delta, update store
 /// - `close`: verify final voucher, close on-chain, finalize in store
 ///
@@ -482,6 +482,9 @@ where
     }
 
     /// Verify that the open transaction's derived channel ID matches the claimed channelId.
+    ///
+    /// Returns the address that signs the channel's vouchers and the deposit
+    /// the transaction opens it with.
     fn verify_open_channel_id_binding(
         tx_bytes: &[u8],
         claimed_channel_id: B256,
@@ -489,7 +492,7 @@ where
         chain_id: u64,
         expected_payee: Address,
         expected_token: Address,
-    ) -> Result<(), VerificationError> {
+    ) -> Result<(Address, u128), VerificationError> {
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::sol_types::SolCall;
 
@@ -499,47 +502,18 @@ where
             }
         }
 
-        // Strip type byte (0x76) if present.
-        let tx_data = if !tx_bytes.is_empty()
-            && tx_bytes[0] == tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID
-        {
-            &tx_bytes[1..]
-        } else {
-            tx_bytes
-        };
-
-        let signed =
-            tempo_alloy::primitives::AASigned::rlp_decode(&mut &tx_data[..]).map_err(|e| {
-                VerificationError::invalid_payload(format!(
-                    "failed to decode open transaction: {e}"
-                ))
-            })?;
+        let (signed, input) = Self::decode_escrow_call(
+            tx_bytes,
+            escrow,
+            <IEscrowOpen::openCall as SolCall>::SELECTOR,
+            "open",
+        )?;
 
         let sender = signed
             .recover_signer()
             .map_err(|e| VerificationError::new(format!("failed to recover sender: {e}")))?;
 
-        let tx = signed.tx();
-
-        // Find the escrow.open(...) call.
-        let open_selector = <IEscrowOpen::openCall as SolCall>::SELECTOR;
-        let open_call = tx
-            .calls
-            .iter()
-            .find(|call| {
-                let targets_escrow = match &call.to {
-                    alloy::primitives::TxKind::Call(addr) => *addr == escrow,
-                    _ => false,
-                };
-                targets_escrow && call.input.len() >= 4 && call.input[..4] == open_selector
-            })
-            .ok_or_else(|| {
-                VerificationError::invalid_payload(
-                    "open transaction does not contain an escrow.open() call",
-                )
-            })?;
-
-        let decoded = IEscrowOpen::openCall::abi_decode(&open_call.input).map_err(|e| {
+        let decoded = IEscrowOpen::openCall::abi_decode(&input).map_err(|e| {
             VerificationError::invalid_payload(format!(
                 "failed to decode escrow.open() calldata: {e}"
             ))
@@ -572,7 +546,101 @@ where
             ));
         }
 
+        let voucher_signer = if decoded.authorizedSigner == Address::ZERO {
+            sender
+        } else {
+            decoded.authorizedSigner
+        };
+
+        Ok((voucher_signer, decoded.deposit))
+    }
+
+    /// Verify that the topUp transaction tops up the claimed channel by the
+    /// declared amount.
+    fn verify_top_up_transaction(
+        tx_bytes: &[u8],
+        claimed_channel_id: B256,
+        escrow: Address,
+        additional_deposit: u128,
+    ) -> Result<(), VerificationError> {
+        use alloy::sol_types::SolCall;
+
+        alloy::sol! {
+            interface IEscrowTopUp {
+                function topUp(bytes32 channelId, uint256 additionalDeposit) external;
+            }
+        }
+
+        let (_, input) = Self::decode_escrow_call(
+            tx_bytes,
+            escrow,
+            <IEscrowTopUp::topUpCall as SolCall>::SELECTOR,
+            "topUp",
+        )?;
+
+        let decoded = IEscrowTopUp::topUpCall::abi_decode(&input).map_err(|e| {
+            VerificationError::invalid_payload(format!(
+                "failed to decode escrow.topUp() calldata: {e}"
+            ))
+        })?;
+
+        if decoded.channelId != claimed_channel_id {
+            return Err(VerificationError::new(
+                "topUp transaction does not match claimed channelId",
+            ));
+        }
+        if decoded.additionalDeposit != alloy::primitives::U256::from(additional_deposit) {
+            return Err(VerificationError::new(
+                "topUp transaction amount does not match additionalDeposit",
+            ));
+        }
+
         Ok(())
+    }
+
+    /// Decode a client-signed Tempo transaction and return it together with
+    /// the input of its call to `selector` on the escrow contract.
+    fn decode_escrow_call(
+        tx_bytes: &[u8],
+        escrow: Address,
+        selector: [u8; 4],
+        action: &str,
+    ) -> Result<(tempo_alloy::primitives::AASigned, Bytes), VerificationError> {
+        // Strip type byte (0x76) if present.
+        let tx_data = if !tx_bytes.is_empty()
+            && tx_bytes[0] == tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID
+        {
+            &tx_bytes[1..]
+        } else {
+            tx_bytes
+        };
+
+        let signed =
+            tempo_alloy::primitives::AASigned::rlp_decode(&mut &tx_data[..]).map_err(|e| {
+                VerificationError::invalid_payload(format!(
+                    "failed to decode {action} transaction: {e}"
+                ))
+            })?;
+
+        let input = signed
+            .tx()
+            .calls
+            .iter()
+            .find(|call| {
+                let targets_escrow = match &call.to {
+                    alloy::primitives::TxKind::Call(addr) => *addr == escrow,
+                    _ => false,
+                };
+                targets_escrow && call.input.len() >= 4 && call.input[..4] == selector
+            })
+            .map(|call| call.input.clone())
+            .ok_or_else(|| {
+                VerificationError::invalid_payload(format!(
+                    "{action} transaction does not contain an escrow.{action}() call"
+                ))
+            })?;
+
+        Ok((signed, input))
     }
 
     /// Handle 'open' action.
@@ -660,7 +728,7 @@ where
         })?;
 
         // Verify the open transaction's derived channel ID matches the claimed channelId
-        Self::verify_open_channel_id_binding(
+        let (voucher_signer, open_deposit) = Self::verify_open_channel_id_binding(
             &tx_bytes,
             channel_id_b256,
             escrow,
@@ -668,6 +736,31 @@ where
             expected_payee,
             expected_token,
         )?;
+
+        // Check the voucher against the transaction before broadcasting it:
+        // once the channel is funded, rejecting the credential would leave the
+        // deposit in a channel the server never recorded.
+        let cumulative_amount: u128 = cumulative_amount_str
+            .parse()
+            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
+        if cumulative_amount > open_deposit {
+            return Err(VerificationError::amount_exceeds_deposit(
+                "voucher amount exceeds open deposit",
+            ));
+        }
+        let sig_bytes = Self::parse_signature(signature_str)?;
+        if !verify_voucher(
+            escrow,
+            chain_id,
+            channel_id_b256,
+            cumulative_amount,
+            &sig_bytes,
+            voucher_signer,
+        ) {
+            return Err(VerificationError::invalid_signature(
+                "invalid voucher signature",
+            ));
+        }
 
         let pending = self
             .provider
@@ -724,10 +817,6 @@ where
             on_chain.authorized_signer
         };
 
-        let cumulative_amount: u128 = cumulative_amount_str
-            .parse()
-            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
-
         if cumulative_amount > on_chain.deposit {
             return Err(VerificationError::amount_exceeds_deposit(
                 "voucher amount exceeds on-chain deposit",
@@ -739,17 +828,18 @@ where
             ));
         }
 
-        let sig_bytes = Self::parse_signature(signature_str)?;
-        let is_valid = verify_voucher(
-            escrow,
-            chain_id,
-            channel_id_b256,
-            cumulative_amount,
-            &sig_bytes,
-            authorized_signer,
-        );
-
-        if !is_valid {
+        // The signature was verified against the transaction's signer above;
+        // only a channel that reports a different one needs another check.
+        if authorized_signer != voucher_signer
+            && !verify_voucher(
+                escrow,
+                chain_id,
+                channel_id_b256,
+                cumulative_amount,
+                &sig_bytes,
+                authorized_signer,
+            )
+        {
             return Err(VerificationError::invalid_signature(
                 "invalid voucher signature",
             ));
@@ -840,7 +930,7 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, settlement_route, _additional_deposit_str, transaction_str) =
+        let (channel_id_str, settlement_route, additional_deposit_str, transaction_str) =
             match payload {
                 SessionCredentialPayload::TopUp {
                     channel_id,
@@ -876,13 +966,23 @@ where
         }
         validate_settlement_route(&channel, details, settlement_route)?;
 
+        if channel.finalized {
+            return Err(VerificationError::channel_closed("channel is finalized"));
+        }
+
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
+
+        let additional_deposit: u128 = additional_deposit_str
+            .parse()
+            .map_err(|_| VerificationError::invalid_payload("invalid additionalDeposit"))?;
 
         // Broadcast the client's signed topUp transaction.
         let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
             VerificationError::invalid_payload(format!("invalid topUp transaction hex: {}", e))
         })?;
+        Self::verify_top_up_transaction(&tx_bytes, channel_id_b256, escrow, additional_deposit)?;
+
         let pending = self
             .provider
             .send_raw_transaction(&tx_bytes)
@@ -3655,6 +3755,354 @@ mod tests {
             err.message.contains("token"),
             "expected token mismatch error, got: {}",
             err.message
+        );
+    }
+
+    alloy::sol! {
+        interface ITestEscrow {
+            function open(address payee, address token, uint128 deposit, bytes32 salt, address authorizedSigner) external;
+            function topUp(bytes32 channelId, uint256 additionalDeposit) external;
+        }
+    }
+
+    const TEST_ESCROW: Address = Address::repeat_byte(0x55);
+    const TEST_PAYEE: Address = Address::repeat_byte(0x22);
+    const TEST_TOKEN: Address = Address::repeat_byte(0x33);
+
+    /// Signs a Tempo transaction with a single call and returns it hex-encoded.
+    fn signed_call_transaction(
+        signer: &alloy::signers::local::PrivateKeySigner,
+        to: Address,
+        input: Vec<u8>,
+    ) -> String {
+        use alloy::eips::Encodable2718;
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::Call;
+        use tempo_alloy::primitives::TempoTransaction;
+
+        let tx = TempoTransaction {
+            chain_id: 42431,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            calls: vec![Call {
+                to: alloy::primitives::TxKind::Call(to),
+                value: alloy::primitives::U256::ZERO,
+                input: Bytes::from(input),
+            }],
+            ..Default::default()
+        };
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        alloy::hex::encode_prefixed(tx.into_signed(signature.into()).encoded_2718())
+    }
+
+    /// Queues the RPC responses for a client transaction that is broadcast and
+    /// mined successfully.
+    fn push_mined_transaction(asserter: &alloy::providers::mock::Asserter) {
+        let tx_hash = B256::repeat_byte(0xcc);
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0xdd),
+            "blockNumber": "0x1",
+            "from": Address::repeat_byte(0x11),
+            "to": TEST_ESCROW,
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": alloy::primitives::Bloom::ZERO,
+            "status": "0x1",
+            "type": "0x76",
+            "feePayer": Address::repeat_byte(0x11),
+        });
+        asserter.push_success(&tx_hash); // eth_sendRawTransaction
+        asserter.push_success(&receipt); // receipt lookup when registering the watcher
+        asserter.push_success(&receipt); // receipt fetch
+    }
+
+    /// Queues the on-chain `getChannel` state of an open channel.
+    fn push_on_chain_channel(
+        asserter: &alloy::providers::mock::Asserter,
+        payer: Address,
+        authorized_signer: Address,
+        deposit: u128,
+    ) {
+        use alloy::sol_types::SolValue;
+
+        asserter.push_success(&Bytes::from(
+            (
+                false,
+                0u64,
+                payer,
+                TEST_PAYEE,
+                TEST_TOKEN,
+                authorized_signer,
+                deposit,
+                0u128,
+            )
+                .abi_encode_params(),
+        ));
+    }
+
+    /// Builds an open credential whose transaction opens a channel with
+    /// `deposit` and whose voucher for `cumulative_amount` is signed by
+    /// `voucher_signer`.
+    async fn open_credential(
+        payer: &alloy::signers::local::PrivateKeySigner,
+        authorized_signer: Address,
+        deposit: u128,
+        voucher_signer: &alloy::signers::local::PrivateKeySigner,
+        cumulative_amount: u128,
+    ) -> (
+        String,
+        crate::protocol::intents::SessionRequest,
+        crate::protocol::core::PaymentCredential,
+    ) {
+        use alloy::sol_types::SolCall;
+
+        let salt = B256::repeat_byte(0xab);
+        let transaction = signed_call_transaction(
+            payer,
+            TEST_ESCROW,
+            ITestEscrow::openCall::new((TEST_PAYEE, TEST_TOKEN, deposit, salt, authorized_signer))
+                .abi_encode(),
+        );
+        let channel_id = voucher::compute_channel_id(
+            payer.address(),
+            TEST_PAYEE,
+            TEST_TOKEN,
+            salt,
+            authorized_signer,
+            TEST_ESCROW,
+            42431,
+        );
+        let signature = voucher::sign_voucher(
+            voucher_signer,
+            channel_id,
+            cumulative_amount,
+            TEST_ESCROW,
+            42431,
+        )
+        .await
+        .unwrap();
+        let (request, credential) = build_session_credential(
+            Some(&TEST_PAYEE.to_string()),
+            &TEST_TOKEN.to_string(),
+            SessionCredentialPayload::Open {
+                payload_type: "transaction".to_string(),
+                channel_id: channel_id.to_string(),
+                transaction,
+                descriptor: None,
+                settlement_route: None,
+                authorized_signer: None,
+                cumulative_amount: cumulative_amount.to_string(),
+                signature: alloy::hex::encode_prefixed(signature),
+            },
+        );
+        (channel_id.to_string(), request, credential)
+    }
+
+    /// A voucher the opened channel could never honour must be rejected while
+    /// the open transaction is still unsent: broadcasting it first would lock
+    /// the deposit in a channel the server never records.
+    #[tokio::test]
+    async fn test_open_rejects_bad_voucher_before_broadcast() {
+        let payer = alloy::signers::local::PrivateKeySigner::random();
+        let stranger = alloy::signers::local::PrivateKeySigner::random();
+
+        let wrong_signer = open_credential(&payer, payer.address(), 10_000, &stranger, 1_000).await;
+        let exceeds_deposit =
+            open_credential(&payer, payer.address(), 10_000, &payer, 10_001).await;
+
+        for ((channel_id, request, credential), expected) in [
+            (wrong_signer, ErrorCode::InvalidSignature),
+            (exceeds_deposit, ErrorCode::AmountExceedsDeposit),
+        ] {
+            let store = Arc::new(InMemoryChannelStore::new());
+            let asserter = alloy::providers::mock::Asserter::new();
+            push_mined_transaction(&asserter);
+            let method = mocked_session_method(store.clone(), asserter.clone());
+
+            let err = method
+                .verify_session(&credential, &request)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, Some(expected), "{}", err.message);
+            assert_eq!(asserter.read_q().len(), 3, "transaction was broadcast");
+            assert!(store.get_channel_sync(&channel_id).is_none());
+        }
+    }
+
+    /// Without an authorized signer in the open call, the payer signs vouchers.
+    #[tokio::test]
+    async fn test_open_stores_channel_after_broadcast() {
+        let payer = alloy::signers::local::PrivateKeySigner::random();
+        let (channel_id, request, credential) =
+            open_credential(&payer, Address::ZERO, 10_000, &payer, 1_000).await;
+
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_mined_transaction(&asserter);
+        push_on_chain_channel(&asserter, payer.address(), Address::ZERO, 10_000);
+        let method = mocked_session_method(store.clone(), asserter);
+
+        method.verify_session(&credential, &request).await.unwrap();
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(stored.authorized_signer, payer.address());
+        assert_eq!(stored.deposit, 10_000);
+        assert_eq!(stored.highest_voucher_amount, 1_000);
+    }
+
+    fn top_up_credential(
+        channel_id: &str,
+        additional_deposit: &str,
+        transaction: String,
+    ) -> (
+        crate::protocol::intents::SessionRequest,
+        crate::protocol::core::PaymentCredential,
+    ) {
+        build_session_credential(
+            Some(&TEST_PAYEE.to_string()),
+            &TEST_TOKEN.to_string(),
+            SessionCredentialPayload::TopUp {
+                payload_type: "transaction".to_string(),
+                channel_id: channel_id.to_string(),
+                descriptor: None,
+                settlement_route: None,
+                additional_deposit: additional_deposit.to_string(),
+                transaction,
+            },
+        )
+    }
+
+    /// Only the escrow top-up of the credential's channel, for the declared
+    /// amount, may be relayed.
+    #[tokio::test]
+    async fn test_top_up_rejects_unrelated_transaction_before_broadcast() {
+        use alloy::primitives::U256;
+        use alloy::sol_types::SolCall;
+
+        let payer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xab);
+        let top_up = |channel_id: B256, amount: u128| {
+            ITestEscrow::topUpCall::new((channel_id, U256::from(amount))).abi_encode()
+        };
+
+        let other_contract = signed_call_transaction(
+            &payer,
+            Address::repeat_byte(0x99),
+            top_up(channel_id, 5_000),
+        );
+        let other_call = signed_call_transaction(
+            &payer,
+            TEST_ESCROW,
+            ITestEscrow::openCall::new((TEST_PAYEE, TEST_TOKEN, 5_000, B256::ZERO, Address::ZERO))
+                .abi_encode(),
+        );
+        let other_channel =
+            signed_call_transaction(&payer, TEST_ESCROW, top_up(B256::repeat_byte(0xcd), 5_000));
+        let other_amount = signed_call_transaction(&payer, TEST_ESCROW, top_up(channel_id, 1));
+
+        for (transaction, expected) in [
+            (other_contract, "does not contain an escrow.topUp() call"),
+            (other_call, "does not contain an escrow.topUp() call"),
+            (other_channel, "does not match claimed channelId"),
+            (other_amount, "does not match additionalDeposit"),
+        ] {
+            let store = Arc::new(InMemoryChannelStore::new());
+            store.insert(
+                &channel_id.to_string(),
+                test_channel_state(&channel_id.to_string()),
+            );
+            let asserter = alloy::providers::mock::Asserter::new();
+            push_mined_transaction(&asserter);
+            let method = mocked_session_method(store, asserter.clone());
+
+            let (request, credential) =
+                top_up_credential(&channel_id.to_string(), "5000", transaction);
+            let err = method
+                .verify_session(&credential, &request)
+                .await
+                .unwrap_err();
+            assert!(err.message.contains(expected), "{}", err.message);
+            assert_eq!(asserter.read_q().len(), 3, "transaction was broadcast");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_top_up_rejects_finalized_channel_before_broadcast() {
+        use alloy::primitives::U256;
+        use alloy::sol_types::SolCall;
+
+        let payer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xab);
+        let mut state = test_channel_state(&channel_id.to_string());
+        state.finalized = true;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id.to_string(), state);
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_mined_transaction(&asserter);
+        let method = mocked_session_method(store, asserter.clone());
+
+        let (request, credential) = top_up_credential(
+            &channel_id.to_string(),
+            "5000",
+            signed_call_transaction(
+                &payer,
+                TEST_ESCROW,
+                ITestEscrow::topUpCall::new((channel_id, U256::from(5_000))).abi_encode(),
+            ),
+        );
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::ChannelClosed));
+        assert_eq!(asserter.read_q().len(), 3, "transaction was broadcast");
+    }
+
+    #[tokio::test]
+    async fn test_top_up_updates_deposit_after_broadcast() {
+        use alloy::primitives::U256;
+        use alloy::sol_types::SolCall;
+
+        let payer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xab);
+        let state = test_channel_state(&channel_id.to_string());
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id.to_string(), state.clone());
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_mined_transaction(&asserter);
+        push_on_chain_channel(
+            &asserter,
+            state.payer,
+            state.authorized_signer,
+            state.deposit + 5_000,
+        );
+        let method = mocked_session_method(store.clone(), asserter);
+
+        let (request, credential) = top_up_credential(
+            &channel_id.to_string(),
+            "5000",
+            signed_call_transaction(
+                &payer,
+                TEST_ESCROW,
+                ITestEscrow::topUpCall::new((channel_id, U256::from(5_000))).abi_encode(),
+            ),
+        );
+        method.verify_session(&credential, &request).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_channel_sync(&channel_id.to_string())
+                .unwrap()
+                .deposit,
+            state.deposit + 5_000
         );
     }
 
