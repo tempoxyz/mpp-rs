@@ -234,24 +234,7 @@ where
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    if state.finalized {
-                        return Err(VerificationError::channel_closed("channel is finalized"));
-                    }
-                    if state.closing {
-                        return Err(VerificationError::channel_closed("channel is closing"));
-                    }
-                    // `spent` can still grow until `closing` is set, so the amount
-                    // validated against the snapshot above may no longer cover it.
-                    if cumulative_amount < state.spent {
-                        return Err(VerificationError::new(format!(
-                            "close voucher amount must be >= {} (spent)",
-                            state.spent,
-                        )));
-                    }
-                    Ok(Some(ChannelState {
-                        closing: true,
-                        ..state
-                    }))
+                    state.mark_pending_close(cumulative_amount).map(Some)
                 }),
             )
             .await?;
@@ -363,18 +346,7 @@ where
                     .store
                     .update_channel(
                         &channel_id_for_lock,
-                        Box::new(|current| {
-                            let Some(state) = current else {
-                                return Ok(None);
-                            };
-                            if state.finalized {
-                                return Ok(Some(state));
-                            }
-                            Ok(Some(ChannelState {
-                                closing: false,
-                                ..state
-                            }))
-                        }),
+                        Box::new(|current| Ok(current.map(ChannelState::clear_pending_close))),
                     )
                     .await;
                 return Err(err);
@@ -388,26 +360,8 @@ where
             .update_channel(
                 &channel_id_owned,
                 Box::new(move |current| {
-                    let state = match current {
-                        Some(s) => s,
-                        None => return Ok(None),
-                    };
-                    let update_voucher = cumulative_amount > state.highest_voucher_amount;
-                    Ok(Some(ChannelState {
-                        deposit: on_chain.deposit,
-                        highest_voucher_amount: if update_voucher {
-                            cumulative_amount
-                        } else {
-                            state.highest_voucher_amount
-                        },
-                        highest_voucher_signature: if update_voucher {
-                            Some(sig_bytes)
-                        } else {
-                            state.highest_voucher_signature
-                        },
-                        finalized: true,
-                        closing: false,
-                        ..state
+                    Ok(current.map(|state| {
+                        state.finalize_close(cumulative_amount, sig_bytes, on_chain.deposit)
                     }))
                 }),
             )

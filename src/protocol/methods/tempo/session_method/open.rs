@@ -6,7 +6,8 @@ use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
 use super::chain::get_on_chain_channel;
-use super::receipt::{now_iso8601, session_receipt};
+use super::receipt::session_receipt;
+use super::state::Opening;
 use super::{normalize_channel_id, ChannelState, SessionMethod};
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
@@ -305,68 +306,21 @@ where
         }
 
         // Create or update channel in store.
-        let channel_id_for_key = channel_id_str.clone();
-        let channel_id_for_state = channel_id_str.clone();
+        let opening = Opening {
+            channel_id: channel_id_str.clone(),
+            chain_id,
+            escrow_contract: escrow,
+            authorized_signer,
+            settlement_route: accepted_settlement_route,
+            cumulative_amount,
+            signature: sig_bytes,
+        };
         let updated = self
             .store
             .update_channel(
-                &channel_id_for_key,
+                channel_id_str,
                 Box::new(move |existing| {
-                    if let Some(existing) = existing {
-                        let settled_on_chain =
-                            std::cmp::max(on_chain.settled, existing.settled_on_chain);
-                        let spent = std::cmp::max(settled_on_chain, existing.spent);
-
-                        // Channel already exists — update if higher.
-                        if cumulative_amount > existing.highest_voucher_amount {
-                            Ok(Some(ChannelState {
-                                settlement_route: existing
-                                    .settlement_route
-                                    .or_else(|| accepted_settlement_route.clone()),
-                                deposit: on_chain.deposit,
-                                settled_on_chain,
-                                spent,
-                                highest_voucher_amount: cumulative_amount,
-                                highest_voucher_signature: Some(sig_bytes),
-                                authorized_signer,
-                                close_requested_at: on_chain.close_requested_at,
-                                ..existing
-                            }))
-                        } else {
-                            Ok(Some(ChannelState {
-                                deposit: on_chain.deposit,
-                                settled_on_chain,
-                                spent,
-                                authorized_signer,
-                                close_requested_at: on_chain.close_requested_at,
-                                ..existing
-                            }))
-                        }
-                    } else {
-                        // New channel (or cold-start reopen after local state was lost).
-                        // Initialize settled_on_chain and spent from on-chain state so
-                        // we don't overstate available balance when on_chain.settled > 0.
-                        Ok(Some(ChannelState {
-                            channel_id: channel_id_for_state,
-                            chain_id,
-                            escrow_contract: escrow,
-                            payer: on_chain.payer,
-                            payee: on_chain.payee,
-                            token: on_chain.token,
-                            settlement_route: accepted_settlement_route,
-                            authorized_signer,
-                            deposit: on_chain.deposit,
-                            settled_on_chain: on_chain.settled,
-                            highest_voucher_amount: cumulative_amount,
-                            highest_voucher_signature: Some(sig_bytes),
-                            spent: on_chain.settled,
-                            units: 0,
-                            finalized: false,
-                            closing: false,
-                            close_requested_at: on_chain.close_requested_at,
-                            created_at: now_iso8601(),
-                        }))
-                    }
+                    Ok(Some(ChannelState::open(existing, &on_chain, opening)))
                 }),
             )
             .await?;

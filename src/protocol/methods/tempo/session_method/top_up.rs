@@ -8,7 +8,7 @@ use tempo_alloy::TempoNetwork;
 use super::chain::get_on_chain_channel;
 use super::payload::validate_settlement_route;
 use super::receipt::session_receipt;
-use super::{normalize_channel_id, ChannelState, SessionMethod};
+use super::{normalize_channel_id, SessionMethod};
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
@@ -150,9 +150,6 @@ where
         }
 
         // Update store with full on-chain snapshot (deposit, settled, close state).
-        let on_chain_deposit = on_chain.deposit;
-        let on_chain_settled = on_chain.settled;
-        let on_chain_close_requested_at = on_chain.close_requested_at;
         let channel_id_owned = channel_id_str.clone();
         let updated = self
             .store
@@ -161,15 +158,7 @@ where
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    let settled_on_chain = std::cmp::max(on_chain_settled, state.settled_on_chain);
-                    let spent = std::cmp::max(settled_on_chain, state.spent);
-                    Ok(Some(ChannelState {
-                        deposit: std::cmp::max(on_chain_deposit, state.deposit),
-                        settled_on_chain,
-                        spent,
-                        close_requested_at: on_chain_close_requested_at,
-                        ..state
-                    }))
+                    Ok(Some(state.refresh_on_chain(&on_chain)))
                 }),
             )
             .await?;

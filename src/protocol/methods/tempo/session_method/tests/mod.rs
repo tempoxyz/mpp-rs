@@ -5,6 +5,7 @@ use alloy::primitives::{Bytes, B256};
 
 mod close;
 mod open;
+mod state;
 mod store;
 mod top_up;
 mod voucher;
@@ -89,6 +90,21 @@ fn test_session_method_config() {
     };
     assert_eq!(config.chain_id, 42431);
     assert_eq!(config.min_voucher_delta, 100);
+}
+
+/// The on-chain channel behind `state`, open, with the given deposit and
+/// settled amount.
+fn on_chain_channel(state: &ChannelState, deposit: u128, settled: u128) -> OnChainChannel {
+    OnChainChannel {
+        payer: state.payer,
+        payee: state.payee,
+        token: state.token,
+        authorized_signer: state.authorized_signer,
+        deposit,
+        settled,
+        close_requested_at: 0,
+        finalized: false,
+    }
 }
 
 /// Create a SessionMethod with a dummy provider for testing voucher logic

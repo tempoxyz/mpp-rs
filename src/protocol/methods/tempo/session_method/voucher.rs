@@ -101,10 +101,6 @@ where
             ));
         }
 
-        let on_chain_deposit = on_chain.deposit;
-        let on_chain_settled = on_chain.settled;
-        let on_chain_close_requested_at = on_chain.close_requested_at;
-        let on_chain_finalized = on_chain.finalized;
         let channel_id_owned = channel_id_str.clone();
         let refreshed = self
             .store
@@ -113,15 +109,9 @@ where
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    let settled_on_chain = std::cmp::max(on_chain_settled, state.settled_on_chain);
-                    let spent = std::cmp::max(settled_on_chain, state.spent);
                     Ok(Some(ChannelState {
-                        deposit: std::cmp::max(on_chain_deposit, state.deposit),
-                        settled_on_chain,
-                        spent,
-                        finalized: state.finalized || on_chain_finalized,
-                        close_requested_at: on_chain_close_requested_at,
-                        ..state
+                        finalized: state.finalized || on_chain.finalized,
+                        ..state.refresh_on_chain(&on_chain)
                     }))
                 }),
             )
@@ -255,23 +245,9 @@ where
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    if cumulative_amount <= state.highest_voucher_amount {
-                        return Err(VerificationError::delta_too_small(
-                            "voucher does not add new funds",
-                        ));
-                    }
-                    let delta = cumulative_amount - state.highest_voucher_amount;
-                    if delta < min_delta {
-                        return Err(VerificationError::delta_too_small(format!(
-                            "voucher delta {} below minimum {}",
-                            delta, min_delta
-                        )));
-                    }
-                    Ok(Some(ChannelState {
-                        highest_voucher_amount: cumulative_amount,
-                        highest_voucher_signature: Some(sig_bytes),
-                        ..state
-                    }))
+                    state
+                        .accept_voucher(cumulative_amount, sig_bytes, min_delta)
+                        .map(Some)
                 }),
             )
             .await?;

@@ -8,27 +8,13 @@ async fn test_topup_refreshes_on_chain_fields() {
     state.close_requested_at = 12345;
     state.settled_on_chain = 1_000;
     state.spent = 2_000;
+    let on_chain = on_chain_channel(&state, 200_000, 1_000);
     store.insert("0xchannel_topup", state);
-
-    let on_chain_deposit: u128 = 200_000;
-    let on_chain_settled: u128 = 1_000;
-    let on_chain_close_requested_at: u64 = 0;
 
     let result = store
         .update_channel(
             "0xchannel_topup",
-            Box::new(move |current| {
-                let state = current.unwrap();
-                let settled_on_chain = std::cmp::max(on_chain_settled, state.settled_on_chain);
-                let spent = std::cmp::max(settled_on_chain, state.spent);
-                Ok(Some(ChannelState {
-                    deposit: on_chain_deposit,
-                    settled_on_chain,
-                    spent,
-                    close_requested_at: on_chain_close_requested_at,
-                    ..state
-                }))
-            }),
+            Box::new(move |current| Ok(Some(current.unwrap().refresh_on_chain(&on_chain)))),
         )
         .await
         .unwrap()
