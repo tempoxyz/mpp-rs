@@ -5,6 +5,7 @@
 //! HTTP client extensions.
 
 use crate::error::MppError;
+use crate::protocol::core::accept_payment::{self, Entry};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use reqwest::header::HeaderMap;
 use reqwest::Url;
@@ -180,7 +181,9 @@ pub trait PaymentProvider: Clone + Send + Sync {
     ///
     /// Returns `None` if the provider does not advertise specific methods.
     /// The default implementation returns `None`; providers that know their
-    /// supported `(method, intent)` pairs should override this.
+    /// supported `(method, intent)` pairs should override this. Offers that
+    /// match no advertised entry are not paid, so the value must cover every
+    /// pair [`supports`](Self::supports) accepts.
     fn accept_payment_header(&self) -> Option<String> {
         None
     }
@@ -258,6 +261,10 @@ impl<P: PaymentProvider> Drop for PendingPayments<P> {
 ///
 /// `MultiProvider` iterates through its providers and uses the first one that
 /// supports the challenge's method and intent combination.
+///
+/// The `Accept-Payment` header is the union of the children's headers. If any
+/// child does not advertise one, none is sent and challenges are considered in
+/// the server's order.
 ///
 /// # Examples
 ///
@@ -466,17 +473,24 @@ impl PaymentProvider for MultiProvider {
     }
 
     fn accept_payment_header(&self) -> Option<String> {
-        let headers: Vec<String> = self
-            .providers
-            .iter()
-            .filter_map(|p| p.dyn_accept_payment_header())
-            .collect();
-
-        if headers.is_empty() {
-            None
-        } else {
-            Some(headers.join(", "))
+        let mut entries: Vec<Entry> = Vec::new();
+        for provider in &self.providers {
+            // The pairs of a child that does not advertise are unknown, and a
+            // partial header would rank that child's challenges out.
+            let header = provider.dyn_accept_payment_header()?;
+            for entry in accept_payment::parse(&header).ok()? {
+                // Payment is routed to the first child supporting a pair, so
+                // that child's preference is the one advertised.
+                if entries
+                    .iter()
+                    .all(|seen| seen.method != entry.method || seen.intent != entry.intent)
+                {
+                    entries.push(entry);
+                }
+            }
         }
+
+        (!entries.is_empty()).then(|| accept_payment::serialize(&entries))
     }
 }
 
@@ -634,6 +648,72 @@ mod tests {
                 PaymentPayload::hash(format!("mock-{}", self.method)),
             ))
         }
+    }
+
+    #[derive(Clone)]
+    struct Advertising(Option<&'static str>);
+
+    impl PaymentProvider for Advertising {
+        fn supports(&self, _method: &str, _intent: &str) -> bool {
+            false
+        }
+
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            Err(MppError::UnsupportedPaymentMethod(
+                challenge.method.to_string(),
+            ))
+        }
+
+        fn accept_payment_header(&self) -> Option<String> {
+            self.0.map(str::to_owned)
+        }
+    }
+
+    #[test]
+    fn multi_provider_accept_payment_merges_children() {
+        let multi = MultiProvider::new()
+            .with(Advertising(Some("tempo/session, tempo/charge;q=0.5")))
+            .with(Advertising(Some("tempo/charge, stripe/charge")));
+
+        // The first child that lists a pair is the one that pays it, so its
+        // q-value is the one advertised.
+        assert_eq!(
+            multi.accept_payment_header().as_deref(),
+            Some("tempo/session, tempo/charge;q=0.5, stripe/charge")
+        );
+    }
+
+    #[test]
+    fn multi_provider_accept_payment_requires_every_child_to_advertise() {
+        assert_eq!(MultiProvider::new().accept_payment_header(), None);
+
+        for silent in [None, Some("not an accept-payment header")] {
+            let multi = MultiProvider::new()
+                .with(Advertising(Some("tempo/charge")))
+                .with(Advertising(silent));
+            assert_eq!(multi.accept_payment_header(), None);
+        }
+    }
+
+    #[cfg(all(feature = "tempo", feature = "stripe"))]
+    #[test]
+    fn multi_provider_advertises_built_in_providers() {
+        use crate::client::{StripeProvider, TempoProvider, TempoSessionProvider};
+        use crate::protocol::methods::stripe::CreateTokenResult;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let rpc_url = "https://rpc.example.com";
+        let multi = MultiProvider::new()
+            .with(TempoSessionProvider::new(PrivateKeySigner::random(), rpc_url).unwrap())
+            .with(TempoProvider::new(PrivateKeySigner::random(), rpc_url).unwrap())
+            .with(StripeProvider::new(|_| {
+                Box::pin(async { Ok(CreateTokenResult::from("spt_test".to_string())) })
+            }));
+
+        assert_eq!(
+            multi.accept_payment_header().as_deref(),
+            Some("tempo/session, tempo/charge, stripe/charge")
+        );
     }
 
     #[test]

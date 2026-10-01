@@ -1824,6 +1824,7 @@ mod tests {
         struct SelectiveProvider {
             supported: Vec<(&'static str, &'static str)>,
             pay_count: Arc<AtomicU32>,
+            accept: Option<&'static str>,
         }
 
         impl SelectiveProvider {
@@ -1831,7 +1832,13 @@ mod tests {
                 Self {
                     supported,
                     pay_count: Arc::new(AtomicU32::new(0)),
+                    accept: None,
                 }
+            }
+
+            fn advertising(mut self, accept: &'static str) -> Self {
+                self.accept = Some(accept);
+                self
             }
 
             fn call_count(&self) -> u32 {
@@ -1856,6 +1863,10 @@ mod tests {
                     echo,
                     PaymentPayload::hash("0xmockhash"),
                 ))
+            }
+
+            fn accept_payment_header(&self) -> Option<String> {
+                self.accept.map(str::to_owned)
             }
         }
 
@@ -2296,6 +2307,54 @@ mod tests {
                 "expected stripe challenge (id s1) to be picked, got id: {}",
                 cred.challenge.id
             );
+        }
+
+        #[tokio::test]
+        async fn multi_provider_pays_challenge_for_non_advertising_child() {
+            let stripe_header = challenge_header("s1", "stripe", "charge");
+            let advertised: Arc<Mutex<Option<String>>> = Arc::new(Default::default());
+            let captured = advertised.clone();
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let stripe_header = stripe_header.clone();
+                    let captured = captured.clone();
+                    async move {
+                        if req.headers().contains_key("authorization") {
+                            return (AxumStatusCode::OK, "ok").into_response();
+                        }
+                        *captured.lock().unwrap() = req
+                            .headers()
+                            .get("accept-payment")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, stripe_header)],
+                            "pay",
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+            let base_url = spawn_server(app).await;
+            let tempo =
+                SelectiveProvider::new(vec![("tempo", "charge")]).advertising("tempo/charge");
+            let stripe = SelectiveProvider::new(vec![("stripe", "charge")]);
+            let multi = crate::client::MultiProvider::new()
+                .with(tempo.clone())
+                .with(stripe.clone());
+
+            let resp = reqwest::Client::new()
+                .get(format!("{base_url}/paid"))
+                .send_with_payment(&multi)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(stripe.call_count(), 1);
+            assert_eq!(tempo.call_count(), 0);
+            assert_eq!(advertised.lock().unwrap().as_deref(), None);
         }
 
         #[tokio::test]

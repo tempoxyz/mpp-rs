@@ -259,6 +259,13 @@ impl PaymentProvider for TempoProvider {
             .await?;
         Ok(signed.into_credential())
     }
+
+    fn accept_payment_header(&self) -> Option<String> {
+        Some(crate::protocol::core::accept_payment::from_methods(&[(
+            crate::protocol::methods::tempo::METHOD_NAME,
+            crate::protocol::methods::tempo::INTENT_CHARGE,
+        )]))
+    }
 }
 
 #[cfg(test)]

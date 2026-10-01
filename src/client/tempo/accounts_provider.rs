@@ -474,9 +474,10 @@ impl PaymentProvider for TempoAccountsProvider {
     }
 
     fn accept_payment_header(&self) -> Option<String> {
-        self.session
-            .as_ref()
-            .map(|_| "tempo/session, tempo/charge;q=0.5".to_owned())
+        Some(match self.session {
+            Some(_) => "tempo/session, tempo/charge;q=0.5".to_owned(),
+            None => "tempo/charge".to_owned(),
+        })
     }
 }
 
@@ -551,6 +552,10 @@ mod tests {
             .with_expected_chain_id(4217)
             .with_autoswap(AutoswapConfig::new(swap_token, 100));
         let expected_key = provider.wallet().active_access_key().unwrap().address();
+        assert_eq!(
+            provider.accept_payment_header().as_deref(),
+            Some("tempo/charge")
+        );
         let provider = provider
             .with_session_store(Arc::new(
                 super::super::session::store::MemoryChannelStore::default(),
