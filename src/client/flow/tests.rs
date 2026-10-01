@@ -79,8 +79,8 @@ impl TestProvider {
 }
 
 impl PaymentProvider for TestProvider {
-    fn supports(&self, _method: &str, _intent: &str) -> bool {
-        true
+    fn supports(&self, method: &str, _intent: &str) -> bool {
+        method == "tempo"
     }
 
     async fn prepare_http_payment_challenge(
@@ -132,16 +132,16 @@ impl PaymentProvider for TestProvider {
     }
 }
 
-fn www_authenticate(id: &str, intent: &str) -> String {
+fn www_authenticate(id: &str, method: &str, intent: &str) -> String {
     let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-    let challenge = PaymentChallenge::new(id, "flow.example.com", "tempo", intent, request);
+    let challenge = PaymentChallenge::new(id, "flow.example.com", method, intent, request);
     format_www_authenticate(&challenge).unwrap()
 }
 
 fn payment_required(id: &str, intent: &str) -> axum::response::Response {
     (
         StatusCode::PAYMENT_REQUIRED,
-        [(WWW_AUTHENTICATE, www_authenticate(id, intent))],
+        [(WWW_AUTHENTICATE, www_authenticate(id, "tempo", intent))],
     )
         .into_response()
 }
@@ -191,6 +191,43 @@ async fn unchallenged_402_after_payment_is_returned() {
         assert_eq!(provider.paid(), ["charge-1"], "{via:?}");
         assert_eq!(provider.rolled_back.load(Ordering::SeqCst), 1, "{via:?}");
         assert_eq!(provider.committed.load(Ordering::SeqCst), 0, "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn unpayable_402_after_payment_is_returned() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(
+                        WWW_AUTHENTICATE,
+                        www_authenticate("stripe-1", "stripe", "charge"),
+                    )],
+                    "method-unsupported",
+                )
+                    .into_response()
+            } else {
+                payment_required("charge-1", "charge")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert_eq!(response.text().await.unwrap(), "method-unsupported");
+        assert_eq!(provider.paid(), ["charge-1"], "{via:?}");
+        assert_eq!(provider.rolled_back.load(Ordering::SeqCst), 1, "{via:?}");
     }
 }
 
