@@ -814,6 +814,186 @@ async fn test_stripe_charge_via_mpp_charge_extractor() {
     stripe_handle.abort();
 }
 
+type CapturedRequest = (
+    axum::http::HeaderMap,
+    std::collections::HashMap<String, String>,
+);
+
+/// Mock Stripe API that records each PaymentIntent request it receives.
+async fn start_mock_stripe_capturing() -> (
+    String,
+    Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let state = captured.clone();
+    let app = Router::new().route(
+        "/v1/payment_intents",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap,
+                  Form(params): Form<std::collections::HashMap<String, String>>| {
+                state.lock().unwrap().push((headers, params));
+                async { Json(serde_json::json!({ "id": "pi_captured", "status": "succeeded" })) }
+            },
+        ),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, captured, handle)
+}
+
+fn create_mock_mpp(stripe_url: &str) -> Mpp<mpp::protocol::methods::stripe::method::ChargeMethod> {
+    Mpp::create_stripe(
+        stripe(StripeConfig {
+            secret_key: "sk_test_mock",
+            network_id: "internal",
+            payment_method_types: &["card"],
+            currency: "usd",
+            decimals: 2,
+        })
+        .stripe_api_base(stripe_url)
+        .secret_key("test-secret"),
+    )
+    .expect("failed to create Mpp")
+}
+
+/// Mirrors the `stripe-external-id-binding` conformance scenarios: a
+/// request-bound externalId must be echoed by the credential and is the only
+/// source of the receipt's externalId.
+#[tokio::test]
+async fn test_stripe_external_id_binding() {
+    let (stripe_url, captured, stripe_handle) = start_mock_stripe_capturing().await;
+    let mpp = create_mock_mpp(&stripe_url);
+
+    // (request externalId, payload externalId, expected receipt externalId or rejection)
+    let cases = [
+        (
+            Some("server-order-123"),
+            Some("server-order-123"),
+            Ok(Some("server-order-123")),
+        ),
+        (
+            Some("server-order-123"),
+            Some("attacker-order-999"),
+            Err(()),
+        ),
+        (Some("server-order-123"), None, Err(())),
+        (None, Some("attacker-order-999"), Ok(None)),
+    ];
+
+    for (request_id, payload_id, expected) in cases {
+        captured.lock().unwrap().clear();
+        let challenge = mpp
+            .stripe_charge_with_options(
+                "0.25",
+                StripeChargeOptions {
+                    external_id: request_id,
+                    ..Default::default()
+                },
+            )
+            .expect("challenge creation");
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            StripeCredentialPayload {
+                spt: "spt_conformance_123".to_string(),
+                external_id: payload_id.map(str::to_string),
+            },
+        );
+
+        let result = mpp.verify_credential(&credential).await;
+        let case = format!("request {request_id:?}, payload {payload_id:?}");
+        match expected {
+            Ok(receipt_id) => {
+                let receipt = result.unwrap_or_else(|e| panic!("{case}: {e}"));
+                assert_eq!(receipt.external_id.as_deref(), receipt_id, "{case}");
+            }
+            Err(()) => {
+                let err = result.expect_err(&case);
+                assert_eq!(
+                    err.code,
+                    Some(mpp::protocol::traits::ErrorCode::CredentialMismatch),
+                    "{case}"
+                );
+                assert!(
+                    captured.lock().unwrap().is_empty(),
+                    "{case}: no PaymentIntent may be created"
+                );
+            }
+        }
+    }
+
+    stripe_handle.abort();
+}
+
+/// PaymentIntent metadata carries the analytics keys plus the challenge's
+/// `methodDetails.metadata`, with values capped at Stripe's 500 characters.
+#[tokio::test]
+async fn test_stripe_payment_intent_metadata() {
+    let (stripe_url, captured, stripe_handle) = start_mock_stripe_capturing().await;
+    let mpp = create_mock_mpp(&stripe_url);
+
+    let user_metadata =
+        std::collections::HashMap::from([("order_id".to_string(), "12345".to_string())]);
+    let challenge = mpp
+        .stripe_charge_with_options(
+            "0.25",
+            StripeChargeOptions {
+                metadata: Some(&user_metadata),
+                ..Default::default()
+            },
+        )
+        .expect("challenge creation");
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        "x".repeat(501),
+        StripeCredentialPayload {
+            spt: "spt_metadata".to_string(),
+            external_id: None,
+        },
+    );
+    mpp.verify_credential(&credential)
+        .await
+        .expect("verification failed");
+
+    let captured = captured.lock().unwrap();
+    let (headers, params) = captured.first().expect("PaymentIntent request");
+    assert_eq!(
+        headers["idempotency-key"],
+        format!("mpp_{}_spt_metadata", challenge.id)
+    );
+
+    let client_id = "x".repeat(500);
+    let mut metadata: Vec<(&str, &str)> = params
+        .iter()
+        .filter_map(|(key, value)| {
+            let key = key.strip_prefix("metadata[")?.strip_suffix(']')?;
+            Some((key, value.as_str()))
+        })
+        .collect();
+    metadata.sort_unstable();
+    assert_eq!(
+        metadata,
+        [
+            ("machine_payment", "true"),
+            ("mpp_challenge_id", challenge.id.as_str()),
+            ("mpp_client_id", client_id.as_str()),
+            ("mpp_intent", "charge"),
+            ("mpp_is_mpp", "true"),
+            ("mpp_server_id", challenge.realm.as_str()),
+            ("mpp_version", "1"),
+            ("order_id", "12345"),
+        ]
+    );
+
+    stripe_handle.abort();
+}
+
 // ==================== Live Stripe API Tests ====================
 //
 // These tests call the real Stripe test-mode API. Skipped at runtime
