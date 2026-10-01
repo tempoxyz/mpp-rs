@@ -125,6 +125,9 @@ impl TempoAccountsProvider {
     }
 
     /// Pin the chain ID this provider will pay on.
+    ///
+    /// Without a pin the provider pays on the chain the challenge names, with
+    /// the Accounts key stored for that chain.
     pub fn with_expected_chain_id(mut self, chain_id: u64) -> Self {
         self.expected_chain_id = Some(chain_id);
         self
