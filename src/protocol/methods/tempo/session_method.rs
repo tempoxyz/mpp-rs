@@ -1032,7 +1032,7 @@ where
                     let settled_on_chain = std::cmp::max(on_chain_settled, state.settled_on_chain);
                     let spent = std::cmp::max(settled_on_chain, state.spent);
                     Ok(Some(ChannelState {
-                        deposit: on_chain_deposit,
+                        deposit: std::cmp::max(on_chain_deposit, state.deposit),
                         settled_on_chain,
                         spent,
                         close_requested_at: on_chain_close_requested_at,
@@ -1149,10 +1149,10 @@ where
                     let settled_on_chain = std::cmp::max(on_chain_settled, state.settled_on_chain);
                     let spent = std::cmp::max(settled_on_chain, state.spent);
                     Ok(Some(ChannelState {
-                        deposit: on_chain_deposit,
+                        deposit: std::cmp::max(on_chain_deposit, state.deposit),
                         settled_on_chain,
                         spent,
-                        finalized: on_chain_finalized,
+                        finalized: state.finalized || on_chain_finalized,
                         close_requested_at: on_chain_close_requested_at,
                         ..state
                     }))
@@ -4564,6 +4564,196 @@ mod tests {
         // Only the on-chain channel read reached the provider, so the queued
         // close transaction was not submitted.
         assert_eq!(asserter.read_q().len(), queued - 1);
+    }
+
+    /// Store that applies `change` to a channel right after its first read,
+    /// like another request landing while the handler awaits the chain.
+    struct ChangeAfterRead {
+        inner: InMemoryChannelStore,
+        change: fn(ChannelState) -> ChannelState,
+        changed: std::sync::atomic::AtomicBool,
+    }
+
+    impl ChangeAfterRead {
+        fn new(change: fn(ChannelState) -> ChannelState) -> Self {
+            Self {
+                inner: InMemoryChannelStore::new(),
+                change,
+                changed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl ChannelStore for ChangeAfterRead {
+        fn get_channel(
+            &self,
+            channel_id: &str,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+        > {
+            let snapshot = self.inner.get_channel_sync(channel_id);
+            if !self.changed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Some(state) = snapshot.clone() {
+                    self.inner.insert(channel_id, (self.change)(state));
+                }
+            }
+            Box::pin(async move { Ok(snapshot) })
+        }
+
+        fn update_channel(
+            &self,
+            channel_id: &str,
+            updater: Box<
+                dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                    + Send,
+            >,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+        > {
+            self.inner.update_channel(channel_id, updater)
+        }
+    }
+
+    /// Builds a voucher credential for `amount` on a stored channel whose
+    /// vouchers `signer` signs.
+    async fn voucher_credential(
+        signer: &alloy::signers::local::PrivateKeySigner,
+        state: &ChannelState,
+        amount: u128,
+    ) -> (
+        crate::protocol::intents::SessionRequest,
+        crate::protocol::core::PaymentCredential,
+    ) {
+        let signature = voucher::sign_voucher(
+            signer,
+            state.channel_id.parse().unwrap(),
+            amount,
+            state.escrow_contract,
+            state.chain_id,
+        )
+        .await
+        .unwrap();
+        build_session_credential(
+            Some(&TEST_PAYEE.to_string()),
+            &TEST_TOKEN.to_string(),
+            SessionCredentialPayload::Voucher {
+                channel_id: state.channel_id.clone(),
+                descriptor: None,
+                settlement_route: None,
+                cumulative_amount: amount.to_string(),
+                signature: alloy::hex::encode_prefixed(signature),
+            },
+        )
+    }
+
+    /// A node that lags behind a top-up reports the old deposit. The deposit
+    /// only grows while a channel is open, so the recorded one stays.
+    #[tokio::test]
+    async fn test_voucher_keeps_deposit_when_chain_read_is_stale() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id, state.clone());
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_on_chain_channel(
+            &asserter,
+            state.payer,
+            state.authorized_signer,
+            state.deposit - 50_000,
+        );
+        let method = mocked_session_method(store.clone(), asserter);
+
+        let (request, credential) = voucher_credential(&signer, &state, state.deposit).await;
+        method.verify_session(&credential, &request).await.unwrap();
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(stored.deposit, state.deposit);
+        assert_eq!(stored.highest_voucher_amount, state.deposit);
+    }
+
+    /// A close that finalizes the channel while a voucher awaits the chain
+    /// must not be undone by that voucher's older on-chain snapshot.
+    #[tokio::test]
+    async fn test_voucher_does_not_reopen_finalized_channel() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        let store = Arc::new(ChangeAfterRead::new(|state| ChannelState {
+            finalized: true,
+            ..state
+        }));
+        store.inner.insert(&channel_id, state.clone());
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_on_chain_channel(
+            &asserter,
+            state.payer,
+            state.authorized_signer,
+            state.deposit,
+        );
+        let method = mocked_session_method(store.clone(), asserter);
+
+        let (request, credential) = voucher_credential(&signer, &state, 2_000).await;
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::ChannelClosed));
+
+        let stored = store.inner.get_channel_sync(&channel_id).unwrap();
+        assert!(stored.finalized);
+        assert_eq!(stored.highest_voucher_amount, 0);
+    }
+
+    /// Two top-ups can finish out of order: the one that read the chain first
+    /// must not lower the deposit the other one already recorded.
+    #[tokio::test]
+    async fn test_top_up_keeps_higher_recorded_deposit() {
+        use alloy::primitives::U256;
+        use alloy::sol_types::SolCall;
+
+        let payer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xab);
+        let state = test_channel_state(&channel_id.to_string());
+        let store = Arc::new(ChangeAfterRead::new(|state| ChannelState {
+            deposit: state.deposit + 20_000,
+            ..state
+        }));
+        store.inner.insert(&channel_id.to_string(), state.clone());
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_mined_transaction(&asserter);
+        push_on_chain_channel(
+            &asserter,
+            state.payer,
+            state.authorized_signer,
+            state.deposit + 5_000,
+        );
+        let method = mocked_session_method(store.clone(), asserter);
+
+        let (request, credential) = top_up_credential(
+            &channel_id.to_string(),
+            "5000",
+            signed_call_transaction(
+                &payer,
+                TEST_ESCROW,
+                ITestEscrow::topUpCall::new((channel_id, U256::from(5_000))).abi_encode(),
+            ),
+        );
+        method.verify_session(&credential, &request).await.unwrap();
+
+        assert_eq!(
+            store
+                .inner
+                .get_channel_sync(&channel_id.to_string())
+                .unwrap()
+                .deposit,
+            state.deposit + 20_000
+        );
     }
 
     #[tokio::test]
