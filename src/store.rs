@@ -294,6 +294,8 @@ impl ChannelStoreAdapter {
     }
 
     fn channel_key(&self, channel_id: &str) -> String {
+        let channel_id =
+            crate::protocol::methods::tempo::session_method::normalize_channel_id(channel_id);
         format!("{}{}", self.prefix, channel_id)
     }
 
@@ -784,6 +786,29 @@ mod adapter_tests {
             .unwrap();
         assert!(result.is_none());
         assert!(adapter.get_channel("ch1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_store_adapter_channel_ids_are_case_insensitive() {
+        let store = Arc::new(MemoryStore::new());
+        let adapter = ChannelStoreAdapter::new(store.clone(), "channels:");
+        let lower = format!("0x{}", "ab".repeat(32));
+        let upper = format!("0x{}", "AB".repeat(32));
+
+        let state = test_channel_state(&lower);
+        adapter
+            .update_channel(&upper, Box::new(move |_| Ok(Some(state))))
+            .await
+            .unwrap();
+
+        // Stored under the lowercase key, reachable with either spelling.
+        assert!(store
+            .get(&format!("channels:{lower}"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(adapter.get_channel(&lower).await.unwrap().is_some());
+        assert!(adapter.get_channel(&upper).await.unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

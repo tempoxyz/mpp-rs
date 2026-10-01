@@ -249,7 +249,9 @@ pub fn serve<G>(
 where
     G: futures_core::Stream<Item = String> + Send + Unpin + 'static,
 {
-    use crate::protocol::methods::tempo::session_method::deduct_from_channel;
+    use crate::protocol::methods::tempo::session_method::{
+        deduct_from_channel, normalize_channel_id,
+    };
 
     let ServeOptions {
         store,
@@ -259,6 +261,7 @@ where
         generate,
         poll_interval_ms,
     } = options;
+    let channel_id = normalize_channel_id(&channel_id);
 
     Box::pin(async_stream::stream! {
         let mut stream = std::pin::pin!(generate);
@@ -595,6 +598,35 @@ mod tests {
             events.push(item);
         }
         events
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_normalizes_channel_id() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let lower = format!("0x{}", "ab".repeat(32));
+        store.insert(&lower, test_channel_state(&lower, 1000, 5000));
+
+        let stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: format!("0x{}", "AB".repeat(32)),
+            challenge_id: "ch-test".to_string(),
+            tick_cost: 100,
+            generate: Box::pin(async_stream::stream! { yield "hello".to_string(); }),
+            poll_interval_ms: 10,
+        });
+
+        let events = collect_stream(stream).await;
+        assert_eq!(
+            parse_event(&events[0]),
+            Some(SseEvent::Message("hello".into()))
+        );
+        match parse_event(&events[1]) {
+            Some(SseEvent::PaymentReceipt(receipt)) => assert_eq!(receipt.channel_id, lower),
+            other => panic!("expected a receipt, got: {other:?}"),
+        }
     }
 
     #[cfg(feature = "tempo")]

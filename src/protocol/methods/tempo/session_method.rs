@@ -63,6 +63,10 @@ pub struct ChannelState {
 ///
 /// Object-safe so it can be used as `Arc<dyn ChannelStore>`.
 ///
+/// The session method and the SSE/WebSocket helpers lowercase channel IDs
+/// before calling the store. Implementations that are also called with
+/// client-supplied IDs should key by the lowercase form too.
+///
 /// # Note
 ///
 /// This is a minimal trait defined inline. It should be consolidated with
@@ -95,6 +99,13 @@ pub trait ChannelStore: Send + Sync {
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(std::future::pending())
     }
+}
+
+/// Normalize a channel ID to the lowercase form that channel state is keyed by.
+///
+/// Channel IDs are hex strings, so clients may send them in any case.
+pub(crate) fn normalize_channel_id(channel_id: &str) -> String {
+    channel_id.to_ascii_lowercase()
 }
 
 /// Atomically deduct `amount` from a channel's available balance.
@@ -582,6 +593,7 @@ where
             ),
             _ => unreachable!(),
         };
+        let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
@@ -820,6 +832,7 @@ where
                 ),
                 _ => unreachable!(),
             };
+        let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel = self
             .store
@@ -926,6 +939,7 @@ where
             ),
             _ => unreachable!(),
         };
+        let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel = self
             .store
@@ -1054,6 +1068,7 @@ where
                 ),
                 _ => unreachable!(),
             };
+        let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel = self
             .store
@@ -1633,7 +1648,11 @@ impl InMemoryChannelStore {
 
     /// Get a snapshot of a channel (for test assertions).
     pub fn get_channel_sync(&self, channel_id: &str) -> Option<ChannelState> {
-        self.channels.lock().unwrap().get(channel_id).cloned()
+        self.channels
+            .lock()
+            .unwrap()
+            .get(&normalize_channel_id(channel_id))
+            .cloned()
     }
 }
 
@@ -1643,7 +1662,7 @@ impl InMemoryChannelStore {
         self.channels
             .lock()
             .unwrap()
-            .insert(channel_id.to_string(), state);
+            .insert(normalize_channel_id(channel_id), state);
     }
 }
 
@@ -1654,7 +1673,7 @@ impl ChannelStore for InMemoryChannelStore {
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
     > {
-        let result = self.channels.lock().unwrap().get(channel_id).cloned();
+        let result = self.get_channel_sync(channel_id);
         Box::pin(async move { Ok(result) })
     }
 
@@ -1668,10 +1687,10 @@ impl ChannelStore for InMemoryChannelStore {
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
     > {
+        let channel_id = normalize_channel_id(channel_id);
         let mut map = self.channels.lock().unwrap();
-        let current = map.get(channel_id).cloned();
+        let current = map.get(&channel_id).cloned();
         let result = updater(current);
-        let channel_id = channel_id.to_string();
         match result {
             Ok(Some(state)) => {
                 map.insert(channel_id.clone(), state.clone());
@@ -1697,7 +1716,7 @@ impl ChannelStore for InMemoryChannelStore {
             .notifiers
             .lock()
             .unwrap()
-            .entry(channel_id.to_string())
+            .entry(normalize_channel_id(channel_id))
             .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
             .clone();
         Box::pin(async move {
@@ -1829,6 +1848,24 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_store_channel_ids_are_case_insensitive() {
+        let store = InMemoryChannelStore::new();
+        let lower = format!("0x{}", "ab".repeat(32));
+        let upper = format!("0x{}", "AB".repeat(32));
+        store.insert(&upper, test_channel_state(&lower));
+
+        assert!(store.get_channel_sync(&lower).is_some());
+        assert!(store.get_channel(&upper).await.unwrap().is_some());
+
+        let mut state = test_channel_state(&lower);
+        state.highest_voucher_amount = 10_000;
+        store.insert(&lower, state);
+        let updated = deduct_from_channel(&store, &upper, 3_000).await.unwrap();
+        assert_eq!(updated.spent, 3_000);
+        assert_eq!(store.get_channel_sync(&lower).unwrap().spent, 3_000);
     }
 
     #[tokio::test]
@@ -3315,6 +3352,118 @@ mod tests {
             "expected token mismatch error, got: {}",
             err.message
         );
+    }
+
+    /// Channel IDs are hex, so a credential may spell one in any case. It must
+    /// resolve to the channel that is stored under the lowercase ID.
+    #[tokio::test]
+    async fn test_voucher_accepts_mixed_case_channel_id() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+        use alloy::sol_types::SolValue;
+
+        /// Store that looks channels up by the exact key it is given.
+        struct ExactKeyStore(InMemoryChannelStore);
+
+        impl ChannelStore for ExactKeyStore {
+            fn get_channel(
+                &self,
+                channel_id: &str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ChannelState>, VerificationError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let result = self.0.channels.lock().unwrap().get(channel_id).cloned();
+                Box::pin(async move { Ok(result) })
+            }
+
+            fn update_channel(
+                &self,
+                channel_id: &str,
+                updater: Box<
+                    dyn FnOnce(
+                            Option<ChannelState>,
+                        )
+                            -> Result<Option<ChannelState>, VerificationError>
+                        + Send,
+                >,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ChannelState>, VerificationError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let mut channels = self.0.channels.lock().unwrap();
+                let result = updater(channels.get(channel_id).cloned());
+                if let Ok(Some(state)) = &result {
+                    channels.insert(channel_id.to_string(), state.clone());
+                }
+                Box::pin(async move { result })
+            }
+        }
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let lower = format!("0x{}", "ab".repeat(32));
+        let upper = format!("0x{}", "AB".repeat(32));
+        let mut state = test_channel_state(&lower);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        let store = Arc::new(ExactKeyStore(InMemoryChannelStore::new()));
+        store.0.insert(&lower, state.clone());
+
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from(
+            (
+                false,
+                0u64,
+                state.payer,
+                state.payee,
+                state.token,
+                state.authorized_signer,
+                state.deposit,
+                0u128,
+            )
+                .abi_encode_params(),
+        ));
+        let method = SessionMethod::new(
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter),
+            store.clone(),
+            SessionMethodConfig {
+                escrow_contract: state.escrow_contract,
+                chain_id: state.chain_id,
+                min_voucher_delta: 0,
+            },
+        );
+
+        let signature = voucher::sign_voucher(
+            &signer,
+            lower.parse().unwrap(),
+            2_000,
+            state.escrow_contract,
+            state.chain_id,
+        )
+        .await
+        .unwrap();
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Voucher {
+                channel_id: upper,
+                descriptor: None,
+                settlement_route: None,
+                cumulative_amount: "2000".to_string(),
+                signature: alloy::hex::encode_prefixed(signature),
+            },
+        );
+
+        let receipt = method.verify_session(&credential, &request).await.unwrap();
+        assert_eq!(receipt.reference, lower);
+        let channels = store.0.channels.lock().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[&lower].highest_voucher_amount, 2_000);
     }
 
     /// A close referencing a channel with a mismatched payee must be
