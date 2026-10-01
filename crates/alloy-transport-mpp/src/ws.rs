@@ -19,7 +19,7 @@ use mpp::PaymentPayload;
 use mpp::{
     client::{
         ws::{WsClientMessage, WsServerMessage},
-        PaymentProvider,
+        PaymentProvider, DEFAULT_MAX_PAYMENT_RETRIES,
     },
     format_authorization, MppError, PaymentChallenge, PaymentCredential, Receipt,
 };
@@ -274,6 +274,10 @@ impl<P: PaymentProvider> Drop for PendingPayment<P> {
 /// On reconnect, [`PaymentProvider::pay`] is called again with the server's
 /// new challenge — providers should handle repeated calls cheaply.
 ///
+/// A server may challenge again mid-connection, up to
+/// [`with_max_payments`](Self::with_max_payments) payments per connection.
+/// A challenge beyond that limit is a fatal error and is not paid.
+///
 /// Only socket-level failures are retried; deterministic MPP failures are
 /// terminal and short-circuit further reconnect attempts.
 #[derive(Clone)]
@@ -285,6 +289,7 @@ pub struct MppWsConnect<P, V = NoVoucher> {
     retry_interval: Duration,
     keepalive_interval: Duration,
     handshake_timeout: Duration,
+    max_payments: usize,
     payment_provider: P,
     voucher_provider: V,
     receipt_tx: watch::Sender<Option<Receipt>>,
@@ -304,6 +309,7 @@ impl<P, V> fmt::Debug for MppWsConnect<P, V> {
             .field("retry_interval", &self.retry_interval)
             .field("keepalive_interval", &self.keepalive_interval)
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("max_payments", &self.max_payments)
             .finish_non_exhaustive()
     }
 }
@@ -341,6 +347,7 @@ impl<P> MppWsConnect<P, NoVoucher> {
             retry_interval: Duration::from_secs(3),
             keepalive_interval: Duration::from_secs(DEFAULT_KEEPALIVE_SECS),
             handshake_timeout: Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
+            max_payments: DEFAULT_MAX_PAYMENT_RETRIES,
             payment_provider,
             voucher_provider: NoVoucher,
             receipt_tx,
@@ -392,6 +399,18 @@ impl<P, V> MppWsConnect<P, V> {
         self
     }
 
+    /// Sets the maximum number of challenges paid on one connection.
+    ///
+    /// Defaults to [`DEFAULT_MAX_PAYMENT_RETRIES`], the same cap the HTTP
+    /// client applies per request. A challenge beyond the limit closes the
+    /// connection with a fatal error instead of being paid. Every reconnect
+    /// starts with a fresh budget; vouchers requested through `needVoucher`
+    /// are not counted.
+    pub const fn with_max_payments(mut self, max_payments: usize) -> Self {
+        self.max_payments = max_payments;
+        self
+    }
+
     /// Plug in a [`VoucherProvider`] for streaming/session intents.
     pub fn with_voucher_provider<V2: VoucherProvider>(
         self,
@@ -405,6 +424,7 @@ impl<P, V> MppWsConnect<P, V> {
             retry_interval: self.retry_interval,
             keepalive_interval: self.keepalive_interval,
             handshake_timeout: self.handshake_timeout,
+            max_payments: self.max_payments,
             payment_provider: self.payment_provider,
             voucher_provider,
             receipt_tx: self.receipt_tx,
@@ -479,6 +499,7 @@ where
             self.voucher_provider.clone(),
             self.keepalive_interval,
             self.handshake_timeout,
+            self.max_payments,
             self.receipt_tx.clone(),
             self.events_tx.clone(),
             self.fatal.clone(),
@@ -500,6 +521,7 @@ async fn run_translator<P, V>(
     voucher_provider: V,
     keepalive_interval: Duration,
     handshake_timeout: Duration,
+    max_payments: usize,
     receipt_tx: watch::Sender<Option<Receipt>>,
     events_tx: broadcast::Sender<MppEvent>,
     fatal: Arc<AtomicBool>,
@@ -526,6 +548,7 @@ async fn run_translator<P, V>(
     let mut pending_pay: Option<JoinHandle<Result<PendingPayment<P>, MppError>>> = None;
     let mut pending_voucher: Option<JoinHandle<Result<PaymentCredential, MppError>>> = None;
     let mut payment_awaiting_receipt: Option<PendingPayment<P>> = None;
+    let mut payments_left = max_payments;
     // Outbound RPCs queued while not safe to send (handshake/payment).
     // Polling `recv_from_frontend` unconditionally lets shutdown be observed
     // mid-payment.
@@ -675,6 +698,8 @@ async fn run_translator<P, V>(
                             &mut pending_voucher,
                             &mut payment_awaiting_receipt,
                             &mut credential_awaiting_receipt,
+                            max_payments,
+                            &mut payments_left,
                         ).await {
                             Ok(()) => {
                                 // Reset the handshake deadline when a new
@@ -799,6 +824,8 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     payment_awaiting_receipt: &mut Option<PendingPayment<P>>,
     credential_awaiting_receipt: &mut bool,
+    max_payments: usize,
+    payments_left: &mut usize,
 ) -> Result<(), TerminationReason> {
     match msg {
         Message::Text(text) => {
@@ -813,6 +840,8 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
                 pending_voucher,
                 payment_awaiting_receipt,
                 credential_awaiting_receipt,
+                max_payments,
+                payments_left,
             )
             .await
         }
@@ -848,6 +877,8 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     payment_awaiting_receipt: &mut Option<PendingPayment<P>>,
     credential_awaiting_receipt: &mut bool,
+    max_payments: usize,
+    payments_left: &mut usize,
 ) -> Result<(), TerminationReason> {
     let server_msg: WsServerMessage = match json_from_str(text) {
         Ok(m) => m,
@@ -908,6 +939,15 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                 )));
                 return Err(TerminationReason::Fatal);
             }
+
+            if *payments_left == 0 {
+                error!(max_payments, "MPP payment limit reached");
+                let _ = events_tx.send(MppEvent::Error(format!(
+                    "server exceeded the payment limit of {max_payments} per connection; not reconnecting"
+                )));
+                return Err(TerminationReason::Fatal);
+            }
+            *payments_left -= 1;
 
             // Spawn `pay()` so the main loop stays responsive (keepalive,
             // socket reads) while the provider signs/broadcasts.
