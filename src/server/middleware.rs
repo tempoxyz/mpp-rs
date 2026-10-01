@@ -6,19 +6,28 @@
 //!
 //! # Example (axum)
 //!
-//! ```ignore
-//! use axum::{Router, routing::get};
+#![cfg_attr(feature = "tempo", doc = "```no_run")]
+#![cfg_attr(not(feature = "tempo"), doc = "```ignore")]
+//! use axum::{routing::get, Router};
 //! use mpp::server::middleware::PaymentLayer;
-//! use mpp::server::{Mpp, tempo, TempoConfig};
+//! use mpp::server::{tempo, Mpp, TempoConfig};
 //!
+//! # fn main() -> mpp::Result<()> {
 //! let mpp = Mpp::create(tempo(TempoConfig {
-//!     recipient: "0xabc...",
-//! })).unwrap();
+//!     recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+//! }))?;
 //!
-//! let app = Router::new()
-//!     .route("/premium", get(handler))
-//!     .layer(PaymentLayer::charge(&mpp, "0.10").unwrap());
+//! let app: Router = Router::new()
+//!     .route("/premium", get(|| async { "paid content" }))
+//!     .route_layer(PaymentLayer::charge(&mpp, "0.10")?);
+//! # Ok(())
+//! # }
 //! ```
+//!
+//! Prefer axum's `route_layer` over `layer`: `layer` also wraps the fallback,
+//! so requests for unknown paths are answered with 402 instead of 404. Apply
+//! CORS handling outside the payment layer so preflight requests, which never
+//! carry credentials, are answered before payment is checked.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -136,9 +145,16 @@ impl PaymentVerifier for FnVerifier {
 /// a `402 Payment Required` response with a `WWW-Authenticate` challenge.
 /// Valid payments are verified and a `Payment-Receipt` header is attached
 /// to the inner service's response.
-#[derive(Clone)]
 pub struct PaymentLayer<V> {
     verifier: Arc<V>,
+}
+
+impl<V> Clone for PaymentLayer<V> {
+    fn clone(&self) -> Self {
+        Self {
+            verifier: Arc::clone(&self.verifier),
+        }
+    }
 }
 
 impl<V: PaymentVerifier> PaymentLayer<V> {
@@ -182,10 +198,18 @@ impl<S, V: PaymentVerifier> tower_layer::Layer<S> for PaymentLayer<V> {
 // ==================== PaymentService ====================
 
 /// Tower [`Service`](tower_service::Service) that wraps an inner service with payment verification.
-#[derive(Clone)]
 pub struct PaymentService<S, V> {
     inner: S,
     verifier: Arc<V>,
+}
+
+impl<S: Clone, V> Clone for PaymentService<S, V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            verifier: Arc::clone(&self.verifier),
+        }
+    }
 }
 
 impl<S, V, ReqBody, ResBody> tower_service::Service<Request<ReqBody>> for PaymentService<S, V>
@@ -271,9 +295,16 @@ where
 ///
 /// The request body is buffered, used for body-digest challenge/verification,
 /// and then replayed to the inner service as `http_body_util::Full<Bytes>`.
-#[derive(Clone)]
 pub struct PaymentBodyLayer<V> {
     verifier: Arc<V>,
+}
+
+impl<V> Clone for PaymentBodyLayer<V> {
+    fn clone(&self) -> Self {
+        Self {
+            verifier: Arc::clone(&self.verifier),
+        }
+    }
 }
 
 impl<V: PaymentVerifier> PaymentBodyLayer<V> {
@@ -297,10 +328,18 @@ impl<S, V: PaymentVerifier> tower_layer::Layer<S> for PaymentBodyLayer<V> {
 }
 
 /// Tower [`Service`](tower_service::Service) for body-bound payment verification.
-#[derive(Clone)]
 pub struct PaymentBodyService<S, V> {
     inner: S,
     verifier: Arc<V>,
+}
+
+impl<S: Clone, V> Clone for PaymentBodyService<S, V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            verifier: Arc::clone(&self.verifier),
+        }
+    }
 }
 
 impl<S, V, ReqBody, ResBody> tower_service::Service<Request<ReqBody>> for PaymentBodyService<S, V>
@@ -440,9 +479,9 @@ fn challenge_response<B: Default>(challenge: &str) -> Response<B> {
 
 /// A [`PaymentVerifier`] backed by an `Mpp` instance's charge flow.
 ///
-/// Created via [`PaymentLayer::charge()`].
+/// Created via [`PaymentLayer::charge()`] and [`PaymentBodyLayer::charge()`].
 #[allow(clippy::type_complexity)]
-struct ChargeVerifier {
+pub struct ChargeVerifier {
     /// Builds a fresh `WWW-Authenticate` header value per request.
     challenge_fn: Box<dyn Fn() -> Result<String, String> + Send + Sync>,
     /// Builds a fresh body-bound `WWW-Authenticate` header value per request.
