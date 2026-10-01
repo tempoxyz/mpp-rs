@@ -112,8 +112,10 @@ impl TempoBuilder {
 
     /// Enable fee sponsorship for all challenges (default: `false`).
     ///
-    /// When enabled, all charge and session challenges will include
-    /// `feePayer: true` in their `methodDetails`. You should also call
+    /// When enabled, all charge challenges will include `feePayer: true` in
+    /// their `methodDetails`, and so will session challenges if the session
+    /// method sponsors client transactions (Tempo's `SessionMethod` does
+    /// not). You should also call
     /// [`fee_payer_signer`](Self::fee_payer_signer) to provide the signer
     /// that will sponsor transaction fees.
     pub fn fee_payer(mut self, enabled: bool) -> Self {
