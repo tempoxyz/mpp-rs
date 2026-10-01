@@ -125,7 +125,8 @@ pub struct TempoSessionProvider {
 #[derive(Clone, Debug)]
 struct PendingOpen {
     challenge_id: String,
-    store_key: String,
+    /// Row persisted for the channel, if it is kept in the channel store.
+    store_key: Option<String>,
 }
 
 struct SessionPaymentLease {
@@ -378,6 +379,15 @@ impl TempoSessionProvider {
         })
     }
 
+    /// Key of the entry's row in the channel store. Only native channels are
+    /// persisted, see [`Self::persist_channel`].
+    fn store_key(entry: &ChannelEntry) -> Result<Option<String>, MppError> {
+        if !is_precompile_escrow(entry.escrow_contract) {
+            return Ok(None);
+        }
+        Self::stored_entry(entry).map(|stored| Some(stored.key()))
+    }
+
     async fn persist_channel(&self, entry: &ChannelEntry) -> Result<(), MppError> {
         if !is_precompile_escrow(entry.escrow_contract) {
             return Ok(());
@@ -461,7 +471,7 @@ impl TempoSessionProvider {
                 Some(pending) if pending.challenge_id != challenge.id => return Ok(()),
                 Some(_) => pending_opens
                     .remove(&channel_id)
-                    .map(|pending| pending.store_key),
+                    .and_then(|pending| pending.store_key),
                 None => None,
             }
         };
@@ -474,11 +484,7 @@ impl TempoSessionProvider {
                 .is_some_and(|entry| entry.channel_id.to_string() == channel_id)
                 .then(|| channels.remove(&runtime_key))
                 .flatten();
-            entry
-                .as_ref()
-                .map(Self::stored_entry)
-                .transpose()?
-                .map(|entry| entry.key())
+            entry.as_ref().map(Self::store_key).transpose()?.flatten()
         } else {
             None
         };
@@ -2024,19 +2030,21 @@ impl TempoSessionProvider {
                 .insert(entry.channel_id.to_string(), route);
         }
 
+        // Everything that can fail runs before the channel is tracked.
+        let pending = PendingOpen {
+            challenge_id: challenge.id.clone(),
+            store_key: Self::store_key(&entry)?,
+        };
+        self.persist_channel(&entry).await?;
         self.channel_id_to_key
             .lock()
             .unwrap()
             .insert(entry.channel_id.to_string(), key.clone());
-        self.persist_channel(&entry).await?;
         self.channels.lock().unwrap().insert(key, entry.clone());
-        self.pending_opens.lock().unwrap().insert(
-            entry.channel_id.to_string(),
-            PendingOpen {
-                challenge_id: challenge.id.clone(),
-                store_key: Self::stored_entry(&entry)?.key(),
-            },
-        );
+        self.pending_opens
+            .lock()
+            .unwrap()
+            .insert(entry.channel_id.to_string(), pending);
         self.notify_update(&entry);
 
         Ok(build_credential(challenge, payload, chain_id, payer))
@@ -2761,7 +2769,7 @@ mod tests {
             channel_id.to_string(),
             PendingOpen {
                 challenge_id: challenge.id.clone(),
-                store_key: store_key.clone(),
+                store_key: Some(store_key.clone()),
             },
         );
 
@@ -2811,7 +2819,7 @@ mod tests {
             channel_id.to_string(),
             PendingOpen {
                 challenge_id: challenge.id.clone(),
-                store_key: store_key.clone(),
+                store_key: Some(store_key.clone()),
             },
         );
 
@@ -3338,6 +3346,87 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceeds locally authorized cumulative amount"));
+    }
+
+    #[tokio::test]
+    async fn pay_opens_a_legacy_channel_and_rolls_it_back() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = Address::repeat_byte(0x33);
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(payee, currency, escrow);
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        assert!(matches!(
+            credential.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Open { .. }
+        ));
+        assert_eq!(provider.channels().len(), 1);
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        provider
+            .rollback_payment(&challenge, &credential)
+            .await
+            .unwrap();
+
+        assert!(provider.channels().is_empty());
+        assert!(provider.channel_id_to_key.lock().unwrap().is_empty());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_open_leaves_no_channel_behind() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::store::{ChannelStoreError, ChannelStoreResult};
+
+        struct ReadOnlyStore;
+
+        #[async_trait::async_trait]
+        impl ChannelStore for ReadOnlyStore {
+            async fn get(&self, _: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
+                Ok(None)
+            }
+
+            async fn set(&self, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                Err(ChannelStoreError::Io("read-only".into()))
+            }
+
+            async fn delete(&self, _: &str) -> ChannelStoreResult<()> {
+                Ok(())
+            }
+        }
+
+        let mut provider = make_test_provider()
+            .with_channel_store(Arc::new(ReadOnlyStore))
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        asserter.push_success(&"0x5208"); // eth_estimateGas
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        );
+
+        let err = provider.pay(&challenge).await.unwrap_err();
+
+        assert!(err.to_string().contains("channel store failed"), "{err}");
+        assert!(provider.channels().is_empty());
+        assert!(provider.channel_id_to_key.lock().unwrap().is_empty());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
     }
 
     #[cfg(feature = "tempo")]
