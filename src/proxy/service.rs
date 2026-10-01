@@ -149,6 +149,9 @@ impl ServiceBuilder {
     }
 
     /// Add a route. `pattern` is `"METHOD /path"` or just `"/path"`.
+    ///
+    /// Routes are matched in the order they are added; see
+    /// [`ProxyConfig::match_route`].
     pub fn route(mut self, pattern: &str, endpoint: Endpoint) -> Self {
         let (method, path) = parse_route_pattern(pattern);
         self.routes.push(Route {
@@ -193,7 +196,10 @@ fn parse_route_pattern(pattern: &str) -> (Option<String>, String) {
 /// Check if a URL path matches a route pattern path.
 ///
 /// Supports `:param` segments as wildcards (e.g., `/v1/customers/:id` matches
-/// `/v1/customers/cus_123`).
+/// `/v1/customers/cus_123`). A `:param` never matches a segment that a URL
+/// parser would rewrite into a different path once the request is forwarded:
+/// dot segments (`.`, `..`, also spelled with `%2e`) and segments containing a
+/// backslash.
 fn path_matches(pattern: &str, path: &str) -> bool {
     let pat_segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
     let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -205,7 +211,27 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     pat_segments
         .iter()
         .zip(path_segments.iter())
-        .all(|(pat, seg)| pat.starts_with(':') || *pat == *seg)
+        .all(|(pat, seg)| {
+            if pat.starts_with(':') {
+                !is_dot_segment(seg) && !seg.contains('\\')
+            } else {
+                *pat == *seg
+            }
+        })
+}
+
+/// Whether `segment` is `.` or `..`, with `%2e` accepted for either dot.
+fn is_dot_segment(segment: &str) -> bool {
+    let mut rest = segment.as_bytes();
+    let mut dots = 0;
+    while !rest.is_empty() {
+        rest = match rest {
+            [b'.', tail @ ..] | [b'%', b'2', b'e' | b'E', tail @ ..] => tail,
+            _ => return false,
+        };
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -236,13 +262,13 @@ pub struct ParsedRoute<'a> {
 impl ProxyConfig {
     /// Strip the base path from a request path and return the remainder.
     ///
-    /// Returns `None` if the path doesn't start with the base path.
+    /// Returns `None` if the path is not the base path or below it.
     pub fn strip_base<'a>(&self, path: &'a str) -> Option<&'a str> {
         match &self.base_path {
             None => Some(path),
             Some(base) => {
-                let base = base.trim_end_matches('/');
-                path.strip_prefix(base)
+                let rest = path.strip_prefix(base.trim_end_matches('/'))?;
+                (rest.is_empty() || rest.starts_with('/')).then_some(rest)
             }
         }
     }
@@ -251,6 +277,10 @@ impl ProxyConfig {
     ///
     /// The `path` should be the full request path (base path will be stripped).
     /// Returns the matched service, route, and the upstream path portion.
+    ///
+    /// Routes are tried in registration order and the first match wins, so a
+    /// pattern shadows any later route it also matches. Register specific
+    /// routes before broader `:param` or any-method ones.
     pub fn match_route<'a>(&'a self, method: &str, path: &str) -> Option<ParsedRoute<'a>> {
         let stripped = self.strip_base(path)?;
         let (service_id, upstream_path) = parse_path(stripped)?;
@@ -881,6 +911,88 @@ mod tests {
         let m = config.match_route("GET", "/stripe/v1/customers/cus_123");
         assert!(m.is_some());
         assert_eq!(m.unwrap().upstream_path, "/v1/customers/cus_123");
+    }
+
+    #[test]
+    fn test_match_route_first_registered_wins() {
+        let svc = Service::new("stripe", "https://api.stripe.com")
+            .route("GET /v1/customers/search", Endpoint::Free)
+            .route("GET /v1/customers/:id", Endpoint::Free)
+            .route("GET /v1/customers/me", Endpoint::Free)
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+
+        let pattern = |path| {
+            config
+                .match_route("GET", path)
+                .unwrap()
+                .route
+                .pattern
+                .as_str()
+        };
+        assert_eq!(
+            pattern("/stripe/v1/customers/search"),
+            "GET /v1/customers/search"
+        );
+        assert_eq!(pattern("/stripe/v1/customers/me"), "GET /v1/customers/:id");
+    }
+
+    #[test]
+    fn test_param_route_rejects_dot_segments() {
+        let svc = Service::new("stripe", "https://api.stripe.com")
+            .route("GET /v1/customers/:id", Endpoint::Free)
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+
+        for id in [
+            "..",
+            ".",
+            "%2e%2e",
+            "%2E%2E",
+            ".%2e",
+            "%2e.",
+            "%2e",
+            "..\\admin",
+        ] {
+            let path = format!("/stripe/v1/customers/{id}");
+            assert!(
+                config.match_route("GET", &path).is_none(),
+                "{path} must not match a :param route"
+            );
+        }
+
+        for id in ["...", "cus_1.2", ".well-known", "%2e%2e%2e"] {
+            let path = format!("/stripe/v1/customers/{id}");
+            assert!(config.match_route("GET", &path).is_some(), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_base_path_requires_segment_boundary() {
+        let config = ProxyConfig {
+            base_path: Some("/api".to_string()),
+            services: vec![test_service()],
+            title: None,
+            description: None,
+        };
+
+        assert_eq!(
+            config.strip_base("/api/openai/v1/models"),
+            Some("/openai/v1/models")
+        );
+        assert_eq!(config.strip_base("/api"), Some(""));
+        assert_eq!(config.strip_base("/apiopenai/v1/models"), None);
+        assert!(config.match_route("GET", "/apiopenai/v1/models").is_none());
     }
 
     #[test]
