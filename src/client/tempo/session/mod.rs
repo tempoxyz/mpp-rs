@@ -112,8 +112,6 @@ pub struct TempoSessionProvider {
     channel_id_to_key: Arc<Mutex<HashMap<String, String>>>,
     /// Newly prepared channels awaiting acceptance by the server.
     pending_opens: Arc<Mutex<HashMap<String, PendingOpen>>>,
-    settlement_routes:
-        Arc<Mutex<HashMap<String, crate::protocol::methods::tempo::session::SettlementRoute>>>,
     /// Optional callback for channel state changes.
     on_channel_update: Option<Arc<dyn Fn(&ChannelEntry) + Send + Sync>>,
     /// Last challenge received from the server, used for `close()`.
@@ -170,7 +168,6 @@ impl TempoSessionProvider {
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
             pending_opens: Arc::new(Mutex::new(HashMap::new())),
-            settlement_routes: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1124,12 +1121,7 @@ impl TempoSessionProvider {
             settlement_route, ..
         } = &mut payload
         {
-            *settlement_route = self
-                .settlement_routes
-                .lock()
-                .unwrap()
-                .get(channel_id_hex)
-                .cloned();
+            *settlement_route = entry.settlement_route.clone();
         }
 
         // Update the registry only after the voucher has been signed.
@@ -2154,13 +2146,9 @@ impl TempoSessionProvider {
             match &mut payload {
                 SessionCredentialPayload::Open {
                     settlement_route, ..
-                } => *settlement_route = Some(route.clone()),
+                } => *settlement_route = Some(route),
                 _ => unreachable!("new session must produce an open payload"),
             }
-            self.settlement_routes
-                .lock()
-                .unwrap()
-                .insert(entry.channel_id.to_string(), route);
         }
 
         // Everything that can fail runs before the channel is tracked.
