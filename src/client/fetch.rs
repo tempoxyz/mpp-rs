@@ -7,7 +7,7 @@ use reqwest::{Request, RequestBuilder, Response};
 use super::accept_payment_policy::AcceptPaymentPolicy;
 use super::error::HttpError;
 use super::events::ClientEvents;
-use super::flow::{Exchange, FlowError, PaymentFlow, Quirks};
+use super::flow::{Exchange, FlowError, PaymentFlow};
 use super::provider::PaymentProvider;
 use super::DEFAULT_MAX_PAYMENT_RETRIES;
 
@@ -198,8 +198,6 @@ async fn send_with_payment<P: PaymentProvider>(
     max_payment_retries: usize,
     initial_response: Option<Response>,
 ) -> Result<Response, HttpError> {
-    // A request that cannot be repeated is refused before it is sent.
-    let request = request.try_clone().ok_or(HttpError::CloneFailed)?;
     let (mut client, request) = request.build_split();
     let request = request.map_err(HttpError::request)?;
 
@@ -208,7 +206,6 @@ async fn send_with_payment<P: PaymentProvider>(
         policy,
         events: &events,
         max_payment_retries,
-        quirks: Quirks::FETCH,
     };
     flow.run(&mut client, request, initial_response)
         .await
