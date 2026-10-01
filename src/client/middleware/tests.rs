@@ -153,6 +153,15 @@ mod integration {
         (challenge, header)
     }
 
+    fn http_error(err: &reqwest_middleware::Error) -> &HttpError {
+        match err {
+            reqwest_middleware::Error::Middleware(err) => {
+                err.downcast_ref().expect("middleware errors are HttpError")
+            }
+            reqwest_middleware::Error::Reqwest(err) => panic!("unexpected reqwest error: {err}"),
+        }
+    }
+
     async fn spawn_server(app: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -985,6 +994,7 @@ mod integration {
             "expected WWW-Authenticate error, got: {}",
             err
         );
+        assert!(matches!(http_error(&err), HttpError::MissingChallenge));
     }
 
     #[tokio::test]
@@ -1052,6 +1062,10 @@ mod integration {
             err.to_string().contains("Payment expired"),
             "expected payment expired error, got: {err}"
         );
+        assert!(matches!(
+            http_error(&err),
+            HttpError::Payment(MppError::PaymentExpired(_))
+        ));
         assert_eq!(provider.call_count(), 0);
         assert_eq!(challenge_count.load(Ordering::SeqCst), 0);
         assert_eq!(failed_count.load(Ordering::SeqCst), 1);
@@ -1250,5 +1264,9 @@ mod integration {
             "expected payment failure, got: {}",
             err
         );
+        assert!(matches!(
+            http_error(&err),
+            HttpError::Payment(MppError::Http(_))
+        ));
     }
 }
