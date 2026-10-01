@@ -26,7 +26,7 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::{CloseProvider, CloseRequest, VoucherProvider, VoucherRequest};
+use crate::{ws::PendingPayment, CloseProvider, CloseRequest, VoucherProvider, VoucherRequest};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -207,12 +207,16 @@ where
             .payment_provider
             .pay_with_context(&challenge, payment_context)
             .await?;
+        // Abandons the payment if the handshake times out or this future is
+        // dropped before the server answers the credential.
+        let payment =
+            PendingPayment::new(self.payment_provider.clone(), challenge.clone(), credential);
 
         let result = async {
             let mut request = self.url.as_str().into_client_request()?;
             request.headers_mut().extend(self.headers.clone());
             let (mut socket, _) = connect_async_with_config(request, None, false).await?;
-            send_authorization(&mut socket, &credential).await?;
+            send_authorization(&mut socket, payment.credential()).await?;
             let _ = self.events_tx.send(MppApplicationEvent::CredentialSent);
 
             let mut client = MppApplicationWs {
@@ -235,15 +239,11 @@ where
 
         match result {
             Ok(client) => {
-                self.payment_provider
-                    .commit_payment(&challenge, &credential)
-                    .await?;
+                payment.commit().await?;
                 Ok(client)
             }
             Err(error) => {
-                self.payment_provider
-                    .rollback_payment(&challenge, &credential)
-                    .await?;
+                payment.rollback().await?;
                 Err(error)
             }
         }
