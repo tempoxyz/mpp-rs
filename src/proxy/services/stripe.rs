@@ -3,7 +3,9 @@ use base64::Engine;
 
 /// Create a Stripe service configuration.
 ///
-/// Injects `Authorization: Basic` header (API key as username) for upstream authentication.
+/// Injects `Authorization: Basic` header (API key as username) for upstream authentication
+/// and strips caller-supplied `Stripe-Account` and `Stripe-Context` headers, which select the
+/// account a request acts on.
 ///
 /// # Example
 ///
@@ -30,7 +32,8 @@ pub fn service(api_key: &str, configure: impl FnOnce(ServiceBuilder) -> ServiceB
     configure(
         Service::new("stripe", "https://api.stripe.com")
             .header("Authorization", format!("Basic {encoded}"))
-            .strip_request_header("Stripe-Account"),
+            .strip_request_header("Stripe-Account")
+            .strip_request_header("Stripe-Context"),
     )
     .build()
 }
@@ -66,6 +69,16 @@ mod tests {
             "expected Basic auth, got: {}",
             auth.1
         );
+    }
+
+    #[test]
+    fn test_stripe_service_strips_caller_supplied_stripe_context() {
+        let svc = service("sk_test_abc", |r| r);
+        let mut headers = vec![("Stripe-Context".into(), "acct_evil".into())];
+        svc.apply_request_headers(&mut headers);
+        assert!(headers
+            .iter()
+            .all(|(n, _)| !n.eq_ignore_ascii_case("stripe-context")));
     }
 
     #[test]
