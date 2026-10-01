@@ -85,7 +85,8 @@ fn test_match_receipt_transfer_logs_merges_transfer_with_memo_twin_logs() {
     let transfer = || make_transfer_log(currency, sender, recipient, amount);
     let transfer_with_memo =
         || make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
-    let unrelated = || serde_json::json!({ "address": format!("{currency:#x}"), "topics": [] });
+    let unrelated =
+        || serde_json::json!({ "address": format!("{currency:#x}"), "topics": [], "data": "0x" });
     // amount=2000 with a 1000 split to the primary recipient.
     let expected = vec![
         Transfer {
@@ -124,6 +125,53 @@ fn test_match_receipt_transfer_logs_merges_transfer_with_memo_twin_logs() {
 
     // Only adjacent logs are twins.
     assert!(matched(&[transfer(), unrelated(), transfer_with_memo()]).is_ok());
+}
+
+/// Only logs with the exact shape of the TIP-20 events count as transfers.
+#[test]
+fn test_match_receipt_transfer_logs_ignores_malformed_logs() {
+    let currency = Address::repeat_byte(0x20);
+    let sender = Address::repeat_byte(0x11);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let memo = attribution::encode("challenge-123", "api.example.com", None);
+    let expected = vec![Transfer {
+        amount,
+        recipient,
+        memo: None,
+    }];
+    let matched = |log: serde_json::Value| {
+        match_receipt_transfer_logs(&[log], sender, currency, &expected, None, None)
+    };
+    let transfer = || make_transfer_log(currency, sender, recipient, amount);
+    let transfer_with_memo =
+        || make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
+
+    assert!(matched(transfer()).is_ok());
+    assert!(matched(transfer_with_memo()).is_ok());
+
+    // `Transfer` with a third indexed topic, as ERC-721 emits it.
+    let mut extra_topic = transfer();
+    extra_topic["topics"]
+        .as_array_mut()
+        .unwrap()
+        .push(address_topic(recipient).into());
+    assert!(matched(extra_topic).is_err());
+
+    // `Approval(owner, spender, amount)` has the shape of `Transfer`.
+    let mut approval = transfer();
+    approval["topics"][0] = alloy::primitives::keccak256("Approval(address,address,uint256)")
+        .to_string()
+        .into();
+    assert!(matched(approval).is_err());
+
+    let mut short_amount = transfer();
+    short_amount["data"] = "0x64".into();
+    assert!(matched(short_amount).is_err());
+
+    let mut missing_memo_topic = transfer_with_memo();
+    missing_memo_topic["topics"].as_array_mut().unwrap().pop();
+    assert!(matched(missing_memo_topic).is_err());
 }
 
 #[test]

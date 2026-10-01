@@ -1,22 +1,13 @@
 //! Matching the TIP-20 transfer logs of a receipt against the expected transfers.
 
-use alloy::primitives::{Address, B256, U256};
-use alloy::providers::Provider;
-use tempo_alloy::TempoNetwork;
+use alloy::primitives::{Address, U256};
+use alloy::rpc::types::Log;
+use alloy::sol_types::SolEvent;
+use tempo_alloy::contracts::precompiles::ITIP20;
 
 use crate::protocol::traits::VerificationError;
 
 use super::super::transfers::Transfer;
-use super::ChargeMethod;
-
-/// TIP-20 Transfer event topic: keccak256("Transfer(address,address,uint256)")
-/// TIP-20 is Tempo's token standard (compatible with ERC-20 Transfer events).
-pub(super) const TRANSFER_EVENT_TOPIC: B256 =
-    alloy::primitives::b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
-
-/// TIP-20 TransferWithMemo event topic: keccak256("TransferWithMemo(address,address,uint256,bytes32)")
-pub(super) const TRANSFER_WITH_MEMO_EVENT_TOPIC: B256 =
-    alloy::primitives::b256!("57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MatchedTransferLog {
@@ -99,62 +90,25 @@ impl ParsedTransferLog {
     }
 }
 
-fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferLog> {
-    let address = log
-        .get("address")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<Address>().ok())?;
-
-    let topics: Vec<&str> = log
-        .get("topics")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())?;
-    if topics.len() < 3 {
-        return None;
-    }
-
-    let topic0 = topics[0].parse::<B256>().ok()?;
-    let from = topics[1]
-        .parse::<B256>()
-        .ok()
-        .map(|b| Address::from_slice(&b[12..]))?;
-    let to = topics[2]
-        .parse::<B256>()
-        .ok()
-        .map(|b| Address::from_slice(&b[12..]))?;
-
-    let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x");
-    if topic0 == TRANSFER_EVENT_TOPIC {
-        if data.len() < 66 {
-            return None;
-        }
-
-        let amount = U256::from_str_radix(&data[2..66], 16).ok()?;
+fn parse_receipt_transfer_log(log: &Log) -> Option<ParsedTransferLog> {
+    let address = log.address();
+    if let Ok(transfer) = ITIP20::Transfer::decode_log_data(log.data()) {
         return Some(ParsedTransferLog::Transfer {
             address,
-            amount,
-            from,
-            to,
+            amount: transfer.amount,
+            from: transfer.from,
+            to: transfer.to,
         });
     }
 
-    if topic0 == TRANSFER_WITH_MEMO_EVENT_TOPIC {
-        if topics.len() < 4 || data.len() < 66 {
-            return None;
-        }
-
-        let amount = U256::from_str_radix(&data[2..66], 16).ok()?;
-        let memo = topics[3].parse::<B256>().ok().map(|bytes| bytes.0)?;
-        return Some(ParsedTransferLog::Memo {
-            address,
-            amount,
-            from,
-            memo,
-            to,
-        });
-    }
-
-    None
+    let transfer = ITIP20::TransferWithMemo::decode_log_data(log.data()).ok()?;
+    Some(ParsedTransferLog::Memo {
+        address,
+        amount: transfer.amount,
+        from: transfer.from,
+        memo: transfer.memo.0,
+        to: transfer.to,
+    })
 }
 
 /// Parse receipt logs into transfer effects, one per token transfer.
@@ -163,7 +117,7 @@ fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferL
 /// `TransferWithMemo` for the same transfer. Such adjacent pairs are merged
 /// into one memo effect so a single transfer cannot satisfy two expected
 /// transfers.
-fn receipt_transfer_effects(logs: &[serde_json::Value]) -> Vec<ParsedTransferLog> {
+fn receipt_transfer_effects(logs: &[Log]) -> Vec<ParsedTransferLog> {
     let mut parsed = logs.iter().map(parse_receipt_transfer_log).peekable();
     let mut effects = Vec::new();
 
@@ -185,31 +139,13 @@ fn receipt_transfer_effects(logs: &[serde_json::Value]) -> Vec<ParsedTransferLog
     effects
 }
 
-#[cfg(test)]
-pub(super) fn match_receipt_transfer_logs(
-    logs: &[serde_json::Value],
-    expected_sender: Address,
-    currency: Address,
-    expected: &[Transfer],
-    source: Option<&str>,
-    validate_sender: Option<&ValidateSenderCallback>,
-) -> Result<Vec<MatchedTransferLog>, VerificationError> {
-    match_receipt_transfer_logs_with_settlement(
-        logs,
-        currency,
-        expected,
-        ReceiptSenderPolicy {
-            expected_sender,
-            source,
-            validate_sender,
-            transaction_sender: expected_sender,
-            settlement_senders: &[],
-        },
-    )
-}
-
+/// Verify that all expected transfers are present in the receipt logs.
+///
+/// Uses order-insensitive matching: sorts expected transfers by memo-specificity
+/// (transfers with memos matched first) and uses a `used` set to prevent
+/// double-matching.
 pub(super) fn match_receipt_transfer_logs_with_settlement(
-    logs: &[serde_json::Value],
+    logs: &[Log],
     currency: Address,
     expected: &[Transfer],
     sender_policy: ReceiptSenderPolicy<'_>,
@@ -319,32 +255,3 @@ pub struct SenderValidation<'a> {
 /// return `true` to accept.
 pub type ValidateSenderCallback =
     dyn for<'a> Fn(SenderValidation<'a>) -> bool + Send + Sync + 'static;
-
-impl<P> ChargeMethod<P>
-where
-    P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
-{
-    /// Verify that all expected transfers are present in the receipt logs.
-    ///
-    /// Uses order-insensitive matching: sorts expected transfers by memo-specificity
-    /// (transfers with memos matched first) and uses a `used` set to prevent
-    /// double-matching.
-    pub(super) fn verify_tip20_transfers(
-        &self,
-        receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
-        currency: Address,
-        expected: &[Transfer],
-        sender_policy: ReceiptSenderPolicy<'_>,
-    ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
-        let receipt_json = serde_json::to_value(receipt).map_err(|e| {
-            VerificationError::internal(format!("Failed to serialize receipt: {}", e))
-        })?;
-
-        let logs = receipt_json
-            .get("logs")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| VerificationError::new("Receipt has no logs".to_string()))?;
-
-        match_receipt_transfer_logs_with_settlement(logs, currency, expected, sender_policy)
-    }
-}
