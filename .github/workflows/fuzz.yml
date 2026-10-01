@@ -48,3 +48,6 @@ jobs:
         run: fuzz/run-all.sh 30
         env:
           FUZZ_JOBS: 4
+          # The prebuilt cargo-fuzz is a musl binary and defaults to its own
+          # target, which sanitizers do not support.
+          CARGO_FUZZ_ARGS: --target x86_64-unknown-linux-gnu
