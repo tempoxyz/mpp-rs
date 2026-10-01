@@ -177,6 +177,17 @@ impl FileStore {
             .collect();
         self.dir.join(format!("{}.json", safe_key))
     }
+
+    /// Unique sibling of `path` for staging a write before it is moved into place.
+    fn tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        path.with_extension(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 }
 
 impl Store for FileStore {
@@ -205,11 +216,19 @@ impl Store for FileStore {
         value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         let path = self.key_path(key);
+        let tmp_path = Self::tmp_path(&path);
         Box::pin(async move {
             let serialized = serde_json::to_string_pretty(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            std::fs::write(&path, serialized).map_err(|e| StoreError::Internal(e.to_string()))?;
-            Ok(())
+            // Write the full value to a private temp file, then rename it over the key
+            // path. Readers see either the old or the new value, never a truncated one,
+            // and a failed write leaves the old value in place.
+            let result = std::fs::write(&tmp_path, serialized)
+                .and_then(|()| std::fs::rename(&tmp_path, &path));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            result.map_err(|e| StoreError::Internal(e.to_string()))
         })
     }
 
@@ -232,14 +251,8 @@ impl Store for FileStore {
         key: &str,
         value: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
-        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
         let path = self.key_path(key);
-        let tmp_path = path.with_extension(format!(
-            "{}-{}.tmp",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
+        let tmp_path = Self::tmp_path(&path);
         Box::pin(async move {
             let serialized = serde_json::to_string_pretty(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
@@ -648,6 +661,55 @@ mod tests {
             Some(serde_json::json!("second"))
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_store_put_is_atomic_for_concurrent_readers() {
+        let tmp =
+            std::env::temp_dir().join(format!("mpp_file_store_atomic_put_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = std::sync::Arc::new(FileStore::new(&tmp).unwrap());
+
+        let values = [
+            serde_json::json!("a".repeat(256 * 1024)),
+            serde_json::json!("b".repeat(128 * 1024)),
+        ];
+        store.put("k", values[0].clone()).await.unwrap();
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let store = store.clone();
+            let values = values.clone();
+            let done = done.clone();
+            readers.push(tokio::spawn(async move {
+                while !done.load(Ordering::Relaxed) {
+                    match store.get("k").await {
+                        Ok(Some(value)) if values.contains(&value) => {}
+                        Ok(other) => panic!(
+                            "read a torn value of {} bytes",
+                            other.map_or(0, |v| v.to_string().len())
+                        ),
+                        Err(e) => panic!("read a torn value: {e}"),
+                    }
+                }
+            }));
+        }
+
+        for i in 0..100 {
+            store.put("k", values[i % 2].clone()).await.unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.await.unwrap();
+        }
+
+        let files: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(files, ["k.json"], "temp files must not be left behind");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
