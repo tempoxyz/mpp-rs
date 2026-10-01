@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "tempo")]
+use super::metered::next_item;
+#[cfg(feature = "tempo")]
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 
 // ---------------------------------------------------------------------------
@@ -283,9 +285,8 @@ pub fn serve<G>(
 where
     G: futures_core::Stream<Item = String> + Send + Unpin + 'static,
 {
-    use crate::protocol::methods::tempo::session_method::{
-        deduct_from_channel, normalize_channel_id,
-    };
+    use super::metered::{Metered, MeteredEvent};
+    use crate::protocol::methods::tempo::session_method::normalize_channel_id;
 
     let ServeOptions {
         store,
@@ -299,147 +300,26 @@ where
     let channel_id = normalize_channel_id(&channel_id);
 
     Box::pin(async_stream::stream! {
-        let mut stream = std::pin::pin!(generate);
+        let events = Metered {
+            store: &*store,
+            channel_id: &channel_id,
+            challenge_id: &challenge_id,
+            tick_cost,
+            generate,
+            poll_interval_ms,
+            min_voucher_delta,
+        }
+        .events();
+        let mut events = std::pin::pin!(events);
 
-        // Hold the generator back until the channel can pay for the first value,
-        // so that no work is started for an exhausted, closed or missing channel.
-        let mut need_voucher_sent = false;
-        loop {
-            let Ok(Some(ch)) = store.get_channel(&channel_id).await else {
-                return;
+        while let Some(event) = next_item(&mut events).await {
+            yield match event {
+                MeteredEvent::Message(value) => format_message_event(&value),
+                MeteredEvent::NeedVoucher(event) => format_need_voucher_event(&event),
+                MeteredEvent::Receipt(receipt) => format_receipt_event(&receipt),
             };
-            if ch.finalized || ch.closing {
-                let mut receipt = SessionReceipt::new(
-                    now_iso8601(),
-                    &challenge_id,
-                    &channel_id,
-                    ch.highest_voucher_amount.to_string(),
-                    ch.spent.to_string(),
-                );
-                receipt.units = Some(ch.units);
-                yield format_receipt_event(&receipt);
-                return;
-            }
-            if ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost {
-                break;
-            }
-            if !need_voucher_sent {
-                need_voucher_sent = true;
-                let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
-                let event = format_need_voucher_event(&NeedVoucherEvent {
-                    channel_id: channel_id.clone(),
-                    required_cumulative: required.to_string(),
-                    accepted_cumulative: ch.highest_voucher_amount.to_string(),
-                    deposit: ch.deposit.to_string(),
-                });
-                yield event;
-            }
-            tokio::select! {
-                _ = store.wait_for_update(&channel_id) => {},
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
-            }
-        }
-
-        while let Some(value) = next_item(&mut stream).await {
-            // Try to charge, waiting for top-up if insufficient
-            let mut need_voucher_sent = false;
-            loop {
-                match deduct_from_channel(&*store, &channel_id, tick_cost).await {
-                    Ok(_state) => break,
-                    Err(e) if e.code == Some(crate::protocol::traits::ErrorCode::InsufficientBalance) => {
-                        // Ask once per exhaustion: clients answer every need-voucher
-                        // event, so a repeat makes them sign a duplicate voucher.
-                        if !need_voucher_sent {
-                            if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-                                need_voucher_sent = true;
-                                let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
-                                let event = format_need_voucher_event(&NeedVoucherEvent {
-                                    channel_id: channel_id.clone(),
-                                    required_cumulative: required.to_string(),
-                                    accepted_cumulative: ch.highest_voucher_amount.to_string(),
-                                    deposit: ch.deposit.to_string(),
-                                });
-                                yield event;
-                            }
-                        }
-
-                        // Wait for channel update or poll interval
-                        tokio::select! {
-                            _ = store.wait_for_update(&channel_id) => {},
-                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
-                        }
-                    }
-                    Err(_) => {
-                        // Closed, missing, or unreadable channel — no voucher can fix
-                        // that, so emit the final receipt and stop.
-                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-                            let mut receipt = SessionReceipt::new(
-                                now_iso8601(),
-                                &challenge_id,
-                                &channel_id,
-                                ch.highest_voucher_amount.to_string(),
-                                ch.spent.to_string(),
-                            );
-                            receipt.units = Some(ch.units);
-                            yield format_receipt_event(&receipt);
-                        }
-                        return;
-                    }
-                }
-            }
-
-            let event = format_message_event(&value);
-            yield event;
-        }
-
-        // Emit final receipt
-        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-            let mut receipt = SessionReceipt::new(
-                now_iso8601(),
-                &challenge_id,
-                &channel_id,
-                ch.highest_voucher_amount.to_string(),
-                ch.spent.to_string(),
-            );
-            receipt.units = Some(ch.units);
-            let event = format_receipt_event(&receipt);
-            yield event;
         }
     })
-}
-
-/// Cumulative amount a need-voucher event asks for: enough to pay for the
-/// next tick, and at least `min_voucher_delta` above the accepted amount.
-#[cfg(feature = "tempo")]
-pub(crate) fn required_cumulative(
-    channel: &crate::protocol::methods::tempo::session_method::ChannelState,
-    tick_cost: u128,
-    min_voucher_delta: u128,
-) -> u128 {
-    let next_tick = channel.spent.saturating_add(tick_cost);
-    let min_accepted = channel
-        .highest_voucher_amount
-        .saturating_add(min_voucher_delta);
-    next_tick.max(min_accepted)
-}
-
-/// Poll the next item from a stream (avoids depending on StreamExt).
-#[cfg(feature = "tempo")]
-async fn next_item<S: futures_core::Stream + Unpin>(stream: &mut S) -> Option<S::Item> {
-    use std::future::poll_fn;
-    use std::pin::Pin;
-
-    poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
-}
-
-#[cfg(feature = "tempo")]
-fn now_iso8601() -> String {
-    use time::format_description::well_known::Iso8601;
-    use time::OffsetDateTime;
-
-    OffsetDateTime::now_utc()
-        .format(&Iso8601::DEFAULT)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1280,62 @@ mod tests {
             Some(SseEvent::PaymentReceipt(receipt)) if receipt.spent == "100"
         ));
         assert_eq!(next_item(&mut stream).await, None);
+    }
+
+    /// Two streams on one channel race for the same balance: the deduction
+    /// is atomic, so only one of them delivers and the other asks for a
+    /// voucher.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_two_streams_share_one_balance() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+        use tokio::time::{timeout, Duration};
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_shared";
+        // Enough for one tick.
+        store.insert(channel_id, test_channel_state(channel_id, 100, 5000));
+
+        let mut senders = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+            senders.push(tx);
+            streams.push(serve(ServeOptions {
+                store: store.clone(),
+                channel_id: channel_id.to_string(),
+                challenge_id: "ch-shared".to_string(),
+                tick_cost: 100,
+                generate: Box::pin(async_stream::stream! {
+                    while let Some(value) = rx.recv().await {
+                        yield value;
+                    }
+                }),
+                poll_interval_ms: 10,
+                min_voucher_delta: 0,
+            }));
+        }
+
+        // Both streams see the balance and wait for their generator.
+        for stream in &mut streams {
+            let waiting = timeout(Duration::from_millis(50), next_item(stream)).await;
+            assert!(waiting.is_err(), "unexpected event: {waiting:?}");
+        }
+        for tx in &senders {
+            tx.send("a".to_string()).await.unwrap();
+        }
+
+        let mut events = Vec::new();
+        for stream in &mut streams {
+            events.push(parse_event(&next_item(stream).await.unwrap()));
+        }
+        assert_eq!(events[0], Some(SseEvent::Message("a".into())));
+        assert!(
+            matches!(events[1], Some(SseEvent::PaymentNeedVoucher(_))),
+            "unexpected event: {:?}",
+            events[1]
+        );
+        assert_eq!(store.get_channel_sync(channel_id).unwrap().spent, 100);
     }
 
     #[test]

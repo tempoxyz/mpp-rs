@@ -11,16 +11,27 @@ pub(super) fn session_receipt(
     state: &ChannelState,
     tx_hash: Option<String>,
 ) -> Receipt {
+    let mut receipt = channel_receipt(challenge_id, &state.channel_id, state);
+    receipt.tx_hash = tx_hash;
+    receipt.to_base_receipt()
+}
+
+/// Build the session receipt that reports `state`, the current state of the
+/// channel `channel_id`.
+pub(crate) fn channel_receipt(
+    challenge_id: &str,
+    channel_id: &str,
+    state: &ChannelState,
+) -> SessionReceipt {
     let mut receipt = SessionReceipt::new(
         now_iso8601(),
         challenge_id,
-        &state.channel_id,
+        channel_id,
         state.highest_voucher_amount.to_string(),
         state.spent.to_string(),
     );
     receipt.units = Some(state.units);
-    receipt.tx_hash = tx_hash;
-    receipt.to_base_receipt()
+    receipt
 }
 
 pub(super) fn now_iso8601() -> String {
