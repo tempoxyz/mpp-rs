@@ -423,6 +423,15 @@ where
                 return Ok(resp);
             }
 
+            // The server no longer has the session channel. Let the provider
+            // forget it so the next request can open a fresh one.
+            if status == StatusCode::GONE && challenge.intent.as_str() == "session" {
+                pending_payments.invalidate().await.map_err(|error| {
+                    reqwest_middleware::Error::Middleware(anyhow::anyhow!(error))
+                })?;
+                return Ok(resp);
+            }
+
             // A completed HTTP response is the application's answer, not a
             // payment flow error. Match MPPx by returning non-402 responses
             // and the final 402 without emitting `payment.failed`.
@@ -876,6 +885,88 @@ mod tests {
                 .collect::<Vec<_>>();
             expected.sort();
             assert_eq!(actual, expected);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_gone_session_invalidates_payment() {
+            #[derive(Clone, Default)]
+            struct SessionProvider {
+                invalidated: Arc<AtomicU32>,
+                rolled_back: Arc<AtomicU32>,
+            }
+
+            impl PaymentProvider for SessionProvider {
+                fn supports(&self, _method: &str, _intent: &str) -> bool {
+                    true
+                }
+
+                async fn pay(
+                    &self,
+                    challenge: &PaymentChallenge,
+                ) -> Result<PaymentCredential, MppError> {
+                    Ok(PaymentCredential::new(
+                        challenge.to_echo(),
+                        PaymentPayload::hash("0xvoucher"),
+                    ))
+                }
+
+                async fn rollback_payment(
+                    &self,
+                    _: &PaymentChallenge,
+                    _: &PaymentCredential,
+                ) -> Result<(), MppError> {
+                    self.rolled_back.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+
+                async fn invalidate_payment(
+                    &self,
+                    _: &PaymentChallenge,
+                    _: &PaymentCredential,
+                ) -> Result<(), MppError> {
+                    self.invalidated.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+
+            let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "500"})).unwrap();
+            let challenge = PaymentChallenge::new(
+                "mw-session",
+                "middleware.example.com",
+                "tempo",
+                "session",
+                request,
+            );
+            let www_auth = format_www_authenticate(&challenge).unwrap();
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().contains_key("authorization") {
+                            AxumStatusCode::GONE.into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = SessionProvider::default();
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()))
+                .build();
+
+            let resp = client.get(format!("{base_url}/paid")).send().await.unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::GONE);
+            assert_eq!(provider.invalidated.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.rolled_back.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]

@@ -53,7 +53,11 @@ type Payment = Mpp<MockMethod>;
 
 #[tokio::main]
 async fn main() {
-    let mpp = Mpp::new(MockMethod, "ws-example.local", "ws-example-secret");
+    let mpp = Mpp::new(
+        MockMethod,
+        "ws-example.local",
+        "mpp-rs-demo-ws-example-secret-key",
+    );
 
     let mpp = Arc::new(mpp);
 

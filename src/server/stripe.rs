@@ -57,6 +57,9 @@ impl StripeBuilder {
     }
 
     /// Override the HMAC secret key (default: reads `MPP_SECRET_KEY` env var).
+    ///
+    /// Must be at least 32 bytes; [`Mpp::create_stripe()`](super::Mpp::create_stripe)
+    /// rejects shorter keys.
     pub fn secret_key(mut self, key: &str) -> Self {
         self.hmac_secret_key = Some(key.to_string());
         self
@@ -93,7 +96,7 @@ impl StripeBuilder {
 ///         currency: "usd",
 ///         decimals: 2,
 ///     })
-///     .secret_key("my-hmac-secret"),
+///     .secret_key("my-hmac-secret-of-at-least-32-bytes"),
 /// )?;
 /// ```
 pub fn stripe(config: StripeConfig<'_>) -> StripeBuilder {

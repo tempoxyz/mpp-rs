@@ -40,6 +40,9 @@ const DEV_PRIVATE_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efca
 /// PathUSD token address.
 const PATH_USD: Address = address!("0x20c0000000000000000000000000000000000000");
 
+/// HMAC secret for test servers (the SDK requires at least 32 bytes).
+const TEST_SECRET: &str = "test-secret-key-at-least-32-bytes";
+
 /// Default localnet RPC URL (overridable via `TEMPO_RPC_URL` env var).
 const DEFAULT_RPC_URL: &str = "http://localhost:8545";
 
@@ -305,7 +308,7 @@ async fn test_health_no_payment() {
             recipient: &format!("{}", server_signer.address()),
         })
         .rpc_url(&rpc)
-        .secret_key("integration-test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -338,7 +341,7 @@ async fn test_402_challenge_flow() {
             recipient: &format!("{}", server_signer.address()),
         })
         .rpc_url(&rpc)
-        .secret_key("integration-test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -397,7 +400,7 @@ async fn test_e2e_charge_round_trip() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("e2e-test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -451,7 +454,7 @@ async fn test_zero_amount_identity_flow_uses_proof_credential() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("identity-test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -533,7 +536,7 @@ async fn test_e2e_premium_charge() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("premium-test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -579,7 +582,7 @@ async fn test_wrong_auth_scheme_returns_402() {
             recipient: &format!("{}", server_signer.address()),
         })
         .rpc_url(&rpc)
-        .secret_key("wrong-scheme-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -612,7 +615,7 @@ async fn test_malformed_credential_returns_402() {
             recipient: &format!("{}", server_signer.address()),
         })
         .rpc_url(&rpc)
-        .secret_key("malformed-cred-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -653,7 +656,7 @@ async fn test_wrong_recipient_transfer_rejected() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("wrong-recipient-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -740,7 +743,7 @@ async fn test_multiple_sequential_payments() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("multi-pay-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -832,7 +835,7 @@ async fn test_client_balance_decreases_after_payment() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("balance-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -899,7 +902,7 @@ async fn test_e2e_charge_without_fee_payer() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("no-fee-payer-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -977,7 +980,7 @@ async fn test_e2e_charge_with_fee_payer() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("fee-payer-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1062,7 +1065,7 @@ async fn test_fee_payer_requested_but_no_signer_returns_402() {
         .rpc_url(&rpc)
         .chain_id(chain_id)
         .fee_payer(true)
-        .secret_key("no-signer-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1113,7 +1116,7 @@ async fn test_fee_payer_wrong_recipient_rejected() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer.clone())
-        .secret_key("wrong-recipient-fp-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1241,7 +1244,7 @@ async fn test_fee_payer_balance_accounting() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer.clone())
-        .secret_key("balance-accounting-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1345,7 +1348,7 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("no-fp-no-buffer"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1402,7 +1405,7 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("fp-no-buffer"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1475,7 +1478,7 @@ async fn test_keychain_source_did_consistent_across_proof_and_paid() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("keychain-did-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1583,7 +1586,7 @@ async fn test_e2e_fee_payer_premium_charge() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("fee-payer-premium-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1639,7 +1642,7 @@ async fn test_tx_hash_replay_rejected() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
-        .secret_key("replay-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1722,7 +1725,7 @@ async fn test_hash_credential_with_extra_transfer_rejected() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("extra-transfer-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1814,7 +1817,7 @@ async fn test_proof_credential_replay_rejected() {
         })
         .rpc_url(&rpc)
         .chain_id(chain_id)
-        .secret_key("proof-replay-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -2013,7 +2016,7 @@ async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(sponsor_signer)
-        .secret_key("keychain-sim-test"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -2097,7 +2100,7 @@ async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
         .chain_id(chain_id)
         .fee_payer(sponsored)
         .fee_payer_signer(merchant.clone())
-        .secret_key("prebroadcast-regression"),
+        .secret_key(TEST_SECRET),
     )
     .unwrap();
     let challenge = mpp.charge("1").unwrap().remove(0);
