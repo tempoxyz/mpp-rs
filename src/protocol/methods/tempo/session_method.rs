@@ -651,6 +651,7 @@ where
         details: &TempoSessionMethodDetails,
         expected_payee: Address,
         expected_token: Address,
+        amount: u128,
     ) -> Result<Receipt, VerificationError> {
         let (
             channel_id_str,
@@ -748,6 +749,11 @@ where
                 "voucher amount exceeds open deposit",
             ));
         }
+        if open_deposit < amount {
+            return Err(VerificationError::insufficient_balance(
+                "open deposit is less than the session amount",
+            ));
+        }
         let sig_bytes = Self::parse_signature(signature_str)?;
         if !verify_voucher(
             escrow,
@@ -808,6 +814,11 @@ where
         if on_chain.close_requested_at != 0 {
             return Err(VerificationError::channel_closed(
                 "channel has a pending close request",
+            ));
+        }
+        if on_chain.deposit.saturating_sub(on_chain.settled) < amount {
+            return Err(VerificationError::insufficient_balance(
+                "channel available balance is less than the session amount",
             ));
         }
 
@@ -1719,12 +1730,19 @@ where
 
             match &payload {
                 SessionCredentialPayload::Open { .. } => {
+                    let amount = request.parse_amount().map_err(|_| {
+                        VerificationError::invalid_challenge(format!(
+                            "invalid session amount: {}",
+                            request.amount
+                        ))
+                    })?;
                     this.handle_open(
                         &credential,
                         &payload,
                         &details,
                         expected_payee,
                         expected_token,
+                        amount,
                     )
                     .await
                 }
@@ -3924,10 +3942,13 @@ mod tests {
         let wrong_signer = open_credential(&payer, payer.address(), 10_000, &stranger, 1_000).await;
         let exceeds_deposit =
             open_credential(&payer, payer.address(), 10_000, &payer, 10_001).await;
+        // The session charges 1_000 per unit, which a deposit of 999 cannot pay.
+        let below_amount = open_credential(&payer, payer.address(), 999, &payer, 0).await;
 
         for ((channel_id, request, credential), expected) in [
             (wrong_signer, ErrorCode::InvalidSignature),
             (exceeds_deposit, ErrorCode::AmountExceedsDeposit),
+            (below_amount, ErrorCode::InsufficientBalance),
         ] {
             let store = Arc::new(InMemoryChannelStore::new());
             let asserter = alloy::providers::mock::Asserter::new();
