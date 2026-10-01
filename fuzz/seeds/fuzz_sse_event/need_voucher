@@ -1,0 +1,3 @@
+event: payment-need-voucher
+data: {"channelId":"0xabc","requiredCumulative":"2000","acceptedCumulative":"1000","deposit":"5000"}
+
