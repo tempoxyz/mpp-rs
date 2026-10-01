@@ -83,6 +83,9 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
 }
 
 /// Escape a string for use in a quoted-string header value.
+///
+/// Only printable ASCII and HTAB are emitted as-is. Everything else is written
+/// as `\uXXXX` UTF-16 code units, so the result is always a valid header value.
 /// Rejects CRLF to prevent header injection attacks.
 fn escape_quoted_value(s: &str) -> Result<String> {
     if s.contains('\r') || s.contains('\n') {
@@ -95,11 +98,13 @@ fn escape_quoted_value(s: &str) -> Result<String> {
         match unit {
             0x005c => escaped.push_str("\\\\"),
             0x0022 => escaped.push_str("\\\""),
-            0x0100.. => {
+            0x0009 | 0x0020..=0x007e => {
+                escaped.push(char::from_u32(u32::from(unit)).expect("ASCII is valid Unicode"))
+            }
+            _ => {
                 use std::fmt::Write as _;
                 write!(escaped, "\\u{unit:04x}").expect("writing to String cannot fail");
             }
-            _ => escaped.push(char::from_u32(u32::from(unit)).expect("Latin-1 is valid Unicode")),
         }
     }
     Ok(escaped)
@@ -316,6 +321,16 @@ fn is_valid_method_name(value: &str) -> bool {
         })
 }
 
+/// Validate that a `request` parameter is base64url-encoded JSON.
+fn validate_request(request_b64: &str) -> Result<()> {
+    let request_bytes = base64url_decode(request_b64)?;
+    // Validate that the decoded bytes are valid JSON (matches TS SDK behavior)
+    let _ = serde_json::from_slice::<serde_json::Value>(&request_bytes).map_err(|e| {
+        MppError::invalid_challenge_reason(format!("Invalid JSON in request field: {}", e))
+    })?;
+    Ok(())
+}
+
 /// Parse a single WWW-Authenticate header into a PaymentChallenge.
 ///
 /// Format: `Payment id="<id>", realm="<realm>", method="<method>", intent="<intent>", request="<base64url-json>"`
@@ -363,11 +378,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     let intent = IntentName::new(require_param!(params, "intent"));
     let request_b64 = require_param!(params, "request").clone();
 
-    let request_bytes = base64url_decode(&request_b64)?;
-    // Validate that the decoded bytes are valid JSON (matches TS SDK behavior)
-    let _ = serde_json::from_slice::<serde_json::Value>(&request_bytes).map_err(|e| {
-        MppError::invalid_challenge_reason(format!("Invalid JSON in request field: {}", e))
-    })?;
+    validate_request(&request_b64)?;
     let request = Base64UrlJson::from_raw(request_b64);
 
     let digest = params.get("digest").cloned();
@@ -526,7 +537,26 @@ fn split_payment_challenges(header: &str) -> Vec<&str> {
 /// let header = format_www_authenticate(&challenge).unwrap();
 /// assert!(header.starts_with("Payment id=\"abc123\""));
 /// ```
+///
+/// # Errors
+///
+/// Returns an error for challenges that [`parse_www_authenticate`] would
+/// reject: an empty `id`, an invalid method name, or a `request` that is not
+/// base64url-encoded JSON. Quoted values containing CR or LF are rejected too.
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
+    if challenge.id.is_empty() {
+        return Err(MppError::invalid_challenge_reason(
+            "Empty 'id' parameter".to_string(),
+        ));
+    }
+    if !is_valid_method_name(challenge.method.as_str()) {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid method: \"{}\". Must match method-name ABNF.",
+            challenge.method
+        )));
+    }
+    validate_request(challenge.request.raw())?;
+
     // Escape all quoted values to prevent header injection
     let mut parts = vec![
         format!("id=\"{}\"", escape_quoted_value(&challenge.id)?),
@@ -1276,6 +1306,64 @@ mod tests {
         assert_eq!(parsed.realm, challenge.realm);
         assert_eq!(parsed.method, challenge.method);
         assert_eq!(parsed.intent, challenge.intent);
+    }
+
+    #[test]
+    fn test_format_www_authenticate_emits_valid_header_values() {
+        for text in [
+            "caf\u{e9} \u{a3}5",
+            "bell\u{7}",
+            "\u{0}\u{1}\u{1f}\u{7f}\u{80}\u{ff}",
+            "tab\there",
+            "1 \u{d7} Classmatic \u{2014} General Admission \u{1f39f}\u{fe0f}",
+        ] {
+            let mut challenge = test_challenge();
+            challenge.realm = text.to_string();
+            challenge.description = Some(text.to_string());
+
+            let header = format_www_authenticate(&challenge).unwrap();
+            assert!(
+                header
+                    .bytes()
+                    .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte)),
+                "{header:?}"
+            );
+            let value = axum::http::HeaderValue::from_str(&header).unwrap();
+            let parsed = parse_www_authenticate(value.to_str().unwrap()).unwrap();
+            assert_eq!(parsed.realm, text);
+            assert_eq!(parsed.description.as_deref(), Some(text));
+        }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_line_breaks() {
+        for text in ["Line one\r\nLine two", "Line one\nLine two", "Line one\r"] {
+            let mut challenge = test_challenge();
+            challenge.description = Some(text.to_string());
+            assert!(format_www_authenticate(&challenge).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_unparseable_challenges() {
+        let mut empty_id = test_challenge();
+        empty_id.id = String::new();
+
+        let mut invalid_method = test_challenge();
+        invalid_method.method = "a b".into();
+
+        let mut invalid_base64 = test_challenge();
+        invalid_base64.request = Base64UrlJson::from_raw("not-valid!!!");
+
+        let mut invalid_json = test_challenge();
+        invalid_json.request = Base64UrlJson::from_raw("bm90IGpzb24");
+
+        for challenge in [empty_id, invalid_method, invalid_base64, invalid_json] {
+            assert!(
+                format_www_authenticate(&challenge).is_err(),
+                "{challenge:?}"
+            );
+        }
     }
 
     #[test]
