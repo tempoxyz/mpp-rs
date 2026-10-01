@@ -27,7 +27,8 @@ use crate::protocol::methods::tempo::precompile_voucher::{
     PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::{
-    ChannelDescriptor, SessionCredentialPayload, TempoSessionExt,
+    ChannelDescriptor, SessionCredentialPayload, TempoSessionExt, SESSION_PROTOCOL_LEGACY,
+    SESSION_PROTOCOL_TIP1034,
 };
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
 use crate::protocol::methods::tempo::CHAIN_ID;
@@ -81,40 +82,92 @@ pub fn resolve_chain_id(challenge: &PaymentChallenge) -> u64 {
     session.ok().and_then(|r| r.chain_id()).unwrap_or(CHAIN_ID)
 }
 
-/// Resolve escrow contract address from an override, challenge hints, or defaults.
+/// Resolve the escrow contract for a session challenge.
+///
+/// Only the canonical escrow is accepted: the TIP-20 channel precompile for
+/// `sessionProtocol: "v2"`, the chain's [`default_escrow_contract`] for legacy
+/// sessions, or `escrow_override` when set. A challenge that advertises any
+/// other escrow is rejected. Use [`resolve_escrow_with_policy`] to opt into
+/// server-chosen escrows.
 pub fn resolve_escrow(
     challenge: &PaymentChallenge,
     chain_id: u64,
     escrow_override: Option<Address>,
 ) -> Result<Address, MppError> {
-    // Match MPPx: an explicit client override wins over server hints.
-    if let Some(addr) = escrow_override {
-        return Ok(addr);
-    }
+    resolve_escrow_with_policy(challenge, chain_id, escrow_override, false)
+}
 
-    if let Ok(req) = challenge.request.decode::<SessionRequest>() {
-        if let Some(details) = req.method_details.as_ref() {
-            for key in ["escrowContract", "escrow"] {
-                if let Some(addr) = details
+/// Resolve the server-advertised escrow against the client's trust policy.
+///
+/// Like [`resolve_escrow`], but with `allow_custom_escrow` a non-canonical
+/// escrow advertised by a legacy challenge is accepted. `escrow_override` is
+/// an exact pin and takes precedence over `allow_custom_escrow`.
+///
+/// Opening a legacy channel approves the deposit to the escrow, so a custom
+/// escrow must only be allowed for servers the caller trusts.
+pub fn resolve_escrow_with_policy(
+    challenge: &PaymentChallenge,
+    chain_id: u64,
+    escrow_override: Option<Address>,
+    allow_custom_escrow: bool,
+) -> Result<Address, MppError> {
+    let request = challenge.request.decode::<SessionRequest>().ok();
+    let advertised = request
+        .as_ref()
+        .and_then(|req| req.method_details.as_ref())
+        .and_then(|details| {
+            ["escrowContract", "escrow"].into_iter().find_map(|key| {
+                details
                     .get(key)
                     .and_then(serde_json::Value::as_str)
                     .and_then(|value| value.parse::<Address>().ok())
-                {
-                    return Ok(addr);
-                }
-            }
+            })
+        });
+    let protocol = request.as_ref().and_then(|req| req.session_protocol());
+    let tip1034 = match protocol.as_deref() {
+        Some(SESSION_PROTOCOL_TIP1034) => true,
+        Some(SESSION_PROTOCOL_LEGACY) => false,
+        Some(other) => {
+            return Err(MppError::InvalidConfig(format!(
+                "unsupported Tempo session protocol {other:?}"
+            )))
         }
-        if req.is_tip1034_session() {
-            return Ok(TIP20_CHANNEL_RESERVE_ADDRESS);
+        // Without a marker the precompile is selected by advertising its address.
+        None => advertised == Some(TIP20_CHANNEL_RESERVE_ADDRESS),
+    };
+
+    let trusted = escrow_override.or_else(|| {
+        if tip1034 {
+            Some(TIP20_CHANNEL_RESERVE_ADDRESS)
+        } else {
+            default_escrow_contract(chain_id)
         }
+    });
+    let escrow = match (advertised, trusted) {
+        (Some(advertised), Some(trusted)) if advertised == trusted => trusted,
+        (Some(advertised), _) if allow_custom_escrow && escrow_override.is_none() => advertised,
+        (Some(advertised), Some(trusted)) => {
+            return Err(MppError::InvalidConfig(format!(
+                "Tempo session escrow {advertised} does not match client escrow {trusted}"
+            )))
+        }
+        (None, Some(trusted)) => trusted,
+        (_, None) => {
+            return Err(MppError::InvalidConfig(
+                "No trusted escrowContract available. Provide it in parameters or use a supported chain.".to_string(),
+            ))
+        }
+    };
+
+    // The rest of the client picks the protocol from the escrow address, so an
+    // explicit marker must agree with it.
+    if let Some(protocol) = protocol.filter(|_| tip1034 != is_precompile_escrow(escrow)) {
+        return Err(MppError::InvalidConfig(format!(
+            "Tempo session escrow {escrow} cannot be used with sessionProtocol {protocol}"
+        )));
     }
 
-    // Legacy sessions retain their chain-specific escrow fallback.
-    default_escrow_contract(chain_id).ok_or_else(|| {
-        MppError::InvalidConfig(
-            "No escrowContract available. Provide it in parameters or ensure the server challenge includes it.".to_string(),
-        )
-    })
+    Ok(escrow)
 }
 
 /// Build a `PaymentCredential` from a challenge and session payload.
@@ -1632,7 +1685,8 @@ mod tests {
             header: None,
         };
 
-        let result = resolve_escrow(&challenge, 42431, None).unwrap();
+        assert!(resolve_escrow(&challenge, 42431, None).is_err());
+        let result = resolve_escrow_with_policy(&challenge, 42431, None, true).unwrap();
         assert_eq!(result, escrow_addr.parse::<Address>().unwrap());
     }
 
@@ -1688,7 +1742,178 @@ mod tests {
             header: None,
         };
 
-        assert_eq!(resolve_escrow(&challenge, 4217, None).unwrap(), hinted);
+        assert_eq!(
+            resolve_escrow_with_policy(&challenge, 4217, None, true).unwrap(),
+            hinted
+        );
+    }
+
+    fn escrow_challenge(method_details: serde_json::Value) -> PaymentChallenge {
+        use crate::protocol::core::Base64UrlJson;
+
+        PaymentChallenge::new(
+            "test",
+            "test",
+            "tempo",
+            "session",
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": Address::repeat_byte(0x44).to_string(),
+                "methodDetails": method_details
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_resolve_escrow_rejects_untrusted_challenge_escrow() {
+        let attacker = Address::repeat_byte(0x66).to_string();
+        let pinned = Address::repeat_byte(0x77);
+        let legacy = default_escrow_contract(4217).unwrap();
+        let precompile = TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        // (methodDetails, chain id, escrow override, allow custom escrow)
+        let rejected = [
+            (
+                serde_json::json!({ "escrowContract": attacker }),
+                4217,
+                None,
+                false,
+            ),
+            (serde_json::json!({ "escrow": attacker }), 4217, None, false),
+            (
+                serde_json::json!({ "escrowContract": attacker, "sessionProtocol": "v1" }),
+                4217,
+                None,
+                false,
+            ),
+            // No canonical legacy escrow is known for this chain.
+            (
+                serde_json::json!({ "escrowContract": attacker }),
+                9999,
+                None,
+                false,
+            ),
+            // The override is an exact pin.
+            (
+                serde_json::json!({ "escrowContract": attacker }),
+                4217,
+                Some(pinned),
+                true,
+            ),
+            (
+                serde_json::json!({ "escrowContract": legacy.to_string() }),
+                4217,
+                Some(pinned),
+                false,
+            ),
+            // v2 is only ever answered on the precompile, v1 never.
+            (
+                serde_json::json!({ "escrowContract": attacker, "sessionProtocol": "v2" }),
+                4217,
+                None,
+                false,
+            ),
+            (
+                serde_json::json!({ "escrowContract": attacker, "sessionProtocol": "v2" }),
+                4217,
+                None,
+                true,
+            ),
+            (
+                serde_json::json!({ "escrowContract": pinned.to_string(), "sessionProtocol": "v2" }),
+                4217,
+                Some(pinned),
+                false,
+            ),
+            (
+                serde_json::json!({ "escrowContract": precompile.to_string(), "sessionProtocol": "v1" }),
+                4217,
+                None,
+                true,
+            ),
+            (
+                serde_json::json!({ "escrowContract": precompile.to_string(), "sessionProtocol": "v3" }),
+                4217,
+                None,
+                true,
+            ),
+        ];
+        for (method_details, chain_id, escrow_override, allow_custom_escrow) in rejected {
+            let challenge = escrow_challenge(method_details.clone());
+            assert!(
+                resolve_escrow_with_policy(
+                    &challenge,
+                    chain_id,
+                    escrow_override,
+                    allow_custom_escrow
+                )
+                .is_err(),
+                "{method_details} on chain {chain_id} with override {escrow_override:?}, \
+                 allow_custom_escrow={allow_custom_escrow}"
+            );
+        }
+
+        // (methodDetails, chain id, escrow override, allow custom escrow, expected)
+        let accepted = [
+            (
+                serde_json::json!({ "escrowContract": legacy.to_string().to_lowercase() }),
+                4217,
+                None,
+                false,
+                legacy,
+            ),
+            (
+                serde_json::json!({ "escrowContract": legacy.to_string(), "sessionProtocol": "v1" }),
+                4217,
+                None,
+                false,
+                legacy,
+            ),
+            (
+                serde_json::json!({ "escrowContract": precompile.to_string() }),
+                4217,
+                None,
+                false,
+                precompile,
+            ),
+            (
+                serde_json::json!({ "escrowContract": precompile.to_string(), "sessionProtocol": "v2" }),
+                4217,
+                None,
+                false,
+                precompile,
+            ),
+            (
+                serde_json::json!({ "escrowContract": pinned.to_string() }),
+                4217,
+                Some(pinned),
+                false,
+                pinned,
+            ),
+            (
+                serde_json::json!({ "escrowContract": pinned.to_string() }),
+                9999,
+                None,
+                true,
+                pinned,
+            ),
+        ];
+        for (method_details, chain_id, escrow_override, allow_custom_escrow, expected) in accepted {
+            let challenge = escrow_challenge(method_details.clone());
+            assert_eq!(
+                resolve_escrow_with_policy(
+                    &challenge,
+                    chain_id,
+                    escrow_override,
+                    allow_custom_escrow
+                )
+                .unwrap(),
+                expected,
+                "{method_details} on chain {chain_id} with override {escrow_override:?}, \
+                 allow_custom_escrow={allow_custom_escrow}"
+            );
+        }
     }
 
     #[test]
@@ -2146,10 +2371,11 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_escrow_override_priority_order() {
+    fn test_resolve_escrow_override_rejects_mismatched_challenge() {
         use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
 
-        // Match MPPx: an explicit caller override wins over a challenge hint.
+        // Match MPPx: an explicit caller override is an exact pin, also when
+        // custom escrows are allowed.
         let escrow_addr = "0x2222222222222222222222222222222222222222";
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
             .parse()
@@ -2175,11 +2401,15 @@ mod tests {
             header: None,
         };
 
-        let result = resolve_escrow(&challenge, 42431, Some(override_addr)).unwrap();
-        assert_eq!(
-            result, override_addr,
-            "override should take priority over challenge escrow"
-        );
+        for allow_custom_escrow in [false, true] {
+            assert!(resolve_escrow_with_policy(
+                &challenge,
+                42431,
+                Some(override_addr),
+                allow_custom_escrow
+            )
+            .is_err());
+        }
     }
 
     /// `try_recover_channel` must reject a channel whose on-chain payer,
