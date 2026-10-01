@@ -1,13 +1,31 @@
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use alloy::primitives::hex;
+use alloy::consensus::transaction::SignerRecoverable;
+use alloy::eips::Decodable2718;
+use alloy::primitives::{hex, keccak256, Bytes, TxKind, B256, U256};
+use alloy::sol_types::SolCall;
+use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
 
 use super::{
-    super::{DEFAULT_CURRENCY_TESTNET, MODERATO_CHAIN_ID, OUSD, USDC},
+    super::{
+        network::TempoNetwork as KnownTempoNetwork, DEFAULT_CURRENCY_TESTNET, MODERATO_CHAIN_ID,
+        OUSD, PATH_USD, USDC,
+    },
+    calls::{TRANSFER_SELECTOR, TRANSFER_WITH_MEMO_SELECTOR},
+    fee_payer::MAX_FEE_PAYER_GAS_LIMIT,
+    hash_credential::parse_hash_credential_source,
+    memo::assert_challenge_bound_memo,
+    receipt_logs::{
+        match_receipt_transfer_logs, match_receipt_transfer_logs_with_settlement,
+        MatchedTransferLog, ReceiptSenderPolicy, TRANSFER_EVENT_TOPIC,
+        TRANSFER_WITH_MEMO_EVENT_TOPIC,
+    },
+    transaction_credential::TransactionValidationOptions,
     *,
 };
 use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+use crate::tempo::attribution;
 
 mod fee_payer;
 mod hash_credential;
