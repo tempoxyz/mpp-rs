@@ -152,19 +152,28 @@ impl Transport for HttpTransport {
 
     fn respond_challenge(&self, ctx: ChallengeContext<'_, Self::Input>) -> Self::ChallengeOutput {
         let www_auth = crate::protocol::core::format_www_authenticate(ctx.challenge)
-            .unwrap_or_else(|_| "Payment".to_string());
+            .ok()
+            .and_then(|value| http_types::HeaderValue::from_str(&value).ok());
 
-        let body = match ctx.error {
-            Some(msg) => serde_json::json!({ "error": msg }).to_string(),
-            None => serde_json::json!({ "error": "Payment Required" }).to_string(),
+        let (status, error) = match (&www_auth, ctx.error) {
+            (None, _) => (
+                http_types::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to format challenge",
+            ),
+            (Some(_), Some(msg)) => (http_types::StatusCode::PAYMENT_REQUIRED, msg),
+            (Some(_), None) => (http_types::StatusCode::PAYMENT_REQUIRED, "Payment Required"),
         };
 
-        let mut resp = http_types::Response::builder()
-            .status(http_types::StatusCode::PAYMENT_REQUIRED)
-            .header(http_types::header::WWW_AUTHENTICATE, &www_auth)
-            .header(http_types::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .expect("response builder cannot fail");
+        let mut resp = http_types::Response::new(serde_json::json!({ "error": error }).to_string());
+        *resp.status_mut() = status;
+        if let Some(www_auth) = www_auth {
+            resp.headers_mut()
+                .insert(http_types::header::WWW_AUTHENTICATE, www_auth);
+        }
+        resp.headers_mut().insert(
+            http_types::header::CONTENT_TYPE,
+            http_types::HeaderValue::from_static("application/json"),
+        );
 
         // Add Cache-Control: no-store to prevent caching of challenges
         resp.headers_mut().insert(
@@ -337,6 +346,69 @@ mod tests {
             .get(http_types::header::WWW_AUTHENTICATE)
             .is_some());
         assert!(resp.body().contains("Payment Required"));
+    }
+
+    #[test]
+    fn test_http_respond_challenge_with_control_character() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        )
+        .with_description("bell\u{7}");
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: None,
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::PAYMENT_REQUIRED);
+        let www_auth = resp.headers()[http_types::header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap();
+        let parsed = crate::protocol::core::parse_www_authenticate(www_auth).unwrap();
+        assert_eq!(parsed.description, challenge.description);
+    }
+
+    #[test]
+    fn test_http_respond_challenge_unformattable_challenge() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: None,
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!resp
+            .headers()
+            .contains_key(http_types::header::WWW_AUTHENTICATE));
     }
 
     #[test]
