@@ -24,7 +24,9 @@ fn test_middleware_new() {
 #[cfg(all(feature = "client", feature = "middleware", feature = "utils"))]
 mod integration {
     use super::*;
-    use crate::client::ClientEventKind;
+    use crate::client::{
+        ClientEvent, ClientEventKind, HttpError, PaymentContext, PaymentFailureReason,
+    };
     use crate::error::MppError;
     use crate::protocol::core::{
         format_www_authenticate, Base64UrlJson, PaymentChallenge, PaymentCredential, PaymentPayload,

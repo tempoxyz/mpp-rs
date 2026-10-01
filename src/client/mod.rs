@@ -34,6 +34,8 @@ pub mod tempo;
 
 #[cfg(feature = "client")]
 mod fetch;
+#[cfg(feature = "client")]
+mod flow;
 
 #[cfg(feature = "middleware")]
 mod middleware;

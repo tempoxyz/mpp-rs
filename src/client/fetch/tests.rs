@@ -9,12 +9,13 @@ fn test_payment_ext_trait_exists() {
 #[cfg(all(feature = "client", feature = "utils"))]
 mod integration {
     use super::*;
-    use crate::client::ClientEventKind;
+    use crate::client::{ClientEvent, ClientEventKind, PaymentContext, PaymentFailureReason};
     use crate::error::MppError;
     use crate::protocol::core::{
         format_www_authenticate, Base64UrlJson, PaymentChallenge, PaymentCredential, PaymentPayload,
     };
     use reqwest::header::AUTHORIZATION;
+    use reqwest::StatusCode;
 
     use axum::http::header::WWW_AUTHENTICATE as WWW_AUTH_NAME;
     use axum::http::StatusCode as AxumStatusCode;
