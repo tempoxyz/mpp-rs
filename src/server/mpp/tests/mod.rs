@@ -228,18 +228,9 @@ fn offers_builder() -> crate::server::TempoBuilder {
 fn success_mpp_from(builder: crate::server::TempoBuilder) -> Mpp<TempoSuccessMethod> {
     let created = Mpp::create(builder).unwrap();
     Mpp {
-        method: TempoSuccessMethod,
+        method: Arc::new(TempoSuccessMethod),
         session_method: None,
-        realm: created.realm,
-        secret_key: created.secret_key,
-        currencies: created.currencies,
-        recipient: created.recipient,
-        decimals: created.decimals,
-        fee_payer: created.fee_payer,
-        machine_token_enabled: created.machine_token_enabled,
-        chain_id: created.chain_id,
-        opaque: created.opaque,
-        credential_header: created.credential_header,
+        config: created.config,
         events: created.events,
     }
 }
