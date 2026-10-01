@@ -100,7 +100,7 @@ where
     let mut need_voucher_sent = false;
     loop {
         match store.get_channel(&channel_id).await {
-            Ok(Some(ch)) if !ch.finalized && !ch.closing => {
+            Ok(Some(ch)) if !ch.finalized && !ch.closing && ch.close_requested_at == 0 => {
                 if ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost {
                     break;
                 }
@@ -680,6 +680,10 @@ mod tests {
             },
             ChannelState {
                 closing: true,
+                ..open.clone()
+            },
+            ChannelState {
+                close_requested_at: 1,
                 ..open
             },
         ] {

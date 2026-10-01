@@ -129,6 +129,11 @@ pub async fn deduct_from_channel(
                 if state.closing {
                     return Err(VerificationError::channel_closed("channel is closing"));
                 }
+                if state.close_requested_at != 0 {
+                    return Err(VerificationError::channel_closed(
+                        "channel has a pending close request",
+                    ));
+                }
                 let available = state.highest_voucher_amount.saturating_sub(state.spent);
                 if available >= amount {
                     Ok(Some(ChannelState {
@@ -3163,6 +3168,8 @@ mod tests {
         assert_eq!(available, 2_000_000);
     }
 
+    /// Once the payer requested a forced close, nothing more may be charged:
+    /// the channel can be withdrawn before the server settles it.
     #[tokio::test]
     async fn test_deduct_rejects_when_close_requested() {
         let store = std::sync::Arc::new(InMemoryChannelStore::new());
@@ -3171,19 +3178,14 @@ mod tests {
         state.close_requested_at = 99999;
         store.insert("0xchannel_closing", state);
 
-        let retrieved = store
-            .get_channel("0xchannel_closing")
+        let err = deduct_from_channel(&*store, "0xchannel_closing", 1_000)
             .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retrieved.close_requested_at, 99999);
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::ChannelClosed));
 
-        // Deduction should still work (close_requested_at is checked at voucher level)
-        let result = deduct_from_channel(&*store, "0xchannel_closing", 1_000).await;
-        assert!(result.is_ok());
-        let updated = result.unwrap();
-        assert_eq!(updated.spent, 1_000);
-        assert_eq!(updated.close_requested_at, 99999);
+        let unchanged = store.get_channel_sync("0xchannel_closing").unwrap();
+        assert_eq!(unchanged.spent, 0);
+        assert_eq!(unchanged.units, 0);
     }
 
     #[tokio::test]
