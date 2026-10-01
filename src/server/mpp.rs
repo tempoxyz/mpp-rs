@@ -880,7 +880,7 @@ where
                     .map_err(|e| {
                         VerificationError::with_code(
                             format!("Invalid expected Tempo request: {e}"),
-                            crate::protocol::traits::ErrorCode::InvalidCredential,
+                            crate::protocol::traits::ErrorCode::Internal,
                         )
                     })?;
 
