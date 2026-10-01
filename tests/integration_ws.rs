@@ -18,13 +18,16 @@ use mpp::server::ws::{WsMessage, WsResponse};
 use mpp::server::{tempo, Mpp, TempoConfig};
 use tokio_tungstenite::tungstenite;
 
+/// HMAC secret for test servers (the SDK requires at least 32 bytes).
+const TEST_SECRET: &str = "test-secret-key-at-least-32-bytes";
+
 /// Start an axum server with a WS payment endpoint.
 async fn start_ws_server() -> (String, tokio::task::JoinHandle<()>) {
     let mpp = Mpp::create(
         tempo(TempoConfig {
             recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
         })
-        .secret_key("ws-test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 

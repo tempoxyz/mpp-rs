@@ -99,6 +99,9 @@ impl TempoBuilder {
     }
 
     /// Override the secret key (default: reads `MPP_SECRET_KEY` env var).
+    ///
+    /// Must be at least 32 bytes; [`Mpp::create()`](super::Mpp::create)
+    /// rejects shorter keys.
     pub fn secret_key(mut self, key: &str) -> Self {
         self.secret_key = Some(key.to_string());
         self
@@ -251,7 +254,7 @@ impl TempoBuilder {
 ///     .currencies(["0xcustom_token_address"])
 ///     .rpc_url("https://rpc.moderato.tempo.xyz")
 ///     .realm("my-api.com")
-///     .secret_key("my-secret")
+///     .secret_key("my-hmac-secret-of-at-least-32-bytes")
 ///     .decimals(18),
 /// )?;
 /// ```

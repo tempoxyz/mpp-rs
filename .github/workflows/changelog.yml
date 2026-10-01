@@ -30,7 +30,10 @@ jobs:
       - name: Check changelog
         uses: tempoxyz/changelogs/check@bd50cca508d81505924dfa3997b1696ac2b7b1aa # v0.9.0
         with:
-          ai: "npx -y @anthropic-ai/claude-code@2.1.220 --bare -p"
+          # `--prefix` moves npm's project root out of the checkout, so the pull
+          # request's `.npmrc` and `node_modules` have no say in what runs with
+          # the API key.
+          ai: "npx --prefix=${{ runner.temp }} -y @anthropic-ai/claude-code@2.1.220 --bare -p"
           ecosystem: rust
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

@@ -149,6 +149,9 @@ impl ServiceBuilder {
     }
 
     /// Add a route. `pattern` is `"METHOD /path"` or just `"/path"`.
+    ///
+    /// Routes are matched in the order they are added; see
+    /// [`ProxyConfig::match_route`].
     pub fn route(mut self, pattern: &str, endpoint: Endpoint) -> Self {
         let (method, path) = parse_route_pattern(pattern);
         self.routes.push(Route {
@@ -193,7 +196,10 @@ fn parse_route_pattern(pattern: &str) -> (Option<String>, String) {
 /// Check if a URL path matches a route pattern path.
 ///
 /// Supports `:param` segments as wildcards (e.g., `/v1/customers/:id` matches
-/// `/v1/customers/cus_123`).
+/// `/v1/customers/cus_123`). A `:param` never matches a segment that a URL
+/// parser would rewrite into a different path once the request is forwarded:
+/// dot segments (`.`, `..`, also spelled with `%2e`) and segments containing a
+/// backslash.
 fn path_matches(pattern: &str, path: &str) -> bool {
     let pat_segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
     let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -205,7 +211,27 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     pat_segments
         .iter()
         .zip(path_segments.iter())
-        .all(|(pat, seg)| pat.starts_with(':') || *pat == *seg)
+        .all(|(pat, seg)| {
+            if pat.starts_with(':') {
+                !is_dot_segment(seg) && !seg.contains('\\')
+            } else {
+                *pat == *seg
+            }
+        })
+}
+
+/// Whether `segment` is `.` or `..`, with `%2e` accepted for either dot.
+fn is_dot_segment(segment: &str) -> bool {
+    let mut rest = segment.as_bytes();
+    let mut dots = 0;
+    while !rest.is_empty() {
+        rest = match rest {
+            [b'.', tail @ ..] | [b'%', b'2', b'e' | b'E', tail @ ..] => tail,
+            _ => return false,
+        };
+        dots += 1;
+    }
+    matches!(dots, 1 | 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -236,13 +262,13 @@ pub struct ParsedRoute<'a> {
 impl ProxyConfig {
     /// Strip the base path from a request path and return the remainder.
     ///
-    /// Returns `None` if the path doesn't start with the base path.
+    /// Returns `None` if the path is not the base path or below it.
     pub fn strip_base<'a>(&self, path: &'a str) -> Option<&'a str> {
         match &self.base_path {
             None => Some(path),
             Some(base) => {
-                let base = base.trim_end_matches('/');
-                path.strip_prefix(base)
+                let rest = path.strip_prefix(base.trim_end_matches('/'))?;
+                (rest.is_empty() || rest.starts_with('/')).then_some(rest)
             }
         }
     }
@@ -251,6 +277,10 @@ impl ProxyConfig {
     ///
     /// The `path` should be the full request path (base path will be stripped).
     /// Returns the matched service, route, and the upstream path portion.
+    ///
+    /// Routes are tried in registration order and the first match wins, so a
+    /// pattern shadows any later route it also matches. Register specific
+    /// routes before broader `:param` or any-method ones.
     pub fn match_route<'a>(&'a self, method: &str, path: &str) -> Option<ParsedRoute<'a>> {
         let stripped = self.strip_base(path)?;
         let (service_id, upstream_path) = parse_path(stripped)?;
@@ -495,14 +525,27 @@ pub fn to_llms_txt_with(services: &[Service], options: Option<&LlmsTxtOptions<'_
 }
 
 /// Generate an OpenAPI 3.1.0 discovery document from the proxy configuration.
+///
+/// Paths include the configured `base_path`, and `:param` route segments are
+/// written as `{param}` path templates with matching `parameters`.
 pub fn generate_openapi(config: &ProxyConfig) -> Value {
     let title = config.title.as_deref().unwrap_or("API Proxy");
+    let base_path = config
+        .base_path
+        .as_deref()
+        .map_or("", |base| base.trim_end_matches('/'));
 
     let mut paths = serde_json::Map::new();
     for service in &config.services {
         for route in &service.routes {
-            let path_key = format!("/{}{}", service.id, route.path);
+            let (path, parameters) = openapi_path(&route.path);
+            let path_key = format!("{base_path}/{}{path}", service.id);
             let method_key = route.method.as_deref().unwrap_or("GET").to_lowercase();
+
+            let mut operation = serde_json::Map::new();
+            if !parameters.is_empty() {
+                operation.insert("parameters".to_string(), Value::Array(parameters));
+            }
 
             let mut responses = serde_json::Map::new();
             if let Endpoint::Paid(p) = &route.endpoint {
@@ -511,43 +554,31 @@ pub fn generate_openapi(config: &ProxyConfig) -> Value {
                     json!({ "description": "Payment Required" }),
                 );
 
-                let mut operation = serde_json::Map::new();
-                operation.insert("intent".to_string(), json!(p.intent));
-                operation.insert("amount".to_string(), json!(p.amount));
+                let mut offer = serde_json::Map::new();
+                offer.insert("intent".to_string(), json!(p.intent));
+                offer.insert("amount".to_string(), json!(p.amount));
                 if let Some(decimals) = p.decimals {
-                    operation.insert("decimals".to_string(), json!(decimals));
+                    offer.insert("decimals".to_string(), json!(decimals));
                 }
                 if let Some(ref currency) = p.currency {
-                    operation.insert("currency".to_string(), json!(currency));
+                    offer.insert("currency".to_string(), json!(currency));
                 }
                 if let Some(ref ut) = p.unit_type {
-                    operation.insert("unitType".to_string(), json!(ut));
+                    offer.insert("unitType".to_string(), json!(ut));
                 }
                 if let Some(ref desc) = p.description {
-                    operation.insert("description".to_string(), json!(desc));
+                    offer.insert("description".to_string(), json!(desc));
                 }
-
-                responses.insert(
-                    "200".to_string(),
-                    json!({ "description": "Successful response" }),
-                );
-
-                let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
-                path_entry[&method_key] = json!({
-                    "responses": Value::Object(responses),
-                    "x-payment-info": Value::Object(operation),
-                });
-            } else {
-                responses.insert(
-                    "200".to_string(),
-                    json!({ "description": "Successful response" }),
-                );
-
-                let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
-                path_entry[&method_key] = json!({
-                    "responses": Value::Object(responses),
-                });
+                operation.insert("x-payment-info".to_string(), json!({ "offers": [offer] }));
             }
+            responses.insert(
+                "200".to_string(),
+                json!({ "description": "Successful response" }),
+            );
+            operation.insert("responses".to_string(), Value::Object(responses));
+
+            let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
+            path_entry[&method_key] = Value::Object(operation);
         }
     }
 
@@ -559,6 +590,29 @@ pub fn generate_openapi(config: &ProxyConfig) -> Value {
         },
         "paths": Value::Object(paths),
     })
+}
+
+/// Rewrite `:param` route segments as OpenAPI `{param}` templates and return
+/// the path parameter objects they require.
+fn openapi_path(route_path: &str) -> (String, Vec<Value>) {
+    let mut parameters = Vec::new();
+    let path = route_path
+        .split('/')
+        .map(|segment| match segment.strip_prefix(':') {
+            Some(name) if !name.is_empty() => {
+                parameters.push(json!({
+                    "name": name,
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" },
+                }));
+                format!("{{{name}}}")
+            }
+            _ => segment.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    (path, parameters)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +810,7 @@ mod tests {
             intent: IntentName::new("session"),
             request: Base64UrlJson::default(),
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
             header: None,
@@ -883,6 +938,88 @@ mod tests {
     }
 
     #[test]
+    fn test_match_route_first_registered_wins() {
+        let svc = Service::new("stripe", "https://api.stripe.com")
+            .route("GET /v1/customers/search", Endpoint::Free)
+            .route("GET /v1/customers/:id", Endpoint::Free)
+            .route("GET /v1/customers/me", Endpoint::Free)
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+
+        let pattern = |path| {
+            config
+                .match_route("GET", path)
+                .unwrap()
+                .route
+                .pattern
+                .as_str()
+        };
+        assert_eq!(
+            pattern("/stripe/v1/customers/search"),
+            "GET /v1/customers/search"
+        );
+        assert_eq!(pattern("/stripe/v1/customers/me"), "GET /v1/customers/:id");
+    }
+
+    #[test]
+    fn test_param_route_rejects_dot_segments() {
+        let svc = Service::new("stripe", "https://api.stripe.com")
+            .route("GET /v1/customers/:id", Endpoint::Free)
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+
+        for id in [
+            "..",
+            ".",
+            "%2e%2e",
+            "%2E%2E",
+            ".%2e",
+            "%2e.",
+            "%2e",
+            "..\\admin",
+        ] {
+            let path = format!("/stripe/v1/customers/{id}");
+            assert!(
+                config.match_route("GET", &path).is_none(),
+                "{path} must not match a :param route"
+            );
+        }
+
+        for id in ["...", "cus_1.2", ".well-known", "%2e%2e%2e"] {
+            let path = format!("/stripe/v1/customers/{id}");
+            assert!(config.match_route("GET", &path).is_some(), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_base_path_requires_segment_boundary() {
+        let config = ProxyConfig {
+            base_path: Some("/api".to_string()),
+            services: vec![test_service()],
+            title: None,
+            description: None,
+        };
+
+        assert_eq!(
+            config.strip_base("/api/openai/v1/models"),
+            Some("/openai/v1/models")
+        );
+        assert_eq!(config.strip_base("/api"), Some(""));
+        assert_eq!(config.strip_base("/apiopenai/v1/models"), None);
+        assert!(config.match_route("GET", "/apiopenai/v1/models").is_none());
+    }
+
+    #[test]
     fn test_discovery_with_base_path() {
         let config = ProxyConfig {
             base_path: Some("/api/proxy".to_string()),
@@ -983,14 +1120,19 @@ mod tests {
         let paid = &paths["/openai/v1/chat/completions"]["post"];
         assert!(paid["responses"]["402"].is_object());
         assert!(paid["responses"]["200"].is_object());
-        assert_eq!(paid["x-payment-info"]["intent"], "charge");
-        assert_eq!(paid["x-payment-info"]["amount"], "50000");
-        assert_eq!(paid["x-payment-info"]["decimals"], 6);
+        assert!(paid["parameters"].is_null());
         assert_eq!(
-            paid["x-payment-info"]["currency"],
-            "0x20c0000000000000000000000000000000000001"
+            paid["x-payment-info"],
+            json!({
+                "offers": [{
+                    "intent": "charge",
+                    "amount": "50000",
+                    "decimals": 6,
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "description": "Chat completion",
+                }],
+            })
         );
-        assert_eq!(paid["x-payment-info"]["description"], "Chat completion");
 
         // Free route
         let free = &paths["/openai/v1/models"]["get"];
@@ -1008,6 +1150,49 @@ mod tests {
         let doc = generate_openapi(&empty);
         assert_eq!(doc["info"]["title"], "Custom");
         assert!(doc["paths"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_generate_openapi_base_path_and_path_params() {
+        let svc = Service::new("stripe", "https://api.stripe.com")
+            .route(
+                "GET /v1/customers/:id/charges/:charge",
+                Endpoint::Paid(PaidEndpoint {
+                    intent: "charge".into(),
+                    amount: "100".into(),
+                    decimals: None,
+                    currency: None,
+                    unit_type: None,
+                    description: None,
+                }),
+            )
+            .route("GET /v1/customers/:id", Endpoint::Free)
+            .build();
+        let config = ProxyConfig {
+            base_path: Some("/api/proxy/".to_string()),
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+        let doc = generate_openapi(&config);
+        let paths = doc["paths"].as_object().unwrap();
+        assert_eq!(
+            paths.keys().collect::<Vec<_>>(),
+            [
+                "/api/proxy/stripe/v1/customers/{id}/charges/{charge}",
+                "/api/proxy/stripe/v1/customers/{id}",
+            ]
+        );
+
+        let path_param = |name: &str| json!({ "name": name, "in": "path", "required": true, "schema": { "type": "string" } });
+        assert_eq!(
+            paths["/api/proxy/stripe/v1/customers/{id}/charges/{charge}"]["get"]["parameters"],
+            json!([path_param("id"), path_param("charge")])
+        );
+        assert_eq!(
+            paths["/api/proxy/stripe/v1/customers/{id}"]["get"]["parameters"],
+            json!([path_param("id")])
+        );
     }
 
     #[test]

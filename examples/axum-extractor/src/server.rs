@@ -88,7 +88,8 @@ async fn main() {
         })
         .rpc_url(&rpc_url)
         .secret_key(
-            &std::env::var("MPP_SECRET_KEY").unwrap_or_else(|_| "axum-example-secret".to_string()),
+            &std::env::var("MPP_SECRET_KEY")
+                .unwrap_or_else(|_| "mpp-rs-demo-axum-example-secret-key".to_string()),
         )
         .fee_payer(true)
         .fee_payer_signer(signer),

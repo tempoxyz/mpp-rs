@@ -7,8 +7,21 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+# Targets and checks that need `mpp`'s `server` feature (SSE events).
+server = ["mpp/server"]
+# Targets and checks that need `mpp`'s `tempo` feature (alloy, tempo-alloy).
+tempo = ["server", "mpp/tempo"]
+# Assert that every amount parser accepts exactly `0|[1-9][0-9]*`.
+strict-amounts = []
+
 [dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+base64 = "0.22"
 libfuzzer-sys = "0.4"
+serde = "1"
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dependencies.mpp]
 path = ".."
@@ -21,6 +34,12 @@ members = ["."]
 [profile.release]
 debug = 1
 
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+bench = false
+
 [[bin]]
 name = "fuzz_www_authenticate"
 path = "fuzz_targets/fuzz_www_authenticate.rs"
@@ -29,8 +48,36 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_challenge_roundtrip"
+path = "fuzz_targets/fuzz_challenge_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_challenge_list"
+path = "fuzz_targets/fuzz_challenge_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_challenge_id"
+path = "fuzz_targets/fuzz_challenge_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_authorization"
 path = "fuzz_targets/fuzz_authorization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_credential_roundtrip"
+path = "fuzz_targets/fuzz_credential_roundtrip.rs"
 test = false
 doc = false
 bench = false
@@ -48,3 +95,64 @@ path = "fuzz_targets/fuzz_base64url_json.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_accept_payment"
+path = "fuzz_targets/fuzz_accept_payment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_amount"
+path = "fuzz_targets/fuzz_amount.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mcp"
+path = "fuzz_targets/fuzz_mcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_sse_event"
+path = "fuzz_targets/fuzz_sse_event.rs"
+test = false
+doc = false
+bench = false
+required-features = ["server"]
+
+[[bin]]
+name = "fuzz_fee_payer_envelope"
+path = "fuzz_targets/fuzz_fee_payer_envelope.rs"
+test = false
+doc = false
+bench = false
+required-features = ["tempo"]
+
+[[bin]]
+name = "fuzz_attribution"
+path = "fuzz_targets/fuzz_attribution.rs"
+test = false
+doc = false
+bench = false
+required-features = ["tempo"]
+
+[[bin]]
+name = "fuzz_session_payload"
+path = "fuzz_targets/fuzz_session_payload.rs"
+test = false
+doc = false
+bench = false
+required-features = ["tempo"]
+
+[[bin]]
+name = "fuzz_voucher_signature"
+path = "fuzz_targets/fuzz_voucher_signature.rs"
+test = false
+doc = false
+bench = false
+required-features = ["tempo"]
