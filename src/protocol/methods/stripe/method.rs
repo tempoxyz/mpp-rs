@@ -319,6 +319,7 @@ mod tests {
             intent: "é".repeat(501).into(),
             request: Default::default(),
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
             header: None,

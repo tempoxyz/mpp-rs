@@ -861,7 +861,7 @@ fn create_mock_mpp(stripe_url: &str) -> Mpp<mpp::protocol::methods::stripe::meth
             decimals: 2,
         })
         .stripe_api_base(stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp")
 }
