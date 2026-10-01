@@ -17,7 +17,7 @@
 use libfuzzer_sys::fuzz_target;
 use mpp::protocol::core::extract_payment_scheme;
 use mpp::{base64url_encode, format_authorization, parse_authorization};
-use mpp_fuzz::{assert_same, has_unparseable_optionals, wire_header};
+use mpp_fuzz::{assert_same, is_well_formed_echo, wire_header};
 
 const MAX_TOKEN_LEN: usize = 16 * 1024;
 
@@ -43,7 +43,7 @@ fn check(header: &str) {
     let echo = &credential.challenge;
     assert!(echo.method.is_valid());
     assert_eq!(echo.header, wire_header(echo.header.as_deref()));
-    assert!(!has_unparseable_optionals(None, echo.digest.as_deref()));
+    assert!(is_well_formed_echo(echo));
 
     let formatted = format_authorization(&credential).expect("parsed credential formats");
     // Re-serialization can grow the JSON (`1e2` becomes `100.0`).

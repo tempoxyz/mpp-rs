@@ -2,8 +2,8 @@
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use mpp::protocol::core::{
-    advertised_credential_header, is_default_credential_header, Base64UrlJson, MethodName,
-    PaymentChallenge,
+    advertised_credential_header, is_default_credential_header, Base64UrlJson, ChallengeEcho,
+    MethodName, PaymentChallenge,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -36,6 +36,36 @@ impl<'a> Arbitrary<'a> for Method {
             name.push(*u.choose(ALPHABET)? as char);
         }
         Ok(Self(name))
+    }
+}
+
+/// An intent name matching `1*( ALPHA / DIGIT / "-" / "_" )`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Intent(pub String);
+
+impl<'a> Arbitrary<'a> for Intent {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        let mut name = String::new();
+        for _ in 0..u.int_in_range(1..=12)? {
+            name.push(*u.choose(ALPHABET)? as char);
+        }
+        Ok(Self(name))
+    }
+}
+
+#[derive(Debug, Clone, Arbitrary)]
+pub enum IntentInput {
+    Name(Intent),
+    Raw(Text),
+}
+
+impl IntentInput {
+    pub fn build(&self) -> &str {
+        match self {
+            Self::Name(name) => &name.0,
+            Self::Raw(text) => &text.0,
+        }
     }
 }
 
@@ -145,14 +175,19 @@ impl ExpiresInput {
 
 #[derive(Debug, Clone, Arbitrary)]
 pub enum DigestInput {
-    Sha256(Text),
+    /// `sha-256=<base64>`, as mppx emits it.
+    Bare([u8; 32]),
+    /// `sha-256=:<base64>:`, the RFC 9530 byte sequence.
+    ByteSequence([u8; 32]),
     Raw(Text),
 }
 
 impl DigestInput {
     pub fn build(&self) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         match self {
-            Self::Sha256(value) => format!("sha-256={}", value.0),
+            Self::Bare(hash) => format!("sha-256={}", STANDARD.encode(hash)),
+            Self::ByteSequence(hash) => format!("sha-256=:{}:", STANDARD.encode(hash)),
             Self::Raw(text) => text.0.clone(),
         }
     }
@@ -213,7 +248,7 @@ pub struct ChallengeInput {
     pub id: Text,
     pub realm: Text,
     pub method: Method,
-    pub intent: Text,
+    pub intent: IntentInput,
     pub request: RequestInput,
     pub expires: Option<ExpiresInput>,
     pub description: Option<Text>,
@@ -229,7 +264,7 @@ impl ChallengeInput {
             id: self.id.0.clone(),
             realm: self.realm.0.clone(),
             method: MethodName::new(&self.method.0),
-            intent: self.intent.0.as_str().into(),
+            intent: self.intent.build().into(),
             request: self.request.build(),
             expires: self.expires.as_ref().map(ExpiresInput::build),
             description: self.description.as_ref().map(|text| text.0.clone()),
@@ -288,16 +323,44 @@ pub fn wire_header(header: Option<&str>) -> Option<String> {
     advertised_credential_header(header)
 }
 
-/// Whether the parsers reject `expires` or `digest` values that the
-/// formatters emit unchecked.
+/// Whether the `id` and the fields it binds have the wire form that the
+/// formatters and parsers require: a non-empty `id`, an intent name, an
+/// RFC 3339 `expires`, a `sha-256=` digest and a base64url `opaque`.
 ///
-/// Known gap: `format_www_authenticate` and `format_authorization` validate
-/// neither field, while `parse_www_authenticate` requires an RFC 3339
-/// `expires` and both parsers require a `sha-256=` digest. Such challenges
-/// format but do not parse back.
-pub fn has_unparseable_optionals(expires: Option<&str>, digest: Option<&str>) -> bool {
-    expires.is_some_and(|expires| !is_rfc3339(expires))
-        || digest.is_some_and(|digest| !digest.starts_with("sha-256="))
+/// `method` and `request` are valid in every generated challenge.
+pub fn is_well_formed(challenge: &PaymentChallenge) -> bool {
+    is_well_formed_echo(&challenge.to_echo())
+}
+
+/// [`is_well_formed`] for the challenge a credential echoes.
+pub fn is_well_formed_echo(echo: &ChallengeEcho) -> bool {
+    let intent = echo.intent.as_str();
+    !echo.id.is_empty()
+        && !intent.is_empty()
+        && intent
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && echo.expires.as_deref().is_none_or(is_rfc3339)
+        && echo.digest.as_deref().is_none_or(is_sha256_digest)
+        && echo
+            .opaque
+            .as_ref()
+            .is_none_or(|opaque| mpp::base64url_decode(opaque.raw()).is_ok())
+}
+
+/// `sha-256=` followed by base64 text, bare or between colons.
+fn is_sha256_digest(digest: &str) -> bool {
+    let Some(value) = digest.strip_prefix("sha-256=") else {
+        return false;
+    };
+    let value = value
+        .strip_prefix(':')
+        .and_then(|value| value.strip_suffix(':'))
+        .unwrap_or(value);
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/-_=".contains(&b))
 }
 
 pub fn is_rfc3339(timestamp: &str) -> bool {

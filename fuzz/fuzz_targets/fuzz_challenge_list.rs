@@ -102,11 +102,7 @@ fuzz_target!(|input: Input| {
         let Ok(header) = format_www_authenticate(&challenge) else {
             return;
         };
-        // Skip challenges the single parser rejects; see `fuzz_challenge_roundtrip`.
-        let Ok(parsed) = parse_www_authenticate(&header) else {
-            return;
-        };
-        expected.push(parsed);
+        expected.push(parse_www_authenticate(&header).expect("formatted header parses"));
 
         let payment = header.replacen("Payment ", entry.scheme.as_str(), 1);
         let mut members = entry.decoy.iter().map(Decoy::build).collect::<Vec<_>>();
