@@ -227,10 +227,9 @@ where
             )
         })?;
 
-        let channel_id_for_lock = channel_id_str.clone();
         self.store
             .update_channel(
-                &channel_id_for_lock,
+                channel_id_str,
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
@@ -345,7 +344,7 @@ where
                 let _ = self
                     .store
                     .update_channel(
-                        &channel_id_for_lock,
+                        channel_id_str,
                         Box::new(|current| Ok(current.map(ChannelState::clear_pending_close))),
                     )
                     .await;
@@ -354,11 +353,10 @@ where
         };
 
         // Finalize in store.
-        let channel_id_owned = channel_id_str.clone();
         let finalized = self
             .store
             .update_channel(
-                &channel_id_owned,
+                channel_id_str,
                 Box::new(move |current| {
                     Ok(current.map(|state| {
                         state.finalize_close(cumulative_amount, sig_bytes, on_chain.deposit)

@@ -2,6 +2,7 @@ use super::*;
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::ErrorCode;
 use alloy::primitives::{Bytes, B256};
+use std::future::Future;
 
 mod close;
 mod open;
