@@ -308,7 +308,7 @@ where
             let Ok(Some(ch)) = store.get_channel(&channel_id).await else {
                 return;
             };
-            if ch.finalized || ch.closing {
+            if ch.finalized || ch.closing || ch.close_requested_at != 0 {
                 let mut receipt = SessionReceipt::new(
                     now_iso8601(),
                     &challenge_id,
@@ -1314,6 +1314,10 @@ mod tests {
             },
             ChannelState {
                 closing: true,
+                ..open.clone()
+            },
+            ChannelState {
+                close_requested_at: 1,
                 ..open
             },
         ] {
