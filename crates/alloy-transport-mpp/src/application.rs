@@ -11,7 +11,8 @@ use futures::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use mpp::{
     client::{PaymentContext, PaymentProvider},
-    format_authorization, MppError, PaymentChallenge, PaymentCredential,
+    format_authorization, parse_www_authenticate_all_bytes, MppError, PaymentChallenge,
+    PaymentCredential,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -468,12 +469,12 @@ async fn probe_challenge<P: PaymentProvider>(
             status: response.status().as_u16(),
         });
     }
-    PaymentChallenge::from_headers(
+    parse_www_authenticate_all_bytes(
         response
             .headers()
             .get_all(reqwest::header::WWW_AUTHENTICATE)
             .iter()
-            .filter_map(|value| value.to_str().ok()),
+            .map(|value| value.as_bytes()),
     )
     .into_iter()
     .filter_map(Result::ok)

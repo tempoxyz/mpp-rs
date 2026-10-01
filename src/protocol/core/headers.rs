@@ -12,6 +12,7 @@
 use super::challenge::{PaymentChallenge, PaymentCredential, Receipt};
 use super::types::{base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName};
 use crate::error::{MppError, Result};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
@@ -511,6 +512,45 @@ pub fn parse_www_authenticate_all<'a>(
         .flat_map(split_payment_challenges)
         .map(parse_www_authenticate)
         .collect()
+}
+
+/// Parse all Payment challenges from raw `WWW-Authenticate` field values.
+///
+/// Like [`parse_www_authenticate_all`], but takes the field values as the
+/// bytes received on the wire and decodes them as ISO-8859-1 (RFC 9110 §5.5).
+/// Servers that send Latin-1 text in a quoted-string as single raw bytes, as
+/// mppx does, are not readable as ASCII or UTF-8.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::protocol::core::parse_www_authenticate_all_bytes;
+///
+/// let header: &[u8] =
+///     b"Payment id=\"abc\", realm=\"caf\xe9\", method=\"tempo\", intent=\"charge\", request=\"e30\"";
+/// let challenges = parse_www_authenticate_all_bytes([header]);
+/// assert_eq!(challenges[0].as_ref().unwrap().realm, "caf\u{e9}");
+/// ```
+pub fn parse_www_authenticate_all_bytes<'a>(
+    headers: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<Result<PaymentChallenge>> {
+    headers
+        .into_iter()
+        .flat_map(|value| {
+            let value = decode_latin1(value);
+            split_payment_challenges(&value)
+                .into_iter()
+                .map(parse_www_authenticate)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(value) {
+        Ok(ascii) if ascii.is_ascii() => Cow::Borrowed(ascii),
+        _ => Cow::Owned(value.iter().copied().map(char::from).collect()),
+    }
 }
 
 /// Split a header value into individual `Payment` challenge slices.
