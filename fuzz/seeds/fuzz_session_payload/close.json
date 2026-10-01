@@ -1,0 +1,1 @@
+{"action":"close","channelId":"0xabc","settlement_route":{"adapter":"0x0a","recipient":"0x0b","targetToken":"0x0c","routeSalt":"0x0d"},"cumulativeAmount":"2000","signature":"0x1b"}

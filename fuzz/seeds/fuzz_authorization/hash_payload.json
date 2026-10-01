@@ -1,0 +1,1 @@
+{"challenge":{"id":"abc","realm":"api","method":"tempo","intent":"charge","request":"e30","digest":"sha-256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU","opaque":"e30","header":"Payment-Authorization"},"source":"did:pkh:eip155:42431:0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2","payload":{"type":"hash","hash":"0xabc","extra":[1,2.5,null,true]}}
