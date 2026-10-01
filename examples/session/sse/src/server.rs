@@ -79,8 +79,7 @@ async fn main() {
         tempo(TempoConfig {
             recipient: &recipient,
         })
-        .rpc_url(RPC_URL)
-        .fee_payer(true),
+        .rpc_url(RPC_URL),
     )
     .expect("failed to create payment handler");
 
