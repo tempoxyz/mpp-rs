@@ -110,7 +110,8 @@ jobs:
             echo "Ring-only transport unexpectedly includes aws-lc-sys"
             exit 1
           fi
-      - run: cargo hack check --each-feature --no-dev-deps --skip integration,integration-stripe,integration-ws
+      - name: Check feature combinations
+        run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --skip integration,integration-stripe,integration-ws
       - name: Check examples
         run: cargo check --workspace --exclude mpp
 
