@@ -784,7 +784,7 @@ where
     ///
     /// When set, each verified transaction hash is recorded and subsequent
     /// attempts to replay the same hash are rejected. Zero-amount proof
-    /// credentials are likewise made single-use per credential fingerprint.
+    /// challenges are likewise made single-use per challenge id.
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
@@ -1216,17 +1216,15 @@ where
     async fn reserve_proof_credential(
         &self,
         credential: &PaymentCredential,
-        signature: &str,
-        source_address: Address,
-        expected_chain_id: u64,
     ) -> Result<(), VerificationError> {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        let replay_key =
-            Self::proof_replay_key(credential, signature, source_address, expected_chain_id)?;
         let reserved = store
-            .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+            .put_if_absent(
+                &Self::proof_replay_key(credential),
+                serde_json::Value::Bool(true),
+            )
             .await
             .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
         if !reserved {
@@ -1237,20 +1235,10 @@ where
         Ok(())
     }
 
-    fn proof_replay_key(
-        credential: &PaymentCredential,
-        signature: &str,
-        source_address: Address,
-        expected_chain_id: u64,
-    ) -> Result<String, VerificationError> {
-        let fingerprint = proof::proof_fingerprint(
-            &credential.challenge.id,
-            source_address,
-            expected_chain_id,
-            signature,
-        )
-        .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
-        Ok(format!("mpp:proof:{fingerprint:x}"))
+    /// Replay key for a proof credential: a challenge id is single-use, no
+    /// matter which account or signature proves it.
+    fn proof_replay_key(credential: &PaymentCredential) -> String {
+        format!("mpp:charge:proof:{}", credential.challenge.id)
     }
 
     fn validate_transaction_credential(
@@ -1387,14 +1375,8 @@ where
                 )
                 .await?;
             if let Some(store) = &self.store {
-                let replay_key = Self::proof_replay_key(
-                    credential,
-                    payload.proof_signature().unwrap(),
-                    sender,
-                    expected_chain_id,
-                )?;
                 if store
-                    .get(&replay_key)
+                    .get(&Self::proof_replay_key(credential))
                     .await
                     .map_err(|e| VerificationError::new(format!("Failed to check proof: {e}")))?
                     .is_some()
@@ -2076,16 +2058,9 @@ where
                 }
 
                 let sig_hex = charge_payload.proof_signature().unwrap();
-                let source_address = this
-                    .validate_proof_credential(&credential, sig_hex, expected_chain_id)
+                this.validate_proof_credential(&credential, sig_hex, expected_chain_id)
                     .await?;
-                this.reserve_proof_credential(
-                    &credential,
-                    sig_hex,
-                    source_address,
-                    expected_chain_id,
-                )
-                .await?;
+                this.reserve_proof_credential(&credential).await?;
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
             } else {
@@ -4123,7 +4098,7 @@ mod tests {
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
-            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+            crate::protocol::core::PaymentPayload::proof(signature),
         );
 
         let provider =
@@ -4135,16 +4110,56 @@ mod tests {
         // verification is purely cryptographic.
         method.cached_chain_id.set(42431).unwrap();
 
-        // First submission succeeds and records the proof fingerprint.
+        // First submission succeeds and records the challenge id.
         let receipt = method.verify(&credential, &request).await.unwrap();
         assert_eq!(receipt.reference, challenge.id);
-        let fingerprint =
-            proof::proof_fingerprint(&challenge.id, signer.address(), 42431, &signature).unwrap();
-        let key = format!("mpp:proof:{:x}", fingerprint);
+        let key = format!("mpp:charge:proof:{}", challenge.id);
         assert!(store.get(&key).await.unwrap().is_some());
 
         // Replaying the identical credential is rejected.
         let err = method.verify(&credential, &request).await.unwrap_err();
+        assert!(err.to_string().contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn test_proof_challenge_is_single_use_across_accounts() {
+        use crate::store::MemoryStore;
+
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let mut credentials = Vec::new();
+        for _ in 0..2 {
+            let signer = alloy::signers::local::PrivateKeySigner::random();
+            let signature = proof::sign_proof(
+                &signer,
+                signer.address(),
+                42431,
+                &challenge.id,
+                &challenge.realm,
+            )
+            .await
+            .unwrap();
+            credentials.push(PaymentCredential::with_source(
+                challenge.to_echo(),
+                proof::proof_source(signer.address(), 42431),
+                crate::protocol::core::PaymentPayload::proof(signature),
+            ));
+        }
+
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
+        method.cached_chain_id.set(42431).unwrap();
+
+        method.verify(&credentials[0], &request).await.unwrap();
+
+        // A valid proof from another account cannot reuse the challenge.
+        let err = method.verify(&credentials[1], &request).await.unwrap_err();
+        assert!(err.to_string().contains("already been used"));
+        let err = ChargeMethodTrait::validate(&method, &credentials[1], &request)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already been used"));
     }
 
@@ -4167,7 +4182,7 @@ mod tests {
         let credential = PaymentCredential::with_source(
             challenge.to_echo(),
             proof::proof_source(signer.address(), 42431),
-            crate::protocol::core::PaymentPayload::proof(signature.clone()),
+            crate::protocol::core::PaymentPayload::proof(signature),
         );
 
         let provider =
@@ -4182,9 +4197,7 @@ mod tests {
             .unwrap();
         assert_eq!(validation.details["mode"], "proof");
 
-        let fingerprint =
-            proof::proof_fingerprint(&challenge.id, signer.address(), 42431, &signature).unwrap();
-        let key = format!("mpp:proof:{:x}", fingerprint);
+        let key = format!("mpp:charge:proof:{}", challenge.id);
         assert!(store.get(&key).await.unwrap().is_none());
 
         let receipt = ChargeMethodTrait::broadcast(&method, &credential, &request)
