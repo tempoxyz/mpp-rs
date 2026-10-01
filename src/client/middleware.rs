@@ -20,7 +20,7 @@ use crate::client::provider::{PaymentContext, PaymentProvider, PendingPayments};
 use crate::client::HttpError;
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
-use crate::protocol::core::{format_authorization, parse_www_authenticate_all};
+use crate::protocol::core::{format_authorization, parse_www_authenticate_all_bytes};
 
 async fn commit_middleware_payments<P: PaymentProvider>(
     payments: &mut PendingPayments<P>,
@@ -228,11 +228,11 @@ where
                 )));
             }
 
-            let www_auth_values: Vec<&str> = resp
+            let www_auth_values: Vec<&[u8]> = resp
                 .headers()
                 .get_all(WWW_AUTHENTICATE)
                 .iter()
-                .filter_map(|v| v.to_str().ok())
+                .map(|v| v.as_bytes())
                 .collect();
 
             if www_auth_values.is_empty() {
@@ -249,7 +249,7 @@ where
                 )));
             }
 
-            let challenges: Vec<_> = parse_www_authenticate_all(www_auth_values)
+            let challenges: Vec<_> = parse_www_authenticate_all_bytes(www_auth_values)
                 .into_iter()
                 .filter_map(|r| r.ok())
                 .collect();
@@ -666,6 +666,48 @@ mod tests {
             assert_eq!(provider.commit_count(), 1);
             assert_eq!(provider.rollback_count(), 0);
             assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn test_middleware_pays_challenge_with_raw_latin1_bytes() {
+            let www_auth = axum::http::HeaderValue::from_bytes(
+                b"Payment id=\"latin1\", realm=\"caf\xe9\", method=\"tempo\", intent=\"charge\", request=\"e30\"",
+            )
+            .unwrap();
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        if req.headers().get("authorization").is_some() {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()))
+                .build();
+
+            let resp = client
+                .get(format!("{}/paid", base_url))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(provider.challenge_ids(), vec!["latin1".to_string()]);
         }
 
         #[tokio::test]

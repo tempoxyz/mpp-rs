@@ -96,17 +96,12 @@ impl Transport for HttpTransport {
         if headers.iter().next().is_none() {
             return Err(MppError::MissingHeader("WWW-Authenticate".to_string()));
         }
-        let values = headers
-            .iter()
-            .map(|header| header.to_str())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                MppError::MalformedCredential(Some(format!("invalid WWW-Authenticate header: {e}")))
-            })?;
-        crate::protocol::core::parse_www_authenticate_all(values)
-            .into_iter()
-            .find_map(Result::ok)
-            .ok_or_else(|| MppError::MalformedCredential(Some("no valid Payment challenge".into())))
+        crate::protocol::core::parse_www_authenticate_all_bytes(
+            headers.iter().map(|header| header.as_bytes()),
+        )
+        .into_iter()
+        .find_map(Result::ok)
+        .ok_or_else(|| MppError::MalformedCredential(Some("no valid Payment challenge".into())))
     }
 
     fn set_credential(
@@ -150,6 +145,25 @@ mod tests {
             let response = reqwest::Response::from(response.body("").unwrap());
             assert_eq!(http().get_challenge(&response).unwrap().id, "first");
         }
+    }
+
+    #[test]
+    fn test_http_transport_decodes_latin1_field_values() {
+        let response = axum::http::Response::builder()
+            .status(402)
+            .header(
+                "WWW-Authenticate",
+                axum::http::HeaderValue::from_bytes(
+                    b"Payment id=\"latin1\", realm=\"caf\xe9\", method=\"tempo\", intent=\"charge\", request=\"e30\"",
+                )
+                .unwrap(),
+            )
+            .body("")
+            .unwrap();
+        let challenge = http()
+            .get_challenge(&reqwest::Response::from(response))
+            .unwrap();
+        assert_eq!(challenge.realm, "caf\u{e9}");
     }
 
     #[test]

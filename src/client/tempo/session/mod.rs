@@ -798,12 +798,12 @@ impl TempoSessionProvider {
             }
             if let Ok(response) = client.get(url).headers(headers.clone()).send().await {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-                    let refreshed = PaymentChallenge::from_headers(
+                    let refreshed = crate::protocol::core::parse_www_authenticate_all_bytes(
                         response
                             .headers()
                             .get_all(WWW_AUTHENTICATE)
                             .iter()
-                            .filter_map(|value| value.to_str().ok()),
+                            .map(|value| value.as_bytes()),
                     )
                     .into_iter()
                     .filter_map(Result::ok)
@@ -855,12 +855,12 @@ impl TempoSessionProvider {
             .mpp_http("session bootstrap challenge request failed")?;
 
         let response = if challenge_response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let challenge = PaymentChallenge::from_headers(
+            let challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
                 challenge_response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
                     .iter()
-                    .filter_map(|value| value.to_str().ok()),
+                    .map(|value| value.as_bytes()),
             )
             .into_iter()
             .filter_map(Result::ok)
@@ -1244,12 +1244,12 @@ impl TempoSessionProvider {
             .await
             .mpp_http("top-up POST failed")?;
         if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let fresh_challenge = PaymentChallenge::from_headers(
+            let fresh_challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
                 response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
                     .iter()
-                    .filter_map(|value| value.to_str().ok()),
+                    .map(|value| value.as_bytes()),
             )
             .into_iter()
             .filter_map(Result::ok)
