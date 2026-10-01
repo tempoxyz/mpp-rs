@@ -83,41 +83,35 @@ pub async fn sign_voucher(
     ))
 }
 
-/// The keychain envelope type prefix byte used by Tempo `SignatureEnvelope`.
-const KEYCHAIN_TYPE_PREFIX: u8 = 0x03;
-
-/// The 32-byte magic trailer that Tempo may append to serialized signature envelopes.
-const MAGIC_BYTES: [u8; 32] = [0x77; 32];
-
-/// Strip trailing Tempo magic bytes from a signature if present.
-fn strip_magic_trailer(sig: &[u8]) -> &[u8] {
-    if sig.len() > 32 && sig[sig.len() - 32..] == MAGIC_BYTES {
-        &sig[..sig.len() - 32]
-    } else {
-        sig
-    }
-}
-
-/// Try to parse a keychain envelope and return the embedded `userAddress`.
+/// Parse a voucher signature into its canonical 65-byte `r || s || v` encoding.
 ///
-/// Keychain wire format: `0x03` + userAddress (20 bytes) + inner signature.
-/// Returns `Some(address)` if the signature is a valid keychain envelope,
-/// `None` otherwise.
-fn parse_keychain_user_address(sig: &[u8]) -> Option<alloy::primitives::Address> {
-    // Minimum size: 1 (prefix) + 20 (address) + 65 (inner secp256k1) = 86
-    if sig.len() < 21 || sig[0] != KEYCHAIN_TYPE_PREFIX {
+/// Accepts the two encodings the escrow contract can settle: 65-byte
+/// `r || s || v` with `v` of 27 or 28, and 64-byte EIP-2098 compact. Both must
+/// be low-s. Everything else is rejected, including Tempo signature envelopes
+/// (keychain, P-256, WebAuthn) and signatures with trailing bytes.
+#[cfg(feature = "evm")]
+pub(super) fn canonical_voucher_signature(signature: &[u8]) -> Option<[u8; 65]> {
+    use alloy::primitives::Signature;
+
+    let signature = match signature.len() {
+        65 if matches!(signature[64], 27 | 28) => Signature::from_raw(signature).ok()?,
+        64 => Signature::from_erc2098(signature),
+        _ => return None,
+    };
+    if signature.normalize_s().is_some() {
         return None;
     }
-    let addr_bytes: [u8; 20] = sig[1..21].try_into().ok()?;
-    Some(alloy::primitives::Address::from(addr_bytes))
+    Some(signature.as_bytes())
 }
 
 /// Verify a voucher signature matches the expected signer.
 ///
-/// Supports both raw ECDSA signatures and Tempo `SignatureEnvelope` keychain
-/// signatures. For keychain envelopes (prefix `0x03`), the embedded
-/// `userAddress` is compared to `expected_signer`. For raw signatures,
-/// standard EIP-712 ECDSA recovery is used.
+/// Only canonical raw secp256k1 signatures are accepted: 65-byte
+/// `r || s || v` (`v` of 27 or 28) or 64-byte EIP-2098 compact, with a low
+/// `s` value. Tempo `SignatureEnvelope` encodings (keychain, P-256, WebAuthn)
+/// and signatures with trailing bytes are rejected, because the escrow
+/// contract verifies vouchers with `ecrecover` and cannot settle them.
+/// Matches the TS SDK (mppx), which requires the canonical serialization.
 ///
 /// Returns `true` if the signature is valid for `expected_signer`, `false`
 /// otherwise (including on any parse/recovery error).
@@ -130,24 +124,16 @@ pub fn verify_voucher(
     signature_bytes: &[u8],
     expected_signer: alloy::primitives::Address,
 ) -> bool {
-    let sig = strip_magic_trailer(signature_bytes);
-
-    // Reject keychain envelopes — the escrow contract verifies raw ECDSA
-    // signatures against authorizedSigner via ecrecover, not keychain-wrapped
-    // ones. Accepting them with only an address comparison (no inner signature
-    // verification) would allow trivial voucher forgery.
-    // Matches the TS SDK (mppx) behavior which returns false for keychain type.
-    if sig.len() != 65 && parse_keychain_user_address(sig).is_some() {
+    let Some(signature) = canonical_voucher_signature(signature_bytes) else {
         return false;
-    }
+    };
 
-    // Fall through to raw ECDSA signature recovery.
     verify_voucher_ecdsa(
         escrow_contract,
         chain_id,
         channel_id,
         cumulative_amount,
-        sig,
+        &signature,
         expected_signer,
     )
 }
@@ -414,58 +400,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_strip_magic_trailer() {
-        let raw = vec![0x01, 0x02, 0x03];
-        assert_eq!(strip_magic_trailer(&raw), &[0x01, 0x02, 0x03]);
-
-        let mut with_magic = vec![0x01, 0x02, 0x03];
-        with_magic.extend_from_slice(&[0x77; 32]);
-        assert_eq!(strip_magic_trailer(&with_magic), &[0x01, 0x02, 0x03]);
-
-        // Exactly 32 bytes of 0x77 with no payload — should NOT strip (len == 32, not > 32)
-        let just_magic = vec![0x77; 32];
-        assert_eq!(strip_magic_trailer(&just_magic), &[0x77; 32]);
-    }
-
-    #[test]
-    fn test_parse_keychain_user_address() {
-        use alloy::primitives::Address;
-
-        let addr: Address = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01"
-            .parse()
-            .unwrap();
-
-        // Valid keychain envelope: 0x03 + 20-byte address + 65-byte inner sig
-        let mut envelope = vec![KEYCHAIN_TYPE_PREFIX];
-        envelope.extend_from_slice(addr.as_slice());
-        envelope.extend_from_slice(&[0xAA; 65]); // dummy inner signature
-        assert_eq!(parse_keychain_user_address(&envelope), Some(addr));
-
-        // Too short (no inner signature bytes, but 21 bytes is minimum)
-        let mut short = vec![KEYCHAIN_TYPE_PREFIX];
-        short.extend_from_slice(addr.as_slice());
-        assert_eq!(parse_keychain_user_address(&short), Some(addr));
-
-        // Wrong prefix
-        let mut wrong_prefix = vec![0x01];
-        wrong_prefix.extend_from_slice(addr.as_slice());
-        wrong_prefix.extend_from_slice(&[0xAA; 65]);
-        assert_eq!(parse_keychain_user_address(&wrong_prefix), None);
-
-        // Too short to contain address
-        assert_eq!(
-            parse_keychain_user_address(&[KEYCHAIN_TYPE_PREFIX; 10]),
-            None
-        );
-
-        // A 65-byte signature starting with 0x03 is still treated as raw ECDSA
-        // by verify_voucher (matching TS SDK behavior where size === 65 is checked first).
-        let raw_65 = vec![0x03; 65];
-        assert!(parse_keychain_user_address(&raw_65).is_some()); // parse_keychain alone would match
-                                                                 // But verify_voucher skips keychain parsing for exactly 65 bytes.
-    }
-
     #[cfg(feature = "evm")]
     #[test]
     fn test_verify_voucher_keychain_envelope() {
@@ -482,7 +416,7 @@ mod tests {
         let chain_id = 42431u64;
 
         // Build a keychain envelope: 0x03 + userAddress (20 bytes) + inner sig (65 bytes)
-        let mut envelope = vec![KEYCHAIN_TYPE_PREFIX];
+        let mut envelope = vec![0x03];
         envelope.extend_from_slice(user_address.as_slice());
         envelope.extend_from_slice(&[0xAA; 65]); // dummy inner signature
 
@@ -515,10 +449,10 @@ mod tests {
         let chain_id = 42431u64;
 
         // Build a keychain envelope with trailing magic bytes
-        let mut envelope = vec![KEYCHAIN_TYPE_PREFIX];
+        let mut envelope = vec![0x03];
         envelope.extend_from_slice(user_address.as_slice());
         envelope.extend_from_slice(&[0xAA; 65]);
-        envelope.extend_from_slice(&MAGIC_BYTES);
+        envelope.extend_from_slice(&[0x77; 32]);
 
         // Keychain envelopes are rejected even with magic trailer
         assert!(!verify_voucher(
@@ -529,6 +463,77 @@ mod tests {
             &envelope,
             user_address,
         ));
+    }
+
+    #[cfg(feature = "evm")]
+    #[tokio::test]
+    async fn test_verify_voucher_signature_encodings() {
+        use alloy::primitives::{Address, Signature, B256, U256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xAB);
+        let cumulative_amount = 1000u128;
+        let escrow_contract: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let chain_id = 42431u64;
+
+        let sig = sign_voucher(
+            &signer,
+            channel_id,
+            cumulative_amount,
+            escrow_contract,
+            chain_id,
+        )
+        .await
+        .unwrap()
+        .to_vec();
+        let parsed = Signature::from_raw(&sig).unwrap();
+
+        let order = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            16,
+        )
+        .unwrap();
+        let high_s = Signature::new(parsed.r(), order - parsed.s(), !parsed.v());
+        assert!(high_s.s() > order >> 1);
+
+        let with_suffix = |suffix: &[u8]| [sig.as_slice(), suffix].concat();
+        let with_v = |v: u8| [&sig[..64], &[v]].concat();
+
+        let cases = [
+            ("65-byte r||s||v", sig.clone(), true),
+            ("EIP-2098 compact", parsed.as_erc2098().to_vec(), true),
+            ("high-s", high_s.as_bytes().to_vec(), false),
+            ("magic trailer", with_suffix(&[0x77; 32]), false),
+            ("trailing byte", with_suffix(&[0x00]), false),
+            ("y-parity v", with_v(sig[64] - 27), false),
+            ("EIP-155 v", with_v(sig[64] + 8), false),
+            ("truncated", sig[..63].to_vec(), false),
+            ("empty", Vec::new(), false),
+        ];
+        for (name, signature, accepted) in cases {
+            assert_eq!(
+                verify_voucher(
+                    escrow_contract,
+                    chain_id,
+                    channel_id,
+                    cumulative_amount,
+                    &signature,
+                    signer.address(),
+                ),
+                accepted,
+                "{name}"
+            );
+        }
+
+        let canonical: [u8; 65] = sig.as_slice().try_into().unwrap();
+        assert_eq!(canonical_voucher_signature(&sig), Some(canonical));
+        assert_eq!(
+            canonical_voucher_signature(&parsed.as_erc2098()),
+            Some(canonical)
+        );
     }
 
     #[cfg(feature = "evm")]

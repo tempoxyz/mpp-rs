@@ -14,7 +14,7 @@ use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
 use super::session::{SessionCredentialPayload, TempoSessionMethodDetails};
-use super::voucher::verify_voucher;
+use super::voucher::{canonical_voucher_signature, verify_voucher};
 use super::{INTENT_SESSION, METHOD_NAME};
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::intents::SessionRequest;
@@ -359,12 +359,20 @@ impl<P> SessionMethod<P> {
             .map_err(|e| VerificationError::invalid_payload(format!("Invalid channel ID: {}", e)))
     }
 
-    /// Parse a hex signature string to bytes.
+    /// Parse a hex voucher signature into its canonical 65-byte encoding.
+    ///
+    /// The returned bytes are what gets stored and submitted on-chain, so
+    /// encodings the escrow contract cannot settle are rejected here.
     fn parse_signature(signature: &str) -> Result<Vec<u8>, VerificationError> {
         let s = signature.strip_prefix("0x").unwrap_or(signature);
-        hex::decode(s).map_err(|e| {
+        let bytes = hex::decode(s).map_err(|e| {
             VerificationError::invalid_payload(format!("Invalid signature hex: {}", e))
-        })
+        })?;
+        canonical_voucher_signature(&bytes)
+            .map(Vec::from)
+            .ok_or_else(|| {
+                VerificationError::invalid_signature("voucher signature is not canonical")
+            })
     }
 
     /// Parse an address string.
@@ -1886,7 +1894,7 @@ mod tests {
 
     #[test]
     fn test_parse_signature_valid() {
-        let sig_hex = format!("0x{}", "ab".repeat(65));
+        let sig_hex = format!("0x{}1b", "01".repeat(64));
         let result = SessionMethod::<()>::parse_signature(&sig_hex);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 65);
@@ -1894,7 +1902,7 @@ mod tests {
 
     #[test]
     fn test_parse_signature_no_prefix() {
-        let sig_hex = "ab".repeat(65);
+        let sig_hex = format!("{}1b", "01".repeat(64));
         let result = SessionMethod::<()>::parse_signature(&sig_hex);
         assert!(result.is_ok());
     }
@@ -2516,6 +2524,65 @@ mod tests {
             err.code,
             Some(crate::protocol::traits::ErrorCode::InvalidSignature)
         );
+    }
+
+    #[tokio::test]
+    async fn test_voucher_signature_must_be_canonical() {
+        use crate::protocol::methods::tempo::voucher::sign_voucher;
+        use alloy::primitives::{Signature, U256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::random();
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let channel_id_b256 = channel_id.parse::<B256>().unwrap();
+        let escrow: Address = "0x5555555555555555555555555555555555555555"
+            .parse()
+            .unwrap();
+        let signature = sign_voucher(&signer, channel_id_b256, 2_000, escrow, 42431)
+            .await
+            .unwrap()
+            .to_vec();
+        let parsed = Signature::from_raw(&signature).unwrap();
+
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.deposit = 10_000;
+        store.insert(&channel_id, state.clone());
+
+        let method = test_session_method(store.clone());
+        let submit = |signature: Vec<u8>| {
+            let signature = alloy::hex::encode_prefixed(signature);
+            let (method, channel_id, state) = (&method, &channel_id, &state);
+            async move {
+                method
+                    .verify_and_accept_voucher(
+                        channel_id, state, 2_000, &signature, escrow, 42431, 0, 10_000, 0, false, 0,
+                    )
+                    .await
+            }
+        };
+
+        let order = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            16,
+        )
+        .unwrap();
+        let high_s = Signature::new(parsed.r(), order - parsed.s(), !parsed.v());
+        let with_trailer = [signature.as_slice(), &[0x77; 32]].concat();
+        for rejected in [high_s.as_bytes().to_vec(), with_trailer] {
+            let err = submit(rejected).await.unwrap_err();
+            assert_eq!(err.code, Some(ErrorCode::InvalidSignature));
+        }
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(stored.highest_voucher_amount, 1_000);
+
+        // An EIP-2098 compact signature is accepted and stored in the 65-byte form.
+        submit(parsed.as_erc2098().to_vec()).await.unwrap();
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(stored.highest_voucher_amount, 2_000);
+        assert_eq!(stored.highest_voucher_signature, Some(signature));
     }
 
     #[tokio::test]
