@@ -114,7 +114,7 @@ pub struct SessionVerifyResult {
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
 /// let method = TempoChargeMethod::new(provider);
-/// let payment = Mpp::new(method, "api.example.com", "my-server-secret");
+/// let payment = Mpp::new(method, "api.example.com", "my-server-secret-of-at-least-32-bytes");
 ///
 /// let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
 /// ```
@@ -142,6 +142,9 @@ where
     /// Create a new payment handler (advanced API).
     ///
     /// For a simpler API, use [`Mpp::create()`] with [`tempo()`](super::tempo).
+    ///
+    /// `secret_key` should be at least 32 bytes. This constructor cannot fail
+    /// and does not check the length; [`Mpp::create()`] does.
     pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpp<M, ()> {
         Mpp {
             method,
@@ -161,6 +164,8 @@ where
     }
 
     /// Create a new payment handler with pre-configured currency and recipient (advanced API).
+    ///
+    /// `secret_key` must be at least 32 bytes; see [`Mpp::new()`].
     pub fn new_with_config(
         method: M,
         realm: impl Into<String>,
@@ -1350,6 +1355,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                     SECRET_KEY_ENV_VAR
                 ))
             })?;
+        crate::protocol::core::validate_secret_key(&secret_key)?;
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
         let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
@@ -1509,7 +1515,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
     ///     currency: "usd",
     ///     decimals: 2,
     /// })
-    /// .secret_key("my-hmac-secret"))?;
+    /// .secret_key("my-hmac-secret-of-at-least-32-bytes"))?;
     /// ```
     pub fn create_stripe(builder: super::StripeBuilder) -> Result<Self> {
         let secret_key = builder
@@ -1522,6 +1528,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
                     SECRET_KEY_ENV_VAR
                 ))
             })?;
+        crate::protocol::core::validate_secret_key(&secret_key)?;
 
         let mut method = crate::protocol::methods::stripe::method::ChargeMethod::new(
             &builder.secret_key,
@@ -1571,6 +1578,8 @@ mod tests {
             Arc, Mutex,
         },
     };
+
+    const TEST_SECRET: &str = "test-secret-key-at-least-32-bytes";
 
     #[derive(Clone)]
     struct MockMethod;
@@ -1792,7 +1801,7 @@ mod tests {
                     reject_validation,
                 },
                 "api.example.com",
-                "test-secret",
+                TEST_SECRET,
             ),
             calls,
         )
@@ -1809,7 +1818,7 @@ mod tests {
                     reject_validation: false,
                 },
                 "api.example.com",
-                "test-secret",
+                TEST_SECRET,
             ),
             calls,
         )
@@ -1841,7 +1850,7 @@ mod tests {
     #[tokio::test]
     async fn validate_credential_is_non_mutating() {
         let (payment, calls) = lifecycle_payment(false);
-        let credential = test_credential_with_body_digest("test-secret", b"body");
+        let credential = test_credential_with_body_digest(TEST_SECRET, b"body");
 
         let validation = payment
             .validate_credential_with_body(&credential, b"body")
@@ -1879,7 +1888,7 @@ mod tests {
                     | EntryPoint::ValidateCredentialWithExpectedRequestAndBody
             );
             let credential =
-                test_lifecycle_credential("test-secret", uses_body.then_some(b"body".as_slice()));
+                test_lifecycle_credential(TEST_SECRET, uses_body.then_some(b"body".as_slice()));
             let expected = test_request();
 
             let validation = match entry_point {
@@ -1919,7 +1928,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_credential_validates_then_broadcasts_without_legacy_verify() {
         let (payment, calls) = lifecycle_payment(false);
-        let credential = test_credential_with_body_digest("test-secret", b"body");
+        let credential = test_credential_with_body_digest(TEST_SECRET, b"body");
 
         let receipt = payment
             .broadcast_credential_with_body(&credential, b"body")
@@ -1933,7 +1942,7 @@ mod tests {
     #[tokio::test]
     async fn verify_credential_is_broadcast_compatibility_alias() {
         let (payment, calls) = lifecycle_payment(false);
-        let credential = test_credential_with_body_digest("test-secret", b"body");
+        let credential = test_credential_with_body_digest(TEST_SECRET, b"body");
 
         let receipt = payment
             .verify_credential_with_body(&credential, b"body")
@@ -1947,7 +1956,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_credential_stops_when_validation_fails() {
         let (payment, calls) = lifecycle_payment(true);
-        let credential = test_credential_with_body_digest("test-secret", b"body");
+        let credential = test_credential_with_body_digest(TEST_SECRET, b"body");
 
         let error = payment
             .broadcast_credential_with_body(&credential, b"body")
@@ -1997,7 +2006,7 @@ mod tests {
                     | EntryPoint::VerifyCredentialWithExpectedRequestAndBody
             );
             let credential =
-                test_lifecycle_credential("test-secret", uses_body.then_some(b"body".as_slice()));
+                test_lifecycle_credential(TEST_SECRET, uses_body.then_some(b"body".as_slice()));
             let expected = test_request();
 
             let receipt = match entry_point {
@@ -2058,7 +2067,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_reports_terminal_failure_after_validation() {
         let (payment, calls) = lifecycle_payment_rejecting_broadcast();
-        let credential = test_lifecycle_credential("test-secret", None);
+        let credential = test_lifecycle_credential(TEST_SECRET, None);
 
         let error = payment.broadcast_credential(&credential).await.unwrap_err();
 
@@ -2084,7 +2093,7 @@ mod tests {
                     }
                 }
             });
-            let credential = test_lifecycle_credential("test-secret", None);
+            let credential = test_lifecycle_credential(TEST_SECRET, None);
 
             assert!(payment.broadcast_credential(&credential).await.is_err());
             assert_eq!(success_count.load(Ordering::SeqCst), 0);
@@ -2097,7 +2106,7 @@ mod tests {
 
         for case in cases {
             let (payment, calls) = lifecycle_payment(false);
-            let mut credential = test_lifecycle_credential("test-secret", Some(b"body"));
+            let mut credential = test_lifecycle_credential(TEST_SECRET, Some(b"body"));
             let result = match case {
                 "invalid-hmac" => {
                     credential.challenge.id = "invalid".into();
@@ -2137,9 +2146,9 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             "api.example.com",
-            "test-secret",
+            TEST_SECRET,
         );
-        let credential = test_lifecycle_credential("test-secret", None);
+        let credential = test_lifecycle_credential(TEST_SECRET, None);
 
         let receipt = payment.broadcast_credential(&credential).await.unwrap();
 
@@ -2155,9 +2164,9 @@ mod tests {
                 calls: Arc::clone(&calls),
             },
             "api.example.com",
-            "test-secret",
+            TEST_SECRET,
         );
-        let credential = test_lifecycle_credential("test-secret", None);
+        let credential = test_lifecycle_credential(TEST_SECRET, None);
 
         let error = payment.validate_credential(&credential).await.unwrap_err();
 
@@ -2177,7 +2186,7 @@ mod tests {
     #[cfg(feature = "tempo")]
     #[test]
     fn test_charge_challenge_generation() {
-        let payment = Mpp::new(MockMethod, "api.example.com", "test-secret");
+        let payment = Mpp::new(MockMethod, "api.example.com", TEST_SECRET);
         let challenge = payment
             .charge_challenge(
                 "1000000",
@@ -2279,7 +2288,7 @@ mod tests {
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        let secret = "test-secret";
+        let secret = TEST_SECRET;
         let id = crate::protocol::core::compute_challenge_id(
             secret,
             "api.example.com",
@@ -2390,7 +2399,7 @@ mod tests {
             tempo(TempoConfig {
                 recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
             })
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         )
         .unwrap()
     }
@@ -2422,7 +2431,7 @@ mod tests {
             .chain_id(CHAIN_ID)
             .fee_payer(true)
             .fee_payer_signer(fee_payer_signer)
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         )
         .unwrap();
 
@@ -2456,7 +2465,7 @@ mod tests {
             .chain_id(chain_id)
             .fee_payer(true)
             .fee_payer_signer(fee_payer_signer)
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         )
         .unwrap();
 
@@ -2486,7 +2495,7 @@ mod tests {
             .fee_payer(true)
             .fee_payer_signer(fee_payer_signer)
             .fee_payer_allowed_fee_tokens(vec![custom_token])
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         )
         .unwrap();
 
@@ -2552,6 +2561,23 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
+    fn test_mpp_create_rejects_short_secret_key() {
+        let create = |secret_key: &str| {
+            Mpp::create(
+                tempo(TempoConfig {
+                    recipient: TEST_RECIPIENT,
+                })
+                .secret_key(secret_key),
+            )
+        };
+
+        let err = create(&"k".repeat(31)).err().expect("31-byte key");
+        assert!(err.to_string().contains("at least 32 bytes"), "{err}");
+        assert!(create(&"k".repeat(32)).is_ok());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
     fn test_charge_dollar_amount() {
         let mpp = create_test_mpp();
 
@@ -2587,7 +2613,7 @@ mod tests {
             })
             .chain_id(CHAIN_ID)
             .machine_token_enabled(true)
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         )
         .unwrap();
 
@@ -2606,7 +2632,7 @@ mod tests {
             })
             .chain_id(1)
             .machine_token_enabled(true)
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         );
         match result {
             Ok(_) => panic!("unsupported machine-token chain should fail"),
@@ -2709,7 +2735,7 @@ mod tests {
 
         let digest = crate::body_digest::compute(body);
         assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
-        assert!(challenge.verify("test-secret"));
+        assert!(challenge.verify(TEST_SECRET));
     }
 
     // ── Real HMAC challenge verification tests ─────────────────────────
@@ -2742,7 +2768,7 @@ mod tests {
             method: TempoSuccessMethod,
             session_method: None,
             realm: "MPP Payment".into(),
-            secret_key: "test-secret".into(),
+            secret_key: TEST_SECRET.into(),
             currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
@@ -2782,7 +2808,7 @@ mod tests {
             .to_header()
             .unwrap()
             .contains(r#"header="Payment-Authorization""#));
-        assert!(challenge.verify("test-secret"));
+        assert!(challenge.verify(TEST_SECRET));
 
         let credential =
             PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
@@ -2920,7 +2946,7 @@ mod tests {
         echo.request = encoded;
         // Re-sign with server secret so HMAC passes
         let id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -2948,7 +2974,7 @@ mod tests {
         let mut echo = challenge.to_echo();
         echo.request = encoded;
         let id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -2980,7 +3006,7 @@ mod tests {
         let mut echo = challenge.to_echo();
         echo.request = encoded;
         let id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -3014,7 +3040,7 @@ mod tests {
         let mut echo = challenge.to_echo();
         echo.request = encoded;
         let id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -3040,7 +3066,7 @@ mod tests {
         echo.opaque =
             Some(Base64UrlJson::from_value(&serde_json::json!({"route": "other"})).unwrap());
         echo.id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -3068,7 +3094,7 @@ mod tests {
             .to_echo();
         echo.opaque = opaque;
         echo.id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -3146,7 +3172,7 @@ mod tests {
             .to_echo();
         echo.opaque = opaque;
         echo.id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "session",
@@ -3206,7 +3232,7 @@ mod tests {
         let mut echo = challenge.to_echo();
         echo.intent = "session".into();
         let id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "session",
@@ -3232,7 +3258,7 @@ mod tests {
         let mut echo = challenge.to_echo();
         echo.method = "stripe".into();
         let id = crate::protocol::core::compute_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "stripe",
             "charge",
@@ -3380,7 +3406,7 @@ mod tests {
             method: TempoSuccessMethod,
             session_method: Some(MockSessionMethod::success()),
             realm: "MPP Payment".into(),
-            secret_key: "test-secret".into(),
+            secret_key: TEST_SECRET.into(),
             currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
@@ -3459,7 +3485,7 @@ mod tests {
             method: TempoSuccessMethod,
             session_method: Some(mock_session),
             realm: "MPP Payment".into(),
-            secret_key: "test-secret".into(),
+            secret_key: TEST_SECRET.into(),
             currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
@@ -3505,7 +3531,7 @@ mod tests {
             method: TempoSuccessMethod,
             session_method: None,
             realm: "MPP Payment".into(),
-            secret_key: "test-secret".into(),
+            secret_key: TEST_SECRET.into(),
             currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
@@ -3613,7 +3639,7 @@ mod tests {
             .fee_payer(true)
             .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
             .machine_token_enabled(true)
-            .secret_key("test-secret"),
+            .secret_key(TEST_SECRET),
         )
         .unwrap()
         .with_session_method(session_method)
@@ -3731,7 +3757,7 @@ mod tests {
             method: TempoSuccessMethod,
             session_method: Some(mock_session),
             realm: "MPP Payment".into(),
-            secret_key: "test-secret".into(),
+            secret_key: TEST_SECRET.into(),
             currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
             recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
             decimals: DEFAULT_DECIMALS,
@@ -3870,7 +3896,7 @@ mod tests {
         };
         let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let id = crate::protocol::methods::tempo::generate_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "charge",
@@ -4169,7 +4195,7 @@ mod tests {
         };
         let encoded = Base64UrlJson::from_typed(&request).unwrap();
         let id = crate::protocol::methods::tempo::generate_challenge_id(
-            "test-secret",
+            TEST_SECRET,
             "MPP Payment",
             "tempo",
             "session",
@@ -4279,9 +4305,29 @@ mod tests {
                 currency: "usd",
                 decimals: 2,
             })
-            .secret_key("test-hmac-secret"),
+            .secret_key(TEST_SECRET),
         )
         .expect("failed to create stripe mpp")
+    }
+
+    #[cfg(feature = "stripe")]
+    #[test]
+    fn test_create_stripe_rejects_short_secret_key() {
+        use crate::server::{stripe, StripeConfig};
+
+        let err = Mpp::create_stripe(
+            stripe(StripeConfig {
+                secret_key: "sk_test_mock",
+                network_id: "test-net",
+                payment_method_types: &["card"],
+                currency: "usd",
+                decimals: 2,
+            })
+            .secret_key(&"k".repeat(31)),
+        )
+        .err()
+        .expect("31-byte key");
+        assert!(err.to_string().contains("at least 32 bytes"), "{err}");
     }
 
     #[cfg(feature = "stripe")]
@@ -4401,11 +4447,11 @@ mod tests {
 
         let digest = crate::body_digest::compute(body);
         assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
-        assert!(challenge.verify("test-hmac-secret"));
+        assert!(challenge.verify(TEST_SECRET));
 
         let mut tampered = challenge.clone();
         tampered.digest = Some(crate::body_digest::compute(br#"{"query":"tampered"}"#));
-        assert!(!tampered.verify("test-hmac-secret"));
+        assert!(!tampered.verify(TEST_SECRET));
     }
 
     #[cfg(feature = "stripe")]
@@ -4433,7 +4479,7 @@ mod tests {
             challenge.description.as_deref(),
             Some("body-bound stripe charge")
         );
-        assert!(challenge.verify("test-hmac-secret"));
+        assert!(challenge.verify(TEST_SECRET));
         let request: serde_json::Value = challenge.request.decode_value().expect("decode request");
         assert_eq!(request["externalId"], "order-42");
     }
@@ -4448,7 +4494,7 @@ mod tests {
         tempo(TempoConfig {
             recipient: TEST_RECIPIENT,
         })
-        .secret_key("test-secret")
+        .secret_key(TEST_SECRET)
     }
 
     #[cfg(feature = "tempo")]
@@ -4562,7 +4608,7 @@ mod tests {
                 ] {
                     assert_eq!(challenge_currencies(&offers), accepted);
                     for offer in offers {
-                        assert!(offer.verify("test-secret"));
+                        assert!(offer.verify(TEST_SECRET));
                         assert_eq!(
                             offer.digest,
                             body_bound.then(|| crate::body_digest::compute(body))
@@ -4606,7 +4652,7 @@ mod tests {
             assert_eq!(request.amount, "250000");
             assert_eq!(request.recipient.as_deref(), Some(TEST_RECIPIENT));
             assert_eq!(request.chain_id(), Some(CHAIN_ID));
-            assert!(challenge.verify("test-secret"));
+            assert!(challenge.verify(TEST_SECRET));
         }
         assert_ne!(challenges[0].id, challenges[1].id);
     }
@@ -5022,7 +5068,7 @@ mod tests {
         assert!(mpp.verify_credential(&credential).await.is_ok());
 
         // Unbound handlers accept whatever currency the request names, as before.
-        let unbound = Mpp::new(TempoSuccessMethod, "MPP Payment", "test-secret");
+        let unbound = Mpp::new(TempoSuccessMethod, "MPP Payment", TEST_SECRET);
         assert!(unbound.currencies().is_empty());
         assert!(unbound.currency().is_none());
         let challenge = unbound

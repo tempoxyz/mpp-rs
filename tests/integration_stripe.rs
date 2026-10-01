@@ -24,6 +24,9 @@ use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
 use mpp::server::{stripe, Mpp, StripeChargeOptions, StripeConfig};
 use reqwest::Client;
 
+/// HMAC secret for test servers (the SDK requires at least 32 bytes).
+const TEST_SECRET: &str = "test-secret-key-at-least-32-bytes";
+
 // ==================== Mock Stripe API ====================
 
 /// Start a mock Stripe API server that accepts `POST /v1/payment_intents`
@@ -360,7 +363,7 @@ async fn test_e2e_stripe_charge() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-hmac-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -422,7 +425,7 @@ async fn test_stripe_402_challenge_format() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -479,7 +482,7 @@ async fn test_stripe_health_no_payment() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -514,7 +517,7 @@ async fn test_stripe_requires_action_rejected() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -563,7 +566,7 @@ async fn test_stripe_challenge_contains_method_details() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -619,7 +622,7 @@ async fn test_e2e_stripe_charge_with_description() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -687,7 +690,7 @@ async fn test_stripe_error_body_parsing() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("create mpp");
 
@@ -726,7 +729,7 @@ async fn test_stripe_rejects_replayed_credential() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("create mpp");
 
@@ -769,7 +772,7 @@ async fn test_stripe_charge_via_mpp_charge_extractor() {
             decimals: 2,
         })
         .stripe_api_base(&stripe_url)
-        .secret_key("test-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
 
@@ -1091,7 +1094,7 @@ fn create_live_mpp(secret_key: &str) -> Mpp<mpp::protocol::methods::stripe::meth
             currency: "usd",
             decimals: 2,
         })
-        .secret_key("live-test-hmac-secret"),
+        .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp")
 }
