@@ -383,6 +383,9 @@ where
                     "request could not be cloned for payment retry"
                 )));
             };
+            // The challenge came from the final URL of any same-origin redirect,
+            // so that is where the credential goes.
+            *retry_req.url_mut() = resp.url().clone();
             retry_req.headers_mut().insert(
                 crate::client::payment_credential_header_name(&challenge),
                 auth_header_value,
@@ -779,6 +782,59 @@ mod tests {
             assert_eq!(provider.call_count(), 0);
             assert_eq!(authorization_observed.load(Ordering::SeqCst), 0);
             assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn paid_retry_targets_final_same_origin_url() {
+            let (_, www_auth) = test_challenge();
+            let app = Router::new()
+                .route(
+                    "/start",
+                    get(|req: axum::http::Request<axum::body::Body>| async move {
+                        if req.headers().contains_key("authorization") {
+                            return AxumStatusCode::BAD_REQUEST.into_response();
+                        }
+                        (
+                            AxumStatusCode::TEMPORARY_REDIRECT,
+                            [(axum::http::header::LOCATION, "/paid")],
+                            "redirect",
+                        )
+                            .into_response()
+                    }),
+                )
+                .route(
+                    "/paid",
+                    get(move |req: axum::http::Request<axum::body::Body>| {
+                        let www_auth = www_auth.clone();
+                        async move {
+                            if req.headers().contains_key("authorization") {
+                                AxumStatusCode::OK.into_response()
+                            } else {
+                                (
+                                    AxumStatusCode::PAYMENT_REQUIRED,
+                                    [(WWW_AUTH_NAME, www_auth)],
+                                    "pay up",
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }),
+                );
+            let base_url = spawn_server(app).await;
+            let provider = TestProvider::new();
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(PaymentMiddleware::new(provider.clone()))
+                .build();
+
+            let resp = client
+                .get(format!("{base_url}/start"))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            assert_eq!(resp.url().path(), "/paid");
+            assert_eq!(provider.call_count(), 1);
         }
 
         #[tokio::test]
