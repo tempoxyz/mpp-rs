@@ -1332,6 +1332,47 @@ impl TempoSessionProvider {
         Ok(receipt)
     }
 
+    /// Returns the deposit to plan a voucher against: the local view, raised
+    /// to the deposit the server reports when that is ahead, e.g. after a
+    /// top-up this provider did not make.
+    async fn known_deposit(
+        &self,
+        channel_id_hex: &str,
+        server_deposit: u128,
+    ) -> Result<u128, MppError> {
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(channel_id_hex)
+            .cloned()
+            .ok_or_else(|| {
+                MppError::InvalidConfig(format!("no channel found for id {channel_id_hex}"))
+            })?;
+        let mut entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.channel_id.to_string() == channel_id_hex)
+            .cloned()
+            .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        if server_deposit <= entry.deposit {
+            return Ok(entry.deposit);
+        }
+
+        entry.deposit = server_deposit;
+        self.persist_channel(&entry).await?;
+        // Raised in place: the entry may have advanced since it was read.
+        if let Some(current) = self.channels.lock().unwrap().get_mut(&key) {
+            if current.channel_id == entry.channel_id {
+                current.deposit = current.deposit.max(server_deposit);
+            }
+        }
+        self.notify_update(&entry);
+        Ok(server_deposit)
+    }
+
     /// Mirror MPPx need-voucher handling: top up over HTTP when required, then
     /// return the voucher that the WebSocket transport sends in-band.
     pub async fn voucher_credential_with_top_up(
@@ -1371,13 +1412,14 @@ impl TempoSessionProvider {
         required_cumulative: u128,
         server_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
+        let deposit = self.known_deposit(channel_id_hex, server_deposit).await?;
         let session_request: SessionRequest = challenge
             .request
             .decode()
             .mpp_config("failed to decode session request")?;
         if let Some(additional_deposit) = self.required_top_up(
             required_cumulative,
-            server_deposit,
+            deposit,
             session_request.suggested_deposit.as_deref(),
         )? {
             self.top_up_with_headers_for_challenge(
@@ -2800,6 +2842,51 @@ mod tests {
         channel_id
     }
 
+    /// Points the provider at an RPC node that answers with `responses` in order.
+    fn mock_rpc(provider: &mut TempoSessionProvider, responses: &[&str]) {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let asserter = Asserter::new();
+        for response in responses {
+            asserter.push_success(response);
+        }
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+    }
+
+    /// Challenge id and payload of every credential a management server received.
+    type Posted = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// Serves a session management endpoint on a local port. Every POST is
+    /// recorded and answered by `respond(challenge id, payload)`.
+    async fn management_server<F>(respond: F) -> (String, Posted)
+    where
+        F: Fn(&str, &serde_json::Value) -> axum::response::Response + Clone + Send + Sync + 'static,
+    {
+        let posted = Posted::default();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post({
+                let posted = posted.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let credential =
+                        PaymentCredential::from_header(headers["authorization"].to_str().unwrap())
+                            .unwrap();
+                    let response = respond(&credential.challenge.id, &credential.payload);
+                    posted
+                        .lock()
+                        .unwrap()
+                        .push((credential.challenge.id, credential.payload));
+                    async move { response }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, posted)
+    }
+
     #[tokio::test]
     async fn rollback_forgets_pending_open_and_keeps_established_channel() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
@@ -3065,6 +3152,70 @@ mod tests {
             err,
             MppError::InvalidConfig(ref msg) if msg.contains("active session")
         ));
+    }
+
+    #[tokio::test]
+    async fn need_voucher_skips_the_top_up_the_server_deposit_already_covers() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+
+        // Someone else raised the deposit to 2000. No top-up may be sent, and
+        // nothing listens on the management URL to accept one.
+        let credential = provider
+            .voucher_credential_with_top_up_for_challenge(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                1_500,
+                2_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(credential.payload["cumulativeAmount"], "1500");
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 2_000);
+    }
+
+    #[tokio::test]
+    async fn need_voucher_tops_up_from_the_deposit_the_server_reports() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider();
+        mock_rpc(&mut provider, &["0x4a817c800", "0x5208"]); // eth_gasPrice, eth_estimateGas
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+
+        let credential = provider
+            .voucher_credential_with_top_up_for_challenge(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                2_500,
+                2_000,
+            )
+            .await
+            .unwrap();
+
+        // 2500 needs 500 on top of the 2000 the server holds.
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].1["action"], "topUp");
+        assert_eq!(posted[0].1["additionalDeposit"], "500");
+        assert_eq!(credential.payload["cumulativeAmount"], "2500");
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 2_500);
     }
 
     // --- close early-return paths ---
