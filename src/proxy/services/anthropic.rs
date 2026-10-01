@@ -22,7 +22,7 @@ use crate::proxy::service::{Service, ServiceBuilder};
 /// });
 ///
 /// assert_eq!(svc.id, "anthropic");
-/// assert_eq!(svc.headers.get("x-api-key").unwrap(), "sk-ant-...");
+/// assert_eq!(svc.headers, [("x-api-key".to_string(), "sk-ant-...".to_string())]);
 /// ```
 pub fn service(api_key: &str, configure: impl FnOnce(ServiceBuilder) -> ServiceBuilder) -> Service {
     configure(Service::new("anthropic", "https://api.anthropic.com").header("x-api-key", api_key))
