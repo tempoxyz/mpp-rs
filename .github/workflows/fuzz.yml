@@ -1,9 +1,16 @@
 name: Fuzz
 
+# The 30 second smoke run on pull requests is the `fuzz` job of ci.yml. This
+# workflow gives every target more time once a day.
 on:
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        type: number
+        default: 600
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,14 +18,14 @@ env:
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
-  smoke:
-    name: Fuzz smoke
+  nightly:
+    name: Fuzz nightly
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       contents: read
       id-token: write
@@ -44,9 +51,10 @@ jobs:
         with:
           tool: cargo-fuzz
       # A crash fails the job; the log prints the reproducer as base64.
-      - name: Run every target for 30 seconds
-        run: fuzz/run-all.sh 30
+      - name: Run every target
+        run: fuzz/run-all.sh "$SECONDS_PER_TARGET"
         env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || 600 }}
           FUZZ_JOBS: 4
           # The prebuilt cargo-fuzz is a musl binary and defaults to its own
           # target, which sanitizers do not support.

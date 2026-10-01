@@ -64,7 +64,9 @@ cargo +nightly fuzz run --sanitizer none fuzz_challenge_list
 
 `run-all.sh` builds with `--features tempo`, passes each target its seeds and
 dictionary, and exits non-zero if a target crashes. CI runs it for 30 seconds
-per target on every pull request (`.github/workflows/fuzz.yml`).
+per target on every pull request (the `fuzz` job of `.github/workflows/ci.yml`,
+which the required `CI Gate` depends on) and for ten minutes per target once a
+day (`.github/workflows/fuzz.yml`).
 
 ## Seeds and dictionaries
 

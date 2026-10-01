@@ -157,10 +157,50 @@ jobs:
       contents: read
       id-token: write
 
+  fuzz:
+    name: Fuzz smoke
+    # Pull requests only: a crash should stop a merge, not a release build.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        with:
+          toolchain: nightly
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        with:
+          workspaces: fuzz
+      - name: Resolve Cargo dependencies
+        # The fuzz crate is its own workspace. Start it from the root lockfile
+        # so it resolves the same versions as the other jobs.
+        run: |
+          .github/scripts/resolve-cargo-dependencies.sh
+          cp Cargo.lock fuzz/Cargo.lock
+      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        with:
+          tool: cargo-fuzz
+      # A crash fails the job; the log prints the reproducer as base64.
+      - name: Run every target for 30 seconds
+        run: fuzz/run-all.sh 30
+        env:
+          FUZZ_JOBS: 4
+          # The prebuilt cargo-fuzz is a musl binary and defaults to its own
+          # target, which sanitizers do not support.
+          CARGO_FUZZ_ARGS: --target x86_64-unknown-linux-gnu
+
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test, integration, deny]
+    needs: [lint, test, integration, deny, fuzz]
     runs-on: ubuntu-latest
     permissions:
       contents: read
