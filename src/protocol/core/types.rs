@@ -127,6 +127,13 @@ impl IntentName {
         Self(name.into().to_ascii_lowercase())
     }
 
+    /// Wrap an intent received on the wire without normalizing it.
+    ///
+    /// The challenge id binds the intent, so it has to be echoed as received.
+    pub(super) fn from_wire(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
     /// Get the intent name as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
