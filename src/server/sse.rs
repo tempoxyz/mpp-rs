@@ -123,15 +123,35 @@ pub fn format_need_voucher_event(event: &NeedVoucherEvent) -> String {
 
 /// Format application data as a Server-Sent Event.
 ///
+/// Multi-line data is emitted as one `data:` field per line, so line breaks
+/// in `data` can never terminate the event or start a new one. `\r\n` and
+/// `\r` are SSE line terminators as well and arrive as `\n`.
+///
 /// # Example
 ///
 /// ```
 /// use mpp::server::sse::format_message_event;
 ///
 /// assert_eq!(format_message_event("hello"), "event: message\ndata: hello\n\n");
+/// assert_eq!(
+///     format_message_event("line1\nline2"),
+///     "event: message\ndata: line1\ndata: line2\n\n"
+/// );
 /// ```
 pub fn format_message_event(data: &str) -> String {
-    format!("event: message\ndata: {data}\n\n")
+    let mut event = String::from("event: message\n");
+    for line in sse_lines(data) {
+        event.push_str("data: ");
+        event.push_str(line);
+        event.push('\n');
+    }
+    event.push('\n');
+    event
+}
+
+/// Split on the SSE line terminators `\r\n`, `\n` and `\r`.
+fn sse_lines(s: &str) -> impl Iterator<Item = &str> {
+    s.split("\r\n").flat_map(|chunk| chunk.split(['\r', '\n']))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +165,9 @@ pub fn format_message_event(data: &str) -> String {
 /// - `payment-need-voucher` — balance exhausted
 /// - `payment-receipt` — final receipt (requires `tempo` feature;
 ///   without it, receipt events are returned as `Message`)
+///
+/// Lines may end in `\n`, `\r\n` or `\r`, and the space after the field
+/// colon is optional. Multiple `data:` lines are joined with `\n`.
 ///
 /// Returns `None` if no `data:` lines are present.
 ///
@@ -162,13 +185,13 @@ pub fn parse_event(raw: &str) -> Option<SseEvent> {
     let mut event_type = "message";
     let mut data_lines: Vec<&str> = Vec::new();
 
-    for line in raw.split('\n') {
-        if let Some(rest) = line.strip_prefix("event: ") {
-            event_type = rest.trim();
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            data_lines.push(rest);
-        } else if line == "data:" {
-            data_lines.push("");
+    for line in sse_lines(raw) {
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event_type = value.trim(),
+            "data" => data_lines.push(value),
+            _ => {}
         }
     }
 
@@ -412,6 +435,66 @@ mod tests {
         assert_eq!(event, "event: message\ndata: hello world\n\n");
     }
 
+    #[test]
+    fn test_format_message_event_multiline() {
+        assert_eq!(
+            format_message_event("line1\nline2\r\n\rline4\n"),
+            "event: message\ndata: line1\ndata: line2\ndata: \ndata: line4\ndata: \n\n"
+        );
+    }
+
+    /// Every value built from line terminators, field lookalikes and plain
+    /// text must be framed as exactly one `message` event and parse back to
+    /// itself (with `\r\n` / `\r` normalised to `\n`).
+    #[test]
+    fn test_message_event_roundtrip() {
+        const FRAGMENTS: &[&str] = &[
+            "\n",
+            "\r",
+            "\r\n",
+            "text",
+            " ",
+            ":",
+            "data: x",
+            "data:",
+            "event: payment-need-voucher",
+            "event: payment-receipt",
+            r#"data: {"channelId":"0xabc","requiredCumulative":"999999","acceptedCumulative":"0","deposit":"999999"}"#,
+        ];
+
+        let mut values = vec![String::new()];
+        let mut start = 0;
+        for _ in 0..4 {
+            let end = values.len();
+            for i in start..end {
+                for fragment in FRAGMENTS {
+                    values.push(format!("{}{fragment}", values[i]));
+                }
+            }
+            start = end;
+        }
+
+        for value in values {
+            let event = format_message_event(&value);
+
+            let body = event.strip_suffix("\n\n").expect("event terminator");
+            assert!(!body.contains('\r'), "{value:?} framed as {event:?}");
+            let mut lines = body.split('\n');
+            assert_eq!(lines.next(), Some("event: message"));
+            assert!(
+                lines.all(|line| line.starts_with("data: ")),
+                "{value:?} framed as {event:?}"
+            );
+
+            let expected = value.replace("\r\n", "\n").replace('\r', "\n");
+            assert_eq!(
+                parse_event(&event),
+                Some(SseEvent::Message(expected)),
+                "{value:?} framed as {event:?}"
+            );
+        }
+    }
+
     // -- Parse tests --
 
     #[test]
@@ -493,6 +576,33 @@ mod tests {
             parse_event(raw),
             Some(SseEvent::Message("line1\nline2\nline3".into()))
         );
+    }
+
+    #[test]
+    fn test_parse_event_line_endings_and_optional_space() {
+        for raw in [
+            "event: message\r\ndata: line1\r\ndata: line2\r\n\r\n",
+            "event: message\rdata: line1\rdata: line2\r\r",
+            "event:message\ndata:line1\ndata:line2\n\n",
+            ": comment\nevent: message\ndata: line1\ndata: line2\n\n",
+        ] {
+            assert_eq!(
+                parse_event(raw),
+                Some(SseEvent::Message("line1\nline2".into())),
+                "{raw:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_event("data:  two spaces\ndata\n\n"),
+            Some(SseEvent::Message(" two spaces\n".into()))
+        );
+
+        let raw = "event: payment-need-voucher\r\ndata:{\"channelId\":\"0xabc\",\"requiredCumulative\":\"2\",\"acceptedCumulative\":\"1\",\"deposit\":\"5\"}\r\n\r\n";
+        assert!(matches!(
+            parse_event(raw),
+            Some(SseEvent::PaymentNeedVoucher(_))
+        ));
     }
 
     // -- is_event_stream tests --
