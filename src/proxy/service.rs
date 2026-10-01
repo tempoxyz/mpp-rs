@@ -525,14 +525,27 @@ pub fn to_llms_txt_with(services: &[Service], options: Option<&LlmsTxtOptions<'_
 }
 
 /// Generate an OpenAPI 3.1.0 discovery document from the proxy configuration.
+///
+/// Paths include the configured `base_path`, and `:param` route segments are
+/// written as `{param}` path templates with matching `parameters`.
 pub fn generate_openapi(config: &ProxyConfig) -> Value {
     let title = config.title.as_deref().unwrap_or("API Proxy");
+    let base_path = config
+        .base_path
+        .as_deref()
+        .map_or("", |base| base.trim_end_matches('/'));
 
     let mut paths = serde_json::Map::new();
     for service in &config.services {
         for route in &service.routes {
-            let path_key = format!("/{}{}", service.id, route.path);
+            let (path, parameters) = openapi_path(&route.path);
+            let path_key = format!("{base_path}/{}{path}", service.id);
             let method_key = route.method.as_deref().unwrap_or("GET").to_lowercase();
+
+            let mut operation = serde_json::Map::new();
+            if !parameters.is_empty() {
+                operation.insert("parameters".to_string(), Value::Array(parameters));
+            }
 
             let mut responses = serde_json::Map::new();
             if let Endpoint::Paid(p) = &route.endpoint {
@@ -541,43 +554,31 @@ pub fn generate_openapi(config: &ProxyConfig) -> Value {
                     json!({ "description": "Payment Required" }),
                 );
 
-                let mut operation = serde_json::Map::new();
-                operation.insert("intent".to_string(), json!(p.intent));
-                operation.insert("amount".to_string(), json!(p.amount));
+                let mut offer = serde_json::Map::new();
+                offer.insert("intent".to_string(), json!(p.intent));
+                offer.insert("amount".to_string(), json!(p.amount));
                 if let Some(decimals) = p.decimals {
-                    operation.insert("decimals".to_string(), json!(decimals));
+                    offer.insert("decimals".to_string(), json!(decimals));
                 }
                 if let Some(ref currency) = p.currency {
-                    operation.insert("currency".to_string(), json!(currency));
+                    offer.insert("currency".to_string(), json!(currency));
                 }
                 if let Some(ref ut) = p.unit_type {
-                    operation.insert("unitType".to_string(), json!(ut));
+                    offer.insert("unitType".to_string(), json!(ut));
                 }
                 if let Some(ref desc) = p.description {
-                    operation.insert("description".to_string(), json!(desc));
+                    offer.insert("description".to_string(), json!(desc));
                 }
-
-                responses.insert(
-                    "200".to_string(),
-                    json!({ "description": "Successful response" }),
-                );
-
-                let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
-                path_entry[&method_key] = json!({
-                    "responses": Value::Object(responses),
-                    "x-payment-info": Value::Object(operation),
-                });
-            } else {
-                responses.insert(
-                    "200".to_string(),
-                    json!({ "description": "Successful response" }),
-                );
-
-                let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
-                path_entry[&method_key] = json!({
-                    "responses": Value::Object(responses),
-                });
+                operation.insert("x-payment-info".to_string(), json!({ "offers": [offer] }));
             }
+            responses.insert(
+                "200".to_string(),
+                json!({ "description": "Successful response" }),
+            );
+            operation.insert("responses".to_string(), Value::Object(responses));
+
+            let path_entry = paths.entry(&path_key).or_insert_with(|| json!({}));
+            path_entry[&method_key] = Value::Object(operation);
         }
     }
 
@@ -589,6 +590,29 @@ pub fn generate_openapi(config: &ProxyConfig) -> Value {
         },
         "paths": Value::Object(paths),
     })
+}
+
+/// Rewrite `:param` route segments as OpenAPI `{param}` templates and return
+/// the path parameter objects they require.
+fn openapi_path(route_path: &str) -> (String, Vec<Value>) {
+    let mut parameters = Vec::new();
+    let path = route_path
+        .split('/')
+        .map(|segment| match segment.strip_prefix(':') {
+            Some(name) if !name.is_empty() => {
+                parameters.push(json!({
+                    "name": name,
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" },
+                }));
+                format!("{{{name}}}")
+            }
+            _ => segment.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    (path, parameters)
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,14 +1120,19 @@ mod tests {
         let paid = &paths["/openai/v1/chat/completions"]["post"];
         assert!(paid["responses"]["402"].is_object());
         assert!(paid["responses"]["200"].is_object());
-        assert_eq!(paid["x-payment-info"]["intent"], "charge");
-        assert_eq!(paid["x-payment-info"]["amount"], "50000");
-        assert_eq!(paid["x-payment-info"]["decimals"], 6);
+        assert!(paid["parameters"].is_null());
         assert_eq!(
-            paid["x-payment-info"]["currency"],
-            "0x20c0000000000000000000000000000000000001"
+            paid["x-payment-info"],
+            json!({
+                "offers": [{
+                    "intent": "charge",
+                    "amount": "50000",
+                    "decimals": 6,
+                    "currency": "0x20c0000000000000000000000000000000000001",
+                    "description": "Chat completion",
+                }],
+            })
         );
-        assert_eq!(paid["x-payment-info"]["description"], "Chat completion");
 
         // Free route
         let free = &paths["/openai/v1/models"]["get"];
@@ -1121,6 +1150,49 @@ mod tests {
         let doc = generate_openapi(&empty);
         assert_eq!(doc["info"]["title"], "Custom");
         assert!(doc["paths"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_generate_openapi_base_path_and_path_params() {
+        let svc = Service::new("stripe", "https://api.stripe.com")
+            .route(
+                "GET /v1/customers/:id/charges/:charge",
+                Endpoint::Paid(PaidEndpoint {
+                    intent: "charge".into(),
+                    amount: "100".into(),
+                    decimals: None,
+                    currency: None,
+                    unit_type: None,
+                    description: None,
+                }),
+            )
+            .route("GET /v1/customers/:id", Endpoint::Free)
+            .build();
+        let config = ProxyConfig {
+            base_path: Some("/api/proxy/".to_string()),
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+        let doc = generate_openapi(&config);
+        let paths = doc["paths"].as_object().unwrap();
+        assert_eq!(
+            paths.keys().collect::<Vec<_>>(),
+            [
+                "/api/proxy/stripe/v1/customers/{id}/charges/{charge}",
+                "/api/proxy/stripe/v1/customers/{id}",
+            ]
+        );
+
+        let path_param = |name: &str| json!({ "name": name, "in": "path", "required": true, "schema": { "type": "string" } });
+        assert_eq!(
+            paths["/api/proxy/stripe/v1/customers/{id}/charges/{charge}"]["get"]["parameters"],
+            json!([path_param("id"), path_param("charge")])
+        );
+        assert_eq!(
+            paths["/api/proxy/stripe/v1/customers/{id}"]["get"]["parameters"],
+            json!([path_param("id")])
+        );
     }
 
     #[test]
