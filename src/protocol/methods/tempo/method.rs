@@ -284,6 +284,16 @@ impl ParsedTransferLog {
             Self::Transfer { to, .. } | Self::Memo { to, .. } => *to,
         }
     }
+
+    /// Whether `self` and `other` are the `Transfer` and `TransferWithMemo`
+    /// events of the same transfer.
+    fn is_twin_of(&self, other: &Self) -> bool {
+        self.memo().is_some() != other.memo().is_some()
+            && self.address() == other.address()
+            && self.from() == other.from()
+            && self.to() == other.to()
+            && self.amount() == other.amount()
+    }
 }
 
 fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferLog> {
@@ -344,6 +354,34 @@ fn parse_receipt_transfer_log(log: &serde_json::Value) -> Option<ParsedTransferL
     None
 }
 
+/// Parse receipt logs into transfer effects, one per token transfer.
+///
+/// TIP-20 `transferWithMemo` emits `Transfer` immediately followed by
+/// `TransferWithMemo` for the same transfer. Such adjacent pairs are merged
+/// into one memo effect so a single transfer cannot satisfy two expected
+/// transfers.
+fn receipt_transfer_effects(logs: &[serde_json::Value]) -> Vec<ParsedTransferLog> {
+    let mut parsed = logs.iter().map(parse_receipt_transfer_log).peekable();
+    let mut effects = Vec::new();
+
+    while let Some(log) = parsed.next() {
+        let Some(log) = log else {
+            continue;
+        };
+        let twin = parsed
+            .peek()
+            .and_then(|next| next.filter(|next| log.is_twin_of(next)));
+        if let Some(twin) = twin {
+            parsed.next();
+            effects.push(if log.memo().is_some() { log } else { twin });
+        } else {
+            effects.push(log);
+        }
+    }
+
+    effects
+}
+
 /// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
 /// for a `did:pkh:eip155` DID matching `expected_chain_id`, else `Err`.
 fn parse_hash_credential_source(
@@ -396,9 +434,8 @@ fn match_receipt_transfer_logs_with_settlement(
     let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
     sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
-    let parsed_logs: Vec<Option<ParsedTransferLog>> =
-        logs.iter().map(parse_receipt_transfer_log).collect();
-    let mut used_logs: Vec<bool> = vec![false; logs.len()];
+    let parsed_logs = receipt_transfer_effects(logs);
+    let mut used_logs: Vec<bool> = vec![false; parsed_logs.len()];
     let mut matched_logs = Vec::with_capacity(expected.len());
 
     for (_, transfer) in &sorted_expected {
@@ -418,10 +455,6 @@ fn match_receipt_transfer_logs_with_settlement(
                 if used_logs[log_idx] {
                     continue;
                 }
-
-                let Some(parsed) = parsed else {
-                    continue;
-                };
 
                 if parsed.address() != currency
                     || parsed.to() != transfer.recipient
@@ -2553,6 +2586,147 @@ mod tests {
         assert_eq!(matched.len(), 2);
         assert!(matched.contains(&MatchedTransferLog::Memo(memo)));
         assert!(matched.contains(&MatchedTransferLog::Transfer));
+    }
+
+    #[test]
+    fn test_match_receipt_transfer_logs_merges_transfer_with_memo_twin_logs() {
+        let currency = Address::repeat_byte(0x20);
+        let sender = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(1000u64);
+        let memo = attribution::encode("challenge-123", "api.example.com", None);
+        let transfer = || make_transfer_log(currency, sender, recipient, amount);
+        let transfer_with_memo =
+            || make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
+        let unrelated = || serde_json::json!({ "address": format!("{currency:#x}"), "topics": [] });
+        // amount=2000 with a 1000 split to the primary recipient.
+        let expected = vec![
+            Transfer {
+                amount,
+                recipient,
+                memo: None,
+            };
+            2
+        ];
+        let matched = |logs: &[serde_json::Value]| {
+            match_receipt_transfer_logs(logs, sender, currency, &expected, None, None)
+        };
+
+        // One transferWithMemo call emits both events but pays only once.
+        assert!(matched(&[transfer(), transfer_with_memo()]).is_err());
+        assert!(matched(&[transfer_with_memo(), transfer()]).is_err());
+
+        assert_eq!(
+            matched(&[
+                transfer(),
+                transfer_with_memo(),
+                transfer(),
+                transfer_with_memo()
+            ])
+            .unwrap(),
+            vec![MatchedTransferLog::Memo(memo); 2]
+        );
+        for logs in [
+            [transfer(), transfer_with_memo(), transfer()],
+            [transfer(), transfer(), transfer_with_memo()],
+        ] {
+            let matched = matched(&logs).unwrap();
+            assert!(matched.contains(&MatchedTransferLog::Memo(memo)));
+            assert!(matched.contains(&MatchedTransferLog::Transfer));
+        }
+
+        // Only adjacent logs are twins.
+        assert!(matched(&[transfer(), unrelated(), transfer_with_memo()]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_hash_rejects_single_transfer_with_memo_for_two_transfers() {
+        use alloy::providers::mock::Asserter;
+
+        let currency = Address::repeat_byte(0x20);
+        let payer = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(1000u64);
+        let request = ChargeRequest {
+            amount: "2000".to_string(),
+            currency: format!("{currency:#x}"),
+            recipient: Some(format!("{recipient:#x}")),
+            method_details: Some(serde_json::json!({
+                "chainId": MODERATO_CHAIN_ID,
+                "splits": [{ "amount": "1000", "recipient": format!("{recipient:#x}") }],
+            })),
+            ..Default::default()
+        };
+        let challenge = test_proof_challenge(&request);
+        let memo = attribution::encode(&challenge.id, &challenge.realm, None);
+        let tx_hash = B256::repeat_byte(0x11);
+        let block_hash = B256::repeat_byte(0x22);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:#x}")),
+        );
+
+        // Receipt of a transaction with `calls` transferWithMemo calls.
+        let verify = |calls: usize| {
+            let logs: Vec<_> = (0..calls)
+                .flat_map(|_| {
+                    [
+                        make_transfer_log(currency, payer, recipient, amount),
+                        make_transfer_with_memo_log(currency, payer, recipient, amount, memo),
+                    ]
+                })
+                .enumerate()
+                .map(|(index, mut log)| {
+                    log.as_object_mut().unwrap().extend(
+                        serde_json::json!({
+                            "blockHash": format!("{block_hash:#x}"),
+                            "blockNumber": "0x1",
+                            "transactionHash": format!("{tx_hash:#x}"),
+                            "transactionIndex": "0x0",
+                            "logIndex": format!("{index:#x}"),
+                            "removed": false,
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    );
+                    log
+                })
+                .collect();
+            let asserter = Asserter::new();
+            asserter.push_success(&serde_json::json!({
+                "type": "0x76",
+                "status": "0x1",
+                "cumulativeGasUsed": "0x5208",
+                "logs": logs,
+                "logsBloom": format!("0x{}", "00".repeat(256)),
+                "transactionHash": format!("{tx_hash:#x}"),
+                "transactionIndex": "0x0",
+                "blockHash": format!("{block_hash:#x}"),
+                "blockNumber": "0x1",
+                "gasUsed": "0x5208",
+                "effectiveGasPrice": "0x1",
+                "from": format!("{payer:#x}"),
+                "to": format!("{currency:#x}"),
+                "contractAddress": null,
+                "feePayer": format!("{payer:#x}"),
+                "feeToken": format!("{currency:#x}"),
+            }));
+            let provider =
+                alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                    .connect_mocked_client(asserter);
+            let method = ChargeMethod::new(provider);
+            method.cached_chain_id.set(MODERATO_CHAIN_ID).unwrap();
+            let (credential, request) = (credential.clone(), request.clone());
+            async move { method.verify(&credential, &request).await }
+        };
+
+        let error = verify(1).await.unwrap_err();
+        assert!(
+            error.to_string().contains("No matching transfer event"),
+            "unexpected error: {error}"
+        );
+        assert!(verify(2).await.is_ok());
     }
 
     #[test]
