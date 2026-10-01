@@ -28,6 +28,7 @@ use super::types::{Base64UrlJson, IntentName, MethodName, PayloadType, ReceiptSt
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "WireChallenge")]
 pub struct PaymentChallenge {
     /// Unique challenge identifier (128+ bits entropy)
     pub id: String,
@@ -73,6 +74,49 @@ pub struct PaymentChallenge {
     /// `Authorization` is the implicit default and is never advertised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
+}
+
+/// Serde shape of [`PaymentChallenge`]. Deserialized challenges get the same
+/// validation as ones parsed from a `WWW-Authenticate` header.
+#[derive(Deserialize)]
+struct WireChallenge {
+    id: String,
+    realm: String,
+    method: MethodName,
+    intent: IntentName,
+    request: Base64UrlJson,
+    expires: Option<String>,
+    description: Option<String>,
+    digest: Option<String>,
+    opaque: Option<Base64UrlJson>,
+    header: Option<String>,
+}
+
+impl TryFrom<WireChallenge> for PaymentChallenge {
+    type Error = crate::error::MppError;
+
+    fn try_from(wire: WireChallenge) -> crate::error::Result<Self> {
+        super::headers::validate_challenge_fields(
+            &wire.id,
+            wire.intent.as_str(),
+            wire.request.raw(),
+            wire.expires.as_deref(),
+            wire.digest.as_deref(),
+            wire.opaque.as_ref().map(Base64UrlJson::raw),
+        )?;
+        Ok(Self {
+            id: wire.id,
+            realm: wire.realm,
+            method: wire.method,
+            intent: wire.intent,
+            request: wire.request,
+            expires: wire.expires,
+            description: wire.description,
+            digest: wire.digest,
+            opaque: wire.opaque,
+            header: parse_advertised_credential_header(wire.header.as_deref())?,
+        })
+    }
 }
 
 impl PaymentChallenge {

@@ -2032,8 +2032,13 @@ mod tests {
         async fn test_multi_challenge_skips_malformed_expiry_first_supported() {
             // A bad expires value fails closed for that challenge, but should
             // not block a later valid challenge for the same method/intent.
-            let bad_header =
-                challenge_header_with_expires("bad", "tempo", "charge", Some("not-a-date"));
+            let bad_header = challenge_header_with_expires(
+                "bad",
+                "tempo",
+                "charge",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .replace("2099-01-01T00:00:00Z", "not-a-date");
             let valid_header = challenge_header("valid", "tempo", "charge");
             let combined = format!("{}, {}", bad_header, valid_header);
 
