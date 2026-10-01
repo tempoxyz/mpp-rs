@@ -20,7 +20,6 @@ pub(crate) use store::normalize_channel_id;
 pub use store::{deduct_from_channel, ChannelState, ChannelStore, InMemoryChannelStore};
 
 use alloy::primitives::Address;
-use std::future::Future;
 use std::sync::Arc;
 
 use alloy::providers::Provider;
@@ -187,132 +186,115 @@ where
         }
     }
 
-    fn verify_session(
+    async fn verify_session(
         &self,
         credential: &PaymentCredential,
         request: &SessionRequest,
-    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
-        let credential = credential.clone();
-        let request = request.clone();
-        let provider = Arc::clone(&self.provider);
-        let store = Arc::clone(&self.store);
-        let config = self.config.clone();
-        let close_signer = self.close_signer.clone();
+    ) -> Result<Receipt, VerificationError> {
+        if credential.challenge.method.as_str() != METHOD_NAME {
+            return Err(VerificationError::credential_mismatch(format!(
+                "Method mismatch: expected {}, got {}",
+                METHOD_NAME, credential.challenge.method
+            )));
+        }
+        if credential.challenge.intent.as_str() != INTENT_SESSION {
+            return Err(VerificationError::credential_mismatch(format!(
+                "Intent mismatch: expected {}, got {}",
+                INTENT_SESSION, credential.challenge.intent
+            )));
+        }
 
-        async move {
-            let this = SessionMethod {
-                provider,
-                store,
-                config,
-                close_signer,
-            };
+        let details = self.resolve_method_details(request)?;
 
-            if credential.challenge.method.as_str() != METHOD_NAME {
-                return Err(VerificationError::credential_mismatch(format!(
-                    "Method mismatch: expected {}, got {}",
-                    METHOD_NAME, credential.challenge.method
-                )));
-            }
-            if credential.challenge.intent.as_str() != INTENT_SESSION {
-                return Err(VerificationError::credential_mismatch(format!(
-                    "Intent mismatch: expected {}, got {}",
-                    INTENT_SESSION, credential.challenge.intent
-                )));
-            }
-
-            let details = this.resolve_method_details(&request)?;
-
-            let merchant = request
-                .recipient
-                .as_deref()
-                .ok_or_else(|| {
-                    VerificationError::invalid_payload("session challenge missing recipient")
-                })
-                .and_then(Self::parse_address)?;
-            let target_token = Self::parse_address(&request.currency)?;
-            let (expected_payee, expected_token) = if details.machine_token_enabled == Some(true) {
-                let (_, swapper) =
-                    crate::protocol::methods::tempo::machine_token::session_addresses(
-                        this.resolve_chain_id(&details),
-                    )
-                    .ok_or_else(|| {
-                        VerificationError::invalid_payload(
-                            "machine tokens are unsupported on the session chain",
-                        )
-                    })?;
-                if details.settlement_adapter.as_deref() != Some(&swapper.to_string())
-                    || details.settlement_recipient.as_deref() != Some(&merchant.to_string())
-                    || details.settlement_token.as_deref() != Some(&target_token.to_string())
-                {
-                    return Err(VerificationError::credential_mismatch(
-                        "machine-token settlement route does not match the session request",
-                    ));
-                }
-                crate::protocol::methods::tempo::machine_token::session_addresses(
-                    this.resolve_chain_id(&details),
+        let merchant = request
+            .recipient
+            .as_deref()
+            .ok_or_else(|| {
+                VerificationError::invalid_payload("session challenge missing recipient")
+            })
+            .and_then(Self::parse_address)?;
+        let target_token = Self::parse_address(&request.currency)?;
+        let (expected_payee, expected_token) = if details.machine_token_enabled == Some(true) {
+            let (_, swapper) = crate::protocol::methods::tempo::machine_token::session_addresses(
+                self.resolve_chain_id(&details),
+            )
+            .ok_or_else(|| {
+                VerificationError::invalid_payload(
+                    "machine tokens are unsupported on the session chain",
                 )
-                .map(|(token, swapper)| (swapper, token))
-                .ok_or_else(|| {
-                    VerificationError::invalid_payload(
-                        "machine tokens are unsupported on the session chain",
-                    )
-                })?
-            } else {
-                (merchant, target_token)
-            };
-
-            let payload: SessionCredentialPayload = credential.payload_as().map_err(|e| {
-                VerificationError::invalid_payload(format!("Expected session payload: {}", e))
             })?;
+            if details.settlement_adapter.as_deref() != Some(&swapper.to_string())
+                || details.settlement_recipient.as_deref() != Some(&merchant.to_string())
+                || details.settlement_token.as_deref() != Some(&target_token.to_string())
+            {
+                return Err(VerificationError::credential_mismatch(
+                    "machine-token settlement route does not match the session request",
+                ));
+            }
+            crate::protocol::methods::tempo::machine_token::session_addresses(
+                self.resolve_chain_id(&details),
+            )
+            .map(|(token, swapper)| (swapper, token))
+            .ok_or_else(|| {
+                VerificationError::invalid_payload(
+                    "machine tokens are unsupported on the session chain",
+                )
+            })?
+        } else {
+            (merchant, target_token)
+        };
 
-            match &payload {
-                SessionCredentialPayload::Open { .. } => {
-                    let amount = request.parse_amount().map_err(|_| {
-                        VerificationError::invalid_challenge(format!(
-                            "invalid session amount: {}",
-                            request.amount
-                        ))
-                    })?;
-                    this.handle_open(
-                        &credential,
-                        &payload,
-                        &details,
-                        expected_payee,
-                        expected_token,
-                        amount,
-                    )
-                    .await
-                }
-                SessionCredentialPayload::TopUp { .. } => {
-                    this.handle_top_up(
-                        &credential,
-                        &payload,
-                        &details,
-                        expected_payee,
-                        expected_token,
-                    )
-                    .await
-                }
-                SessionCredentialPayload::Voucher { .. } => {
-                    this.handle_voucher(
-                        &credential,
-                        &payload,
-                        &details,
-                        expected_payee,
-                        expected_token,
-                    )
-                    .await
-                }
-                SessionCredentialPayload::Close { .. } => {
-                    this.handle_close(
-                        &credential,
-                        &payload,
-                        &details,
-                        expected_payee,
-                        expected_token,
-                    )
-                    .await
-                }
+        let payload: SessionCredentialPayload = credential.payload_as().map_err(|e| {
+            VerificationError::invalid_payload(format!("Expected session payload: {}", e))
+        })?;
+
+        match &payload {
+            SessionCredentialPayload::Open { .. } => {
+                let amount = request.parse_amount().map_err(|_| {
+                    VerificationError::invalid_challenge(format!(
+                        "invalid session amount: {}",
+                        request.amount
+                    ))
+                })?;
+                self.handle_open(
+                    credential,
+                    &payload,
+                    &details,
+                    expected_payee,
+                    expected_token,
+                    amount,
+                )
+                .await
+            }
+            SessionCredentialPayload::TopUp { .. } => {
+                self.handle_top_up(
+                    credential,
+                    &payload,
+                    &details,
+                    expected_payee,
+                    expected_token,
+                )
+                .await
+            }
+            SessionCredentialPayload::Voucher { .. } => {
+                self.handle_voucher(
+                    credential,
+                    &payload,
+                    &details,
+                    expected_payee,
+                    expected_token,
+                )
+                .await
+            }
+            SessionCredentialPayload::Close { .. } => {
+                self.handle_close(
+                    credential,
+                    &payload,
+                    &details,
+                    expected_payee,
+                    expected_token,
+                )
+                .await
             }
         }
     }

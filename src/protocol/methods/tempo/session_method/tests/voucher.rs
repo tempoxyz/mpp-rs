@@ -28,13 +28,7 @@ async fn test_stale_voucher_with_garbage_signature_rejected() {
             &state,
             0,            // cumulative_amount <= highest_voucher_amount
             &garbage_sig, // garbage signature
-            state.escrow_contract,
-            42431,
-            0,       // min_delta
-            100_000, // deposit
-            0,       // settled
-            false,   // not finalized
-            0,       // no close request
+            0,            // min_delta
         )
         .await;
 
@@ -78,12 +72,6 @@ async fn test_stale_voucher_same_amount_different_signature_rejected() {
             &state,
             1000,        // same amount as highest
             &forged_sig, // different signature
-            escrow,
-            42431,
-            0,
-            100_000,
-            0,
-            false,
             0,
         )
         .await;
@@ -121,19 +109,7 @@ async fn test_exact_replay_of_highest_voucher_rejected() {
 
     // Exact replay: same amount and same signature does not add new funds.
     let result = method
-        .verify_and_accept_voucher(
-            &channel_id_hex,
-            &state,
-            1000,
-            &sig_hex,
-            escrow,
-            42431,
-            0,
-            100_000,
-            0,
-            false,
-            0,
-        )
+        .verify_and_accept_voucher(&channel_id_hex, &state, 1000, &sig_hex, 0)
         .await;
 
     assert!(result.is_err());
@@ -165,21 +141,7 @@ async fn test_concurrent_voucher_acceptance_has_one_winner() {
     store.insert(&channel_id, state.clone());
 
     let method = test_session_method(store.clone());
-    let verify = || {
-        method.verify_and_accept_voucher(
-            &channel_id,
-            &state,
-            2_000,
-            &signature,
-            escrow,
-            42431,
-            0,
-            10_000,
-            0,
-            false,
-            0,
-        )
-    };
+    let verify = || method.verify_and_accept_voucher(&channel_id, &state, 2_000, &signature, 0);
     let (first, second) = tokio::join!(verify(), verify());
 
     assert_eq!(
@@ -225,32 +187,10 @@ async fn test_concurrent_vouchers_recheck_minimum_delta_atomically() {
     store.insert(&channel_id, state.clone());
 
     let method = test_session_method(store.clone());
-    let lower = method.verify_and_accept_voucher(
-        &channel_id,
-        &state,
-        2_000,
-        &lower_signature,
-        escrow,
-        42431,
-        1_000,
-        10_000,
-        0,
-        false,
-        0,
-    );
-    let higher = method.verify_and_accept_voucher(
-        &channel_id,
-        &state,
-        2_500,
-        &higher_signature,
-        escrow,
-        42431,
-        1_000,
-        10_000,
-        0,
-        false,
-        0,
-    );
+    let lower =
+        method.verify_and_accept_voucher(&channel_id, &state, 2_000, &lower_signature, 1_000);
+    let higher =
+        method.verify_and_accept_voucher(&channel_id, &state, 2_500, &higher_signature, 1_000);
     let (lower, higher) = tokio::join!(lower, higher);
 
     assert!(lower.is_ok());
@@ -293,19 +233,7 @@ async fn test_accept_voucher_preserves_concurrent_deposit_update() {
 
     let method = test_session_method(store.clone());
     method
-        .verify_and_accept_voucher(
-            &channel_id_hex,
-            &stale_state,
-            2_000,
-            &sig_hex,
-            escrow,
-            42431,
-            0,
-            stale_state.deposit,
-            0,
-            false,
-            0,
-        )
+        .verify_and_accept_voucher(&channel_id_hex, &stale_state, 2_000, &sig_hex, 0)
         .await
         .unwrap();
 
@@ -345,12 +273,6 @@ async fn test_stale_voucher_with_forged_keychain_envelope_rejected() {
             &state,
             500, // stale: below highest_voucher_amount of 1000
             &forged_sig,
-            state.escrow_contract,
-            42431,
-            0,
-            100_000,
-            0,
-            false,
             0,
         )
         .await;
@@ -394,9 +316,7 @@ async fn test_voucher_signature_must_be_canonical() {
         let (method, channel_id, state) = (&method, &channel_id, &state);
         async move {
             method
-                .verify_and_accept_voucher(
-                    channel_id, state, 2_000, &signature, escrow, 42431, 0, 10_000, 0, false, 0,
-                )
+                .verify_and_accept_voucher(channel_id, state, 2_000, &signature, 0)
                 .await
         }
     };

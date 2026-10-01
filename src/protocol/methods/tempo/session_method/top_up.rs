@@ -150,11 +150,10 @@ where
         }
 
         // Update store with full on-chain snapshot (deposit, settled, close state).
-        let channel_id_owned = channel_id_str.clone();
         let updated = self
             .store
             .update_channel(
-                &channel_id_owned,
+                channel_id_str,
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;

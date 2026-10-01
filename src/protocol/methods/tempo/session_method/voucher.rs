@@ -101,11 +101,10 @@ where
             ));
         }
 
-        let channel_id_owned = channel_id_str.clone();
         let refreshed = self
             .store
             .update_channel(
-                &channel_id_owned,
+                channel_id_str,
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
@@ -124,53 +123,44 @@ where
                 &refreshed,
                 cumulative_amount,
                 signature_str,
-                escrow,
-                chain_id,
                 min_delta,
-                refreshed.deposit,
-                refreshed.settled_on_chain,
-                refreshed.finalized,
-                refreshed.close_requested_at,
             )
             .await?;
 
         Ok(session_receipt(&credential.challenge.id, &state, None))
     }
 
-    /// Shared logic for verifying an incremental voucher and updating channel state.
+    /// Check a voucher against `channel`, the state as last refreshed from
+    /// chain, and record it.
+    ///
+    /// The signature is verified for the channel's own escrow and chain; the
+    /// caller has checked that the challenge names the same ones.
     ///
     /// Returns the channel state with the voucher applied.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn verify_and_accept_voucher(
         &self,
         channel_id_str: &str,
         channel: &ChannelState,
         cumulative_amount: u128,
         signature_str: &str,
-        escrow: Address,
-        chain_id: u64,
         min_delta: u128,
-        deposit: u128,
-        settled: u128,
-        finalized: bool,
-        close_requested_at: u64,
     ) -> Result<ChannelState, VerificationError> {
-        if finalized {
+        if channel.finalized {
             return Err(VerificationError::channel_closed(
                 "channel is finalized on-chain",
             ));
         }
-        if close_requested_at != 0 {
+        if channel.close_requested_at != 0 {
             return Err(VerificationError::channel_closed(
                 "channel has a pending close request",
             ));
         }
-        if cumulative_amount < settled {
+        if cumulative_amount < channel.settled_on_chain {
             return Err(VerificationError::new(
                 "voucher cumulativeAmount is below on-chain settled amount",
             ));
         }
-        if cumulative_amount > deposit {
+        if cumulative_amount > channel.deposit {
             return Err(VerificationError::amount_exceeds_deposit(
                 "voucher amount exceeds on-chain deposit",
             ));
@@ -192,8 +182,8 @@ where
             if !is_exact_replay {
                 let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
                 let is_valid = verify_voucher(
-                    escrow,
-                    chain_id,
+                    channel.escrow_contract,
+                    channel.chain_id,
                     channel_id_b256,
                     cumulative_amount,
                     &sig_bytes,
@@ -222,8 +212,8 @@ where
         let sig_bytes = Self::parse_signature(signature_str)?;
 
         let is_valid = verify_voucher(
-            escrow,
-            chain_id,
+            channel.escrow_contract,
+            channel.chain_id,
             channel_id_b256,
             cumulative_amount,
             &sig_bytes,
@@ -237,11 +227,10 @@ where
         }
 
         // Update store with new highest voucher.
-        let channel_id_owned = channel_id_str.to_string();
         let updated = self
             .store
             .update_channel(
-                &channel_id_owned,
+                channel_id_str,
                 Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
