@@ -120,7 +120,7 @@ async fn main() {
     {
         println!(
             "Open channel tx: https://explore.moderato.tempo.xyz/tx/{}",
-            r.reference
+            tx_hash(&r)
         );
     }
     let open_status = open_resp.status();
@@ -214,7 +214,7 @@ async fn main() {
         Ok(Some(receipt)) => {
             println!(
                 "  Channel settled: https://explore.moderato.tempo.xyz/tx/{}",
-                receipt.reference
+                tx_hash(&receipt)
             );
         }
         Ok(None) => {
@@ -242,4 +242,13 @@ async fn main() {
     println!("  Balance before:  {balance_before_f64} pathUSD");
     println!("  Balance after:   {balance_after_f64} pathUSD");
     println!("  Total spent:     {total_spent} pathUSD (deposit - refund + gas)");
+}
+
+/// The transaction a session receipt reports, falling back to its reference.
+fn tx_hash(receipt: &mpp::Receipt) -> &str {
+    receipt
+        .extensions
+        .get("txHash")
+        .and_then(|hash| hash.as_str())
+        .unwrap_or(&receipt.reference)
 }
