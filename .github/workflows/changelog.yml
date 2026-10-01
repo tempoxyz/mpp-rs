@@ -17,6 +17,13 @@ jobs:
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      # Installed before the checkout, so the pull request's `.npmrc` and
+      # `node_modules` have no say in what runs with the API key.
+      - name: Install Claude CLI
+        run: npm install -g @anthropic-ai/claude-code@2.1.220
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -24,13 +31,10 @@ jobs:
           persist-credentials: false
       - name: Remove repo-local Claude settings
         run: rm -rf .claude/
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
       - name: Check changelog
         uses: tempoxyz/changelogs/check@bd50cca508d81505924dfa3997b1696ac2b7b1aa # v0.9.0
         with:
-          ai: "npx -y @anthropic-ai/claude-code@2.1.220 --bare -p"
+          ai: "claude --bare -p"
           ecosystem: rust
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
