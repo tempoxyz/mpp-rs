@@ -1086,6 +1086,13 @@ where
     /// `chainId`, and `minVoucherDelta`. Additional options like `suggestedDeposit`,
     /// `feePayer`, `description`, and `expires` can be set via [`SessionChallengeOptions`](super::SessionChallengeOptions).
     ///
+    /// `feePayer` and the machine-token settlement route are only advertised
+    /// when the session method reports that it supports them (see
+    /// [`SessionMethod::supports_fee_payer`](crate::protocol::traits::SessionMethod::supports_fee_payer)
+    /// and
+    /// [`SessionMethod::supports_machine_tokens`](crate::protocol::traits::SessionMethod::supports_machine_tokens)).
+    /// Tempo's `SessionMethod` supports neither.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -1096,7 +1103,6 @@ where
     ///     SessionChallengeOptions {
     ///         unit_type: Some("second"),
     ///         suggested_deposit: Some("60000"),
-    ///         fee_payer: true,
     ///         ..Default::default()
     ///     },
     /// )?;
@@ -1116,14 +1122,19 @@ where
 
         let mut method_details = session.and_then(|s| s.challenge_method_details());
 
-        if options.fee_payer || self.fee_payer {
+        // Fee sponsorship and machine tokens are configured on the handler for
+        // charges; only advertise them when the session method can honour them.
+        let sponsors_fees = session.is_some_and(|s| s.supports_fee_payer());
+        let settles_machine_tokens = session.is_some_and(|s| s.supports_machine_tokens());
+
+        if (options.fee_payer || self.fee_payer) && sponsors_fees {
             let details = method_details.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = details.as_object_mut() {
                 obj.insert("feePayer".to_string(), serde_json::json!(true));
             }
         }
 
-        if self.machine_token_enabled {
+        if self.machine_token_enabled && settles_machine_tokens {
             let chain_id = self
                 .chain_id
                 .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
@@ -3586,6 +3597,127 @@ mod tests {
         assert_eq!(request.amount, "1000");
         assert_eq!(request.unit_type.as_deref(), Some("second"));
         assert_eq!(request.suggested_deposit.as_deref(), Some("60000"));
+    }
+
+    /// A handler with fee sponsorship and machine tokens enabled for charges,
+    /// combined with the given session method.
+    #[cfg(feature = "tempo")]
+    fn sponsoring_machine_token_mpp<S>(
+        session_method: S,
+    ) -> Mpp<crate::protocol::methods::tempo::ChargeMethod<crate::server::TempoProvider>, S> {
+        Mpp::create(
+            tempo(TempoConfig {
+                recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            })
+            .chain_id(CHAIN_ID)
+            .fee_payer(true)
+            .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+            .machine_token_enabled(true)
+            .secret_key("test-secret"),
+        )
+        .unwrap()
+        .with_session_method(session_method)
+    }
+
+    #[cfg(feature = "tempo")]
+    fn session_challenge_details<M, S>(
+        mpp: &Mpp<M, S>,
+    ) -> crate::protocol::methods::tempo::session::TempoSessionMethodDetails
+    where
+        M: ChargeMethod,
+        S: crate::protocol::traits::SessionMethod,
+    {
+        use crate::protocol::methods::tempo::session::TempoSessionExt;
+
+        let challenge = mpp
+            .session_challenge_with_details(
+                "1000",
+                DEFAULT_CURRENCY_MAINNET,
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                crate::server::SessionChallengeOptions {
+                    fee_payer: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let request: crate::protocol::intents::SessionRequest = challenge.request.decode().unwrap();
+        request.tempo_session_details().unwrap()
+    }
+
+    /// The Tempo session method broadcasts client transactions as submitted and
+    /// has no machine-token open path, so its challenges must not advertise
+    /// either capability even when the handler enables them for charges.
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_session_challenge_omits_unsupported_capabilities() {
+        use crate::protocol::methods::tempo::session_method::{
+            InMemoryChannelStore, SessionMethod, SessionMethodConfig,
+        };
+
+        let mpp = sponsoring_machine_token_mpp(SessionMethod::new(
+            crate::server::tempo_provider("https://rpc.test.invalid").unwrap(),
+            Arc::new(InMemoryChannelStore::new()),
+            SessionMethodConfig {
+                escrow_contract: Address::ZERO,
+                chain_id: CHAIN_ID,
+                min_voucher_delta: 0,
+            },
+        ));
+
+        let details = session_challenge_details(&mpp);
+        assert_eq!(details.chain_id, Some(CHAIN_ID));
+        assert_eq!(details.fee_payer, None);
+        assert_eq!(details.machine_token_enabled, None);
+        assert_eq!(details.settlement_adapter, None);
+        assert_eq!(details.settlement_recipient, None);
+        assert_eq!(details.settlement_token, None);
+
+        let charge: ChargeRequest = mpp.charge("1").unwrap().remove(0).request.decode().unwrap();
+        assert!(charge.fee_payer());
+        assert!(charge.machine_token_enabled());
+    }
+
+    /// Session methods that report support keep getting both advertised.
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_session_challenge_advertises_supported_capabilities() {
+        #[derive(Clone)]
+        struct CapableSessionMethod;
+
+        impl crate::protocol::traits::SessionMethod for CapableSessionMethod {
+            fn method(&self) -> &str {
+                "tempo"
+            }
+
+            fn verify_session(
+                &self,
+                _credential: &PaymentCredential,
+                _request: &crate::protocol::intents::SessionRequest,
+            ) -> impl Future<Output = std::result::Result<Receipt, VerificationError>> + Send
+            {
+                std::future::ready(Err(VerificationError::new("unused")))
+            }
+
+            fn challenge_method_details(&self) -> Option<serde_json::Value> {
+                Some(serde_json::json!({ "escrowContract": Address::ZERO }))
+            }
+
+            fn supports_fee_payer(&self) -> bool {
+                true
+            }
+
+            fn supports_machine_tokens(&self) -> bool {
+                true
+            }
+        }
+
+        let details =
+            session_challenge_details(&sponsoring_machine_token_mpp(CapableSessionMethod));
+        assert_eq!(details.fee_payer, Some(true));
+        assert_eq!(details.machine_token_enabled, Some(true));
+        assert!(details.settlement_adapter.is_some());
+        assert!(details.settlement_recipient.is_some());
+        assert!(details.settlement_token.is_some());
     }
 
     #[cfg(feature = "tempo")]

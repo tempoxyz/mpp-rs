@@ -86,7 +86,8 @@ pub struct SessionChallengeOptions<'a> {
     pub unit_type: Option<&'a str>,
     /// Suggested deposit amount in base units.
     pub suggested_deposit: Option<&'a str>,
-    /// Enable fee sponsorship.
+    /// Advertise fee sponsorship. Ignored unless the session method sponsors
+    /// client transactions (`SessionMethod::supports_fee_payer`).
     pub fee_payer: bool,
     /// Human-readable description.
     pub description: Option<&'a str>,

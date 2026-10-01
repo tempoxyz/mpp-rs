@@ -83,6 +83,26 @@ pub trait SessionMethod: Clone + Send + Sync {
         None
     }
 
+    /// Whether this method sponsors the fees of client-signed transactions
+    /// (e.g. channel open and top-up).
+    ///
+    /// Session challenges only advertise `feePayer: true` when this returns
+    /// `true`: a client that follows the advertisement submits a transaction
+    /// that is only valid once the server has co-signed it. Defaults to
+    /// `false`.
+    fn supports_fee_payer(&self) -> bool {
+        false
+    }
+
+    /// Whether this method can open and settle sessions funded with machine
+    /// tokens.
+    ///
+    /// Session challenges only advertise a machine-token settlement route
+    /// when this returns `true`. Defaults to `false`.
+    fn supports_machine_tokens(&self) -> bool {
+        false
+    }
+
     /// Optional respond hook called after successful verification.
     ///
     /// If this returns `Some(response_body)`, the request is treated as a
