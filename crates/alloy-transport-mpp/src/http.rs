@@ -9,6 +9,10 @@ use reqwest::{header::HeaderMap, Url};
 use tokio::sync::Semaphore;
 use tower_service::Service;
 
+/// Default response body limit. Larger than the 160 MB default response cap
+/// of reth-based nodes, so responses a default node sends are never rejected.
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
 /// An Alloy HTTP transport that pays MPP challenges before replaying JSON-RPC requests.
 ///
 /// The canonical MPP client flow owns challenge selection, credential creation,
@@ -21,6 +25,7 @@ pub struct MppHttpTransport<P> {
     provider: P,
     headers: Option<Arc<HeaderMap>>,
     request_limit: Option<(usize, Arc<Semaphore>)>,
+    max_response_bytes: usize,
 }
 
 impl<P> MppHttpTransport<P> {
@@ -43,6 +48,7 @@ impl<P> MppHttpTransport<P> {
             provider,
             headers: None,
             request_limit: None,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 
@@ -63,6 +69,16 @@ impl<P> MppHttpTransport<P> {
     /// unbounded behavior.
     pub fn with_max_concurrent_requests(mut self, limit: usize) -> Self {
         self.request_limit = (limit != 0).then(|| (limit, Arc::new(Semaphore::new(limit))));
+        self
+    }
+
+    /// Set the largest response body, in bytes, the transport reads into memory.
+    ///
+    /// Defaults to 256 MiB. A larger response fails the request with a
+    /// transport error. The limit applies to the decoded body, so it also
+    /// bounds compressed responses.
+    pub const fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
         self
     }
 
@@ -90,6 +106,7 @@ impl<P> fmt::Debug for MppHttpTransport<P> {
                 "max_concurrent_requests",
                 &self.request_limit.as_ref().map(|(limit, _)| limit),
             )
+            .field("max_response_bytes", &self.max_response_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -165,7 +182,7 @@ where
                     })
                 })?,
         };
-        decode_response(response).await
+        decode_response(response, self.max_response_bytes).await
     }
 }
 
@@ -194,10 +211,13 @@ where
     }
 }
 
-async fn decode_response(response: reqwest::Response) -> TransportResult<ResponsePacket> {
+async fn decode_response(
+    mut response: reqwest::Response,
+    max_response_bytes: usize,
+) -> TransportResult<ResponsePacket> {
     let status = response.status();
     let diagnostics = format_http_diagnostics(response.headers());
-    let body = response.bytes().await.map_err(TransportErrorKind::custom)?;
+    let body = read_body(&mut response, max_response_bytes).await?;
     if !status.is_success() {
         return Err(TransportErrorKind::http_error(
             status.as_u16(),
@@ -206,6 +226,31 @@ async fn decode_response(response: reqwest::Response) -> TransportResult<Respons
     }
     serde_json::from_slice(&body)
         .map_err(|error| TransportError::deser_err(error, String::from_utf8_lossy(&body)))
+}
+
+/// Buffer the response body, failing once it exceeds `limit` bytes.
+async fn read_body(response: &mut reqwest::Response, limit: usize) -> TransportResult<Vec<u8>> {
+    let too_large = || {
+        TransportErrorKind::custom_str(&format!(
+            "MPP HTTP response body exceeds the {limit} byte limit"
+        ))
+    };
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(TransportErrorKind::custom)? {
+        if chunk.len() > limit - body.len() {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn format_http_diagnostics(headers: &reqwest::header::HeaderMap) -> String {
@@ -750,6 +795,51 @@ mod tests {
         }
 
         assert_eq!(observed.maximum.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bounds_response_body() {
+        const LIMIT: usize = 1024;
+
+        fn json_rpc_response(length: usize) -> String {
+            let envelope = r#"{"jsonrpc":"2.0","id":1,"result":""}"#;
+            let padding = "a".repeat(length - envelope.len());
+            format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{padding}"}}"#)
+        }
+
+        let app = Router::new()
+            .route("/fits", post(|| async { json_rpc_response(LIMIT) }))
+            .route("/sized", post(|| async { json_rpc_response(LIMIT + 1) }))
+            .route(
+                "/streamed",
+                post(|| async {
+                    axum::body::Body::from_stream(futures::stream::iter(
+                        json_rpc_response(64 * LIMIT)
+                            .into_bytes()
+                            .chunks(LIMIT / 2)
+                            .map(|chunk| Ok::<_, std::io::Error>(chunk.to_vec()))
+                            .collect::<Vec<_>>(),
+                    ))
+                }),
+            );
+        let (url, task) = server(app).await;
+        let transport = |path: &str| {
+            MppHttpTransport::new(client(), url.join(path).unwrap(), MockProvider::default())
+                .with_max_response_bytes(LIMIT)
+        };
+
+        let response = transport("/fits").call(request()).await.unwrap();
+        assert!(matches!(response, ResponsePacket::Single(response) if response.is_success()));
+
+        for path in ["/sized", "/streamed"] {
+            let error = transport(path).call(request()).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "MPP HTTP response body exceeds the 1024 byte limit",
+                "{path}"
+            );
+        }
         task.abort();
     }
 

@@ -12,6 +12,7 @@
 use super::challenge::{PaymentChallenge, PaymentCredential, Receipt};
 use super::types::{base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName};
 use crate::error::{MppError, Result};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
@@ -303,11 +304,29 @@ fn is_iso8601_timestamp(s: &str) -> bool {
     time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).is_ok()
 }
 
-/// Validate digest format.
-///
-/// Matches TypeScript SDK behavior: digest must start with `sha-256=`.
+/// Validate digest format: `sha-256=` followed by the base64 hash, either bare
+/// (as mppx emits it) or as an RFC 9530 byte sequence (`:<base64>:`).
 fn is_valid_digest_format(d: &str) -> bool {
-    d.starts_with("sha-256=")
+    let Some(value) = d.strip_prefix("sha-256=") else {
+        return false;
+    };
+    let value = value
+        .strip_prefix(':')
+        .and_then(|value| value.strip_suffix(':'))
+        .unwrap_or(value);
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
+        })
+}
+
+/// Validate an intent name: the spec grammar `1*( ALPHA / DIGIT / "-" )`,
+/// plus `_`, which mppx accepts in custom intents.
+fn is_valid_intent_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Validate the method identifier grammar used by mppx.
@@ -321,13 +340,54 @@ fn is_valid_method_name(value: &str) -> bool {
         })
 }
 
-/// Validate that a `request` parameter is base64url-encoded JSON.
+/// Validate that a `request` parameter is a base64url-encoded JSON object.
 fn validate_request(request_b64: &str) -> Result<()> {
     let request_bytes = base64url_decode(request_b64)?;
-    // Validate that the decoded bytes are valid JSON (matches TS SDK behavior)
-    let _ = serde_json::from_slice::<serde_json::Value>(&request_bytes).map_err(|e| {
-        MppError::invalid_challenge_reason(format!("Invalid JSON in request field: {}", e))
-    })?;
+    // Validate that the decoded bytes are a JSON object (matches TS SDK behavior)
+    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&request_bytes).map_err(
+        |e| MppError::invalid_challenge_reason(format!("Invalid JSON in request field: {}", e)),
+    )?;
+    Ok(())
+}
+
+/// Validate the wire form of a challenge's `id` and of the fields the id binds.
+///
+/// The id is an HMAC over the bound fields joined with `|`, so none of them
+/// may contain one. This is the single validator for challenges parsed from
+/// `WWW-Authenticate`, deserialized from JSON, and echoed in a credential.
+pub(super) fn validate_challenge_fields(
+    id: &str,
+    intent: &str,
+    request: &str,
+    expires: Option<&str>,
+    digest: Option<&str>,
+    opaque: Option<&str>,
+) -> Result<()> {
+    if id.is_empty() {
+        return Err(MppError::invalid_challenge_reason(
+            "Empty 'id' parameter".to_string(),
+        ));
+    }
+    if !is_valid_intent_name(intent) {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid intent: \"{}\".",
+            intent
+        )));
+    }
+    validate_request(request)?;
+    if digest.is_some_and(|digest| !is_valid_digest_format(digest)) {
+        return Err(MppError::invalid_challenge_reason("Invalid digest format"));
+    }
+    if expires.is_some_and(|expires| !is_iso8601_timestamp(expires)) {
+        return Err(MppError::invalid_challenge_reason(
+            "Invalid expires timestamp",
+        ));
+    }
+    if opaque.is_some_and(|opaque| base64url_decode(opaque).is_err()) {
+        return Err(MppError::invalid_challenge_reason(
+            "Invalid opaque: expected base64url",
+        ));
+    }
     Ok(())
 }
 
@@ -361,11 +421,6 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
     let params = parse_auth_params(params_str)?;
 
     let id = require_param!(params, "id").clone();
-    if id.is_empty() {
-        return Err(MppError::invalid_challenge_reason(
-            "Empty 'id' parameter".to_string(),
-        ));
-    }
     let realm = require_param!(params, "realm").clone();
     let method_raw = require_param!(params, "method").clone();
     if !is_valid_method_name(&method_raw) {
@@ -375,27 +430,20 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         )));
     }
     let method = MethodName::new(method_raw);
-    let intent = IntentName::new(require_param!(params, "intent"));
-    let request_b64 = require_param!(params, "request").clone();
-
-    validate_request(&request_b64)?;
-    let request = Base64UrlJson::from_raw(request_b64);
-
+    let intent = IntentName::from_wire(require_param!(params, "intent"));
+    let request = Base64UrlJson::from_raw(require_param!(params, "request"));
     let digest = params.get("digest").cloned();
-    if let Some(ref d) = digest {
-        if !is_valid_digest_format(d) {
-            return Err(MppError::invalid_challenge_reason("Invalid digest format"));
-        }
-    }
-
     let expires = params.get("expires").cloned();
-    if let Some(ref timestamp) = expires {
-        if !is_iso8601_timestamp(timestamp) {
-            return Err(MppError::invalid_challenge_reason(
-                "Invalid expires timestamp",
-            ));
-        }
-    }
+    let opaque = params.get("opaque").map(Base64UrlJson::from_raw);
+
+    validate_challenge_fields(
+        &id,
+        intent.as_str(),
+        request.raw(),
+        expires.as_deref(),
+        digest.as_deref(),
+        opaque.as_ref().map(Base64UrlJson::raw),
+    )?;
 
     Ok(PaymentChallenge {
         id,
@@ -406,7 +454,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
         expires,
         description: params.get("description").cloned(),
         digest,
-        opaque: params.get("opaque").map(Base64UrlJson::from_raw),
+        opaque,
         header: super::parse_advertised_credential_header(
             params.get("header").map(String::as_str),
         )?,
@@ -464,6 +512,45 @@ pub fn parse_www_authenticate_all<'a>(
         .flat_map(split_payment_challenges)
         .map(parse_www_authenticate)
         .collect()
+}
+
+/// Parse all Payment challenges from raw `WWW-Authenticate` field values.
+///
+/// Like [`parse_www_authenticate_all`], but takes the field values as the
+/// bytes received on the wire and decodes them as ISO-8859-1 (RFC 9110 §5.5).
+/// Servers that send Latin-1 text in a quoted-string as single raw bytes, as
+/// mppx does, are not readable as ASCII or UTF-8.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::protocol::core::parse_www_authenticate_all_bytes;
+///
+/// let header: &[u8] =
+///     b"Payment id=\"abc\", realm=\"caf\xe9\", method=\"tempo\", intent=\"charge\", request=\"e30\"";
+/// let challenges = parse_www_authenticate_all_bytes([header]);
+/// assert_eq!(challenges[0].as_ref().unwrap().realm, "caf\u{e9}");
+/// ```
+pub fn parse_www_authenticate_all_bytes<'a>(
+    headers: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<Result<PaymentChallenge>> {
+    headers
+        .into_iter()
+        .flat_map(|value| {
+            let value = decode_latin1(value);
+            split_payment_challenges(&value)
+                .into_iter()
+                .map(parse_www_authenticate)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(value) {
+        Ok(ascii) if ascii.is_ascii() => Cow::Borrowed(ascii),
+        _ => Cow::Owned(value.iter().copied().map(char::from).collect()),
+    }
 }
 
 /// Split a header value into individual `Payment` challenge slices.
@@ -541,21 +628,24 @@ fn split_payment_challenges(header: &str) -> Vec<&str> {
 /// # Errors
 ///
 /// Returns an error for challenges that [`parse_www_authenticate`] would
-/// reject: an empty `id`, an invalid method name, or a `request` that is not
-/// base64url-encoded JSON. Quoted values containing CR or LF are rejected too.
+/// reject: an empty `id`, an invalid method or intent name, a `request` that
+/// is not a base64url-encoded JSON object, or a malformed `expires`, `digest`
+/// or `opaque`. Quoted values containing CR or LF are rejected too.
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
-    if challenge.id.is_empty() {
-        return Err(MppError::invalid_challenge_reason(
-            "Empty 'id' parameter".to_string(),
-        ));
-    }
     if !is_valid_method_name(challenge.method.as_str()) {
         return Err(MppError::invalid_challenge_reason(format!(
             "Invalid method: \"{}\". Must match method-name ABNF.",
             challenge.method
         )));
     }
-    validate_request(challenge.request.raw())?;
+    validate_challenge_fields(
+        &challenge.id,
+        challenge.intent.as_str(),
+        challenge.request.raw(),
+        challenge.expires.as_deref(),
+        challenge.digest.as_deref(),
+        challenge.opaque.as_ref().map(Base64UrlJson::raw),
+    )?;
 
     // Escape all quoted values to prevent header injection
     let mut parts = vec![
@@ -634,34 +724,50 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 ///
 /// Format: `Payment <base64url-json>`
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
-    let payment_part = extract_payment_scheme(header).ok_or_else(|| {
-        MppError::invalid_challenge_reason("Expected 'Payment' scheme".to_string())
-    })?;
+    let payment_part = extract_payment_scheme(header)
+        .ok_or_else(|| MppError::malformed_credential("Expected 'Payment' scheme"))?;
 
     // Strip "Payment " prefix to get the token
     let token = payment_part.get(8..).unwrap_or("").trim();
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::invalid_challenge_reason(format!(
+        return Err(MppError::malformed_credential(format!(
             "Token exceeds maximum length of {} bytes",
             MAX_TOKEN_LEN
         )));
     }
 
-    let decoded = base64url_decode(token)?;
-    let mut credential: PaymentCredential = serde_json::from_slice(&decoded).map_err(|e| {
-        MppError::invalid_challenge_reason(format!("Invalid credential JSON: {}", e))
+    let decoded =
+        base64url_decode(token).map_err(|_| MppError::malformed_credential("Invalid base64url"))?;
+    let mut credential: PaymentCredential = serde_json::from_slice(&decoded)
+        .map_err(|e| MppError::malformed_credential(format!("Invalid credential JSON: {}", e)))?;
+
+    credential.challenge.header = super::parse_advertised_credential_header(
+        credential.challenge.header.as_deref(),
+    )
+    .map_err(|_| {
+        MppError::malformed_credential(
+            "Unsupported credential header: must be Payment-Authorization",
+        )
     })?;
 
-    credential.challenge.header =
-        super::parse_advertised_credential_header(credential.challenge.header.as_deref())?;
-
-    if let Some(ref d) = credential.challenge.digest {
-        if !is_valid_digest_format(d) {
-            return Err(MppError::invalid_challenge_reason("Invalid digest format"));
-        }
-    }
+    let echo = &credential.challenge;
+    validate_challenge_fields(
+        &echo.id,
+        echo.intent.as_str(),
+        echo.request.raw(),
+        echo.expires.as_deref(),
+        echo.digest.as_deref(),
+        echo.opaque.as_ref().map(Base64UrlJson::raw),
+    )
+    .map_err(|error| match error {
+        MppError::InvalidChallenge {
+            reason: Some(reason),
+            ..
+        } => MppError::malformed_credential(reason),
+        error => MppError::malformed_credential(error.to_string()),
+    })?;
 
     Ok(credential)
 }
@@ -683,7 +789,7 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
 
     // Enforce size limit to prevent memory exhaustion DoS
     if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::invalid_challenge_reason(format!(
+        return Err(MppError::InvalidReceipt(format!(
             "Receipt exceeds maximum length of {} bytes",
             MAX_TOKEN_LEN
         )));
@@ -691,10 +797,10 @@ pub fn parse_receipt(header: &str) -> Result<Receipt> {
 
     let decoded = base64url_decode(token)?;
     let receipt: Receipt = serde_json::from_slice(&decoded)
-        .map_err(|e| MppError::invalid_challenge_reason(format!("Invalid receipt JSON: {}", e)))?;
+        .map_err(|e| MppError::InvalidReceipt(format!("Invalid receipt JSON: {}", e)))?;
 
     if !is_iso8601_timestamp(&receipt.timestamp) {
-        return Err(MppError::invalid_challenge_reason(
+        return Err(MppError::InvalidReceipt(
             "Invalid timestamp format: expected ISO 8601".to_string(),
         ));
     }
@@ -989,20 +1095,20 @@ mod tests {
     #[test]
     fn test_parse_authorization_missing_payment_scheme() {
         let result = parse_authorization("Bearer abc123");
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
     fn test_parse_authorization_invalid_base64url() {
         let result = parse_authorization("Payment !");
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
     fn test_parse_authorization_invalid_json() {
         let token = base64url_encode(b"not valid json");
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1010,7 +1116,7 @@ mod tests {
         let json = r#"{"challenge":{"id":"abc"},"payload":{}}"#;
         let token = base64url_encode(json.as_bytes());
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1052,7 +1158,7 @@ mod tests {
         let json = r#"{"status":"failed","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc"}"#;
         let token = base64url_encode(json.as_bytes());
         let result = parse_receipt(&token);
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::InvalidReceipt(_))));
     }
 
     #[test]
@@ -1070,7 +1176,7 @@ mod tests {
         let json = serde_json::to_string(&credential).unwrap();
         let token = base64url_encode(json.as_bytes());
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1087,7 +1193,7 @@ mod tests {
         let json = serde_json::to_string(&credential).unwrap();
         let token = base64url_encode(json.as_bytes());
         let result = parse_authorization(&format!("Payment {}", token));
-        assert!(result.is_err());
+        assert!(matches!(result, Err(MppError::MalformedCredential(_))));
     }
 
     #[test]
@@ -1356,7 +1462,24 @@ mod tests {
         let mut invalid_json = test_challenge();
         invalid_json.request = Base64UrlJson::from_raw("bm90IGpzb24");
 
-        for challenge in [empty_id, invalid_method, invalid_base64, invalid_json] {
+        let mut invalid_intent = test_challenge();
+        invalid_intent.intent = "payment plan".into();
+
+        let mut request_not_object = test_challenge();
+        request_not_object.request = Base64UrlJson::from_raw("W10");
+
+        let mut invalid_opaque = test_challenge();
+        invalid_opaque.opaque = Some(Base64UrlJson::from_raw("a|b"));
+
+        for challenge in [
+            empty_id,
+            invalid_method,
+            invalid_base64,
+            invalid_json,
+            invalid_intent,
+            request_not_object,
+            invalid_opaque,
+        ] {
             assert!(
                 format_www_authenticate(&challenge).is_err(),
                 "{challenge:?}"
@@ -1396,6 +1519,7 @@ mod tests {
         // base64url encoded
         let wire = "eyJtZXRob2QiOiJ0ZW1wbyIsInJlZmVyZW5jZSI6IjB4YWJjIiwic3RhdHVzIjoic3VjY2VzcyIsInRpbWVzdGFtcCI6IkphbiAyOSAyMDI2IDEyOjAwIn0";
         let err = parse_receipt(wire).unwrap_err();
+        assert!(matches!(err, MppError::InvalidReceipt(_)));
         assert!(err.to_string().contains("timestamp"));
     }
 
@@ -1476,12 +1600,7 @@ mod tests {
             |c| c.description.as_deref().unwrap(),
         );
         let id: Field = (|c, v| c.id = v.to_string(), |c| &c.id);
-        let intent: Field = (|c, v| c.intent = v.into(), |c| c.intent.as_str());
         let realm: Field = (|c, v| c.realm = v.to_string(), |c| &c.realm);
-        let opaque: Field = (
-            |c, v| c.opaque = Some(Base64UrlJson::from_raw(v)),
-            |c| c.opaque.as_ref().unwrap().raw(),
-        );
 
         let cases = [
             (description, "Agentcash card payment test"),
@@ -1489,9 +1608,7 @@ mod tests {
             (description, r#"Use "Payment now", then retry \"#),
             (description, "comma, Payment fake challenge"),
             (id, "id with Payment text"),
-            (intent, "payment plan"),
             (realm, "Payment realm"),
-            (opaque, "opaque Payment value"),
         ];
 
         for ((set, get), value) in cases {
@@ -1619,7 +1736,155 @@ mod tests {
         let credential =
             PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
         let header = format_authorization(&credential).unwrap();
-        assert!(parse_authorization(&header).is_err());
+        assert!(matches!(
+            parse_authorization(&header),
+            Err(MppError::MalformedCredential(_))
+        ));
+    }
+
+    fn wire_challenge(overrides: &[(&str, &str)]) -> serde_json::Value {
+        let mut challenge = serde_json::json!({
+            "id": "abc",
+            "realm": "api",
+            "method": "tempo",
+            "intent": "charge",
+            "request": "e30",
+        });
+        for (key, value) in overrides {
+            challenge[*key] = (*value).into();
+        }
+        challenge
+    }
+
+    fn parse_wire_challenge_as_header(challenge: &serde_json::Value) -> Result<PaymentChallenge> {
+        let params: Vec<String> = challenge
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| format!("{key}=\"{}\"", value.as_str().unwrap()))
+            .collect();
+        parse_www_authenticate(&format!("Payment {}", params.join(", ")))
+    }
+
+    fn parse_wire_challenge_as_echo(challenge: &serde_json::Value) -> Result<PaymentCredential> {
+        let credential = serde_json::json!({
+            "challenge": challenge,
+            "payload": {"type": "transaction", "signature": "0xabc"},
+        });
+        parse_authorization(&format!(
+            "Payment {}",
+            base64url_encode(credential.to_string().as_bytes())
+        ))
+    }
+
+    #[test]
+    fn test_bound_fields_are_validated_on_every_wire_path() {
+        for case in [
+            ("id", ""),
+            ("intent", ""),
+            ("intent", "Charge Me"),
+            ("intent", "charge|x"),
+            // `[]`
+            ("request", "W10"),
+            ("request", "e30|e30"),
+            // `not json`
+            ("request", "bm90IGpzb24"),
+            ("expires", "tomorrow"),
+            ("expires", "2025-01-15T12:00:00Z|x"),
+            ("digest", "sha-512=abc"),
+            ("digest", "sha-256=X|Payment-Authorization"),
+            ("opaque", "Payment-Authorization|"),
+            ("opaque", "not base64url"),
+        ] {
+            let challenge = wire_challenge(&[case]);
+            assert!(
+                parse_wire_challenge_as_header(&challenge).is_err(),
+                "header: {case:?}"
+            );
+            assert!(
+                serde_json::from_value::<PaymentChallenge>(challenge.clone()).is_err(),
+                "serde: {case:?}"
+            );
+            assert!(
+                matches!(
+                    parse_wire_challenge_as_echo(&challenge),
+                    Err(MppError::MalformedCredential(_))
+                ),
+                "echo: {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bound_fields_are_not_normalized() {
+        let challenge = wire_challenge(&[
+            ("intent", "Charge-2"),
+            ("expires", "2025-01-15T12:00:00Z"),
+            (
+                "digest",
+                "sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:",
+            ),
+            ("opaque", "eyJwaSI6InBpXzEyMyJ9"),
+            ("header", "Payment-Authorization"),
+        ]);
+        let from_header = parse_wire_challenge_as_header(&challenge).unwrap();
+        let from_serde: PaymentChallenge = serde_json::from_value(challenge.clone()).unwrap();
+        let echo = parse_wire_challenge_as_echo(&challenge).unwrap().challenge;
+
+        assert_eq!(from_header.intent.as_str(), "Charge-2");
+        assert_eq!(from_serde.intent.as_str(), "Charge-2");
+        assert_eq!(echo.intent.as_str(), "Charge-2");
+        assert_eq!(
+            serde_json::to_value(&from_header).unwrap(),
+            serde_json::to_value(&from_serde).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&from_serde).unwrap(), challenge);
+    }
+
+    #[test]
+    fn test_deserialized_challenge_header_matches_header_parser() {
+        let challenge = wire_challenge(&[("header", "Cookie")]);
+        assert!(parse_wire_challenge_as_header(&challenge).is_err());
+        assert!(serde_json::from_value::<PaymentChallenge>(challenge).is_err());
+
+        let challenge = wire_challenge(&[("header", "Authorization")]);
+        let from_header = parse_wire_challenge_as_header(&challenge).unwrap();
+        let from_serde: PaymentChallenge = serde_json::from_value(challenge).unwrap();
+        assert_eq!(from_header.header, None);
+        assert_eq!(from_serde.header, None);
+    }
+
+    /// Without field validation the `|`-joined HMAC input is ambiguous: a
+    /// challenge bound to `Payment-Authorization` has the same id as one whose
+    /// opaque is `Payment-Authorization|`.
+    #[test]
+    fn test_parse_authorization_rejects_shifted_hmac_slots() {
+        let signed = PaymentChallenge::with_secret_key_full(
+            "shifted-slot-secret",
+            "api",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_raw("e30"),
+            None,
+            None,
+            None,
+            None,
+            Some("Payment-Authorization"),
+        );
+        let shifted_id = crate::protocol::core::compute_challenge_id(
+            "shifted-slot-secret",
+            "api",
+            "tempo",
+            "charge",
+            "e30",
+            None,
+            None,
+            Some("Payment-Authorization|"),
+        );
+        assert_eq!(signed.id, shifted_id);
+
+        let shifted = wire_challenge(&[("id", &signed.id), ("opaque", "Payment-Authorization|")]);
+        assert!(parse_wire_challenge_as_echo(&shifted).is_err());
     }
 
     #[test]

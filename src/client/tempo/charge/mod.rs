@@ -17,11 +17,17 @@
 //! ```ignore
 //! let charge = TempoCharge::from_challenge(&challenge)?;
 //! let signed = charge.sign_with_options(&signer, SignOptions {
+//!     // A 2D nonce lane instead of the default expiring nonce.
+//!     nonce_key: Some(U256::from(1)),
 //!     nonce: Some(42),
 //!     gas_limit: Some(500_000),
-//!     max_fee_per_gas: Some(2_000_000_000),
-//!     max_priority_fee_per_gas: Some(100_000_000),
-//!     signing_mode: TempoSigningMode::Keychain { wallet, key_authorization: None },
+//!     max_fee_per_gas: Some(50_000_000_000),
+//!     max_priority_fee_per_gas: Some(2_000_000_000),
+//!     signing_mode: Some(TempoSigningMode::Keychain {
+//!         wallet,
+//!         key_authorization: None,
+//!         version: KeychainVersion::V2,
+//!     }),
 //!     rpc_url: Some("https://rpc.tempo.xyz".to_string()),
 //!     ..Default::default()
 //! }).await?;
@@ -60,10 +66,10 @@ use tempo_alloy::accounts::{TempoAccountsWallet, TempoAuthorizationReservation};
 use tempo_alloy::contracts::precompiles::ITIP20;
 use tempo_alloy::rpc::TempoTransactionRequest;
 
-/// Nonce key for expiring nonce transactions (fee payer mode).
+/// Nonce key for expiring nonce transactions, the default for every charge.
 const EXPIRING_NONCE_KEY: U256 = U256::MAX;
 
-/// Validity window (in seconds) for fee payer transactions.
+/// Default validity window (in seconds) for charge transactions.
 const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 
 /// Encode a TIP-20 token transfer call, optionally with memo.
@@ -89,6 +95,53 @@ fn encode_transfer(
             }
             .abi_encode(),
         )
+    }
+}
+
+/// Reject a charge the server will not accept as a signed transaction.
+///
+/// This client always answers non-zero charges in `pull` mode
+/// (`type="transaction"`). An omitted `supportedModes` allows every mode.
+fn ensure_pull_supported(charge: &ChargeRequest) -> Result<(), MppError> {
+    let supported_modes = charge
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("supportedModes"))
+        .filter(|modes| !modes.is_null());
+    let Some(supported_modes) = supported_modes else {
+        return Ok(());
+    };
+    let pull_supported = supported_modes
+        .as_array()
+        .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("pull")));
+    if pull_supported {
+        Ok(())
+    } else {
+        Err(MppError::UnsupportedPaymentMethod(
+            "challenge does not support pull mode (signed transaction credentials)".into(),
+        ))
+    }
+}
+
+/// Resolve the transaction's `validBefore`: the requested timestamp, or 25
+/// seconds from now, capped at the challenge `expires`.
+fn resolve_valid_before(challenge: &PaymentChallenge, requested: Option<u64>) -> u64 {
+    let valid_before = requested.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(FEE_PAYER_VALID_BEFORE_SECS)
+    });
+    let Some(expires) = challenge.expires_at() else {
+        return valid_before;
+    };
+    // `0` encodes "no validBefore", which would outlive any expiry.
+    let expires = u64::try_from(expires.unix_timestamp()).unwrap_or(0).max(1);
+    if valid_before == 0 {
+        expires
+    } else {
+        valid_before.min(expires)
     }
 }
 
@@ -129,6 +182,13 @@ impl TempoCharge {
     ///
     /// Validates that the challenge is a Tempo charge, decodes the
     /// [`ChargeRequest`], and extracts all payment fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the challenge is malformed, or if it is a non-zero
+    /// charge whose `methodDetails.supportedModes` does not list `pull`: the
+    /// charge is always answered with a signed transaction for the server to
+    /// broadcast.
     pub fn from_challenge(challenge: &PaymentChallenge) -> Result<Self, MppError> {
         challenge.validate_for_charge("tempo")?;
 
@@ -138,6 +198,9 @@ impl TempoCharge {
         let recipient = charge_req.recipient_address()?;
         let currency = charge_req.currency_address()?;
         let amount = charge_req.amount_u256()?;
+        if !amount.is_zero() {
+            ensure_pull_supported(&charge_req)?;
+        }
         let memo = Some(crate::tempo::attribution::encode(
             &challenge.id,
             &challenge.realm,
@@ -274,13 +337,14 @@ impl TempoCharge {
     /// Sign the charge with default options.
     ///
     /// This is the simple path — resolves the RPC provider from chain_id,
-    /// fetches the pending nonce, reads the current base fee, estimates gas,
-    /// builds and signs the transaction.
+    /// estimates gas, builds and signs the transaction. The transaction uses
+    /// an expiring nonce and Tempo's static gas fees, so neither the account
+    /// nonce nor the base fee is fetched. See [`SignOptions`] for the defaults.
     ///
     /// # Errors
     ///
     /// Returns an error if the chain_id is not a known Tempo network, or if
-    /// RPC calls (nonce, gas estimation) fail.
+    /// gas estimation fails.
     pub async fn sign(
         self,
         signer: &(impl alloy::signers::Signer + Clone),
@@ -292,6 +356,9 @@ impl TempoCharge {
     ///
     /// Power users use this to inject their own nonce resolution, gas bumping,
     /// keychain signing mode, and key authorization provisioning.
+    ///
+    /// The transaction's `validBefore` is never later than the challenge
+    /// `expires`, whatever [`SignOptions::valid_before`] asks for.
     pub async fn sign_with_options(
         self,
         signer: &(impl alloy::signers::Signer + Clone),
@@ -407,13 +474,7 @@ impl TempoCharge {
             .unwrap_or(crate::client::tempo::MAX_PRIORITY_FEE_PER_GAS);
         let nonce = options.nonce.unwrap_or(0);
         let nonce_key = options.nonce_key.unwrap_or(EXPIRING_NONCE_KEY);
-        let valid_before = options.valid_before.or_else(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            Some(now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS))
-        });
+        let valid_before = Some(resolve_valid_before(&self.challenge, options.valid_before));
         let explicit_gas = options
             .gas_limit
             .or_else(|| self.fee_payer.then_some(1_000_000));
@@ -538,7 +599,8 @@ impl TempoCharge {
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
         // All charge payments use expiring nonces (nonceKey=MAX, nonce=0,
-        // validBefore=now+25s) so we never need a nonce fetch.
+        // validBefore=min(now+25s, challenge expires)) so we never need a
+        // nonce fetch.
         // Tempo uses a fixed 20 gwei base fee, so gas fees are static.
         let max_fee_per_gas = options
             .max_fee_per_gas
@@ -549,13 +611,7 @@ impl TempoCharge {
 
         let nonce = options.nonce.unwrap_or(0);
         let nonce_key = options.nonce_key.unwrap_or(EXPIRING_NONCE_KEY);
-        let valid_before = options.valid_before.or_else(|| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            Some(now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS))
-        });
+        let valid_before = Some(resolve_valid_before(&self.challenge, options.valid_before));
 
         let gas_limit = if let Some(gas) = options.gas_limit {
             gas
@@ -705,30 +761,50 @@ impl PreparedTempoCharge {
 
 /// Options for controlling the signing pipeline.
 ///
-/// Power users set these to override the defaults (nonce resolution,
-/// gas estimation, signing mode, etc.). All fields are optional —
-/// unset fields are resolved automatically.
+/// Power users set these to override the defaults (nonce, gas, signing
+/// mode, etc.). All fields are optional — unset fields use the defaults
+/// documented on each field.
+///
+/// By default a charge is signed with an expiring nonce (`nonce_key` =
+/// `U256::MAX`, `nonce` = 0, `valid_before` = now + 25 seconds) and Tempo's
+/// static gas fees, so neither the account nonce nor the base fee is fetched.
 #[derive(Debug, Clone, Default)]
 pub struct SignOptions {
     /// Override the RPC URL (otherwise resolved from chain_id).
     pub rpc_url: Option<String>,
-    /// Override the transaction nonce (otherwise fetched as pending via `eth_getTransactionCount`).
+    /// Override the transaction nonce (default: `0`).
+    ///
+    /// The nonce is never fetched from the RPC. `0` is right for the default
+    /// expiring nonce key and for the first transaction on an unused 2D nonce
+    /// lane. For a [`nonce_key`](Self::nonce_key) that has been used before,
+    /// including the protocol nonce (key `0`), set the lane's current nonce
+    /// here or the transaction is rejected.
     pub nonce: Option<u64>,
-    /// Override the nonce key (default: `U256::ZERO`).
+    /// Override the nonce key (default: `U256::MAX`, the expiring nonce key).
+    ///
+    /// Any other key selects a sequential nonce: `U256::ZERO` is the protocol
+    /// nonce and every other value a 2D nonce lane. Set [`nonce`](Self::nonce)
+    /// along with it, since the lane's current nonce is not looked up.
     pub nonce_key: Option<U256>,
-    /// Override the gas limit (otherwise estimated via `eth_estimateGas`).
+    /// Override the gas limit (otherwise estimated via `eth_estimateGas`, or
+    /// a fixed 1,000,000 for fee-sponsored charges, which are not estimated).
     pub gas_limit: Option<u64>,
-    /// Override max fee per gas in wei (otherwise derived from the latest block's base fee).
+    /// Override max fee per gas in wei (default:
+    /// [`MAX_FEE_PER_GAS`](crate::client::tempo::MAX_FEE_PER_GAS), 41 gwei).
     pub max_fee_per_gas: Option<u128>,
-    /// Override max priority fee per gas in wei (default: 1 gwei floor).
+    /// Override max priority fee per gas in wei (default:
+    /// [`MAX_PRIORITY_FEE_PER_GAS`](crate::client::tempo::MAX_PRIORITY_FEE_PER_GAS),
+    /// 1 gwei).
     pub max_priority_fee_per_gas: Option<u128>,
-    /// Override the fee token address (default: the charge currency).
+    /// Override the fee token address (default: the charge currency). Unused
+    /// for fee-sponsored charges, where the server chooses the fee token.
     pub fee_token: Option<Address>,
     /// Override the signing mode (default: [`TempoSigningMode::Direct`]).
     pub signing_mode: Option<TempoSigningMode>,
     /// Provide a key authorization to include in the transaction.
     pub key_authorization: Option<Box<SignedKeyAuthorization>>,
-    /// Optional validity window upper bound (unix timestamp) for fee payer mode.
+    /// Override the transaction's `validBefore` as a unix timestamp (default:
+    /// 25 seconds from now). Applies to every charge, fee-sponsored or not.
     pub valid_before: Option<u64>,
 }
 
@@ -1040,6 +1116,87 @@ mod tests {
 
         let calls = charge.build_transfer_calls().unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn test_from_challenge_honours_supported_modes() {
+        use serde_json::json;
+
+        let cases = [
+            ("1000000", json!(null), true),
+            ("1000000", json!(["pull"]), true),
+            ("1000000", json!(["push", "pull"]), true),
+            ("1000000", json!(["push"]), false),
+            ("1000000", json!([]), false),
+            ("1000000", json!("pull"), false),
+            // Zero-amount charges are answered with a proof, which has no mode.
+            ("0", json!(["push"]), true),
+        ];
+
+        for (amount, supported_modes, payable) in cases {
+            let request = Base64UrlJson::from_value(&json!({
+                "amount": amount,
+                "currency": "0x20c0000000000000000000000000000000000000",
+                "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                "methodDetails": { "chainId": 42431, "supportedModes": supported_modes },
+            }))
+            .unwrap();
+            let challenge =
+                PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+
+            let result = TempoCharge::from_challenge(&challenge);
+            assert_eq!(
+                result.is_ok(),
+                payable,
+                "amount {amount}, supportedModes {supported_modes}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_valid_before_is_capped_at_challenge_expires() {
+        use alloy::eips::Decodable2718;
+        use tempo_alloy::primitives::transaction::AASigned;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+
+        // `Some(0)` asks for no `validBefore` at all.
+        let challenge = test_challenge().with_expires(crate::expires::seconds(5));
+        let expires = challenge.expires_at().unwrap().unix_timestamp() as u64;
+        assert_eq!(resolve_valid_before(&challenge, Some(0)), expires);
+
+        // (seconds until `expires`, explicit `valid_before` offset from now)
+        let cases = [(5, None), (5, Some(600)), (3600, None), (3600, Some(600))];
+
+        for (expires_in, explicit) in cases {
+            let challenge = test_challenge().with_expires(crate::expires::seconds(expires_in));
+            let expires = challenge.expires_at().unwrap().unix_timestamp() as u64;
+            // An explicit gas limit keeps signing off the RPC.
+            let options = SignOptions {
+                gas_limit: Some(100_000),
+                valid_before: explicit.map(|offset| now + offset),
+                ..Default::default()
+            };
+
+            let signed = TempoCharge::from_challenge(&challenge)
+                .unwrap()
+                .sign_with_options(&signer, options)
+                .await
+                .unwrap();
+            let tx = AASigned::decode_2718(&mut signed.tx_bytes()).unwrap();
+            let valid_before = tx.tx().valid_before.unwrap().get();
+
+            assert!(
+                valid_before <= expires,
+                "expires in {expires_in}s, explicit {explicit:?}: validBefore is {}s past expires",
+                valid_before.saturating_sub(expires)
+            );
+            if expires_in == 3600 {
+                let requested = explicit.unwrap_or(FEE_PAYER_VALID_BEFORE_SECS);
+                assert!((now + requested..=now + requested + 5).contains(&valid_before));
+            }
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,7 @@ use alloy::network::ReceiptResponse;
 use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::simulate::{SimBlock, SimCallResult, SimulatePayload};
+use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use std::future::Future;
 use std::sync::Arc;
@@ -91,22 +92,25 @@ fn call_selector(data: &Bytes) -> Option<[u8; 4]> {
     }
 }
 
-fn decode_approve_spender(call: &tempo_alloy::primitives::transaction::Call) -> Option<Address> {
+fn decode_approve(call: &tempo_alloy::primitives::transaction::Call) -> Option<(Address, U256)> {
     if call_selector(&call.input) != Some(ITIP20::approveCall::SELECTOR) || call.input.len() != 68 {
         return None;
     }
 
-    Some(Address::from_slice(&call.input[16..36]))
+    Some((
+        Address::from_slice(&call.input[16..36]),
+        U256::from_be_slice(&call.input[36..68]),
+    ))
 }
 
-fn decode_swap_token_in(call: &tempo_alloy::primitives::transaction::Call) -> Option<Address> {
+fn decode_swap(
+    call: &tempo_alloy::primitives::transaction::Call,
+) -> Option<IStablecoinDEX::swapExactAmountOutCall> {
     if call_selector(&call.input) != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
         return None;
     }
 
-    IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..])
-        .ok()
-        .map(|decoded| decoded.tokenIn)
+    IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..]).ok()
 }
 
 fn transfer_call_offset(
@@ -149,6 +153,8 @@ fn get_transfer_calls(
 
 fn validate_fee_payer_calls(
     calls: &[tempo_alloy::primitives::transaction::Call],
+    currency: Address,
+    expected: &[Transfer],
 ) -> Result<(), VerificationError> {
     if calls.is_empty() {
         return Err(disallowed_fee_payer_call_pattern_error());
@@ -187,19 +193,24 @@ fn validate_fee_payer_calls(
             TxKind::Call(address) => *address,
             _ => return Err(disallowed_fee_payer_call_pattern_error()),
         };
-        let swap_token_in =
-            decode_swap_token_in(&calls[1]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
-        if approve_target != swap_token_in {
+        let swap = decode_swap(&calls[1]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        if approve_target != swap.tokenIn {
             return Err(VerificationError::new(
                 "Fee-sponsored transaction approve target is not the swap input token".to_string(),
             ));
         }
 
-        let approve_spender = decode_approve_spender(&calls[0])
-            .ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        let (approve_spender, approve_amount) =
+            decode_approve(&calls[0]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
         if approve_spender != STABLECOIN_DEX_ADDRESS {
             return Err(VerificationError::new(
                 "Fee-sponsored transaction approve spender is not the DEX".to_string(),
+            ));
+        }
+        if approve_amount != U256::from(swap.maxAmountIn) {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction approve amount does not match the swap max input"
+                    .to_string(),
             ));
         }
 
@@ -210,6 +221,22 @@ fn validate_fee_payer_calls(
                     "Fee-sponsored transaction swap target is not the DEX".to_string(),
                 ));
             }
+        }
+
+        if swap.tokenOut != currency {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction swap output token is not the payment currency"
+                    .to_string(),
+            ));
+        }
+        let payment_amount = expected.iter().fold(U256::ZERO, |sum, transfer| {
+            sum.saturating_add(transfer.amount)
+        });
+        if U256::from(swap.amountOut) != payment_amount {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction swap output does not match the payment amount"
+                    .to_string(),
+            ));
         }
     }
 
@@ -686,6 +713,7 @@ pub struct ChargeMethod<P> {
     fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     relay: Option<Relay>,
     fee_payer_fee_token: Option<Address>,
+    fee_payer_allow_key_authorization: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -814,6 +842,7 @@ where
             fee_payer_allowed_fee_tokens: None,
             relay: None,
             fee_payer_fee_token: None,
+            fee_payer_allow_key_authorization: true,
         }
     }
 
@@ -869,6 +898,16 @@ where
     /// allowed token. An explicit token must also be in the allowlist.
     pub fn with_fee_payer_fee_token(mut self, fee_token: Address) -> Self {
         self.fee_payer_fee_token = Some(fee_token);
+        self
+    }
+
+    /// Set whether a sponsored transaction may install an access key.
+    ///
+    /// Allowed by default, matching mppx. A key authorization adds intrinsic
+    /// gas the fee payer pays for; pass `false` to reject sponsored
+    /// transactions that carry one.
+    pub fn with_fee_payer_allow_key_authorization(mut self, allow: bool) -> Self {
+        self.fee_payer_allow_key_authorization = allow;
         self
     }
 
@@ -982,7 +1021,7 @@ where
                     .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                     .await
                     .map_err(|e| {
-                        VerificationError::new(format!("Failed to record tx hash: {e}"))
+                        VerificationError::internal(format!("Failed to record tx hash: {e}"))
                     })?;
                 if !claimed {
                     return Err(VerificationError::new(
@@ -992,7 +1031,7 @@ where
             } else if store
                 .get(&replay_key)
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to check tx hash: {e}")))?
+                .map_err(|e| VerificationError::internal(format!("Failed to check tx hash: {e}")))?
                 .is_some()
             {
                 return Err(VerificationError::new(
@@ -1016,8 +1055,9 @@ where
         expected: &[Transfer],
         sender_policy: ReceiptSenderPolicy<'_>,
     ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
-        let receipt_json = serde_json::to_value(receipt)
-            .map_err(|e| VerificationError::new(format!("Failed to serialize receipt: {}", e)))?;
+        let receipt_json = serde_json::to_value(receipt).map_err(|e| {
+            VerificationError::internal(format!("Failed to serialize receipt: {}", e))
+        })?;
 
         let logs = receipt_json
             .get("logs")
@@ -1121,7 +1161,7 @@ where
         let transfer_calls = get_transfer_calls(&tx.calls)?;
 
         if require_exact_calls {
-            validate_fee_payer_calls(&tx.calls)?;
+            validate_fee_payer_calls(&tx.calls, currency, expected)?;
         }
 
         // Sort expected transfers: memo-bearing first for greedy-safe matching
@@ -1312,7 +1352,7 @@ where
                 serde_json::Value::Bool(true),
             )
             .await
-            .map_err(|e| VerificationError::new(format!("Failed to record proof: {e}")))?;
+            .map_err(|e| VerificationError::internal(format!("Failed to record proof: {e}")))?;
         if !reserved {
             return Err(VerificationError::new(
                 "Proof credential has already been used.",
@@ -1465,7 +1505,9 @@ where
                 if store
                     .get(&Self::proof_replay_key(credential))
                     .await
-                    .map_err(|e| VerificationError::new(format!("Failed to check proof: {e}")))?
+                    .map_err(|e| {
+                        VerificationError::internal(format!("Failed to check proof: {e}"))
+                    })?
                     .is_some()
                 {
                     return Err(VerificationError::new(
@@ -1569,7 +1611,7 @@ where
             let claimed = store
                 .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx: {e}")))?;
+                .map_err(|e| VerificationError::internal(format!("Failed to record tx: {e}")))?;
             if !claimed {
                 return Err(VerificationError::new(
                     "Transaction has already been submitted.",
@@ -1619,7 +1661,9 @@ where
             let claimed = store
                 .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                 .await
-                .map_err(|e| VerificationError::new(format!("Failed to record tx hash: {e}")))?;
+                .map_err(|e| {
+                    VerificationError::internal(format!("Failed to record tx hash: {e}"))
+                })?;
             if !claimed {
                 return Err(VerificationError::new(
                     "Transaction hash has already been used.",
@@ -1706,10 +1750,10 @@ where
         })
     }
 
-    /// Simulate a co-signed `0x76` tx and error if it would revert. Generally
-    /// fails closed: an RPC error is treated as a failed check, not a pass.
-    /// Exception: nodes without `tempo_simulateV1` (JSON-RPC -32601) skip the
-    /// check rather than reject every sponsored payment.
+    /// Simulate a co-signed `0x76` tx and error if it would revert. Fails
+    /// closed: an RPC error is treated as a failed check, not a pass. Nodes
+    /// without `tempo_simulateV1` (JSON-RPC -32601) are asked to `eth_call`
+    /// the transaction's calls instead.
     async fn simulate_before_broadcast(
         &self,
         final_tx_bytes: &[u8],
@@ -1722,17 +1766,15 @@ where
         // tempo_simulateV1(payload, block?) — omit block to use the latest state.
         let response: TempoSimulateResponse = match self
             .provider
-            .raw_request("tempo_simulateV1".into(), (payload,))
+            .raw_request("tempo_simulateV1".into(), (&payload,))
             .await
         {
             Ok(response) => response,
             Err(e) => {
-                // Node doesn't support pre-simulation: skip the check rather
-                // than failing the payment.
                 if e.as_error_resp()
                     .is_some_and(|err| err.code == JSONRPC_METHOD_NOT_FOUND)
                 {
-                    return Ok(());
+                    return self.simulate_with_eth_call(payload).await;
                 }
                 return Err(VerificationError::network_error(format!(
                     "Pre-broadcast simulation failed: {e}"
@@ -1745,7 +1787,7 @@ where
             .first()
             .and_then(|block| block.calls.first())
             .ok_or_else(|| {
-                VerificationError::new("Pre-broadcast simulation returned no call results")
+                VerificationError::internal("Pre-broadcast simulation returned no call results")
             })?;
 
         if !call.status {
@@ -1762,6 +1804,54 @@ where
             return Err(VerificationError::transaction_failed(format!(
                 "Sponsored transaction would revert in pre-broadcast simulation: {detail}"
             )));
+        }
+
+        Ok(())
+    }
+
+    /// Reduce a simulation request to its sender and calls. Without fee
+    /// fields or signatures the node only checks call execution, so the
+    /// sender does not need to hold a fee token (mppx simulates the same way).
+    fn sender_call_request(request: TempoTransactionRequest) -> TempoTransactionRequest {
+        TempoTransactionRequest {
+            inner: TransactionRequest {
+                from: request.inner.from,
+                to: request.inner.to,
+                value: request.inner.value,
+                input: request.inner.input,
+                ..Default::default()
+            },
+            calls: request.calls,
+            ..Default::default()
+        }
+    }
+
+    /// `eth_call` fallback for [`Self::simulate_before_broadcast`].
+    async fn simulate_with_eth_call(
+        &self,
+        payload: SimulatePayload<TempoTransactionRequest>,
+    ) -> Result<(), VerificationError> {
+        // JSON-RPC error code nodes return for a reverted call.
+        const JSONRPC_EXECUTION_REVERTED: i64 = 3;
+
+        let requests = payload
+            .block_state_calls
+            .into_iter()
+            .flat_map(|block| block.calls);
+        for request in requests {
+            if let Err(e) = self.provider.call(Self::sender_call_request(request)).await {
+                return Err(match e.as_error_resp() {
+                    Some(err) if err.code == JSONRPC_EXECUTION_REVERTED => {
+                        VerificationError::transaction_failed(format!(
+                            "Sponsored transaction would revert in pre-broadcast simulation: {} (code {})",
+                            err.message, err.code
+                        ))
+                    }
+                    _ => VerificationError::network_error(format!(
+                        "Pre-broadcast simulation failed: {e}"
+                    )),
+                });
+            }
         }
 
         Ok(())
@@ -1818,6 +1908,20 @@ where
         // Stripped by `to_recoverable_signed`; guard against regression.
         debug_assert!(tx.access_list.is_empty());
 
+        // Both add intrinsic gas the sponsor pays for without being part of
+        // the charge. mppx rejects the former and makes the latter opt-out.
+        if !tx.tempo_authorization_list.is_empty() {
+            return Err(VerificationError::new(
+                "Fee payer transaction must not include an authorization list",
+            ));
+        }
+
+        if tx.key_authorization.is_some() && !self.fee_payer_allow_key_authorization {
+            return Err(VerificationError::new(
+                "Fee payer transaction must not include a key authorization",
+            ));
+        }
+
         if tx.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
             return Err(VerificationError::new(
                 "Fee payer envelope must use expiring nonce key (U256::MAX)",
@@ -1826,7 +1930,7 @@ where
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| VerificationError::new(format!("System clock error: {e}")))?
+            .map_err(|e| VerificationError::internal(format!("System clock error: {e}")))?
             .as_secs();
 
         let valid_before = match tx.valid_before {
@@ -1922,10 +2026,9 @@ where
 
         // Compute the fee payer signature hash and co-sign
         let fp_hash = tx.fee_payer_signature_hash(sender);
-        let fp_sig = fee_payer_signer
-            .sign_hash(&fp_hash)
-            .await
-            .map_err(|e| VerificationError::new(format!("Failed to co-sign transaction: {e}")))?;
+        let fp_sig = fee_payer_signer.sign_hash(&fp_hash).await.map_err(|e| {
+            VerificationError::internal(format!("Failed to co-sign transaction: {e}"))
+        })?;
 
         tx.fee_payer_signature = Some(fp_sig);
 
@@ -2059,6 +2162,7 @@ where
         let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
         let relay = self.relay.clone();
         let fee_payer_fee_token = self.fee_payer_fee_token;
+        let fee_payer_allow_key_authorization = self.fee_payer_allow_key_authorization;
 
         async move {
             if let Some(relay) = relay {
@@ -2076,6 +2180,7 @@ where
                 fee_payer_allowed_fee_tokens,
                 relay: None,
                 fee_payer_fee_token,
+                fee_payer_allow_key_authorization,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -4193,6 +4298,108 @@ mod tests {
         assert!(error.to_string().contains("swap target is not the DEX"));
     }
 
+    /// The swap prefix must only acquire the charge: the approval covers
+    /// exactly the swap input, and the swap buys exactly the payment.
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_unbound_swap_prefix() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let split_recipient = Address::repeat_byte(0x34);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![
+            Transfer {
+                amount: U256::from(90u64),
+                recipient,
+                memo: None,
+            },
+            Transfer {
+                amount: U256::from(10u64),
+                recipient: split_recipient,
+                memo: None,
+            },
+        ];
+
+        let validate = |approve_amount: u64, token_out: Address, amount_out: u128| {
+            let tx_bytes = encode_signed_tx(
+                vec![
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(token_in),
+                        value: U256::ZERO,
+                        input: make_approve_input(
+                            STABLECOIN_DEX_ADDRESS,
+                            U256::from(approve_amount),
+                        ),
+                    },
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                        value: U256::ZERO,
+                        input: Bytes::from(
+                            IStablecoinDEX::swapExactAmountOutCall {
+                                tokenIn: token_in,
+                                tokenOut: token_out,
+                                amountOut: amount_out,
+                                maxAmountIn: 101,
+                            }
+                            .abi_encode(),
+                        ),
+                    },
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(currency),
+                        value: U256::ZERO,
+                        input: make_transfer_input(recipient, U256::from(90u64)),
+                    },
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(currency),
+                        value: U256::ZERO,
+                        input: make_transfer_input(split_recipient, U256::from(10u64)),
+                    },
+                ],
+                MAX_FEE_PAYER_GAS_LIMIT,
+            );
+            method.validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+        };
+
+        validate(101, currency, 100).expect("bound swap prefix is accepted");
+
+        for (approve_amount, token_out, amount_out, expected_error) in [
+            (
+                u64::MAX,
+                currency,
+                100,
+                "approve amount does not match the swap max input",
+            ),
+            (
+                101,
+                Address::repeat_byte(0x21),
+                100,
+                "swap output token is not the payment currency",
+            ),
+            (
+                101,
+                currency,
+                1_000,
+                "swap output does not match the payment amount",
+            ),
+            (
+                101,
+                currency,
+                90,
+                "swap output does not match the payment amount",
+            ),
+        ] {
+            let error = validate(approve_amount, token_out, amount_out).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "expected `{expected_error}`, got: {error}"
+            );
+        }
+    }
+
     #[test]
     fn test_validate_transaction_transfers_rejects_fee_payer_gas_limit_above_max() {
         let provider =
@@ -4391,6 +4598,92 @@ mod tests {
             err.to_string().to_lowercase().contains("sender mismatch"),
             "expected sender mismatch, got: {err}"
         );
+    }
+
+    /// An authorization list adds intrinsic gas the sponsor would pay for
+    /// delegations unrelated to the charge.
+    #[tokio::test]
+    async fn test_cosign_rejects_authorization_list() {
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::TempoSignedAuthorization;
+
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+
+        let authorization = alloy::eips::eip7702::Authorization {
+            chain_id: U256::from(CHAIN_ID),
+            address: Address::repeat_byte(0xde),
+            nonce: 0,
+        };
+        let signature = client_signer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let mut tx = make_fee_payer_tx(60);
+        tx.tempo_authorization_list = vec![TempoSignedAuthorization::new_unchecked(
+            authorization,
+            signature.into(),
+        )];
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await
+            .expect_err("authorization list must not be sponsored");
+        assert!(err.to_string().contains("authorization list"), "got: {err}");
+    }
+
+    /// Key authorizations are sponsored by default and rejected once the
+    /// server opts out.
+    #[tokio::test]
+    async fn test_cosign_key_authorization_follows_policy() {
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::{
+            KeyAuthorization, PrimitiveSignature, SignatureType,
+        };
+
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+
+        let authorization = KeyAuthorization {
+            chain_id: CHAIN_ID,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::repeat_byte(0xde),
+            expiry: NonZeroU64::new(9999999999),
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let signature = client_signer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let mut tx = make_fee_payer_tx(60);
+        tx.key_authorization =
+            Some(authorization.into_signed(PrimitiveSignature::Secp256k1(signature)));
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await
+            .expect("key authorization is sponsored by default");
+
+        let method = method.with_fee_payer_allow_key_authorization(false);
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await
+            .expect_err("key authorization must be rejected when disallowed");
+        assert!(err.to_string().contains("key authorization"), "got: {err}");
     }
 
     /// cosign_fee_payer_transaction rejects txs with expired valid_before.
@@ -4753,6 +5046,70 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.reference, challenge.id);
         assert!(store.get(&key).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_and_store_failures_are_internal_errors() {
+        use crate::error::PaymentError;
+        use crate::store::{Store, StoreError};
+        use std::pin::Pin;
+
+        // Has no atomic claim, so recording the proof fails.
+        struct NonAtomicStore;
+        impl Store for NonAtomicStore {
+            fn get(
+                &self,
+                _key: &str,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+            fn put(
+                &self,
+                _key: &str,
+                _value: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn delete(
+                &self,
+                _key: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = test_charge_request_with_amount("0");
+        let challenge = test_proof_challenge(&request);
+        let signature = proof::sign_proof(
+            &signer,
+            signer.address(),
+            42431,
+            &challenge.id,
+            &challenge.realm,
+        )
+        .await
+        .unwrap();
+        let credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            proof::proof_source(signer.address(), 42431),
+            crate::protocol::core::PaymentPayload::proof(signature),
+        );
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+
+        // The chain ID lookup hits an unreachable RPC.
+        let method = ChargeMethod::new(provider.clone());
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert_eq!(err.to_problem_details(None).status, 500, "{err}");
+
+        let method = ChargeMethod::new(provider).with_store(Arc::new(NonAtomicStore));
+        method.cached_chain_id.set(42431).unwrap();
+        let err = method.verify(&credential, &request).await.unwrap_err();
+        assert_eq!(err.to_problem_details(None).status, 500, "{err}");
     }
 
     #[tokio::test]
@@ -5839,30 +6196,101 @@ mod tests {
     }
 
     /// A node that doesn't implement `tempo_simulateV1` (JSON-RPC "method not
-    /// found", -32601) has nothing to simulate against, so the check is skipped
-    /// and the broadcast proceeds rather than rejecting the payment.
+    /// found", -32601) is asked to `eth_call` the calls from the sender, so a
+    /// reverting transaction is still caught before the sponsor pays for it.
     #[tokio::test]
-    async fn test_simulate_before_broadcast_skips_when_method_not_found() {
+    async fn test_simulate_before_broadcast_falls_back_to_eth_call() {
         use alloy::providers::mock::Asserter;
 
         let cosigned = make_cosigned_fee_payer_tx().await;
 
-        let asserter = Asserter::new();
-        asserter.push_failure(alloy_json_rpc::ErrorPayload {
-            code: -32601,
-            message: "the method tempo_simulateV1 does not exist/is not available".into(),
-            data: None,
-        });
+        let method_with = |eth_call: Result<Bytes, alloy_json_rpc::ErrorPayload>| {
+            let asserter = Asserter::new();
+            asserter.push_failure(alloy_json_rpc::ErrorPayload {
+                code: -32601,
+                message: "the method tempo_simulateV1 does not exist/is not available".into(),
+                data: None,
+            });
+            match eth_call {
+                Ok(output) => asserter.push_success(&output),
+                Err(error) => asserter.push_failure(error),
+            }
+            let provider =
+                alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                    .connect_mocked_client(asserter.clone());
+            (ChargeMethod::new(provider), asserter)
+        };
 
-        let provider =
-            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
-                .connect_mocked_client(asserter);
-        let method = ChargeMethod::new(provider);
-
+        let (method, asserter) = method_with(Ok(Bytes::from(U256::from(1).to_be_bytes::<32>())));
         method
             .simulate_before_broadcast(&cosigned)
             .await
-            .expect("method-not-found must skip the check, not fail");
+            .expect("successful eth_call must pass");
+        assert!(asserter.read_q().is_empty(), "eth_call must be issued");
+
+        let (method, _) = method_with(Err(alloy_json_rpc::ErrorPayload {
+            code: 3,
+            message: "execution reverted: InsufficientBalance".into(),
+            data: None,
+        }));
+        let err = method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect_err("reverting eth_call must be rejected");
+        assert!(err.to_string().contains("would revert"), "got: {err}");
+        assert!(err.to_string().contains("InsufficientBalance"));
+
+        let (method, _) = method_with(Err(alloy_json_rpc::ErrorPayload {
+            code: -32601,
+            message: "the method eth_call does not exist/is not available".into(),
+            data: None,
+        }));
+        let err = method
+            .simulate_before_broadcast(&cosigned)
+            .await
+            .expect_err("a node that cannot simulate at all must fail closed");
+        assert!(
+            err.to_string().contains("Pre-broadcast simulation failed"),
+            "got: {err}"
+        );
+    }
+
+    /// The `eth_call` fallback runs the calls from the sender without fee
+    /// fields, so it does not depend on the sender holding a fee token.
+    #[tokio::test]
+    async fn test_sender_call_request_keeps_only_sender_and_calls() {
+        let cosigned = make_cosigned_fee_payer_tx().await;
+        let signed =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let sender = signed.recover_signer().unwrap();
+
+        let mut payload =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::build_simulate_payload(
+                &cosigned,
+            )
+            .unwrap();
+        let request =
+            ChargeMethod::<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>>::sender_call_request(
+                payload.block_state_calls.remove(0).calls.remove(0),
+            );
+
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            wire["from"].as_str().unwrap().to_lowercase(),
+            format!("{sender:#x}")
+        );
+        assert!(wire["to"].is_string() && wire["input"].is_string());
+        for field in [
+            "feePayerSignature",
+            "nonceKey",
+            "validBefore",
+            "gas",
+            "maxFeePerGas",
+            "maxPriorityFeePerGas",
+        ] {
+            assert!(wire.get(field).is_none(), "{field} must be omitted: {wire}");
+        }
+        assert!(wire["feeToken"].is_null());
     }
 
     // ==================== Sponsor fee-token selection ====================

@@ -79,8 +79,7 @@ async fn main() {
         tempo(TempoConfig {
             recipient: &recipient,
         })
-        .rpc_url(RPC_URL)
-        .fee_payer(true),
+        .rpc_url(RPC_URL),
     )
     .expect("failed to create payment handler");
 
@@ -197,6 +196,7 @@ async fn chat(
         tick_cost: PRICE_PER_TOKEN,
         generate: token_stream,
         poll_interval_ms: 100,
+        min_voucher_delta: 0,
     });
 
     let body_stream = async_stream::stream! {

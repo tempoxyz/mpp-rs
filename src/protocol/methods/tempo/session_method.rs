@@ -822,7 +822,8 @@ where
             )
             .await?;
 
-        let state = updated.ok_or_else(|| VerificationError::new("failed to create channel"))?;
+        let state =
+            updated.ok_or_else(|| VerificationError::internal("failed to create channel"))?;
 
         Ok(session_receipt(
             &credential.challenge.id,

@@ -18,7 +18,7 @@ use crate::client::challenge_selection::{
 };
 use crate::error::MppError;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
-use crate::protocol::core::{format_authorization, parse_www_authenticate_all};
+use crate::protocol::core::{format_authorization, parse_www_authenticate_all_bytes};
 
 /// Extension trait for `reqwest::RequestBuilder` with payment support.
 ///
@@ -272,11 +272,11 @@ async fn send_with_payment<P: PaymentProvider>(
             return Err(err);
         }
 
-        let www_auth_values: Vec<&str> = resp
+        let www_auth_values: Vec<&[u8]> = resp
             .headers()
             .get_all(WWW_AUTHENTICATE)
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.as_bytes())
             .collect();
 
         if www_auth_values.is_empty() {
@@ -310,7 +310,7 @@ async fn send_with_payment<P: PaymentProvider>(
             return Err(HttpError::MissingChallenge);
         }
 
-        let challenges: Vec<_> = parse_www_authenticate_all(www_auth_values)
+        let challenges: Vec<_> = parse_www_authenticate_all_bytes(www_auth_values)
             .into_iter()
             .filter_map(|r| r.ok())
             .collect();
@@ -818,6 +818,82 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(provider.call_count(), 1);
             assert_eq!(call_count.load(Ordering::SeqCst), 2); // initial 402 + retry
+        }
+
+        /// mppx servers put Latin-1 text on the wire as single raw bytes.
+        #[tokio::test]
+        async fn pays_challenge_with_raw_latin1_bytes() {
+            const SECRET: &str = "latin1-test-secret";
+            const REALM: &str = "caf\u{e9}.example";
+            const DESCRIPTION: &str = "cr\u{e8}me br\u{fb}l\u{e9}e \u{a3}5";
+            let request =
+                Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+            let challenge =
+                PaymentChallenge::with_secret_key(SECRET, REALM, "tempo", "charge", request);
+            let www_auth: Vec<u8> = format!(
+                r#"Payment id="{}", realm="{REALM}", method="tempo", intent="charge", request="{}", description="{DESCRIPTION}""#,
+                challenge.id,
+                challenge.request.raw(),
+            )
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap())
+            .collect();
+            let www_auth = axum::http::HeaderValue::from_bytes(&www_auth).unwrap();
+            assert!(www_auth.to_str().is_err());
+
+            let app = Router::new().route(
+                "/paid",
+                get(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    async move {
+                        let Some(authorization) = req.headers().get("authorization") else {
+                            return (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response();
+                        };
+                        let echo = crate::protocol::core::parse_authorization(
+                            authorization.to_str().unwrap(),
+                        )
+                        .unwrap()
+                        .challenge;
+                        let expected_id = crate::protocol::core::compute_challenge_id(
+                            SECRET,
+                            &echo.realm,
+                            echo.method.as_str(),
+                            echo.intent.as_str(),
+                            echo.request.raw(),
+                            None,
+                            None,
+                            None,
+                        );
+                        if echo.realm == REALM
+                            && crate::protocol::core::challenge::constant_time_eq(
+                                &echo.id,
+                                &expected_id,
+                            )
+                        {
+                            (AxumStatusCode::OK, "ok").into_response()
+                        } else {
+                            (AxumStatusCode::FORBIDDEN, "challenge binding mismatch")
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+            let resp = reqwest::Client::new()
+                .get(format!("{}/paid", base_url))
+                .send_with_payment(&provider)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
         }
 
         #[tokio::test]
@@ -2032,8 +2108,13 @@ mod tests {
         async fn test_multi_challenge_skips_malformed_expiry_first_supported() {
             // A bad expires value fails closed for that challenge, but should
             // not block a later valid challenge for the same method/intent.
-            let bad_header =
-                challenge_header_with_expires("bad", "tempo", "charge", Some("not-a-date"));
+            let bad_header = challenge_header_with_expires(
+                "bad",
+                "tempo",
+                "charge",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .replace("2099-01-01T00:00:00Z", "not-a-date");
             let valid_header = challenge_header("valid", "tempo", "charge");
             let combined = format!("{}, {}", bad_header, valid_header);
 

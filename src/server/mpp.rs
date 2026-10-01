@@ -30,12 +30,14 @@ const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;
 
 /// Environment variables checked (in order) to auto-detect the server realm.
+///
+/// `HOST` and `HOSTNAME` are deliberately absent: container runtimes set them
+/// per replica, and the realm is part of the challenge HMAC, so a credential
+/// for a challenge issued by one replica would be rejected by the others.
 const REALM_ENV_VARS: &[&str] = &[
     "MPP_REALM",
     "FLY_APP_NAME",
     "HEROKU_APP_NAME",
-    "HOST",
-    "HOSTNAME",
     "RAILWAY_PUBLIC_DOMAIN",
     "RENDER_EXTERNAL_HOSTNAME",
     "VERCEL_URL",
@@ -68,14 +70,14 @@ fn validate_charge_modes(modes: &[&str]) -> Result<()> {
 /// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
 /// falling back to `"MPP Payment"`.
 pub(crate) fn detect_realm() -> String {
-    for name in REALM_ENV_VARS {
-        if let Ok(value) = std::env::var(name) {
-            if !value.is_empty() {
-                return value;
-            }
-        }
-    }
-    DEFAULT_REALM.to_string()
+    realm_from_env(|name| std::env::var(name).ok())
+}
+
+fn realm_from_env(lookup: impl Fn(&str) -> Option<String>) -> String {
+    REALM_ENV_VARS
+        .iter()
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
+        .unwrap_or_else(|| DEFAULT_REALM.to_string())
 }
 
 /// Result of session verification, including optional management response.
@@ -365,7 +367,7 @@ where
         if echoed_opaque != configured_opaque {
             return Err(VerificationError::with_code(
                 "credential opaque data does not match this route's requirements",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
         Ok(())
@@ -389,7 +391,7 @@ where
                     "credential method '{}' does not match this route's requirements (expected '{}')",
                     credential.challenge.method, self.method.method()
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -399,7 +401,7 @@ where
                     "credential intent '{}' does not match this route's requirements (expected 'charge')",
                     credential.challenge.intent
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -409,7 +411,7 @@ where
                     "credential realm '{}' does not match this route's requirements (expected '{}')",
                     credential.challenge.realm, self.realm
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -422,7 +424,7 @@ where
                     "credential currency '{}' does not match this route's requirements",
                     request.currency
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -430,7 +432,7 @@ where
             if request.recipient.as_deref() != Some(expected_recipient.as_str()) {
                 return Err(VerificationError::with_code(
                     "credential recipient does not match this route's requirements",
-                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ));
             }
         }
@@ -453,7 +455,7 @@ where
                         "credential chainId {:?} does not match this route's requirements (expected '{}')",
                         actual_chain_id, expected_chain_id
                     ),
-                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ));
             }
         }
@@ -483,20 +485,22 @@ where
         if !crate::protocol::core::constant_time_eq(&credential.challenge.id, &expected_id) {
             return Err(VerificationError::with_code(
                 "Challenge ID mismatch - not issued by this server",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
         let expires = credential.challenge.expires.as_deref().ok_or_else(|| {
             VerificationError::with_code(
                 "Challenge missing required expires field",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             )
         })?;
 
         let expires_at =
             time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
-                .map_err(|_| VerificationError::new("Invalid expires timestamp in challenge"))?;
+                .map_err(|_| {
+                    VerificationError::invalid_challenge("Invalid expires timestamp in challenge")
+                })?;
 
         if expires_at <= time::OffsetDateTime::now_utc() {
             return Err(VerificationError::expired(format!(
@@ -686,11 +690,9 @@ where
     fn decode_credential_request(
         credential: &PaymentCredential,
     ) -> std::result::Result<ChargeRequest, VerificationError> {
-        credential
-            .challenge
-            .request
-            .decode()
-            .map_err(|e| VerificationError::new(format!("Failed to decode request: {e}")))
+        credential.challenge.request.decode().map_err(|e| {
+            VerificationError::invalid_challenge(format!("Failed to decode request: {e}"))
+        })
     }
 
     /// Validate a payment credential without consuming or broadcasting it.
@@ -832,7 +834,7 @@ where
                     "Amount mismatch: credential has {} but endpoint expects {}",
                     request.amount, expected.amount
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -847,21 +849,21 @@ where
                     "Currency mismatch: credential has {} but endpoint expects {}",
                     request.currency, expected.currency
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
         if request.recipient != expected.recipient {
             return Err(VerificationError::with_code(
                 "Recipient mismatch: credential was issued for a different recipient",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
         if request.mppx_scope != expected.mppx_scope {
             return Err(VerificationError::with_code(
                 "Framework scope mismatch: credential was issued for a different route",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -903,7 +905,7 @@ where
             if !same_transfers {
                 return Err(VerificationError::with_code(
                     "Tempo transfer routing mismatch: credential was issued with different memo or splits",
-                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ));
             }
         }
@@ -995,16 +997,16 @@ where
         match (credential.challenge.digest.as_deref(), body) {
             (Some(_), None) => Err(VerificationError::with_code(
                 "body digest present but request body was not provided",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             )),
             (None, Some(_)) => Err(VerificationError::with_code(
                 "missing body digest",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             )),
             (Some(digest), Some(body)) if !crate::body_digest::verify(digest, body) => {
                 Err(VerificationError::with_code(
                     "body digest mismatch",
-                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ))
             }
             _ => Ok(()),
@@ -1250,7 +1252,7 @@ where
 
         let request: crate::protocol::intents::SessionRequest =
             credential.challenge.request.decode().map_err(|e| {
-                crate::protocol::traits::VerificationError::new(format!(
+                crate::protocol::traits::VerificationError::invalid_challenge(format!(
                     "Failed to decode session request: {}",
                     e
                 ))
@@ -1270,7 +1272,7 @@ where
                     request.currency,
                     self.currencies.join(" or ")
                 ),
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
@@ -1282,7 +1284,7 @@ where
                         "Recipient mismatch: credential has {} but server expects {}",
                         echoed, bound
                     ),
-                    crate::protocol::traits::ErrorCode::CredentialMismatch,
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ));
             }
         }
@@ -1340,6 +1342,13 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if builder.fee_payer_fee_token.is_some() && builder.fee_payer_signer.is_none() {
             return Err(crate::error::MppError::InvalidConfig(
                 "fee_payer_fee_token requires a local fee payer signer".into(),
+            ));
+        }
+        // Without a sponsor every challenge would advertise `feePayer: true`
+        // and every credential built for it would then be rejected.
+        if builder.fee_payer && builder.fee_payer_signer.is_none() && builder.relay.is_none() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "fee_payer(true) requires fee_payer_signer(...) or relay(...)".into(),
             ));
         }
         if builder
@@ -2440,6 +2449,36 @@ mod tests {
         assert_eq!(mpp.decimals(), 6);
     }
 
+    #[test]
+    fn test_realm_detection_ignores_host_and_hostname() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+
+        assert_eq!(
+            realm_from_env(env(&[
+                ("HOST", "0.0.0.0"),
+                ("HOSTNAME", "pod-7f9c5d-abcde")
+            ])),
+            DEFAULT_REALM
+        );
+        assert_eq!(
+            realm_from_env(env(&[
+                ("HOSTNAME", "pod-7f9c5d-abcde"),
+                ("VERCEL_URL", "app.vercel.app"),
+            ])),
+            "app.vercel.app"
+        );
+        assert_eq!(
+            realm_from_env(env(&[("MPP_REALM", ""), ("FLY_APP_NAME", "my-app")])),
+            "my-app"
+        );
+    }
+
     #[cfg(feature = "tempo")]
     #[test]
     fn test_default_fee_payer_charges_offer_ousd_first() {
@@ -2533,6 +2572,29 @@ mod tests {
             mpp.method.fee_payer_allowed_fee_tokens(),
             Some([custom_token].as_slice())
         );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_mpp_create_rejects_fee_payer_without_sponsor() {
+        let builder = || {
+            tempo(TempoConfig {
+                recipient: TEST_RECIPIENT,
+            })
+            .secret_key("fee-payer-test-secret-key-32-bytes")
+            .fee_payer(true)
+        };
+
+        let err = Mpp::create(builder()).err().expect("no signer or relay");
+        assert!(
+            matches!(&err, crate::error::MppError::InvalidConfig(msg) if msg.contains("fee_payer")),
+            "{err}"
+        );
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        assert!(Mpp::create(builder().fee_payer_signer(signer)).is_ok());
+        let relay = crate::server::TempoRelayConfig::new("test-api-key");
+        assert!(Mpp::create(builder().relay(relay)).is_ok());
     }
 
     #[cfg(feature = "tempo")]
@@ -3663,7 +3725,7 @@ mod tests {
 
         let result = mpp.verify_session(&credential).await;
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
     }
 
     #[cfg(feature = "tempo")]
@@ -3990,7 +4052,7 @@ mod tests {
         let result = mpp.verify_credential(&credential).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("missing required expires"),
             "expected missing expires error, got: {}",
@@ -4018,7 +4080,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("Amount mismatch"),
             "expected amount mismatch error, got: {}",
@@ -4067,7 +4129,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("Recipient mismatch"),
             "expected recipient mismatch error, got: {}",
@@ -4114,7 +4176,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("Tempo transfer routing mismatch"),
             "expected split routing mismatch error, got: {}",
@@ -4206,7 +4268,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("Tempo transfer routing mismatch"),
             "expected memo routing mismatch error, got: {}",
@@ -4298,7 +4360,7 @@ mod tests {
         let result = mpp.verify_session(&credential).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("missing required expires"),
             "expected missing expires error, got: {}",
@@ -5047,7 +5109,7 @@ mod tests {
         let credential = PaymentCredential::new(foreign.to_echo(), PaymentPayload::hash("0x01"));
 
         let err = mpp.verify_credential(&credential).await.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(
             err.message.contains("credential currency"),
             "{}",
@@ -5363,7 +5425,7 @@ mod tests {
 
         let credential = session_voucher_credential(&mpp, PATH_USD);
         let err = mpp.verify_session(&credential).await.unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(err.message.contains("Currency mismatch"), "{}", err.message);
         assert!(
             err.message.contains(OUSD) && err.message.contains(USDC),

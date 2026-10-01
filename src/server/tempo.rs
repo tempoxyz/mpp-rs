@@ -118,9 +118,10 @@ impl TempoBuilder {
     /// When enabled, all charge challenges will include `feePayer: true` in
     /// their `methodDetails`, and so will session challenges if the session
     /// method sponsors client transactions (Tempo's `SessionMethod` does
-    /// not). You should also call
-    /// [`fee_payer_signer`](Self::fee_payer_signer) to provide the signer
-    /// that will sponsor transaction fees.
+    /// not). Requires [`fee_payer_signer`](Self::fee_payer_signer), the
+    /// signer that sponsors transaction fees, or a [`relay`](Self::relay):
+    /// [`Mpp::create()`](super::Mpp::create) rejects the configuration
+    /// otherwise.
     pub fn fee_payer(mut self, enabled: bool) -> Self {
         self.fee_payer = enabled;
         self
@@ -209,8 +210,8 @@ impl TempoBuilder {
 ///
 /// - **rpc_url**: `https://rpc.tempo.xyz`
 /// - **realm**: auto-detected from `MPP_REALM`, `FLY_APP_NAME`, `HEROKU_APP_NAME`,
-///   `HOST`, `HOSTNAME`, `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`,
-///   `VERCEL_URL`, `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
+///   `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`, `VERCEL_URL`,
+///   `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
 /// - **currencies**: one charge challenge per accepted currency, in order:
 ///   - Tempo mainnet (`.chain_id(4217)` or a non-Moderato `.rpc_url(...)`):

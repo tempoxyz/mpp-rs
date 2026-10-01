@@ -129,12 +129,7 @@ impl Transport for WsTransport {
     fn get_credential(&self, input: &Self::Input) -> Result<Option<PaymentCredential>, MppError> {
         match input {
             WsMessage::Credential { credential } => {
-                let parsed =
-                    crate::protocol::core::parse_authorization(credential).map_err(|e| {
-                        MppError::MalformedCredential(Some(format!(
-                            "failed to parse WS credential: {e}"
-                        )))
-                    })?;
+                let parsed = crate::protocol::core::parse_authorization(credential)?;
                 Ok(Some(parsed))
             }
             WsMessage::Data { .. } => Ok(None),
