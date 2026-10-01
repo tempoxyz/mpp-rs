@@ -643,14 +643,13 @@ where
         currency: &str,
         recipient: &str,
     ) -> Result<PaymentChallenge> {
-        let challenge = crate::protocol::methods::tempo::charge_challenge(
-            &self.secret_key,
-            &self.realm,
-            amount,
-            currency,
-            recipient,
-        )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        let request = ChargeRequest {
+            amount: amount.to_string(),
+            currency: currency.to_string(),
+            recipient: Some(recipient.to_string()),
+            ..Default::default()
+        };
+        self.charge_challenge_with_options(&request, None, None)
     }
 
     /// Generate a charge challenge with full options (base units).
@@ -661,10 +660,23 @@ where
         expires: Option<&str>,
         description: Option<&str>,
     ) -> Result<PaymentChallenge> {
+        // Verification fails closed on a missing `chainId` when one is pinned,
+        // so a caller-built request must carry it like `charge()` requests do.
+        let mut request = request.clone();
+        if let Some(chain_id) = self.chain_id {
+            let details = request
+                .method_details
+                .get_or_insert_with(|| serde_json::json!({}));
+            if let Some(details) = details.as_object_mut() {
+                details
+                    .entry("chainId")
+                    .or_insert_with(|| serde_json::json!(chain_id));
+            }
+        }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.secret_key,
             &self.realm,
-            request,
+            &request,
             expires,
             description,
         )?;
@@ -3054,6 +3066,50 @@ mod tests {
         let result = mpp.verify_credential(&credential).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("chainId"));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_charge_challenge_pins_chain_id() {
+        const CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
+
+        let mut mpp = create_hmac_test_mpp();
+        mpp.chain_id = Some(42431);
+
+        let request = ChargeRequest {
+            amount: "1000".into(),
+            currency: CURRENCY.into(),
+            recipient: Some(TEST_RECIPIENT.into()),
+            method_details: Some(serde_json::json!({ "feePayer": true })),
+            ..Default::default()
+        };
+        let challenges = [
+            mpp.charge_challenge("1000", CURRENCY, TEST_RECIPIENT)
+                .unwrap(),
+            mpp.charge_challenge_with_options(&request, None, None)
+                .unwrap(),
+        ];
+        for challenge in &challenges {
+            let credential =
+                PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+            mpp.verify_credential(&credential)
+                .await
+                .expect("a challenge issued by this handler must verify");
+        }
+
+        let issued: ChargeRequest = challenges[1].request.decode().unwrap();
+        assert!(issued.fee_payer(), "caller methodDetails must be kept");
+
+        // An explicit chainId is the caller's choice and is not overwritten.
+        let explicit = ChargeRequest {
+            method_details: Some(serde_json::json!({ "chainId": 4217 })),
+            ..request
+        };
+        let challenge = mpp
+            .charge_challenge_with_options(&explicit, None, None)
+            .unwrap();
+        let issued: ChargeRequest = challenge.request.decode().unwrap();
+        assert_eq!(issued.chain_id(), Some(4217));
     }
 
     #[cfg(feature = "tempo")]
