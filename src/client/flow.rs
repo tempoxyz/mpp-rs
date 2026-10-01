@@ -172,6 +172,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     return Err(err.into());
                 }
                 Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
+                    // A paid request answered with challenges the provider
+                    // cannot pay is the server's final answer.
+                    if !paid_challenge_ids.is_empty() {
+                        return Ok(resp);
+                    }
                     return Err(self
                         .fail(None, HttpError::NoSupportedChallenge(message))
                         .await);
