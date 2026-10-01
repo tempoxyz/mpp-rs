@@ -870,7 +870,7 @@ where
         if request.external_id != expected.external_id {
             return Err(VerificationError::with_code(
                 "External ID mismatch: credential was issued for a different order",
-                crate::protocol::traits::ErrorCode::CredentialMismatch,
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
