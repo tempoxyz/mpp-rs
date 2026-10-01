@@ -54,8 +54,14 @@ pub enum Endpoint {
 }
 
 /// Payment parameters for a paid endpoint.
+///
+/// Created with [`PaidEndpoint::new`]; the optional fields have `with_*`
+/// setters.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PaidEndpoint {
+    /// Payment method (e.g., "tempo", "stripe").
+    pub method: String,
     /// Payment intent (e.g., "charge", "session").
     pub intent: String,
     /// Amount in atomic units (e.g., "50000").
@@ -69,6 +75,50 @@ pub struct PaidEndpoint {
     pub unit_type: Option<String>,
     /// Description.
     pub description: Option<String>,
+}
+
+impl PaidEndpoint {
+    /// Payment parameters for `amount` atomic units paid with `method` and
+    /// `intent`.
+    pub fn new(
+        method: impl Into<String>,
+        intent: impl Into<String>,
+        amount: impl Into<String>,
+    ) -> Self {
+        Self {
+            method: method.into(),
+            intent: intent.into(),
+            amount: amount.into(),
+            decimals: None,
+            currency: None,
+            unit_type: None,
+            description: None,
+        }
+    }
+
+    /// Set the number of decimal places of `amount`.
+    pub fn with_decimals(mut self, decimals: u8) -> Self {
+        self.decimals = Some(decimals);
+        self
+    }
+
+    /// Set the currency identifier.
+    pub fn with_currency(mut self, currency: impl Into<String>) -> Self {
+        self.currency = Some(currency.into());
+        self
+    }
+
+    /// Set the unit type for session payments.
+    pub fn with_unit_type(mut self, unit_type: impl Into<String>) -> Self {
+        self.unit_type = Some(unit_type.into());
+        self
+    }
+
+    /// Set the description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
 }
 
 impl Service {
@@ -453,25 +503,29 @@ pub fn serialize_services(services: &[Service]) -> Value {
 fn serialize_payment(endpoint: &Endpoint) -> Value {
     match endpoint {
         Endpoint::Free => Value::Null,
-        Endpoint::Paid(p) => {
-            let mut m = serde_json::Map::new();
-            m.insert("intent".to_string(), json!(p.intent));
-            m.insert("amount".to_string(), json!(p.amount));
-            if let Some(decimals) = p.decimals {
-                m.insert("decimals".to_string(), json!(decimals));
-            }
-            if let Some(ref currency) = p.currency {
-                m.insert("currency".to_string(), json!(currency));
-            }
-            if let Some(ref ut) = p.unit_type {
-                m.insert("unitType".to_string(), json!(ut));
-            }
-            if let Some(ref desc) = p.description {
-                m.insert("description".to_string(), json!(desc));
-            }
-            Value::Object(m)
-        }
+        Endpoint::Paid(p) => payment_offer(p),
     }
+}
+
+/// A payment offer object as defined for `x-payment-info`.
+fn payment_offer(p: &PaidEndpoint) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("intent".to_string(), json!(p.intent));
+    m.insert("method".to_string(), json!(p.method));
+    m.insert("amount".to_string(), json!(p.amount));
+    if let Some(decimals) = p.decimals {
+        m.insert("decimals".to_string(), json!(decimals));
+    }
+    if let Some(ref currency) = p.currency {
+        m.insert("currency".to_string(), json!(currency));
+    }
+    if let Some(ref ut) = p.unit_type {
+        m.insert("unitType".to_string(), json!(ut));
+    }
+    if let Some(ref desc) = p.description {
+        m.insert("description".to_string(), json!(desc));
+    }
+    Value::Object(m)
 }
 
 /// Options for customizing llms.txt output.
@@ -554,22 +608,10 @@ pub fn generate_openapi(config: &ProxyConfig) -> Value {
                     json!({ "description": "Payment Required" }),
                 );
 
-                let mut offer = serde_json::Map::new();
-                offer.insert("intent".to_string(), json!(p.intent));
-                offer.insert("amount".to_string(), json!(p.amount));
-                if let Some(decimals) = p.decimals {
-                    offer.insert("decimals".to_string(), json!(decimals));
-                }
-                if let Some(ref currency) = p.currency {
-                    offer.insert("currency".to_string(), json!(currency));
-                }
-                if let Some(ref ut) = p.unit_type {
-                    offer.insert("unitType".to_string(), json!(ut));
-                }
-                if let Some(ref desc) = p.description {
-                    offer.insert("description".to_string(), json!(desc));
-                }
-                operation.insert("x-payment-info".to_string(), json!({ "offers": [offer] }));
+                operation.insert(
+                    "x-payment-info".to_string(),
+                    json!({ "offers": [payment_offer(p)] }),
+                );
             }
             responses.insert(
                 "200".to_string(),
@@ -628,14 +670,12 @@ mod tests {
             .bearer("sk-test")
             .route(
                 "POST /v1/chat/completions",
-                Endpoint::Paid(PaidEndpoint {
-                    intent: "charge".into(),
-                    amount: "50000".into(),
-                    decimals: Some(6),
-                    currency: Some("0x20c0000000000000000000000000000000000001".into()),
-                    unit_type: None,
-                    description: Some("Chat completion".into()),
-                }),
+                Endpoint::Paid(
+                    PaidEndpoint::new("tempo", "charge", "50000")
+                        .with_decimals(6)
+                        .with_currency("0x20c0000000000000000000000000000000000001")
+                        .with_description("Chat completion"),
+                ),
             )
             .route("GET /v1/models", Endpoint::Free)
             .build()
@@ -738,14 +778,7 @@ mod tests {
         let svc = Service::new("api", "https://api.example.com")
             .route(
                 "GET /v1/stream",
-                Endpoint::Paid(PaidEndpoint {
-                    intent: "charge".into(),
-                    amount: "0.05".into(),
-                    decimals: None,
-                    currency: None,
-                    unit_type: None,
-                    description: None,
-                }),
+                Endpoint::Paid(PaidEndpoint::new("tempo", "charge", "0.05")),
             )
             .build();
 
@@ -787,14 +820,9 @@ mod tests {
         let service = Service::new("api", "https://api.example.com")
             .route(
                 "GET /v1/stream",
-                Endpoint::Paid(PaidEndpoint {
-                    intent: "session".into(),
-                    amount: "1000".into(),
-                    decimals: None,
-                    currency: None,
-                    unit_type: Some("token".into()),
-                    description: None,
-                }),
+                Endpoint::Paid(
+                    PaidEndpoint::new("tempo", "session", "1000").with_unit_type("token"),
+                ),
             )
             .build();
         let config = ProxyConfig {
@@ -895,6 +923,7 @@ mod tests {
         assert_eq!(routes[0]["pattern"], "POST /v1/chat/completions");
         assert!(routes[0]["payment"].is_object());
         assert_eq!(routes[0]["payment"]["intent"], "charge");
+        assert_eq!(routes[0]["payment"]["method"], "tempo");
         assert_eq!(routes[0]["payment"]["amount"], "50000");
         assert_eq!(routes[0]["payment"]["decimals"], 6);
         assert_eq!(
@@ -1126,6 +1155,7 @@ mod tests {
             json!({
                 "offers": [{
                     "intent": "charge",
+                    "method": "tempo",
                     "amount": "50000",
                     "decimals": 6,
                     "currency": "0x20c0000000000000000000000000000000000001",
@@ -1157,14 +1187,7 @@ mod tests {
         let svc = Service::new("stripe", "https://api.stripe.com")
             .route(
                 "GET /v1/customers/:id/charges/:charge",
-                Endpoint::Paid(PaidEndpoint {
-                    intent: "charge".into(),
-                    amount: "100".into(),
-                    decimals: None,
-                    currency: None,
-                    unit_type: None,
-                    description: None,
-                }),
+                Endpoint::Paid(PaidEndpoint::new("tempo", "charge", "100")),
             )
             .route("GET /v1/customers/:id", Endpoint::Free)
             .build();

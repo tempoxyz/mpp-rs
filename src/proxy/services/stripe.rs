@@ -10,18 +10,14 @@ use base64::Engine;
 /// # Example
 ///
 /// ```
-/// use mpp::proxy::service::{Endpoint, ServiceBuilder};
+/// use mpp::proxy::service::{Endpoint, PaidEndpoint, ServiceBuilder};
 /// use mpp::proxy::services::stripe;
 ///
 /// let svc = stripe::service("sk_test_123", |r| {
-///     r.route("POST /v1/charges", Endpoint::Paid(mpp::proxy::service::PaidEndpoint {
-///         intent: "charge".into(),
-///         amount: "100".into(),
-///         decimals: Some(2),
-///         currency: None,
-///         unit_type: None,
-///         description: None,
-///     }))
+///     r.route(
+///         "POST /v1/charges",
+///         Endpoint::Paid(PaidEndpoint::new("tempo", "charge", "100").with_decimals(2)),
+///     )
 ///     .route("GET /v1/customers/:id", Endpoint::Free)
 /// });
 ///

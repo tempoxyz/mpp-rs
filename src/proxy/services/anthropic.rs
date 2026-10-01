@@ -11,14 +11,14 @@ use crate::proxy::service::{Service, ServiceBuilder};
 /// use mpp::proxy::services::anthropic;
 ///
 /// let svc = anthropic::service("sk-ant-...", |r| {
-///     r.route("POST /v1/messages", Endpoint::Paid(PaidEndpoint {
-///         intent: "charge".into(),
-///         amount: "30000".into(),
-///         decimals: Some(6),
-///         currency: None,
-///         unit_type: None,
-///         description: Some("Message".into()),
-///     }))
+///     r.route(
+///         "POST /v1/messages",
+///         Endpoint::Paid(
+///             PaidEndpoint::new("tempo", "charge", "30000")
+///                 .with_decimals(6)
+///                 .with_description("Message"),
+///         ),
+///     )
 /// });
 ///
 /// assert_eq!(svc.id, "anthropic");
