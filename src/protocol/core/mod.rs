@@ -67,20 +67,25 @@
 //! ```
 
 pub mod accept_payment;
+mod auth_params;
+mod binding;
 pub mod challenge;
+mod credential;
 pub mod headers;
+mod receipt;
 pub mod types;
 
 // Re-export all public types
 #[cfg(feature = "server")]
-pub(crate) use challenge::constant_time_eq;
+pub(crate) use binding::constant_time_eq;
 #[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
-pub(crate) use challenge::validate_secret_key;
-pub use challenge::{
+pub(crate) use binding::validate_secret_key;
+pub use binding::{
     advertised_credential_header, compute_challenge_id, compute_challenge_id_with_header,
-    extract_tx_hash, is_default_credential_header, parse_advertised_credential_header,
-    ChallengeEcho, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt,
+    is_default_credential_header, parse_advertised_credential_header,
 };
+pub use challenge::{ChallengeEcho, PaymentChallenge};
+pub use credential::{PaymentCredential, PaymentPayload};
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
     format_www_authenticate_many, parse_authorization, parse_receipt, parse_www_authenticate,
@@ -88,6 +93,7 @@ pub use headers::{
     AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME,
     WWW_AUTHENTICATE_HEADER,
 };
+pub use receipt::{extract_tx_hash, Receipt};
 
 pub use types::{
     base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName, PayloadType,
