@@ -51,7 +51,7 @@ use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSe
 /// # Examples
 ///
 /// ```ignore
-/// use mpp::client::TempoSessionProvider;
+/// use mpp::client::{Fetch, TempoSessionProvider};
 /// use mpp::PrivateKeySigner;
 ///
 /// let signer = PrivateKeySigner::random();
@@ -60,8 +60,25 @@ use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSe
 ///     "https://rpc.moderato.tempo.xyz",
 /// )?;
 ///
-/// // First call opens a channel, subsequent calls send vouchers
+/// // The first request opens a channel, later requests send vouchers
+/// let response = client.get(url).send_with_payment(&provider).await?;
+/// ```
+///
+/// # Calling `pay` directly
+///
+/// Payments are serialized: [`pay`](PaymentProvider::pay) holds the provider's
+/// payment lock until the credential is settled with
+/// [`commit_payment`](PaymentProvider::commit_payment),
+/// [`rollback_payment`](PaymentProvider::rollback_payment) or
+/// [`abandon_payment`](PaymentProvider::abandon_payment). The HTTP helpers do
+/// this for you. When calling `pay` yourself, settle every credential before
+/// paying again, otherwise the next `pay` waits until its challenge expires and
+/// fails with [`MppError::PaymentExpired`].
+///
+/// ```ignore
 /// let credential = provider.pay(&challenge).await?;
+/// // ... send the credential and read the response ...
+/// provider.commit_payment(&challenge, &credential).await?;
 /// ```
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
@@ -1677,7 +1694,7 @@ impl TempoSessionProvider {
         top_up: Option<ApplicationTopUp<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
-        let process_lease = self.payment_lock.clone().lock_owned().await;
+        let process_lease = self.acquire_payment_lock(challenge).await?;
         let (key, _) = self.expected_channel_key(challenge)?;
         let store_lease = self
             .channel_store
@@ -1693,6 +1710,25 @@ impl TempoSessionProvider {
             },
         );
         Ok(credential)
+    }
+
+    /// Waits for the payment lock, but not past the challenge's expiry: an
+    /// expired challenge cannot be paid, and a payment that is never settled
+    /// would otherwise block every later one forever.
+    async fn acquire_payment_lock(
+        &self,
+        challenge: &PaymentChallenge,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
+        let lock = self.payment_lock.clone().lock_owned();
+        let Some(expires) = challenge.expires_at() else {
+            return Ok(lock.await);
+        };
+        let remaining = (expires - time::OffsetDateTime::now_utc())
+            .try_into()
+            .unwrap_or_default();
+        tokio::time::timeout(remaining, lock)
+            .await
+            .map_err(|_| MppError::PaymentExpired(challenge.expires.clone()))
     }
 
     async fn payment_credential_inner(
@@ -4016,5 +4052,78 @@ mod tests {
         assert!(provider.close(&client, &url).await.unwrap().is_some());
         assert!(provider.channels.lock().unwrap().is_empty());
         assert!(store.get(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pay_stops_waiting_for_an_unsettled_payment_when_its_challenge_expires() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::channel_ops::build_channel_descriptor;
+        use crate::protocol::methods::tempo::precompile_voucher::compute_precompile_channel_id;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let salt = B256::repeat_byte(0x44);
+        let nonce_hash = B256::repeat_byte(0x55);
+        let provider = make_test_provider();
+        let payer = provider.signer.address();
+        let channel_id = compute_precompile_channel_id(
+            payer,
+            payee,
+            Address::ZERO,
+            currency,
+            salt,
+            payer,
+            nonce_hash,
+            42431,
+        );
+        let key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+        provider.channels.lock().unwrap().insert(
+            key.clone(),
+            ChannelEntry {
+                channel_id,
+                salt,
+                cumulative_amount: 1_000,
+                deposit: 100_000,
+                descriptor: Some(build_channel_descriptor(
+                    payer,
+                    payee,
+                    Address::ZERO,
+                    currency,
+                    salt,
+                    payer,
+                    nonce_hash,
+                )),
+                settlement_route: None,
+                escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), key);
+
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::milliseconds(500))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS)
+            .with_expires(expires);
+
+        // Never committed, rolled back or abandoned, so its lease stays parked.
+        provider.pay(&challenge).await.unwrap();
+
+        let second =
+            tokio::time::timeout(std::time::Duration::from_secs(3), provider.pay(&challenge))
+                .await
+                .expect("pay must not wait forever for an unsettled payment");
+        assert!(matches!(second, Err(MppError::PaymentExpired(_))));
     }
 }
