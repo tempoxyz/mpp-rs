@@ -1,10 +1,13 @@
 use super::*;
-use crate::protocol::core::{ChallengeEcho, PaymentPayload};
+#[cfg(any(feature = "tempo", feature = "stripe"))]
+use crate::protocol::core::PaymentChallenge;
+use crate::protocol::core::{ChallengeEcho, PaymentCredential, PaymentPayload, Receipt};
+use crate::protocol::intents::ChargeRequest;
 #[cfg(feature = "tempo")]
 use crate::protocol::methods::tempo::{
     FeePayerPolicy, TempoChargeExt, CHAIN_ID, DEFAULT_CURRENCY_MAINNET, DEFAULT_CURRENCY_TESTNET,
 };
-use crate::protocol::traits::ErrorCode;
+use crate::protocol::traits::{ChargeValidation, ErrorCode, VerificationError};
 #[cfg(feature = "tempo")]
 use crate::server::{tempo, ChargeOptions, TempoConfig};
 #[cfg(feature = "tempo")]
