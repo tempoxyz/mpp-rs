@@ -210,6 +210,11 @@ async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
 /// Validate the close voucher amount against spent, on-chain settled, and deposit.
 /// Matches mppx handleClose:
 /// https://github.com/wevm/mppx/blob/c526ea6/src/tempo/server/Session.ts#L837-L846
+///
+/// The amount must exceed the on-chain settled amount: a settled voucher is
+/// public on-chain and must not close the channel when presented again
+/// (GHSA-mv9j-8jvg-j8mr). The one exception is a funded channel nothing was
+/// ever settled on, which can be closed at zero to refund the payer.
 fn validate_close_amount(
     cumulative_amount: u128,
     spent: u128,
@@ -222,7 +227,8 @@ fn validate_close_amount(
             spent,
         )));
     }
-    if cumulative_amount <= on_chain_settled {
+    let refunds_untouched = cumulative_amount == 0 && on_chain_settled == 0 && on_chain_deposit > 0;
+    if cumulative_amount <= on_chain_settled && !refunds_untouched {
         return Err(VerificationError::new(format!(
             "close voucher amount must be > {} (on-chain settled)",
             on_chain_settled,
@@ -4125,6 +4131,22 @@ mod tests {
         crate::protocol::intents::SessionRequest,
         crate::protocol::core::PaymentCredential,
     ) {
+        close_setup_with(store, asserter, 500, 0, 1_000).await
+    }
+
+    /// Like [`close_setup`], for a channel that spent `spent`, has `settled`
+    /// settled on-chain and is closed with a voucher for `close_amount`.
+    async fn close_setup_with(
+        store: &InMemoryChannelStore,
+        asserter: &alloy::providers::mock::Asserter,
+        spent: u128,
+        settled: u128,
+        close_amount: u128,
+    ) -> (
+        String,
+        crate::protocol::intents::SessionRequest,
+        crate::protocol::core::PaymentCredential,
+    ) {
         use alloy::sol_types::SolValue;
 
         let signer = alloy::signers::local::PrivateKeySigner::random();
@@ -4132,7 +4154,8 @@ mod tests {
         let mut state = test_channel_state(&channel_id);
         state.authorized_signer = signer.address();
         state.highest_voucher_amount = 1_000;
-        state.spent = 500;
+        state.spent = spent;
+        state.settled_on_chain = settled;
         store.insert(&channel_id, state.clone());
 
         asserter.push_success(&Bytes::from(
@@ -4144,7 +4167,7 @@ mod tests {
                 state.token,
                 state.authorized_signer,
                 state.deposit,
-                0u128,
+                settled,
             )
                 .abi_encode_params(),
         ));
@@ -4152,7 +4175,7 @@ mod tests {
         let signature = voucher::sign_voucher(
             &signer,
             channel_id.parse().unwrap(),
-            1_000,
+            close_amount,
             state.escrow_contract,
             state.chain_id,
         )
@@ -4165,7 +4188,7 @@ mod tests {
                 channel_id: channel_id.clone(),
                 descriptor: None,
                 settlement_route: None,
-                cumulative_amount: "1000".to_string(),
+                cumulative_amount: close_amount.to_string(),
                 signature: alloy::hex::encode_prefixed(signature),
             },
         );
@@ -4289,6 +4312,57 @@ mod tests {
         let stored = store.get_channel_sync(&channel_id).unwrap();
         assert!(stored.finalized);
         assert!(!stored.closing);
+    }
+
+    /// A channel nothing was spent or settled on can be closed at zero, which
+    /// refunds the whole deposit to the payer.
+    #[tokio::test]
+    async fn test_close_at_zero_closes_untouched_channel() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup_with(&store, &asserter, 0, 0, 0).await;
+        let tx_hash = push_close_transaction(&asserter, true);
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let receipt = method.verify_session(&credential, &request).await.unwrap();
+        let receipt = receipt_json(&receipt);
+        assert_eq!(receipt["spent"], "0");
+        assert_eq!(receipt["txHash"], tx_hash.to_string());
+        assert!(asserter.read_q().is_empty(), "close was not submitted");
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert!(stored.finalized);
+        assert!(!stored.closing);
+    }
+
+    /// GHSA-mv9j-8jvg-j8mr: a voucher that was already settled is public
+    /// on-chain, so presenting it again must not close the channel.
+    #[tokio::test]
+    async fn test_close_at_settled_amount_is_rejected() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) =
+            close_setup_with(&store, &asserter, 1_000, 1_000, 1_000).await;
+        push_close_transaction(&asserter, true);
+        let queued = asserter.read_q().len();
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message,
+            "close voucher amount must be > 1000 (on-chain settled)"
+        );
+
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert!(!stored.finalized);
+        assert!(!stored.closing);
+        // Only the on-chain channel read reached the provider.
+        assert_eq!(asserter.read_q().len(), queued - 1);
     }
 
     /// A voucher receipt reports the channel's balance and carries no
@@ -4638,9 +4712,15 @@ mod tests {
     }
 
     #[test]
-    fn test_close_at_zero_rejects_when_zero_settled() {
-        // close at 0 with settled=0: 0 <= 0 is true, so rejected
-        let err = validate_close_amount(0, 0, 0, 10_000_000).unwrap_err();
+    fn test_close_at_zero_accepted_for_untouched_channel() {
+        // Nothing spent, nothing settled: closing at 0 refunds the deposit.
+        assert!(validate_close_amount(0, 0, 0, 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_close_at_zero_rejects_unfunded_channel() {
+        // No deposit on-chain: there is nothing to refund.
+        let err = validate_close_amount(0, 0, 0, 0).unwrap_err();
         assert!(
             err.message.contains("on-chain settled"),
             "got: {}",
