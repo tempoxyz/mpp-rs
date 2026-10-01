@@ -260,6 +260,11 @@ pub struct ServeOptions<G> {
 
 /// Wrap an async stream with payment metering, producing SSE event bytes.
 ///
+/// `generate` is first polled once the channel can pay for one tick: until
+/// then the stream asks for a voucher and waits, and it ends right away (with
+/// the final receipt if the channel is readable) when the channel is closed
+/// or missing.
+///
 /// For each value from `generate`:
 /// 1. Deducts `tick_cost` from the channel balance atomically
 /// 2. If balance sufficient, yields `event: message\ndata: {value}\n\n`
@@ -295,6 +300,45 @@ where
 
     Box::pin(async_stream::stream! {
         let mut stream = std::pin::pin!(generate);
+
+        // Hold the generator back until the channel can pay for the first value,
+        // so that no work is started for an exhausted, closed or missing channel.
+        let mut need_voucher_sent = false;
+        loop {
+            let Ok(Some(ch)) = store.get_channel(&channel_id).await else {
+                return;
+            };
+            if ch.finalized || ch.closing {
+                let mut receipt = SessionReceipt::new(
+                    now_iso8601(),
+                    &challenge_id,
+                    &channel_id,
+                    ch.highest_voucher_amount.to_string(),
+                    ch.spent.to_string(),
+                );
+                receipt.units = Some(ch.units);
+                yield format_receipt_event(&receipt);
+                return;
+            }
+            if ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost {
+                break;
+            }
+            if !need_voucher_sent {
+                need_voucher_sent = true;
+                let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
+                let event = format_need_voucher_event(&NeedVoucherEvent {
+                    channel_id: channel_id.clone(),
+                    required_cumulative: required.to_string(),
+                    accepted_cumulative: ch.highest_voucher_amount.to_string(),
+                    deposit: ch.deposit.to_string(),
+                });
+                yield event;
+            }
+            tokio::select! {
+                _ = store.wait_for_update(&channel_id) => {},
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
+            }
+        }
 
         while let Some(value) = next_item(&mut stream).await {
             // Try to charge, waiting for top-up if insufficient
@@ -736,6 +780,23 @@ mod tests {
             events.push(item);
         }
         events
+    }
+
+    /// Generator yielding "a" that records whether it was ever polled.
+    #[cfg(feature = "tempo")]
+    fn tracked_generator() -> (
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = String> + Send>>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let polled = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = polled.clone();
+        let generate = Box::pin(async_stream::stream! {
+            flag.store(true, Ordering::SeqCst);
+            yield "a".to_string();
+        });
+        (generate, polled)
     }
 
     #[cfg(feature = "tempo")]
@@ -1216,16 +1277,14 @@ mod tests {
     async fn test_serve_missing_channel_stops() {
         use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
 
-        let gen = Box::pin(async_stream::stream! {
-            yield "a".to_string();
-        });
+        let (generate, polled) = tracked_generator();
 
         let stream = serve(ServeOptions {
             store: std::sync::Arc::new(InMemoryChannelStore::new()),
             channel_id: "0xchannel_missing".to_string(),
             challenge_id: "ch-missing".to_string(),
             tick_cost: 100,
-            generate: gen,
+            generate,
             poll_interval_ms: 10,
             min_voucher_delta: 0,
         });
@@ -1236,6 +1295,111 @@ mod tests {
                 .await
                 .expect("stream must terminate when the channel does not exist");
         assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A channel that is already closed gets its receipt without the
+    /// generator being started.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_closed_channel_never_polls_generator() {
+        use crate::protocol::methods::tempo::session_method::{ChannelState, InMemoryChannelStore};
+
+        let channel_id = "0xchannel_closed";
+        let open = test_channel_state(channel_id, 1000, 5000);
+        for state in [
+            ChannelState {
+                finalized: true,
+                ..open.clone()
+            },
+            ChannelState {
+                closing: true,
+                ..open
+            },
+        ] {
+            let store = std::sync::Arc::new(InMemoryChannelStore::new());
+            store.insert(channel_id, state);
+            let (generate, polled) = tracked_generator();
+
+            let events = collect_stream(serve(ServeOptions {
+                store,
+                channel_id: channel_id.to_string(),
+                challenge_id: "ch-closed".to_string(),
+                tick_cost: 100,
+                generate,
+                poll_interval_ms: 10,
+                min_voucher_delta: 0,
+            }))
+            .await;
+
+            assert_eq!(events.len(), 1, "unexpected events: {events:?}");
+            assert!(matches!(
+                parse_event(&events[0]),
+                Some(SseEvent::PaymentReceipt(receipt)) if receipt.spent == "0"
+            ));
+            assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    /// The generator is only started once the channel can pay for the first
+    /// value.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_exhausted_channel_polls_generator_after_voucher() {
+        use crate::protocol::methods::tempo::session_method::{
+            ChannelState, ChannelStore, InMemoryChannelStore,
+        };
+        use std::sync::atomic::Ordering;
+        use tokio::time::{timeout, Duration};
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_unfunded";
+        store.insert(channel_id, test_channel_state(channel_id, 50, 5000));
+        let (generate, polled) = tracked_generator();
+
+        let mut stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: channel_id.to_string(),
+            challenge_id: "ch-unfunded".to_string(),
+            tick_cost: 100,
+            generate,
+            poll_interval_ms: 10,
+            min_voucher_delta: 0,
+        });
+
+        match parse_event(&next_item(&mut stream).await.unwrap()) {
+            Some(SseEvent::PaymentNeedVoucher(event)) => {
+                assert_eq!(event.required_cumulative, "100");
+                assert_eq!(event.accepted_cumulative, "50");
+            }
+            other => panic!("expected a need-voucher event, got: {other:?}"),
+        }
+        let waiting = timeout(Duration::from_millis(100), next_item(&mut stream)).await;
+        assert!(waiting.is_err(), "unexpected event: {waiting:?}");
+        assert!(!polled.load(Ordering::SeqCst));
+
+        store
+            .update_channel(
+                channel_id,
+                Box::new(|current: Option<ChannelState>| {
+                    Ok(current.map(|state| ChannelState {
+                        highest_voucher_amount: 100,
+                        ..state
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
+
+        let event = next_item(&mut stream).await.unwrap();
+        assert_eq!(parse_event(&event), Some(SseEvent::Message("a".into())));
+        assert!(polled.load(Ordering::SeqCst));
+        let event = next_item(&mut stream).await.unwrap();
+        assert!(matches!(
+            parse_event(&event),
+            Some(SseEvent::PaymentReceipt(receipt)) if receipt.spent == "100"
+        ));
+        assert_eq!(next_item(&mut stream).await, None);
     }
 
     #[test]

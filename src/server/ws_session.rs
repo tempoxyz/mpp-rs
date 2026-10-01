@@ -9,7 +9,7 @@
 //!
 //! 1. Server sends session challenge
 //! 2. Client sends open credential (with deposit transaction)
-//! 3. Server verifies, begins streaming data
+//! 3. Server verifies, begins streaming data once the channel can pay for a tick
 //! 4. Per tick: deduct from channel balance
 //! 5. When exhausted: send `needVoucher` once, wait for voucher frame
 //! 6. Client sends voucher credential → server verifies, replies with a
@@ -94,6 +94,40 @@ where
     let channel_id = normalize_channel_id(&channel_id);
 
     let mut stream = std::pin::pin!(generate);
+
+    // Hold the generator back until the channel can pay for the first value,
+    // so that no work is started for an exhausted, closed or missing channel.
+    let mut need_voucher_sent = false;
+    loop {
+        match store.get_channel(&channel_id).await {
+            Ok(Some(ch)) if !ch.finalized && !ch.closing => {
+                if ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost {
+                    break;
+                }
+                if !need_voucher_sent {
+                    need_voucher_sent = true;
+                    let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
+                    let msg = WsResponse::NeedVoucher {
+                        channel_id: channel_id.clone(),
+                        required_cumulative: required.to_string(),
+                        accepted_cumulative: ch.highest_voucher_amount.to_string(),
+                        deposit: ch.deposit.to_string(),
+                    };
+                    if sender.send(msg.to_text()).await.is_err() {
+                        return; // client disconnected
+                    }
+                }
+                tokio::select! {
+                    _ = store.wait_for_update(&channel_id) => {},
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
+                }
+            }
+            _ => {
+                send_receipt(sender, &*store, &channel_id, &challenge_id).await;
+                return;
+            }
+        }
+    }
 
     while let Some(value) = stream.next().await {
         // Deduct, waiting for voucher top-up if insufficient
@@ -341,6 +375,22 @@ mod tests {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(tx)
         });
         (Box::pin(sink), rx)
+    }
+
+    /// Generator yielding "a" that records whether it was ever polled.
+    fn tracked_generator() -> (
+        std::pin::Pin<Box<dyn futures_core::Stream<Item = String> + Send>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = polled.clone();
+        let generate = Box::pin(async_stream::stream! {
+            flag.store(true, Ordering::SeqCst);
+            yield "a".to_string();
+        });
+        (generate, polled)
     }
 
     /// While a session stays exhausted, neither poll ticks nor channel writes
@@ -591,9 +641,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_session_missing_channel_stops() {
         let (mut sink, frames) = recording_sink();
-        let generate = Box::pin(async_stream::stream! {
-            yield "a".to_string();
-        });
+        let (generate, polled) = tracked_generator();
 
         // No voucher can create the channel, so the session must end instead of polling.
         tokio::time::timeout(
@@ -616,6 +664,118 @@ mod tests {
 
         let frames = frames.lock().unwrap();
         assert!(frames.is_empty(), "unexpected frames: {frames:?}");
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A channel that is already closed gets its receipt without the
+    /// generator being started.
+    #[tokio::test]
+    async fn test_ws_session_closed_channel_never_polls_generator() {
+        let channel_id = "0xchannel_ws_closed";
+        let open = test_channel_state(channel_id, 1000, 5000);
+        for state in [
+            ChannelState {
+                finalized: true,
+                ..open.clone()
+            },
+            ChannelState {
+                closing: true,
+                ..open
+            },
+        ] {
+            let store = Arc::new(InMemoryChannelStore::new());
+            store.insert(channel_id, state);
+            let (mut sink, frames) = recording_sink();
+            let (generate, polled) = tracked_generator();
+
+            ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store,
+                    channel_id: channel_id.to_string(),
+                    challenge_id: "ch-closed".to_string(),
+                    tick_cost: 100,
+                    generate,
+                    poll_interval_ms: 10,
+                    min_voucher_delta: 0,
+                },
+            )
+            .await;
+
+            let frames = frames.lock().unwrap();
+            assert!(
+                matches!(
+                    frames.as_slice(),
+                    [WsResponse::Receipt { receipt }] if receipt["spent"] == "0"
+                ),
+                "unexpected frames: {frames:?}"
+            );
+            assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    /// The generator is only started once the channel can pay for the first
+    /// value.
+    #[tokio::test]
+    async fn test_ws_session_exhausted_channel_polls_generator_after_voucher() {
+        use std::sync::atomic::Ordering;
+        use tokio::time::{timeout, Duration};
+
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_ws_unfunded";
+        store.insert(channel_id, test_channel_state(channel_id, 50, 5000));
+        let (generate, polled) = tracked_generator();
+
+        let (mut sink, mut frames) = channel_sink();
+        let session_store = store.clone();
+        let session = tokio::spawn(async move {
+            ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store: session_store,
+                    channel_id: channel_id.to_string(),
+                    challenge_id: "ch-unfunded".to_string(),
+                    tick_cost: 100,
+                    generate,
+                    poll_interval_ms: 10,
+                    min_voucher_delta: 0,
+                },
+            )
+            .await;
+        });
+
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::NeedVoucher { required_cumulative, accepted_cumulative, .. })
+                if required_cumulative == "100" && accepted_cumulative == "50"
+        ));
+        let waiting = timeout(Duration::from_millis(100), frames.recv()).await;
+        assert!(waiting.is_err(), "unexpected frame: {waiting:?}");
+        assert!(!polled.load(Ordering::SeqCst));
+
+        store
+            .update_channel(
+                channel_id,
+                Box::new(|current: Option<ChannelState>| {
+                    Ok(current.map(|state| ChannelState {
+                        highest_voucher_amount: 100,
+                        ..state
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::Data { data }) if data == "a"
+        ));
+        assert!(polled.load(Ordering::SeqCst));
+        assert!(matches!(
+            frames.recv().await,
+            Some(WsResponse::Receipt { receipt }) if receipt["spent"] == "100"
+        ));
+        session.await.unwrap();
     }
 
     #[derive(Clone)]
