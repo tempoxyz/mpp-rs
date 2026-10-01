@@ -3,6 +3,7 @@
 use alloy::primitives::{Address, Bytes, TxKind, U256};
 use alloy::sol_types::SolCall;
 use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
+use tempo_alloy::primitives::transaction::Call;
 
 use crate::protocol::traits::VerificationError;
 
@@ -30,7 +31,7 @@ fn call_selector(data: &Bytes) -> Option<[u8; 4]> {
     }
 }
 
-fn decode_approve(call: &tempo_alloy::primitives::transaction::Call) -> Option<(Address, U256)> {
+fn decode_approve(call: &Call) -> Option<(Address, U256)> {
     if call_selector(&call.input) != Some(ITIP20::approveCall::SELECTOR) || call.input.len() != 68 {
         return None;
     }
@@ -41,9 +42,7 @@ fn decode_approve(call: &tempo_alloy::primitives::transaction::Call) -> Option<(
     ))
 }
 
-fn decode_swap(
-    call: &tempo_alloy::primitives::transaction::Call,
-) -> Option<IStablecoinDEX::swapExactAmountOutCall> {
+fn decode_swap(call: &Call) -> Option<IStablecoinDEX::swapExactAmountOutCall> {
     if call_selector(&call.input) != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
         return None;
     }
@@ -51,87 +50,68 @@ fn decode_swap(
     IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..]).ok()
 }
 
-fn transfer_call_offset(
-    calls: &[tempo_alloy::primitives::transaction::Call],
-) -> Result<usize, VerificationError> {
-    let first_selector = calls.first().and_then(|call| call_selector(&call.input));
+/// The calls of a charge transaction: an optional `approve` +
+/// `swapExactAmountOut` prefix that buys the payment currency, followed by
+/// TIP-20 `transfer` / `transferWithMemo` calls.
+pub(super) struct PaymentCalls<'a> {
+    swap_prefix: Option<(&'a Call, &'a Call)>,
+    /// The transfer calls, never empty.
+    pub(super) transfers: &'a [Call],
+}
 
-    if first_selector == Some(ITIP20::approveCall::SELECTOR) {
-        let second_selector = calls.get(1).and_then(|call| call_selector(&call.input));
-        if second_selector != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
+impl<'a> PaymentCalls<'a> {
+    /// Split `calls` into the swap prefix and the transfers. Any other call
+    /// is rejected.
+    pub(super) fn parse(calls: &'a [Call]) -> Result<Self, VerificationError> {
+        let selector = |index: usize| calls.get(index).and_then(|call| call_selector(&call.input));
+
+        let swap_prefix = if selector(0) == Some(ITIP20::approveCall::SELECTOR) {
+            if selector(1) != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
+                return Err(no_matching_payment_call_error());
+            }
+            Some((&calls[0], &calls[1]))
+        } else {
+            None
+        };
+
+        // The remaining calls must all be transfers, which also rejects a
+        // swap that does not follow an approve.
+        let transfers = &calls[if swap_prefix.is_some() { 2 } else { 0 }..];
+        if transfers.is_empty()
+            || transfers.iter().any(|call| {
+                !matches!(
+                    call_selector(&call.input),
+                    Some(TRANSFER_SELECTOR) | Some(TRANSFER_WITH_MEMO_SELECTOR)
+                )
+            })
+        {
             return Err(no_matching_payment_call_error());
         }
-        Ok(2)
-    } else if first_selector == Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
-        Err(no_matching_payment_call_error())
-    } else {
-        Ok(0)
-    }
-}
 
-pub(super) fn get_transfer_calls(
-    calls: &[tempo_alloy::primitives::transaction::Call],
-) -> Result<&[tempo_alloy::primitives::transaction::Call], VerificationError> {
-    let offset = transfer_call_offset(calls)?;
-    let transfer_calls = &calls[offset..];
-
-    if transfer_calls.is_empty()
-        || transfer_calls.iter().any(|call| {
-            !matches!(
-                call_selector(&call.input),
-                Some(TRANSFER_SELECTOR) | Some(TRANSFER_WITH_MEMO_SELECTOR)
-            )
+        Ok(Self {
+            swap_prefix,
+            transfers,
         })
-    {
-        return Err(no_matching_payment_call_error());
     }
-
-    Ok(transfer_calls)
 }
 
+/// Checks that only apply to a fee-sponsored transaction: at most 11
+/// transfers, and a swap prefix that buys exactly the payment.
 pub(super) fn validate_fee_payer_calls(
-    calls: &[tempo_alloy::primitives::transaction::Call],
+    calls: &PaymentCalls<'_>,
     currency: Address,
     expected: &[Transfer],
 ) -> Result<(), VerificationError> {
-    if calls.is_empty() {
+    if calls.transfers.len() > 11 {
         return Err(disallowed_fee_payer_call_pattern_error());
     }
 
-    let has_swap_prefix = calls.first().and_then(|call| call_selector(&call.input))
-        == Some(ITIP20::approveCall::SELECTOR);
-
-    if has_swap_prefix {
-        if calls.get(1).and_then(|call| call_selector(&call.input))
-            != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR)
-        {
-            return Err(disallowed_fee_payer_call_pattern_error());
-        }
-    } else if calls.first().and_then(|call| call_selector(&call.input))
-        == Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR)
-    {
-        return Err(disallowed_fee_payer_call_pattern_error());
-    }
-
-    let transfer_calls = &calls[if has_swap_prefix { 2 } else { 0 }..];
-    if transfer_calls.is_empty()
-        || transfer_calls.len() > 11
-        || transfer_calls.iter().any(|call| {
-            !matches!(
-                call_selector(&call.input),
-                Some(TRANSFER_SELECTOR) | Some(TRANSFER_WITH_MEMO_SELECTOR)
-            )
-        })
-    {
-        return Err(disallowed_fee_payer_call_pattern_error());
-    }
-
-    if has_swap_prefix {
-        let approve_target = match &calls[0].to {
+    if let Some((approve, swap_call)) = calls.swap_prefix {
+        let approve_target = match &approve.to {
             TxKind::Call(address) => *address,
             _ => return Err(disallowed_fee_payer_call_pattern_error()),
         };
-        let swap = decode_swap(&calls[1]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        let swap = decode_swap(swap_call).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
         if approve_target != swap.tokenIn {
             return Err(VerificationError::new(
                 "Fee-sponsored transaction approve target is not the swap input token".to_string(),
@@ -139,7 +119,7 @@ pub(super) fn validate_fee_payer_calls(
         }
 
         let (approve_spender, approve_amount) =
-            decode_approve(&calls[0]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+            decode_approve(approve).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
         if approve_spender != STABLECOIN_DEX_ADDRESS {
             return Err(VerificationError::new(
                 "Fee-sponsored transaction approve spender is not the DEX".to_string(),
@@ -152,7 +132,7 @@ pub(super) fn validate_fee_payer_calls(
             ));
         }
 
-        match &calls[1].to {
+        match &swap_call.to {
             TxKind::Call(address) if *address == STABLECOIN_DEX_ADDRESS => {}
             _ => {
                 return Err(VerificationError::new(
