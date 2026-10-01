@@ -57,6 +57,8 @@ pub enum ErrorCode {
     /// Server-side failure (store, signer, upstream API) unrelated to the
     /// submitted payment.
     Internal,
+    /// Payment needs further action from the payer (e.g. 3D Secure).
+    PaymentActionRequired,
 }
 
 impl ErrorCode {
@@ -81,6 +83,7 @@ impl ErrorCode {
             Self::DeltaTooSmall => "delta-too-small",
             Self::InvalidChallenge => "invalid-challenge",
             Self::Internal => "internal",
+            Self::PaymentActionRequired => "payment-action-required",
         }
     }
 
@@ -195,6 +198,11 @@ impl VerificationError {
         Self::with_code(message, ErrorCode::Internal)
     }
 
+    /// Create a "payment-action-required" verification error.
+    pub fn payment_action_required(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::PaymentActionRequired)
+    }
+
     /// Create a retryable "not found" error (e.g., tx not yet mined).
     pub fn pending(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::NotFound).retryable()
@@ -290,6 +298,9 @@ impl From<VerificationError> for MppError {
                 MppError::AmountExceedsDeposit(Some(err.message))
             }
             Some(ErrorCode::DeltaTooSmall) => MppError::DeltaTooSmall(Some(err.message)),
+            Some(ErrorCode::PaymentActionRequired) => {
+                MppError::PaymentActionRequired(Some(err.message))
+            }
             Some(ErrorCode::CredentialMismatch)
             | Some(ErrorCode::InvalidAmount)
             | Some(ErrorCode::InvalidRecipient)
@@ -481,6 +492,7 @@ mod tests {
             (ErrorCode::DeltaTooSmall, "session/delta-too-small"),
             (ErrorCode::InvalidChallenge, "invalid-challenge"),
             (ErrorCode::Internal, "internal-payment-error"),
+            (ErrorCode::PaymentActionRequired, "payment-action-required"),
         ];
         for (code, suffix) in codes {
             let label = format!("{code:?}");
