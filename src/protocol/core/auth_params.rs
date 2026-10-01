@@ -112,7 +112,7 @@ pub(super) fn parse_auth_params(params_str: &str) -> Result<HashMap<String, Stri
                         "Unterminated quoted-string",
                     ));
                 }
-                if key == "request" && value.len() + (i - segment_start) >= MAX_TOKEN_LEN {
+                if key == "request" && value.len() + (i - segment_start) > MAX_TOKEN_LEN {
                     return Err(MppError::invalid_challenge_reason(format!(
                         "Request parameter exceeds maximum length of {} bytes",
                         MAX_TOKEN_LEN
