@@ -4,7 +4,7 @@
 //!   server helpers emit, with one node replaced or removed.
 //! - A challenge sent with `payment_required_error` is extracted unchanged;
 //!   its `request` travels as a JSON object and is re-canonicalized to the
-//!   same bytes.
+//!   same bytes. A malformed challenge is skipped.
 //! - A credential attached with `try_attach_credential` is extracted
 //!   unchanged.
 //! - A receipt attached with `try_attach_receipt` reads back unchanged.
@@ -15,7 +15,9 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use mpp::mcp::{self, McpReceipt};
 use mpp::{Base64UrlJson, PaymentCredential, PaymentErrorDetails, Receipt};
-use mpp_fuzz::{assert_same, ChallengeInput, Json};
+use mpp_fuzz::{
+    assert_same, has_supported_header, is_well_formed, wire_header, ChallengeInput, Json,
+};
 use serde_json::{json, Value};
 
 #[derive(Debug, Arbitrary)]
@@ -91,13 +93,20 @@ fuzz_target!(|input: Input| {
     let mut error = serde_json::to_value(&error).expect("payment error serializes");
     // The same payload can arrive in a tool result's `_meta`.
     let mut meta = json!({ mcp::PAYMENT_REQUIRED_META_KEY: error["data"] });
+    let valid = is_well_formed(&challenge) && has_supported_header(challenge.header.as_deref());
+    let mut expected = challenge.clone();
+    expected.header = wire_header(challenge.header.as_deref());
     for extracted in [
         mcp::extract_challenges(&error),
         mcp::extract_result_challenges(&meta),
     ] {
-        let extracted = extracted.expect("challenge is present");
-        assert_eq!(extracted.len(), 1);
-        assert_same(&extracted[0], &challenge);
+        if valid {
+            let extracted = extracted.expect("challenge is present");
+            assert_eq!(extracted.len(), 1);
+            assert_same(&extracted[0], &expected);
+        } else {
+            assert!(extracted.is_none(), "extracted {challenge:?}");
+        }
     }
     assert!(mcp::is_payment_required(&error));
 

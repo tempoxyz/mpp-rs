@@ -1,8 +1,8 @@
 //! Format → parse round trip over structured credentials.
 //!
 //! - `format_authorization` output is a single `Payment <base64url>` token.
-//! - Every credential the formatter accepts parses back field for field,
-//!   also when other schemes share the header field.
+//! - Every credential whose challenge echo is well formed parses back field
+//!   for field, also when other schemes share the header field.
 //! - Charge payloads keep their type and data.
 
 #![no_main]
@@ -11,7 +11,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use mpp::{format_authorization, parse_authorization, PaymentCredential, PaymentPayload};
 use mpp_fuzz::{
-    assert_same, has_supported_header, has_unparseable_optionals, wire_header, ChallengeInput, Json,
+    assert_same, has_supported_header, is_well_formed, wire_header, ChallengeInput, Json,
 };
 
 #[derive(Debug, Arbitrary)]
@@ -43,7 +43,9 @@ impl PayloadInput {
 }
 
 fuzz_target!(|input: Input| {
-    let echo = input.challenge.build().to_echo();
+    let challenge = input.challenge.build();
+    let well_formed = is_well_formed(&challenge);
+    let echo = challenge.to_echo();
     let charge = input.payload.charge();
     let mut credential = match (&input.payload, &charge) {
         (PayloadInput::Json(json), _) => PaymentCredential::new(echo, json.to_value()),
@@ -66,16 +68,16 @@ fuzz_target!(|input: Input| {
     let parsed = match parse_authorization(&header) {
         Ok(parsed) => parsed,
         Err(error) => {
-            let echo = &credential.challenge;
             assert!(
-                !has_supported_header(echo.header.as_deref())
-                    || has_unparseable_optionals(None, echo.digest.as_deref())
+                !well_formed
+                    || !has_supported_header(credential.challenge.header.as_deref())
                     || token.len() > 16 * 1024,
                 "{error}: {credential:?}"
             );
             return;
         }
     };
+    assert!(well_formed, "parsed {credential:?}");
     credential.challenge.header = wire_header(credential.challenge.header.as_deref());
     assert_same(&parsed, &credential);
 

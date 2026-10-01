@@ -11,11 +11,11 @@ panics.
 | Target | Input | Invariants |
 |--------|-------|------------|
 | `fuzz_www_authenticate` | text | `parse_www_authenticate` and `parse_www_authenticate_all` never panic; an accepted header formats and parses back to the same challenge; both parsers agree on a header that names the scheme once |
-| `fuzz_challenge_roundtrip` | structured challenge | formatted headers are printable ASCII; every challenge the formatter accepts parses back field for field |
+| `fuzz_challenge_roundtrip` | structured challenge | the formatter accepts exactly the well-formed challenges; formatted headers are printable ASCII and parse back field for field |
 | `fuzz_challenge_list` | 1–5 challenges, decoy schemes, separators | `parse_www_authenticate_all` returns exactly the Payment challenges, in order, among `Basic`/`Bearer`/`Digest` challenges whose quoted values look like Payment ones |
 | `fuzz_challenge_id` | structured challenge, field mutations | a signed challenge verifies, also through the header and the credential echo; changing a bound field or the id fails verification |
 | `fuzz_authorization` | text, as header and as credential JSON | `parse_authorization` and `extract_payment_scheme` never panic; an accepted credential formats and parses back unchanged |
-| `fuzz_credential_roundtrip` | structured credential | every credential the formatter accepts parses back field for field, also next to other schemes |
+| `fuzz_credential_roundtrip` | structured credential | every credential with a well-formed challenge echo parses back field for field, also next to other schemes |
 | `fuzz_receipt` | text, as header and as receipt JSON | `parse_receipt` never panics; accepted receipts are successful with an RFC 3339 timestamp and round-trip with their extension fields; `Receipt::success` round-trips |
 | `fuzz_base64url_json` | bytes | encode/decode round trip; the lenient decoder agrees with the strict engines and has one canonical spelling per input; `Base64UrlJson::from_value` is idempotent |
 | `fuzz_accept_payment` | text | `parse` never panics; `parse(serialize(e)) == e`; `rank` matches a reference implementation of the ranking rule |
@@ -105,9 +105,9 @@ cargo +nightly fuzz run --features tempo <target> crash
 Assertions that do not hold yet are narrowed in the target, with a comment at
 the place:
 
-- `format_www_authenticate` and `format_authorization` do not validate
-  `expires` and `digest`; the parsers do. Such values format but do not parse
-  back (`has_unparseable_optionals` in `src/lib.rs`).
+- `format_authorization` does not validate the challenge echo; the parser
+  does. A credential whose echo is not well formed (`is_well_formed` in
+  `src/lib.rs`) formats but does not parse back (`fuzz_credential_roundtrip`).
 - The challenge id joins its slots with `|` without escaping, so it is only
   injective for slots that do not contain `|` (`fuzz_challenge_id`).
 - `parse_www_authenticate` trims Unicode whitespace before the scheme and
