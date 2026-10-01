@@ -1553,11 +1553,56 @@ impl TempoSessionProvider {
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
+    /// POSTs a management credential that answers `challenge` to `url`.
+    async fn post_credential(
+        client: &reqwest::Client,
+        url: &str,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+        context: &str,
+    ) -> Result<reqwest::Response, MppError> {
+        client
+            .post(url)
+            .header(
+                crate::client::payment_credential_header_name(challenge),
+                crate::protocol::core::format_authorization(credential)?,
+            )
+            .send()
+            .await
+            .mpp_http(context)
+    }
+
+    /// The session challenge of a `402` response, which asks for the
+    /// management credential to be signed again, e.g. because the challenge
+    /// it answered has expired.
+    fn refreshed_challenge(response: &reqwest::Response) -> Option<PaymentChallenge> {
+        if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
+            return None;
+        }
+        crate::protocol::core::parse_www_authenticate_all_bytes(
+            response
+                .headers()
+                .get_all(reqwest::header::WWW_AUTHENTICATE)
+                .iter()
+                .map(|value| value.as_bytes()),
+        )
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|challenge| {
+            challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME
+                && challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION
+        })
+    }
+
     /// Send a voucher for a need-voucher SSE event.
     ///
     /// Called during SSE session metering when the server emits a `payment-need-voucher`
     /// event. Updates the internal cumulative amount and POSTs a signed voucher
     /// credential to the server.
+    ///
+    /// When the server answers `402` with a new session challenge, e.g. because
+    /// the stream outlived the one it was opened with, the voucher is signed
+    /// for that challenge and sent once more.
     ///
     /// Mirrors the TypeScript SDK's `SessionManager.sse` need-voucher handling.
     pub async fn send_voucher(
@@ -1567,31 +1612,36 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         required_cumulative: u128,
     ) -> Result<(), MppError> {
+        let challenge =
+            self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
+                MppError::InvalidConfig("no challenge available for voucher".into())
+            })?;
         let credential = self
-            .voucher_credential(channel_id_hex, required_cumulative)
+            .voucher_credential_for_challenge(&challenge, channel_id_hex, required_cumulative)
             .await?;
-        let auth_header = crate::protocol::core::format_authorization(&credential)?;
-        let header_name = self
-            .last_challenge
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .as_ref()
-            .map(crate::client::payment_credential_header_name)
-            .unwrap_or(reqwest::header::AUTHORIZATION);
-
-        let resp = client
-            .post(url)
-            .header(header_name, auth_header)
-            .send()
-            .await
-            .mpp_http("voucher POST failed")?;
+        let mut resp =
+            Self::post_credential(client, url, &challenge, &credential, "voucher POST failed")
+                .await?;
+        // A stream can outlive the challenge it was opened with.
+        let refreshed = Self::refreshed_challenge(&resp);
+        if let Some(refreshed) = &refreshed {
+            let credential = self
+                .voucher_credential_for_challenge(refreshed, channel_id_hex, required_cumulative)
+                .await?;
+            resp =
+                Self::post_credential(client, url, refreshed, &credential, "voucher POST failed")
+                    .await?;
+        }
 
         if !resp.status().is_success() {
             return Err(MppError::Http(format!(
                 "voucher POST returned status {}",
                 resp.status()
             )));
+        }
+        // Later vouchers answer the challenge the server accepted.
+        if let Some(refreshed) = refreshed {
+            *self.last_challenge.lock().unwrap() = Some(refreshed);
         }
 
         Ok(())
@@ -1602,6 +1652,10 @@ impl TempoSessionProvider {
     /// Sends a close credential to the server, which triggers on-chain settlement.
     /// The server will submit the highest cumulative voucher to the escrow contract,
     /// transferring the owed amount to the server and refunding the remainder.
+    ///
+    /// When the server answers `402` with a new session challenge, e.g. because
+    /// the last one has expired, the close is signed for that challenge and
+    /// sent once more.
     ///
     /// Mirrors the TypeScript SDK's `session.close()` method.
     ///
@@ -1649,19 +1703,21 @@ impl TempoSessionProvider {
             ));
         }
 
-        let credential = self.close_credential(&entry.channel_id.to_string()).await?;
-
-        let auth_header = crate::protocol::core::format_authorization(&credential)?;
-
-        let resp = client
-            .post(url)
-            .header(
-                crate::client::payment_credential_header_name(&challenge),
-                auth_header,
-            )
-            .send()
-            .await
-            .mpp_http("close request failed")?;
+        let channel_id = entry.channel_id.to_string();
+        let credential = self
+            .close_credential_for_challenge_inner(&challenge, &channel_id, None)
+            .await?;
+        let mut resp =
+            Self::post_credential(client, url, &challenge, &credential, "close request failed")
+                .await?;
+        if let Some(refreshed) = Self::refreshed_challenge(&resp) {
+            let credential = self
+                .close_credential_for_challenge_inner(&refreshed, &channel_id, None)
+                .await?;
+            resp =
+                Self::post_credential(client, url, &refreshed, &credential, "close request failed")
+                    .await?;
+        }
 
         let status = resp.status();
         let receipt_header = resp
@@ -2887,6 +2943,19 @@ mod tests {
         (url, posted)
     }
 
+    /// `Payment-Receipt` of a server that settled the close credential `payload`.
+    fn close_receipt(challenge_id: &str, payload: &serde_json::Value) -> String {
+        let mut receipt = crate::protocol::methods::tempo::SessionReceipt::new(
+            "2026-01-01T00:00:00Z",
+            challenge_id,
+            payload["channelId"].as_str().unwrap(),
+            payload["cumulativeAmount"].as_str().unwrap(),
+            "0",
+        );
+        receipt.tx_hash = Some(B256::repeat_byte(0x99).to_string());
+        receipt.to_header().unwrap()
+    }
+
     #[tokio::test]
     async fn rollback_forgets_pending_open_and_keeps_established_channel() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
@@ -3216,6 +3285,109 @@ mod tests {
         assert_eq!(posted[0].1["additionalDeposit"], "500");
         assert_eq!(credential.payload["cumulativeAmount"], "2500");
         assert_eq!(provider.channels().values().next().unwrap().deposit, 2_500);
+    }
+
+    #[tokio::test]
+    async fn management_requests_answer_the_refreshed_challenge() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let expired = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        *provider.last_challenge.lock().unwrap() = Some(expired.clone());
+        let mut refreshed = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        refreshed.id = "refreshed-id".into();
+
+        // The server no longer accepts the challenge the session started with.
+        let (url, posted) = management_server(move |challenge_id, payload| {
+            if challenge_id != "refreshed-id" {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [("www-authenticate", refreshed.to_header().unwrap())],
+                )
+                    .into_response();
+            }
+            if payload["action"] == "close" {
+                let receipt = close_receipt(challenge_id, payload);
+                return (StatusCode::OK, [("payment-receipt", receipt)]).into_response();
+            }
+            StatusCode::OK.into_response()
+        })
+        .await;
+        let client = reqwest::Client::new();
+        let attempts = |action: &str| -> Vec<String> {
+            posted
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, payload)| payload["action"] == action)
+                .map(|(challenge_id, _)| challenge_id.clone())
+                .collect()
+        };
+
+        provider
+            .send_voucher(&client, &url, &channel_id.to_string(), 2_000)
+            .await
+            .unwrap();
+        assert_eq!(attempts("voucher"), ["test-id", "refreshed-id"]);
+
+        // The accepted challenge is remembered, so the next voucher needs one request.
+        provider
+            .send_voucher(&client, &url, &channel_id.to_string(), 3_000)
+            .await
+            .unwrap();
+        assert_eq!(attempts("voucher").len(), 3);
+
+        *provider.last_challenge.lock().unwrap() = Some(expired);
+        assert!(provider.close(&client, &url).await.unwrap().is_some());
+        assert_eq!(attempts("close"), ["test-id", "refreshed-id"]);
+        assert!(provider.channels().is_empty());
+    }
+
+    #[tokio::test]
+    async fn management_requests_refuse_a_refreshed_challenge_for_another_scope() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        *provider.last_challenge.lock().unwrap() = Some(make_scoped_challenge(
+            payee,
+            currency,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        ));
+        let other_payee = make_scoped_challenge(
+            Address::repeat_byte(0x77),
+            currency,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        );
+        let (url, posted) = management_server(move |_, _| {
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                [("www-authenticate", other_payee.to_header().unwrap())],
+            )
+                .into_response()
+        })
+        .await;
+        let client = reqwest::Client::new();
+
+        let err = provider
+            .send_voucher(&client, &url, &channel_id.to_string(), 2_000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("active session"), "{err}");
+
+        let err = provider.close(&client, &url).await.unwrap_err();
+        assert!(err.to_string().contains("active session"), "{err}");
+
+        // Nothing was signed for the other payee's challenge.
+        assert_eq!(posted.lock().unwrap().len(), 2);
+        assert_eq!(provider.channels().len(), 1);
     }
 
     // --- close early-return paths ---
