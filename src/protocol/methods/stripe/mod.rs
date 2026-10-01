@@ -13,7 +13,7 @@
 //!
 //! # Types
 //!
-//! - [`StripeChargeRequest`]: Stripe-specific charge request fields
+//! - [`StripeMethodDetails`]: Stripe-specific `methodDetails` of a charge request
 //! - [`StripeCredentialPayload`]: Client credential containing the SPT
 //!
 //! # Constants

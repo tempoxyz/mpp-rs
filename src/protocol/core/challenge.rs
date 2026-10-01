@@ -225,7 +225,7 @@ impl PaymentChallenge {
 
     /// Create a new payment challenge with HMAC-bound ID including all optional fields.
     ///
-    /// Unlike [`with_secret_key`], this includes `expires` and `digest` in the HMAC
+    /// Unlike [`Self::with_secret_key`], this includes `expires` and `digest` in the HMAC
     /// computation, matching the full TS SDK `Challenge.from()` behavior.
     ///
     /// The `opaque` parameter accepts a `Base64UrlJson` value (use
@@ -280,7 +280,7 @@ impl PaymentChallenge {
     ///
     /// Note: When using `with_secret_key`, set expires BEFORE creating the challenge
     /// since it affects the HMAC. For post-creation use, the HMAC won't include the
-    /// expires. Use [`with_secret_key_full`] instead if expires is needed in the HMAC.
+    /// expires. Use [`Self::with_secret_key_full`] instead if expires is needed in the HMAC.
     pub fn with_expires(mut self, expires: impl Into<String>) -> Self {
         self.expires = Some(expires.into());
         self
@@ -301,7 +301,7 @@ impl PaymentChallenge {
     /// Set the opaque correlation data from a JSON value.
     ///
     /// Note: When using `with_secret_key`, set opaque BEFORE creating the challenge
-    /// since it affects the HMAC. Use [`with_secret_key_full`] instead if opaque
+    /// since it affects the HMAC. Use [`Self::with_secret_key_full`] instead if opaque
     /// is needed in the HMAC.
     pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
         self.opaque = Some(opaque);
@@ -314,7 +314,7 @@ impl PaymentChallenge {
     /// `Authorization` is the implicit default and is stored as `None`, as is
     /// any other value.
     /// Note: When using `with_secret_key`, set header BEFORE creating the
-    /// challenge since it affects the HMAC. Use [`with_secret_key_full`]
+    /// challenge since it affects the HMAC. Use [`Self::with_secret_key_full`]
     /// instead if header is needed in the HMAC.
     pub fn with_header(mut self, header: impl Into<String>) -> Self {
         let header = header.into();

@@ -117,7 +117,7 @@ fn build_tempo_signature_primitive(
     }
 }
 
-/// Sign a [`TempoTransaction`] and return the EIP-2718 encoded bytes.
+/// Sign a [`TempoTransaction`](tempo_alloy::primitives::transaction::TempoTransaction) and return the EIP-2718 encoded bytes.
 ///
 /// Uses the provided signing mode to produce either a primitive ECDSA
 /// signature (direct) or a keychain envelope signature.
@@ -136,7 +136,7 @@ pub fn sign_and_encode(
     Ok(signed_tx.encoded_2718())
 }
 
-/// Sign a [`TempoTransaction`] and return the **fee payer envelope** encoded bytes.
+/// Sign a [`TempoTransaction`](tempo_alloy::primitives::transaction::TempoTransaction) and return the **fee payer envelope** encoded bytes.
 ///
 /// The resulting bytes start with `0x78` and are meant to be sent to an MPPx server
 /// (or fee payer proxy) which will co-sign and broadcast.

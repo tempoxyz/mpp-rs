@@ -1,6 +1,6 @@
 //! WebSocket transport for client-side session payments.
 //!
-//! Provides a WebSocket transport that implements [`Transport`](super::transport::Transport)
+//! Provides a WebSocket transport that implements [`Transport`]
 //! for bidirectional payment flows. The client can send vouchers inline over the
 //! same WebSocket connection (no separate HTTP request needed).
 //!
