@@ -2046,7 +2046,7 @@ impl TempoSessionProvider {
             if let Some(ref cid_str) = suggested_channel_id {
                 if let Ok(cid) = cid_str.parse::<B256>() {
                     let expected_authorized_signer = authorized_signer;
-                    if let Some(mut recovered) = try_recover_channel(
+                    let recovered = try_recover_channel(
                         &self.rpc_provider,
                         escrow_contract,
                         cid,
@@ -2057,9 +2057,17 @@ impl TempoSessionProvider {
                         expected_authorized_signer,
                     )
                     .await
-                    {
-                        // Start from recovered settled amount + request amount
-                        recovered.cumulative_amount += amount;
+                    // Start from recovered settled amount + request amount. A
+                    // channel whose remaining deposit cannot cover the request
+                    // is not resumed.
+                    .and_then(|mut recovered| {
+                        recovered.cumulative_amount = recovered
+                            .cumulative_amount
+                            .checked_add(amount)
+                            .filter(|cumulative| *cumulative <= recovered.deposit)?;
+                        Some(recovered)
+                    });
+                    if let Some(recovered) = recovered {
                         self.assert_within_max_deposit(recovered.cumulative_amount)?;
 
                         let payload = create_voucher_payload(
@@ -3920,6 +3928,58 @@ mod tests {
             "{err}"
         );
         assert!(provider.channels().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pay_does_not_resume_a_legacy_channel_that_cannot_cover_the_request() {
+        use alloy::sol_types::SolValue;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = Address::repeat_byte(0x33);
+
+        // 500 of the deposit are left; the amount of the second request does
+        // not even fit the voucher type.
+        for amount in [1_000, u128::MAX] {
+            let mut provider = make_test_provider().with_allow_custom_escrow(true);
+            let payer = provider.signer.address();
+            let on_chain = (
+                false,
+                0u64,
+                payer,
+                payee,
+                currency,
+                Address::ZERO,
+                1_500u128,
+                1_000u128,
+            );
+            let on_chain = alloy::primitives::Bytes::from(on_chain.abi_encode()).to_string();
+            mock_rpc(&mut provider, &[&on_chain]);
+            let challenge = PaymentChallenge::new(
+                "test-id",
+                "test-realm",
+                "tempo",
+                "session",
+                crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                    "amount": amount.to_string(),
+                    "currency": format!("{currency:#x}"),
+                    "recipient": format!("{payee:#x}"),
+                    "methodDetails": {
+                        "escrowContract": format!("{escrow:#x}"),
+                        "channelId": B256::repeat_byte(0x44).to_string(),
+                        "chainId": 42431
+                    }
+                }))
+                .unwrap(),
+            );
+
+            // No deposit is configured, so falling through to a new channel
+            // fails instead of signing a voucher above the deposit.
+            let err = provider.pay(&challenge).await.unwrap_err();
+
+            assert!(err.to_string().contains("No deposit amount"), "{err}");
+            assert!(provider.channels().is_empty());
+        }
     }
 
     #[tokio::test]
