@@ -15,7 +15,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -23,7 +23,7 @@ use futures::stream;
 use mpp::client::channel_ops::default_escrow_contract;
 use mpp::server::{
     tempo, Mpp, SessionChallengeOptions, SessionChannelStore, SessionMethodConfig,
-    TempoChargeMethod, TempoConfig, TempoSessionMethod,
+    SessionVerifyResult, TempoChargeMethod, TempoConfig, TempoSessionMethod,
 };
 use mpp::{parse_authorization, PaymentCredential, PrivateKeySigner};
 use serde::Deserialize;
@@ -103,7 +103,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/health", get(health))
-        .route("/api/chat", get(chat).post(chat))
+        .route("/api/chat", get(chat).post(manage))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -115,70 +115,100 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Verify the session credential of a request. Without a credential the
+/// request is answered with a session challenge, and a rejected one with the
+/// reason.
+#[allow(clippy::result_large_err)]
+async fn verify(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(PaymentCredential, SessionVerifyResult), Response> {
+    // Phase 1: No credential → 402 with session challenge.
+    let Some(credential) = parse_credential(headers) else {
+        let challenge = state
+            .payment
+            .session_challenge_with_details(
+                &PRICE_PER_TOKEN.to_string(),
+                CURRENCY,
+                state.payment.recipient().unwrap(),
+                SessionChallengeOptions {
+                    unit_type: Some(UNIT_TYPE),
+                    ..Default::default()
+                },
+            )
+            .expect("failed to create session challenge");
+
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            [(
+                header::WWW_AUTHENTICATE,
+                challenge.to_header().expect("failed to format challenge"),
+            )],
+            "Payment required",
+        )
+            .into_response());
+    };
+
+    // Phases 2-4: Verify the session credential.
+    match state.payment.verify_session(&credential).await {
+        Ok(result) => Ok((credential, result)),
+        Err(e) => {
+            eprintln!("[server] session verification failed: {}", e);
+            Err((
+                StatusCode::BAD_REQUEST,
+                format!("Verification failed: {}", e),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Answer a credential that does not ask for content with its receipt.
+fn receipt_response(result: SessionVerifyResult) -> Response {
+    let receipt_header = result.receipt.to_header().unwrap_or_else(|_| String::new());
+    let mgmt = result
+        .management_response
+        .unwrap_or_else(|| serde_json::json!({}));
+    let body = serde_json::to_string(&mgmt).unwrap_or_else(|_| "{}".to_string());
+    let mut response = (StatusCode::OK, body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("payment-receipt"),
+        axum::http::HeaderValue::from_str(&receipt_header).unwrap(),
+    );
+    response
+}
+
+/// `POST /api/chat`: vouchers, top-ups and the close of a running session.
+///
+/// None of them asks for content. A voucher in particular must not start a
+/// stream here: it would compete for the balance with the stream that asked
+/// for it, which then waits for a voucher that was already spent.
+async fn manage(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match verify(&state, &headers).await {
+        Ok((_, result)) => receipt_response(result),
+        Err(response) => response,
+    }
+}
+
+/// `GET /api/chat`: the content request.
 async fn chat(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ChatQuery>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     let prompt = query.prompt.unwrap_or_else(|| "Hello!".to_string());
 
-    let credential = parse_credential(&headers);
-
-    // Phase 1: No credential → 402 with session challenge.
-    let credential = match credential {
-        Some(c) => c,
-        None => {
-            let challenge = state
-                .payment
-                .session_challenge_with_details(
-                    &PRICE_PER_TOKEN.to_string(),
-                    CURRENCY,
-                    state.payment.recipient().unwrap(),
-                    SessionChallengeOptions {
-                        unit_type: Some(UNIT_TYPE),
-                        ..Default::default()
-                    },
-                )
-                .expect("failed to create session challenge");
-
-            return (
-                StatusCode::PAYMENT_REQUIRED,
-                [(
-                    header::WWW_AUTHENTICATE,
-                    challenge.to_header().expect("failed to format challenge"),
-                )],
-                "Payment required",
-            )
-                .into_response();
-        }
+    let (credential, result) = match verify(&state, &headers).await {
+        Ok(verified) => verified,
+        Err(response) => return response,
     };
 
-    // Phases 2-4: Verify the session credential.
-    let result = match state.payment.verify_session(&credential).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[server] session verification failed: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Verification failed: {}", e),
-            )
-                .into_response();
-        }
-    };
-
-    // If management response (open/close/topUp), return it directly.
-    if let Some(mgmt) = result.management_response {
-        let receipt_header = result.receipt.to_header().unwrap_or_else(|_| String::new());
-        let body = serde_json::to_string(&mgmt).unwrap_or_else(|_| "{}".to_string());
-        let mut response = (StatusCode::OK, body).into_response();
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
-        response.headers_mut().insert(
-            axum::http::HeaderName::from_static("payment-receipt"),
-            axum::http::HeaderValue::from_str(&receipt_header).unwrap(),
-        );
-        return response;
+    // An open is answered directly; the client asks again with a voucher.
+    if result.management_response.is_some() {
+        return receipt_response(result);
     }
 
     // Content request (voucher): stream tokens as SSE.
