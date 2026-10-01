@@ -150,21 +150,14 @@ impl crate::protocol::traits::SessionMethod for MockFailingSessionMethod {
 
 #[cfg(feature = "tempo")]
 fn create_session_test_mpp() -> Mpp<TempoSuccessMethod, MockSessionMethod> {
-    Mpp {
-        method: TempoSuccessMethod,
-        session_method: Some(MockSessionMethod::success()),
-        realm: "MPP Payment".into(),
-        secret_key: TEST_SECRET.into(),
-        currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
-        recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
-        decimals: DEFAULT_DECIMALS,
-        fee_payer: false,
-        machine_token_enabled: false,
-        chain_id: None,
-        opaque: None,
-        credential_header: None,
-        events: ServerEvents::default(),
-    }
+    Mpp::new_with_config(
+        TempoSuccessMethod,
+        "MPP Payment",
+        TEST_SECRET,
+        "0x20c0000000000000000000000000000000000000",
+        "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+    )
+    .with_session_method(MockSessionMethod::success())
 }
 
 #[cfg(feature = "tempo")]
@@ -229,21 +222,14 @@ async fn test_verify_session_happy_path() {
 async fn test_verify_session_management_response() {
     let mock_session = MockSessionMethod::success()
         .with_management_response(serde_json::json!({"status": "ok", "channelId": "0xabc"}));
-    let mpp: Mpp<TempoSuccessMethod, MockSessionMethod> = Mpp {
-        method: TempoSuccessMethod,
-        session_method: Some(mock_session),
-        realm: "MPP Payment".into(),
-        secret_key: TEST_SECRET.into(),
-        currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
-        recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
-        decimals: DEFAULT_DECIMALS,
-        fee_payer: false,
-        machine_token_enabled: false,
-        chain_id: None,
-        opaque: None,
-        credential_header: None,
-        events: ServerEvents::default(),
-    };
+    let mpp: Mpp<TempoSuccessMethod, MockSessionMethod> = Mpp::new_with_config(
+        TempoSuccessMethod,
+        "MPP Payment",
+        TEST_SECRET,
+        "0x20c0000000000000000000000000000000000000",
+        "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+    )
+    .with_session_method(mock_session);
 
     let challenge = mpp
         .session_challenge(
@@ -275,20 +261,12 @@ async fn test_verify_session_management_response() {
 #[cfg(feature = "tempo")]
 #[tokio::test]
 async fn test_verify_session_no_session_method() {
+    let configured = create_session_test_mpp();
     let mpp: Mpp<TempoSuccessMethod, MockSessionMethod> = Mpp {
-        method: TempoSuccessMethod,
+        method: configured.method,
         session_method: None,
-        realm: "MPP Payment".into(),
-        secret_key: TEST_SECRET.into(),
-        currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
-        recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
-        decimals: DEFAULT_DECIMALS,
-        fee_payer: false,
-        machine_token_enabled: false,
-        chain_id: None,
-        opaque: None,
-        credential_header: None,
-        events: ServerEvents::default(),
+        config: configured.config,
+        events: configured.events,
     };
 
     let echo = ChallengeEcho {
@@ -500,21 +478,14 @@ async fn test_verify_session_method_returns_error() {
         ErrorCode::InsufficientBalance,
         "channel balance exhausted",
     );
-    let mpp: Mpp<TempoSuccessMethod, MockFailingSessionMethod> = Mpp {
-        method: TempoSuccessMethod,
-        session_method: Some(mock_session),
-        realm: "MPP Payment".into(),
-        secret_key: TEST_SECRET.into(),
-        currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
-        recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
-        decimals: DEFAULT_DECIMALS,
-        fee_payer: false,
-        machine_token_enabled: false,
-        chain_id: None,
-        opaque: None,
-        credential_header: None,
-        events: ServerEvents::default(),
-    };
+    let mpp: Mpp<TempoSuccessMethod, MockFailingSessionMethod> = Mpp::new_with_config(
+        TempoSuccessMethod,
+        "MPP Payment",
+        TEST_SECRET,
+        "0x20c0000000000000000000000000000000000000",
+        "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+    )
+    .with_session_method(mock_session);
 
     let challenge = mpp
         .session_challenge(
@@ -699,7 +670,7 @@ fn test_session_challenge_with_details_default_expires() {
 #[cfg(feature = "tempo")]
 fn session_mpp_with(currencies: &[&str]) -> Mpp<TempoSuccessMethod, MockSessionMethod> {
     let mut mpp = create_session_test_mpp();
-    mpp.currencies = currencies.iter().map(|c| c.to_string()).collect();
+    Arc::make_mut(&mut mpp.config).currencies = currencies.iter().map(|c| c.to_string()).collect();
     mpp
 }
 

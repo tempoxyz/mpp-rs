@@ -15,6 +15,8 @@
 //! let challenges = mpp.charge("0.10")?;
 //! ```
 
+use std::sync::Arc;
+
 #[cfg(any(feature = "tempo", feature = "stripe"))]
 use crate::error::Result;
 use crate::protocol::core::Base64UrlJson;
@@ -75,6 +77,8 @@ fn realm_from_env(lookup: impl Fn(&str) -> Option<String>) -> String {
 /// Binds a payment method with realm, secret_key, and optionally
 /// a default currency and recipient for simplified `charge()` calls.
 ///
+/// Cloning is cheap: clones share the payment method and the configuration.
+///
 /// # Simple API
 ///
 /// ```ignore
@@ -107,8 +111,15 @@ fn realm_from_env(lookup: impl Fn(&str) -> Option<String>) -> String {
 /// ```
 #[derive(Clone)]
 pub struct Mpp<M, S = ()> {
-    method: M,
-    session_method: Option<S>,
+    method: Arc<M>,
+    session_method: Option<Arc<S>>,
+    config: Arc<Config>,
+    events: ServerEvents,
+}
+
+/// Handler settings, shared by every clone of an [`Mpp`].
+#[derive(Clone)]
+struct Config {
     realm: String,
     secret_key: String,
     currencies: Vec<String>,
@@ -119,7 +130,23 @@ pub struct Mpp<M, S = ()> {
     chain_id: Option<u64>,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
-    events: ServerEvents,
+}
+
+impl Config {
+    fn new(realm: String, secret_key: String) -> Self {
+        Self {
+            realm,
+            secret_key,
+            currencies: Vec::new(),
+            recipient: None,
+            decimals: DEFAULT_DECIMALS,
+            fee_payer: false,
+            machine_token_enabled: false,
+            chain_id: None,
+            opaque: None,
+            credential_header: None,
+        }
+    }
 }
 
 impl<M> Mpp<M, ()>
@@ -133,21 +160,7 @@ where
     /// `secret_key` should be at least 32 bytes. This constructor cannot fail
     /// and does not check the length; [`Mpp::create()`] does.
     pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpp<M, ()> {
-        Mpp {
-            method,
-            session_method: None,
-            realm: realm.into(),
-            secret_key: secret_key.into(),
-            currencies: Vec::new(),
-            recipient: None,
-            decimals: DEFAULT_DECIMALS,
-            fee_payer: false,
-            machine_token_enabled: false,
-            chain_id: None,
-            opaque: None,
-            credential_header: None,
-            events: ServerEvents::default(),
-        }
+        Self::from_config(method, Config::new(realm.into(), secret_key.into()))
     }
 
     /// Create a new payment handler with pre-configured currency and recipient (advanced API).
@@ -160,19 +173,21 @@ where
         currency: impl Into<String>,
         recipient: impl Into<String>,
     ) -> Self {
-        Mpp {
+        Self::from_config(
             method,
+            Config {
+                currencies: vec![currency.into()],
+                recipient: Some(recipient.into()),
+                ..Config::new(realm.into(), secret_key.into())
+            },
+        )
+    }
+
+    fn from_config(method: M, config: Config) -> Self {
+        Mpp {
+            method: Arc::new(method),
             session_method: None,
-            realm: realm.into(),
-            secret_key: secret_key.into(),
-            currencies: vec![currency.into()],
-            recipient: Some(recipient.into()),
-            decimals: DEFAULT_DECIMALS,
-            fee_payer: false,
-            machine_token_enabled: false,
-            chain_id: None,
-            opaque: None,
-            credential_header: None,
+            config: Arc::new(config),
             events: ServerEvents::default(),
         }
     }
@@ -186,17 +201,8 @@ where
     pub fn with_session_method<S2>(self, session_method: S2) -> Mpp<M, S2> {
         Mpp {
             method: self.method,
-            session_method: Some(session_method),
-            realm: self.realm,
-            secret_key: self.secret_key,
-            currencies: self.currencies,
-            recipient: self.recipient,
-            decimals: self.decimals,
-            fee_payer: self.fee_payer,
-            machine_token_enabled: self.machine_token_enabled,
-            chain_id: self.chain_id,
-            opaque: self.opaque,
-            credential_header: self.credential_header,
+            session_method: Some(Arc::new(session_method)),
+            config: self.config,
             events: self.events,
         }
     }
@@ -210,7 +216,7 @@ where
     /// Pin the route `opaque` for issuance and verification: challenge helpers
     /// emit it, and verification rejects any credential that doesn't match.
     pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
-        self.opaque = Some(opaque);
+        Arc::make_mut(&mut self.config).opaque = Some(opaque);
         self
     }
 
@@ -220,7 +226,7 @@ where
     /// Challenges advertise `header="Payment-Authorization"`, and clients send
     /// the credential in that field instead of `Authorization`.
     pub fn with_requires_auth(mut self, enabled: bool) -> Self {
-        self.credential_header =
+        Arc::make_mut(&mut self.config).credential_header =
             enabled.then(|| crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER.to_string());
         self
     }
@@ -229,12 +235,15 @@ where
     ///
     /// When true, Payment credentials use `Payment-Authorization`.
     pub fn requires_auth(&self) -> bool {
-        self.credential_header.is_some()
+        self.config.credential_header.is_some()
     }
 
     /// HTTP field a client must use for Payment credentials issued by this handler.
     pub fn credential_header(&self) -> &str {
-        self.credential_header.as_deref().unwrap_or("Authorization")
+        self.config
+            .credential_header
+            .as_deref()
+            .unwrap_or("Authorization")
     }
 
     /// Get the event registry used by this payment handler.
@@ -271,7 +280,7 @@ where
 
     /// Get the realm.
     pub fn realm(&self) -> &str {
-        &self.realm
+        &self.config.realm
     }
 
     /// Get the method name.
@@ -284,43 +293,43 @@ where
     /// When several currencies are accepted, this is the first (preferred)
     /// one. See [`currencies()`](Self::currencies) for the full list.
     pub fn currency(&self) -> Option<&str> {
-        self.currencies.first().map(String::as_str)
+        self.config.currencies.first().map(String::as_str)
     }
 
     /// Get the ordered list of accepted currencies (empty when unbound).
     pub fn currencies(&self) -> &[String] {
-        &self.currencies
+        &self.config.currencies
     }
 
     /// Get the bound recipient, if configured.
     pub fn recipient(&self) -> Option<&str> {
-        self.recipient.as_deref()
+        self.config.recipient.as_deref()
     }
 
     /// Get the configured decimals.
     pub fn decimals(&self) -> u32 {
-        self.decimals
+        self.config.decimals
     }
 
     /// Get whether fee sponsorship is enabled.
     pub fn fee_payer(&self) -> bool {
-        self.fee_payer
+        self.config.fee_payer
     }
 
     /// Get whether canonical first-party machine-token funding is advertised.
     pub fn machine_token_enabled(&self) -> bool {
-        self.machine_token_enabled
+        self.config.machine_token_enabled
     }
 
     /// Get the configured chain ID, if set.
     pub fn chain_id(&self) -> Option<u64> {
-        self.chain_id
+        self.config.chain_id
     }
 
     /// Replace the bound currencies (test-only helper for sibling modules).
     #[cfg(test)]
     pub(crate) fn with_currencies(mut self, currencies: Vec<String>) -> Self {
-        self.currencies = currencies;
+        Arc::make_mut(&mut self.config).currencies = currencies;
         self
     }
 }
@@ -414,21 +423,19 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             method = method.with_relay(relay)?;
         }
 
-        Ok(Self {
+        Ok(Self::from_config(
             method,
-            session_method: None,
-            realm: builder.realm,
-            secret_key,
-            currencies,
-            recipient: Some(builder.recipient),
-            decimals: builder.decimals,
-            fee_payer: builder.fee_payer,
-            machine_token_enabled: builder.machine_token_enabled,
-            chain_id: builder.chain_id,
-            opaque: None,
-            credential_header: advertised_builder_credential_header(builder.requires_auth),
-            events: ServerEvents::default(),
-        })
+            Config {
+                currencies,
+                recipient: Some(builder.recipient),
+                decimals: builder.decimals,
+                fee_payer: builder.fee_payer,
+                machine_token_enabled: builder.machine_token_enabled,
+                chain_id: builder.chain_id,
+                credential_header: advertised_builder_credential_header(builder.requires_auth),
+                ..Config::new(builder.realm, secret_key)
+            },
+        ))
     }
 }
 
@@ -472,21 +479,15 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             method = method.with_api_base(api_base);
         }
 
-        Ok(Self {
+        Ok(Self::from_config(
             method,
-            session_method: None,
-            realm: builder.realm,
-            secret_key,
-            currencies: vec![builder.currency],
-            recipient: None,
-            decimals: builder.decimals as u32,
-            fee_payer: false,
-            machine_token_enabled: false,
-            chain_id: None,
-            opaque: None,
-            credential_header: advertised_builder_credential_header(builder.requires_auth),
-            events: ServerEvents::default(),
-        })
+            Config {
+                currencies: vec![builder.currency],
+                decimals: builder.decimals as u32,
+                credential_header: advertised_builder_credential_header(builder.requires_auth),
+                ..Config::new(builder.realm, secret_key)
+            },
+        ))
     }
 }
 

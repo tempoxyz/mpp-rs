@@ -9,6 +9,18 @@ fn test_mpp_creation() {
     assert!(payment.recipient().is_none());
 }
 
+#[test]
+fn clones_share_state_until_reconfigured() {
+    let mpp = Mpp::new(MockMethod, "api.example.com", TEST_SECRET);
+    let clone = mpp.clone();
+    assert!(Arc::ptr_eq(&mpp.method, &clone.method));
+    assert!(Arc::ptr_eq(&mpp.config, &clone.config));
+
+    let reconfigured = clone.with_requires_auth(true);
+    assert!(reconfigured.requires_auth());
+    assert!(!mpp.requires_auth());
+}
+
 #[cfg(feature = "tempo")]
 #[test]
 fn test_charge_challenge_generation() {

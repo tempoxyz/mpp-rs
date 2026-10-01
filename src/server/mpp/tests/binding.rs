@@ -6,21 +6,13 @@ use super::*;
 /// currency, recipient, and decimals match create_test_mpp().
 #[cfg(feature = "tempo")]
 fn create_hmac_test_mpp() -> Mpp<TempoSuccessMethod> {
-    Mpp {
-        method: TempoSuccessMethod,
-        session_method: None,
-        realm: "MPP Payment".into(),
-        secret_key: TEST_SECRET.into(),
-        currencies: vec!["0x20c0000000000000000000000000000000000000".into()],
-        recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
-        decimals: DEFAULT_DECIMALS,
-        fee_payer: false,
-        machine_token_enabled: false,
-        chain_id: None,
-        opaque: None,
-        credential_header: None,
-        events: ServerEvents::default(),
-    }
+    Mpp::new_with_config(
+        TempoSuccessMethod,
+        "MPP Payment",
+        TEST_SECRET,
+        "0x20c0000000000000000000000000000000000000",
+        "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+    )
 }
 
 #[cfg(feature = "tempo")]
@@ -236,7 +228,7 @@ async fn test_pinned_recipient_mismatch_rejected() {
 #[tokio::test]
 async fn test_pinned_chain_id_mismatch_rejected() {
     let mut mpp = create_hmac_test_mpp();
-    mpp.chain_id = Some(42431);
+    Arc::make_mut(&mut mpp.config).chain_id = Some(42431);
     let challenge = mpp.charge("0.10").unwrap().remove(0);
 
     // Tamper chainId in the request, re-sign HMAC
@@ -269,7 +261,7 @@ async fn test_pinned_chain_id_mismatch_rejected() {
 async fn test_pinned_chain_id_missing_rejected() {
     // Server expects chainId but credential omits it entirely (fail-closed)
     let mut mpp = create_hmac_test_mpp();
-    mpp.chain_id = Some(42431);
+    Arc::make_mut(&mut mpp.config).chain_id = Some(42431);
     let challenge = mpp.charge("0.10").unwrap().remove(0);
 
     // Strip chainId from request, re-sign
@@ -304,7 +296,7 @@ async fn test_charge_challenge_pins_chain_id() {
     const CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
 
     let mut mpp = create_hmac_test_mpp();
-    mpp.chain_id = Some(42431);
+    Arc::make_mut(&mut mpp.config).chain_id = Some(42431);
 
     let request = ChargeRequest {
         amount: "1000".into(),
@@ -493,7 +485,7 @@ async fn test_pinned_method_mismatch_rejected() {
 async fn test_pinned_fields_pass_when_matching() {
     // Happy path: all pinned fields match → verification succeeds
     let mut mpp = create_hmac_test_mpp();
-    mpp.chain_id = Some(42431);
+    Arc::make_mut(&mut mpp.config).chain_id = Some(42431);
     let challenge = mpp.charge("0.10").unwrap().remove(0);
     let echo = challenge.to_echo();
     let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));

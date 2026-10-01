@@ -30,15 +30,15 @@ where
     /// challenge and recompute its HMAC id. No-op when neither is configured.
     #[cfg(any(feature = "tempo", feature = "stripe"))]
     pub(super) fn apply_pinned_opaque(&self, mut challenge: PaymentChallenge) -> PaymentChallenge {
-        if self.opaque.is_none() && self.credential_header.is_none() {
+        if self.config.opaque.is_none() && self.config.credential_header.is_none() {
             return challenge;
         }
-        if let Some(opaque) = &self.opaque {
+        if let Some(opaque) = &self.config.opaque {
             challenge.opaque = Some(opaque.clone());
         }
-        challenge.header = self.credential_header.clone();
+        challenge.header = self.config.credential_header.clone();
         challenge.id = crate::protocol::core::compute_challenge_id_with_header(
-            &self.secret_key,
+            &self.config.secret_key,
             &challenge.realm,
             challenge.method.as_str(),
             challenge.intent.as_str(),
@@ -58,7 +58,7 @@ where
                 "currency not configured — use Mpp::create() or set currency".into(),
             )
         })?;
-        let recipient = self.recipient.as_deref().ok_or_else(|| {
+        let recipient = self.config.recipient.as_deref().ok_or_else(|| {
             crate::error::MppError::InvalidConfig(
                 "recipient not configured — use Mpp::create() or set recipient".into(),
             )
@@ -103,7 +103,8 @@ where
         options: crate::server::ChargeOptions<'_>,
     ) -> Result<Vec<PaymentChallenge>> {
         self.require_bound_config()?;
-        self.currencies
+        self.config
+            .currencies
             .iter()
             .map(|currency| self.charge_for_currency(amount, currency, &options))
             .collect()
@@ -135,7 +136,7 @@ where
         options: &crate::server::ChargeOptions<'_>,
     ) -> Result<PaymentChallenge> {
         let (_, recipient) = self.require_bound_config()?;
-        let base_units = crate::server::parse_dollar_amount(amount, self.decimals)?;
+        let base_units = crate::server::parse_dollar_amount(amount, self.config.decimals)?;
         let mut request = ChargeRequest {
             amount: base_units,
             currency: currency.to_string(),
@@ -147,13 +148,13 @@ where
         };
         {
             let mut details = serde_json::Map::new();
-            if options.fee_payer || self.fee_payer {
+            if options.fee_payer || self.config.fee_payer {
                 details.insert("feePayer".into(), serde_json::json!(true));
             }
-            if self.machine_token_enabled {
+            if self.config.machine_token_enabled {
                 details.insert("machineTokenEnabled".into(), serde_json::json!(true));
             }
-            if let Some(chain_id) = self.chain_id {
+            if let Some(chain_id) = self.config.chain_id {
                 details.insert("chainId".into(), serde_json::json!(chain_id));
             }
             if let Some(supported_modes) = options.supported_modes {
@@ -165,8 +166,8 @@ where
             }
         }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
-            &self.secret_key,
-            &self.realm,
+            &self.config.secret_key,
+            &self.config.realm,
             &request,
             options.expires,
             options.description,
@@ -206,7 +207,7 @@ where
         // Verification fails closed on a missing `chainId` when one is pinned,
         // so a caller-built request must carry it like `charge()` requests do.
         let mut request = request.clone();
-        if let Some(chain_id) = self.chain_id {
+        if let Some(chain_id) = self.config.chain_id {
             let details = request
                 .method_details
                 .get_or_insert_with(|| serde_json::json!({}));
@@ -217,8 +218,8 @@ where
             }
         }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
-            &self.secret_key,
-            &self.realm,
+            &self.config.secret_key,
+            &self.config.realm,
             &request,
             expires,
             description,
@@ -250,7 +251,7 @@ where
     fn with_body_digest(&self, mut challenge: PaymentChallenge, body: &[u8]) -> PaymentChallenge {
         let digest = crate::body_digest::compute(body);
         challenge.id = crate::protocol::core::compute_challenge_id_with_header(
-            &self.secret_key,
+            &self.config.secret_key,
             &challenge.realm,
             challenge.method.as_str(),
             challenge.intent.as_str(),
@@ -298,7 +299,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
 
         use crate::protocol::methods::stripe::StripeMethodDetails;
 
-        let base_units = crate::server::parse_dollar_amount(amount, self.decimals)?;
+        let base_units = crate::server::parse_dollar_amount(amount, self.config.decimals)?;
         let currency = self.currency().unwrap_or("usd");
 
         let details = StripeMethodDetails {
@@ -335,8 +336,8 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         };
 
         let id = crate::protocol::core::compute_challenge_id(
-            &self.secret_key,
-            &self.realm,
+            &self.config.secret_key,
+            &self.config.realm,
             crate::protocol::methods::stripe::METHOD_NAME,
             crate::protocol::methods::stripe::INTENT_CHARGE,
             encoded_request.raw(),
@@ -347,7 +348,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
 
         Ok(self.apply_pinned_opaque(PaymentChallenge {
             id,
-            realm: self.realm.clone(),
+            realm: self.config.realm.clone(),
             method: crate::protocol::methods::stripe::METHOD_NAME.into(),
             intent: crate::protocol::methods::stripe::INTENT_CHARGE.into(),
             request: encoded_request,

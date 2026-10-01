@@ -15,7 +15,7 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
-        let configured_opaque = self.opaque.as_ref().map(|o| o.raw());
+        let configured_opaque = self.config.opaque.as_ref().map(|o| o.raw());
         let echoed_opaque = credential.challenge.opaque.as_ref().map(|o| o.raw());
         if echoed_opaque != configured_opaque {
             return Err(VerificationError::with_code(
@@ -58,11 +58,11 @@ where
             ));
         }
 
-        if credential.challenge.realm != self.realm {
+        if credential.challenge.realm != self.config.realm {
             return Err(VerificationError::with_code(
                 format!(
                     "credential realm '{}' does not match this route's requirements (expected '{}')",
-                    credential.challenge.realm, self.realm
+                    credential.challenge.realm, self.config.realm
                 ),
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
@@ -71,7 +71,7 @@ where
         self.verify_opaque(credential)?;
 
         // Request-level core fields: currency, recipient
-        if !self.currencies.is_empty() && !self.offers_currency(&request.currency) {
+        if !self.config.currencies.is_empty() && !self.offers_currency(&request.currency) {
             return Err(VerificationError::with_code(
                 format!(
                     "credential currency '{}' does not match this route's requirements",
@@ -81,7 +81,7 @@ where
             ));
         }
 
-        if let Some(ref expected_recipient) = self.recipient {
+        if let Some(ref expected_recipient) = self.config.recipient {
             if request.recipient.as_deref() != Some(expected_recipient.as_str()) {
                 return Err(VerificationError::with_code(
                     "credential recipient does not match this route's requirements",
@@ -91,7 +91,7 @@ where
         }
 
         // Request-level method fields: chainId (fail-closed when expected but missing)
-        if let Some(expected_chain_id) = self.chain_id {
+        if let Some(expected_chain_id) = self.config.chain_id {
             let actual_chain_id = request
                 .method_details
                 .as_ref()
@@ -124,8 +124,8 @@ where
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
         let expected_id = crate::protocol::core::compute_challenge_id_with_header(
-            &self.secret_key,
-            &self.realm,
+            &self.config.secret_key,
+            &self.config.realm,
             credential.challenge.method.as_str(),
             credential.challenge.intent.as_str(),
             credential.challenge.request.raw(),
@@ -549,7 +549,10 @@ where
 
     /// Whether `currency` is one of this handler's bound currencies.
     fn offers_currency(&self, currency: &str) -> bool {
-        self.currencies.iter().any(|offered| offered == currency)
+        self.config
+            .currencies
+            .iter()
+            .any(|offered| offered == currency)
     }
 }
 

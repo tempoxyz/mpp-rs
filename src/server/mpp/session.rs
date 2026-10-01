@@ -55,8 +55,8 @@ where
         };
 
         let id = crate::protocol::methods::tempo::generate_challenge_id(
-            &self.secret_key,
-            &self.realm,
+            &self.config.secret_key,
+            &self.config.realm,
             "tempo",
             "session",
             encoded.raw(),
@@ -67,7 +67,7 @@ where
 
         Ok(self.apply_pinned_opaque(PaymentChallenge {
             id,
-            realm: self.realm.clone(),
+            realm: self.config.realm.clone(),
             method: "tempo".into(),
             intent: "session".into(),
             request: encoded,
@@ -127,15 +127,16 @@ where
         let sponsors_fees = session.is_some_and(|s| s.supports_fee_payer());
         let settles_machine_tokens = session.is_some_and(|s| s.supports_machine_tokens());
 
-        if (options.fee_payer || self.fee_payer) && sponsors_fees {
+        if (options.fee_payer || self.config.fee_payer) && sponsors_fees {
             let details = method_details.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = details.as_object_mut() {
                 obj.insert("feePayer".to_string(), serde_json::json!(true));
             }
         }
 
-        if self.machine_token_enabled && settles_machine_tokens {
+        if self.config.machine_token_enabled && settles_machine_tokens {
             let chain_id = self
+                .config
                 .chain_id
                 .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
             let (_, adapter) =
@@ -188,8 +189,8 @@ where
         };
 
         let id = crate::protocol::methods::tempo::generate_challenge_id(
-            &self.secret_key,
-            &self.realm,
+            &self.config.secret_key,
+            &self.config.realm,
             "tempo",
             "session",
             encoded.raw(),
@@ -200,7 +201,7 @@ where
 
         Ok(self.apply_pinned_opaque(PaymentChallenge {
             id,
-            realm: self.realm.clone(),
+            realm: self.config.realm.clone(),
             method: "tempo".into(),
             intent: "session".into(),
             request: encoded,
@@ -234,8 +235,9 @@ where
 
         // Channels opened in any accepted currency keep verifying, including
         // channels opened before OUSD became the preferred default.
-        if !self.currencies.is_empty()
+        if !self.config.currencies.is_empty()
             && !self
+                .config
                 .currencies
                 .iter()
                 .any(|bound| request.currency.eq_ignore_ascii_case(bound))
@@ -244,13 +246,13 @@ where
                 format!(
                     "Currency mismatch: credential has {} but server expects {}",
                     request.currency,
-                    self.currencies.join(" or ")
+                    self.config.currencies.join(" or ")
                 ),
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
 
-        if let Some(bound) = &self.recipient {
+        if let Some(bound) = &self.config.recipient {
             let echoed = request.recipient.as_deref().unwrap_or("");
             if !echoed.eq_ignore_ascii_case(bound) {
                 return Err(VerificationError::with_code(
