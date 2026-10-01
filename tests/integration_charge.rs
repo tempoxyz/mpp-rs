@@ -215,6 +215,60 @@ async fn wait_for_receipt(
     ))
 }
 
+/// Start a JSON-RPC proxy to `rpc` that answers `tempo_simulateV1` the way a
+/// node without the method does, as the public Tempo RPC endpoints do.
+/// Returns its URL and the methods it was asked for, in order.
+async fn start_rpc_without_simulate(rpc: &str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = rpc.to_string();
+    let client = Client::new();
+
+    let app = Router::new().route(
+        "/",
+        axum::routing::post({
+            let methods = methods.clone();
+            move |Json(request): Json<serde_json::Value>| {
+                let (methods, upstream, client) =
+                    (methods.clone(), upstream.clone(), client.clone());
+                async move {
+                    let method = request["method"].as_str().unwrap_or_default().to_string();
+                    methods.lock().unwrap().push(method.clone());
+                    if method == "tempo_simulateV1" {
+                        return Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": {
+                                "code": -32601,
+                                "message": "the method tempo_simulateV1 does not exist/is not available",
+                            },
+                        }));
+                    }
+                    let response = client
+                        .post(&upstream)
+                        .json(&request)
+                        .send()
+                        .await
+                        .expect("upstream RPC unreachable")
+                        .json::<serde_json::Value>()
+                        .await
+                        .expect("upstream RPC response is not JSON");
+                    Json(response)
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("proxy error");
+    });
+
+    (url, methods)
+}
+
 // ==================== ChargeConfig types ====================
 
 struct OneCent;
@@ -1040,6 +1094,118 @@ async fn test_e2e_charge_with_fee_payer() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["message"], "paid content");
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// A node without `tempo_simulateV1` (the public RPC endpoints) still gets a
+/// pre-broadcast check: the sponsored transaction is simulated with `eth_call`
+/// and then broadcast.
+#[tokio::test]
+async fn test_fee_payer_simulates_with_eth_call_without_simulate_v1() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+    let (server_rpc, methods) = start_rpc_without_simulate(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let client_signer = PrivateKeySigner::random();
+    fund_account(&rpc, server_signer.address()).await;
+    fund_account(&rpc, client_signer.address()).await;
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", server_signer.address()),
+        })
+        .rpc_url(&server_rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key(TEST_SECRET),
+    )
+    .expect("failed to create Mpp");
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("fee-payer payment failed");
+    assert_eq!(resp.status(), 200);
+
+    let methods = methods.lock().unwrap().clone();
+    let simulate = methods
+        .iter()
+        .position(|method| method == "tempo_simulateV1")
+        .expect("tempo_simulateV1 was not tried");
+    let broadcast = methods
+        .iter()
+        .position(|method| method.starts_with("eth_sendRawTransaction"))
+        .unwrap_or_else(|| panic!("transaction was not broadcast: {methods:?}"));
+    assert!(
+        methods[simulate..broadcast].iter().any(|m| m == "eth_call"),
+        "no eth_call between the failed simulation and the broadcast: {methods:?}"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// The `eth_call` fallback rejects a sponsored transaction that would revert,
+/// so the fee payer does not broadcast and pay for it.
+#[tokio::test]
+async fn test_fee_payer_eth_call_fallback_rejects_reverting_transaction() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+    let (server_rpc, methods) = start_rpc_without_simulate(&rpc).await;
+
+    let server_signer = PrivateKeySigner::random();
+    let fee_payer_addr = server_signer.address();
+    fund_account(&rpc, fee_payer_addr).await;
+    // The payer holds no pathUSD, so its transfer reverts.
+    let client_signer = PrivateKeySigner::random();
+
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: &format!("{}", fee_payer_addr),
+        })
+        .rpc_url(&server_rpc)
+        .chain_id(chain_id)
+        .fee_payer(true)
+        .fee_payer_signer(server_signer)
+        .secret_key(TEST_SECRET),
+    )
+    .expect("failed to create Mpp");
+    let (url, handle) = start_server(Arc::new(mpp) as Arc<dyn ChargeChallenger>).await;
+
+    let chain =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+    let fee_payer_before = tip20_balance(&chain, fee_payer_addr).await;
+
+    let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 402, "a reverting payment must be rejected");
+
+    let methods = methods.lock().unwrap().clone();
+    assert!(
+        methods.iter().any(|m| m == "tempo_simulateV1") && methods.iter().any(|m| m == "eth_call"),
+        "the transaction was not simulated: {methods:?}"
+    );
+    assert!(
+        !methods
+            .iter()
+            .any(|m| m.starts_with("eth_sendRawTransaction")),
+        "a reverting transaction was broadcast: {methods:?}"
+    );
+    assert_eq!(
+        tip20_balance(&chain, fee_payer_addr).await,
+        fee_payer_before
+    );
 
     handle.abort();
     let _ = handle.await;
