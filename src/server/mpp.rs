@@ -49,6 +49,20 @@ fn advertised_builder_credential_header(requires_auth: bool) -> Option<String> {
     requires_auth.then(|| crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER.to_string())
 }
 
+/// Validate the `supportedModes` a charge challenge advertises.
+///
+/// The verifier rejects credentials whose mode is not listed, so an empty or
+/// misspelled list would make the challenge unpayable.
+#[cfg(feature = "tempo")]
+fn validate_charge_modes(modes: &[&str]) -> Result<()> {
+    if modes.is_empty() || modes.iter().any(|mode| !matches!(*mode, "pull" | "push")) {
+        return Err(crate::error::MppError::InvalidConfig(
+            "supported_modes must be a non-empty list of \"pull\" and/or \"push\"".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Detect the server realm from environment variables.
 ///
 /// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
@@ -595,6 +609,7 @@ where
                 details.insert("chainId".into(), serde_json::json!(chain_id));
             }
             if let Some(supported_modes) = options.supported_modes {
+                validate_charge_modes(supported_modes)?;
                 details.insert("supportedModes".into(), serde_json::json!(supported_modes));
             }
             if !details.is_empty() {
@@ -2629,6 +2644,40 @@ mod tests {
             request.method_details.unwrap()["supportedModes"],
             serde_json::json!(["pull"])
         );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn test_charge_supported_modes_advertisement() {
+        let mpp = create_test_mpp();
+        let modes = |fee_payer, supported_modes| {
+            let options = ChargeOptions {
+                fee_payer,
+                supported_modes,
+                ..Default::default()
+            };
+            mpp.charge_with_options("1", options).map(|mut offers| {
+                let request: ChargeRequest = offers.remove(0).request.decode().unwrap();
+                request
+                    .method_details
+                    .unwrap()
+                    .get("supportedModes")
+                    .cloned()
+            })
+        };
+
+        assert_eq!(modes(false, None).unwrap(), None);
+        assert_eq!(
+            modes(false, Some(&["push", "pull"])).unwrap(),
+            Some(serde_json::json!(["push", "pull"]))
+        );
+        assert_eq!(
+            modes(true, Some(&["pull"])).unwrap(),
+            Some(serde_json::json!(["pull"]))
+        );
+
+        assert!(modes(false, Some(&[])).is_err());
+        assert!(modes(false, Some(&["Pull"])).is_err());
     }
 
     #[cfg(feature = "tempo")]
