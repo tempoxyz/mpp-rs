@@ -1,6 +1,6 @@
 //! EIP-712 proof signing for zero-amount Tempo charge flows.
 
-use alloy::primitives::{keccak256, Address, B256};
+use alloy::primitives::{Address, B256};
 use alloy::sol_types::{eip712_domain, SolStruct};
 #[cfg(feature = "evm")]
 use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
@@ -65,29 +65,6 @@ pub fn parse_proof_source(source: &str) -> crate::error::Result<ProofSource> {
         .parse()
         .map_err(|e| MppError::invalid_payload(format!("invalid proof source address: {e}")))?;
     Ok(ProofSource { address, chain_id })
-}
-
-/// Compute a canonical single-use replay fingerprint for a proof credential.
-///
-/// Hashes canonical parsed values rather than raw strings so equivalent
-/// spellings (address/signature hex casing, `0x` prefix) map to the same key.
-#[cfg(feature = "evm")]
-pub fn proof_fingerprint(
-    challenge_id: &str,
-    source_address: Address,
-    chain_id: u64,
-    signature_hex: &str,
-) -> crate::error::Result<B256> {
-    let signature = parse_signature(signature_hex)?;
-    let signature_bytes = signature.to_bytes();
-
-    let mut buf = Vec::with_capacity(challenge_id.len() + 1 + 20 + 8 + signature_bytes.len());
-    buf.extend_from_slice(challenge_id.as_bytes());
-    buf.push(0xff); // separator: variable-length id from fixed-width fields
-    buf.extend_from_slice(source_address.as_slice());
-    buf.extend_from_slice(&chain_id.to_be_bytes());
-    buf.extend_from_slice(&signature_bytes);
-    Ok(keccak256(&buf))
 }
 
 /// Compute the EIP-712 signing hash for a proof credential.
@@ -362,32 +339,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered, signer.address());
-    }
-
-    #[tokio::test]
-    async fn test_proof_fingerprint_is_spelling_invariant() {
-        let signer = alloy::signers::local::PrivateKeySigner::random();
-        let signature = sign_proof(
-            &signer,
-            signer.address(),
-            42431,
-            "challenge-123",
-            "api.example.com",
-        )
-        .await
-        .unwrap();
-
-        // Canonical spelling vs. uppercase signature hex — same proof.
-        let upper_sig = signature.to_uppercase().replace("0X", "0x");
-        assert_ne!(signature, upper_sig);
-
-        let a = proof_fingerprint("challenge-123", signer.address(), 42431, &signature).unwrap();
-        let b = proof_fingerprint("challenge-123", signer.address(), 42431, &upper_sig).unwrap();
-        assert_eq!(a, b, "re-encoded signature must yield the same fingerprint");
-
-        // Different challenge id must change the fingerprint.
-        let c = proof_fingerprint("challenge-456", signer.address(), 42431, &signature).unwrap();
-        assert_ne!(a, c);
     }
 
     #[test]
