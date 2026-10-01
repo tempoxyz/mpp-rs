@@ -1159,7 +1159,7 @@ where
         self.store
             .update_channel(
                 &channel_id_for_lock,
-                Box::new(|current| {
+                Box::new(move |current| {
                     let state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
                     if state.finalized {
@@ -1167,6 +1167,14 @@ where
                     }
                     if state.closing {
                         return Err(VerificationError::channel_closed("channel is closing"));
+                    }
+                    // `spent` can still grow until `closing` is set, so the amount
+                    // validated against the snapshot above may no longer cover it.
+                    if cumulative_amount < state.spent {
+                        return Err(VerificationError::new(format!(
+                            "close voucher amount must be >= {} (spent)",
+                            state.spent,
+                        )));
                     }
                     Ok(Some(ChannelState {
                         closing: true,
@@ -3679,7 +3687,7 @@ mod tests {
     }
 
     fn mocked_session_method(
-        store: Arc<InMemoryChannelStore>,
+        store: Arc<dyn ChannelStore>,
         asserter: alloy::providers::mock::Asserter,
     ) -> SessionMethod<impl Provider<TempoNetwork> + Clone + 'static> {
         let provider = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
@@ -3811,6 +3819,92 @@ mod tests {
         let stored = store.get_channel_sync(&channel_id).unwrap();
         assert!(!stored.finalized);
         assert!(!stored.closing);
+    }
+
+    /// Units deducted between the close's snapshot and its `closing` update
+    /// must be covered by the close amount, otherwise the channel would be
+    /// closed on-chain for less than was spent.
+    #[tokio::test]
+    async fn test_close_rechecks_spent_under_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Store that deducts from a channel right after its first read, like
+        /// a request metered while the close awaits the on-chain channel.
+        struct DeductAfterRead {
+            inner: InMemoryChannelStore,
+            deducted: AtomicBool,
+        }
+
+        impl ChannelStore for DeductAfterRead {
+            fn get_channel(
+                &self,
+                channel_id: &str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ChannelState>, VerificationError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let channel_id = channel_id.to_string();
+                Box::pin(async move {
+                    let snapshot = self.inner.get_channel(&channel_id).await?;
+                    if !self.deducted.swap(true, Ordering::SeqCst) {
+                        deduct_from_channel(&self.inner, &channel_id, 1_000).await?;
+                    }
+                    Ok(snapshot)
+                })
+            }
+
+            fn update_channel(
+                &self,
+                channel_id: &str,
+                updater: Box<
+                    dyn FnOnce(
+                            Option<ChannelState>,
+                        )
+                            -> Result<Option<ChannelState>, VerificationError>
+                        + Send,
+                >,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn Future<Output = Result<Option<ChannelState>, VerificationError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                self.inner.update_channel(channel_id, updater)
+            }
+        }
+
+        let store = Arc::new(DeductAfterRead {
+            inner: InMemoryChannelStore::new(),
+            deducted: AtomicBool::new(false),
+        });
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store.inner, &asserter).await;
+        // The close voucher (1_000) covers the 500 spent so far, but the channel
+        // holds a higher voucher that requests can still be metered against.
+        let mut state = store.inner.get_channel_sync(&channel_id).unwrap();
+        state.highest_voucher_amount = 2_000;
+        store.inner.insert(&channel_id, state);
+        push_close_transaction(&asserter, true);
+        let queued = asserter.read_q().len();
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "close voucher amount must be >= 1500 (spent)");
+
+        let stored = store.inner.get_channel_sync(&channel_id).unwrap();
+        assert!(!stored.finalized);
+        assert!(!stored.closing);
+        // Only the on-chain channel read reached the provider, so the queued
+        // close transaction was not submitted.
+        assert_eq!(asserter.read_q().len(), queued - 1);
     }
 
     #[tokio::test]
