@@ -43,6 +43,16 @@ fn strip_payment_scheme(header: &str) -> Option<&str> {
     }
 }
 
+/// Whether `value` starts with the `Payment` scheme token (case-insensitive)
+/// followed by SP or HTAB.
+pub(super) fn starts_with_payment_scheme(value: &[u8]) -> bool {
+    let scheme_len = PAYMENT_SCHEME.len();
+    value
+        .get(..scheme_len)
+        .is_some_and(|token| token.eq_ignore_ascii_case(PAYMENT_SCHEME.as_bytes()))
+        && matches!(value.get(scheme_len), Some(b' ' | b'\t'))
+}
+
 /// Extract the `Payment` scheme from an Authorization header that may contain
 /// multiple comma-separated schemes (per RFC 9110).
 ///
@@ -66,11 +76,10 @@ fn strip_payment_scheme(header: &str) -> Option<&str> {
 /// assert!(extract_payment_scheme("Bearer token123").is_none());
 /// ```
 pub fn extract_payment_scheme(header: &str) -> Option<&str> {
-    header.split(',').map(|s| s.trim()).find(|s| {
-        s.len() >= 8
-            && s.get(..8)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("payment "))
-    })
+    header
+        .split(',')
+        .map(|s| s.trim())
+        .find(|s| starts_with_payment_scheme(s.as_bytes()))
 }
 
 /// Escape a string for use in a quoted-string header value.
@@ -156,18 +165,25 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
         while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+        let key_end = i;
+
+        // RFC 9110 §11.2 allows whitespace around "=".
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // A token that is not followed by "=" starts another auth scheme.
         if i >= bytes.len() || bytes[i] != b'=' {
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' {
-                i += 1;
-            }
-            continue;
+            break;
         }
 
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
-        let raw_key = &params_str[key_start..i];
+        let raw_key = &params_str[key_start..key_end];
         let key = raw_key.to_ascii_lowercase();
         i += 1;
 
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         if i >= bytes.len() {
             break;
         }
@@ -441,30 +457,46 @@ pub fn parse_www_authenticate_all<'a>(
 
 /// Split a header value into individual `Payment` challenge slices.
 ///
-/// Finds `Payment ` scheme boundaries (case-insensitive per RFC 9110 §11.6.1)
+/// Finds `Payment` scheme boundaries (case-insensitive per RFC 9110 §11.6.1)
 /// that appear at the start of the header or after a comma separator, and
-/// returns the individual challenge strings.
+/// returns the individual challenge strings. Quoted-string contents are
+/// skipped, so scheme-like text inside a parameter value is never a boundary.
 fn split_payment_challenges(header: &str) -> Vec<&str> {
-    fn is_valid_start(header: &str, pos: usize) -> bool {
-        pos == 0
-            || header[..pos].bytes().all(|b| b.is_ascii_whitespace())
-            || header[..pos].bytes().rfind(|b| !b.is_ascii_whitespace()) == Some(b',')
+    let bytes = header.as_bytes();
+    let mut starts = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (pos, &byte) in bytes.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_quotes = true;
+            continue;
+        }
+        if !starts_with_payment_scheme(&bytes[pos..]) {
+            continue;
+        }
+        let boundary = bytes[..pos].iter().rfind(|b| !b.is_ascii_whitespace());
+        if matches!(boundary, None | Some(b',')) {
+            starts.push(pos);
+        }
     }
-
-    let lower = header.to_ascii_lowercase();
-
-    let starts: Vec<_> = lower
-        .match_indices("payment ")
-        .map(|(pos, _)| pos)
-        .filter(|&pos| is_valid_start(header, pos))
-        .collect();
 
     starts
         .iter()
         .enumerate()
         .map(|(i, &start)| {
             let end = starts.get(i + 1).copied().unwrap_or(header.len());
-            header[start..end].trim_end_matches([',', ' '])
+            header[start..end].trim_end_matches([',', ' ', '\t'])
         })
         .collect()
 }
@@ -1115,6 +1147,15 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_payment_scheme_accepts_tab() {
+        assert_eq!(
+            extract_payment_scheme("Bearer xxx, pAyMeNt\teyJhYmMi"),
+            Some("pAyMeNt\teyJhYmMi")
+        );
+        assert!(extract_payment_scheme("PaymentX eyJhYmMi").is_none());
+    }
+
+    #[test]
     fn test_parse_authorization_mixed_schemes() {
         let challenge = test_challenge();
         let credential = PaymentCredential::with_source(
@@ -1332,6 +1373,94 @@ mod tests {
         let results = parse_www_authenticate_all(vec![mixed]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].as_ref().unwrap().method.as_str(), "stripe");
+    }
+
+    fn second_challenge_header() -> &'static str {
+        r#"Payment id="second", realm="api.example.com", method="tempo", intent="charge", request="e30""#
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_ignores_scheme_like_text_in_quoted_values() {
+        type Field = (
+            fn(&mut PaymentChallenge, &str),
+            fn(&PaymentChallenge) -> &str,
+        );
+        let description: Field = (
+            |c, v| c.description = Some(v.to_string()),
+            |c| c.description.as_deref().unwrap(),
+        );
+        let id: Field = (|c, v| c.id = v.to_string(), |c| &c.id);
+        let intent: Field = (|c, v| c.intent = v.into(), |c| c.intent.as_str());
+        let realm: Field = (|c, v| c.realm = v.to_string(), |c| &c.realm);
+        let opaque: Field = (
+            |c, v| c.opaque = Some(Base64UrlJson::from_raw(v)),
+            |c| c.opaque.as_ref().unwrap().raw(),
+        );
+
+        let cases = [
+            (description, "Agentcash card payment test"),
+            (description, "Payment at the start"),
+            (description, r#"Use "Payment now", then retry \"#),
+            (description, "comma, Payment fake challenge"),
+            (id, "id with Payment text"),
+            (intent, "payment plan"),
+            (realm, "Payment realm"),
+            (opaque, "opaque Payment value"),
+        ];
+
+        for ((set, get), value) in cases {
+            let mut first = test_challenge();
+            first.id = "first".to_string();
+            set(&mut first, value);
+            let header = format!(
+                "{}, {}",
+                format_www_authenticate(&first).unwrap(),
+                second_challenge_header()
+            );
+
+            let results = parse_www_authenticate_all([header.as_str()]);
+            assert_eq!(results.len(), 2, "{value:?}: {results:?}");
+            assert_eq!(get(results[0].as_ref().unwrap()), value);
+            assert_eq!(results[1].as_ref().unwrap().id, "second");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_among_other_schemes() {
+        let header = format!(
+            "Bearer error_description=\"use Payment challenge\", {}, \
+             Digest realm=\"fallback Payment realm\", {}",
+            r#"Payment id="first", realm="api.example.com", method="stripe", intent="charge", request="e30""#,
+            second_challenge_header().replacen("Payment ", "pAyMeNt\t", 1),
+        );
+
+        let ids: Vec<_> = parse_www_authenticate_all([header.as_str()])
+            .into_iter()
+            .map(|result| result.unwrap().id)
+            .collect();
+        assert_eq!(ids, ["first", "second"]);
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_ignores_payment_inside_other_scheme() {
+        for header in [
+            r#"Bearer error_description="use Payment challenge""#,
+            r#"Bearer realm="x, Payment id=evil, realm=api, method=tempo, intent=charge, request=e30, x=y""#,
+        ] {
+            assert!(parse_www_authenticate_all([header]).is_empty(), "{header}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_accepts_whitespace_around_equals() {
+        let header =
+            "Payment id = \"abc\", realm= \"api\", method =\"tempo\", intent\t=\t\"charge\", request = e30";
+        let parsed = parse_www_authenticate(header).unwrap();
+        assert_eq!(parsed.id, "abc");
+        assert_eq!(parsed.realm, "api");
+        assert_eq!(parsed.method.as_str(), "tempo");
+        assert_eq!(parsed.intent.as_str(), "charge");
+        assert_eq!(parsed.request.raw(), "e30");
     }
 
     #[test]

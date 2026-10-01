@@ -309,15 +309,10 @@ impl PaymentProtocol {
     /// # Arguments
     /// * `www_authenticate` - The value of the WWW-Authenticate header, if present
     pub fn detect(www_authenticate: Option<&str>) -> Option<Self> {
-        const PAYMENT_SCHEME_WITH_SPACE: &str = "payment ";
-
         match www_authenticate {
             Some(header) => {
                 let trimmed = header.trim_start();
-                if trimmed
-                    .get(..PAYMENT_SCHEME_WITH_SPACE.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PAYMENT_SCHEME_WITH_SPACE))
-                {
+                if super::headers::starts_with_payment_scheme(trimmed.as_bytes()) {
                     Some(Self::WebPaymentAuth)
                 } else {
                     None
@@ -532,6 +527,10 @@ mod tests {
         );
         assert_eq!(
             PaymentProtocol::detect(Some("PAYMENT id=\"abc\"")),
+            Some(PaymentProtocol::WebPaymentAuth)
+        );
+        assert_eq!(
+            PaymentProtocol::detect(Some("pAyMeNt\tid=\"abc\"")),
             Some(PaymentProtocol::WebPaymentAuth)
         );
         assert_eq!(
