@@ -9,8 +9,9 @@ use alloy_pubsub::PubSubConnect;
 use alloy_transport_mpp::{MppEvent, MppWsConnect, VoucherProvider, VoucherRequest};
 use futures::{future::BoxFuture, SinkExt, StreamExt};
 use mpp::{
-    client::PaymentProvider, protocol::core::Base64UrlJson, MppError, PaymentChallenge,
-    PaymentCredential, PaymentPayload, Receipt,
+    client::{PaymentProvider, DEFAULT_MAX_PAYMENT_RETRIES},
+    protocol::core::Base64UrlJson,
+    MppError, PaymentChallenge, PaymentCredential, PaymentPayload, Receipt,
 };
 use serde_json::{from_str as json_from_str, json, to_value as json_to_value, Value};
 use std::{
@@ -47,6 +48,7 @@ impl PaymentProvider for StubProvider {
 
 #[derive(Clone, Default)]
 struct LifecycleProvider {
+    pays: Arc<AtomicUsize>,
     commits: Arc<AtomicUsize>,
     rollbacks: Arc<AtomicUsize>,
     abandons: Arc<AtomicUsize>,
@@ -58,6 +60,7 @@ impl PaymentProvider for LifecycleProvider {
     }
 
     async fn pay(&self, ch: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        self.pays.fetch_add(1, Ordering::SeqCst);
         Ok(PaymentCredential::new(
             ch.to_echo(),
             PaymentPayload::hash("0xlifecycle"),
@@ -763,6 +766,57 @@ async fn re_challenge_mid_session_pays_again() {
     }
     assert_eq!(challenges, 2, "expected two challenges");
     assert_eq!(credentials_sent, 2, "expected two credentials sent");
+}
+
+/// Waits for the next [`MppEvent::Error`] and returns its message.
+async fn next_error(events: &mut BroadcastReceiver<MppEvent>) -> String {
+    loop {
+        if let MppEvent::Error(message) = timeout(TIMEOUT, events.recv()).await.unwrap().unwrap() {
+            return message;
+        }
+    }
+}
+
+#[tokio::test]
+async fn payments_per_connection_are_capped() {
+    for (configured, limit) in [(None, DEFAULT_MAX_PAYMENT_RETRIES), (Some(1), 1)] {
+        let url = spawn_server(|mut ws| {
+            Box::pin(async move {
+                for round in 0..25 {
+                    let mut frame = challenge_frame();
+                    frame["challenge"]["id"] = json!(format!("id-{round}"));
+                    if ws
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Some(Ok(_credential)) = ws.next().await else {
+                        return;
+                    };
+                    send_text(&mut ws, receipt_frame()).await;
+                }
+            })
+        })
+        .await;
+
+        let provider = LifecycleProvider::default();
+        let mut connect = MppWsConnect::new(url, provider.clone());
+        if let Some(max_payments) = configured {
+            connect = connect.with_max_payments(max_payments);
+        }
+        let mut events = connect.mpp_handle().events;
+        let _connection = connect.connect().await.unwrap();
+
+        let error = next_error(&mut events).await;
+        assert!(
+            error.contains(&format!("payment limit of {limit}")),
+            "{error}"
+        );
+        assert_eq!(provider.pays.load(Ordering::SeqCst), limit);
+        assert_eq!(provider.commits.load(Ordering::SeqCst), limit);
+    }
 }
 
 #[tokio::test]
