@@ -24,6 +24,34 @@ fn test_refresh_on_chain_keeps_the_higher_values() {
     assert_eq!(newer.spent, 4_000);
 }
 
+/// An `open` for a recorded channel merges the on-chain read like a refresh,
+/// whether or not its voucher replaces the recorded one.
+#[test]
+fn test_open_on_a_recorded_channel_keeps_the_higher_deposit() {
+    use crate::protocol::methods::tempo::session_method::state::Opening;
+
+    let mut state = test_channel_state("0xchannel");
+    state.deposit = 100_000;
+    state.highest_voucher_amount = 1_000;
+    let reopen = |on_chain_deposit: u128, cumulative_amount: u128| {
+        let opening = Opening {
+            channel_id: state.channel_id.clone(),
+            chain_id: state.chain_id,
+            escrow_contract: state.escrow_contract,
+            authorized_signer: state.authorized_signer,
+            settlement_route: None,
+            cumulative_amount,
+            signature: vec![0xAA; 65],
+        };
+        let on_chain = on_chain_channel(&state, on_chain_deposit, 0);
+        ChannelState::open(Some(state.clone()), &on_chain, opening)
+    };
+
+    assert_eq!(reopen(50_000, 500).deposit, 100_000);
+    assert_eq!(reopen(50_000, 2_000).deposit, 100_000);
+    assert_eq!(reopen(150_000, 500).deposit, 150_000);
+}
+
 #[test]
 fn test_pending_close_is_marked_once_and_cleared() {
     let mut state = test_channel_state("0xchannel");

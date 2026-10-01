@@ -43,6 +43,8 @@ impl ChannelState {
         } = opening;
 
         if let Some(existing) = existing {
+            // The read can be older than what is recorded, as in `refresh_on_chain`.
+            let deposit = std::cmp::max(on_chain.deposit, existing.deposit);
             let settled_on_chain = std::cmp::max(on_chain.settled, existing.settled_on_chain);
             let spent = std::cmp::max(settled_on_chain, existing.spent);
 
@@ -50,7 +52,7 @@ impl ChannelState {
             if cumulative_amount > existing.highest_voucher_amount {
                 Self {
                     settlement_route: existing.settlement_route.or(settlement_route),
-                    deposit: on_chain.deposit,
+                    deposit,
                     settled_on_chain,
                     spent,
                     highest_voucher_amount: cumulative_amount,
@@ -61,7 +63,7 @@ impl ChannelState {
                 }
             } else {
                 Self {
-                    deposit: on_chain.deposit,
+                    deposit,
                     settled_on_chain,
                     spent,
                     authorized_signer,
