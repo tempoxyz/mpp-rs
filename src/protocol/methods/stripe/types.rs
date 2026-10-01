@@ -38,6 +38,9 @@ pub struct CreateTokenResult {
     /// Shared Payment Token from Stripe.
     pub spt: String,
     /// Optional per-payment external reference ID.
+    ///
+    /// Only used as a fallback: an `externalId` bound into the challenge
+    /// request is echoed in the credential instead.
     pub external_id: Option<String>,
 }
 

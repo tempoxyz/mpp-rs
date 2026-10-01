@@ -112,6 +112,11 @@ impl PaymentProvider for StripeProvider {
             .transpose()
             .mpp_config("invalid methodDetails")?
             .unwrap_or_default();
+        if details.network_id.is_empty() {
+            return Err(MppError::InvalidConfig(
+                "networkId is required in challenge methodDetails".into(),
+            ));
+        }
 
         let expires_at = challenge
             .expires
@@ -139,9 +144,10 @@ impl PaymentProvider for StripeProvider {
 
         let result = (self.create_token)(params).await?;
 
+        // A request-bound externalId must be echoed; servers reject a mismatch.
         let payload = StripeCredentialPayload {
             spt: result.spt,
-            external_id: result.external_id,
+            external_id: request.external_id.or(result.external_id),
         };
 
         Ok(PaymentCredential::new(challenge.to_echo(), payload))
@@ -200,5 +206,88 @@ mod tests {
 
         assert!(matches!(err, MppError::PaymentExpired(_)));
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    fn charge_challenge(
+        external_id: Option<&str>,
+        method_details: Option<serde_json::Value>,
+    ) -> PaymentChallenge {
+        let request = ChargeRequest {
+            amount: "1000".to_string(),
+            currency: "usd".to_string(),
+            external_id: external_id.map(str::to_string),
+            method_details,
+            ..Default::default()
+        };
+        PaymentChallenge::new(
+            "challenge-123",
+            "api.example.com",
+            "stripe",
+            "charge",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_pay_echoes_request_external_id() {
+        // (request externalId, create_token externalId, expected payload externalId)
+        let cases = [
+            (Some("order-123"), None, Some("order-123")),
+            (Some("order-123"), Some("client-ref"), Some("order-123")),
+            (None, Some("client-ref"), Some("client-ref")),
+        ];
+
+        for (request_id, token_id, expected) in cases {
+            let provider = StripeProvider::new(move |_| {
+                Box::pin(async move {
+                    Ok(CreateTokenResult {
+                        spt: "spt_test".to_string(),
+                        external_id: token_id.map(str::to_string),
+                    })
+                })
+            });
+            let challenge = charge_challenge(
+                request_id,
+                Some(serde_json::json!({
+                    "networkId": "internal",
+                    "paymentMethodTypes": ["card"]
+                })),
+            );
+
+            let credential = provider.pay(&challenge).await.unwrap();
+
+            let payload: StripeCredentialPayload = credential.payload_as().unwrap();
+            assert_eq!(payload.external_id.as_deref(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pay_rejects_missing_network_id() {
+        let cases = [
+            None,
+            Some(serde_json::json!({
+                "networkId": "",
+                "paymentMethodTypes": ["card"]
+            })),
+        ];
+
+        for method_details in cases {
+            let called = Arc::new(AtomicBool::new(false));
+            let provider = StripeProvider::new({
+                let called = called.clone();
+                move |_| {
+                    called.store(true, Ordering::SeqCst);
+                    Box::pin(async { Ok(CreateTokenResult::from("spt_test".to_string())) })
+                }
+            });
+
+            let err = provider
+                .pay(&charge_challenge(None, method_details))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, MppError::InvalidConfig(_)), "{err}");
+            assert!(!called.load(Ordering::SeqCst));
+        }
     }
 }
