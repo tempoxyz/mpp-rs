@@ -91,22 +91,25 @@ fn call_selector(data: &Bytes) -> Option<[u8; 4]> {
     }
 }
 
-fn decode_approve_spender(call: &tempo_alloy::primitives::transaction::Call) -> Option<Address> {
+fn decode_approve(call: &tempo_alloy::primitives::transaction::Call) -> Option<(Address, U256)> {
     if call_selector(&call.input) != Some(ITIP20::approveCall::SELECTOR) || call.input.len() != 68 {
         return None;
     }
 
-    Some(Address::from_slice(&call.input[16..36]))
+    Some((
+        Address::from_slice(&call.input[16..36]),
+        U256::from_be_slice(&call.input[36..68]),
+    ))
 }
 
-fn decode_swap_token_in(call: &tempo_alloy::primitives::transaction::Call) -> Option<Address> {
+fn decode_swap(
+    call: &tempo_alloy::primitives::transaction::Call,
+) -> Option<IStablecoinDEX::swapExactAmountOutCall> {
     if call_selector(&call.input) != Some(IStablecoinDEX::swapExactAmountOutCall::SELECTOR) {
         return None;
     }
 
-    IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..])
-        .ok()
-        .map(|decoded| decoded.tokenIn)
+    IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..]).ok()
 }
 
 fn transfer_call_offset(
@@ -149,6 +152,8 @@ fn get_transfer_calls(
 
 fn validate_fee_payer_calls(
     calls: &[tempo_alloy::primitives::transaction::Call],
+    currency: Address,
+    expected: &[Transfer],
 ) -> Result<(), VerificationError> {
     if calls.is_empty() {
         return Err(disallowed_fee_payer_call_pattern_error());
@@ -187,19 +192,24 @@ fn validate_fee_payer_calls(
             TxKind::Call(address) => *address,
             _ => return Err(disallowed_fee_payer_call_pattern_error()),
         };
-        let swap_token_in =
-            decode_swap_token_in(&calls[1]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
-        if approve_target != swap_token_in {
+        let swap = decode_swap(&calls[1]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        if approve_target != swap.tokenIn {
             return Err(VerificationError::new(
                 "Fee-sponsored transaction approve target is not the swap input token".to_string(),
             ));
         }
 
-        let approve_spender = decode_approve_spender(&calls[0])
-            .ok_or_else(disallowed_fee_payer_call_pattern_error)?;
+        let (approve_spender, approve_amount) =
+            decode_approve(&calls[0]).ok_or_else(disallowed_fee_payer_call_pattern_error)?;
         if approve_spender != STABLECOIN_DEX_ADDRESS {
             return Err(VerificationError::new(
                 "Fee-sponsored transaction approve spender is not the DEX".to_string(),
+            ));
+        }
+        if approve_amount != U256::from(swap.maxAmountIn) {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction approve amount does not match the swap max input"
+                    .to_string(),
             ));
         }
 
@@ -210,6 +220,22 @@ fn validate_fee_payer_calls(
                     "Fee-sponsored transaction swap target is not the DEX".to_string(),
                 ));
             }
+        }
+
+        if swap.tokenOut != currency {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction swap output token is not the payment currency"
+                    .to_string(),
+            ));
+        }
+        let payment_amount = expected.iter().fold(U256::ZERO, |sum, transfer| {
+            sum.saturating_add(transfer.amount)
+        });
+        if U256::from(swap.amountOut) != payment_amount {
+            return Err(VerificationError::new(
+                "Fee-sponsored transaction swap output does not match the payment amount"
+                    .to_string(),
+            ));
         }
     }
 
@@ -686,6 +712,7 @@ pub struct ChargeMethod<P> {
     fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     relay: Option<Relay>,
     fee_payer_fee_token: Option<Address>,
+    fee_payer_allow_key_authorization: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -814,6 +841,7 @@ where
             fee_payer_allowed_fee_tokens: None,
             relay: None,
             fee_payer_fee_token: None,
+            fee_payer_allow_key_authorization: true,
         }
     }
 
@@ -869,6 +897,16 @@ where
     /// allowed token. An explicit token must also be in the allowlist.
     pub fn with_fee_payer_fee_token(mut self, fee_token: Address) -> Self {
         self.fee_payer_fee_token = Some(fee_token);
+        self
+    }
+
+    /// Set whether a sponsored transaction may install an access key.
+    ///
+    /// Allowed by default, matching mppx. A key authorization adds intrinsic
+    /// gas the fee payer pays for; pass `false` to reject sponsored
+    /// transactions that carry one.
+    pub fn with_fee_payer_allow_key_authorization(mut self, allow: bool) -> Self {
+        self.fee_payer_allow_key_authorization = allow;
         self
     }
 
@@ -1122,7 +1160,7 @@ where
         let transfer_calls = get_transfer_calls(&tx.calls)?;
 
         if require_exact_calls {
-            validate_fee_payer_calls(&tx.calls)?;
+            validate_fee_payer_calls(&tx.calls, currency, expected)?;
         }
 
         // Sort expected transfers: memo-bearing first for greedy-safe matching
@@ -1823,6 +1861,20 @@ where
         // Stripped by `to_recoverable_signed`; guard against regression.
         debug_assert!(tx.access_list.is_empty());
 
+        // Both add intrinsic gas the sponsor pays for without being part of
+        // the charge. mppx rejects the former and makes the latter opt-out.
+        if !tx.tempo_authorization_list.is_empty() {
+            return Err(VerificationError::new(
+                "Fee payer transaction must not include an authorization list",
+            ));
+        }
+
+        if tx.key_authorization.is_some() && !self.fee_payer_allow_key_authorization {
+            return Err(VerificationError::new(
+                "Fee payer transaction must not include a key authorization",
+            ));
+        }
+
         if tx.nonce_key != TEMPO_EXPIRING_NONCE_KEY {
             return Err(VerificationError::new(
                 "Fee payer envelope must use expiring nonce key (U256::MAX)",
@@ -2063,6 +2115,7 @@ where
         let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
         let relay = self.relay.clone();
         let fee_payer_fee_token = self.fee_payer_fee_token;
+        let fee_payer_allow_key_authorization = self.fee_payer_allow_key_authorization;
 
         async move {
             if let Some(relay) = relay {
@@ -2080,6 +2133,7 @@ where
                 fee_payer_allowed_fee_tokens,
                 relay: None,
                 fee_payer_fee_token,
+                fee_payer_allow_key_authorization,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
@@ -4197,6 +4251,108 @@ mod tests {
         assert!(error.to_string().contains("swap target is not the DEX"));
     }
 
+    /// The swap prefix must only acquire the charge: the approval covers
+    /// exactly the swap input, and the swap buys exactly the payment.
+    #[test]
+    fn test_validate_transaction_transfers_rejects_fee_payer_unbound_swap_prefix() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let split_recipient = Address::repeat_byte(0x34);
+        let token_in = Address::repeat_byte(0x11);
+        let expected = vec![
+            Transfer {
+                amount: U256::from(90u64),
+                recipient,
+                memo: None,
+            },
+            Transfer {
+                amount: U256::from(10u64),
+                recipient: split_recipient,
+                memo: None,
+            },
+        ];
+
+        let validate = |approve_amount: u64, token_out: Address, amount_out: u128| {
+            let tx_bytes = encode_signed_tx(
+                vec![
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(token_in),
+                        value: U256::ZERO,
+                        input: make_approve_input(
+                            STABLECOIN_DEX_ADDRESS,
+                            U256::from(approve_amount),
+                        ),
+                    },
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(STABLECOIN_DEX_ADDRESS),
+                        value: U256::ZERO,
+                        input: Bytes::from(
+                            IStablecoinDEX::swapExactAmountOutCall {
+                                tokenIn: token_in,
+                                tokenOut: token_out,
+                                amountOut: amount_out,
+                                maxAmountIn: 101,
+                            }
+                            .abi_encode(),
+                        ),
+                    },
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(currency),
+                        value: U256::ZERO,
+                        input: make_transfer_input(recipient, U256::from(90u64)),
+                    },
+                    tempo_alloy::primitives::transaction::Call {
+                        to: TxKind::Call(currency),
+                        value: U256::ZERO,
+                        input: make_transfer_input(split_recipient, U256::from(10u64)),
+                    },
+                ],
+                MAX_FEE_PAYER_GAS_LIMIT,
+            );
+            method.validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+        };
+
+        validate(101, currency, 100).expect("bound swap prefix is accepted");
+
+        for (approve_amount, token_out, amount_out, expected_error) in [
+            (
+                u64::MAX,
+                currency,
+                100,
+                "approve amount does not match the swap max input",
+            ),
+            (
+                101,
+                Address::repeat_byte(0x21),
+                100,
+                "swap output token is not the payment currency",
+            ),
+            (
+                101,
+                currency,
+                1_000,
+                "swap output does not match the payment amount",
+            ),
+            (
+                101,
+                currency,
+                90,
+                "swap output does not match the payment amount",
+            ),
+        ] {
+            let error = validate(approve_amount, token_out, amount_out).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "expected `{expected_error}`, got: {error}"
+            );
+        }
+    }
+
     #[test]
     fn test_validate_transaction_transfers_rejects_fee_payer_gas_limit_above_max() {
         let provider =
@@ -4395,6 +4551,92 @@ mod tests {
             err.to_string().to_lowercase().contains("sender mismatch"),
             "expected sender mismatch, got: {err}"
         );
+    }
+
+    /// An authorization list adds intrinsic gas the sponsor would pay for
+    /// delegations unrelated to the charge.
+    #[tokio::test]
+    async fn test_cosign_rejects_authorization_list() {
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::TempoSignedAuthorization;
+
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+
+        let authorization = alloy::eips::eip7702::Authorization {
+            chain_id: U256::from(CHAIN_ID),
+            address: Address::repeat_byte(0xde),
+            nonce: 0,
+        };
+        let signature = client_signer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let mut tx = make_fee_payer_tx(60);
+        tx.tempo_authorization_list = vec![TempoSignedAuthorization::new_unchecked(
+            authorization,
+            signature.into(),
+        )];
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await
+            .expect_err("authorization list must not be sponsored");
+        assert!(err.to_string().contains("authorization list"), "got: {err}");
+    }
+
+    /// Key authorizations are sponsored by default and rejected once the
+    /// server opts out.
+    #[tokio::test]
+    async fn test_cosign_key_authorization_follows_policy() {
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::{
+            KeyAuthorization, PrimitiveSignature, SignatureType,
+        };
+
+        let (method, client_signer, fee_token) = make_cosign_method(None);
+
+        let authorization = KeyAuthorization {
+            chain_id: CHAIN_ID,
+            key_type: SignatureType::Secp256k1,
+            key_id: Address::repeat_byte(0xde),
+            expiry: NonZeroU64::new(9999999999),
+            limits: None,
+            allowed_calls: None,
+            witness: None,
+            is_admin: false,
+            account: None,
+        };
+        let signature = client_signer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let mut tx = make_fee_payer_tx(60);
+        tx.key_authorization =
+            Some(authorization.into_signed(PrimitiveSignature::Secp256k1(signature)));
+        let encoded = sign_and_encode_0x78(tx, &client_signer);
+
+        method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await
+            .expect("key authorization is sponsored by default");
+
+        let method = method.with_fee_payer_allow_key_authorization(false);
+        let err = method
+            .cosign_fee_payer_transaction(
+                &encoded,
+                method.fee_payer_signer.as_deref().unwrap(),
+                fee_token,
+            )
+            .await
+            .expect_err("key authorization must be rejected when disallowed");
+        assert!(err.to_string().contains("key authorization"), "got: {err}");
     }
 
     /// cosign_fee_payer_transaction rejects txs with expired valid_before.
