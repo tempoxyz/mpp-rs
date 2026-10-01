@@ -206,9 +206,10 @@ impl ChargeMethodTrait for ChargeMethod {
     fn verify(
         &self,
         credential: &PaymentCredential,
-        _request: &ChargeRequest,
+        request: &ChargeRequest,
     ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
         let credential = credential.clone();
+        let charge_request = request.clone();
         let this = self.clone();
 
         async move {
@@ -224,11 +225,6 @@ impl ChargeMethodTrait for ChargeMethod {
 
             // Note: expiry is already checked by Mpp::verify_hmac_and_expiry()
             // before this method is called.
-
-            // Decode the challenge request to get amount/currency
-            let charge_request: ChargeRequest = challenge.request.decode().map_err(|e| {
-                VerificationError::new(format!("Failed to decode challenge request: {e}"))
-            })?;
 
             // A request-bound externalId must be echoed by the credential.
             if let Some(expected) = charge_request.external_id.as_deref() {

@@ -995,6 +995,62 @@ async fn test_stripe_external_id_binding() {
     stripe_handle.abort();
 }
 
+/// The PaymentIntent is created from the request passed to `verify`, not from
+/// the request the credential echoes.
+#[tokio::test]
+async fn test_stripe_charges_the_request_passed_to_verify() {
+    use mpp::protocol::traits::ChargeMethod as _;
+
+    let (stripe_url, captured, stripe_handle) = start_mock_stripe_capturing().await;
+    let method = mpp::protocol::methods::stripe::method::ChargeMethod::new(
+        "sk_test_mock",
+        "internal",
+        vec!["card".to_string()],
+    )
+    .with_api_base(&stripe_url);
+
+    let challenge = create_mock_mpp(&stripe_url)
+        .stripe_charge("0.25")
+        .expect("challenge creation");
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        StripeCredentialPayload {
+            spt: "spt_route_request".to_string(),
+            external_id: None,
+        },
+    );
+
+    let mut request = mpp::ChargeRequest {
+        amount: "1000".to_string(),
+        currency: "eur".to_string(),
+        ..Default::default()
+    };
+    method
+        .verify(&credential, &request)
+        .await
+        .expect("verification failed");
+    {
+        let captured = captured.lock().unwrap();
+        let (_, params) = captured.first().expect("PaymentIntent request");
+        assert_eq!(params["amount"], "1000");
+        assert_eq!(params["currency"], "eur");
+    }
+
+    captured.lock().unwrap().clear();
+    request.external_id = Some("server-order-123".to_string());
+    let err = method
+        .verify(&credential, &request)
+        .await
+        .expect_err("the credential does not echo the request's externalId");
+    assert_eq!(
+        err.code,
+        Some(mpp::protocol::traits::ErrorCode::CredentialMismatch)
+    );
+    assert!(captured.lock().unwrap().is_empty());
+
+    stripe_handle.abort();
+}
+
 /// PaymentIntent metadata carries the analytics keys plus the challenge's
 /// `methodDetails.metadata`, with values capped at Stripe's 500 characters.
 #[tokio::test]
