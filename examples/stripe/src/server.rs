@@ -63,7 +63,7 @@ async fn main() {
         })
         .secret_key(
             &std::env::var("MPP_SECRET_KEY")
-                .unwrap_or_else(|_| "stripe-example-secret".to_string()),
+                .unwrap_or_else(|_| "mpp-rs-demo-stripe-example-secret-key".to_string()),
         ),
     )
     .expect("failed to create Stripe payment handler");

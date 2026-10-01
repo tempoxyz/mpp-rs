@@ -125,6 +125,9 @@ impl PaymentChallenge {
     ///
     /// This is the Rust equivalent of `Challenge.from({ secretKey, ... })` in the TS SDK.
     ///
+    /// `secret_key` must be at least 32 bytes. This constructor cannot fail and
+    /// does not check the length.
+    ///
     /// # Examples
     ///
     /// ```
@@ -132,7 +135,7 @@ impl PaymentChallenge {
     /// use mpp::protocol::core::Base64UrlJson;
     ///
     /// let challenge = PaymentChallenge::with_secret_key(
-    ///     "my-server-secret",
+    ///     "my-server-secret-of-at-least-32-bytes",
     ///     "api.example.com",
     ///     "tempo",
     ///     "charge",
@@ -140,7 +143,7 @@ impl PaymentChallenge {
     /// );
     ///
     /// // ID is HMAC-bound — can be verified later
-    /// assert!(challenge.verify("my-server-secret"));
+    /// assert!(challenge.verify("my-server-secret-of-at-least-32-bytes"));
     /// ```
     pub fn with_secret_key(
         secret_key: &str,
@@ -184,6 +187,9 @@ impl PaymentChallenge {
     /// The `opaque` parameter accepts a `Base64UrlJson` value (use
     /// `Base64UrlJson::from_value()` to create from a JSON object). This matches
     /// the mppx SDK where opaque is `Record<string, string>`.
+    ///
+    /// `secret_key` must be at least 32 bytes. This constructor cannot fail and
+    /// does not check the length.
     #[allow(clippy::too_many_arguments)]
     pub fn with_secret_key_full(
         secret_key: &str,
@@ -300,6 +306,7 @@ impl PaymentChallenge {
             intent: self.intent.clone(),
             request: self.request.clone(),
             expires: self.expires.clone(),
+            description: self.description.clone(),
             digest: self.digest.clone(),
             opaque: self.opaque.clone(),
             header: self.header.clone(),
@@ -459,6 +466,25 @@ impl PaymentChallenge {
 
         Ok(())
     }
+}
+
+/// Minimum HMAC secret key length in bytes, matching mppx.
+#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+const MIN_SECRET_KEY_BYTES: usize = 32;
+
+/// Reject HMAC secret keys shorter than 32 bytes.
+///
+/// Whoever can guess the key can mint challenges for any amount, so the
+/// fallible entry points that take a secret call this before signing.
+#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+pub(crate) fn validate_secret_key(secret_key: &str) -> crate::error::Result<()> {
+    if secret_key.len() < MIN_SECRET_KEY_BYTES {
+        return Err(crate::error::MppError::InvalidConfig(format!(
+            "Secret key must be at least {MIN_SECRET_KEY_BYTES} bytes. \
+             Generate one with `openssl rand -base64 32`."
+        )));
+    }
+    Ok(())
 }
 
 /// Compute an HMAC-SHA256 challenge ID from challenge parameters.
@@ -628,12 +654,23 @@ pub struct ChallengeEcho {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
 
+    /// Human-readable description, echoed from the challenge when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     /// Request body digest for body binding (RFC 9530 Content-Digest)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
 
     /// Server-defined correlation data (base64url-encoded JSON).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// The legacy object form sent by older mppx clients is accepted and
+    /// normalized to the base64url string.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_echo_opaque"
+    )]
     pub opaque: Option<Base64UrlJson>,
 
     /// HTTP field that must carry the Payment credential.
@@ -642,6 +679,26 @@ pub struct ChallengeEcho {
     /// used the default `Authorization` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
+}
+
+fn deserialize_echo_opaque<'de, D>(deserializer: D) -> Result<Option<Base64UrlJson>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Opaque {
+        Raw(String),
+        Legacy(std::collections::BTreeMap<String, String>),
+    }
+
+    match Option::<Opaque>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Opaque::Raw(raw)) => Ok(Some(Base64UrlJson::from_raw(raw))),
+        Some(Opaque::Legacy(meta)) => Base64UrlJson::from_typed(&meta)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 /// Payment payload in credential.
@@ -911,7 +968,7 @@ impl PaymentCredential {
 /// methods MAY add fields; the Tempo subscription method adds `subscriptionId`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
-    /// Receipt status ("success" or "failed")
+    /// Receipt status (always "success")
     pub status: ReceiptStatus,
 
     /// Payment method used
@@ -989,7 +1046,6 @@ impl Receipt {
     ///
     /// # Arguments
     /// * `receipt_header` - The value of the Payment-Receipt header
-    /// * `status_code` - The HTTP status code (must be 2xx for receipt)
     pub fn from_response(receipt_header: &str) -> crate::error::Result<Self> {
         Self::from_header(receipt_header)
     }

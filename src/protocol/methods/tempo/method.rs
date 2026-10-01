@@ -1001,7 +1001,7 @@ where
             }
         }
 
-        Ok(Receipt::success(METHOD_NAME, tx_hash))
+        Ok(Receipt::success(METHOD_NAME, format!("{hash:#x}")))
     }
 
     /// Verify that all expected transfers are present in the receipt logs.
@@ -2889,6 +2889,76 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(verify(2).await.is_ok());
+    }
+
+    /// The receipt reference is the canonical transaction hash, however the
+    /// credential spelled it.
+    #[tokio::test]
+    async fn test_verify_hash_returns_canonical_reference() {
+        use alloy::providers::mock::Asserter;
+
+        let currency = Address::repeat_byte(0x20);
+        let payer = Address::repeat_byte(0x11);
+        let recipient = Address::repeat_byte(0x33);
+        let amount = U256::from(1000u64);
+        let request = ChargeRequest {
+            amount: "1000".to_string(),
+            currency: format!("{currency:#x}"),
+            recipient: Some(format!("{recipient:#x}")),
+            method_details: Some(serde_json::json!({ "chainId": MODERATO_CHAIN_ID })),
+            ..Default::default()
+        };
+        let challenge = test_proof_challenge(&request);
+        let memo = attribution::encode(&challenge.id, &challenge.realm, None);
+        let tx_hash = B256::repeat_byte(0xab);
+        let block_hash = B256::repeat_byte(0x22);
+
+        let mut log = make_transfer_with_memo_log(currency, payer, recipient, amount, memo);
+        log.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "blockHash": format!("{block_hash:#x}"),
+                "blockNumber": "0x1",
+                "transactionHash": format!("{tx_hash:#x}"),
+                "transactionIndex": "0x0",
+                "logIndex": "0x0",
+                "removed": false,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "type": "0x76",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x5208",
+            "logs": [log],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "from": format!("{payer:#x}"),
+            "to": format!("{currency:#x}"),
+            "contractAddress": null,
+            "feePayer": format!("{payer:#x}"),
+            "feeToken": format!("{currency:#x}"),
+        }));
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+        method.cached_chain_id.set(MODERATO_CHAIN_ID).unwrap();
+
+        // Upper case and without the `0x` prefix.
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:X}")),
+        );
+        let receipt = method.verify(&credential, &request).await.unwrap();
+        assert_eq!(receipt.reference, format!("{tx_hash:#x}"));
     }
 
     #[test]

@@ -118,8 +118,27 @@ impl SessionReceipt {
     }
 
     /// Convert to a base [`Receipt`] for protocol-level compatibility.
+    ///
+    /// The session fields are carried in the receipt's extension fields, so
+    /// the result serializes to the same JSON object as this receipt.
     #[must_use]
     pub fn to_base_receipt(&self) -> Receipt {
+        let mut extensions = serde_json::Map::new();
+        extensions.insert("intent".into(), self.intent.as_str().into());
+        extensions.insert("challengeId".into(), self.challenge_id.as_str().into());
+        extensions.insert("channelId".into(), self.channel_id.as_str().into());
+        extensions.insert(
+            "acceptedCumulative".into(),
+            self.accepted_cumulative.as_str().into(),
+        );
+        extensions.insert("spent".into(), self.spent.as_str().into());
+        if let Some(units) = self.units {
+            extensions.insert("units".into(), units.into());
+        }
+        if let Some(tx_hash) = &self.tx_hash {
+            extensions.insert("txHash".into(), tx_hash.as_str().into());
+        }
+
         Receipt {
             status: ReceiptStatus::Success,
             method: MethodName::new(&self.method),
@@ -127,7 +146,7 @@ impl SessionReceipt {
             reference: self.reference.clone(),
             external_id: None,
             subscription_id: None,
-            extensions: serde_json::Map::new(),
+            extensions,
         }
     }
 }
@@ -225,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_to_base_receipt() {
-        let receipt = SessionReceipt::new(
+        let mut receipt = SessionReceipt::new(
             "2026-01-01T00:00:00Z",
             "challenge-123",
             "0xabc",
@@ -238,6 +257,27 @@ mod tests {
         assert_eq!(base.method.as_str(), "tempo");
         assert_eq!(base.timestamp, "2026-01-01T00:00:00Z");
         assert_eq!(base.reference, "0xabc");
+        assert_eq!(
+            serde_json::to_value(&base).unwrap(),
+            serde_json::json!({
+                "method": "tempo",
+                "intent": "session",
+                "status": "success",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "reference": "0xabc",
+                "challengeId": "challenge-123",
+                "channelId": "0xabc",
+                "acceptedCumulative": "5000",
+                "spent": "1000",
+            })
+        );
+
+        // The header of the base receipt is a session receipt, optional
+        // fields included.
+        receipt.units = Some(42);
+        receipt.tx_hash = Some("0xdef".to_string());
+        let header = receipt.to_base_receipt().to_header().unwrap();
+        assert_eq!(SessionReceipt::from_header(&header).unwrap(), receipt);
     }
 
     #[test]

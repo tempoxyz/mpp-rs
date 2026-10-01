@@ -84,9 +84,9 @@ impl SessionRequest {
     ///
     /// Returns an error if the amount is not a valid unsigned integer.
     pub fn parse_amount(&self) -> Result<u128> {
-        self.amount
-            .parse()
-            .map_err(|_| MppError::InvalidAmount(format!("Invalid amount: {}", self.amount)))
+        super::base_unit_digits(&self.amount)
+            .and_then(|amount| amount.parse().ok())
+            .ok_or_else(|| MppError::InvalidAmount(format!("Invalid amount: {}", self.amount)))
     }
 
     /// Validate that the session amount does not exceed a maximum.

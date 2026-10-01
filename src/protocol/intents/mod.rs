@@ -44,6 +44,15 @@ pub use payment_request::{
 };
 pub use session::SessionRequest;
 
+/// Return `amount` if it is a base-unit integer: one or more ASCII digits.
+///
+/// Integer parsers are more lenient than the protocol (`u128` accepts `+1`;
+/// `U256` accepts `0x10`, `1_000` and the empty string), so amounts are
+/// checked here before they are parsed. Leading zeros are accepted, as in mppx.
+pub(crate) fn base_unit_digits(amount: &str) -> Option<&str> {
+    (!amount.is_empty() && amount.bytes().all(|b| b.is_ascii_digit())).then_some(amount)
+}
+
 /// Convert a human-readable amount to base units by scaling with `10^decimals`.
 ///
 /// Mirrors the TypeScript SDK's `parseUnits(amount, decimals)` from viem.
@@ -157,5 +166,63 @@ mod tests {
     #[test]
     fn test_parse_units_empty_string() {
         assert!(parse_units("", 6).is_err());
+    }
+
+    /// Every amount parser accepts the same grammar: ASCII digits only.
+    #[test]
+    fn test_amount_parsers_agree_on_grammar() {
+        let charge = |amount: &str| ChargeRequest {
+            amount: amount.to_string(),
+            ..Default::default()
+        };
+        let session = |amount: &str| SessionRequest {
+            amount: amount.to_string(),
+            ..Default::default()
+        };
+
+        for (amount, expected) in [
+            ("0", Some(0u128)),
+            ("1000000", Some(1_000_000)),
+            ("007", Some(7)),
+            ("340282366920938463463374607431768211455", Some(u128::MAX)),
+            ("", None),
+            ("+100", None),
+            ("-1", None),
+            ("0x10", None),
+            ("0X10", None),
+            ("0b11", None),
+            ("0o7", None),
+            ("1_000", None),
+            ("1.5", None),
+            ("1e3", None),
+            (" 1", None),
+            ("1 ", None),
+            ("١٢٣", None),
+        ] {
+            assert_eq!(
+                charge(amount).parse_amount().ok(),
+                expected,
+                "charge {amount:?}"
+            );
+            assert_eq!(
+                session(amount).parse_amount().ok(),
+                expected,
+                "session {amount:?}"
+            );
+            #[cfg(feature = "evm")]
+            {
+                let expected = expected.map(crate::evm::U256::from);
+                assert_eq!(
+                    crate::evm::parse_amount(amount).ok(),
+                    expected,
+                    "evm {amount:?}"
+                );
+                assert_eq!(
+                    charge(amount).parse_amount_u256().ok(),
+                    expected,
+                    "charge u256 {amount:?}"
+                );
+            }
+        }
     }
 }

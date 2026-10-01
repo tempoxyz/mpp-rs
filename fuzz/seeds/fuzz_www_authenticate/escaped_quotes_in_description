@@ -1,0 +1,1 @@
+Payment id="ch_escaped", realm="api.example.com", method="tempo", intent="charge", request="e30", description="Pay \"premium\" API"
