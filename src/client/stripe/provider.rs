@@ -146,6 +146,13 @@ impl PaymentProvider for StripeProvider {
 
         Ok(PaymentCredential::new(challenge.to_echo(), payload))
     }
+
+    fn accept_payment_header(&self) -> Option<String> {
+        Some(crate::protocol::core::accept_payment::from_methods(&[(
+            METHOD_NAME,
+            INTENT_CHARGE,
+        )]))
+    }
 }
 
 #[cfg(test)]
