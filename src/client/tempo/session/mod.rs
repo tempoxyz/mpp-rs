@@ -1540,7 +1540,9 @@ impl TempoSessionProvider {
     ///
     /// # Returns
     ///
-    /// The payment receipt from the server, if available.
+    /// The payment receipt from the server, if available. The channel is only
+    /// forgotten once a receipt confirms the close; `None` after a successful
+    /// response leaves it in place so the close can be retried.
     pub async fn close(
         &self,
         client: &reqwest::Client,
@@ -1608,7 +1610,9 @@ impl TempoSessionProvider {
             .as_deref()
             .and_then(|s| crate::protocol::core::parse_receipt(s).ok());
 
-        if is_precompile_escrow(entry.escrow_contract) {
+        // Only a receipt confirms the close. Without one the channel may still
+        // be open and funded, so it stays tracked and the close can be retried.
+        if receipt.is_some() && is_precompile_escrow(entry.escrow_contract) {
             let store_key = Self::stored_entry(&entry)?.key();
             self.channel_store
                 .delete(&store_key)
@@ -3909,5 +3913,108 @@ mod tests {
                 "{rejection}"
             );
         }
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn close_keeps_channel_until_receipt_confirms_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::channel_ops::build_channel_descriptor;
+        use crate::protocol::methods::tempo::precompile_voucher::compute_precompile_channel_id;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let salt = B256::repeat_byte(0x44);
+        let nonce_hash = B256::repeat_byte(0x55);
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider().with_channel_store(store.clone());
+        let payer = provider.signer.address();
+        let channel_id = compute_precompile_channel_id(
+            payer,
+            payee,
+            Address::ZERO,
+            currency,
+            salt,
+            payer,
+            nonce_hash,
+            42431,
+        );
+        let entry = ChannelEntry {
+            channel_id,
+            salt,
+            cumulative_amount: 1_000,
+            deposit: 100_000,
+            descriptor: Some(build_channel_descriptor(
+                payer,
+                payee,
+                Address::ZERO,
+                currency,
+                salt,
+                payer,
+                nonce_hash,
+            )),
+            settlement_route: None,
+            escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id: 42431,
+            opened: true,
+        };
+        let key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+        store
+            .set(&TempoSessionProvider::stored_entry(&entry).unwrap())
+            .await
+            .unwrap();
+        provider.channels.lock().unwrap().insert(key.clone(), entry);
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), key.clone());
+        *provider.last_challenge.lock().unwrap() = Some(make_scoped_challenge(
+            payee,
+            currency,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        ));
+
+        // The first close is answered without a receipt, the second one with it.
+        let closes = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/close",
+            post(move || {
+                let closes = closes.clone();
+                async move {
+                    if closes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return StatusCode::OK.into_response();
+                    }
+                    let receipt = Receipt::success("tempo", B256::repeat_byte(0x99).to_string());
+                    (
+                        StatusCode::OK,
+                        [("payment-receipt", receipt.to_header().unwrap())],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{address}/close");
+        let client = reqwest::Client::new();
+
+        assert!(provider.close(&client, &url).await.unwrap().is_none());
+        assert!(provider.channels.lock().unwrap().contains_key(&key));
+        assert!(store.get(&key).await.unwrap().is_some());
+
+        assert!(provider.close(&client, &url).await.unwrap().is_some());
+        assert!(provider.channels.lock().unwrap().is_empty());
+        assert!(store.get(&key).await.unwrap().is_none());
     }
 }
