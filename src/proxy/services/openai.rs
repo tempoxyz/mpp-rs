@@ -14,14 +14,14 @@ use crate::proxy::service::{Service, ServiceBuilder};
 /// use mpp::proxy::services::openai;
 ///
 /// let svc = openai::service("sk-...", |r| {
-///     r.route("POST /v1/chat/completions", Endpoint::Paid(PaidEndpoint {
-///         intent: "charge".into(),
-///         amount: "50000".into(),
-///         decimals: Some(6),
-///         currency: None,
-///         unit_type: None,
-///         description: Some("Chat completion".into()),
-///     }))
+///     r.route(
+///         "POST /v1/chat/completions",
+///         Endpoint::Paid(
+///             PaidEndpoint::new("tempo", "charge", "50000")
+///                 .with_decimals(6)
+///                 .with_description("Chat completion"),
+///         ),
+///     )
 ///     .route("GET /v1/models", Endpoint::Free)
 /// });
 ///
