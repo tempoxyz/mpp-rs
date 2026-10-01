@@ -58,8 +58,9 @@ const TEST_SECRET: &str = "test-secret-key-at-least-32-bytes";
 /// Default localnet RPC URL (overridable via `TEMPO_RPC_URL` env var).
 const DEFAULT_RPC_URL: &str = "http://localhost:8545";
 
-/// Creation bytecode of the `TempoStreamChannel` escrow, the artifact mppx
-/// deploys in its own session tests (`test/fixtures/TempoStreamChannel.json`).
+/// Creation bytecode of the `TempoStreamChannel` escrow: the `bytecode` field
+/// of `test/fixtures/TempoStreamChannel.json` in wevm/mppx at commit b09a35a,
+/// the artifact mppx deploys in its own session tests.
 const ESCROW_CREATION_CODE: &str = include_str!("fixtures/TempoStreamChannel.hex");
 
 /// Price of one streamed value in base units.
@@ -685,7 +686,9 @@ async fn test_e2e_session_top_up() {
         DEPOSIT + TICK_COST
     );
 
-    // The close settles the last voucher and refunds the rest of both deposits.
+    // The client closes at the amount it authorized, so the close settles the
+    // last voucher although nothing was delivered for it, and refunds the rest
+    // of both deposits.
     let settlement = fixture.close().await;
     let mut payouts = escrow_payouts(&settlement, fixture.escrow);
     payouts.sort();
