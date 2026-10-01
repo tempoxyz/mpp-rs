@@ -7,7 +7,7 @@
 //!
 //! - Neither `parse_authorization` nor `extract_payment_scheme` panics.
 //! - The extracted scheme is one list member of the input that starts with
-//!   `Payment` followed by SP or HTAB.
+//!   `Payment` followed by SP or HTAB, and extracting from it returns it.
 //! - Parsing normalizes once: an accepted credential formats, and the result
 //!   parses back to the same credential.
 //! - Accepted credentials satisfy what the parser claims to validate.
@@ -32,6 +32,7 @@ fn check(header: &str) {
         assert!(header.contains(scheme) && !scheme.contains(','));
         assert!(scheme.as_bytes()[..7].eq_ignore_ascii_case(b"payment"));
         assert!(matches!(scheme.as_bytes()[7], b' ' | b'\t'));
+        assert_eq!(extract_payment_scheme(scheme), Some(scheme));
     }
 
     let Ok(credential) = parse_authorization(header) else {

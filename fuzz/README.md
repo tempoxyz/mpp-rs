@@ -10,7 +10,7 @@ panics.
 
 | Target | Input | Invariants |
 |--------|-------|------------|
-| `fuzz_www_authenticate` | text | `parse_www_authenticate` and `parse_www_authenticate_all` never panic; an accepted header formats and parses back to the same challenge; both parsers agree on a header that names the scheme once |
+| `fuzz_www_authenticate` | text | `parse_www_authenticate` and `parse_www_authenticate_all` never panic; they and `PaymentProtocol::detect` agree on the first challenge of a header; an accepted header formats and parses back to the same challenge |
 | `fuzz_challenge_roundtrip` | structured challenge | the formatter accepts exactly the well-formed challenges; formatted headers are printable ASCII and parse back field for field |
 | `fuzz_challenge_list` | 1–5 challenges, decoy schemes, separators | `parse_www_authenticate_all` returns exactly the Payment challenges, in order, among `Basic`/`Bearer`/`Digest` challenges whose quoted values look like Payment ones |
 | `fuzz_challenge_id` | structured challenge, field mutations | a signed challenge verifies, also through the header and the credential echo; changing a bound field or the id fails verification |
@@ -110,9 +110,6 @@ the place:
   `src/lib.rs`) formats but does not parse back (`fuzz_credential_roundtrip`).
 - The challenge id joins its slots with `|` without escaping, so it is only
   injective for slots that do not contain `|` (`fuzz_challenge_id`).
-- `parse_www_authenticate` trims Unicode whitespace before the scheme and
-  `parse_www_authenticate_all` only SP and HTAB; an auth-param named
-  `Payment` splits a challenge in the list parser (`fuzz_www_authenticate`).
 - The amount parsers accept leading zeros (`007`), as mppx does.
   `--features strict-amounts` asserts that they accept only `0|[1-9][0-9]*`
   (`fuzz_amount`).

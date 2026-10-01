@@ -9,19 +9,17 @@
 //!
 //! The parser is implemented without regex for minimal dependencies.
 
-use super::auth_params::{
-    escape_quoted_value, parse_auth_params, split_payment_challenges, starts_with_payment_scheme,
-    strip_payment_scheme,
-};
+use super::auth_params::{escape_quoted_value, Tokenizer};
 use super::challenge::PaymentChallenge;
 use super::credential::PaymentCredential;
 use super::receipt::Receipt;
 use super::types::{base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName};
 use crate::error::{MppError, Result};
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
-pub(super) const MAX_TOKEN_LEN: usize = 16 * 1024;
+const MAX_TOKEN_LEN: usize = 16 * 1024;
 
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {
@@ -36,7 +34,8 @@ macro_rules! require_param {
 /// multiple comma-separated schemes (per RFC 9110).
 ///
 /// Returns the `Payment ...` scheme string, or `None` if not found.
-/// This matches the TypeScript SDK's `Credential.extractPaymentScheme`.
+/// This matches the TypeScript SDK's `Credential.extractPaymentScheme`,
+/// except that text inside a quoted-string of another scheme is not searched.
 ///
 /// # Examples
 ///
@@ -55,10 +54,15 @@ macro_rules! require_param {
 /// assert!(extract_payment_scheme("Bearer token123").is_none());
 /// ```
 pub fn extract_payment_scheme(header: &str) -> Option<&str> {
-    header
-        .split(',')
-        .map(|s| s.trim())
-        .find(|s| starts_with_payment_scheme(s.as_bytes()))
+    let mut tokens = Tokenizer::new(header);
+    while let Some(Ok(token)) = tokens.next() {
+        if token.is_payment_scheme() {
+            if let Some(credentials) = tokens.credentials() {
+                return Some(credentials);
+            }
+        }
+    }
+    None
 }
 
 /// Header name for payment challenges (from server)
@@ -206,18 +210,35 @@ pub(super) fn validate_challenge_fields(
 /// assert_eq!(challenge.id, "abc123");
 /// ```
 pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
-    let rest = strip_payment_scheme(header).ok_or_else(|| {
-        MppError::invalid_challenge_reason("Expected 'Payment' scheme".to_string())
-    })?;
+    let mut tokens = Tokenizer::new(header);
+    match tokens.next() {
+        Some(Ok(token)) if token.is_payment_scheme() => read_challenge(&mut tokens),
+        _ => Err(MppError::invalid_challenge_reason(
+            "Expected 'Payment' scheme".to_string(),
+        )),
+    }
+}
 
-    let params_str = rest
-        .strip_prefix(' ')
-        .or_else(|| rest.strip_prefix('\t'))
-        .ok_or_else(|| {
-            MppError::invalid_challenge_reason("Expected space after 'Payment' scheme".to_string())
-        })?
-        .trim_start();
-    let params = parse_auth_params(params_str)?;
+/// Reads the auth-params that follow a `Payment` scheme into a challenge.
+fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
+    let mut params = HashMap::new();
+    while let Some((name, value)) = tokens.param()? {
+        // Auth-param names are case-insensitive (RFC 9110 §11.2).
+        let key = name.to_ascii_lowercase();
+        if key == "request" && value.len() > MAX_TOKEN_LEN {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Request parameter exceeds maximum length of {} bytes",
+                MAX_TOKEN_LEN
+            )));
+        }
+        if params.contains_key(&key) {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Duplicate parameter: {}",
+                name
+            )));
+        }
+        params.insert(key, value.into_owned());
+    }
 
     let id = require_param!(params, "id").clone();
     let realm = require_param!(params, "realm").clone();
@@ -306,11 +327,7 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 pub fn parse_www_authenticate_all<'a>(
     headers: impl IntoIterator<Item = &'a str>,
 ) -> Vec<Result<PaymentChallenge>> {
-    headers
-        .into_iter()
-        .flat_map(split_payment_challenges)
-        .map(parse_www_authenticate)
-        .collect()
+    headers.into_iter().flat_map(parse_challenges).collect()
 }
 
 /// Parse all Payment challenges from raw `WWW-Authenticate` field values.
@@ -335,14 +352,20 @@ pub fn parse_www_authenticate_all_bytes<'a>(
 ) -> Vec<Result<PaymentChallenge>> {
     headers
         .into_iter()
-        .flat_map(|value| {
-            let value = decode_latin1(value);
-            split_payment_challenges(&value)
-                .into_iter()
-                .map(parse_www_authenticate)
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|value| parse_challenges(&decode_latin1(value)))
         .collect()
+}
+
+/// Parses every `Payment` challenge of one field value.
+fn parse_challenges(header: &str) -> Vec<Result<PaymentChallenge>> {
+    let mut tokens = Tokenizer::new(header);
+    let mut challenges = Vec::new();
+    while let Some(Ok(token)) = tokens.next() {
+        if token.is_payment_scheme() {
+            challenges.push(read_challenge(&mut tokens));
+        }
+    }
+    challenges
 }
 
 fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
@@ -1021,6 +1044,24 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_payment_scheme_ignores_quoted_text() {
+        assert_eq!(
+            extract_payment_scheme(r#"Digest username="a, Payment b", Payment abc=="#),
+            Some("Payment abc==")
+        );
+        assert!(extract_payment_scheme(r#"Digest username="a, Payment b""#).is_none());
+    }
+
+    #[test]
+    fn test_extract_payment_scheme_requires_a_token() {
+        assert!(extract_payment_scheme("Payment ").is_none());
+        assert_eq!(
+            extract_payment_scheme("Payment , Payment abc"),
+            Some("Payment abc")
+        );
+    }
+
+    #[test]
     fn test_parse_authorization_mixed_schemes() {
         let challenge = test_challenge();
         let credential = PaymentCredential::with_source(
@@ -1354,6 +1395,40 @@ mod tests {
             r#"Bearer realm="x, Payment id=evil, realm=api, method=tempo, intent=charge, request=e30, x=y""#,
         ] {
             assert!(parse_www_authenticate_all([header]).is_empty(), "{header}");
+        }
+    }
+
+    #[test]
+    fn test_parsers_agree_on_param_named_payment() {
+        let header = r#"Payment id="abc", payment ="x", realm="api", method="tempo", intent="charge", request="e30""#;
+        assert_eq!(parse_www_authenticate(header).unwrap().id, "abc");
+        let all = parse_www_authenticate_all([header]);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].as_ref().unwrap().id, "abc");
+    }
+
+    #[test]
+    fn test_parsers_agree_on_text_before_the_scheme() {
+        let challenge =
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30""#;
+        // ASCII whitespace and empty list elements are skipped, other text is not.
+        for (prefix, accepted) in [
+            (" \t", true),
+            (", ", true),
+            ("\u{b}", false),
+            ("\u{a0}", false),
+        ] {
+            let header = format!("{prefix}{challenge}");
+            assert_eq!(
+                parse_www_authenticate(&header).is_ok(),
+                accepted,
+                "{header:?}"
+            );
+            assert_eq!(
+                parse_www_authenticate_all([header.as_str()]).len(),
+                usize::from(accepted),
+                "{header:?}"
+            );
         }
     }
 
