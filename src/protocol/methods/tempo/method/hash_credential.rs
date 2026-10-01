@@ -11,7 +11,7 @@ use crate::protocol::traits::VerificationError;
 
 use super::super::{proof, TempoChargeExt, METHOD_NAME};
 use super::memo::assert_challenge_bound_memo;
-use super::receipt_logs::ReceiptSenderPolicy;
+use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
 use super::ChargeMethod;
 
 /// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
@@ -96,8 +96,8 @@ where
         let expected_sender = source_address.unwrap_or_else(|| receipt.from());
 
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
-        let matched_logs = self.verify_tip20_transfers(
-            &receipt,
+        let matched_logs = match_receipt_transfer_logs_with_settlement(
+            receipt.logs(),
             currency,
             &expected,
             ReceiptSenderPolicy {

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::{hex, keccak256, Bytes, TxKind, B256, U256};
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolEvent};
 use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
 
 use super::{
@@ -16,11 +16,7 @@ use super::{
     fee_payer::MAX_FEE_PAYER_GAS_LIMIT,
     hash_credential::parse_hash_credential_source,
     memo::assert_challenge_bound_memo,
-    receipt_logs::{
-        match_receipt_transfer_logs, match_receipt_transfer_logs_with_settlement,
-        MatchedTransferLog, ReceiptSenderPolicy, TRANSFER_EVENT_TOPIC,
-        TRANSFER_WITH_MEMO_EVENT_TOPIC,
-    },
+    receipt_logs::{MatchedTransferLog, ReceiptSenderPolicy},
     transaction_credential::TransactionValidationOptions,
     *,
 };
@@ -187,6 +183,9 @@ fn encode_signed_tx(
     tx.into_signed(signature).encoded_2718()
 }
 
+const TRANSFER_EVENT_TOPIC: B256 = ITIP20::Transfer::SIGNATURE_HASH;
+const TRANSFER_WITH_MEMO_EVENT_TOPIC: B256 = ITIP20::TransferWithMemo::SIGNATURE_HASH;
+
 fn address_topic(address: Address) -> String {
     format!("0x{:0>64}", hex::encode(address.as_slice()))
 }
@@ -231,6 +230,51 @@ fn make_transfer_with_memo_log(
         ],
         "data": format!("0x{}", amount_data(amount)),
     })
+}
+
+fn match_receipt_transfer_logs(
+    logs: &[serde_json::Value],
+    expected_sender: Address,
+    currency: Address,
+    expected: &[Transfer],
+    source: Option<&str>,
+    validate_sender: Option<&ValidateSenderCallback>,
+) -> Result<Vec<MatchedTransferLog>, VerificationError> {
+    match_receipt_transfer_logs_with_settlement(
+        logs,
+        currency,
+        expected,
+        ReceiptSenderPolicy {
+            expected_sender,
+            source,
+            validate_sender,
+            transaction_sender: expected_sender,
+            settlement_senders: &[],
+        },
+    )
+}
+
+/// Runs the receipt matcher on JSON log fixtures, decoded the way the RPC
+/// client decodes the logs of a receipt.
+fn match_receipt_transfer_logs_with_settlement(
+    logs: &[serde_json::Value],
+    currency: Address,
+    expected: &[Transfer],
+    sender_policy: ReceiptSenderPolicy<'_>,
+) -> Result<Vec<MatchedTransferLog>, VerificationError> {
+    let logs: Vec<_> = logs
+        .iter()
+        .map(|log| alloy::rpc::types::Log {
+            inner: serde_json::from_value(log.clone()).unwrap(),
+            ..Default::default()
+        })
+        .collect();
+    super::receipt_logs::match_receipt_transfer_logs_with_settlement(
+        &logs,
+        currency,
+        expected,
+        sender_policy,
+    )
 }
 
 fn did_pkh(chain_id: u64, address: Address) -> String {

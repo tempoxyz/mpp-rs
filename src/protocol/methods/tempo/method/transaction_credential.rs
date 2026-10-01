@@ -21,7 +21,7 @@ use super::memo::{
     assert_challenge_bound_memo, assert_challenge_bound_memos, challenge_bound_memo_error,
     is_challenge_bound_memo,
 };
-use super::receipt_logs::ReceiptSenderPolicy;
+use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
 use super::ChargeMethod;
 
 /// Check a transaction credential `source` against the recovered transaction
@@ -450,8 +450,8 @@ where
 
         // Verify the receipt contains the expected TIP-20 transfer(s).
         let settlement_senders = settlement_sender.into_iter().collect::<Vec<_>>();
-        let matched_logs = self.verify_tip20_transfers(
-            &receipt,
+        let matched_logs = match_receipt_transfer_logs_with_settlement(
+            receipt.logs(),
             currency,
             &expected,
             ReceiptSenderPolicy {
