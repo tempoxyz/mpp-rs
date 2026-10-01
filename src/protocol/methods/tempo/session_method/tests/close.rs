@@ -1,4 +1,7 @@
 use super::*;
+use crate::protocol::methods::tempo::session_method::close::{
+    machine_session_close_calls, validate_close_amount,
+};
 use crate::protocol::methods::tempo::voucher;
 
 struct AsyncOnlyCloseSigner(alloy::signers::local::PrivateKeySigner);

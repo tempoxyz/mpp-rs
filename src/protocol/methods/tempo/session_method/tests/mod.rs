@@ -1,5 +1,7 @@
 use super::*;
+use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::ErrorCode;
+use alloy::primitives::{Bytes, B256};
 
 mod close;
 mod open;
