@@ -269,8 +269,8 @@ impl ChargeMethodTrait for ChargeMethod {
                         None => receipt,
                     })
                 }
-                "requires_action" => Err(VerificationError::new(
-                    "Stripe PaymentIntent requires action (e.g., 3DS)",
+                "requires_action" => Err(VerificationError::payment_action_required(
+                    "Stripe PaymentIntent requires action",
                 )),
                 other => Err(VerificationError::new(format!(
                     "Stripe PaymentIntent status: {other}"

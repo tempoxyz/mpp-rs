@@ -22,6 +22,7 @@ use mpp::protocol::core::PaymentCredential;
 use mpp::protocol::methods::stripe::{CreateTokenResult, StripeCredentialPayload};
 use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
 use mpp::server::{stripe, Mpp, StripeChargeOptions, StripeConfig};
+use mpp::PaymentError;
 use reqwest::Client;
 
 /// HMAC secret for test servers (the SDK requires at least 32 bytes).
@@ -504,7 +505,8 @@ async fn test_stripe_health_no_payment() {
     stripe_handle.abort();
 }
 
-/// Stripe API returning `requires_action` should fail verification.
+/// Stripe API returning `requires_action` should fail verification with the
+/// `payment-action-required` problem.
 #[tokio::test]
 async fn test_stripe_requires_action_rejected() {
     let (stripe_url, stripe_handle) = start_mock_stripe_requires_action().await;
@@ -521,6 +523,25 @@ async fn test_stripe_requires_action_rejected() {
         .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
+
+    let challenge = mpp.stripe_charge("0.10").expect("challenge creation");
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        StripeCredentialPayload {
+            spt: "spt_will_require_action".to_string(),
+            external_id: None,
+        },
+    );
+    let err = mpp
+        .stripe_verify_charge(&credential, "0.10")
+        .await
+        .expect_err("requires_action must not verify");
+    let problem = err.to_problem_details(None);
+    assert_eq!(
+        problem.problem_type,
+        "https://paymentauth.org/problems/payment-action-required"
+    );
+    assert_eq!(problem.status, 402);
 
     let mpp = Arc::new(mpp);
     let (url, handle) = start_server(mpp).await;
