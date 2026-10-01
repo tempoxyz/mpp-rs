@@ -465,6 +465,20 @@ impl PaymentProvider for TempoAccountsProvider {
         Ok(())
     }
 
+    async fn invalidate_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            return self
+                .configured_session_provider()?
+                .invalidate_payment(challenge, credential)
+                .await;
+        }
+        self.rollback_payment(challenge, credential).await
+    }
+
     fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         if challenge.intent.as_str() == "session" {
             if let Ok(provider) = self.configured_session_provider() {
