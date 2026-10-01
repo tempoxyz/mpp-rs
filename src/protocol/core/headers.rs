@@ -9,14 +9,19 @@
 //!
 //! The parser is implemented without regex for minimal dependencies.
 
-use super::challenge::{PaymentChallenge, PaymentCredential, Receipt};
+use super::auth_params::{
+    escape_quoted_value, parse_auth_params, split_payment_challenges, starts_with_payment_scheme,
+    strip_payment_scheme,
+};
+use super::challenge::PaymentChallenge;
+use super::credential::PaymentCredential;
+use super::receipt::Receipt;
 use super::types::{base64url_decode, base64url_encode, Base64UrlJson, IntentName, MethodName};
 use crate::error::{MppError, Result};
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 /// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
-const MAX_TOKEN_LEN: usize = 16 * 1024;
+pub(super) const MAX_TOKEN_LEN: usize = 16 * 1024;
 
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {
@@ -25,33 +30,6 @@ macro_rules! require_param {
             MppError::invalid_challenge_reason(format!("Missing '{}' field", $key))
         })?
     };
-}
-
-/// Strip the Payment scheme prefix (case-insensitive) from a header value.
-/// Returns the remainder of the header after the scheme, or None if not a Payment header.
-fn strip_payment_scheme(header: &str) -> Option<&str> {
-    let header = header.trim_start();
-    let scheme_len = PAYMENT_SCHEME.len();
-
-    if header.len() >= scheme_len
-        && header
-            .get(..scheme_len)
-            .is_some_and(|s| s.eq_ignore_ascii_case(PAYMENT_SCHEME))
-    {
-        header.get(scheme_len..)
-    } else {
-        None
-    }
-}
-
-/// Whether `value` starts with the `Payment` scheme token (case-insensitive)
-/// followed by SP or HTAB.
-pub(super) fn starts_with_payment_scheme(value: &[u8]) -> bool {
-    let scheme_len = PAYMENT_SCHEME.len();
-    value
-        .get(..scheme_len)
-        .is_some_and(|token| token.eq_ignore_ascii_case(PAYMENT_SCHEME.as_bytes()))
-        && matches!(value.get(scheme_len), Some(b' ' | b'\t'))
 }
 
 /// Extract the `Payment` scheme from an Authorization header that may contain
@@ -81,34 +59,6 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
         .split(',')
         .map(|s| s.trim())
         .find(|s| starts_with_payment_scheme(s.as_bytes()))
-}
-
-/// Escape a string for use in a quoted-string header value.
-///
-/// Only printable ASCII and HTAB are emitted as-is. Everything else is written
-/// as `\uXXXX` UTF-16 code units, so the result is always a valid header value.
-/// Rejects CRLF to prevent header injection attacks.
-fn escape_quoted_value(s: &str) -> Result<String> {
-    if s.contains('\r') || s.contains('\n') {
-        return Err(MppError::invalid_challenge_reason(
-            "Header value contains invalid CRLF characters",
-        ));
-    }
-    let mut escaped = String::with_capacity(s.len());
-    for unit in s.encode_utf16() {
-        match unit {
-            0x005c => escaped.push_str("\\\\"),
-            0x0022 => escaped.push_str("\\\""),
-            0x0009 | 0x0020..=0x007e => {
-                escaped.push(char::from_u32(u32::from(unit)).expect("ASCII is valid Unicode"))
-            }
-            _ => {
-                use std::fmt::Write as _;
-                write!(escaped, "\\u{unit:04x}").expect("writing to String cannot fail");
-            }
-        }
-    }
-    Ok(escaped)
 }
 
 /// Header name for payment challenges (from server)
@@ -146,154 +96,6 @@ pub fn with_private_cache_control(value: Option<&str>) -> String {
         }
         _ => "private".to_string(),
     }
-}
-
-/// Parse key="value" pairs from an auth-param string.
-///
-/// This is a simple parser that handles:
-/// - Quoted string values with escaped quotes
-/// - Key=value without quotes for simple values
-/// - Comma or space separated parameters
-fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
-    let mut params = HashMap::new();
-    let bytes = params_str.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-
-        let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let key_end = i;
-
-        // RFC 9110 §11.2 allows whitespace around "=".
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        // A token that is not followed by "=" starts another auth scheme.
-        if i >= bytes.len() || bytes[i] != b'=' {
-            break;
-        }
-
-        // Auth-param names are case-insensitive (RFC 9110 §11.2).
-        let raw_key = &params_str[key_start..key_end];
-        let key = raw_key.to_ascii_lowercase();
-        i += 1;
-
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-
-        let value = if bytes.get(i) == Some(&b'"') {
-            i += 1;
-            let mut value = String::new();
-            let mut segment_start = i;
-            let value_end = loop {
-                if i >= bytes.len() {
-                    return Err(MppError::invalid_challenge_reason(
-                        "Unterminated quoted-string",
-                    ));
-                }
-                if key == "request" && value.len() + (i - segment_start) >= MAX_TOKEN_LEN {
-                    return Err(MppError::invalid_challenge_reason(format!(
-                        "Request parameter exceeds maximum length of {} bytes",
-                        MAX_TOKEN_LEN
-                    )));
-                }
-
-                match bytes[i] {
-                    b'"' => break i,
-                    b'\\' => {
-                        value.push_str(&params_str[segment_start..i]);
-                        i += 1;
-                        if i >= bytes.len() {
-                            return Err(MppError::invalid_challenge_reason(
-                                "Unterminated quoted-string",
-                            ));
-                        }
-                        if let Some((decoded, next)) = read_unicode_escape(params_str, i) {
-                            value.push(decoded);
-                            i = next;
-                        } else {
-                            let escaped = params_str[i..]
-                                .chars()
-                                .next()
-                                .expect("index is on a character boundary");
-                            value.push(escaped);
-                            i += escaped.len_utf8();
-                        }
-                        segment_start = i;
-                    }
-                    _ => i += 1,
-                }
-            };
-            value.push_str(&params_str[segment_start..value_end]);
-            i = value_end + 1;
-            value
-        } else {
-            let value_start = i;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b',' {
-                i += 1;
-            }
-            if key == "request" && i - value_start > MAX_TOKEN_LEN {
-                return Err(MppError::invalid_challenge_reason(format!(
-                    "Request parameter exceeds maximum length of {} bytes",
-                    MAX_TOKEN_LEN
-                )));
-            }
-            params_str[value_start..i].to_string()
-        };
-
-        if params.contains_key(&key) {
-            return Err(MppError::invalid_challenge_reason(format!(
-                "Duplicate parameter: {}",
-                raw_key
-            )));
-        }
-        params.insert(key, value);
-    }
-
-    Ok(params)
-}
-
-fn read_unicode_escape(input: &str, at: usize) -> Option<(char, usize)> {
-    let (unit, next) = read_escaped_code_unit(input, at)?;
-
-    if !(0xD800..=0xDFFF).contains(&unit) {
-        return char::from_u32(u32::from(unit)).map(|decoded| (decoded, next));
-    }
-
-    if (0xD800..=0xDBFF).contains(&unit) && input.as_bytes().get(next) == Some(&b'\\') {
-        if let Some((low, after)) = read_escaped_code_unit(input, next + 1) {
-            if (0xDC00..=0xDFFF).contains(&low) {
-                let code =
-                    0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
-                return char::from_u32(code).map(|decoded| (decoded, after));
-            }
-        }
-    }
-
-    Some((char::REPLACEMENT_CHARACTER, next))
-}
-
-fn read_escaped_code_unit(input: &str, at: usize) -> Option<(u16, usize)> {
-    if input.as_bytes().get(at) != Some(&b'u') {
-        return None;
-    }
-    let digits = input.get(at + 1..at + 5)?;
-    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    u16::from_str_radix(digits, 16)
-        .ok()
-        .map(|unit| (unit, at + 5))
 }
 
 /// Validate ISO 8601 / RFC 3339 timestamp format.
@@ -550,52 +352,6 @@ fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
     }
 }
 
-/// Split a header value into individual `Payment` challenge slices.
-///
-/// Finds `Payment` scheme boundaries (case-insensitive per RFC 9110 §11.6.1)
-/// that appear at the start of the header or after a comma separator, and
-/// returns the individual challenge strings. Quoted-string contents are
-/// skipped, so scheme-like text inside a parameter value is never a boundary.
-fn split_payment_challenges(header: &str) -> Vec<&str> {
-    let bytes = header.as_bytes();
-    let mut starts = Vec::new();
-    let mut in_quotes = false;
-    let mut escaped = false;
-
-    for (pos, &byte) in bytes.iter().enumerate() {
-        if in_quotes {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_quotes = false;
-            }
-            continue;
-        }
-        if byte == b'"' {
-            in_quotes = true;
-            continue;
-        }
-        if !starts_with_payment_scheme(&bytes[pos..]) {
-            continue;
-        }
-        let boundary = bytes[..pos].iter().rfind(|b| !b.is_ascii_whitespace());
-        if matches!(boundary, None | Some(b',')) {
-            starts.push(pos);
-        }
-    }
-
-    starts
-        .iter()
-        .enumerate()
-        .map(|(i, &start)| {
-            let end = starts.get(i + 1).copied().unwrap_or(header.len());
-            header[start..end].trim_end_matches([',', ' ', '\t'])
-        })
-        .collect()
-}
-
 /// Format a PaymentChallenge as a WWW-Authenticate header value.
 ///
 /// Format: `Payment id="<id>", realm="<realm>", method="<method>", intent="<intent>", request="<base64url-json>"`
@@ -816,6 +572,7 @@ pub fn format_receipt(receipt: &Receipt) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::core::challenge::tests::test_challenge;
     use crate::protocol::core::types::{PayloadType, ReceiptStatus};
     use crate::protocol::core::PaymentPayload;
 
@@ -843,25 +600,6 @@ mod tests {
         );
         // Detection is case-insensitive and whitespace-tolerant.
         assert_eq!(with_private_cache_control(Some("  PRIVATE ")), "  PRIVATE ");
-    }
-
-    fn test_challenge() -> PaymentChallenge {
-        PaymentChallenge {
-            id: "abc123".to_string(),
-            realm: "api".to_string(),
-            method: "tempo".into(),
-            intent: "charge".into(),
-            request: Base64UrlJson::from_value(&serde_json::json!({
-                "amount": "10000",
-                "currency": "0x123"
-            }))
-            .unwrap(),
-            expires: Some("2024-01-01T00:00:00Z".to_string()),
-            description: None,
-            digest: None,
-            opaque: None,
-            header: None,
-        }
     }
 
     #[test]
@@ -960,25 +698,6 @@ mod tests {
         assert_eq!(results[0].as_ref().unwrap().method.as_str(), "tempo");
         assert_eq!(results[1].as_ref().unwrap().id, "b");
         assert_eq!(results[1].as_ref().unwrap().method.as_str(), "stripe");
-    }
-
-    #[test]
-    fn test_split_payment_schemes_ignores_quoted() {
-        // "Payment" inside a quoted value should NOT be treated as a boundary
-        let header = r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", description="Payment required""#;
-        let schemes = split_payment_challenges(header);
-        assert_eq!(schemes.len(), 1);
-    }
-
-    #[test]
-    fn test_split_payment_schemes_leading_whitespace() {
-        // Headers with leading whitespace must still be recognized
-        let header =
-            r#"  Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
-        let schemes = split_payment_challenges(header);
-        assert_eq!(schemes.len(), 1);
-        let challenge = parse_www_authenticate(schemes[0]).unwrap();
-        assert_eq!(challenge.id, "a");
     }
 
     #[test]
@@ -1518,34 +1237,6 @@ mod tests {
         let err = parse_receipt(wire).unwrap_err();
         assert!(matches!(err, MppError::InvalidReceipt(_)));
         assert!(err.to_string().contains("timestamp"));
-    }
-
-    #[test]
-    fn test_split_payment_challenges() {
-        // single challenge
-        let single =
-            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#;
-        assert_eq!(split_payment_challenges(single).len(), 1);
-
-        // two challenges, normal spacing
-        let two = concat!(
-            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", "#,
-            r#"Payment id="b", realm="api", method="stripe", intent="charge", request="e30""#,
-        );
-        let parts = split_payment_challenges(two);
-        assert_eq!(parts.len(), 2);
-        assert!(parts[0].contains(r#"id="a""#));
-        assert!(parts[1].contains(r#"id="b""#));
-
-        // no whitespace after comma, mixed case scheme
-        let compact = concat!(
-            r#"PAYMENT id="a", realm="api", method="tempo", intent="charge", request="e30","#,
-            r#"payment id="b", realm="api", method="stripe", intent="charge", request="e30""#,
-        );
-        assert_eq!(split_payment_challenges(compact).len(), 2);
-
-        // non-Payment scheme is dropped
-        assert!(split_payment_challenges("Bearer token123").is_empty());
     }
 
     #[test]
