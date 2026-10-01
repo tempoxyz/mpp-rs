@@ -291,18 +291,28 @@ where
 
 // ==================== PaymentBodyLayer ====================
 
+/// Default cap on the request body bytes buffered by [`PaymentBodyLayer`],
+/// matching axum's `DefaultBodyLimit`.
+const DEFAULT_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 /// Tower [`Layer`](tower_layer::Layer) that binds payment verification to request body bytes.
 ///
 /// The request body is buffered, used for body-digest challenge/verification,
 /// and then replayed to the inner service as `http_body_util::Full<Bytes>`.
+///
+/// Buffering happens before any payment is made, so bodies larger than
+/// [`max_body_bytes`](Self::max_body_bytes) (2 MiB by default) are rejected
+/// with `413 Payload Too Large`.
 pub struct PaymentBodyLayer<V> {
     verifier: Arc<V>,
+    max_body_bytes: usize,
 }
 
 impl<V> Clone for PaymentBodyLayer<V> {
     fn clone(&self) -> Self {
         Self {
             verifier: Arc::clone(&self.verifier),
+            max_body_bytes: self.max_body_bytes,
         }
     }
 }
@@ -312,7 +322,18 @@ impl<V: PaymentVerifier> PaymentBodyLayer<V> {
     pub fn new(verifier: V) -> Self {
         Self {
             verifier: Arc::new(verifier),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
+    }
+}
+
+impl<V> PaymentBodyLayer<V> {
+    /// Set the maximum number of request body bytes to buffer.
+    ///
+    /// Defaults to 2 MiB.
+    pub fn max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
     }
 }
 
@@ -323,6 +344,7 @@ impl<S, V: PaymentVerifier> tower_layer::Layer<S> for PaymentBodyLayer<V> {
         PaymentBodyService {
             inner,
             verifier: Arc::clone(&self.verifier),
+            max_body_bytes: self.max_body_bytes,
         }
     }
 }
@@ -331,6 +353,7 @@ impl<S, V: PaymentVerifier> tower_layer::Layer<S> for PaymentBodyLayer<V> {
 pub struct PaymentBodyService<S, V> {
     inner: S,
     verifier: Arc<V>,
+    max_body_bytes: usize,
 }
 
 impl<S: Clone, V> Clone for PaymentBodyService<S, V> {
@@ -338,6 +361,7 @@ impl<S: Clone, V> Clone for PaymentBodyService<S, V> {
         Self {
             inner: self.inner.clone(),
             verifier: Arc::clone(&self.verifier),
+            max_body_bytes: self.max_body_bytes,
         }
     }
 }
@@ -365,13 +389,22 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let verifier = Arc::clone(&self.verifier);
+        let max_body_bytes = self.max_body_bytes;
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
+            let body =
+                http_body_util::Limited::new(body.map_err(|e| e.to_string()), max_body_bytes);
             let body = match body.collect().await {
                 Ok(collected) => collected.to_bytes(),
+                Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+                    return Ok(error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Request body too large",
+                    ));
+                }
                 Err(e) => {
                     return Ok(error_response(
                         StatusCode::BAD_REQUEST,
@@ -656,6 +689,7 @@ impl PaymentBodyLayer<ChargeVerifier> {
         let layer = PaymentLayer::charge(mpp, amount)?;
         Ok(Self {
             verifier: layer.verifier,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         })
     }
 }
@@ -1098,6 +1132,73 @@ mod tests {
             verify_body.lock().unwrap().as_deref(),
             Some(br#"{"query":"paid"}"#.as_slice())
         );
+    }
+
+    fn body_aware_layer() -> PaymentBodyLayer<BodyAwareVerifier> {
+        PaymentBodyLayer::new(BodyAwareVerifier {
+            challenge_body: Arc::new(std::sync::Mutex::new(None)),
+            verify_body: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_body_service_stops_reading_oversized_body() {
+        use futures_util::StreamExt;
+        use tower_service::Service;
+
+        let mut svc = body_aware_layer()
+            .max_body_bytes(1024)
+            .layer(BodyEchoService);
+
+        let chunks = futures_util::stream::iter(0..).map(|i| {
+            assert!(i < 4, "body read past the limit");
+            Ok::<_, std::convert::Infallible>(http_body::Frame::data(Bytes::from_static(&[0; 512])))
+        });
+        let req = Request::builder()
+            .uri("/premium")
+            .body(http_body_util::StreamBody::new(chunks))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+    }
+
+    #[tokio::test]
+    async fn test_body_service_default_body_limit() {
+        use tower_service::Service;
+
+        for (len, status) in [
+            (DEFAULT_MAX_BODY_BYTES, StatusCode::PAYMENT_REQUIRED),
+            (DEFAULT_MAX_BODY_BYTES + 1, StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let mut svc = body_aware_layer().layer(BodyEchoService);
+            let req = Request::builder()
+                .uri("/premium")
+                .body(http_body_util::Full::new(Bytes::from(vec![0; len])))
+                .unwrap();
+
+            let resp = svc.call(req).await.unwrap();
+            assert_eq!(resp.status(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_body_service_body_read_error_returns_400() {
+        use tower_service::Service;
+
+        let mut svc = body_aware_layer().layer(BodyEchoService);
+
+        let chunks = futures_util::stream::iter([Err::<http_body::Frame<Bytes>, _>(
+            std::io::Error::other("reset"),
+        )]);
+        let req = Request::builder()
+            .uri("/premium")
+            .body(http_body_util::StreamBody::new(chunks))
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A body-aware verifier that, like `Mpp::requires_auth`, advertises
