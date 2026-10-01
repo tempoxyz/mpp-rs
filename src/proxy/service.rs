@@ -1,7 +1,6 @@
 use crate::protocol::core::PaymentCredential;
 use crate::proxy::headers::scrub_request_headers;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 /// Canonical proxy→upstream request-header pipeline: generic scrub, then
 /// per-service strip/inject. Reversing the order would drop the injected
@@ -20,8 +19,8 @@ pub struct Service {
     pub base_url: String,
     /// Route definitions.
     pub routes: Vec<Route>,
-    /// Headers to inject on upstream requests.
-    pub headers: HashMap<String, String>,
+    /// Headers to inject on upstream requests, in the order they are sent.
+    pub headers: Vec<(String, String)>,
     /// Caller-supplied request headers to drop before forwarding (vendor-specific
     /// strips on top of [`crate::proxy::headers::scrub_request_headers`]).
     pub strip_request_headers: Vec<String>,
@@ -79,7 +78,7 @@ impl Service {
             id: id.into(),
             base_url: base_url.into(),
             routes: Vec::new(),
-            headers: HashMap::new(),
+            headers: Vec::new(),
             strip_request_headers: Vec::new(),
             title: None,
             description: None,
@@ -108,7 +107,7 @@ pub struct ServiceBuilder {
     id: String,
     base_url: String,
     routes: Vec<Route>,
-    headers: HashMap<String, String>,
+    headers: Vec<(String, String)>,
     strip_request_headers: Vec<String>,
     title: Option<String>,
     description: Option<String>,
@@ -116,17 +115,18 @@ pub struct ServiceBuilder {
 
 impl ServiceBuilder {
     /// Inject an `Authorization: Bearer {token}` header on upstream requests.
-    pub fn bearer(mut self, token: impl Into<String>) -> Self {
-        self.headers.insert(
-            "Authorization".to_string(),
-            format!("Bearer {}", token.into()),
-        );
-        self
+    pub fn bearer(self, token: impl Into<String>) -> Self {
+        self.header("Authorization", format!("Bearer {}", token.into()))
     }
 
     /// Inject a custom header on upstream requests.
+    ///
+    /// Headers are injected in the order they are added. Adding a name again,
+    /// in any letter case, replaces the earlier value.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.insert(name.into(), value.into());
+        let name = name.into();
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
+        self.headers.push((name, value.into()));
         self
     }
 
@@ -679,8 +679,8 @@ mod tests {
         assert_eq!(svc.base_url, "https://api.openai.com");
         assert_eq!(svc.routes.len(), 2);
         assert_eq!(
-            svc.headers.get("Authorization"),
-            Some(&"Bearer sk-test".to_string())
+            svc.headers,
+            [("Authorization".to_string(), "Bearer sk-test".to_string())]
         );
     }
 
@@ -691,9 +691,30 @@ mod tests {
             .route("POST /v1/messages", Endpoint::Free)
             .build();
         assert_eq!(
-            svc.headers.get("x-api-key"),
-            Some(&"sk-ant-test".to_string())
+            svc.headers,
+            [("x-api-key".to_string(), "sk-ant-test".to_string())]
         );
+    }
+
+    #[test]
+    fn test_request_headers_are_injected_in_insertion_order() {
+        let names: Vec<String> = (0..16).map(|i| format!("x-injected-{i}")).collect();
+        let mut builder = Service::new("api", "https://api.example.com").bearer("first");
+        for name in &names {
+            builder = builder.header(name, "value");
+        }
+        // Same header in another letter case: the last value wins.
+        let svc = builder.header("authorization", "Basic last").build();
+
+        let mut headers = vec![("Authorization".to_string(), "Payment caller".to_string())];
+        svc.apply_request_headers(&mut headers);
+
+        let mut expected: Vec<(String, String)> = names
+            .into_iter()
+            .map(|name| (name, "value".to_string()))
+            .collect();
+        expected.push(("authorization".to_string(), "Basic last".to_string()));
+        assert_eq!(headers, expected);
     }
 
     #[test]
