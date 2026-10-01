@@ -157,7 +157,7 @@ async fn fortune(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Ok(credential) = parse_authorization(auth_str) {
-                match state.payment.verify_credential(&credential).await {
+                match state.payment.stripe_verify_charge(&credential, "1").await {
                     Ok(receipt) => {
                         let fortune = FORTUNES
                             .choose(&mut rand::rng())
@@ -173,10 +173,8 @@ async fn fortune(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
                         )
                             .into_response();
                     }
-                    Err(e) => {
-                        let body = serde_json::json!({ "error": e.to_string() });
-                        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
-                    }
+                    // A rejected credential gets a fresh challenge below.
+                    Err(e) => eprintln!("payment rejected: {e}"),
                 }
             }
         }

@@ -99,7 +99,11 @@ async fn ws_handler(
             return;
         }
 
-        // 2. Wait for credential
+        // 2. Wait for a credential that pays the challenge sent above
+        let Ok(expected) = challenge.request.decode::<ChargeRequest>() else {
+            let _ = send_error(&mut socket, "Failed to create challenge").await;
+            return;
+        };
         let receipt = loop {
             let Some(Ok(Message::Text(msg))) = socket.recv().await else {
                 return;
@@ -115,7 +119,10 @@ async fn ws_handler(
                 continue;
             };
 
-            match mpp.verify_credential(&parsed).await {
+            match mpp
+                .verify_credential_with_expected_request(&parsed, &expected)
+                .await
+            {
                 Ok(receipt) => {
                     println!("Payment verified: {}", receipt.reference);
                     break receipt;

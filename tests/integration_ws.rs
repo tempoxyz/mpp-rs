@@ -68,7 +68,7 @@ async fn start_ws_server() -> (String, tokio::task::JoinHandle<()>) {
                                 continue;
                             };
 
-                            match mpp.verify_credential(&parsed).await {
+                            match mpp.verify_charge(&parsed, "0.01").await {
                                 Ok(receipt) => {
                                     let data = WsResponse::Data {
                                         data: "hello from ws".into(),

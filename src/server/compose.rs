@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use mpp::server::{compose, compose_verify};
+//! use mpp::server::{compose, compose_verify_with_expected_requests};
 //! use mpp::format_www_authenticate_many;
 //!
 //! let mut challenges = tempo_mpp.charge("0.10")?;
@@ -21,9 +21,15 @@
 //! );
 //! let headers = format_www_authenticate_many(&ranked)?;
 //!
-//! // Credential path: dispatch to the correct verifier
-//! let verifiers: Vec<&dyn ChargeVerifier> = vec![&tempo_mpp, &stripe_mpp];
-//! let receipt = compose_verify(&verifiers, &credential).await?;
+//! // Credential path: dispatch to the correct verifier, which checks the
+//! // credential against the request this route charges with that method
+//! let tempo_expected = tempo_mpp.expected_charge_request("0.10", Default::default())?;
+//! let stripe_expected = stripe_mpp.stripe_expected_charge_request("0.10", Default::default())?;
+//! let receipt = compose_verify_with_expected_requests(
+//!     &[(&tempo_mpp, &tempo_expected), (&stripe_mpp, &stripe_expected)],
+//!     &credential,
+//! )
+//! .await?;
 //! ```
 
 use std::future::Future;
@@ -31,6 +37,7 @@ use std::pin::Pin;
 
 use crate::protocol::core::accept_payment;
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::VerificationError;
 
 /// Rank pre-generated challenges by client `Accept-Payment` preferences.
@@ -86,7 +93,7 @@ pub fn compose(
 ///
 /// This enables multi-method credential dispatch: multiple `Mpp` instances
 /// with different `ChargeMethod` types can be collected as `&dyn ChargeVerifier`
-/// and used with [`compose_verify()`].
+/// and used with [`compose_verify_with_expected_requests()`].
 ///
 /// Automatically implemented for all [`Mpp<M, S>`](super::Mpp) where
 /// `M: ChargeMethod`.
@@ -94,11 +101,26 @@ pub trait ChargeVerifier: Send + Sync {
     /// Payment method name (e.g., `"tempo"`, `"stripe"`).
     fn method_name(&self) -> &str;
 
-    /// Verify a payment credential.
+    /// Verify a payment credential without checking it against a route.
     fn verify_credential<'a>(
         &'a self,
         credential: &'a PaymentCredential,
     ) -> Pin<Box<dyn Future<Output = Result<Receipt, VerificationError>> + Send + 'a>>;
+
+    /// Verify a payment credential against the request the route charges.
+    ///
+    /// The default rejects every credential, so a custom verifier that does
+    /// not compare the request cannot pass for a route-bound one.
+    fn verify_credential_with_expected_request<'a>(
+        &'a self,
+        credential: &'a PaymentCredential,
+        expected: &'a ChargeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Receipt, VerificationError>> + Send + 'a>> {
+        let _ = (credential, expected);
+        Box::pin(std::future::ready(Err(VerificationError::new(
+            "expected request verification is not implemented for this ChargeVerifier",
+        ))))
+    }
 }
 
 impl<M, S> ChargeVerifier for super::Mpp<M, S>
@@ -114,7 +136,15 @@ where
         &'a self,
         credential: &'a PaymentCredential,
     ) -> Pin<Box<dyn Future<Output = Result<Receipt, VerificationError>> + Send + 'a>> {
-        Box::pin(self.verify_credential(credential))
+        Box::pin(self.broadcast_credential(credential))
+    }
+
+    fn verify_credential_with_expected_request<'a>(
+        &'a self,
+        credential: &'a PaymentCredential,
+        expected: &'a ChargeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Receipt, VerificationError>> + Send + 'a>> {
+        Box::pin(self.broadcast_credential_with_expected_request(credential, expected))
     }
 }
 
@@ -123,10 +153,44 @@ where
 /// Non-charge intents are rejected immediately. If no verifier matches
 /// the credential's method, falls back to the first verifier (which
 /// will reject via HMAC mismatch).
+#[deprecated(
+    since = "0.15.0",
+    note = "accepts a credential paid for any route of the matching handler, whatever its price; use `compose_verify_with_expected_requests`"
+)]
 pub async fn compose_verify(
     verifiers: &[&dyn ChargeVerifier],
     credential: &PaymentCredential,
 ) -> Result<Receipt, VerificationError> {
+    select_verifier(verifiers, credential, |verifier| verifier.method_name())?
+        .verify_credential(credential)
+        .await
+}
+
+/// Dispatch a charge credential to the matching verifier by method name and
+/// verify it against the request this route charges with that method.
+///
+/// Each entry pairs a verifier with its expected request (for example from
+/// [`Mpp::expected_charge_request()`](super::Mpp::expected_charge_request)).
+/// A credential whose challenge was issued for another amount, currency or
+/// recipient is rejected, so a payment for a cheaper route cannot be replayed
+/// here. Dispatch follows the same rules as [`compose_verify()`].
+pub async fn compose_verify_with_expected_requests(
+    routes: &[(&dyn ChargeVerifier, &ChargeRequest)],
+    credential: &PaymentCredential,
+) -> Result<Receipt, VerificationError> {
+    let (verifier, expected) =
+        select_verifier(routes, credential, |(verifier, _)| verifier.method_name())?;
+    verifier
+        .verify_credential_with_expected_request(credential, expected)
+        .await
+}
+
+/// Pick the entry whose method matches the charge credential, else the first.
+fn select_verifier<'a, T>(
+    verifiers: &'a [T],
+    credential: &PaymentCredential,
+    method_name: impl Fn(&T) -> &str,
+) -> Result<&'a T, VerificationError> {
     if verifiers.is_empty() {
         return Err(VerificationError::new("No verifiers configured"));
     }
@@ -141,15 +205,14 @@ pub async fn compose_verify(
         ));
     }
 
-    let verifier = verifiers
+    Ok(verifiers
         .iter()
-        .find(|v| v.method_name() == cred_method)
-        .unwrap_or(&verifiers[0]);
-
-    verifier.verify_credential(credential).await
+        .find(|v| method_name(v) == cred_method)
+        .unwrap_or(&verifiers[0]))
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::protocol::core::types::Base64UrlJson;
@@ -339,6 +402,82 @@ mod tests {
         let result = compose_verify(&verifiers, &cred).await;
         let err = result.unwrap_err();
         assert!(err.message.contains("only supports charge"));
+    }
+
+    fn expected(amount: &str) -> ChargeRequest {
+        ChargeRequest {
+            amount: amount.into(),
+            currency: "USD".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_rejects_other_routes_credential() {
+        let mpp = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        // Issued by this handler for a route that charges 1000.
+        let cred = test_credential("alpha", "secret");
+
+        let expensive = expected("100000");
+        let err = compose_verify_with_expected_requests(&[(&mpp, &expensive)], &cred)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("Amount mismatch"), "{}", err.message);
+
+        let route = expected("1000");
+        let receipt = compose_verify_with_expected_requests(&[(&mpp, &route)], &cred)
+            .await
+            .unwrap();
+        assert_eq!(receipt.method.as_str(), "alpha");
+
+        // The deprecated dispatcher has no expectation to compare against.
+        let verifiers: Vec<&dyn ChargeVerifier> = vec![&mpp];
+        assert!(compose_verify(&verifiers, &cred).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_uses_matching_verifiers_expectation() {
+        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp_b = super::super::Mpp::new(MockMethod("beta"), "test.example.com", "secret");
+        let (alpha_expected, beta_expected) = (expected("5"), expected("1000"));
+        let cred = test_credential("beta", "secret");
+
+        let receipt = compose_verify_with_expected_requests(
+            &[(&mpp_a, &alpha_expected), (&mpp_b, &beta_expected)],
+            &cred,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.method.as_str(), "beta");
+
+        let result = compose_verify_with_expected_requests(
+            &[(&mpp_a, &beta_expected), (&mpp_b, &alpha_expected)],
+            &cred,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_rejects_verifier_without_comparison() {
+        struct Unbound;
+        impl ChargeVerifier for Unbound {
+            fn method_name(&self) -> &str {
+                "alpha"
+            }
+            fn verify_credential<'a>(
+                &'a self,
+                _credential: &'a PaymentCredential,
+            ) -> Pin<Box<dyn Future<Output = Result<Receipt, VerificationError>> + Send + 'a>>
+            {
+                Box::pin(async { Ok(Receipt::success("alpha", "alpha_ref")) })
+            }
+        }
+
+        let cred = test_credential("alpha", "secret");
+        let route = expected("1000");
+        let result = compose_verify_with_expected_requests(&[(&Unbound, &route)], &cred).await;
+        assert!(result.is_err());
     }
 
     #[test]

@@ -32,10 +32,11 @@ The flow is:
 3. The adapter calls `POST /v1/mpp/validate`, then `POST /v1/mpp/broadcast`.
 4. The relay receipt becomes the `Payment-Receipt` response header.
 
-The handler uses `Mpp::broadcast_credential`, which re-validates before the
-terminal relay call. `Mpp::validate_credential` is also available for advisory,
-non-mutating pre-checks; `verify_credential` remains a compatibility alias for
-the broadcast path.
+The handler uses `Mpp::verify_charge_with_options`, which checks that the
+credential was issued for this route's price and re-validates before the
+terminal relay call. `Mpp::validate_credential_with_expected_request` is also
+available for advisory, non-mutating pre-checks; it takes the expected request
+from `Mpp::expected_charge_request`.
 
 The relay broadcasts pull credentials. For push credentials, it recognizes the
 already-broadcast transaction and returns its receipt without sending it again.

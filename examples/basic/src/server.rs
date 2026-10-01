@@ -104,7 +104,8 @@ async fn ping(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl I
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Ok(credential) = parse_authorization(auth_str) {
-                match payment.verify_credential(&credential).await {
+                // Only a credential paid for this route's price is accepted.
+                match payment.verify_charge(&credential, "0.01").await {
                     Ok(receipt) => {
                         let receipt_header = receipt.to_header().unwrap_or_default();
                         return (
@@ -114,10 +115,8 @@ async fn ping(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl I
                         )
                             .into_response();
                     }
-                    Err(e) => {
-                        let body = serde_json::json!({ "error": e.to_string() });
-                        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
-                    }
+                    // A rejected credential gets a fresh challenge below.
+                    Err(e) => eprintln!("payment rejected: {e}"),
                 }
             }
         }
@@ -152,7 +151,9 @@ async fn fortune(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> imp
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
             if let Ok(credential) = parse_authorization(auth_str) {
-                match payment.verify_credential(&credential).await {
+                // Only a credential paid for this route's price is accepted,
+                // so paying for `/api/ping` does not unlock a fortune.
+                match payment.verify_charge(&credential, "1").await {
                     Ok(receipt) => {
                         let fortune = FORTUNES
                             .choose(&mut rand::rng())
@@ -165,10 +166,8 @@ async fn fortune(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> imp
                         )
                             .into_response();
                     }
-                    Err(e) => {
-                        let body = serde_json::json!({ "error": e.to_string() });
-                        return (StatusCode::PAYMENT_REQUIRED, Json(body)).into_response();
-                    }
+                    // A rejected credential gets a fresh challenge below.
+                    Err(e) => eprintln!("payment rejected: {e}"),
                 }
             }
         }
