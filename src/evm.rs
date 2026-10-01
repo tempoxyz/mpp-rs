@@ -41,7 +41,10 @@ pub fn parse_address(s: &str) -> Result<Address> {
         .map_err(|e| MppError::InvalidConfig(format!("Invalid EVM address '{}': {}", s, e)))
 }
 
-/// Parse a U256 amount from a string.
+/// Parse a U256 amount from a string of base-10 digits.
+///
+/// Signs, `0x`/`0o`/`0b` prefixes, `_` separators and the empty string are
+/// rejected.
 ///
 /// # Examples
 ///
@@ -50,9 +53,16 @@ pub fn parse_address(s: &str) -> Result<Address> {
 ///
 /// let amount = parse_amount("1000000").unwrap();
 /// assert_eq!(amount.to_string(), "1000000");
+/// assert!(parse_amount("0x10").is_err());
 /// ```
 pub fn parse_amount(s: &str) -> Result<U256> {
-    U256::from_str(s)
+    let digits = crate::protocol::intents::base_unit_digits(s).ok_or_else(|| {
+        MppError::InvalidAmount(format!(
+            "Invalid U256 amount '{}': expected base-10 digits",
+            s
+        ))
+    })?;
+    U256::from_str_radix(digits, 10)
         .map_err(|e| MppError::InvalidAmount(format!("Invalid U256 amount '{}': {}", s, e)))
 }
 

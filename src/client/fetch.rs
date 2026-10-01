@@ -570,7 +570,7 @@ async fn send_with_payment<P: PaymentProvider>(
         {
             retried_stale_session = true;
             pending_payments
-                .rollback()
+                .invalidate()
                 .await
                 .map_err(HttpError::Payment)?;
             paid_challenge_ids.clear();

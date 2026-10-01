@@ -12,7 +12,8 @@
 //! 3. Server verifies, begins streaming data
 //! 4. Per tick: deduct from channel balance
 //! 5. When exhausted: send `needVoucher`, wait for voucher frame
-//! 6. Client sends voucher credential → server verifies, resumes
+//! 6. Client sends voucher credential → server verifies, replies with a
+//!    receipt and resumes (or replies with an error and ends the session)
 //! 7. On completion: send session receipt, close
 //!
 //! # Example
@@ -43,7 +44,7 @@ use crate::protocol::methods::tempo::session_method::{
     deduct_from_channel, normalize_channel_id, ChannelStore,
 };
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
-use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod};
+use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 
 /// Options for [`ws_session`].
 pub struct WsSessionOptions<G> {
@@ -167,6 +168,10 @@ async fn send_receipt<S>(
 /// split WebSocket. When a voucher credential arrives, it's verified via
 /// the session method, which updates the channel store and unblocks the
 /// sender's `wait_for_update`.
+///
+/// The verification result is not reported to the client, which cannot tell
+/// a rejected voucher from an accepted one. Use [`process_vouchers`] instead.
+#[deprecated(note = "use `process_vouchers`, which reports each voucher result to the client")]
 pub async fn process_incoming_vouchers<M, S, R>(receiver: &mut R, mpp: &crate::server::Mpp<M, S>)
 where
     M: ChargeMethod,
@@ -186,9 +191,77 @@ where
     }
 }
 
+/// Process incoming WebSocket messages for voucher credentials and report
+/// each result to the client.
+///
+/// Call this concurrently with [`ws_session`] on the receiver half of a
+/// split WebSocket. `sender` must write to the same socket as the sink
+/// given to [`ws_session`], e.g. both are clones of a channel that is
+/// drained into the socket's write half.
+///
+/// Every `credential` frame is verified via the session method:
+/// - accepted: the channel store is updated, which unblocks the sender's
+///   `wait_for_update`, and the receipt is sent as a `receipt` frame
+/// - rejected or malformed: an `error` frame is sent and processing stops,
+///   since clients treat `error` as terminal
+///
+/// Frames that are not credentials are ignored.
+///
+/// Returns `Ok(())` once the connection ends and the verification error
+/// after a credential was refused. Either way the session is over, while
+/// [`ws_session`] would keep waiting for a voucher: stop it (e.g. by running
+/// both futures in `tokio::select!`) and close the socket.
+pub async fn process_vouchers<M, S, R, W>(
+    receiver: &mut R,
+    sender: &mut W,
+    mpp: &crate::server::Mpp<M, S>,
+) -> Result<(), VerificationError>
+where
+    M: ChargeMethod,
+    S: SessionMethod,
+    R: futures_util::Stream<Item = Result<String, Box<dyn std::error::Error + Send + Sync>>>
+        + Send
+        + Unpin,
+    W: futures_util::Sink<String> + Unpin,
+{
+    while let Some(Ok(text)) = receiver.next().await {
+        let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
+            continue;
+        };
+        let result = match parse_authorization(&credential) {
+            Ok(parsed) => mpp.verify_session(&parsed).await,
+            Err(e) => Err(VerificationError::with_code(
+                format!("malformed credential: {e}"),
+                ErrorCode::InvalidCredential,
+            )),
+        };
+        match result {
+            Ok(verified) => {
+                let msg = WsResponse::Receipt {
+                    receipt: serde_json::to_value(&verified.receipt)
+                        .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
+                };
+                if sender.send(msg.to_text()).await.is_err() {
+                    return Ok(()); // client disconnected
+                }
+            }
+            Err(error) => {
+                let msg = WsResponse::Error {
+                    error: error.message.clone(),
+                };
+                let _ = sender.send(msg.to_text()).await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::core::{format_authorization, PaymentCredential, Receipt};
+    use crate::protocol::intents::{ChargeRequest, SessionRequest};
     use crate::protocol::methods::tempo::session_method::{ChannelState, InMemoryChannelStore};
 
     fn test_channel_state(channel_id: &str, voucher_amount: u128, deposit: u128) -> ChannelState {
@@ -380,6 +453,140 @@ mod tests {
 
         let frames = frames.lock().unwrap();
         assert!(frames.is_empty(), "unexpected frames: {frames:?}");
+    }
+
+    #[derive(Clone)]
+    struct MockCharge;
+
+    impl ChargeMethod for MockCharge {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        async fn verify(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &ChargeRequest,
+        ) -> Result<Receipt, VerificationError> {
+            Err(VerificationError::new("charge is not used"))
+        }
+    }
+
+    /// Session method that accepts every voucher except those signed `0xbad`.
+    #[derive(Clone)]
+    struct MockSession;
+
+    impl SessionMethod for MockSession {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        async fn verify_session(
+            &self,
+            credential: &PaymentCredential,
+            _request: &SessionRequest,
+        ) -> Result<Receipt, VerificationError> {
+            if credential.payload["signature"] == "0xbad" {
+                return Err(VerificationError::invalid_signature(
+                    "invalid voucher signature",
+                ));
+            }
+            let amount = credential.payload["cumulativeAmount"].as_str().unwrap();
+            Ok(Receipt::success("tempo", format!("accepted-{amount}")))
+        }
+    }
+
+    /// Voucher results are reported in-band: a receipt per accepted voucher,
+    /// and an error that ends processing for a rejected or malformed one.
+    #[tokio::test]
+    async fn test_process_vouchers_reports_results() {
+        let mpp = crate::server::Mpp::new(MockCharge, "ws.test", "secret")
+            .with_session_method(MockSession);
+        let voucher = |amount: &str, signature: &str| {
+            let challenge = mpp
+                .session_challenge(
+                    "100",
+                    "0x20c0000000000000000000000000000000000000",
+                    "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                )
+                .unwrap();
+            let credential = PaymentCredential::new(
+                challenge.to_echo(),
+                serde_json::json!({
+                    "action": "voucher",
+                    "channelId": "0xabc",
+                    "cumulativeAmount": amount,
+                    "signature": signature,
+                }),
+            );
+            serde_json::json!({
+                "type": "credential",
+                "credential": format_authorization(&credential).unwrap(),
+            })
+            .to_string()
+        };
+        let data = serde_json::json!({"type": "message", "data": "hi"}).to_string();
+        let malformed =
+            serde_json::json!({"type": "credential", "credential": "Payment !"}).to_string();
+
+        // (incoming frames, receipts sent, error sent, error code returned)
+        let cases = [
+            (
+                vec![
+                    data,
+                    "not json".to_string(),
+                    voucher("200", "0xok"),
+                    voucher("300", "0xok"),
+                ],
+                vec!["accepted-200", "accepted-300"],
+                None,
+                None,
+            ),
+            (
+                vec![
+                    voucher("200", "0xok"),
+                    voucher("300", "0xbad"),
+                    voucher("400", "0xok"),
+                ],
+                vec!["accepted-200"],
+                Some("invalid voucher signature"),
+                Some(ErrorCode::InvalidSignature),
+            ),
+            (
+                vec![malformed, voucher("200", "0xok")],
+                vec![],
+                Some("malformed credential"),
+                Some(ErrorCode::InvalidCredential),
+            ),
+        ];
+
+        for (incoming, receipts, error, code) in cases {
+            let mut receiver = futures_util::stream::iter(incoming.into_iter().map(Ok));
+            let (mut sink, frames) = recording_sink();
+
+            let result = process_vouchers(&mut receiver, &mut sink, &mpp).await;
+            assert_eq!(result.err().and_then(|e| e.code), code);
+
+            let frames = frames.lock().unwrap();
+            let mut expected = receipts.len();
+            for (frame, reference) in frames.iter().zip(&receipts) {
+                assert!(
+                    matches!(frame, WsResponse::Receipt { receipt }
+                        if receipt["status"] == "success" && receipt["reference"] == *reference),
+                    "expected a receipt for {reference}, got: {frame:?}"
+                );
+            }
+            if let Some(error) = error {
+                expected += 1;
+                assert!(
+                    matches!(frames.last(), Some(WsResponse::Error { error: sent })
+                        if sent.contains(error)),
+                    "expected error {error:?}, got: {:?}",
+                    frames.last()
+                );
+            }
+            assert_eq!(frames.len(), expected, "unexpected frames: {frames:?}");
+        }
     }
 
     #[test]

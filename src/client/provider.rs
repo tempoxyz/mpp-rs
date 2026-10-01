@@ -168,6 +168,20 @@ pub trait PaymentProvider: Clone + Send + Sync {
         async { Ok(()) }
     }
 
+    /// Discard provider state the server reported as permanently unusable.
+    ///
+    /// Called instead of [`rollback_payment`](Self::rollback_payment) when the
+    /// server answers a credential with `410 Gone`, e.g. a session channel it
+    /// no longer knows or that is already finalized. Defaults to
+    /// `rollback_payment`.
+    fn invalidate_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> impl Future<Output = Result<(), MppError>> + Send {
+        self.rollback_payment(challenge, credential)
+    }
+
     /// Release transient delivery state when a paid request future is dropped.
     ///
     /// This hook is synchronous because cancellation is observed from `Drop`.
@@ -230,6 +244,16 @@ impl<P: PaymentProvider> PendingPayments<P> {
 
     pub(crate) async fn rollback(&mut self) -> Result<(), MppError> {
         rollback_payments(&self.provider, &self.payments).await?;
+        self.payments.clear();
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate(&mut self) -> Result<(), MppError> {
+        for (challenge, credential) in &self.payments {
+            self.provider
+                .invalidate_payment(challenge, credential)
+                .await?;
+        }
         self.payments.clear();
         Ok(())
     }
@@ -460,6 +484,26 @@ impl PaymentProvider for MultiProvider {
         )))
     }
 
+    async fn invalidate_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider.dyn_invalidate_payment(challenge, credential).await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
     fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         let method = challenge.method.as_str();
         let intent = challenge.intent.as_str();
@@ -528,6 +572,11 @@ trait DynPaymentProvider: Send + Sync {
         credential: &'a PaymentCredential,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
     fn dyn_rollback_payment<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
+    fn dyn_invalidate_payment<'a>(
         &'a self,
         challenge: &'a PaymentChallenge,
         credential: &'a PaymentCredential,
@@ -603,6 +652,16 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         credential: &'a PaymentCredential,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>> {
         Box::pin(PaymentProvider::rollback_payment(
+            self, challenge, credential,
+        ))
+    }
+
+    fn dyn_invalidate_payment<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>> {
+        Box::pin(PaymentProvider::invalidate_payment(
             self, challenge, credential,
         ))
     }

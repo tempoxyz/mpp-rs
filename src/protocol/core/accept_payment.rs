@@ -13,8 +13,10 @@
 //! Accept-Payment: <method>/<intent>[;q=<qvalue>], ...
 //! ```
 //!
-//! - `method` and `intent` are lowercase `[a-z0-9-]+` or `*` (wildcard).
-//! - `q` is a float in `0.0..=1.0` with up to 3 decimal places.
+//! - `method` and `intent` are lowercase `[a-z0-9-]+` or `*` (wildcard);
+//!   `method` may also contain `:` and `_`.
+//! - `q` is an HTTP qvalue: `0` or `1`, optionally followed by `.` and up to
+//!   3 decimal places (`0.0..=1.0`). The parameter name is case-insensitive.
 //! - Omitted `q` defaults to `1.0`.
 //! - `q=0` means explicit opt-out.
 //!
@@ -125,8 +127,8 @@ fn parse_entry(part: &str, index: usize) -> Result<Entry, MppError> {
         )));
     }
 
-    validate_token(method, part)?;
-    validate_token(intent, part)?;
+    validate_token(method, true, part)?;
+    validate_token(intent, false, part)?;
 
     let q = match params_str {
         Some(ps) => parse_q_param(ps, part)?,
@@ -141,15 +143,18 @@ fn parse_entry(part: &str, index: usize) -> Result<Entry, MppError> {
     })
 }
 
-/// Validate that a token is `[a-z0-9-]+` or `*`.
-fn validate_token(token: &str, entry: &str) -> Result<(), MppError> {
+/// Validate that a token is `[a-z0-9-]+` or `*`. Method tokens may also
+/// contain `:` and `_`, which the method name grammar allows.
+fn validate_token(token: &str, is_method: bool, entry: &str) -> Result<(), MppError> {
     if token == "*" {
         return Ok(());
     }
-    if token
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if token.chars().all(|c| {
+        c.is_ascii_lowercase()
+            || c.is_ascii_digit()
+            || c == '-'
+            || (is_method && matches!(c, ':' | '_'))
+    }) {
         Ok(())
     } else {
         Err(MppError::bad_request(format!(
@@ -160,40 +165,62 @@ fn validate_token(token: &str, entry: &str) -> Result<(), MppError> {
 
 /// Parse `q=<value>` from params string.
 /// Last `q` wins (matches mppx behavior). Spaces around `=` are tolerated.
+/// The parameter name is case-insensitive, other parameters are ignored.
 fn parse_q_param(params: &str, entry: &str) -> Result<f32, MppError> {
     let mut q = 1.0;
     for param in params.split(';') {
         let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
         // Split on '=' tolerating spaces: "q = 0.5" → name="q", value="0.5"
-        if let Some(eq_pos) = param.find('=') {
-            let name = param[..eq_pos].trim();
-            let value = param[eq_pos + 1..].trim();
-            if name == "q" {
-                q = parse_q_value(value, entry)?;
-            }
+        let (name, value) = param
+            .split_once('=')
+            .map(|(name, value)| (name.trim(), value.trim()))
+            .filter(|(name, value)| {
+                is_param_name(name) && !value.is_empty() && !value.contains(char::is_whitespace)
+            })
+            .ok_or_else(|| {
+                MppError::bad_request(format!(
+                    "invalid parameter in Accept-Payment entry: {entry}"
+                ))
+            })?;
+        if name.eq_ignore_ascii_case("q") {
+            q = parse_q_value(value, entry)?;
         }
     }
     Ok(q)
 }
 
+fn is_param_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Parse an RFC 9110 `qvalue`: `0` or `1`, optionally followed by `.` and up
+/// to three digits (only zeros after `1`).
 fn parse_q_value(val: &str, entry: &str) -> Result<f32, MppError> {
-    let q: f32 = val
-        .parse()
-        .map_err(|_| MppError::bad_request(format!("invalid q-value in: {entry}")))?;
-    if !(0.0..=1.0).contains(&q) {
+    let (int, frac) = val.split_once('.').unwrap_or((val, ""));
+    let valid = frac.len() <= 3
+        && match int {
+            "0" => frac.bytes().all(|b| b.is_ascii_digit()),
+            "1" => frac.bytes().all(|b| b == b'0'),
+            _ => false,
+        };
+    if !valid {
         return Err(MppError::bad_request(format!(
-            "q-value out of range in: {entry}"
+            "invalid q-value in: {entry}"
         )));
     }
-    // Validate max 3 decimal places
-    if let Some(dot) = val.find('.') {
-        if val[dot + 1..].len() > 3 {
-            return Err(MppError::bad_request(format!(
-                "q-value has more than 3 decimal places in: {entry}"
-            )));
-        }
+    if int == "1" {
+        return Ok(1.0);
     }
-    Ok(q)
+    let thousandths = (0..3).fold(0u16, |acc, i| {
+        acc * 10 + u16::from(frac.as_bytes().get(i).map_or(0, |b| b - b'0'))
+    });
+    Ok(f32::from(thousandths) / 1000.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +375,7 @@ fn matches_entry<T: HasMethodIntent>(offer: &T, pref: &Entry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::core::MethodName;
 
     struct Offer {
         method: String,
@@ -405,6 +433,50 @@ mod tests {
         assert!(parse("tempo/charge;q=1.5").is_err()); // q > 1
         assert!(parse("tempo/charge;q=-0.1").is_err()); // q < 0
         assert!(parse("tempo/charge;q=0.1234").is_err()); // >3 decimals
+    }
+
+    #[test]
+    fn parse_rejects_non_http_qvalues() {
+        for q in [
+            ".5", "1e-1", "+0.5", "0.5f", "01", "1.001", "inf", "NaN", "",
+        ] {
+            assert!(parse(&format!("tempo/charge;q={q}")).is_err(), "q={q}");
+        }
+        for (q, expected) in [("0.", 0.0), ("1.", 1.0), ("1.000", 1.0), ("0.25", 0.25)] {
+            let e = parse(&format!("tempo/charge;q={q}")).unwrap();
+            assert_eq!(e[0].q, expected, "q={q}");
+        }
+    }
+
+    #[test]
+    fn parse_q_name_is_case_insensitive() {
+        let prefs = parse("tempo/charge;Q=0, stripe/charge").unwrap();
+        assert_eq!(prefs[0].q, 0.0);
+
+        let offers = vec![offer("tempo", "charge"), offer("stripe", "charge")];
+        let ranked = rank(&offers, &prefs);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].method(), "stripe");
+    }
+
+    #[test]
+    fn parse_rejects_parameter_without_value() {
+        assert!(parse("tempo/charge;q").is_err());
+        assert!(parse("tempo/charge;q=").is_err());
+        assert!(parse("tempo/charge;=0.5").is_err());
+        // Unknown well-formed parameters are ignored.
+        assert_eq!(parse("tempo/charge;foo=bar;q=0.5").unwrap()[0].q, 0.5);
+    }
+
+    #[test]
+    fn parse_accepts_method_name_grammar() {
+        let e = parse("eip155:8453_usdc/charge;q=0.5").unwrap();
+        assert_eq!(e[0].method, "eip155:8453_usdc");
+        assert!(MethodName::new(e[0].method.as_str()).is_valid());
+
+        // The intent token grammar has neither.
+        assert!(parse("tempo/char:ge").is_err());
+        assert!(parse("tempo/char_ge").is_err());
     }
 
     #[test]

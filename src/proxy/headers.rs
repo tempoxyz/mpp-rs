@@ -14,6 +14,7 @@ const HOP_BY_HOP: &[&str] = &[
 const PAYMENT_HEADERS: &[&str] = &[
     "authorization",
     "accept-payment",
+    "payment-authorization",
     "payment-receipt",
     "payment-required",
     "payment-response",
@@ -145,6 +146,7 @@ mod tests {
             ("Transfer-Encoding".into(), "chunked".into()),
             ("Proxy-Authorization".into(), "Basic xxx".into()),
             ("Authorization".into(), "Payment …".into()),
+            ("Payment-Authorization".into(), "Payment …".into()),
             ("Accept-Payment".into(), "tempo/charge".into()),
             ("Payment-Receipt".into(), "…".into()),
             ("WWW-Authenticate".into(), "…".into()),

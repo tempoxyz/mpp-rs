@@ -408,7 +408,29 @@ impl TempoSessionProvider {
         self.commit_referenced_open(&channel_id);
     }
 
+    /// Forgets a channel whose open was never accepted. An established channel
+    /// holds the payer's deposit and outlives a rejected voucher.
     async fn rollback_credential(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let Some(channel_id) = Self::credential_channel_id(credential) else {
+            return Ok(());
+        };
+        let is_pending_open = self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .get(&channel_id)
+            .is_some_and(|pending| pending.challenge_id == challenge.id);
+        if !is_pending_open {
+            return Ok(());
+        }
+        self.invalidate_credential(challenge, credential).await
+    }
+
+    async fn invalidate_credential(
         &self,
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
@@ -2050,6 +2072,21 @@ impl PaymentProvider for TempoSessionProvider {
         result
     }
 
+    async fn invalidate_payment(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<(), MppError> {
+        let lease = self
+            .pending_payment_leases
+            .lock()
+            .unwrap()
+            .remove(&challenge.id);
+        let result = self.invalidate_credential(challenge, credential).await;
+        drop(lease);
+        result
+    }
+
     fn abandon_payment(&self, challenge: &PaymentChallenge, _credential: &PaymentCredential) {
         self.pending_payment_leases
             .lock()
@@ -2626,7 +2663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_session_credential_invalidates_its_channel() {
+    async fn rollback_forgets_pending_open_and_keeps_established_channel() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
         use crate::protocol::methods::tempo::session::{
@@ -2741,6 +2778,15 @@ mod tests {
         provider.commit_referenced_open(&channel_id.to_string());
         provider
             .rollback_payment(&challenge, &credential)
+            .await
+            .unwrap();
+
+        assert_eq!(provider.channels.lock().unwrap().len(), 1);
+        assert_eq!(provider.channel_id_to_key.lock().unwrap().len(), 1);
+        assert!(store.get(&store_key).await.unwrap().is_some());
+
+        provider
+            .invalidate_payment(&challenge, &credential)
             .await
             .unwrap();
 
@@ -3725,5 +3771,143 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn rejected_voucher_keeps_established_channel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::channel_ops::build_channel_descriptor;
+        use crate::client::Fetch;
+        use crate::protocol::methods::tempo::precompile_voucher::compute_precompile_channel_id;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let salt = B256::repeat_byte(0x44);
+        let nonce_hash = B256::repeat_byte(0x55);
+        let key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+
+        for (rejection, kept) in [
+            (StatusCode::PAYMENT_REQUIRED, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::GONE, false),
+        ] {
+            let store = Arc::new(MemoryChannelStore::default());
+            let provider = make_test_provider().with_channel_store(store.clone());
+            let payer = provider.signer.address();
+            let channel_id = compute_precompile_channel_id(
+                payer,
+                payee,
+                Address::ZERO,
+                currency,
+                salt,
+                payer,
+                nonce_hash,
+                42431,
+            );
+            let entry = ChannelEntry {
+                channel_id,
+                salt,
+                cumulative_amount: 1_000,
+                deposit: 100_000,
+                descriptor: Some(build_channel_descriptor(
+                    payer,
+                    payee,
+                    Address::ZERO,
+                    currency,
+                    salt,
+                    payer,
+                    nonce_hash,
+                )),
+                settlement_route: None,
+                escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
+                chain_id: 42431,
+                opened: true,
+            };
+            store
+                .set(&TempoSessionProvider::stored_entry(&entry).unwrap())
+                .await
+                .unwrap();
+            provider.channels.lock().unwrap().insert(key.clone(), entry);
+            provider
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .insert(channel_id.to_string(), key.clone());
+
+            let challenges = Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/paid",
+                get({
+                    let challenge = challenge.clone();
+                    move |headers: HeaderMap| {
+                        let mut challenge = challenge.clone();
+                        let challenges = challenges.clone();
+                        async move {
+                            let paid = headers.contains_key("authorization");
+                            if paid && rejection != StatusCode::PAYMENT_REQUIRED {
+                                return rejection.into_response();
+                            }
+                            challenge.id =
+                                format!("challenge-{}", challenges.fetch_add(1, Ordering::SeqCst));
+                            (
+                                StatusCode::PAYMENT_REQUIRED,
+                                [("www-authenticate", challenge.to_header().unwrap())],
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let result = reqwest::Client::new()
+                .get(format!("http://{address}/paid"))
+                .send_with_payment(&provider)
+                .await;
+
+            if !kept {
+                // The retry found no channel and went on to open a new one.
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains("No deposit amount available"), "{err}");
+                assert!(provider.channels.lock().unwrap().is_empty());
+                assert!(store.get(&key).await.unwrap().is_none());
+                continue;
+            }
+
+            assert_eq!(result.unwrap().status(), rejection);
+            assert_eq!(
+                store.get(&key).await.unwrap().map(|entry| entry.channel_id),
+                Some(channel_id),
+                "{rejection}"
+            );
+            let credential = provider.pay(&challenge).await.unwrap();
+            assert!(
+                matches!(
+                    credential.payload_as::<SessionCredentialPayload>().unwrap(),
+                    SessionCredentialPayload::Voucher { channel_id: reused, .. }
+                        if reused == channel_id.to_string()
+                ),
+                "{rejection}"
+            );
+        }
     }
 }
