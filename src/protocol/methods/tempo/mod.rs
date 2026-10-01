@@ -25,7 +25,7 @@
 //!
 //! // Simple charge challenge with HMAC-bound ID
 //! let challenge = tempo::charge_challenge(
-//!     "my-server-secret",
+//!     "my-server-secret-of-at-least-32-bytes",
 //!     "api.example.com",
 //!     "1000000",
 //!     "0x20c0000000000000000000000000000000000000",
@@ -42,7 +42,7 @@
 //!     ..Default::default()
 //! };
 //! let challenge = tempo::charge_challenge_with_options(
-//!     "my-server-secret",
+//!     "my-server-secret-of-at-least-32-bytes",
 //!     "api.example.com",
 //!     &request,
 //!     None,
@@ -211,7 +211,8 @@ pub use crate::protocol::intents::INTENT_SESSION;
 /// # Arguments
 ///
 /// * `secret_key` - Server secret key for HMAC-bound challenge ID.
-///   Enables stateless verification of payment credentials.
+///   Enables stateless verification of payment credentials. Should be at
+///   least 32 bytes.
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
 /// * `amount` - Amount in atomic units (e.g., "1000000" for 1 pathUSD)
 /// * `currency` - Token address (e.g., pathUSD address)
@@ -223,7 +224,7 @@ pub use crate::protocol::intents::INTENT_SESSION;
 /// use mpp::protocol::methods::tempo;
 ///
 /// let challenge = tempo::charge_challenge(
-///     "my-server-secret",
+///     "my-server-secret-of-at-least-32-bytes",
 ///     "api.example.com",
 ///     "1000000",
 ///     "0x20c0000000000000000000000000000000000000",
@@ -261,7 +262,8 @@ pub fn charge_challenge(
 /// # Arguments
 ///
 /// * `secret_key` - Server secret key for HMAC-bound challenge ID.
-///   Enables stateless verification of payment credentials.
+///   Enables stateless verification of payment credentials. Should be at
+///   least 32 bytes.
 /// * `realm` - Protection space / realm (e.g., "api.example.com")
 /// * `request` - A fully configured [`ChargeRequest`](crate::protocol::intents::ChargeRequest)
 /// * `expires` - Optional challenge expiration (ISO 8601)
@@ -282,7 +284,7 @@ pub fn charge_challenge(
 /// };
 ///
 /// let challenge = tempo::charge_challenge_with_options(
-///     "my-server-secret",
+///     "my-server-secret-of-at-least-32-bytes",
 ///     "api.example.com",
 ///     &request,
 ///     None,
@@ -467,7 +469,7 @@ pub fn generate_challenge_id_from_request(
 mod tests {
     use super::*;
 
-    const TEST_SECRET: &str = "test-secret-key";
+    const TEST_SECRET: &str = "test-secret-key-at-least-32-bytes";
 
     #[test]
     fn test_challenge_id_is_deterministic() {
@@ -628,7 +630,7 @@ mod tests {
     #[test]
     fn test_challenge_id_differs_for_different_secret() {
         let challenge1 = charge_challenge(
-            "secret-one",
+            "secret-one-key-at-least-32-bytes",
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000000",
@@ -637,7 +639,7 @@ mod tests {
         .unwrap();
 
         let challenge2 = charge_challenge(
-            "secret-two", // Different secret
+            "secret-two-key-at-least-32-bytes", // Different secret
             "api.example.com",
             "1000000",
             "0x20c0000000000000000000000000000000000000",

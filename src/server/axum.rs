@@ -2067,7 +2067,7 @@ mod tests {
                     mpp: Mpp::new_with_config(
                         SuccessMethod,
                         "MPP Payment",
-                        "test-secret",
+                        "test-secret-key-at-least-32-bytes",
                         "0x20c0000000000000000000000000000000000000",
                         "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
                     ),
@@ -2300,7 +2300,7 @@ mod tests {
                     mpp: Mpp::new_with_config(
                         SuccessMethod,
                         "MPP Payment",
-                        "test-secret",
+                        "test-secret-key-at-least-32-bytes",
                         "",
                         RECIPIENT,
                     )
@@ -2438,7 +2438,9 @@ mod tests {
             assert!(matches!(err, MppChargeRejection::Offers(_)));
             let offers = response_offers(err);
             assert_eq!(currencies_of(&offers), [OUSD, USDC]);
-            assert!(offers.iter().all(|c| c.verify("test-secret")));
+            assert!(offers
+                .iter()
+                .all(|c| c.verify("test-secret-key-at-least-32-bytes")));
         }
 
         #[tokio::test]
@@ -2486,7 +2488,7 @@ mod tests {
                     recipient: RECIPIENT,
                 })
                 .chain_id(CHAIN_ID)
-                .secret_key("test-secret"),
+                .secret_key("test-secret-key-at-least-32-bytes"),
             )
             .unwrap();
             let challenger: Arc<dyn ChargeChallenger> = Arc::new(mpp);

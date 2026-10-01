@@ -125,6 +125,9 @@ impl PaymentChallenge {
     ///
     /// This is the Rust equivalent of `Challenge.from({ secretKey, ... })` in the TS SDK.
     ///
+    /// `secret_key` must be at least 32 bytes. This constructor cannot fail and
+    /// does not check the length.
+    ///
     /// # Examples
     ///
     /// ```
@@ -132,7 +135,7 @@ impl PaymentChallenge {
     /// use mpp::protocol::core::Base64UrlJson;
     ///
     /// let challenge = PaymentChallenge::with_secret_key(
-    ///     "my-server-secret",
+    ///     "my-server-secret-of-at-least-32-bytes",
     ///     "api.example.com",
     ///     "tempo",
     ///     "charge",
@@ -140,7 +143,7 @@ impl PaymentChallenge {
     /// );
     ///
     /// // ID is HMAC-bound — can be verified later
-    /// assert!(challenge.verify("my-server-secret"));
+    /// assert!(challenge.verify("my-server-secret-of-at-least-32-bytes"));
     /// ```
     pub fn with_secret_key(
         secret_key: &str,
@@ -184,6 +187,9 @@ impl PaymentChallenge {
     /// The `opaque` parameter accepts a `Base64UrlJson` value (use
     /// `Base64UrlJson::from_value()` to create from a JSON object). This matches
     /// the mppx SDK where opaque is `Record<string, string>`.
+    ///
+    /// `secret_key` must be at least 32 bytes. This constructor cannot fail and
+    /// does not check the length.
     #[allow(clippy::too_many_arguments)]
     pub fn with_secret_key_full(
         secret_key: &str,
@@ -459,6 +465,25 @@ impl PaymentChallenge {
 
         Ok(())
     }
+}
+
+/// Minimum HMAC secret key length in bytes, matching mppx.
+#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+const MIN_SECRET_KEY_BYTES: usize = 32;
+
+/// Reject HMAC secret keys shorter than 32 bytes.
+///
+/// Whoever can guess the key can mint challenges for any amount, so the
+/// fallible entry points that take a secret call this before signing.
+#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+pub(crate) fn validate_secret_key(secret_key: &str) -> crate::error::Result<()> {
+    if secret_key.len() < MIN_SECRET_KEY_BYTES {
+        return Err(crate::error::MppError::InvalidConfig(format!(
+            "Secret key must be at least {MIN_SECRET_KEY_BYTES} bytes. \
+             Generate one with `openssl rand -base64 32`."
+        )));
+    }
+    Ok(())
 }
 
 /// Compute an HMAC-SHA256 challenge ID from challenge parameters.

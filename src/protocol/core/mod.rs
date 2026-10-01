@@ -74,6 +74,8 @@ pub mod types;
 // Re-export all public types
 #[cfg(feature = "server")]
 pub(crate) use challenge::constant_time_eq;
+#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+pub(crate) use challenge::validate_secret_key;
 pub use challenge::{
     advertised_credential_header, compute_challenge_id, compute_challenge_id_with_header,
     extract_tx_hash, is_default_credential_header, parse_advertised_credential_header,
