@@ -99,7 +99,8 @@ pub struct TempoSessionProvider {
     max_deposit: Option<u128>,
     /// Default deposit in atomic units when no suggestedDeposit is available.
     default_deposit: Option<u128>,
-    /// Preferred automatic top-up size. Exact shortfalls are used when unset.
+    /// Preferred automatic top-up size. When unset, the server's
+    /// `suggestedDeposit` is used, or the exact shortfall without one.
     top_up_amount: Option<u128>,
     /// Stablecoin used to acquire the session currency before open/top-up.
     autoswap: Option<AutoswapConfig>,
@@ -230,6 +231,10 @@ impl TempoSessionProvider {
     }
 
     /// Set the preferred automatic top-up size in atomic units.
+    ///
+    /// Takes precedence over the server's `suggestedDeposit`. A top-up is
+    /// never smaller than the shortfall it has to cover, nor does it raise the
+    /// deposit above [`Self::with_max_deposit`].
     pub fn with_top_up_amount(mut self, amount: u128) -> Self {
         self.top_up_amount = Some(amount);
         self
@@ -353,9 +358,7 @@ impl TempoSessionProvider {
             .transpose()
             .mpp_config("invalid suggestedDeposit")?
             .unwrap_or_default();
-        let proposed = shortfall
-            .max(suggested)
-            .max(self.top_up_amount.unwrap_or_default());
+        let proposed = shortfall.max(self.top_up_amount.unwrap_or(suggested));
         let additional = match self.max_deposit {
             Some(max_deposit) => proposed.min(max_deposit - deposit),
             None => proposed,
@@ -2360,6 +2363,25 @@ mod tests {
                 .required_top_up(9_500_001, 9_500_000, None)
                 .unwrap(),
             Some(500_000)
+        );
+    }
+
+    #[test]
+    fn configured_top_up_amount_takes_precedence_over_suggested_deposit() {
+        let provider = make_test_provider().with_top_up_amount(10_000);
+
+        assert_eq!(
+            provider
+                .required_top_up(25_000, 20_000, Some("500000"))
+                .unwrap(),
+            Some(10_000)
+        );
+        // Never less than what the voucher needs.
+        assert_eq!(
+            provider
+                .required_top_up(45_000, 20_000, Some("500000"))
+                .unwrap(),
+            Some(25_000)
         );
     }
 
