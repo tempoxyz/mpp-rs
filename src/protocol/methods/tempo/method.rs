@@ -526,10 +526,33 @@ fn assert_challenge_bound_memo(
     challenge_id: &str,
     realm: &str,
 ) -> Result<(), VerificationError> {
-    let bound = matched_logs.iter().any(|log| match log {
-        MatchedTransferLog::Transfer => false,
-        MatchedTransferLog::Memo(memo) => is_challenge_bound_memo(memo, challenge_id, realm),
+    let memos = matched_logs.iter().filter_map(|log| match log {
+        MatchedTransferLog::Transfer => None,
+        MatchedTransferLog::Memo(memo) => Some(memo),
     });
+    assert_challenge_bound_memos(memos, challenge_id, realm)
+}
+
+/// Require a challenge-bound attribution memo among the memos of the matched
+/// transfers, and reject MPP attribution for any other challenge or server.
+///
+/// Otherwise one transaction could carry attribution for several challenges
+/// and be accepted for each of them. Non-MPP memos are ignored.
+fn assert_challenge_bound_memos<'a>(
+    memos: impl IntoIterator<Item = &'a [u8; 32]>,
+    challenge_id: &str,
+    realm: &str,
+) -> Result<(), VerificationError> {
+    let mut bound = false;
+    for memo in memos {
+        if !attribution::is_mpp_memo(memo) {
+            continue;
+        }
+        if !is_challenge_bound_memo(memo, challenge_id, realm) {
+            return Err(challenge_bound_memo_error());
+        }
+        bound = true;
+    }
 
     if bound {
         Ok(())
@@ -1106,7 +1129,7 @@ where
         sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
 
         let mut used_calls: Vec<bool> = vec![false; transfer_calls.len()];
-        let mut has_challenge_bound_memo = challenge_binding.is_none();
+        let mut matched_memos: Vec<[u8; 32]> = Vec::new();
 
         if require_exact_calls && transfer_calls.len() != expected.len() {
             return Err(VerificationError::new(format!(
@@ -1161,10 +1184,7 @@ where
                             && memo_bytes == B256::from(*exp_memo)
                         {
                             used_calls[call_idx] = true;
-                            if let Some((challenge_id, realm)) = challenge_binding {
-                                has_challenge_bound_memo |=
-                                    is_challenge_bound_memo(exp_memo, challenge_id, realm);
-                            }
+                            matched_memos.push(*exp_memo);
                             found = true;
                             break;
                         }
@@ -1188,10 +1208,7 @@ where
 
                         if to == transfer.recipient && amount == transfer.amount {
                             used_calls[call_idx] = true;
-                            if let Some((challenge_id, realm)) = challenge_binding {
-                                has_challenge_bound_memo |=
-                                    is_challenge_bound_memo(&memo.0, challenge_id, realm);
-                            }
+                            matched_memos.push(memo.0);
                             found = true;
                             break;
                         }
@@ -1219,8 +1236,8 @@ where
             ));
         }
 
-        if !has_challenge_bound_memo {
-            return Err(challenge_bound_memo_error());
+        if let Some((challenge_id, realm)) = challenge_binding {
+            assert_challenge_bound_memos(&matched_memos, challenge_id, realm)?;
         }
 
         Ok(None)
@@ -3268,6 +3285,40 @@ mod tests {
             .contains("memo is not bound to this challenge"));
     }
 
+    #[test]
+    fn test_assert_challenge_bound_memo_rejects_conflicting_attribution() {
+        let bound = MatchedTransferLog::Memo(attribution::encode(
+            "challenge-123",
+            "api.example.com",
+            None,
+        ));
+        let other_challenge = attribution::encode("challenge-456", "api.example.com", None);
+        let other_realm = attribution::encode("challenge-123", "other.example.com", None);
+
+        for conflicting in [other_challenge, other_realm].map(MatchedTransferLog::Memo) {
+            for matched in [[bound, conflicting], [conflicting, bound]] {
+                let error =
+                    assert_challenge_bound_memo(&matched, "challenge-123", "api.example.com")
+                        .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("memo is not bound to this challenge"));
+            }
+        }
+
+        // Plain transfers and non-MPP memos carry no attribution to conflict.
+        assert!(assert_challenge_bound_memo(
+            &[
+                MatchedTransferLog::Memo([0x11; 32]),
+                MatchedTransferLog::Transfer,
+                bound,
+            ],
+            "challenge-123",
+            "api.example.com",
+        )
+        .is_ok());
+    }
+
     /// Helper: sign a tx and encode as a 0x78 fee payer envelope.
     fn sign_and_encode_0x78(
         tx: tempo_alloy::primitives::TempoTransaction,
@@ -3574,6 +3625,89 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_validate_transaction_transfers_rejects_conflicting_attribution() {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let method = ChargeMethod::new(provider);
+        let currency = Address::repeat_byte(0x20);
+        let recipient = Address::repeat_byte(0x33);
+        let split_recipient = Address::repeat_byte(0x44);
+        let amount = U256::from(100u64);
+        let realm = "api.example.com";
+        // One transaction paying the primary transfer of `challenge-456` and
+        // the split of `challenge-123`.
+        let calls = vec![
+            tempo_alloy::primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_with_memo_input(
+                    recipient,
+                    amount,
+                    attribution::encode("challenge-456", realm, None),
+                ),
+            },
+            tempo_alloy::primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_with_memo_input(
+                    split_recipient,
+                    amount,
+                    attribution::encode("challenge-123", realm, None),
+                ),
+            },
+        ];
+        let primary = Transfer {
+            amount,
+            recipient,
+            memo: None,
+        };
+        let split = Transfer {
+            amount,
+            recipient: split_recipient,
+            memo: None,
+        };
+
+        for reverse in [false, true] {
+            let mut calls = calls.clone();
+            if reverse {
+                calls.reverse();
+            }
+            let tx_bytes = encode_signed_tx(calls, MAX_FEE_PAYER_GAS_LIMIT);
+            let validate = |challenge_id, expected: &[Transfer], require_exact_calls| {
+                method.validate_transaction_transfers_with_machine_token(
+                    &tx_bytes,
+                    currency,
+                    expected,
+                    CHAIN_ID,
+                    TransactionValidationOptions {
+                        require_exact_calls,
+                        challenge_binding: Some((challenge_id, realm)),
+                        ..Default::default()
+                    },
+                )
+            };
+
+            for require_exact_calls in [false, true] {
+                let error = validate(
+                    "challenge-123",
+                    &[primary.clone(), split.clone()],
+                    require_exact_calls,
+                )
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("memo is not bound to this challenge"),
+                    "unexpected error: {error}"
+                );
+            }
+            // The unmatched split transfer does not affect the other challenge.
+            assert!(validate("challenge-456", std::slice::from_ref(&primary), false).is_ok());
         }
     }
 
