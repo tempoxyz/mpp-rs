@@ -36,15 +36,11 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use time::format_description::well_known::Iso8601;
-use time::OffsetDateTime;
 
-use super::sse::required_cumulative;
+use super::metered::{final_receipt, Metered, MeteredEvent};
 use super::ws::{WsMessage, WsResponse};
 use crate::protocol::core::parse_authorization;
-use crate::protocol::methods::tempo::session_method::{
-    deduct_from_channel, normalize_channel_id, ChannelStore,
-};
+use crate::protocol::methods::tempo::session_method::{normalize_channel_id, ChannelStore};
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 
@@ -93,122 +89,57 @@ where
     } = options;
     let channel_id = normalize_channel_id(&channel_id);
 
-    let mut stream = std::pin::pin!(generate);
-
-    // Hold the generator back until the channel can pay for the first value,
-    // so that no work is started for an exhausted, closed or missing channel.
-    let mut need_voucher_sent = false;
-    loop {
-        match store.get_channel(&channel_id).await {
-            Ok(Some(ch)) if !ch.finalized && !ch.closing => {
-                if ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost {
-                    break;
-                }
-                if !need_voucher_sent {
-                    need_voucher_sent = true;
-                    let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
-                    let msg = WsResponse::NeedVoucher {
-                        channel_id: channel_id.clone(),
-                        required_cumulative: required.to_string(),
-                        accepted_cumulative: ch.highest_voucher_amount.to_string(),
-                        deposit: ch.deposit.to_string(),
-                    };
-                    if sender.send(msg.to_text()).await.is_err() {
-                        return; // client disconnected
-                    }
-                }
-                tokio::select! {
-                    _ = store.wait_for_update(&channel_id) => {},
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
-                }
-            }
-            _ => {
-                send_receipt(sender, &*store, &channel_id, &challenge_id).await;
-                return;
-            }
-        }
+    let events = Metered {
+        store: &*store,
+        channel_id: &channel_id,
+        challenge_id: &challenge_id,
+        tick_cost,
+        generate,
+        poll_interval_ms,
+        min_voucher_delta,
     }
+    .events();
+    let mut events = std::pin::pin!(events);
 
-    while let Some(value) = stream.next().await {
-        // Deduct, waiting for voucher top-up if insufficient
-        let mut need_voucher_sent = false;
-        loop {
-            match deduct_from_channel(&*store, &channel_id, tick_cost).await {
-                Ok(_state) => break,
-                Err(e) if e.code == Some(ErrorCode::InsufficientBalance) => {
-                    // Ask once per exhaustion: clients answer every needVoucher
-                    // frame, so a repeat makes them sign a duplicate voucher.
-                    if !need_voucher_sent {
-                        if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
-                            need_voucher_sent = true;
-                            let required = required_cumulative(&ch, tick_cost, min_voucher_delta);
-                            let msg = WsResponse::NeedVoucher {
-                                channel_id: channel_id.clone(),
-                                required_cumulative: required.to_string(),
-                                accepted_cumulative: ch.highest_voucher_amount.to_string(),
-                                deposit: ch.deposit.to_string(),
-                            };
-                            if sender.send(msg.to_text()).await.is_err() {
-                                return; // client disconnected
-                            }
-                        }
-                    }
-
-                    // Wait for channel update (voucher from receiver) or poll
-                    tokio::select! {
-                        _ = store.wait_for_update(&channel_id) => {},
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
-                    }
+    while let Some(event) = events.next().await {
+        match event {
+            MeteredEvent::NeedVoucher(event) => {
+                let msg = WsResponse::NeedVoucher {
+                    channel_id: event.channel_id,
+                    required_cumulative: event.required_cumulative,
+                    accepted_cumulative: event.accepted_cumulative,
+                    deposit: event.deposit,
+                };
+                if sender.send(msg.to_text()).await.is_err() {
+                    return; // client disconnected
                 }
-                Err(_) => {
-                    // Closed, missing, or unreadable channel — no voucher can fix
-                    // that, so emit the final receipt and stop instead of waiting forever.
-                    send_receipt(sender, &*store, &channel_id, &challenge_id).await;
+            }
+            MeteredEvent::Message(data) => {
+                let msg = WsResponse::Data { data };
+                if sender.send(msg.to_text()).await.is_err() {
+                    // Stop generating; the receipt is still attempted.
+                    if let Some(receipt) = final_receipt(&*store, &channel_id, &challenge_id).await
+                    {
+                        send_receipt(sender, &receipt).await;
+                    }
                     return;
                 }
             }
-        }
-
-        // Send data frame
-        let msg = WsResponse::Data { data: value };
-        if sender.send(msg.to_text()).await.is_err() {
-            break;
+            MeteredEvent::Receipt(receipt) => send_receipt(sender, &receipt).await,
         }
     }
-
-    // Emit final session receipt
-    send_receipt(sender, &*store, &channel_id, &challenge_id).await;
 }
 
-/// Send the final session receipt for `channel_id`, if the channel still exists.
-async fn send_receipt<S>(
-    sender: &mut S,
-    store: &dyn ChannelStore,
-    channel_id: &str,
-    challenge_id: &str,
-) where
+/// Send a session receipt frame.
+async fn send_receipt<S>(sender: &mut S, receipt: &SessionReceipt)
+where
     S: futures_util::Sink<String> + Unpin,
 {
-    if let Ok(Some(ch)) = store.get_channel(channel_id).await {
-        let timestamp = OffsetDateTime::now_utc()
-            .format(&Iso8601::DEFAULT)
-            .expect("ISO 8601 formatting cannot fail");
-
-        let mut receipt = SessionReceipt::new(
-            timestamp,
-            challenge_id,
-            channel_id,
-            ch.highest_voucher_amount.to_string(),
-            ch.spent.to_string(),
-        );
-        receipt.units = Some(ch.units);
-
-        let msg = WsResponse::Receipt {
-            receipt: serde_json::to_value(&receipt)
-                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
-        };
-        let _ = sender.send(msg.to_text()).await;
-    }
+    let msg = WsResponse::Receipt {
+        receipt: serde_json::to_value(receipt)
+            .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
+    };
+    let _ = sender.send(msg.to_text()).await;
 }
 
 /// Process incoming WebSocket messages for voucher credentials.

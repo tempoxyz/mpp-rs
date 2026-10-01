@@ -32,6 +32,8 @@
 mod amount;
 mod compose;
 mod events;
+#[cfg(feature = "tempo")]
+mod metered;
 mod mpp;
 pub mod sse;
 pub mod transport;
