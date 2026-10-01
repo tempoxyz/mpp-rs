@@ -70,10 +70,10 @@
 
 use std::sync::Arc;
 
+use axum_core::extract::rejection::BytesRejection;
 use axum_core::extract::{FromRef, FromRequest, FromRequestParts, Request};
 use axum_core::response::IntoResponse;
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use http_types::{header, HeaderValue, StatusCode};
 
 #[cfg(any(feature = "stripe", feature = "tempo"))]
@@ -266,6 +266,10 @@ pub struct MppCharge<C: ChargeConfig> {
 /// This extractor consumes the request body, binds issued challenges to the
 /// body digest, verifies submitted credentials against the same bytes, and
 /// exposes the preserved bytes to the handler.
+///
+/// The body is buffered before any payment is made, so its size is capped by
+/// axum's `DefaultBodyLimit` (2 MiB unless configured otherwise). Larger
+/// bodies are rejected with `413 Payload Too Large`.
 #[derive(Debug)]
 pub struct MppChargeWithBody<C: ChargeConfig> {
     /// The verified payment receipt.
@@ -289,6 +293,9 @@ pub enum MppChargeRejection {
     Offers(PaymentOffers),
     /// Verification failed — return 402 with several offers for retry.
     VerificationFailedOffers(PaymentOffers),
+    /// The request body could not be buffered — 413 if it exceeds the body
+    /// limit, 400 if reading it failed.
+    Body(BytesRejection),
 }
 
 impl MppChargeRejection {
@@ -319,6 +326,7 @@ impl IntoResponse for MppChargeRejection {
             }
             MppChargeRejection::Offers(offers) => offers.into_response(),
             MppChargeRejection::VerificationFailedOffers(offers) => offers.into_response(),
+            MppChargeRejection::Body(rejection) => rejection.into_response(),
         }
     }
 }
@@ -1119,15 +1127,13 @@ where
             .and_then(|v| v.to_str().ok())
             .and_then(extract_payment_scheme)
             .map(|s| s.to_string());
+        let req = Request::from_parts(parts, body);
 
         async move {
-            let body = body
-                .collect()
+            // Buffer through axum's `Bytes` extractor so `DefaultBodyLimit` applies.
+            let body = Bytes::from_request(req, state)
                 .await
-                .map_err(|e| {
-                    MppChargeRejection::InternalError(format!("Failed to read request body: {e}"))
-                })?
-                .to_bytes();
+                .map_err(MppChargeRejection::Body)?;
             let options = ChallengeOptions {
                 description: C::description(),
                 mppx_scope: mppx_scope.clone(),
@@ -1895,6 +1901,45 @@ mod tests {
             seen_verify_body.lock().unwrap().as_deref(),
             Some(br#"{"query":"paid"}"#.as_slice())
         );
+    }
+
+    async fn post_to_body_extractor(body: axum_core::body::Body) -> StatusCode {
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        async fn paid(_charge: MppChargeWithBody<OneCent>) {}
+
+        let state: Arc<dyn ChargeChallenger> = Arc::new(MockChallenger { accept: true });
+        let app = axum::Router::new()
+            .route("/paid", post(paid))
+            .layer(axum_core::extract::DefaultBodyLimit::max(1024))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/paid")
+            .body(body)
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn test_body_extractor_respects_default_body_limit() {
+        use futures_util::StreamExt;
+
+        let chunks = futures_util::stream::iter(0..).map(|i| {
+            assert!(i < 4, "body read past the limit");
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(&[0; 512]))
+        });
+        let status = post_to_body_extractor(axum_core::body::Body::from_stream(chunks)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_body_extractor_body_read_error_returns_400() {
+        let chunks = futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("reset"))]);
+        let status = post_to_body_extractor(axum_core::body::Body::from_stream(chunks)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
