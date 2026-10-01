@@ -2,9 +2,8 @@
 //!
 //! Provides `PaymentMiddleware` for use with `reqwest_middleware::ClientBuilder`.
 
-use anyhow::Context;
 use async_trait::async_trait;
-use reqwest::header::WWW_AUTHENTICATE;
+use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
 use reqwest::{Request, Response, StatusCode};
 use reqwest_middleware::{Middleware, Next};
 
@@ -22,13 +21,17 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{format_authorization, parse_www_authenticate_all_bytes};
 
+fn middleware_error(error: HttpError) -> reqwest_middleware::Error {
+    reqwest_middleware::Error::Middleware(anyhow::Error::new(error))
+}
+
 async fn commit_middleware_payment<P: PaymentProvider>(
     payment: PendingPayment<P>,
 ) -> reqwest_middleware::Result<()> {
     payment
         .commit()
         .await
-        .map_err(|error| reqwest_middleware::Error::Middleware(anyhow::anyhow!(error)))
+        .map_err(|error| middleware_error(HttpError::Payment(error)))
 }
 
 async fn rollback_middleware_payment<P: PaymentProvider>(
@@ -37,7 +40,7 @@ async fn rollback_middleware_payment<P: PaymentProvider>(
     payment
         .rollback()
         .await
-        .map_err(|error| reqwest_middleware::Error::Middleware(anyhow::anyhow!(error)))
+        .map_err(|error| middleware_error(HttpError::Payment(error)))
 }
 
 /// Middleware that automatically handles 402 Payment Required responses.
@@ -46,6 +49,10 @@ async fn rollback_middleware_payment<P: PaymentProvider>(
 /// 1. Parses the challenge from the `WWW-Authenticate` header
 /// 2. Calls the provider to execute the payment
 /// 3. Retries the request with the credential in the `Authorization` header
+///
+/// Payment failures are returned as [`HttpError`] inside
+/// [`reqwest_middleware::Error::Middleware`] and can be recovered with
+/// `downcast_ref::<HttpError>()`.
 ///
 /// # Examples
 ///
@@ -193,7 +200,7 @@ where
         let base_retry_req = match retry_req {
             Some(req) => req,
             None => {
-                let err = anyhow::anyhow!("request could not be cloned for payment retry");
+                let err = HttpError::CloneFailed;
                 self.events
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: None,
@@ -201,7 +208,7 @@ where
                         reason: None,
                     }))
                     .await;
-                return Err(reqwest_middleware::Error::Middleware(err));
+                return Err(middleware_error(err));
             }
         };
 
@@ -213,17 +220,15 @@ where
             }
 
             if payment_context.url.origin() != resp.url().origin() {
-                let error = HttpError::CrossOriginRedirect.to_string();
+                let err = HttpError::CrossOriginRedirect;
                 self.events
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: None,
-                        error: error.clone(),
+                        error: err.to_string(),
                         reason: None,
                     }))
                     .await;
-                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    error
-                )));
+                return Err(middleware_error(err));
             }
 
             let www_auth_values: Vec<&[u8]> = resp
@@ -234,16 +239,15 @@ where
                 .collect();
 
             if www_auth_values.is_empty() {
+                let err = HttpError::MissingChallenge;
                 self.events
                     .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                         challenge: None,
-                        error: "402 response missing WWW-Authenticate header".to_string(),
+                        error: err.to_string(),
                         reason: None,
                     }))
                     .await;
-                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    "402 response missing WWW-Authenticate header"
-                )));
+                return Err(middleware_error(err));
             }
 
             let challenges: Vec<_> = parse_www_authenticate_all_bytes(www_auth_values)
@@ -262,8 +266,8 @@ where
             ) {
                 Ok(challenge) => challenge.clone(),
                 Err(ChallengeSelectionError::Expired(challenge)) => {
-                    let mpp_error = expired_payment_error(&challenge);
-                    let error = mpp_error.to_string();
+                    let err = HttpError::Payment(expired_payment_error(&challenge));
+                    let error = err.to_string();
                     let expires = challenge.expires.clone();
                     self.events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
@@ -272,12 +276,10 @@ where
                             reason: Some(PaymentFailureReason::PreSigningExpired { expires }),
                         }))
                         .await;
-                    return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                        mpp_error
-                    )));
+                    return Err(middleware_error(err));
                 }
                 Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
-                    let err = anyhow::anyhow!(message);
+                    let err = HttpError::NoSupportedChallenge(message);
                     self.events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: None,
@@ -285,7 +287,7 @@ where
                             reason: None,
                         }))
                         .await;
-                    return Err(reqwest_middleware::Error::Middleware(err));
+                    return Err(middleware_error(err));
                 }
             };
 
@@ -317,7 +319,7 @@ where
                 {
                     Ok(credential) => credential,
                     Err(err) => {
-                        let err = anyhow::anyhow!(err).context("payment failed");
+                        let err = HttpError::Payment(err);
                         self.events
                             .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                                 challenge: Some(challenge),
@@ -325,7 +327,7 @@ where
                                 reason: None,
                             }))
                             .await;
-                        return Err(reqwest_middleware::Error::Middleware(err));
+                        return Err(middleware_error(err));
                     }
                 },
             };
@@ -340,42 +342,40 @@ where
                 }))
                 .await;
 
-            let auth_header =
-                match format_authorization(&credential).context("failed to format credential") {
-                    Ok(auth_header) => auth_header,
-                    Err(err) => {
-                        self.events
-                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                                challenge: Some(challenge),
-                                error: err.to_string(),
-                                reason: None,
-                            }))
-                            .await;
-                        rollback_middleware_payment(pending).await?;
-                        return Err(reqwest_middleware::Error::Middleware(err));
-                    }
-                };
+            let auth_header = match format_authorization(&credential) {
+                Ok(auth_header) => auth_header,
+                Err(err) => {
+                    let err = HttpError::InvalidCredential(err.to_string());
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    rollback_middleware_payment(pending).await?;
+                    return Err(middleware_error(err));
+                }
+            };
 
-            let auth_header_value =
-                match auth_header.parse().context("invalid authorization header") {
-                    Ok(value) => value,
-                    Err(err) => {
-                        self.events
-                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                                challenge: Some(challenge),
-                                error: err.to_string(),
-                                reason: None,
-                            }))
-                            .await;
-                        rollback_middleware_payment(pending).await?;
-                        return Err(reqwest_middleware::Error::Middleware(err));
-                    }
-                };
+            let auth_header_value = match HeaderValue::from_str(&auth_header) {
+                Ok(value) => value,
+                Err(err) => {
+                    let err = HttpError::InvalidCredential(err.to_string());
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    rollback_middleware_payment(pending).await?;
+                    return Err(middleware_error(err));
+                }
+            };
             let Some(mut retry_req) = base_retry_req.try_clone() else {
                 rollback_middleware_payment(pending).await?;
-                return Err(reqwest_middleware::Error::Middleware(anyhow::anyhow!(
-                    "request could not be cloned for payment retry"
-                )));
+                return Err(middleware_error(HttpError::CloneFailed));
             };
             // The challenge came from the final URL of any same-origin redirect,
             // so that is where the credential goes.
@@ -420,9 +420,10 @@ where
             // The server no longer has the session channel. Let the provider
             // forget it so the next request can open a fresh one.
             if status == StatusCode::GONE && challenge.intent.as_str() == "session" {
-                pending.invalidate().await.map_err(|error| {
-                    reqwest_middleware::Error::Middleware(anyhow::anyhow!(error))
-                })?;
+                pending
+                    .invalidate()
+                    .await
+                    .map_err(|error| middleware_error(HttpError::Payment(error)))?;
                 return Ok(resp);
             }
 
