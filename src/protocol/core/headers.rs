@@ -190,11 +190,8 @@ fn parse_auth_params(params_str: &str) -> Result<HashMap<String, String>> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if i >= bytes.len() {
-            break;
-        }
 
-        let value = if bytes[i] == b'"' {
+        let value = if bytes.get(i) == Some(&b'"') {
             i += 1;
             let mut value = String::new();
             let mut segment_start = i;
@@ -1664,6 +1661,20 @@ mod tests {
         assert_eq!(parsed.method.as_str(), "tempo");
         assert_eq!(parsed.intent.as_str(), "charge");
         assert_eq!(parsed.request.raw(), "e30");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_keeps_empty_trailing_param() {
+        for tail in ["description=", "description=,", "description=,\t"] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", {tail}"#
+            );
+            let single = parse_www_authenticate(&header).unwrap();
+            assert_eq!(single.description.as_deref(), Some(""), "{header:?}");
+            let all = parse_www_authenticate_all([header.as_str()]);
+            let listed = all[0].as_ref().unwrap();
+            assert_eq!(listed.description.as_deref(), Some(""), "{header:?}");
+        }
     }
 
     #[test]
