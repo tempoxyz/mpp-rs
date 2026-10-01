@@ -18,6 +18,7 @@ use std::fmt;
 
 /// Error codes for payment verification failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// Payment has expired.
     Expired,
@@ -51,6 +52,11 @@ pub enum ErrorCode {
     AmountExceedsDeposit,
     /// Voucher delta is below the minimum threshold.
     DeltaTooSmall,
+    /// Challenge was not issued by this server, or not for this request.
+    InvalidChallenge,
+    /// Server-side failure (store, signer, upstream API) unrelated to the
+    /// submitted payment.
+    Internal,
 }
 
 impl ErrorCode {
@@ -73,37 +79,21 @@ impl ErrorCode {
             Self::InvalidSignature => "invalid-signature",
             Self::AmountExceedsDeposit => "amount-exceeds-deposit",
             Self::DeltaTooSmall => "delta-too-small",
+            Self::InvalidChallenge => "invalid-challenge",
+            Self::Internal => "internal",
         }
     }
 
-    /// Returns the IETF spec-compliant error code string (§8.2).
+    /// Returns the problem type this code is reported as, relative to
+    /// [`CORE_PROBLEM_TYPE_BASE`](crate::error::CORE_PROBLEM_TYPE_BASE)
+    /// (e.g. `payment-expired`, `session/channel-not-found`).
     ///
-    /// These codes are intended for JSON error responses per the spec:
-    /// - `payment-required` - Payment is required
-    /// - `payment-insufficient` - Payment amount was insufficient
-    /// - `payment-expired` - Payment or challenge has expired
-    /// - `verification-failed` - Payment verification failed
-    /// - `method-unsupported` - Payment method not supported
-    /// - `malformed-credential` - Credential format is invalid
+    /// Derived from the same conversion that builds the problem details of a
+    /// [`VerificationError`], so the two cannot disagree.
     pub fn spec_code(&self) -> &'static str {
-        match self {
-            Self::Expired => "payment-expired",
-            Self::InvalidAmount => "payment-insufficient",
-            Self::InvalidRecipient => "verification-failed",
-            Self::TransactionFailed => "verification-failed",
-            Self::NotFound => "verification-failed",
-            Self::InvalidCredential => "malformed-credential",
-            Self::NetworkError => "verification-failed",
-            Self::ChainIdMismatch => "method-unsupported",
-            Self::CredentialMismatch => "malformed-credential",
-            Self::ChannelNotFound => "verification-failed",
-            Self::ChannelClosed => "verification-failed",
-            Self::InsufficientBalance => "payment-insufficient",
-            Self::InvalidPayload => "malformed-credential",
-            Self::InvalidSignature => "verification-failed",
-            Self::AmountExceedsDeposit => "verification-failed",
-            Self::DeltaTooSmall => "verification-failed",
-        }
+        MppError::from(VerificationError::with_code(String::new(), *self))
+            .problem_type_suffix()
+            .unwrap_or(crate::error::INTERNAL_PROBLEM_TYPE_SUFFIX)
     }
 }
 
@@ -123,7 +113,10 @@ pub struct VerificationError {
     pub message: String,
     /// Error code for programmatic handling (optional).
     pub code: Option<ErrorCode>,
-    /// Whether the error is retryable.
+    /// Whether the client should retry with the same credential.
+    ///
+    /// Retryable errors are reported as `internal-payment-error` rather than
+    /// as a payment problem with a fresh challenge.
     pub retryable: bool,
 }
 
@@ -190,6 +183,16 @@ impl VerificationError {
     /// Create a retryable network error.
     pub fn network_error(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::NetworkError).retryable()
+    }
+
+    /// Create an "invalid-challenge" verification error.
+    pub fn invalid_challenge(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::InvalidChallenge)
+    }
+
+    /// Create an "internal" verification error for a server-side failure.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::Internal)
     }
 
     /// Create a retryable "not found" error (e.g., tx not yet mined).
@@ -263,8 +266,18 @@ use crate::error::{MppError, PaymentError, PaymentErrorDetails};
 
 impl From<VerificationError> for MppError {
     fn from(err: VerificationError) -> Self {
+        // A retryable failure is resolved by resending the same credential,
+        // so it must not be reported as a payment problem: those are answered
+        // with a fresh challenge, which asks the client to pay again.
+        if err.retryable {
+            return MppError::Internal(err.message);
+        }
         match err.code {
             Some(ErrorCode::Expired) => MppError::PaymentExpired(None),
+            Some(ErrorCode::InvalidChallenge) => MppError::invalid_challenge_reason(err.message),
+            Some(ErrorCode::NetworkError) | Some(ErrorCode::Internal) => {
+                MppError::Internal(err.message)
+            }
             Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
             Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(Some(err.message)),
             Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(Some(err.message)),
@@ -283,7 +296,6 @@ impl From<VerificationError> for MppError {
             | Some(ErrorCode::TransactionFailed)
             | Some(ErrorCode::ChainIdMismatch)
             | Some(ErrorCode::NotFound)
-            | Some(ErrorCode::NetworkError)
             | None => MppError::VerificationFailed(Some(err.message)),
         }
     }
@@ -319,19 +331,184 @@ mod tests {
         assert!(err.retryable);
     }
 
+    /// Problem types and statuses from the core spec's "Error Codes" table
+    /// and the session spec's problem type registry.
+    const SPEC_PROBLEMS: &[(&str, u16)] = &[
+        ("payment-required", 402),
+        ("payment-insufficient", 402),
+        ("payment-expired", 402),
+        ("verification-failed", 402),
+        ("method-unsupported", 400),
+        ("malformed-credential", 402),
+        ("invalid-challenge", 402),
+        ("bad-request", 400),
+        ("invalid-payload", 402),
+        ("internal-payment-error", 500),
+        ("payment-action-required", 402),
+        ("session/invalid-signature", 402),
+        ("session/signer-mismatch", 402),
+        ("session/amount-exceeds-deposit", 402),
+        ("session/delta-too-small", 402),
+        ("session/channel-not-found", 410),
+        ("session/channel-finalized", 410),
+        ("session/insufficient-balance", 402),
+    ];
+
+    #[track_caller]
+    fn assert_spec_problem(label: &str, problem: PaymentErrorDetails, suffix: &str) {
+        let (_, status) = SPEC_PROBLEMS
+            .iter()
+            .find(|(problem_type, _)| *problem_type == suffix)
+            .unwrap_or_else(|| panic!("{label}: {suffix} is not a spec problem type"));
+        assert_eq!(
+            problem.problem_type,
+            format!("{}/{suffix}", crate::error::CORE_PROBLEM_TYPE_BASE),
+            "{label}"
+        );
+        assert_eq!(problem.status, *status, "{label}");
+        if suffix == "internal-payment-error" {
+            assert_eq!(
+                problem.detail, "An internal payment error occurred.",
+                "{label}"
+            );
+        }
+    }
+
     #[test]
-    fn test_error_code_spec_codes() {
-        // Verify IETF spec-compliant error codes (§8.2)
-        assert_eq!(ErrorCode::Expired.spec_code(), "payment-expired");
-        assert_eq!(ErrorCode::InvalidAmount.spec_code(), "payment-insufficient");
-        assert_eq!(
-            ErrorCode::InvalidCredential.spec_code(),
-            "malformed-credential"
+    fn test_problem_mapping_matches_spec() {
+        let reason = || Some("reason".to_string());
+        let errors = [
+            (
+                MppError::MalformedCredential(reason()),
+                "malformed-credential",
+            ),
+            (
+                MppError::InvalidChallenge {
+                    id: None,
+                    reason: reason(),
+                },
+                "invalid-challenge",
+            ),
+            (
+                MppError::VerificationFailed(reason()),
+                "verification-failed",
+            ),
+            (MppError::PaymentExpired(reason()), "payment-expired"),
+            (
+                MppError::PaymentRequired {
+                    realm: None,
+                    description: None,
+                },
+                "payment-required",
+            ),
+            (MppError::InvalidPayload(reason()), "invalid-payload"),
+            (MppError::BadRequest(reason()), "bad-request"),
+            (
+                MppError::UnsupportedPaymentMethod("method".into()),
+                "method-unsupported",
+            ),
+            (
+                MppError::PaymentActionRequired(reason()),
+                "payment-action-required",
+            ),
+            (
+                MppError::PaymentInsufficient(reason()),
+                "payment-insufficient",
+            ),
+            (
+                MppError::InsufficientBalance(reason()),
+                "session/insufficient-balance",
+            ),
+            (
+                MppError::InvalidSignature(reason()),
+                "session/invalid-signature",
+            ),
+            (
+                MppError::SignerMismatch(reason()),
+                "session/signer-mismatch",
+            ),
+            (
+                MppError::AmountExceedsDeposit(reason()),
+                "session/amount-exceeds-deposit",
+            ),
+            (MppError::DeltaTooSmall(reason()), "session/delta-too-small"),
+            (
+                MppError::ChannelNotFound(reason()),
+                "session/channel-not-found",
+            ),
+            (
+                MppError::ChannelClosed(reason()),
+                "session/channel-finalized",
+            ),
+            (
+                MppError::Internal("store unavailable".into()),
+                "internal-payment-error",
+            ),
+            (
+                MppError::Http("rpc unavailable".into()),
+                "internal-payment-error",
+            ),
+        ];
+        for (error, suffix) in errors {
+            let label = format!("{error:?}");
+            let payment_problem = (suffix != "internal-payment-error").then_some(suffix);
+            assert_eq!(error.problem_type_suffix(), payment_problem, "{label}");
+            assert_spec_problem(&label, error.to_problem_details(None), suffix);
+        }
+
+        let codes = [
+            (ErrorCode::Expired, "payment-expired"),
+            (ErrorCode::InvalidAmount, "verification-failed"),
+            (ErrorCode::InvalidRecipient, "verification-failed"),
+            (ErrorCode::TransactionFailed, "verification-failed"),
+            (ErrorCode::NotFound, "verification-failed"),
+            (ErrorCode::InvalidCredential, "malformed-credential"),
+            (ErrorCode::NetworkError, "internal-payment-error"),
+            (ErrorCode::ChainIdMismatch, "verification-failed"),
+            (ErrorCode::CredentialMismatch, "verification-failed"),
+            (ErrorCode::ChannelNotFound, "session/channel-not-found"),
+            (ErrorCode::ChannelClosed, "session/channel-finalized"),
+            (
+                ErrorCode::InsufficientBalance,
+                "session/insufficient-balance",
+            ),
+            (ErrorCode::InvalidPayload, "invalid-payload"),
+            (ErrorCode::InvalidSignature, "session/invalid-signature"),
+            (
+                ErrorCode::AmountExceedsDeposit,
+                "session/amount-exceeds-deposit",
+            ),
+            (ErrorCode::DeltaTooSmall, "session/delta-too-small"),
+            (ErrorCode::InvalidChallenge, "invalid-challenge"),
+            (ErrorCode::Internal, "internal-payment-error"),
+        ];
+        for (code, suffix) in codes {
+            let label = format!("{code:?}");
+            assert_eq!(code.spec_code(), suffix, "{label}");
+            let error = VerificationError::with_code("message", code);
+            assert_spec_problem(&label, error.to_problem_details(None), suffix);
+        }
+
+        assert_spec_problem(
+            "no code",
+            VerificationError::new("message").to_problem_details(None),
+            "verification-failed",
         );
-        assert_eq!(ErrorCode::ChainIdMismatch.spec_code(), "method-unsupported");
-        assert_eq!(
-            ErrorCode::TransactionFailed.spec_code(),
-            "verification-failed"
-        );
+        // Retryable failures are resolved with the same credential, so they
+        // must not be answered with a payment problem and a fresh challenge.
+        for (label, error) in [
+            ("pending", VerificationError::pending("not yet mined")),
+            ("network", VerificationError::network_error("rpc down")),
+            (
+                "retryable",
+                VerificationError::invalid_amount("message").retryable(),
+            ),
+        ] {
+            assert_spec_problem(
+                label,
+                error.to_problem_details(None),
+                "internal-payment-error",
+            );
+        }
     }
 }

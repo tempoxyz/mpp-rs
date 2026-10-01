@@ -22,6 +22,13 @@ pub const SESSION_PROBLEM_TYPE_BASE: &str = "https://paymentauth.org/problems/se
 #[deprecated(since = "0.5.0", note = "renamed to SESSION_PROBLEM_TYPE_BASE")]
 pub const STREAM_PROBLEM_TYPE_BASE: &str = SESSION_PROBLEM_TYPE_BASE;
 
+/// Problem type suffix for server-side failures.
+pub(crate) const INTERNAL_PROBLEM_TYPE_SUFFIX: &str = "internal-payment-error";
+
+/// Detail reported for every `internal-payment-error` problem. The underlying
+/// error can carry RPC URLs or store paths, so it is never sent to clients.
+const INTERNAL_PROBLEM_DETAIL: &str = "An internal payment error occurred.";
+
 /// Default hint for payment-required errors.
 pub const HINT_PAYMENT_REQUIRED: &str = "Use a supported wallet to pay for this resource using one of the supported payment methods returned in the WWW-Authenticate header. See https://mpp.dev/tools/wallet.md";
 
@@ -219,6 +226,18 @@ pub enum MppError {
     /// Invalid base64url encoding
     #[error("Invalid base64url: {0}")]
     InvalidBase64Url(String),
+
+    /// Receipt is malformed (invalid base64url, bad JSON structure).
+    #[error("Receipt is invalid: {0}.")]
+    InvalidReceipt(String),
+
+    /// Server-side failure while processing a payment (RPC, store, upstream
+    /// API).
+    ///
+    /// Reported to clients as `internal-payment-error` with a fixed detail;
+    /// the message is only part of this error's `Display` output.
+    #[error("Internal payment error: {0}")]
+    Internal(String),
 
     // ==================== RFC 9457 Payment Problems ====================
     // These variants can be converted to RFC 9457 Problem Details format.
@@ -693,11 +712,15 @@ impl PaymentError for MppError {
                 .with_status(410),
             // Errors that are not payment problems are the server's own
             // failures, reported as the spec's internal-payment-error.
-            _ => PaymentErrorDetails::core("internal-payment-error")
+            _ => PaymentErrorDetails::core(INTERNAL_PROBLEM_TYPE_SUFFIX)
                 .with_title("InternalPaymentError")
                 .with_status(500),
         }
-        .with_detail(self.to_string());
+        .with_detail(if self.is_payment_problem() {
+            self.to_string()
+        } else {
+            INTERNAL_PROBLEM_DETAIL.to_string()
+        });
 
         // Use embedded challenge ID from InvalidChallenge, or the provided one
         let embedded_id = match self {
@@ -1167,6 +1190,20 @@ mod tests {
         );
         assert_eq!(problem.title, "InternalPaymentError");
         assert_eq!(problem.status, 500);
+    }
+
+    #[test]
+    fn test_internal_problem_detail_hides_error_text() {
+        let message = "error sending request for url (https://rpc.example/v2/SECRETKEY)";
+        for err in [
+            MppError::Http(message.to_string()),
+            MppError::Internal(message.to_string()),
+        ] {
+            assert!(err.to_string().contains(message));
+            let problem = err.to_problem_details(Some("challenge-id"));
+            assert_eq!(problem.detail, "An internal payment error occurred.");
+            assert_eq!(problem.challenge_id.as_deref(), Some("challenge-id"));
+        }
     }
 
     #[test]
