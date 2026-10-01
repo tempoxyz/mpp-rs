@@ -235,7 +235,7 @@ async fn paid(
                 Err(_) => return issue_challenge(),
             };
 
-            match mpp.verify_credential(&credential).await {
+            match mpp.stripe_verify_charge(&credential, "0.10").await {
                 Ok(receipt) => {
                     let body = serde_json::json!({ "message": "paid content" });
                     let mut resp = axum::response::Json(body).into_response();
@@ -268,16 +268,14 @@ async fn paid_premium(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let options = || StripeChargeOptions {
+        description: Some("Premium content"),
+        external_id: Some("premium-001"),
+        ..Default::default()
+    };
     let issue_challenge = || {
         let challenge = mpp
-            .stripe_charge_with_options(
-                "1.00",
-                StripeChargeOptions {
-                    description: Some("Premium content"),
-                    external_id: Some("premium-001"),
-                    ..Default::default()
-                },
-            )
+            .stripe_charge_with_options("1.00", options())
             .expect("challenge creation");
         let www_auth = challenge.to_header().expect("format challenge");
         let mut resp = axum::http::StatusCode::PAYMENT_REQUIRED.into_response();
@@ -290,7 +288,10 @@ async fn paid_premium(
 
     match auth_header {
         Some(auth) => match mpp::parse_authorization(&auth) {
-            Ok(credential) => match mpp.verify_credential(&credential).await {
+            Ok(credential) => match mpp
+                .stripe_verify_charge_with_options(&credential, "1.00", options())
+                .await
+            {
                 Ok(receipt) => {
                     let body = serde_json::json!({ "message": "premium content" });
                     let mut resp = axum::response::Json(body).into_response();
@@ -676,6 +677,66 @@ async fn test_e2e_stripe_charge_with_description() {
     stripe_handle.abort();
 }
 
+/// A credential paid for the $0.10 route must not unlock the $1.00 route
+/// served by the same `Mpp`.
+#[tokio::test]
+async fn test_stripe_cheap_credential_rejected_on_premium_route() {
+    let (stripe_url, stripe_handle) = start_mock_stripe().await;
+
+    let mpp = Mpp::create_stripe(
+        stripe(StripeConfig {
+            secret_key: "sk_test_mock",
+            network_id: "test-net",
+            payment_method_types: &["card"],
+            currency: "usd",
+            decimals: 2,
+        })
+        .stripe_api_base(&stripe_url)
+        .secret_key(TEST_SECRET),
+    )
+    .expect("failed to create Mpp");
+
+    let mpp = Arc::new(mpp);
+    let (url, handle) = start_server(mpp).await;
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 402);
+    let www_auth = resp.headers()["www-authenticate"].to_str().unwrap();
+    let cheap = mpp::parse_www_authenticate(www_auth).expect("failed to parse");
+    let credential = PaymentCredential::new(
+        cheap.to_echo(),
+        StripeCredentialPayload {
+            spt: "spt_cheap_token".to_string(),
+            external_id: None,
+        },
+    );
+    let authorization = mpp::format_authorization(&credential).expect("format credential");
+
+    let resp = Client::new()
+        .get(format!("{url}/paid-premium"))
+        .header("authorization", &authorization)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 402, "cheap credential must not buy premium");
+    assert!(resp.headers().contains_key("www-authenticate"));
+
+    let resp = Client::new()
+        .get(format!("{url}/paid"))
+        .header("authorization", &authorization)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 200);
+
+    handle.abort();
+    stripe_handle.abort();
+}
+
 /// Stripe API returning an error body should result in failed verification.
 #[tokio::test]
 async fn test_stripe_error_body_parsing() {
@@ -909,7 +970,7 @@ async fn test_stripe_external_id_binding() {
             },
         );
 
-        let result = mpp.verify_credential(&credential).await;
+        let result = mpp.broadcast_credential(&credential).await;
         let case = format!("request {request_id:?}, payload {payload_id:?}");
         match expected {
             Ok(receipt_id) => {
@@ -960,7 +1021,7 @@ async fn test_stripe_payment_intent_metadata() {
             external_id: None,
         },
     );
-    mpp.verify_credential(&credential)
+    mpp.broadcast_credential(&credential)
         .await
         .expect("verification failed");
 
@@ -1134,7 +1195,7 @@ async fn test_live_stripe_charge_success() {
     );
 
     let receipt = mpp
-        .verify_credential(&credential)
+        .stripe_verify_charge(&credential, "0.50")
         .await
         .expect("verification failed");
     assert!(receipt.is_success());
@@ -1161,6 +1222,6 @@ async fn test_live_stripe_invalid_spt_rejected() {
         },
     );
 
-    let result = mpp.verify_credential(&credential).await;
+    let result = mpp.stripe_verify_charge(&credential, "0.10").await;
     assert!(result.is_err(), "invalid SPT should fail verification");
 }

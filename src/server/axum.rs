@@ -516,7 +516,7 @@ where
         };
         let mpp = self.clone();
         Box::pin(async move {
-            super::Mpp::verify_credential(&mpp, &credential)
+            super::Mpp::broadcast_credential(&mpp, &credential)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -829,7 +829,7 @@ where
         };
         let mpp = self.clone();
         Box::pin(async move {
-            super::Mpp::verify_credential(&mpp, &credential)
+            super::Mpp::broadcast_credential(&mpp, &credential)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -2105,7 +2105,7 @@ mod tests {
                 };
                 let mpp = self.mpp.clone();
                 Box::pin(async move {
-                    mpp.verify_credential(&credential)
+                    mpp.broadcast_credential(&credential)
                         .await
                         .map_err(|e| e.to_string())
                 })

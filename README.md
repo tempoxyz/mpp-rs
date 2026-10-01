@@ -56,7 +56,7 @@ let mpp = Mpp::create(tempo(TempoConfig {
 }))?;
 
 let challenges = mpp.charge("1")?; // OUSD, then USDC.e on mainnet
-let receipt = mpp.verify_credential(&credential).await?;
+let receipt = mpp.verify_charge(&credential, "1").await?;
 ```
 
 ### Server (Stripe)
@@ -73,8 +73,10 @@ let mpp = Mpp::create_stripe(stripe(StripeConfig {
 }))?;
 
 let challenge = mpp.stripe_charge("1")?;
-let receipt = mpp.verify_credential(&credential).await?;
+let receipt = mpp.stripe_verify_charge(&credential, "1").await?;
 ```
+
+`verify_charge` and `stripe_verify_charge` take the amount the route charges and reject a credential that was issued for a different amount, so a payment for a cheap route cannot be replayed on an expensive one served by the same `Mpp`. `broadcast_credential` skips that comparison: it accepts any challenge the `Mpp` issued, which is only safe when all of them are interchangeable.
 
 If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`, and clients send the Payment credential in that header instead of `Authorization`.
 
@@ -129,7 +131,7 @@ use mpp::server::ws::{WsMessage, WsResponse};
 let msg: WsMessage = serde_json::from_str(&text)?;
 if let WsMessage::Credential { credential } = msg {
     let parsed = mpp::parse_authorization(&credential)?;
-    let receipt = mpp.verify_credential(&parsed).await?;
+    let receipt = mpp.verify_charge(&parsed, "0.01").await?; // the amount this socket charges
     let resp = WsResponse::Receipt {
         receipt: serde_json::to_value(&receipt)?,
     };

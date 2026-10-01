@@ -2155,7 +2155,7 @@ async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
             format!("did:pkh:eip155:{chain_id}:{}", payer.address()),
             mpp::PaymentPayload::transaction(alloy::hex::encode_prefixed(bytes)),
         );
-        let result = mpp.verify_credential(&credential).await;
+        let result = mpp.verify_charge(&credential, "1").await;
         if valid {
             assert!(result.is_ok(), "sponsored={sponsored}, {name}: {result:?}");
             let payer_after = tip20_balance(&provider, payer.address()).await;

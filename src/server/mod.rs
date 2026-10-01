@@ -55,7 +55,9 @@ pub use crate::protocol::traits::{
     ChargeMethod, ChargeValidation, ErrorCode, SessionMethod, VerificationError,
 };
 pub use amount::{parse_dollar_amount, AmountError};
-pub use compose::{compose, compose_verify, ChargeVerifier};
+#[allow(deprecated)]
+pub use compose::compose_verify;
+pub use compose::{compose, compose_verify_with_expected_requests, ChargeVerifier};
 pub use events::{
     PaymentSuccessContext, ServerEvent, ServerEventKind, ServerEventSubscription, ServerEvents,
 };

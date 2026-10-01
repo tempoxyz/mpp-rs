@@ -59,6 +59,15 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// What `/api/photo` charges with, both to issue challenges and to verify credentials.
+fn photo_charge() -> ChargeOptions<'static> {
+    ChargeOptions {
+        description: Some("Random stock photo"),
+        supported_modes: Some(&["pull"]),
+        ..Default::default()
+    }
+}
+
 async fn photo(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(credential) = auth
@@ -66,30 +75,25 @@ async fn photo(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl 
             .map_err(|_| ())
             .and_then(|value| parse_authorization(value).map_err(|_| ()))
         {
-            return match payment.broadcast_credential(&credential).await {
-                Ok(receipt) => (
-                    StatusCode::OK,
-                    [("payment-receipt", receipt.to_header().unwrap_or_default())],
-                    Json(serde_json::json!({ "url": "https://picsum.photos/1024/1024" })),
-                )
-                    .into_response(),
-                Err(error) => (
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(serde_json::json!({ "error": error.to_string() })),
-                )
-                    .into_response(),
-            };
+            match payment
+                .verify_charge_with_options(&credential, "0.01", photo_charge())
+                .await
+            {
+                Ok(receipt) => {
+                    return (
+                        StatusCode::OK,
+                        [("payment-receipt", receipt.to_header().unwrap_or_default())],
+                        Json(serde_json::json!({ "url": "https://picsum.photos/1024/1024" })),
+                    )
+                        .into_response()
+                }
+                // A rejected credential gets a fresh challenge below.
+                Err(error) => eprintln!("payment rejected: {error}"),
+            }
         }
     }
 
-    match payment.charge_with_options(
-        "0.01",
-        ChargeOptions {
-            description: Some("Random stock photo"),
-            supported_modes: Some(&["pull"]),
-            ..Default::default()
-        },
-    ) {
+    match payment.charge_with_options("0.01", photo_charge()) {
         Ok(challenges) => {
             match format_www_authenticate_many(&challenges).map(|values| values.join(", ")) {
                 Ok(value) => (

@@ -105,6 +105,9 @@ pub struct SessionVerifyResult {
 ///
 /// // Charge $0.10 — currency, recipient, realm, secret, expires all handled
 /// let challenges = mpp.charge("0.10")?;
+///
+/// // Accept a credential only if it paid this route's $0.10
+/// let receipt = mpp.verify_charge(&credential, "0.10").await?;
 /// ```
 ///
 /// # Advanced API
@@ -694,6 +697,8 @@ where
     }
 
     /// Validate a payment credential without consuming or broadcasting it.
+    ///
+    /// Not bound to a route: see [`Self::broadcast_credential`].
     pub async fn validate_credential(
         &self,
         credential: &PaymentCredential,
@@ -703,6 +708,8 @@ where
     }
 
     /// Validate a credential against the actual request body without accepting payment.
+    ///
+    /// Not bound to a route: see [`Self::broadcast_credential`].
     pub async fn validate_credential_with_body(
         &self,
         credential: &PaymentCredential,
@@ -738,6 +745,13 @@ where
     }
 
     /// Re-validate and accept a payment credential.
+    ///
+    /// Not bound to a route: this accepts any unexpired charge challenge this
+    /// handler issued, whatever its amount. A handler that serves routes with
+    /// different prices must compare the credential with the route's request,
+    /// using [`Self::broadcast_credential_with_expected_request`] or
+    /// [`Self::verify_charge`]. Otherwise a credential paid for the cheapest
+    /// route unlocks every other one.
     pub async fn broadcast_credential(
         &self,
         credential: &PaymentCredential,
@@ -747,6 +761,8 @@ where
     }
 
     /// Re-validate and accept a credential bound to the actual request body.
+    ///
+    /// Not bound to a route: see [`Self::broadcast_credential`].
     pub async fn broadcast_credential_with_body(
         &self,
         credential: &PaymentCredential,
@@ -781,7 +797,66 @@ where
             .await
     }
 
+    /// The charge request [`charge_with_options()`](Self::charge_with_options)
+    /// issues for `amount` and `options`: what a route with that price expects
+    /// a credential to have paid.
+    ///
+    /// Pass it to the `*_with_expected_request` verification methods, for
+    /// example to validate without accepting payment or to verify a
+    /// body-bound challenge. It names the first accepted currency; credentials
+    /// for the other accepted currencies match it too.
+    #[cfg(feature = "tempo")]
+    pub fn expected_charge_request(
+        &self,
+        amount: &str,
+        options: super::ChargeOptions<'_>,
+    ) -> Result<ChargeRequest> {
+        let (currency, _) = self.require_bound_config()?;
+        self.charge_for_currency(amount, currency, &options)?
+            .request
+            .decode()
+    }
+
+    /// Accept a credential for a route that charges `amount` with
+    /// [`charge()`](Self::charge).
+    ///
+    /// Rejects a credential whose challenge was issued for another amount,
+    /// currency or recipient, so a payment for a cheaper route cannot be
+    /// replayed here. `amount` is in dollars, as for `charge()`.
+    #[cfg(feature = "tempo")]
+    pub async fn verify_charge(
+        &self,
+        credential: &PaymentCredential,
+        amount: &str,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        self.verify_charge_with_options(credential, amount, super::ChargeOptions::default())
+            .await
+    }
+
+    /// Accept a credential for a route that charges `amount` with
+    /// [`charge_with_options()`](Self::charge_with_options).
+    ///
+    /// Pass the options the route issues its challenges with. See
+    /// [`verify_charge()`](Self::verify_charge).
+    #[cfg(feature = "tempo")]
+    pub async fn verify_charge_with_options(
+        &self,
+        credential: &PaymentCredential,
+        amount: &str,
+        options: super::ChargeOptions<'_>,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let expected = self.expected_charge_request(amount, options).map_err(|e| {
+            VerificationError::new(format!("Failed to build expected charge request: {e}"))
+        })?;
+        self.broadcast_credential_with_expected_request(credential, &expected)
+            .await
+    }
+
     /// Backwards-compatible alias for [`Self::broadcast_credential`].
+    #[deprecated(
+        since = "0.15.0",
+        note = "accepts a credential paid for any route of this handler, whatever its price; use `verify_charge` (Tempo), `stripe_verify_charge` (Stripe) or `verify_credential_with_expected_request`. `broadcast_credential` keeps the unbound behavior"
+    )]
     pub async fn verify_credential(
         &self,
         credential: &PaymentCredential,
@@ -790,6 +865,10 @@ where
     }
 
     /// Backwards-compatible alias for [`Self::broadcast_credential_with_body`].
+    #[deprecated(
+        since = "0.15.0",
+        note = "accepts a credential paid for any route of this handler, whatever its price; use `verify_credential_with_expected_request_and_body`. `broadcast_credential_with_body` keeps the unbound behavior"
+    )]
     pub async fn verify_credential_with_body(
         &self,
         credential: &PaymentCredential,
@@ -1516,6 +1595,62 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         let challenge = self.stripe_charge_with_options(amount, options)?;
         Ok(self.with_body_digest(challenge, body))
     }
+
+    /// The charge request
+    /// [`stripe_charge_with_options()`](Self::stripe_charge_with_options)
+    /// issues for `amount` and `options`: what a route with that price expects
+    /// a credential to have paid.
+    ///
+    /// Pass it to the `*_with_expected_request` verification methods, for
+    /// example to validate without accepting payment or to verify a
+    /// body-bound challenge.
+    pub fn stripe_expected_charge_request(
+        &self,
+        amount: &str,
+        options: super::StripeChargeOptions<'_>,
+    ) -> Result<ChargeRequest> {
+        self.stripe_charge_with_options(amount, options)?
+            .request
+            .decode()
+    }
+
+    /// Accept a credential for a route that charges `amount` with
+    /// [`stripe_charge()`](Self::stripe_charge).
+    ///
+    /// Rejects a credential whose challenge was issued for another amount or
+    /// currency, so a payment for a cheaper route cannot be replayed here.
+    pub async fn stripe_verify_charge(
+        &self,
+        credential: &PaymentCredential,
+        amount: &str,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        self.stripe_verify_charge_with_options(
+            credential,
+            amount,
+            super::StripeChargeOptions::default(),
+        )
+        .await
+    }
+
+    /// Accept a credential for a route that charges `amount` with
+    /// [`stripe_charge_with_options()`](Self::stripe_charge_with_options).
+    ///
+    /// Pass the options the route issues its challenges with. See
+    /// [`stripe_verify_charge()`](Self::stripe_verify_charge).
+    pub async fn stripe_verify_charge_with_options(
+        &self,
+        credential: &PaymentCredential,
+        amount: &str,
+        options: super::StripeChargeOptions<'_>,
+    ) -> std::result::Result<Receipt, VerificationError> {
+        let expected = self
+            .stripe_expected_charge_request(amount, options)
+            .map_err(|e| {
+                VerificationError::new(format!("Failed to build expected charge request: {e}"))
+            })?;
+        self.broadcast_credential_with_expected_request(credential, &expected)
+            .await
+    }
 }
 
 #[cfg(feature = "stripe")]
@@ -1577,6 +1712,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::protocol::core::{ChallengeEcho, PaymentPayload};
@@ -4070,6 +4206,93 @@ mod tests {
         assert!(result.is_ok(), "correct request should be accepted");
     }
 
+    /// One handler serves a $0.01 and a $1 route, as in `examples/basic`.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_charge_rejects_credential_paid_for_cheaper_route() {
+        let mpp = create_hmac_test_mpp();
+        let cheap = mpp.charge("0.01").unwrap().remove(0);
+        let credential =
+            PaymentCredential::new(cheap.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+
+        let err = mpp.verify_charge(&credential, "1").await.unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
+        assert!(err.message.contains("Amount mismatch"), "{}", err.message);
+
+        let receipt = mpp.verify_charge(&credential, "0.01").await.unwrap();
+        assert!(receipt.is_success());
+
+        // The unbound primitive still accepts it on any route.
+        assert!(mpp.broadcast_credential(&credential).await.is_ok());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_charge_accepts_every_offered_currency() {
+        use crate::protocol::methods::tempo::{OUSD, USDC};
+
+        let mpp = success_mpp_from(offers_builder().chain_id(CHAIN_ID));
+        let challenges = mpp.charge("0.10").unwrap();
+        for currency in [OUSD, USDC] {
+            let credential = offered_credential(&challenges, currency);
+            assert!(
+                mpp.verify_charge(&credential, "0.10").await.is_ok(),
+                "{currency} should match the route"
+            );
+            let err = mpp.verify_charge(&credential, "0.20").await.unwrap_err();
+            assert!(err.message.contains("Amount mismatch"), "{}", err.message);
+        }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_expected_charge_request_matches_issued_request() {
+        let mpp = create_hmac_test_mpp();
+        let scope = serde_json::json!({ "route": "/api/fortune" });
+        let options = || ChargeOptions {
+            fee_payer: true,
+            mppx_scope: Some(&scope),
+            ..Default::default()
+        };
+        let challenge = mpp
+            .charge_with_options("0.10", options())
+            .unwrap()
+            .remove(0);
+        let issued: serde_json::Value = challenge.request.decode_value().unwrap();
+        let expected = mpp.expected_charge_request("0.10", options()).unwrap();
+        assert_eq!(serde_json::to_value(&expected).unwrap(), issued);
+
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+        assert!(mpp
+            .verify_charge_with_options(&credential, "0.10", options())
+            .await
+            .is_ok());
+        // `verify_charge` expects an unscoped challenge.
+        let err = mpp.verify_charge(&credential, "0.10").await.unwrap_err();
+        assert!(err.message.contains("scope mismatch"), "{}", err.message);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_verify_charge_rejects_without_bound_currency() {
+        use crate::protocol::methods::tempo::PATH_USD;
+
+        let mpp = Mpp::new(TempoSuccessMethod, "MPP Payment", "test-secret");
+        let challenge = mpp
+            .charge_challenge("10000", PATH_USD, TEST_RECIPIENT)
+            .unwrap();
+        let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0x01"));
+
+        let err = mpp.verify_charge(&credential, "0.01").await.unwrap_err();
+        assert!(
+            err.message.contains("expected charge request"),
+            "{}",
+            err.message
+        );
+        assert!(err.code.is_none());
+    }
+
     #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn test_verify_credential_with_wrong_recipient_rejected() {
@@ -4400,6 +4623,31 @@ mod tests {
             .secret_key(TEST_SECRET),
         )
         .expect("failed to create stripe mpp")
+    }
+
+    #[cfg(feature = "stripe")]
+    #[tokio::test]
+    async fn test_stripe_verify_charge_rejects_credential_paid_for_cheaper_route() {
+        let mpp = test_stripe_mpp();
+        let cheap = mpp.stripe_charge("0.10").unwrap();
+        let credential = PaymentCredential::new(
+            cheap.to_echo(),
+            serde_json::json!({ "spt": "spt_test_cheap" }),
+        );
+
+        // Rejected before the Stripe API is reached.
+        let err = mpp
+            .stripe_verify_charge(&credential, "1.00")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
+        assert!(err.message.contains("Amount mismatch"), "{}", err.message);
+
+        let expected = mpp
+            .stripe_expected_charge_request("0.10", Default::default())
+            .unwrap();
+        assert_eq!(expected.amount, "10");
+        assert_eq!(expected.currency, "usd");
     }
 
     #[cfg(feature = "stripe")]
