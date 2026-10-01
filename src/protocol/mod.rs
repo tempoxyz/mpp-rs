@@ -84,7 +84,7 @@
 pub mod core;
 pub mod intents;
 
-#[cfg(any(feature = "server", feature = "tempo"))]
+#[cfg(any(feature = "server", feature = "tempo", feature = "stripe"))]
 pub mod methods;
 
 #[cfg(feature = "server")]
