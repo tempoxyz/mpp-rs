@@ -306,6 +306,7 @@ impl PaymentChallenge {
             intent: self.intent.clone(),
             request: self.request.clone(),
             expires: self.expires.clone(),
+            description: self.description.clone(),
             digest: self.digest.clone(),
             opaque: self.opaque.clone(),
             header: self.header.clone(),
@@ -653,12 +654,23 @@ pub struct ChallengeEcho {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
 
+    /// Human-readable description, echoed from the challenge when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     /// Request body digest for body binding (RFC 9530 Content-Digest)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
 
     /// Server-defined correlation data (base64url-encoded JSON).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// The legacy object form sent by older mppx clients is accepted and
+    /// normalized to the base64url string.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_echo_opaque"
+    )]
     pub opaque: Option<Base64UrlJson>,
 
     /// HTTP field that must carry the Payment credential.
@@ -667,6 +679,26 @@ pub struct ChallengeEcho {
     /// used the default `Authorization` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
+}
+
+fn deserialize_echo_opaque<'de, D>(deserializer: D) -> Result<Option<Base64UrlJson>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Opaque {
+        Raw(String),
+        Legacy(std::collections::BTreeMap<String, String>),
+    }
+
+    match Option::<Opaque>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Opaque::Raw(raw)) => Ok(Some(Base64UrlJson::from_raw(raw))),
+        Some(Opaque::Legacy(meta)) => Base64UrlJson::from_typed(&meta)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 /// Payment payload in credential.
@@ -936,7 +968,7 @@ impl PaymentCredential {
 /// methods MAY add fields; the Tempo subscription method adds `subscriptionId`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Receipt {
-    /// Receipt status ("success" or "failed")
+    /// Receipt status (always "success")
     pub status: ReceiptStatus,
 
     /// Payment method used
@@ -1014,7 +1046,6 @@ impl Receipt {
     ///
     /// # Arguments
     /// * `receipt_header` - The value of the Payment-Receipt header
-    /// * `status_code` - The HTTP status code (must be 2xx for receipt)
     pub fn from_response(receipt_header: &str) -> crate::error::Result<Self> {
         Self::from_header(receipt_header)
     }

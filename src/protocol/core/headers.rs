@@ -1623,6 +1623,87 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_echo_includes_description() {
+        let mut challenge = test_challenge();
+        challenge.description = Some("Pay for caf\u{e9}".to_string());
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
+        let header = format_authorization(&credential).unwrap();
+
+        let wire: serde_json::Value =
+            serde_json::from_slice(&base64url_decode(&header[8..]).unwrap()).unwrap();
+        assert_eq!(wire["challenge"]["description"], "Pay for caf\u{e9}");
+        assert_eq!(
+            parse_authorization(&header).unwrap().challenge.description,
+            challenge.description
+        );
+
+        // Without a description the field is omitted.
+        let credential = PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        );
+        let header = format_authorization(&credential).unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&base64url_decode(&header[8..]).unwrap()).unwrap();
+        assert!(wire["challenge"].get("description").is_none());
+    }
+
+    #[test]
+    fn test_parse_authorization_accepts_legacy_object_opaque() {
+        let opaque =
+            Base64UrlJson::from_value(&serde_json::json!({"pi": "pi_3abc123XYZ"})).unwrap();
+        let challenge = PaymentChallenge::with_secret_key_full(
+            "legacy-opaque-secret",
+            "api.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_raw("eyJhbW91bnQiOiIxMDAwIn0"),
+            None,
+            None,
+            None,
+            Some(opaque),
+            None,
+        );
+        let credential = |opaque: serde_json::Value| {
+            let json = serde_json::json!({
+                "challenge": {
+                    "id": challenge.id,
+                    "realm": "api.example.com",
+                    "method": "tempo",
+                    "intent": "charge",
+                    "request": "eyJhbW91bnQiOiIxMDAwIn0",
+                    "opaque": opaque,
+                },
+                "payload": {"type": "transaction", "signature": "0x1234"},
+            });
+            format!("Payment {}", base64url_encode(json.to_string().as_bytes()))
+        };
+
+        let echo = parse_authorization(&credential(serde_json::json!({"pi": "pi_3abc123XYZ"})))
+            .unwrap()
+            .challenge;
+        let opaque = echo.opaque.as_ref().map(|opaque| opaque.raw());
+        assert_eq!(opaque, Some("eyJwaSI6InBpXzNhYmMxMjNYWVoifQ"));
+        assert_eq!(
+            echo.id,
+            crate::protocol::core::compute_challenge_id(
+                "legacy-opaque-secret",
+                &echo.realm,
+                echo.method.as_str(),
+                echo.intent.as_str(),
+                echo.request.raw(),
+                None,
+                None,
+                opaque,
+            )
+        );
+
+        assert!(parse_authorization(&credential(serde_json::json!({"pi": 123}))).is_err());
+        assert!(parse_authorization(&credential(serde_json::json!(["pi"]))).is_err());
+    }
+
+    #[test]
     fn test_credential_echo_roundtrip_includes_header() {
         let mut challenge = test_challenge();
         challenge.header = Some("Payment-Authorization".to_string());

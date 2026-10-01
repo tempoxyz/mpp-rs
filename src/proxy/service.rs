@@ -756,6 +756,7 @@ mod tests {
             intent: IntentName::new("session"),
             request: Base64UrlJson::default(),
             expires: None,
+            description: None,
             digest: None,
             opaque: None,
             header: None,
