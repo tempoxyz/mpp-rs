@@ -17,11 +17,17 @@
 //! ```ignore
 //! let charge = TempoCharge::from_challenge(&challenge)?;
 //! let signed = charge.sign_with_options(&signer, SignOptions {
+//!     // A 2D nonce lane instead of the default expiring nonce.
+//!     nonce_key: Some(U256::from(1)),
 //!     nonce: Some(42),
 //!     gas_limit: Some(500_000),
-//!     max_fee_per_gas: Some(2_000_000_000),
-//!     max_priority_fee_per_gas: Some(100_000_000),
-//!     signing_mode: TempoSigningMode::Keychain { wallet, key_authorization: None },
+//!     max_fee_per_gas: Some(50_000_000_000),
+//!     max_priority_fee_per_gas: Some(2_000_000_000),
+//!     signing_mode: Some(TempoSigningMode::Keychain {
+//!         wallet,
+//!         key_authorization: None,
+//!         version: KeychainVersion::V2,
+//!     }),
 //!     rpc_url: Some("https://rpc.tempo.xyz".to_string()),
 //!     ..Default::default()
 //! }).await?;
@@ -60,10 +66,10 @@ use tempo_alloy::accounts::{TempoAccountsWallet, TempoAuthorizationReservation};
 use tempo_alloy::contracts::precompiles::ITIP20;
 use tempo_alloy::rpc::TempoTransactionRequest;
 
-/// Nonce key for expiring nonce transactions (fee payer mode).
+/// Nonce key for expiring nonce transactions, the default for every charge.
 const EXPIRING_NONCE_KEY: U256 = U256::MAX;
 
-/// Validity window (in seconds) for fee payer transactions.
+/// Default validity window (in seconds) for charge transactions.
 const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
 
 /// Encode a TIP-20 token transfer call, optionally with memo.
@@ -274,13 +280,14 @@ impl TempoCharge {
     /// Sign the charge with default options.
     ///
     /// This is the simple path — resolves the RPC provider from chain_id,
-    /// fetches the pending nonce, reads the current base fee, estimates gas,
-    /// builds and signs the transaction.
+    /// estimates gas, builds and signs the transaction. The transaction uses
+    /// an expiring nonce and Tempo's static gas fees, so neither the account
+    /// nonce nor the base fee is fetched. See [`SignOptions`] for the defaults.
     ///
     /// # Errors
     ///
     /// Returns an error if the chain_id is not a known Tempo network, or if
-    /// RPC calls (nonce, gas estimation) fail.
+    /// gas estimation fails.
     pub async fn sign(
         self,
         signer: &(impl alloy::signers::Signer + Clone),
@@ -705,30 +712,50 @@ impl PreparedTempoCharge {
 
 /// Options for controlling the signing pipeline.
 ///
-/// Power users set these to override the defaults (nonce resolution,
-/// gas estimation, signing mode, etc.). All fields are optional —
-/// unset fields are resolved automatically.
+/// Power users set these to override the defaults (nonce, gas, signing
+/// mode, etc.). All fields are optional — unset fields use the defaults
+/// documented on each field.
+///
+/// By default a charge is signed with an expiring nonce (`nonce_key` =
+/// `U256::MAX`, `nonce` = 0, `valid_before` = now + 25 seconds) and Tempo's
+/// static gas fees, so neither the account nonce nor the base fee is fetched.
 #[derive(Debug, Clone, Default)]
 pub struct SignOptions {
     /// Override the RPC URL (otherwise resolved from chain_id).
     pub rpc_url: Option<String>,
-    /// Override the transaction nonce (otherwise fetched as pending via `eth_getTransactionCount`).
+    /// Override the transaction nonce (default: `0`).
+    ///
+    /// The nonce is never fetched from the RPC. `0` is right for the default
+    /// expiring nonce key and for the first transaction on an unused 2D nonce
+    /// lane. For a [`nonce_key`](Self::nonce_key) that has been used before,
+    /// including the protocol nonce (key `0`), set the lane's current nonce
+    /// here or the transaction is rejected.
     pub nonce: Option<u64>,
-    /// Override the nonce key (default: `U256::ZERO`).
+    /// Override the nonce key (default: `U256::MAX`, the expiring nonce key).
+    ///
+    /// Any other key selects a sequential nonce: `U256::ZERO` is the protocol
+    /// nonce and every other value a 2D nonce lane. Set [`nonce`](Self::nonce)
+    /// along with it, since the lane's current nonce is not looked up.
     pub nonce_key: Option<U256>,
-    /// Override the gas limit (otherwise estimated via `eth_estimateGas`).
+    /// Override the gas limit (otherwise estimated via `eth_estimateGas`, or
+    /// a fixed 1,000,000 for fee-sponsored charges, which are not estimated).
     pub gas_limit: Option<u64>,
-    /// Override max fee per gas in wei (otherwise derived from the latest block's base fee).
+    /// Override max fee per gas in wei (default:
+    /// [`MAX_FEE_PER_GAS`](crate::client::tempo::MAX_FEE_PER_GAS), 41 gwei).
     pub max_fee_per_gas: Option<u128>,
-    /// Override max priority fee per gas in wei (default: 1 gwei floor).
+    /// Override max priority fee per gas in wei (default:
+    /// [`MAX_PRIORITY_FEE_PER_GAS`](crate::client::tempo::MAX_PRIORITY_FEE_PER_GAS),
+    /// 1 gwei).
     pub max_priority_fee_per_gas: Option<u128>,
-    /// Override the fee token address (default: the charge currency).
+    /// Override the fee token address (default: the charge currency). Unused
+    /// for fee-sponsored charges, where the server chooses the fee token.
     pub fee_token: Option<Address>,
     /// Override the signing mode (default: [`TempoSigningMode::Direct`]).
     pub signing_mode: Option<TempoSigningMode>,
     /// Provide a key authorization to include in the transaction.
     pub key_authorization: Option<Box<SignedKeyAuthorization>>,
-    /// Optional validity window upper bound (unix timestamp) for fee payer mode.
+    /// Override the transaction's `validBefore` as a unix timestamp (default:
+    /// 25 seconds from now). Applies to every charge, fee-sponsored or not.
     pub valid_before: Option<u64>,
 }
 
