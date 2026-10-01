@@ -1600,6 +1600,11 @@ impl TempoSessionProvider {
     /// event. Updates the internal cumulative amount and POSTs a signed voucher
     /// credential to the server.
     ///
+    /// When [`Self::with_max_deposit`] is set, a voucher that exceeds the
+    /// channel deposit is preceded by a top-up within that limit, sent to the
+    /// same URL. Without it the deposit is the limit and such a voucher is
+    /// refused, because nothing else bounds the amount the server asks for.
+    ///
     /// When the server answers `402` with a new session challenge, e.g. because
     /// the stream outlived the one it was opened with, the voucher is signed
     /// for that challenge and sent once more.
@@ -1616,9 +1621,23 @@ impl TempoSessionProvider {
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for voucher".into())
             })?;
-        let credential = self
-            .voucher_credential_for_challenge(&challenge, channel_id_hex, required_cumulative)
-            .await?;
+        let credential = if self.max_deposit.is_some() {
+            // The event's deposit is not passed in, so the top-up is planned
+            // against the local one.
+            self.voucher_credential_with_top_up_for_challenge(
+                client,
+                url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                channel_id_hex,
+                required_cumulative,
+                0,
+            )
+            .await?
+        } else {
+            self.voucher_credential_for_challenge(&challenge, channel_id_hex, required_cumulative)
+                .await?
+        };
         let mut resp =
             Self::post_credential(client, url, &challenge, &credential, "voucher POST failed")
                 .await?;
@@ -3388,6 +3407,75 @@ mod tests {
         // Nothing was signed for the other payee's challenge.
         assert_eq!(posted.lock().unwrap().len(), 2);
         assert_eq!(provider.channels().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_voucher_tops_up_before_exceeding_the_deposit() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider().with_max_deposit(2_000);
+        mock_rpc(&mut provider, &["0x4a817c800", "0x5208"]); // eth_gasPrice, eth_estimateGas
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        *provider.last_challenge.lock().unwrap() = Some(make_scoped_challenge(
+            payee,
+            currency,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        ));
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+
+        provider
+            .send_voucher(
+                &reqwest::Client::new(),
+                &url,
+                &channel_id.to_string(),
+                1_500,
+            )
+            .await
+            .unwrap();
+
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted.len(), 2);
+        assert_eq!(posted[0].1["action"], "topUp");
+        assert_eq!(posted[0].1["additionalDeposit"], "500");
+        assert_eq!(posted[1].1["action"], "voucher");
+        assert_eq!(posted[1].1["cumulativeAmount"], "1500");
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 1_500);
+    }
+
+    /// Without `max_deposit` the deposit is the only limit on what a server
+    /// can ask for, so `send_voucher` does not raise it.
+    #[tokio::test]
+    async fn send_voucher_does_not_top_up_without_max_deposit() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        *provider.last_challenge.lock().unwrap() = Some(make_scoped_challenge(
+            payee,
+            currency,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        ));
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+
+        let err = provider
+            .send_voucher(
+                &reqwest::Client::new(),
+                &url,
+                &channel_id.to_string(),
+                1_500,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("exceeds channel deposit"), "{err}");
+        assert!(posted.lock().unwrap().is_empty());
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 1_000);
     }
 
     // --- close early-return paths ---
