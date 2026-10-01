@@ -79,6 +79,39 @@ fn test_validate_transaction_transfers_rejects_unexpected_fee_payer_calls() {
 }
 
 #[test]
+fn test_validate_transaction_transfers_rejects_fee_payer_with_too_many_transfers() {
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let method = ChargeMethod::new(provider);
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let transfer = Transfer {
+        amount: U256::from(100u64),
+        recipient,
+        memo: None,
+    };
+    let call = tempo_alloy::primitives::transaction::Call {
+        to: TxKind::Call(currency),
+        value: U256::ZERO,
+        input: make_transfer_input(recipient, U256::from(100u64)),
+    };
+    let validate = |transfers: usize| {
+        let tx_bytes = encode_signed_tx(vec![call.clone(); transfers], MAX_FEE_PAYER_GAS_LIMIT);
+        let expected = vec![transfer.clone(); transfers];
+        method.validate_transaction_transfers(&tx_bytes, currency, &expected, CHAIN_ID, true)
+    };
+
+    validate(11).unwrap();
+    let error = validate(12).unwrap_err();
+    assert!(
+        error.to_string().contains("disallowed call pattern"),
+        "{error}"
+    );
+}
+
+#[test]
 fn test_validate_transaction_transfers_accepts_fee_payer_approve_swap_prefix() {
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()

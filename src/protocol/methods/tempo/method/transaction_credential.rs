@@ -14,7 +14,7 @@ use crate::protocol::traits::VerificationError;
 use super::super::transfers::Transfer;
 use super::super::{proof, TempoChargeExt};
 use super::calls::{
-    get_transfer_calls, validate_fee_payer_calls, TRANSFER_SELECTOR, TRANSFER_WITH_MEMO_SELECTOR,
+    validate_fee_payer_calls, PaymentCalls, TRANSFER_SELECTOR, TRANSFER_WITH_MEMO_SELECTOR,
 };
 use super::fee_payer::FeePayerPolicy;
 use super::memo::{
@@ -158,10 +158,11 @@ where
             return Ok(Some(route.settlement_sender));
         }
 
-        let transfer_calls = get_transfer_calls(&tx.calls)?;
+        let calls = PaymentCalls::parse(&tx.calls)?;
+        let transfer_calls = calls.transfers;
 
         if require_exact_calls {
-            validate_fee_payer_calls(&tx.calls, currency, expected)?;
+            validate_fee_payer_calls(&calls, currency, expected)?;
         }
 
         // Sort expected transfers: memo-bearing first for greedy-safe matching
