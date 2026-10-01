@@ -4,7 +4,7 @@
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
+use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
@@ -13,10 +13,9 @@ use crate::protocol::traits::VerificationError;
 
 use super::super::transfers::Transfer;
 use super::super::{proof, TempoChargeExt};
-use super::calls::{
-    validate_fee_payer_calls, PaymentCalls, TRANSFER_SELECTOR, TRANSFER_WITH_MEMO_SELECTOR,
-};
+use super::calls::{validate_fee_payer_calls, PaymentCalls};
 use super::fee_payer::FeePayerPolicy;
+use super::matching::{match_transfers, TransferSource};
 use super::memo::{
     assert_challenge_bound_memo, assert_challenge_bound_memos, challenge_bound_memo_error,
     is_challenge_bound_memo,
@@ -159,126 +158,30 @@ where
         }
 
         let calls = PaymentCalls::parse(&tx.calls)?;
-        let transfer_calls = calls.transfers;
 
         if require_exact_calls {
             validate_fee_payer_calls(&calls, currency, expected)?;
         }
 
-        // Sort expected transfers: memo-bearing first for greedy-safe matching
-        let mut sorted_expected: Vec<(usize, &Transfer)> = expected.iter().enumerate().collect();
-        sorted_expected.sort_by_key(|(_, t)| if t.memo.is_some() { 0 } else { 1 });
-
-        let mut used_calls: Vec<bool> = vec![false; transfer_calls.len()];
-        let mut matched_memos: Vec<[u8; 32]> = Vec::new();
-
-        if require_exact_calls && transfer_calls.len() != expected.len() {
+        // With one call per expected transfer, matching every expected
+        // transfer leaves no call unaccounted for.
+        if require_exact_calls && calls.transfers.len() != expected.len() {
             return Err(VerificationError::new(format!(
                 "Invalid transaction: no matching payment call found (expected {} transfer calls, got {})",
                 expected.len(),
-                transfer_calls.len()
+                calls.transfers.len()
             )));
         }
 
-        for (_, transfer) in &sorted_expected {
-            if transfer.amount.is_zero() {
-                return Err(VerificationError::new(
-                    "Invalid amount: expected_amount must be greater than zero".to_string(),
-                ));
-            }
-            if transfer.recipient.is_zero() {
-                return Err(VerificationError::new(
-                    "Invalid recipient: expected_recipient cannot be the zero address".to_string(),
-                ));
-            }
-
-            let mut found = false;
-
-            for (call_idx, call) in transfer_calls.iter().enumerate() {
-                if used_calls[call_idx] {
-                    continue;
-                }
-
-                let call_to = match &call.to {
-                    TxKind::Call(addr) => addr,
-                    TxKind::Create => continue,
-                };
-                if call_to != &currency {
-                    continue;
-                }
-
-                let data = &call.input;
-                if data.len() < 4 {
-                    continue;
-                }
-
-                let selector: [u8; 4] = data[..4].try_into().unwrap_or([0; 4]);
-
-                if let Some(exp_memo) = &transfer.memo {
-                    if selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
-                        let to = Address::from_slice(&data[16..36]);
-                        let amount = U256::from_be_slice(&data[36..68]);
-                        let memo_bytes = B256::from_slice(&data[68..100]);
-
-                        if to == transfer.recipient
-                            && amount == transfer.amount
-                            && memo_bytes == B256::from(*exp_memo)
-                        {
-                            used_calls[call_idx] = true;
-                            matched_memos.push(*exp_memo);
-                            found = true;
-                            break;
-                        }
-                    }
-                } else {
-                    // No memo — accept transfer or transferWithMemo
-                    if selector == TRANSFER_SELECTOR && data.len() == 68 {
-                        let to = Address::from_slice(&data[16..36]);
-                        let amount = U256::from_be_slice(&data[36..68]);
-
-                        if to == transfer.recipient && amount == transfer.amount {
-                            used_calls[call_idx] = true;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found && selector == TRANSFER_WITH_MEMO_SELECTOR && data.len() == 100 {
-                        let to = Address::from_slice(&data[16..36]);
-                        let amount = U256::from_be_slice(&data[36..68]);
-                        let memo = B256::from_slice(&data[68..100]);
-
-                        if to == transfer.recipient && amount == transfer.amount {
-                            used_calls[call_idx] = true;
-                            matched_memos.push(memo.0);
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !found {
-                return Err(VerificationError::new(format!(
-                    "Invalid transaction: no matching transfer call found for {} to {}{}",
-                    transfer.amount,
-                    transfer.recipient,
-                    if transfer.memo.is_some() {
-                        " with memo"
-                    } else {
-                        ""
-                    }
-                )));
-            }
-        }
-
-        if require_exact_calls && !used_calls.iter().all(|used| *used) {
-            return Err(VerificationError::new(
-                "Fee-sponsored transaction contains unexpected calls".to_string(),
-            ));
-        }
+        let matched_memos = match_transfers(
+            &calls.transfer_effects(),
+            TransferSource::Calls,
+            currency,
+            expected,
+        )?;
 
         if let Some((challenge_id, realm)) = challenge_binding {
-            assert_challenge_bound_memos(&matched_memos, challenge_id, realm)?;
+            assert_challenge_bound_memos(matched_memos.iter().flatten(), challenge_id, realm)?;
         }
 
         Ok(None)

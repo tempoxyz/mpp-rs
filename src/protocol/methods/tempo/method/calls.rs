@@ -1,6 +1,6 @@
 //! Call-shape validation for charge transactions.
 
-use alloy::primitives::{Address, Bytes, TxKind, U256};
+use alloy::primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy::sol_types::SolCall;
 use tempo_alloy::contracts::precompiles::{IStablecoinDEX, ITIP20, STABLECOIN_DEX_ADDRESS};
 use tempo_alloy::primitives::transaction::Call;
@@ -8,6 +8,7 @@ use tempo_alloy::primitives::transaction::Call;
 use crate::protocol::traits::VerificationError;
 
 use super::super::transfers::Transfer;
+use super::matching::TransferEffect;
 
 /// TIP-20 transfer function selector: bytes4(keccak256("transfer(address,uint256)"))
 pub(super) const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -93,6 +94,34 @@ impl<'a> PaymentCalls<'a> {
             transfers,
         })
     }
+
+    /// The transfers the calls make. A call that is not sent to a contract,
+    /// or whose calldata does not have the exact length, makes none.
+    pub(super) fn transfer_effects(&self) -> Vec<TransferEffect> {
+        self.transfers.iter().filter_map(transfer_effect).collect()
+    }
+}
+
+fn transfer_effect(call: &Call) -> Option<TransferEffect> {
+    let TxKind::Call(token) = call.to else {
+        return None;
+    };
+    let data = &call.input;
+    let memo = match call_selector(data)? {
+        TRANSFER_SELECTOR if data.len() == 68 => None,
+        TRANSFER_WITH_MEMO_SELECTOR if data.len() == 100 => {
+            Some(B256::from_slice(&data[68..100]).0)
+        }
+        _ => return None,
+    };
+
+    Some(TransferEffect {
+        token,
+        from: None,
+        to: Address::from_slice(&data[16..36]),
+        amount: U256::from_be_slice(&data[36..68]),
+        memo,
+    })
 }
 
 /// Checks that only apply to a fee-sponsored transaction: at most 11

@@ -48,6 +48,7 @@ use super::{
 mod calls;
 mod fee_payer;
 mod hash_credential;
+mod matching;
 mod memo;
 mod proof_credential;
 mod receipt_logs;
