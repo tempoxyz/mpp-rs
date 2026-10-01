@@ -39,7 +39,9 @@ use time::OffsetDateTime;
 
 use super::ws::{WsMessage, WsResponse};
 use crate::protocol::core::parse_authorization;
-use crate::protocol::methods::tempo::session_method::{deduct_from_channel, ChannelStore};
+use crate::protocol::methods::tempo::session_method::{
+    deduct_from_channel, normalize_channel_id, ChannelStore,
+};
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod};
 
@@ -79,6 +81,7 @@ where
         generate,
         poll_interval_ms,
     } = options;
+    let channel_id = normalize_channel_id(&channel_id);
 
     let mut stream = std::pin::pin!(generate);
 
@@ -318,6 +321,34 @@ mod tests {
                 assert_eq!(receipt["spent"], "200");
                 assert_eq!(receipt["units"], 2);
             }
+            other => panic!("last frame should be a receipt, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_session_normalizes_channel_id() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let lower = format!("0x{}", "ab".repeat(32));
+        store.insert(&lower, test_channel_state(&lower, 1000, 5000));
+
+        let (mut sink, frames) = recording_sink();
+        ws_session(
+            &mut sink,
+            WsSessionOptions {
+                store,
+                channel_id: format!("0x{}", "AB".repeat(32)),
+                challenge_id: "ch-case".to_string(),
+                tick_cost: 100,
+                generate: Box::pin(async_stream::stream! { yield "a".to_string(); }),
+                poll_interval_ms: 10,
+            },
+        )
+        .await;
+
+        let frames = frames.lock().unwrap();
+        assert!(matches!(&frames[0], WsResponse::Data { data } if data == "a"));
+        match frames.last() {
+            Some(WsResponse::Receipt { receipt }) => assert_eq!(receipt["channelId"], lower),
             other => panic!("last frame should be a receipt, got: {other:?}"),
         }
     }
