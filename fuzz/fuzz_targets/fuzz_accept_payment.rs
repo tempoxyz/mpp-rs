@@ -1,7 +1,8 @@
 //! `Accept-Payment` parsing, serialization and ranking.
 //!
 //! - `parse` never panics; accepted entries are well-formed (`[a-z0-9-]+` or
-//!   `*` tokens, `0 <= q <= 1`, indices in header order).
+//!   `*` tokens, method tokens also `:` and `_`, `0 <= q <= 1`, indices in
+//!   header order).
 //! - `parse(serialize(entries))` gives the same entries.
 //! - `rank` returns offers without duplicates, drops offers that match
 //!   nothing or whose best match is `q=0`, and orders the rest by `q`
@@ -37,17 +38,12 @@ fuzz_target!(|header: &str| {
         assert_eq!(entry.index, index);
         assert!((0.0..=1.0).contains(&entry.q));
         assert!(
-            is_token(&entry.method) && is_token(&entry.intent),
+            is_token(&entry.method, true) && is_token(&entry.intent, false),
             "{entry:?}"
         );
     }
 
-    // The serializer writes three decimals. `parse` also accepts exponent
-    // forms such as `q=1e-5` (which mppx and RFC 9110 reject); those do not
-    // survive and would flip to an opt-out, so they are left out here.
-    if entries.iter().all(|entry| is_qvalue(entry.q)) {
-        assert_eq!(parse(&serialize(&entries)).unwrap(), entries);
-    }
+    assert_eq!(parse(&serialize(&entries)).unwrap(), entries);
 
     // Offers: everything the header names, plus offers it does not name.
     let mut offers = Vec::new();
@@ -79,16 +75,15 @@ fuzz_target!(|header: &str| {
     );
 });
 
-fn is_token(token: &str) -> bool {
+fn is_token(token: &str, is_method: bool) -> bool {
     token == "*"
         || (!token.is_empty()
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
-}
-
-fn is_qvalue(q: f32) -> bool {
-    (q * 1000.0).round() / 1000.0 == q
+            && token.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'-'
+                    || (is_method && matches!(b, b':' | b'_'))
+            }))
 }
 
 fn reference_rank(offers: &[Offer], entries: &[Entry]) -> Vec<usize> {

@@ -3,8 +3,7 @@
 //! - `ChargeRequest::parse_amount` and `SessionRequest::parse_amount` agree.
 //! - `parse_units` never panics, returns a canonical base-unit integer
 //!   (`0|[1-9][0-9]*`), and one more decimal multiplies the result by ten.
-//! - With `--features tempo`: the `u128` and `U256` parsers agree on digit
-//!   strings, and `get_transfers` conserves the amount: the transfers sum to
+//! - With `--features tempo`: the `u128` and `U256` parsers agree, and `get_transfers` conserves the amount: the transfers sum to
 //!   the total, none is zero, and the primary recipient comes first.
 //! - With `--features strict-amounts`: every parser rejects anything but
 //!   `0|[1-9][0-9]*`.
@@ -52,7 +51,7 @@ fuzz_target!(|input: (&str, u8, Vec<(&str, [u8; 20])>)| {
     }
 
     #[cfg(feature = "tempo")]
-    tempo::check(&charge, parsed, digits, &splits);
+    tempo::check(&charge, parsed, &splits);
     #[cfg(not(feature = "tempo"))]
     let _ = splits;
 });
@@ -70,22 +69,13 @@ mod tempo {
     use mpp::protocol::methods::tempo::{get_transfers, transfers::MAX_SPLITS, Split};
     use mpp::{Address, ChargeRequest, U256};
 
-    pub fn check(
-        charge: &ChargeRequest,
-        parsed: Option<u128>,
-        digits: bool,
-        splits: &[(&str, [u8; 20])],
-    ) {
+    pub fn check(charge: &ChargeRequest, parsed: Option<u128>, splits: &[(&str, [u8; 20])]) {
         let wide = charge.parse_amount_u256().ok();
-        // The parsers disagree outside the digit grammar: `u128` takes a
-        // leading `+`, `U256` takes `0x`/`0o`/`0b` prefixes and `_`.
-        if digits || cfg!(feature = "strict-amounts") {
-            match wide {
-                Some(wide) if wide <= U256::from(u128::MAX) => {
-                    assert_eq!(parsed.map(U256::from), Some(wide));
-                }
-                _ => assert_eq!(parsed, None),
+        match wide {
+            Some(wide) if wide <= U256::from(u128::MAX) => {
+                assert_eq!(parsed.map(U256::from), Some(wide));
             }
+            _ => assert_eq!(parsed, None),
         }
         if cfg!(feature = "strict-amounts") {
             let amount = &charge.amount;
