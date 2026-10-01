@@ -949,6 +949,13 @@ where
             ));
         }
 
+        if request.external_id != expected.external_id {
+            return Err(VerificationError::with_code(
+                "External ID mismatch: credential was issued for a different order",
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
+            ));
+        }
+
         #[cfg(feature = "tempo")]
         if _credential.challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME {
             let req_transfers =
@@ -5392,6 +5399,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("Currency mismatch"), "{}", err.message);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_expected_request_binds_external_id() {
+        use crate::protocol::methods::tempo::OUSD;
+
+        let mpp = success_mpp_from(offers_builder().chain_id(CHAIN_ID));
+        let challenges = mpp
+            .charge_with_options(
+                "0.10",
+                ChargeOptions {
+                    external_id: Some("order-1"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let credential = offered_credential(&challenges, OUSD);
+        let issued: ChargeRequest = challenges[0].request.decode().unwrap();
+
+        // Another order at the same price, and a route that expects no order id.
+        for external_id in [Some("order-2".to_string()), None] {
+            let expected = ChargeRequest {
+                external_id,
+                ..issued.clone()
+            };
+            let err = mpp
+                .verify_credential_with_expected_request(&credential, &expected)
+                .await
+                .unwrap_err();
+            assert!(
+                err.message.contains("External ID mismatch"),
+                "{}",
+                err.message
+            );
+        }
+
+        assert!(mpp
+            .verify_credential_with_expected_request(&credential, &issued)
+            .await
+            .is_ok());
     }
 
     #[cfg(feature = "tempo")]
