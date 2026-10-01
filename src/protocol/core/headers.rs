@@ -947,6 +947,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_www_authenticate_accepts_request_parameter_at_the_limit() {
+        let json = format!(r#"{{"a":"{}"}}"#, "x".repeat(MAX_TOKEN_LEN / 4 * 3 - 8));
+        let request = base64url_encode(json.as_bytes());
+        assert_eq!(request.len(), MAX_TOKEN_LEN);
+
+        for value in [format!("\"{request}\""), request.clone()] {
+            let header = format!(
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request={value}"#
+            );
+            let challenge = parse_www_authenticate(&header).unwrap();
+            assert_eq!(challenge.request.raw(), request);
+        }
+    }
+
+    #[test]
     fn test_roundtrip_preserves_request() {
         let original_request = serde_json::json!({
             "amount": "5000",
