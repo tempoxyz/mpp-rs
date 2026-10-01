@@ -38,6 +38,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_types::{header, HeaderValue, Request, Response, StatusCode};
 
+use crate::error::{MppError, PaymentError};
 use crate::protocol::core::headers::{
     extract_payment_scheme, format_receipt, format_www_authenticate_many, parse_authorization,
     with_private_cache_control, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
@@ -74,6 +75,26 @@ pub trait PaymentVerifier: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
         let _ = body;
         self.verify(credential)
+    }
+
+    /// Verify a credential string, against the request body bytes when the
+    /// layer is body-bound, keeping the failure typed.
+    ///
+    /// The layers call this method and answer a failure by its kind: a
+    /// payment problem gets a fresh challenge, a server-side failure a `500`
+    /// without one. The default delegates to [`verify`](Self::verify) and
+    /// [`verify_with_body`](Self::verify_with_body) and reports every failure
+    /// as `verification-failed`.
+    fn verify_credential(
+        &self,
+        credential: &str,
+        body: Option<&[u8]>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>> {
+        let verified = match body {
+            Some(body) => self.verify_with_body(credential, body),
+            None => self.verify(credential),
+        };
+        Box::pin(async move { verified.await.map_err(MppError::verification_failed) })
     }
 
     /// HTTP field containing the Payment credential.
@@ -145,6 +166,11 @@ impl PaymentVerifier for FnVerifier {
 /// a `402 Payment Required` response with a `WWW-Authenticate` challenge.
 /// Valid payments are verified and a `Payment-Receipt` header is attached
 /// to the inner service's response.
+///
+/// A credential that cannot be verified because of a server-side failure
+/// (RPC, store) is answered with `500` and no challenge, so the client does
+/// not pay again. The layer is generic over the response body, so its own
+/// responses have an empty body and carry no problem details.
 pub struct PaymentLayer<V> {
     verifier: Arc<V>,
 }
@@ -253,7 +279,9 @@ where
                 None => {
                     // No credential — return a fresh, retryable 402 challenge.
                     return Ok(match verifier.challenge() {
-                        Ok(challenge) => challenge_response(&challenge),
+                        Ok(challenge) => {
+                            challenge_response(StatusCode::PAYMENT_REQUIRED, &challenge)
+                        }
                         Err(e) => error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             &format!("Failed to generate challenge: {}", e),
@@ -263,21 +291,9 @@ where
             };
 
             // Verify the credential.
-            let receipt_header = match verifier.verify(&credential).await {
+            let receipt_header = match verifier.verify_credential(&credential, None).await {
                 Ok(r) => r,
-                Err(_e) => {
-                    // Verification failed — per the Payment auth spec, return a
-                    // fresh, retryable 402 carrying a new `WWW-Authenticate`
-                    // challenge (not a dead-end bare 402) so the client can pay
-                    // again. Mirrors the no-credential path above.
-                    return Ok(match verifier.challenge() {
-                        Ok(challenge) => challenge_response(&challenge),
-                        Err(e) => error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &format!("Failed to generate challenge: {}", e),
-                        ),
-                    });
-                }
+                Err(error) => return Ok(rejection_response(&error, || verifier.challenge())),
             };
 
             // Call the inner service.
@@ -433,20 +449,16 @@ where
                             ));
                         }
                     };
-                    return Ok(challenge_response(&challenge));
+                    return Ok(challenge_response(StatusCode::PAYMENT_REQUIRED, &challenge));
                 }
             };
 
-            let receipt_header = match verifier.verify_with_body(&credential, &body).await {
+            let receipt_header = match verifier.verify_credential(&credential, Some(&body)).await {
                 Ok(r) => r,
-                Err(_e) => {
-                    return Ok(match verifier.challenge_with_body(&body) {
-                        Ok(challenge) => challenge_response(&challenge),
-                        Err(e) => error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &format!("Failed to generate challenge: {e}"),
-                        ),
-                    });
+                Err(error) => {
+                    return Ok(rejection_response(&error, || {
+                        verifier.challenge_with_body(&body)
+                    }));
                 }
             };
 
@@ -490,22 +502,50 @@ fn attach_receipt<B>(resp: &mut Response<B>, receipt_header: &str) {
     resp.headers_mut().insert(PAYMENT_RECEIPT_HEADER, receipt);
 }
 
-/// Build a retryable `402 Payment Required` response carrying a fresh
-/// `WWW-Authenticate: Payment` challenge and `Cache-Control: no-store`.
+/// Build a retryable response carrying a fresh `WWW-Authenticate: Payment`
+/// challenge and `Cache-Control: no-store`.
 ///
-/// Used for both the no-credential and failed-verification paths so that a
-/// client always receives a usable challenge it can pay against, per the
-/// Payment authentication scheme.
-fn challenge_response<B: Default>(challenge: &str) -> Response<B> {
+/// A challenge that is not a valid header value cannot be offered to the
+/// client, so it is answered as a server-side failure.
+fn challenge_response<B: Default>(status: StatusCode, challenge: &str) -> Response<B> {
+    let Ok(challenge) = HeaderValue::from_str(challenge) else {
+        return internal_error_response();
+    };
     let mut resp = Response::new(B::default());
-    *resp.status_mut() = StatusCode::PAYMENT_REQUIRED;
-    resp.headers_mut().insert(
-        WWW_AUTHENTICATE_HEADER,
-        HeaderValue::from_str(challenge).unwrap_or_else(|_| HeaderValue::from_static("Payment")),
-    );
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(WWW_AUTHENTICATE_HEADER, challenge);
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
+}
+
+/// Build a `500` response without a challenge.
+fn internal_error_response<B: Default>() -> Response<B> {
+    let mut resp = error_response(StatusCode::INTERNAL_SERVER_ERROR, "");
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// Build the response for a credential that failed with `error`.
+///
+/// A payment problem is answered with its status and the fresh challenge
+/// from `challenge` so the client can retry. A server-side failure is
+/// answered with `500` and no challenge, so the client does not pay again.
+fn rejection_response<B: Default>(
+    error: &MppError,
+    challenge: impl FnOnce() -> Result<String, String>,
+) -> Response<B> {
+    if !error.is_payment_problem() {
+        return internal_error_response();
+    }
+    let status = StatusCode::from_u16(error.to_problem_details(None).status)
+        .unwrap_or(StatusCode::PAYMENT_REQUIRED);
+    match challenge() {
+        Ok(challenge) => challenge_response(status, &challenge),
+        Err(_) => internal_error_response(),
+    }
 }
 
 // ==================== Mpp integration ====================
@@ -523,13 +563,13 @@ pub struct ChargeVerifier {
     credential_header: String,
     /// Shared mpp instance for verification (type-erased).
     verify_fn: Box<
-        dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>>
             + Send
             + Sync,
     >,
     /// Shared mpp instance for body-bound verification (type-erased).
     verify_with_body_fn: Box<
-        dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>>
             + Send
             + Sync,
     >,
@@ -548,7 +588,8 @@ impl PaymentVerifier for ChargeVerifier {
         &self,
         credential: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        (self.verify_fn)(credential.to_string())
+        let verified = self.verify_credential(credential, None);
+        Box::pin(async move { verified.await.map_err(|e| e.to_string()) })
     }
 
     fn verify_with_body(
@@ -556,7 +597,19 @@ impl PaymentVerifier for ChargeVerifier {
         credential: &str,
         body: &[u8],
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        (self.verify_with_body_fn)(credential.to_string(), body.to_vec())
+        let verified = self.verify_credential(credential, Some(body));
+        Box::pin(async move { verified.await.map_err(|e| e.to_string()) })
+    }
+
+    fn verify_credential(
+        &self,
+        credential: &str,
+        body: Option<&[u8]>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>> {
+        match body {
+            Some(body) => (self.verify_with_body_fn)(credential.to_string(), body.to_vec()),
+            None => (self.verify_fn)(credential.to_string()),
+        }
     }
 
     fn credential_header(&self) -> &str {
@@ -623,19 +676,17 @@ impl PaymentLayer<ChargeVerifier> {
 
         let mpp_for_verify = mpp.clone();
         let expected_request_for_body = expected_request.clone();
-        let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let verify_fn = Box::new(move |credential_str: String| -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>> {
             let mpp = mpp_for_verify.clone();
             let expected_request = expected_request.clone();
             Box::pin(async move {
-                let credential = parse_authorization(&credential_str)
-                    .map_err(|e| format!("Invalid credential: {e}"))?;
+                let credential = parse_authorization(&credential_str)?;
 
                 let receipt = mpp
                     .verify_credential_with_expected_request(&credential, &expected_request)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    .await?;
 
-                format_receipt(&receipt).map_err(|e| format!("Failed to format receipt: {e}"))
+                format_receipt(&receipt)
             })
         });
 
@@ -643,12 +694,11 @@ impl PaymentLayer<ChargeVerifier> {
         let verify_with_body_fn = Box::new(
             move |credential_str: String,
                   body: Vec<u8>|
-                  -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+                  -> Pin<Box<dyn Future<Output = Result<String, MppError>> + Send>> {
                 let mpp = mpp_for_body_verify.clone();
                 let expected_request = expected_request_for_body.clone();
                 Box::pin(async move {
-                    let credential = parse_authorization(&credential_str)
-                        .map_err(|e| format!("Invalid credential: {e}"))?;
+                    let credential = parse_authorization(&credential_str)?;
 
                     let receipt = mpp
                         .verify_credential_with_expected_request_and_body(
@@ -656,10 +706,9 @@ impl PaymentLayer<ChargeVerifier> {
                             &expected_request,
                             &body,
                         )
-                        .await
-                        .map_err(|e| e.to_string())?;
+                        .await?;
 
-                    format_receipt(&receipt).map_err(|e| format!("Failed to format receipt: {e}"))
+                    format_receipt(&receipt)
                 })
             },
         );
@@ -953,6 +1002,27 @@ mod tests {
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=60"
         );
+    }
+
+    #[tokio::test]
+    async fn test_service_unusable_challenge_returns_500_without_challenge() {
+        use tower_service::Service;
+
+        for authorization in [None, Some("Payment eyJmYWtlIjp0cnVlfQ")] {
+            let layer = PaymentLayer::new(MockVerifier {
+                challenge_value: "Payment id=\"a\nb\"".to_string(),
+                accept: false,
+            });
+            let mut svc = layer.layer(StatusService(StatusCode::OK));
+            let mut req = Request::builder().uri("/premium");
+            if let Some(authorization) = authorization {
+                req = req.header(header::AUTHORIZATION, authorization);
+            }
+
+            let resp = svc.call(req.body(()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        }
     }
 
     /// Test: invalid auth → retryable 402 with a fresh challenge.
