@@ -403,6 +403,14 @@ impl<P> SessionMethod<P> {
         addr.parse::<Address>()
             .map_err(|e| VerificationError::invalid_payload(format!("Invalid address: {}", e)))
     }
+
+    /// Parse the base-unit amount in the payload field `field`: decimal
+    /// digits only, without the sign `u128::from_str` would accept.
+    fn parse_amount(amount: &str, field: &str) -> Result<u128, VerificationError> {
+        crate::protocol::intents::base_unit_digits(amount)
+            .and_then(|digits| digits.parse().ok())
+            .ok_or_else(|| VerificationError::invalid_payload(format!("invalid {field}")))
+    }
 }
 
 impl<P> SessionMethod<P>
@@ -747,9 +755,7 @@ where
         // Check the voucher against the transaction before broadcasting it:
         // once the channel is funded, rejecting the credential would leave the
         // deposit in a channel the server never recorded.
-        let cumulative_amount: u128 = cumulative_amount_str
-            .parse()
-            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
+        let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
         if cumulative_amount > open_deposit {
             return Err(VerificationError::amount_exceeds_deposit(
                 "voucher amount exceeds open deposit",
@@ -991,9 +997,7 @@ where
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
 
-        let additional_deposit: u128 = additional_deposit_str
-            .parse()
-            .map_err(|_| VerificationError::invalid_payload("invalid additionalDeposit"))?;
+        let additional_deposit = Self::parse_amount(additional_deposit_str, "additionalDeposit")?;
 
         // Broadcast the client's signed topUp transaction.
         let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
@@ -1113,9 +1117,7 @@ where
             return Err(VerificationError::channel_closed("channel is closing"));
         }
 
-        let cumulative_amount: u128 = cumulative_amount_str
-            .parse()
-            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
+        let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
 
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
@@ -1244,9 +1246,7 @@ where
             ));
         }
 
-        let cumulative_amount: u128 = cumulative_amount_str
-            .parse()
-            .map_err(|_| VerificationError::invalid_payload("invalid cumulativeAmount"))?;
+        let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
@@ -4454,6 +4454,63 @@ mod tests {
                 "spent": "400",
                 "units": 4,
             })
+        );
+    }
+
+    /// Amounts are decimal digits only. `u128::from_str` would also read a
+    /// leading `+`, so the same voucher could be spelled in two ways.
+    #[tokio::test]
+    async fn test_voucher_rejects_signed_amount() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id, state.clone());
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_on_chain_channel(
+            &asserter,
+            state.payer,
+            state.authorized_signer,
+            state.deposit,
+        );
+        let method = mocked_session_method(store.clone(), asserter);
+
+        let signature = voucher::sign_voucher(
+            &signer,
+            channel_id.parse().unwrap(),
+            2_000,
+            state.escrow_contract,
+            state.chain_id,
+        )
+        .await
+        .unwrap();
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Voucher {
+                channel_id: channel_id.clone(),
+                descriptor: None,
+                settlement_route: None,
+                cumulative_amount: "+2000".to_string(),
+                signature: alloy::hex::encode_prefixed(signature),
+            },
+        );
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InvalidPayload));
+        assert_eq!(err.message, "invalid cumulativeAmount");
+        assert_eq!(
+            store
+                .get_channel_sync(&channel_id)
+                .unwrap()
+                .highest_voucher_amount,
+            1_000
         );
     }
 
