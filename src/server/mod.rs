@@ -105,7 +105,8 @@ pub struct ChargeOptions<'a> {
     pub expires: Option<&'a str>,
     /// Enable fee sponsorship.
     pub fee_payer: bool,
-    /// Credential modes advertised to clients (for example, `&["pull"]`).
+    /// Credential modes advertised to clients: `"pull"` and/or `"push"` (for
+    /// example, `&["pull"]`). Credentials of any other mode are rejected.
     pub supported_modes: Option<&'a [&'a str]>,
     /// Framework adapter route/resource/query scope.
     pub mppx_scope: Option<&'a serde_json::Value>,

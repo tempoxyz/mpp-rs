@@ -40,7 +40,7 @@ use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
 use tokio::sync::OnceCell;
 
-use crate::protocol::core::{ChallengeEcho, PaymentCredential, Receipt};
+use crate::protocol::core::{ChallengeEcho, PaymentCredential, PaymentPayload, Receipt};
 use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{
     ChargeMethod as ChargeMethodTrait, ChargeValidation, VerificationError,
@@ -545,6 +545,42 @@ fn request_settlement_senders(charge: &ChargeRequest, chain_id: u64) -> Vec<Addr
     } else {
         Vec::new()
     }
+}
+
+/// Reject a credential whose submission mode the challenge does not allow.
+///
+/// `type="hash"` is `push` mode and `type="transaction"` is `pull` mode.
+/// `methodDetails.supportedModes`, when present, lists the allowed modes.
+/// Proof credentials are exempt: zero-amount charges have no submission mode.
+fn ensure_submission_mode_allowed(
+    charge: &ChargeRequest,
+    payload: &PaymentPayload,
+) -> Result<(), VerificationError> {
+    let (mode, kind) = if payload.is_hash() {
+        ("push", "Hash")
+    } else if payload.is_transaction() {
+        ("pull", "Transaction")
+    } else {
+        return Ok(());
+    };
+
+    let supported_modes = charge
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("supportedModes"))
+        .filter(|modes| !modes.is_null());
+    if let Some(supported_modes) = supported_modes {
+        let supported = supported_modes
+            .as_array()
+            .is_some_and(|modes| modes.iter().any(|m| m.as_str() == Some(mode)));
+        if !supported {
+            return Err(VerificationError::new(format!(
+                "{kind} credentials are not supported for this challenge."
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Tempo charge method for one-time payment verification.
@@ -1361,6 +1397,7 @@ where
                 "Zero-amount challenges require a proof credential.",
             ));
         }
+        ensure_submission_mode_allowed(request, &payload)?;
 
         let details = if payload.is_hash() {
             self.verify_hash(
@@ -2056,6 +2093,7 @@ where
                     "Zero-amount challenges require a proof credential.",
                 ));
             }
+            ensure_submission_mode_allowed(&request, &charge_payload)?;
 
             if charge_payload.is_hash() {
                 // Client already broadcast the transaction, verify by hash
@@ -2345,6 +2383,138 @@ mod tests {
         let payload = credential.charge_payload().unwrap();
         assert!(!payload.is_proof());
         assert!(request.amount_u256().unwrap().is_zero());
+    }
+
+    #[test]
+    fn test_ensure_submission_mode_allowed() {
+        const HASH_UNSUPPORTED: &str = "Hash credentials are not supported for this challenge.";
+        const TX_UNSUPPORTED: &str =
+            "Transaction credentials are not supported for this challenge.";
+
+        let hash = PaymentPayload::hash("0x00");
+        let transaction = PaymentPayload::transaction("0x00");
+        let proof = PaymentPayload::proof("0x00");
+
+        // (methodDetails, payload, expected error)
+        let cases = [
+            (serde_json::json!({}), &hash, None),
+            (serde_json::json!({}), &transaction, None),
+            (serde_json::json!({ "supportedModes": null }), &hash, None),
+            (
+                serde_json::json!({ "supportedModes": ["pull", "push"] }),
+                &hash,
+                None,
+            ),
+            (
+                serde_json::json!({ "supportedModes": ["pull", "push"] }),
+                &transaction,
+                None,
+            ),
+            (
+                serde_json::json!({ "supportedModes": ["push"] }),
+                &hash,
+                None,
+            ),
+            (
+                serde_json::json!({ "supportedModes": ["pull"] }),
+                &transaction,
+                None,
+            ),
+            (
+                serde_json::json!({ "supportedModes": ["pull"] }),
+                &hash,
+                Some(HASH_UNSUPPORTED),
+            ),
+            (
+                serde_json::json!({ "supportedModes": ["push"] }),
+                &transaction,
+                Some(TX_UNSUPPORTED),
+            ),
+            (
+                serde_json::json!({ "supportedModes": [] }),
+                &hash,
+                Some(HASH_UNSUPPORTED),
+            ),
+            (
+                serde_json::json!({ "supportedModes": [] }),
+                &transaction,
+                Some(TX_UNSUPPORTED),
+            ),
+            (
+                serde_json::json!({ "supportedModes": "push" }),
+                &hash,
+                Some(HASH_UNSUPPORTED),
+            ),
+            // Zero-amount proofs ignore the submission mode.
+            (
+                serde_json::json!({ "supportedModes": ["pull"] }),
+                &proof,
+                None,
+            ),
+        ];
+
+        for (details, payload, expected) in cases {
+            let request = ChargeRequest {
+                method_details: Some(details.clone()),
+                ..test_charge_request_with_amount("1")
+            };
+            let error = ensure_submission_mode_allowed(&request, payload)
+                .err()
+                .map(|e| e.message);
+            assert_eq!(
+                error.as_deref(),
+                expected,
+                "{details} {:?}",
+                payload.payload_type()
+            );
+        }
+
+        let no_details = ChargeRequest {
+            method_details: None,
+            ..test_charge_request_with_amount("1")
+        };
+        assert!(ensure_submission_mode_allowed(&no_details, &hash).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_disallowed_submission_mode_before_rpc() {
+        use alloy::providers::mock::Asserter;
+
+        let cases = [
+            (
+                serde_json::json!({ "chainId": 42431, "supportedModes": ["pull"] }),
+                PaymentPayload::hash(format!("{:#x}", B256::repeat_byte(0x11))),
+                "Hash credentials are not supported for this challenge.",
+            ),
+            (
+                serde_json::json!({ "chainId": 42431, "supportedModes": ["push"] }),
+                PaymentPayload::transaction("0x76"),
+                "Transaction credentials are not supported for this challenge.",
+            ),
+        ];
+
+        for (details, payload, expected) in cases {
+            let request = ChargeRequest {
+                method_details: Some(details),
+                ..test_charge_request_with_amount("1")
+            };
+            let credential =
+                PaymentCredential::new(test_proof_challenge(&request).to_echo(), payload);
+            // No mock responses are queued: reaching the provider would
+            // produce a different error.
+            let provider =
+                alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                    .connect_mocked_client(Asserter::new());
+            let method = ChargeMethod::new(provider);
+            method.cached_chain_id.set(42431).unwrap();
+
+            let error = method.verify(&credential, &request).await.unwrap_err();
+            assert_eq!(error.message, expected);
+            let error = ChargeMethodTrait::validate(&method, &credential, &request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.message, expected);
+        }
     }
 
     // ==================== Fee payer co-sign unit tests ====================
