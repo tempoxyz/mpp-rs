@@ -12,11 +12,14 @@
 //! # Example
 //!
 //! ```ignore
+//! use std::sync::Arc;
 //! use mpp::server::{tempo_provider, TempoChargeMethod};
 //! use mpp::protocol::traits::ChargeMethod as ChargeMethodTrait;
+//! use mpp::store::MemoryStore;
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
-//! let method = TempoChargeMethod::new(provider);
+//! // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+//! let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 //!
 //! // In your server handler:
 //! let receipt = method.verify(&credential, &request).await?;
@@ -717,11 +720,14 @@ fn ensure_submission_mode_allowed(
 /// # Example
 ///
 /// ```ignore
+/// use std::sync::Arc;
 /// use mpp::server::{tempo_provider, TempoChargeMethod};
 /// use mpp::protocol::traits::ChargeMethod as ChargeMethodTrait;
+/// use mpp::store::MemoryStore;
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
-/// let method = TempoChargeMethod::new(provider);
+/// // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+/// let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 ///
 /// // Verify a payment
 /// let receipt = method.verify(&credential, &request).await?;
@@ -858,6 +864,11 @@ where
     ///
     /// The provider must be configured for `TempoNetwork`. Use
     /// [`tempo_provider`](crate::server::tempo_provider) to create one.
+    ///
+    /// No replay store is configured. Until [`with_store`](Self::with_store) is
+    /// called, a hash or proof credential is accepted again for as long as its
+    /// challenge is valid. [`Mpp::create`](crate::server::Mpp::create) configures
+    /// an in-memory store by default.
     pub fn new(provider: P) -> Self {
         Self {
             provider: Arc::new(provider),

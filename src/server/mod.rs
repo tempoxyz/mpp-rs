@@ -16,10 +16,13 @@
 //! # Advanced API
 //!
 //! ```ignore
+//! use std::sync::Arc;
 //! use mpp::server::{Mpp, tempo_provider, TempoChargeMethod};
+//! use mpp::store::MemoryStore;
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
-//! let method = TempoChargeMethod::new(provider);
+//! // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+//! let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 //! let payment = Mpp::new(method, "api.example.com", "my-server-secret-of-at-least-32-bytes");
 //!
 //! let challenge = payment.charge_challenge("1000000", "0x...", "0x...")?;
