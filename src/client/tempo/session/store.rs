@@ -4,7 +4,10 @@
 //! persists the latest client view and can therefore be replaced without
 //! changing snapshot or on-chain hydration behavior.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use alloy::primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
@@ -83,13 +86,14 @@ pub type ChannelStoreResult<T> = std::result::Result<T, ChannelStoreError>;
 pub trait ChannelStoreLease: Send {}
 
 impl ChannelStoreLease for () {}
+impl ChannelStoreLease for tokio::sync::OwnedMutexGuard<()> {}
 
 /// Store of reusable payer session channels keyed by payment scope.
 #[async_trait::async_trait]
 pub trait ChannelStore: Send + Sync {
     /// Serialize credential creation and delivery for one payment scope.
     ///
-    /// Stores shared by multiple processes should override this with a
+    /// Stores shared by multiple processes must override this with a
     /// cross-process lease. Cumulative vouchers must reach the server in the
     /// same order they are allocated.
     async fn acquire(&self, _key: &str) -> ChannelStoreResult<Box<dyn ChannelStoreLease>> {
@@ -107,10 +111,19 @@ pub trait ChannelStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct MemoryChannelStore {
     entries: Mutex<HashMap<String, StoredChannelEntry>>,
+    leases: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[async_trait::async_trait]
 impl ChannelStore for MemoryChannelStore {
+    async fn acquire(&self, key: &str) -> ChannelStoreResult<Box<dyn ChannelStoreLease>> {
+        let lock = {
+            let mut leases = self.leases.lock().unwrap();
+            leases.entry(key.to_owned()).or_default().clone()
+        };
+        Ok(Box::new(lock.lock_owned().await))
+    }
+
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
         Ok(self.entries.lock().unwrap().get(key).cloned())
     }
