@@ -165,7 +165,7 @@ where
         Ok(())
     }
 
-    /// Reduce a simulation request to its sender and calls. Without fee
+    /// Preserve the signed gas limit alongside the sender and calls. Without fee
     /// fields or signatures the node only checks call execution, so the
     /// sender does not need to hold a fee token (mppx simulates the same way).
     pub(super) fn sender_call_request(request: TempoTransactionRequest) -> TempoTransactionRequest {
@@ -175,6 +175,7 @@ where
                 to: request.inner.to,
                 value: request.inner.value,
                 input: request.inner.input,
+                gas: request.inner.gas,
                 ..Default::default()
             },
             calls: request.calls,
