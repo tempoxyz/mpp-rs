@@ -496,6 +496,7 @@ async fn run_translator<P, V>(
     let mut pending_voucher: Option<JoinHandle<Result<PaymentCredential, MppError>>> = None;
     let mut payment_awaiting_receipt: Option<PendingPayment<P>> = None;
     let mut payments_left = max_payments;
+    let mut vouchers_started = false;
     // Outbound RPCs queued while not safe to send (handshake/payment).
     // Polling `recv_from_frontend` unconditionally lets shutdown be observed
     // mid-payment.
@@ -654,6 +655,9 @@ async fn run_translator<P, V>(
                                 let entered_pay = !pay_was_pending && pending_pay.is_some();
                                 let entered_voucher =
                                     !voucher_was_pending && pending_voucher.is_some();
+                                if entered_voucher {
+                                    vouchers_started = true;
+                                }
                                 if entered_pay || entered_voucher {
                                     handshake_deadline
                                         .as_mut()
@@ -691,7 +695,9 @@ async fn run_translator<P, V>(
 
     // A receipt acknowledges payment, not completion of pending RPCs. Never
     // turn a paid (or ambiguously paid) socket failure into fresh authorization.
-    if matches!(termination, Some(TerminationReason::Transient)) && payments_left < max_payments {
+    if matches!(termination, Some(TerminationReason::Transient))
+        && (payments_left < max_payments || vouchers_started)
+    {
         let _ = events_tx.send(MppEvent::Error(
             "MPP connection lost after payment started; renewed authorization required".to_string(),
         ));

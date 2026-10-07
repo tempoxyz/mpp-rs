@@ -165,6 +165,44 @@ fn streaming_body(content: &'static str) -> reqwest::Body {
 }
 
 #[tokio::test]
+async fn custom_header_offer_falls_back_to_safe_challenge() {
+    let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+    let unsafe_challenge =
+        PaymentChallenge::new("unsafe", "flow.example.com", "tempo", "charge", request)
+            .with_header("Payment-Authorization");
+    let combined = format!(
+        "{}, {}",
+        format_www_authenticate(&unsafe_challenge).unwrap(),
+        www_authenticate("safe", "tempo", "charge"),
+    );
+    let app = Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let combined = combined.clone();
+            async move {
+                if is_paid(&request) {
+                    StatusCode::OK.into_response()
+                } else {
+                    (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, combined)]).into_response()
+                }
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+        assert_eq!(provider.paid(), ["safe"], "{via:?}");
+    }
+}
+
+#[tokio::test]
 async fn unchallenged_402_after_payment_is_returned() {
     let app = Router::new().route(
         "/paid",

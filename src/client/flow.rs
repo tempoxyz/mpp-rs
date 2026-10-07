@@ -149,12 +149,36 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            let safe_supported = challenges.iter().any(|challenge| {
+                challenge.credential_header() == "Authorization"
+                    && self
+                        .provider
+                        .supports(challenge.method.as_str(), challenge.intent.as_str())
+            });
+            if !safe_supported {
+                if let Some(unsafe_challenge) = challenges.iter().find(|challenge| {
+                    challenge.credential_header() != "Authorization"
+                        && self
+                            .provider
+                            .supports(challenge.method.as_str(), challenge.intent.as_str())
+                }) {
+                    return Err(self
+                        .fail(
+                            Some(unsafe_challenge.clone()),
+                            HttpError::UnsafeCredentialHeader,
+                        )
+                        .await);
+                }
+            }
+
             let challenge = match select_supported_challenge(
                 &challenges,
                 ranking_accept.as_deref(),
                 |challenge| {
-                    self.provider
-                        .supports(challenge.method.as_str(), challenge.intent.as_str())
+                    challenge.credential_header() == "Authorization"
+                        && self
+                            .provider
+                            .supports(challenge.method.as_str(), challenge.intent.as_str())
                 },
                 |challenges| self.provider.select_challenge(challenges),
             ) {
@@ -182,12 +206,6 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         .await);
                 }
             };
-
-            if challenge.credential_header() != "Authorization" {
-                return Err(self
-                    .fail(Some(challenge), HttpError::UnsafeCredentialHeader)
-                    .await);
-            }
 
             let challenge = match self
                 .provider

@@ -1398,6 +1398,58 @@ async fn reconnect_must_not_renew_payment_authorization() {
 }
 
 #[tokio::test]
+async fn voucher_only_reconnect_requires_renewed_authorization() {
+    #[derive(Clone)]
+    struct CountingVoucher(Arc<AtomicUsize>);
+    impl VoucherProvider for CountingVoucher {
+        async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let challenge = test_challenge();
+            Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::hash("0xvoucher"),
+            ))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = spawn(async move {
+        for n in 0..3 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            send_text(
+                &mut ws,
+                json!({
+                    "type": "needVoucher",
+                    "channelId": "0xchannel",
+                    "requiredCumulative": ((n + 1) * 1000).to_string(),
+                    "acceptedCumulative": "0",
+                    "deposit": "5000",
+                }),
+            )
+            .await;
+            if let Ok(Some(Ok(Message::Text(_)))) = timeout(TIMEOUT, ws.next()).await {
+                send_text(&mut ws, receipt_frame()).await;
+                ws.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Restart,
+                    reason: "restart".into(),
+                }))).await.unwrap();
+            }
+        }
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let connect = MppWsConnect::new(url, StubProvider)
+        .with_voucher_provider(CountingVoucher(calls.clone()))
+        .with_max_retries(5)
+        .with_retry_interval(Duration::from_millis(10));
+    let _frontend = connect.into_service().await.unwrap();
+    sleep(Duration::from_millis(500)).await;
+    server.abort();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn disconnect_during_pay_requires_renewed_authorization() {
     #[derive(Clone)]
     struct BlockedProvider {

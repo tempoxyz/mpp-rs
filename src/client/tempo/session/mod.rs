@@ -1688,6 +1688,7 @@ impl TempoSessionProvider {
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for voucher".into())
             })?;
+        ensure_redirect_safe_credential_header(&challenge)?;
         let credential = if self.max_deposit.is_some() {
             // The event's deposit is not passed in, so the top-up is planned
             // against the local one.
@@ -1711,6 +1712,7 @@ impl TempoSessionProvider {
         // A stream can outlive the challenge it was opened with.
         let refreshed = Self::refreshed_challenge(&resp);
         if let Some(refreshed) = &refreshed {
+            ensure_redirect_safe_credential_header(refreshed)?;
             let credential = self
                 .voucher_credential_for_challenge(refreshed, channel_id_hex, required_cumulative)
                 .await?;
@@ -1789,6 +1791,7 @@ impl TempoSessionProvider {
             ));
         }
 
+        ensure_redirect_safe_credential_header(&challenge)?;
         let channel_id = entry.channel_id.to_string();
         let credential = self
             .close_credential_for_challenge_inner(&challenge, &channel_id, None)
@@ -1797,6 +1800,7 @@ impl TempoSessionProvider {
             Self::post_credential(client, url, &challenge, &credential, "close request failed")
                 .await?;
         if let Some(refreshed) = Self::refreshed_challenge(&resp) {
+            ensure_redirect_safe_credential_header(&refreshed)?;
             let credential = self
                 .close_credential_for_challenge_inner(&refreshed, &channel_id, None)
                 .await?;
@@ -2908,6 +2912,45 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("redirect-safe client"));
+    }
+
+    #[tokio::test]
+    async fn custom_header_voucher_is_rejected_before_channel_update() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let updates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_updates = updates.clone();
+        let provider = make_test_provider().with_on_channel_update(move |_| {
+            observed_updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        *provider.last_challenge.lock().unwrap() = Some(
+            make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS)
+                .with_header("Payment-Authorization"),
+        );
+
+        let error = provider
+            .send_voucher(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                &channel_id.to_string(),
+                2_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("redirect-safe client"));
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .channels()
+                .values()
+                .next()
+                .unwrap()
+                .cumulative_amount,
+            1_000
+        );
     }
 
     fn make_test_challenge() -> PaymentChallenge {
