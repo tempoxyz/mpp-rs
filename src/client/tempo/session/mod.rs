@@ -1250,6 +1250,7 @@ impl TempoSessionProvider {
             .deposit
             .checked_add(additional_deposit)
             .ok_or_else(|| MppError::InvalidConfig("channel deposit overflowed".into()))?;
+        self.assert_within_max_deposit(new_deposit)?;
         let credential = self
             .top_up_credential_for_challenge(challenge, &entry, additional_deposit)
             .await?;
@@ -1286,9 +1287,11 @@ impl TempoSessionProvider {
                         "top-up route challenge does not match active session".into(),
                     ));
                 }
-                let credential = self
-                    .top_up_credential_for_challenge(&fresh_challenge, &entry, additional_deposit)
-                    .await?;
+                // A new signature would authorize another independent deposit. Only
+                // refresh the challenge echo; both attempts must spend the same tx.
+                let mut credential = credential.clone();
+                credential.challenge = fresh_challenge.to_echo();
+                headers.remove(crate::client::payment_credential_header_name(challenge));
                 headers.insert(
                     crate::client::payment_credential_header_name(&fresh_challenge),
                     crate::protocol::core::format_authorization(&credential)?
@@ -3300,6 +3303,79 @@ mod tests {
         assert_eq!(posted[0].1["additionalDeposit"], "500");
         assert_eq!(credential.payload["cumulativeAmount"], "2500");
         assert_eq!(provider.channels().values().next().unwrap().deposit, 2_500);
+    }
+
+    #[tokio::test]
+    async fn top_up_retry_reuses_the_signed_transaction() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        for sponsored in [false, true] {
+            let payee = Address::repeat_byte(0x11);
+            let currency = Address::repeat_byte(0x22);
+            let mut provider = make_test_provider().with_max_deposit(11_000);
+            let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["methodDetails"]["feePayer"] = serde_json::json!(sponsored);
+            challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+            let mut refreshed = challenge.clone();
+            refreshed.id = "refreshed-id".into();
+            // Only one signing pass may consume gas-price and gas-estimate RPCs.
+            mock_rpc(&mut provider, &["0x4a817c800", "0x5208"]);
+            let (url, posted) = management_server(move |id, _| {
+                if id != "refreshed-id" {
+                    return (
+                        StatusCode::PAYMENT_REQUIRED,
+                        [("www-authenticate", refreshed.to_header().unwrap())],
+                    )
+                        .into_response();
+                }
+                StatusCode::OK.into_response()
+            })
+            .await;
+            provider
+                .top_up_with_headers_for_challenge(
+                    &reqwest::Client::new(),
+                    &url,
+                    reqwest::header::HeaderMap::new(),
+                    &challenge,
+                    &channel_id.to_string(),
+                    1_000,
+                )
+                .await
+                .unwrap();
+            let posted = posted.lock().unwrap();
+            assert_eq!(posted.len(), 2);
+            assert_eq!(posted[0].0, "test-id");
+            assert_eq!(posted[1].0, "refreshed-id");
+            assert_eq!(posted[0].1, posted[1].1);
+            assert_eq!(provider.channels().values().next().unwrap().deposit, 11_000);
+        }
+    }
+
+    #[tokio::test]
+    async fn top_up_rejects_deposits_above_the_local_cap_before_signing() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let provider = make_test_provider().with_max_deposit(10_000);
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let err = provider
+            .top_up_with_headers_for_challenge(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("max_deposit"), "{err}");
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
     }
 
     #[tokio::test]
