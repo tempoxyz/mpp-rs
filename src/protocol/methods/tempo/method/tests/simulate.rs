@@ -422,7 +422,7 @@ async fn test_simulate_before_broadcast_falls_back_to_eth_call() {
 /// The `eth_call` fallback runs the calls from the sender without fee
 /// fields, so it does not depend on the sender holding a fee token.
 #[tokio::test]
-async fn test_sender_call_request_keeps_only_sender_and_calls() {
+async fn test_sender_call_request_preserves_execution_gas_without_fee_fields() {
     let cosigned = make_cosigned_fee_payer_tx().await;
     let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
     let sender = signed.recover_signer().unwrap();
@@ -447,11 +447,53 @@ async fn test_sender_call_request_keeps_only_sender_and_calls() {
         "feePayerSignature",
         "nonceKey",
         "validBefore",
-        "gas",
         "maxFeePerGas",
         "maxPriorityFeePerGas",
     ] {
         assert!(wire.get(field).is_none(), "{field} must be omitted: {wire}");
     }
+    assert_eq!(wire["gas"], format!("0x{:x}", signed.tx().gas_limit));
     assert!(wire["feeToken"].is_null());
+}
+
+#[tokio::test]
+async fn test_fallback_rejects_out_of_gas_with_signed_limit() {
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+
+    let cosigned = make_cosigned_fee_payer_tx().await;
+    let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+    let expected_gas = format!("0x{:x}", signed.tx().gas_limit);
+    let app = Router::new().route(
+        "/",
+        post(move |Json(request): Json<Value>| {
+            let expected_gas = expected_gas.clone();
+            async move {
+                let mut response = json!({"jsonrpc": "2.0", "id": request["id"]});
+                match request["method"].as_str().unwrap() {
+                    "tempo_simulateV1" => {
+                        response["error"] = json!({"code": -32601, "message": "unsupported"})
+                    }
+                    "eth_call" if request["params"][0]["gas"] == expected_gas => {
+                        response["error"] = json!({"code": 3, "message": "out of gas"});
+                    }
+                    "eth_call" => response["result"] = json!("0x"),
+                    method => panic!("unexpected RPC: {method}"),
+                }
+                Json(response)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http(url.parse().unwrap());
+    let result = ChargeMethod::new(provider)
+        .simulate_before_broadcast(&cosigned)
+        .await;
+    server.abort();
+    let error = result.expect_err("fallback must simulate the signed gas limit");
+    assert!(error.to_string().contains("out of gas"), "{error}");
 }
