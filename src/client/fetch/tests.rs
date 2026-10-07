@@ -152,6 +152,65 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn custom_credential_header_is_rejected_before_payment() {
+        for manual in [false, true] {
+            let contacted = Arc::new(AtomicU32::new(0));
+            let target_contacted = contacted.clone();
+            let target = spawn_server(Router::new().route(
+                "/",
+                get(move || {
+                    let contacted = target_contacted.clone();
+                    async move {
+                        contacted.fetch_add(1, Ordering::SeqCst);
+                        "ok"
+                    }
+                }),
+            ))
+            .await;
+            let (challenge, _) = test_challenge();
+            let header =
+                format_www_authenticate(&challenge.with_header("Payment-Authorization")).unwrap();
+            let origin = spawn_server(Router::new().route(
+                "/",
+                get(move |headers: axum::http::HeaderMap| {
+                    let target = target.clone();
+                    let header = header.clone();
+                    async move {
+                        if headers.contains_key("payment-authorization") {
+                            (AxumStatusCode::TEMPORARY_REDIRECT, [("location", target)])
+                                .into_response()
+                        } else {
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [("www-authenticate", header)],
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            ))
+            .await;
+            let builder = reqwest::Client::builder();
+            let client = if manual {
+                builder.redirect(reqwest::redirect::Policy::none())
+            } else {
+                builder
+            }
+            .build()
+            .unwrap();
+            let provider = MockProvider::new();
+            let error = client
+                .get(origin)
+                .send_with_payment(&provider)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HttpError::UnsafeCredentialHeader));
+            assert_eq!(provider.call_count(), 0);
+            assert_eq!(contacted.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn test_happy_path_402_then_200() {
         let (_, www_auth) = test_challenge();
         let call_count = Arc::new(AtomicU32::new(0));

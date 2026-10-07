@@ -22,6 +22,9 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 /// 2. Calls the provider to execute the payment
 /// 3. Retries the request with the credential in the `Authorization` header
 ///
+/// Challenges that select `Payment-Authorization` are rejected before payment
+/// because this middleware cannot control the underlying client's redirect policy.
+///
 /// Payment failures are returned as [`HttpError`](crate::client::HttpError) inside
 /// [`reqwest_middleware::Error::Middleware`] and can be recovered with
 /// `downcast_ref::<HttpError>()`.

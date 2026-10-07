@@ -183,6 +183,12 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 }
             };
 
+            if challenge.credential_header() != "Authorization" {
+                return Err(self
+                    .fail(Some(challenge), HttpError::UnsafeCredentialHeader)
+                    .await);
+            }
+
             let challenge = match self
                 .provider
                 .prepare_http_payment_challenge(&challenge, payment_context.clone())
@@ -209,6 +215,14 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
                 }
             };
+            // The caller owns reqwest's redirect policy, which cannot be changed
+            // for one request. Unlike Authorization, reqwest preserves this
+            // custom header across origins. Reject before the provider pays.
+            if challenge.credential_header() != "Authorization" {
+                return Err(self
+                    .fail(Some(challenge), HttpError::UnsafeCredentialHeader)
+                    .await);
+            }
             payment_attempt += 1;
 
             if !paid_challenge_ids.insert(challenge.id.clone()) {

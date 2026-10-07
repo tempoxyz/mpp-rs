@@ -15,6 +15,9 @@ use super::DEFAULT_MAX_PAYMENT_RETRIES;
 ///
 /// This trait adds a `.send_with_payment()` method that automatically handles
 /// HTTP 402 responses by executing a payment and retrying the request.
+/// Challenges that select `Payment-Authorization` are rejected before payment:
+/// this API accepts a caller-owned reqwest client whose redirect policy cannot
+/// be changed for the credential-bearing retry.
 ///
 /// # Examples
 ///

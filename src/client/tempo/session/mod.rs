@@ -39,6 +39,16 @@ use super::signing::TempoPrimitiveSigner;
 use crate::client::{PaymentContext, PaymentProvider};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+
+fn ensure_redirect_safe_credential_header(challenge: &PaymentChallenge) -> Result<(), MppError> {
+    if challenge.credential_header() != "Authorization" {
+        return Err(MppError::InvalidConfig(
+            "Payment-Authorization requires a redirect-safe client; refusing to create a credential".into(),
+        ));
+    }
+    Ok(())
+}
+
 use crate::protocol::intents::{ChargeRequest, SessionRequest};
 use crate::protocol::methods::tempo::proof::sign_proof_primitive;
 use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSessionExt};
@@ -908,6 +918,7 @@ impl TempoSessionProvider {
                 return Ok(None);
             };
 
+            ensure_redirect_safe_credential_header(&challenge)?;
             let request: ChargeRequest = challenge.request.decode()?;
             let chain_id = request
                 .method_details
@@ -1207,6 +1218,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
+        ensure_redirect_safe_credential_header(challenge)?;
         let _process_lease = self.acquire_payment_lock(challenge).await?;
         let (key, _) = self.expected_channel_key(challenge)?;
         let _store_lease = self
@@ -1237,6 +1249,7 @@ impl TempoSessionProvider {
     ) -> Result<Option<Receipt>, MppError> {
         use reqwest::header::WWW_AUTHENTICATE;
 
+        ensure_redirect_safe_credential_header(challenge)?;
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
                 "top-up amount must be greater than zero".into(),
@@ -1346,6 +1359,7 @@ impl TempoSessionProvider {
                 }
                 // A new signature would authorize another independent deposit. Only
                 // refresh the challenge echo; both attempts must spend the same tx.
+                ensure_redirect_safe_credential_header(&fresh_challenge)?;
                 let mut credential = credential.clone();
                 credential.challenge = fresh_challenge.to_echo();
                 headers.remove(crate::client::payment_credential_header_name(challenge));
@@ -1613,6 +1627,7 @@ impl TempoSessionProvider {
         credential: &PaymentCredential,
         context: &str,
     ) -> Result<reqwest::Response, MppError> {
+        ensure_redirect_safe_credential_header(challenge)?;
         client
             .post(url)
             .header(
@@ -2874,6 +2889,25 @@ mod tests {
             chain_id: 42431,
             opened,
         }
+    }
+
+    #[tokio::test]
+    async fn custom_header_management_credential_is_rejected_before_send() {
+        let challenge = make_test_challenge().with_header("Payment-Authorization");
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0x00"),
+        );
+        let error = TempoSessionProvider::post_credential(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1/",
+            &challenge,
+            &credential,
+            "test",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("redirect-safe client"));
     }
 
     fn make_test_challenge() -> PaymentChallenge {
