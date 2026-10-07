@@ -216,15 +216,17 @@ enum TerminationReason {
 /// server-issued `challenge` / `needVoucher` frames are settled by the
 /// supplied [`PaymentProvider`] / [`VoucherProvider`].
 ///
-/// On reconnect, [`PaymentProvider::pay`] is called again with the server's
-/// new challenge — providers should handle repeated calls cheaply.
+/// Automatic reconnect is permitted only before the first payment attempt.
+/// Once payment starts, losing the socket is terminal: a new connection would
+/// otherwise authorize a new challenge for work that may already be paid for.
+/// Create a new connector only after explicitly authorizing a new payment.
 ///
 /// A server may challenge again mid-connection, up to
 /// [`with_max_payments`](Self::with_max_payments) payments per connection.
 /// A challenge beyond that limit is a fatal error and is not paid.
 ///
-/// Only socket-level failures are retried; deterministic MPP failures are
-/// terminal and short-circuit further reconnect attempts.
+/// Only socket-level failures before payment are retried; deterministic MPP
+/// failures and socket failures after payment starts are terminal.
 #[derive(Clone)]
 pub struct MppWsConnect<P, V = NoVoucher> {
     url: String,
@@ -494,6 +496,7 @@ async fn run_translator<P, V>(
     let mut pending_voucher: Option<JoinHandle<Result<PaymentCredential, MppError>>> = None;
     let mut payment_awaiting_receipt: Option<PendingPayment<P>> = None;
     let mut payments_left = max_payments;
+    let mut vouchers_started = false;
     // Outbound RPCs queued while not safe to send (handshake/payment).
     // Polling `recv_from_frontend` unconditionally lets shutdown be observed
     // mid-payment.
@@ -652,6 +655,9 @@ async fn run_translator<P, V>(
                                 let entered_pay = !pay_was_pending && pending_pay.is_some();
                                 let entered_voucher =
                                     !voucher_was_pending && pending_voucher.is_some();
+                                if entered_voucher {
+                                    vouchers_started = true;
+                                }
                                 if entered_pay || entered_voucher {
                                     handshake_deadline
                                         .as_mut()
@@ -685,6 +691,17 @@ async fn run_translator<P, V>(
                 }
             }
         }
+    }
+
+    // A receipt acknowledges payment, not completion of pending RPCs. Never
+    // turn a paid (or ambiguously paid) socket failure into fresh authorization.
+    if matches!(termination, Some(TerminationReason::Transient))
+        && (payments_left < max_payments || vouchers_started)
+    {
+        let _ = events_tx.send(MppEvent::Error(
+            "MPP connection lost after payment started; renewed authorization required".to_string(),
+        ));
+        termination = Some(TerminationReason::Fatal);
     }
 
     // Cancel any background tasks still running on shutdown.

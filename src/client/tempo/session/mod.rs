@@ -39,6 +39,16 @@ use super::signing::TempoPrimitiveSigner;
 use crate::client::{PaymentContext, PaymentProvider};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+
+fn ensure_redirect_safe_credential_header(challenge: &PaymentChallenge) -> Result<(), MppError> {
+    if challenge.credential_header() != "Authorization" {
+        return Err(MppError::InvalidConfig(
+            "Payment-Authorization requires a redirect-safe client; refusing to create a credential".into(),
+        ));
+    }
+    Ok(())
+}
+
 use crate::protocol::intents::{ChargeRequest, SessionRequest};
 use crate::protocol::methods::tempo::proof::sign_proof_primitive;
 use crate::protocol::methods::tempo::session::{SessionCredentialPayload, TempoSessionExt};
@@ -908,6 +918,7 @@ impl TempoSessionProvider {
                 return Ok(None);
             };
 
+            ensure_redirect_safe_credential_header(&challenge)?;
             let request: ChargeRequest = challenge.request.decode()?;
             let chain_id = request
                 .method_details
@@ -1207,6 +1218,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
+        ensure_redirect_safe_credential_header(challenge)?;
         let _process_lease = self.acquire_payment_lock(challenge).await?;
         let (key, _) = self.expected_channel_key(challenge)?;
         let _store_lease = self
@@ -1237,6 +1249,7 @@ impl TempoSessionProvider {
     ) -> Result<Option<Receipt>, MppError> {
         use reqwest::header::WWW_AUTHENTICATE;
 
+        ensure_redirect_safe_credential_header(challenge)?;
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
                 "top-up amount must be greater than zero".into(),
@@ -1346,6 +1359,7 @@ impl TempoSessionProvider {
                 }
                 // A new signature would authorize another independent deposit. Only
                 // refresh the challenge echo; both attempts must spend the same tx.
+                ensure_redirect_safe_credential_header(&fresh_challenge)?;
                 let mut credential = credential.clone();
                 credential.challenge = fresh_challenge.to_echo();
                 headers.remove(crate::client::payment_credential_header_name(challenge));
@@ -1613,6 +1627,7 @@ impl TempoSessionProvider {
         credential: &PaymentCredential,
         context: &str,
     ) -> Result<reqwest::Response, MppError> {
+        ensure_redirect_safe_credential_header(challenge)?;
         client
             .post(url)
             .header(
@@ -1673,6 +1688,7 @@ impl TempoSessionProvider {
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for voucher".into())
             })?;
+        ensure_redirect_safe_credential_header(&challenge)?;
         let credential = if self.max_deposit.is_some() {
             // The event's deposit is not passed in, so the top-up is planned
             // against the local one.
@@ -1696,6 +1712,7 @@ impl TempoSessionProvider {
         // A stream can outlive the challenge it was opened with.
         let refreshed = Self::refreshed_challenge(&resp);
         if let Some(refreshed) = &refreshed {
+            ensure_redirect_safe_credential_header(refreshed)?;
             let credential = self
                 .voucher_credential_for_challenge(refreshed, channel_id_hex, required_cumulative)
                 .await?;
@@ -1774,6 +1791,7 @@ impl TempoSessionProvider {
             ));
         }
 
+        ensure_redirect_safe_credential_header(&challenge)?;
         let channel_id = entry.channel_id.to_string();
         let credential = self
             .close_credential_for_challenge_inner(&challenge, &channel_id, None)
@@ -1782,6 +1800,7 @@ impl TempoSessionProvider {
             Self::post_credential(client, url, &challenge, &credential, "close request failed")
                 .await?;
         if let Some(refreshed) = Self::refreshed_challenge(&resp) {
+            ensure_redirect_safe_credential_header(&refreshed)?;
             let credential = self
                 .close_credential_for_challenge_inner(&refreshed, &channel_id, None)
                 .await?;
@@ -2874,6 +2893,64 @@ mod tests {
             chain_id: 42431,
             opened,
         }
+    }
+
+    #[tokio::test]
+    async fn custom_header_management_credential_is_rejected_before_send() {
+        let challenge = make_test_challenge().with_header("Payment-Authorization");
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0x00"),
+        );
+        let error = TempoSessionProvider::post_credential(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1/",
+            &challenge,
+            &credential,
+            "test",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("redirect-safe client"));
+    }
+
+    #[tokio::test]
+    async fn custom_header_voucher_is_rejected_before_channel_update() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let updates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_updates = updates.clone();
+        let provider = make_test_provider().with_on_channel_update(move |_| {
+            observed_updates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        *provider.last_challenge.lock().unwrap() = Some(
+            make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS)
+                .with_header("Payment-Authorization"),
+        );
+
+        let error = provider
+            .send_voucher(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                &channel_id.to_string(),
+                2_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("redirect-safe client"));
+        assert_eq!(updates.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            provider
+                .channels()
+                .values()
+                .next()
+                .unwrap()
+                .cumulative_amount,
+            1_000
+        );
     }
 
     fn make_test_challenge() -> PaymentChallenge {

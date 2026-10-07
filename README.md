@@ -78,7 +78,7 @@ let receipt = mpp.stripe_verify_charge(&credential, "1").await?;
 
 `verify_charge` and `stripe_verify_charge` take the amount the route charges and reject a credential that was issued for a different amount, so a payment for a cheap route cannot be replayed on an expensive one served by the same `Mpp`. `broadcast_credential` skips that comparison: it accepts any challenge the `Mpp` issued, which is only safe when all of them are interchangeable.
 
-If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`, and clients send the Payment credential in that header instead of `Authorization`.
+If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`. The reqwest `send_with_payment` and `PaymentMiddleware` APIs reject those challenges before paying: they accept caller-owned clients and cannot enforce a safe redirect policy for the custom credential header. Use a transport that sends credential-bearing requests with redirects disabled until these APIs support a verified redirect-safe client.
 
 ```rust
 let mpp = Mpp::create(tempo(config).requires_auth(true))?;

@@ -1341,3 +1341,192 @@ async fn shutdown_during_in_flight_payment_breaks_promptly() {
     // Unpark pay() so the spawned task can finish on abort.
     release.notify_waiters();
 }
+
+/// A receipt followed by a retryable close must not mint a fresh payment allowance.
+#[tokio::test]
+async fn reconnect_must_not_renew_payment_authorization() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = spawn(async move {
+        for n in 0..3 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let challenge = PaymentChallenge::new(
+                format!("fresh-{n}"),
+                "alloy-test",
+                "tempo",
+                "charge",
+                Base64UrlJson::from_value(&json!({
+                    "amount": ((n + 1) * 1000).to_string(),
+                    "currency": "USD", "recipient": format!("recipient-{n}")
+                }))
+                .unwrap(),
+            );
+            send_text(&mut ws, json!({"type":"challenge", "challenge":challenge})).await;
+            if let Ok(Some(Ok(Message::Text(_)))) = timeout(TIMEOUT, ws.next()).await {
+                send_text(&mut ws, receipt_frame()).await;
+                if n == 0 {
+                    let rpc = timeout(TIMEOUT, recv_value(&mut ws)).await.unwrap();
+                    assert_eq!(rpc["type"], "message");
+                }
+                // Acknowledge payment, but never answer the pending application request.
+                ws.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Restart,
+                    reason: "restart".into(),
+                }))).await.unwrap();
+            }
+        }
+    });
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone())
+        .with_max_payments(1)
+        .with_max_retries(5)
+        .with_retry_interval(Duration::from_millis(10));
+    let frontend = connect.into_service().await.unwrap();
+    let req = Request::new("eth_blockNumber", Id::Number(1), ())
+        .serialize()
+        .unwrap();
+    let pending_rpc = spawn(frontend.send(req));
+    sleep(Duration::from_millis(500)).await;
+    pending_rpc.abort();
+    server.abort();
+    assert_eq!(
+        provider.pays.load(Ordering::SeqCst),
+        1,
+        "one authorization must survive reconnects, including fresh IDs and changed terms"
+    );
+}
+
+#[tokio::test]
+async fn voucher_only_reconnect_requires_renewed_authorization() {
+    #[derive(Clone)]
+    struct CountingVoucher(Arc<AtomicUsize>);
+    impl VoucherProvider for CountingVoucher {
+        async fn next_voucher(&self, _: &VoucherRequest) -> Result<PaymentCredential, MppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let challenge = test_challenge();
+            Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::hash("0xvoucher"),
+            ))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = spawn(async move {
+        for n in 0..3 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            send_text(
+                &mut ws,
+                json!({
+                    "type": "needVoucher",
+                    "channelId": "0xchannel",
+                    "requiredCumulative": ((n + 1) * 1000).to_string(),
+                    "acceptedCumulative": "0",
+                    "deposit": "5000",
+                }),
+            )
+            .await;
+            if let Ok(Some(Ok(Message::Text(_)))) = timeout(TIMEOUT, ws.next()).await {
+                send_text(&mut ws, receipt_frame()).await;
+                ws.send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Restart,
+                    reason: "restart".into(),
+                }))).await.unwrap();
+            }
+        }
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let connect = MppWsConnect::new(url, StubProvider)
+        .with_voucher_provider(CountingVoucher(calls.clone()))
+        .with_max_retries(5)
+        .with_retry_interval(Duration::from_millis(10));
+    let _frontend = connect.into_service().await.unwrap();
+    sleep(Duration::from_millis(500)).await;
+    server.abort();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn disconnect_during_pay_requires_renewed_authorization() {
+    #[derive(Clone)]
+    struct BlockedProvider {
+        calls: Arc<AtomicUsize>,
+        started: Arc<Notify>,
+    }
+    impl PaymentProvider for BlockedProvider {
+        fn supports(&self, _: &str, _: &str) -> bool {
+            true
+        }
+        async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+    let provider = BlockedProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        started: Arc::new(Notify::new()),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let started = provider.started.clone();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let count = accepts.clone();
+    let server = spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut ws = accept_async(stream).await.unwrap();
+            send_text(&mut ws, challenge_frame()).await;
+            started.notified().await;
+            drop(ws);
+        }
+    });
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_retry_interval(Duration::from_millis(10));
+    let mut events = connect.mpp_handle().events;
+    let _frontend = connect.into_service().await.unwrap();
+    let error = timeout(TIMEOUT, async {
+        loop {
+            if let MppEvent::Error(error) = events.recv().await.unwrap() {
+                break error;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(error.contains("renewed authorization"));
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn disconnect_before_payment_still_reconnects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        drop(ws);
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        send_text(&mut ws, challenge_frame()).await;
+        assert_eq!(recv_value(&mut ws).await["type"], "credential");
+        send_text(&mut ws, receipt_frame()).await;
+        std::future::pending::<()>().await;
+    });
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone())
+        .with_max_payments(1)
+        .with_retry_interval(Duration::from_millis(10));
+    let mut receipt = connect.mpp_handle().receipt;
+    let _frontend = connect.into_service().await.unwrap();
+    timeout(TIMEOUT, receipt.changed()).await.unwrap().unwrap();
+    assert_eq!(provider.pays.load(Ordering::SeqCst), 1);
+    server.abort();
+}

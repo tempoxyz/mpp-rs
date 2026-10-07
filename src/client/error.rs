@@ -24,6 +24,9 @@ pub enum HttpError {
     /// A redirect changed the request origin before returning a payment challenge
     CrossOriginRedirect,
 
+    /// The caller-owned HTTP client may forward a custom credential header across redirects.
+    UnsafeCredentialHeader,
+
     /// Payment provider error
     Payment(MppError),
 
@@ -47,6 +50,10 @@ impl fmt::Display for HttpError {
             Self::CrossOriginRedirect => {
                 write!(f, "Refusing to send payment credential across redirect")
             }
+            Self::UnsafeCredentialHeader => write!(
+                f,
+                "Payment-Authorization requires a redirect-safe client; refusing to create a credential"
+            ),
             Self::Payment(e) => write!(f, "payment failed: {}", e),
             #[cfg(feature = "client")]
             Self::Request(e) => write!(f, "HTTP request failed: {}", e),
