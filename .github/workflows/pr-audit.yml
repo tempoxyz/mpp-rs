@@ -2,13 +2,16 @@ name: PR Audit
 
 on:
   pull_request:
-    types: [labeled]
+    types: [labeled, opened, synchronize, reopened, ready_for_review]
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions: {}
 
 jobs:
+  # Manual `cyclops` labels stay admin-only; push audits need no label.
   authorize:
-    if: github.event.label.name == 'cyclops'
+    if: github.event.action == 'labeled' && github.event.label.name == 'cyclops'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,12 +33,17 @@ jobs:
 
   pr-audit:
     needs: authorize
+    if: >-
+      !cancelled() &&
+      (needs.authorize.result == 'success' || github.event.action != 'labeled')
     permissions:
       contents: read
       id-token: write
       pull-requests: read
       statuses: write
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
+    with:
+      audit-on-push: true
     secrets:
       EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
       EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
