@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.15.1 (2026-10-12)
+
+### Patch Changes
+
+- Stopped WebSocket reconnects from renewing payment authorization after a charge or voucher attempt. Rejected custom-header payment challenges before credential creation when the caller's reqwest redirect policy cannot be verified, while selecting a safe alternative challenge when offered. (by @TanishkGoyal, [#564](https://github.com/tempoxyz/mpp-rs/pull/564))
+- Preserved the signed transaction gas limit in fallback pre-broadcast simulation. (by @TanishkGoyal, [#564](https://github.com/tempoxyz/mpp-rs/pull/564))
+- Reused the signed top-up transaction when retrying a refreshed challenge and enforced the local deposit cap before signing.
+- Serialized top-ups with channel-store leases, reconciled deposits before enforcing caps, and rejected refreshed challenges that change sponsorship mode. (by @TanishkGoyal, [#564](https://github.com/tempoxyz/mpp-rs/pull/564))
+- Verified session `close` and `voucher` signatures before comparing the voucher against the channel, so unauthenticated requests no longer learn a channel's spent or accepted amount from the error. (by @TanishkGoyal, [#564](https://github.com/tempoxyz/mpp-rs/pull/564))
+
 ## 0.15.0 (2026-10-01)
 
 ### Minor Changes
