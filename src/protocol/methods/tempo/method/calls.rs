@@ -179,9 +179,9 @@ pub(super) fn validate_fee_payer_calls(
         let payment_amount = expected.iter().fold(U256::ZERO, |sum, transfer| {
             sum.saturating_add(transfer.amount)
         });
-        if U256::from(swap.amountOut) != payment_amount {
+        if swap.amountOut == 0 || U256::from(swap.amountOut) > payment_amount {
             return Err(VerificationError::new(
-                "Fee-sponsored transaction swap output does not match the payment amount"
+                "Fee-sponsored transaction swap output must be positive and no greater than the payment amount"
                     .to_string(),
             ));
         }

@@ -21,6 +21,7 @@
 //!     .with_autoswap(AutoswapConfig {
 //!         token_in: "0x20C000000000000000000000b9537d11c60E8b50".parse()?,
 //!         slippage_bps: 100, // 1%
+//!         max_amount_in: Some(1_010_000), // explicit input-token budget
 //!     });
 //! ```
 
@@ -44,6 +45,9 @@ pub struct AutoswapConfig {
     /// Slippage tolerance in basis points (e.g., 100 = 1%).
     /// Applied on top of the quoted `amountIn` to protect against price movement.
     pub slippage_bps: u16,
+    /// Maximum input-token units per swap. Defaults to the missing output amount
+    /// plus slippage (1:1 token units). Set explicitly for non-parity pairs.
+    pub max_amount_in: Option<u128>,
 }
 
 impl AutoswapConfig {
@@ -52,6 +56,7 @@ impl AutoswapConfig {
         Self {
             token_in,
             slippage_bps,
+            max_amount_in: None,
         }
     }
 }
@@ -121,7 +126,11 @@ pub fn build_swap_call(
     slippage_bps: u16,
 ) -> Call {
     // max_amount_in = quoted_amount_in * (10000 + slippage_bps) / 10000
-    let max_amount_in = quoted_amount_in.saturating_mul(10_000 + slippage_bps as u128) / 10_000;
+    let max_amount_in = (U256::from(quoted_amount_in)
+        * U256::from(10_000u64 + u64::from(slippage_bps))
+        / U256::from(10_000))
+    .min(U256::from(u128::MAX))
+    .to::<u128>();
 
     let swap_data = Bytes::from(
         IStablecoinDEX::swapExactAmountOutCall {
@@ -166,22 +175,18 @@ pub async fn resolve_autoswap_calls<P: alloy::providers::Provider<tempo_alloy::T
         return Ok(None);
     }
 
-    match check_balance_deficit(provider, owner, currency, amount).await? {
-        Some(_) => {}
+    let deficit = match check_balance_deficit(provider, owner, currency, amount).await? {
+        Some(deficit) => deficit,
         None => return Ok(None),
-    }
-
-    // Match MPPx: acquire the full requested output amount when the target
-    // balance is insufficient, leaving any pre-existing dust untouched.
-    let amount_out: u128 = amount
+    };
+    let amount_out: u128 = deficit
         .try_into()
-        .map_err(|_| MppError::InvalidAmount(format!("amount {amount} exceeds u128")))?;
+        .map_err(|_| MppError::InvalidAmount(format!("deficit {deficit} exceeds u128")))?;
 
     let quoted_amount_in = quote_swap(provider, config.token_in, currency, amount_out).await?;
 
     // Compute max_amount_in with slippage and verify the user can cover it.
-    let max_amount_in =
-        quoted_amount_in.saturating_mul(10_000 + config.slippage_bps as u128) / 10_000;
+    let max_amount_in = bounded_swap_input(amount_out, quoted_amount_in, config)?;
     let required = U256::from(max_amount_in);
     if let Some(deficit) = check_balance_deficit(provider, owner, config.token_in, required).await?
     {
@@ -196,14 +201,33 @@ pub async fn resolve_autoswap_calls<P: alloy::providers::Provider<tempo_alloy::T
 
     Ok(Some(vec![
         build_approve_call(config.token_in, max_amount_in),
-        build_swap_call(
-            config.token_in,
-            currency,
-            amount_out,
-            quoted_amount_in,
-            config.slippage_bps,
-        ),
+        build_swap_call(config.token_in, currency, amount_out, max_amount_in, 0),
     ]))
+}
+
+/// Bound spending independently of the DEX quote, using wide arithmetic to avoid overflow.
+fn bounded_swap_input(
+    amount_out: u128,
+    quoted: u128,
+    config: &AutoswapConfig,
+) -> Result<u128, MppError> {
+    let with_slippage = |amount: u128| {
+        U256::from(amount) * U256::from(10_000u64 + u64::from(config.slippage_bps))
+            / U256::from(10_000)
+    };
+    let limit = config
+        .max_amount_in
+        .map(U256::from)
+        .unwrap_or_else(|| with_slippage(amount_out));
+    if quoted == 0 || U256::from(quoted) > limit {
+        return Err(MppError::InvalidAmount(
+            "autoswap quote exceeds spend limit or is zero".into(),
+        ));
+    }
+    with_slippage(quoted)
+        .min(limit)
+        .try_into()
+        .map_err(|_| MppError::InvalidAmount("autoswap maximum input exceeds u128".into()))
 }
 
 /// Resolve the DEX swap call without its approval call.
@@ -229,6 +253,28 @@ pub async fn resolve_autoswap<P: alloy::providers::Provider<tempo_alloy::TempoNe
 mod tests {
     use super::*;
     use alloy::primitives::address;
+
+    #[test]
+    fn test_independent_spend_limit() {
+        for (quote, cap, expected) in [
+            (100, None, Some(101)),
+            (101, None, Some(101)),
+            (102, None, None),
+            (0, None, None),
+            (500, Some(600), Some(505)),
+            (500, Some(499), None),
+        ] {
+            let mut config = AutoswapConfig::new(Address::ZERO, 100);
+            config.max_amount_in = cap;
+            assert_eq!(bounded_swap_input(100, quote, &config).ok(), expected);
+        }
+        let config = AutoswapConfig::new(Address::ZERO, 100);
+        assert!(bounded_swap_input(u128::MAX, u128::MAX, &config).is_err());
+        let call = build_swap_call(Address::ZERO, Address::ZERO, 1, u128::MAX, 0);
+        let decoded =
+            IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&call.input[4..]).unwrap();
+        assert_eq!(decoded.maxAmountIn, u128::MAX);
+    }
 
     #[test]
     fn test_autoswap_config_new() {
@@ -306,7 +352,7 @@ mod tests {
             &U256::from(52_906),
         )));
         asserter.push_success(&Bytes::from(
-            IStablecoinDEX::quoteSwapExactAmountOutCall::abi_encode_returns(&5_000_500u128),
+            IStablecoinDEX::quoteSwapExactAmountOutCall::abi_encode_returns(&4_947_094u128),
         ));
         asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
             &U256::from(16_852_785),
@@ -328,11 +374,11 @@ mod tests {
         assert_eq!(calls.len(), 2);
         let approve = ITIP20::approveCall::abi_decode_raw(&calls[0].input[4..]).unwrap();
         assert_eq!(approve.spender, DEX_ADDRESS);
-        assert_eq!(approve.amount, U256::from(5_050_505));
+        assert_eq!(approve.amount, U256::from(4_996_564));
         let swap =
             IStablecoinDEX::swapExactAmountOutCall::abi_decode_raw(&calls[1].input[4..]).unwrap();
-        assert_eq!(swap.amountOut, 5_000_000);
-        assert_eq!(swap.maxAmountIn, 5_050_505);
+        assert_eq!(swap.amountOut, 4_947_094);
+        assert_eq!(swap.maxAmountIn, 4_996_564);
     }
 
     #[tokio::test]

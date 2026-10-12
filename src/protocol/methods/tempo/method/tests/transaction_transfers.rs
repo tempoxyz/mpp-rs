@@ -772,6 +772,8 @@ fn test_validate_transaction_transfers_rejects_fee_payer_unbound_swap_prefix() {
 
     validate(101, currency, 100).expect("bound swap prefix is accepted");
 
+    assert!(validate(101, currency, 90).is_ok());
+
     for (approve_amount, token_out, amount_out, expected_error) in [
         (
             u64::MAX,
@@ -789,13 +791,13 @@ fn test_validate_transaction_transfers_rejects_fee_payer_unbound_swap_prefix() {
             101,
             currency,
             1_000,
-            "swap output does not match the payment amount",
+            "swap output must be positive and no greater than the payment amount",
         ),
         (
             101,
             currency,
-            90,
-            "swap output does not match the payment amount",
+            0,
+            "swap output must be positive and no greater than the payment amount",
         ),
     ] {
         let error = validate(approve_amount, token_out, amount_out).unwrap_err();
