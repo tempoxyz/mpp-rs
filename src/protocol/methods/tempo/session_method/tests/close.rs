@@ -288,6 +288,110 @@ async fn test_close_at_settled_amount_is_rejected() {
     assert_eq!(asserter.read_q().len(), queued - 1);
 }
 
+/// VER-913: a close voucher signed by anyone other than the channel's
+/// signer must be rejected before its amount is checked, so the error does
+/// not disclose how much the channel has spent.
+#[tokio::test]
+async fn test_close_with_invalid_signature_does_not_disclose_spent() {
+    use alloy::sol_types::SolValue;
+
+    let store = Arc::new(InMemoryChannelStore::new());
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = alloy::signers::local::PrivateKeySigner::random().address();
+    state.highest_voucher_amount = 987_654;
+    state.spent = 123_456;
+    store.insert(&channel_id, state.clone());
+
+    let attacker = alloy::signers::local::PrivateKeySigner::random();
+    let close_amount = 1u128;
+    let signature = voucher::sign_voucher(
+        &attacker,
+        channel_id.parse().unwrap(),
+        close_amount,
+        state.escrow_contract,
+        state.chain_id,
+    )
+    .await
+    .unwrap();
+    for signature in [
+        alloy::hex::encode_prefixed(signature),
+        format!("0x{}", "aa".repeat(65)),
+    ] {
+        let (request, credential) = build_session_credential(
+            Some("0x2222222222222222222222222222222222222222"),
+            "0x3333333333333333333333333333333333333333",
+            SessionCredentialPayload::Close {
+                channel_id: channel_id.clone(),
+                descriptor: None,
+                settlement_route: None,
+                cumulative_amount: close_amount.to_string(),
+                signature,
+            },
+        );
+        // The on-chain channel is readable, so only the signature check
+        // stands between the request and the spent check.
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&Bytes::from(
+            (
+                false,
+                0u64,
+                state.payer,
+                state.payee,
+                state.token,
+                state.authorized_signer,
+                state.deposit,
+                0u128,
+            )
+                .abi_encode_params(),
+        ));
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::InvalidSignature));
+        assert_eq!(
+            asserter.read_q().len(),
+            1,
+            "unauthenticated close read the chain"
+        );
+        let problem = crate::error::PaymentError::to_problem_details(&err, None);
+        let problem = serde_json::to_string(&problem).unwrap();
+        assert!(!problem.contains("123456"), "spent disclosed: {problem}");
+        assert!(!problem.contains("987654"), "voucher disclosed: {problem}");
+    }
+
+    let stored = store.get_channel_sync(&channel_id).unwrap();
+    assert!(!stored.finalized);
+    assert!(!stored.closing);
+}
+
+/// A close voucher signed by the channel's signer is still rejected when it
+/// does not cover what the channel spent.
+#[tokio::test]
+async fn test_close_with_valid_signature_below_spent_is_rejected() {
+    let store = Arc::new(InMemoryChannelStore::new());
+    let asserter = alloy::providers::mock::Asserter::new();
+    let (channel_id, request, credential) =
+        close_setup_with(&store, &asserter, 1_500, 0, 1_000).await;
+    push_close_transaction(&asserter, true);
+    let method = mocked_session_method(store.clone(), asserter)
+        .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.message, "close voucher amount must be >= 1500 (spent)");
+
+    let stored = store.get_channel_sync(&channel_id).unwrap();
+    assert!(!stored.finalized);
+    assert!(!stored.closing);
+}
+
 /// A mined-but-reverted close leaves the channel open on-chain, so it must
 /// stay open in the store too.
 #[tokio::test]

@@ -189,22 +189,9 @@ where
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
 
-        // For close, always re-read on-chain state.
-        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
-
-        if on_chain.finalized {
-            return Err(VerificationError::channel_closed(
-                "channel is finalized on-chain",
-            ));
-        }
-
-        validate_close_amount(
-            cumulative_amount,
-            channel.spent,
-            on_chain.settled,
-            on_chain.deposit,
-        )?;
-
+        // Authenticate the voucher before comparing it against the channel:
+        // the amount checks report the channel's spent amount, which only the
+        // payer may learn.
         let sig_bytes = Self::parse_signature(signature_str)?;
         let is_valid = verify_voucher(
             escrow,
@@ -220,6 +207,22 @@ where
                 "invalid voucher signature",
             ));
         }
+
+        // For close, always re-read on-chain state.
+        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+
+        if on_chain.finalized {
+            return Err(VerificationError::channel_closed(
+                "channel is finalized on-chain",
+            ));
+        }
+
+        validate_close_amount(
+            cumulative_amount,
+            channel.spent,
+            on_chain.settled,
+            on_chain.deposit,
+        )?;
 
         let signer = self.close_signer.as_ref().ok_or_else(|| {
             VerificationError::new(

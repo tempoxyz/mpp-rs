@@ -155,6 +155,30 @@ where
                 "channel has a pending close request",
             ));
         }
+        // Authenticate the voucher before comparing it against the channel:
+        // the delta check reports how far it is above the accepted amount,
+        // which only the payer may learn. An exact replay of the stored
+        // voucher was verified when it was accepted.
+        let sig_bytes = Self::parse_signature(signature_str)?;
+        let is_exact_replay = cumulative_amount == channel.highest_voucher_amount
+            && channel.highest_voucher_signature.as_ref() == Some(&sig_bytes);
+        if !is_exact_replay {
+            let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+            let is_valid = verify_voucher(
+                channel.escrow_contract,
+                channel.chain_id,
+                channel_id_b256,
+                cumulative_amount,
+                &sig_bytes,
+                channel.authorized_signer,
+            );
+            if !is_valid {
+                return Err(VerificationError::invalid_signature(
+                    "invalid voucher signature",
+                ));
+            }
+        }
+
         if cumulative_amount < channel.settled_on_chain {
             return Err(VerificationError::new(
                 "voucher cumulativeAmount is below on-chain settled amount",
@@ -166,35 +190,9 @@ where
             ));
         }
 
-        // If voucher is not higher than what we already have, verify the
-        // signature and reject it as a replay. A successful voucher must add new
-        // funds for the current metered request.
+        // A successful voucher must add new funds for the current metered
+        // request.
         if cumulative_amount <= channel.highest_voucher_amount {
-            let sig_bytes = Self::parse_signature(signature_str)?;
-            let is_exact_replay =
-                channel
-                    .highest_voucher_signature
-                    .as_ref()
-                    .is_some_and(|stored_sig| {
-                        stored_sig == &sig_bytes
-                            && cumulative_amount == channel.highest_voucher_amount
-                    });
-            if !is_exact_replay {
-                let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
-                let is_valid = verify_voucher(
-                    channel.escrow_contract,
-                    channel.chain_id,
-                    channel_id_b256,
-                    cumulative_amount,
-                    &sig_bytes,
-                    channel.authorized_signer,
-                );
-                if !is_valid {
-                    return Err(VerificationError::invalid_signature(
-                        "invalid voucher signature",
-                    ));
-                }
-            }
             return Err(VerificationError::delta_too_small(
                 "voucher does not add new funds",
             ));
@@ -206,24 +204,6 @@ where
                 "voucher delta {} below minimum {}",
                 delta, min_delta
             )));
-        }
-
-        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
-        let sig_bytes = Self::parse_signature(signature_str)?;
-
-        let is_valid = verify_voucher(
-            channel.escrow_contract,
-            channel.chain_id,
-            channel_id_b256,
-            cumulative_amount,
-            &sig_bytes,
-            channel.authorized_signer,
-        );
-
-        if !is_valid {
-            return Err(VerificationError::invalid_signature(
-                "invalid voucher signature",
-            ));
         }
 
         // Update store with new highest voucher.
