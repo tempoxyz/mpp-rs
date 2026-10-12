@@ -35,7 +35,8 @@ jobs:
     needs: authorize
     if: >-
       !cancelled() &&
-      (needs.authorize.result == 'success' || github.event.action != 'labeled')
+      (needs.authorize.result == 'success' || github.event.action != 'labeled') &&
+      (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
       id-token: write
