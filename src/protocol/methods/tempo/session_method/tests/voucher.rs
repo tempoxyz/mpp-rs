@@ -116,6 +116,30 @@ async fn test_exact_replay_of_highest_voucher_rejected() {
     assert_eq!(result.unwrap_err().code, Some(ErrorCode::DeltaTooSmall));
 }
 
+/// VER-913: a voucher just above the accepted amount but below the minimum
+/// delta must fail on its signature, not report the delta, which would
+/// disclose the accepted amount to anyone.
+#[tokio::test]
+async fn test_unsigned_voucher_does_not_disclose_accepted_amount() {
+    let store = Arc::new(InMemoryChannelStore::new());
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = alloy::signers::local::PrivateKeySigner::random().address();
+    state.highest_voucher_amount = 123_456;
+    state.deposit = 1_000_000;
+    store.insert(&channel_id, state.clone());
+
+    let method = test_session_method(store);
+    let garbage_sig = format!("0x{}", "ff".repeat(65));
+    let err = method
+        .verify_and_accept_voucher(&channel_id, &state, 123_457, &garbage_sig, 1_000)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, Some(ErrorCode::InvalidSignature));
+    assert!(!err.message.contains("123456"), "{}", err.message);
+}
+
 #[tokio::test]
 async fn test_concurrent_voucher_acceptance_has_one_winner() {
     use crate::protocol::methods::tempo::voucher::sign_voucher;

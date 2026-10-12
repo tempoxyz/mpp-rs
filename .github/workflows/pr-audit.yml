@@ -1,18 +1,17 @@
 name: PR Audit
 
 on:
-  issue_comment:
-    types: [created]
-  pull_request_target: # zizmor: ignore[dangerous-triggers] Publishes authorized events without checking out PR code.
-    types: [synchronize, reopened, ready_for_review]
   pull_request:
-    types: [labeled, synchronize, reopened, ready_for_review]
+    types: [labeled, opened, synchronize, reopened, ready_for_review]
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions: {}
 
 jobs:
+  # Manual `cyclops` labels stay admin-only; push audits need no label.
   authorize:
-    if: github.event.label.name == 'cyclops'
+    if: github.event.action == 'labeled' && github.event.label.name == 'cyclops'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -34,72 +33,19 @@ jobs:
 
   pr-audit:
     needs: authorize
-    permissions:
-      contents: read
-      id-token: write
-      pull-requests: read
-      statuses: write
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@ff385914926ea9e9d9647597b9cc501fb7b6d69a
-    secrets:
-      EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
-      EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
-      EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }}
-
-  warden-updates:
-    if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && github.event.action != 'labeled'
-    permissions:
-      contents: read
-      id-token: write
-      pull-requests: read
-      statuses: write
-    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@ff385914926ea9e9d9647597b9cc501fb7b6d69a
-    with:
-      audit-on-command: true
-    secrets:
-      EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
-      EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
-      EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }}
-
-  pr-audit-comment:
     if: >-
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request &&
-      (
-        startsWith(github.event.comment.body, 'cyclops audit') ||
-        startsWith(github.event.comment.body, 'cyclops private audit') ||
-        startsWith(github.event.comment.body, '@decofe cyclops audit') ||
-        startsWith(github.event.comment.body, '@decofe cyclops private audit') ||
-        startsWith(github.event.comment.body, 'derek audit')
-      )
-    runs-on: ubuntu-latest
+      !cancelled() &&
+      (needs.authorize.result == 'success' || github.event.action != 'labeled') &&
+      (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
-      id-token: write
       contents: read
-      issues: write
-      pull-requests: write
-    steps:
-      - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@e813067e922303348ee5aad965f745803cc24f1f # 2026-10-02T09-56-31Z-e813067e
-
-      - name: Check admin permission
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          COMMENTER: ${{ github.event.comment.user.login }}
-        run: |
-          PERM=$(gh api "repos/${REPOSITORY}/collaborators/${COMMENTER}/permission" --jq '.permission')
-          if [[ "$PERM" != "admin" ]]; then
-            echo "::error::Only admins can trigger pr-audit (got: $PERM)"
-            exit 1
-          fi
-
-      - name: Handle audit command
-        uses: tempoxyz/gh-actions/actions/pr-audit-comment@ff385914926ea9e9d9647597b9cc501fb7b6d69a
-        with:
-          command-regex: '^(?:@decofe\s+)?(?:cyclops\s+(?:private\s+)?audit|derek\s+audit)\b'
-          permission-check-mode: association
-          organization: tempoxyz
-          events-key: ${{ secrets.EVENTS_KEY }}
-          events-cert: ${{ secrets.EVENTS_CERT }}
-          events-args: ${{ secrets.EVENTS_ARGS }}
-          github-token: ${{ github.token }}
+      id-token: write
+      pull-requests: read
+      statuses: write
+    uses: tempoxyz/gh-actions/.github/workflows/pr-audit.yml@2ab28a31ae569be9f780c7675b684471060afa40 # 2026-10-09T21-43-19Z-2ab28a31
+    with:
+      audit-on-push: true
+    secrets:
+      EVENTS_KEY: ${{ secrets.EVENTS_KEY }}
+      EVENTS_CERT: ${{ secrets.EVENTS_CERT }}
+      EVENTS_ARGS: ${{ secrets.EVENTS_ARGS }}
