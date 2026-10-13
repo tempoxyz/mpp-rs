@@ -214,6 +214,12 @@ impl Relay {
             .header("tempo-api-key", &self.api_key)
             .json(input);
 
+        // An empty value overrides custom-client defaults; the relay treats it as absent.
+        let request = if path == "v1/mpp/broadcast" {
+            request.header("idempotency-key", "")
+        } else {
+            request
+        };
         let response = request.send().await.map_err(|_| unavailable())?;
         if response.status().is_server_error() {
             return Err(unavailable());
@@ -420,7 +426,7 @@ mod tests {
         let app = Router::new().route("/v1/mpp/broadcast", post(move |headers: HeaderMap| {
             let consumed = consumed.clone();
             async move {
-                if consumed.swap(true, Ordering::SeqCst) && !headers.contains_key("idempotency-key") {
+                if consumed.swap(true, Ordering::SeqCst) && headers.get("idempotency-key").is_none_or(|value| value.is_empty()) {
                     return Json(serde_json::json!({"success": false, "error": {"code": "already_used", "message": "Used"}}));
                 }
                 Json(serde_json::json!({"success": true, "receipt": {"method": "tempo", "reference": "0xabc", "timestamp": "2026-08-03T12:00:00Z"}}))
@@ -429,8 +435,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let relay =
-            Relay::new(RelayConfig::new("key").api_base_url(format!("http://{address}"))).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "shared-key".parse().unwrap());
+        let client = Client::builder().default_headers(headers).build().unwrap();
+        let relay = Relay::new(
+            RelayConfig::new("key")
+                .client(client)
+                .api_base_url(format!("http://{address}")),
+        )
+        .unwrap();
         let credential = credential(PaymentPayload::transaction("0x1234"));
         let (first, second) = tokio::join!(
             relay.broadcast(&credential, "tempo"),
@@ -600,7 +613,7 @@ mod tests {
             assert_eq!(call.body["source"], "did:pkh:eip155:42431:0x1234");
         }
         assert!(calls[0].headers.get("idempotency-key").is_none());
-        assert!(calls[1].headers.get("idempotency-key").is_none());
+        assert_eq!(calls[1].headers["idempotency-key"], "");
     }
 
     #[tokio::test]

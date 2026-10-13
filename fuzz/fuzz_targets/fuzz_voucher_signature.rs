@@ -133,15 +133,27 @@ fuzz_target!(|input: Input| {
             let same = fields.channel_id == CHANNEL_ID
                 && fields.amount == AMOUNT
                 && fields.chain_id == CHAIN_ID
-                && Address::from(fields.escrow) == ESCROW
-                && Address::from(fields.signer) == signed.signer;
+                && Address::from(fields.escrow) == ESCROW;
+            // Keep the authorized signer fixed: arbitrary signatures recover some
+            // address, which the fuzzer can copy into an unconstrained signer field.
+            assert_eq!(
+                verify_voucher(
+                    ESCROW,
+                    CHAIN_ID,
+                    CHANNEL_ID.into(),
+                    AMOUNT,
+                    &signed.signature,
+                    fields.signer.into()
+                ),
+                Address::from(fields.signer) == signed.signer,
+            );
             let accepted = verify_voucher(
                 fields.escrow.into(),
                 fields.chain_id,
                 fields.channel_id.into(),
                 fields.amount,
                 &signature,
-                fields.signer.into(),
+                signed.signer,
             );
             assert!(!accepted || same, "accepted for other fields: {fields:?}");
             accepted

@@ -45,6 +45,12 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check_canonical(value: &Value) {
+    // serde_json's raw_value/arbitrary_precision features interpret these map
+    // keys as internal wrappers when canonical sorting moves them first.
+    // Such values are not round-trippable through serde_json::Value itself.
+    if has_reserved_key(value) {
+        return;
+    }
     let canonical = Base64UrlJson::from_value(value).expect("JSON values canonicalize");
     let decoded = canonical.decode_value().expect("canonical JSON decodes");
     let again = Base64UrlJson::from_value(&decoded).expect("JSON values canonicalize");
@@ -71,6 +77,19 @@ fn has_unsafe_integer(value: &Value) -> bool {
         }
         Value::Array(items) => items.iter().any(has_unsafe_integer),
         Value::Object(object) => object.values().any(has_unsafe_integer),
+        _ => false,
+    }
+}
+
+fn has_reserved_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "$serde_json::private::RawValue" | "$serde_json::private::Number"
+            ) || has_reserved_key(value)
+        }),
+        Value::Array(items) => items.iter().any(has_reserved_key),
         _ => false,
     }
 }
