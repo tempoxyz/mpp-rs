@@ -14,7 +14,7 @@ use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
 };
 use crate::protocol::methods::tempo::voucher::verify_voucher;
-use crate::protocol::traits::VerificationError;
+use crate::protocol::traits::{ErrorCode, VerificationError};
 
 /// Validate the close voucher amount against spent, on-chain settled, and deposit.
 /// Matches mppx handleClose:
@@ -241,8 +241,9 @@ where
             )
             .await?;
 
-        // Submit the close transaction on-chain. Failures are collected so the
-        // `closing` flag can be reset below.
+        // Once submission starts, transport errors do not prove the transaction
+        // failed. Keep metering blocked until the chain outcome is known.
+        let mut may_have_broadcast = false;
         let close_tx_result: Result<String, VerificationError> = async {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
@@ -319,18 +320,21 @@ where
             let signed_tx = tempo_tx.into_signed(signature.into());
             let tx_bytes = Bytes::from(signed_tx.encoded_2718());
 
+            let tx_hash = alloy::primitives::keccak256(&tx_bytes);
+            may_have_broadcast = true;
             let pending = self
                 .provider
                 .send_raw_transaction(&tx_bytes)
                 .await
                 .map_err(|e| {
-                    VerificationError::network_error(format!("failed to send close tx: {}", e))
+                    VerificationError::with_code(format!("close outcome unknown (tx: {}): {}", tx_hash, e), ErrorCode::NetworkError)
                 })?;
             let receipt = pending
                 .get_receipt()
                 .await
-                .map_err(|e| VerificationError::network_error(format!("close tx failed: {}", e)))?;
+                .map_err(|e| VerificationError::with_code(format!("close outcome unknown (tx: {}): {}", tx_hash, e), ErrorCode::NetworkError))?;
             if !receipt.status() {
+                may_have_broadcast = false;
                 return Err(VerificationError::transaction_failed(format!(
                     "close transaction reverted (tx: {})",
                     receipt.transaction_hash()
@@ -344,13 +348,14 @@ where
         let close_tx_hash = match close_tx_result {
             Ok(hash) => hash,
             Err(err) => {
-                let _ = self
-                    .store
-                    .update_channel(
-                        channel_id_str,
-                        Box::new(|current| Ok(current.map(ChannelState::clear_pending_close))),
-                    )
-                    .await;
+                if !may_have_broadcast {
+                    self.store
+                        .update_channel(
+                            channel_id_str,
+                            Box::new(|current| Ok(current.map(ChannelState::clear_pending_close))),
+                        )
+                        .await?;
+                }
                 return Err(err);
             }
         };

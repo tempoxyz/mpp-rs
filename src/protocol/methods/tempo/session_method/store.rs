@@ -33,6 +33,10 @@ pub struct ChannelState {
     pub spent: u128,
     pub units: u64,
     pub finalized: bool,
+    /// Blocks metering while a close is in flight or its outcome is unknown.
+    /// After an ambiguous broadcast error, reconcile the transaction hash in
+    /// the error with chain state before clearing this flag. An absent receipt
+    /// is not evidence of failure. Persist this guard across process restarts.
     #[serde(default)]
     pub closing: bool,
     #[serde(default)]

@@ -712,3 +712,43 @@ fn machine_session_close_is_settle_swap_close_and_requires_full_consumption() {
         &ITIP20ChannelReserve::closeCall::SELECTOR
     );
 }
+
+#[tokio::test]
+async fn test_ambiguous_close_never_resumes_metering() {
+    use alloy::primitives::{U128, U64};
+    for broadcast_acknowledged in [false, true] {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store, &asserter).await;
+        let mut state = store.get_channel_sync(&channel_id).unwrap();
+        state.highest_voucher_amount = 2_000;
+        store.insert(&channel_id, state);
+        asserter.push_success(&U64::ZERO);
+        asserter.push_success(&U128::from(1));
+        if broadcast_acknowledged {
+            asserter.push_success(&B256::repeat_byte(0xcc));
+        }
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::NetworkError));
+        assert!(err.message.contains("outcome unknown (tx: 0x"));
+        assert!(!err.retryable);
+        let state = store.get_channel_sync(&channel_id).unwrap();
+        assert!(state.closing && !state.finalized);
+        // The safety guard survives persistence/reload and blocks H-C service.
+        let restored: ChannelState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        store.insert(&channel_id, restored);
+        assert_eq!(
+            deduct_from_channel(&*store, &channel_id, 1)
+                .await
+                .unwrap_err()
+                .code,
+            Some(ErrorCode::ChannelClosed)
+        );
+    }
+}
