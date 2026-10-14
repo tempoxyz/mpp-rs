@@ -18,7 +18,9 @@ mod voucher;
 pub use chain::OnChainChannel;
 pub(crate) use receipt::channel_receipt;
 pub(crate) use store::normalize_channel_id;
-pub use store::{deduct_from_channel, ChannelState, ChannelStore, InMemoryChannelStore};
+pub use store::{
+    deduct_from_channel, ChannelState, ChannelStore, InMemoryChannelStore, PendingClose,
+};
 
 use alloy::primitives::Address;
 use std::sync::Arc;

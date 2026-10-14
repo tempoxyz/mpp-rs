@@ -263,3 +263,19 @@ async fn test_top_up_keeps_higher_recorded_deposit() {
         state.deposit + 20_000
     );
 }
+
+#[tokio::test]
+async fn test_top_up_rejects_uncertain_close_before_broadcast() {
+    let store = Arc::new(InMemoryChannelStore::new());
+    let channel_id = B256::repeat_byte(0xab).to_string();
+    let mut state = test_channel_state(&channel_id);
+    state.closing = true;
+    store.insert(&channel_id, state);
+    let method = test_session_method(store);
+    let (request, credential) = top_up_credential(&channel_id, "5000", "0xinvalid".into());
+    let error = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::ChannelClosed));
+}

@@ -92,6 +92,7 @@ impl ChannelState {
                 units: 0,
                 finalized: false,
                 closing: false,
+                pending_close: None,
                 close_requested_at: on_chain.close_requested_at,
                 created_at: now_iso8601(),
             }
@@ -197,6 +198,7 @@ impl ChannelState {
         }
         Self {
             closing: false,
+            pending_close: None,
             ..self
         }
     }
@@ -223,6 +225,7 @@ impl ChannelState {
             },
             finalized: true,
             closing: false,
+            pending_close: None,
             ..self
         }
     }

@@ -739,6 +739,10 @@ async fn test_ambiguous_close_never_resumes_metering() {
         assert!(!err.retryable);
         let state = store.get_channel_sync(&channel_id).unwrap();
         assert!(state.closing && !state.finalized);
+        let evidence = state.pending_close.as_ref().unwrap();
+        assert!(err.message.contains(&evidence.transaction_hash.to_string()));
+        assert_eq!(evidence.cumulative_amount, 1000);
+        assert_eq!(evidence.nonce, 0);
         // The safety guard survives persistence/reload and blocks H-C service.
         let restored: ChannelState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
@@ -750,5 +754,76 @@ async fn test_ambiguous_close_never_resumes_metering() {
                 .code,
             Some(ErrorCode::ChannelClosed)
         );
+    }
+}
+
+#[tokio::test]
+async fn test_reconcile_pending_close_after_restart() {
+    for outcome in [None, Some(false), Some(true)] {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = B256::repeat_byte(0xab).to_string();
+        let hash = B256::repeat_byte(0xcc);
+        let mut state = test_channel_state(&channel_id);
+        state.closing = true;
+        state.pending_close = Some(super::super::PendingClose {
+            transaction_hash: hash,
+            nonce: 7,
+            cumulative_amount: 1000,
+            signature: vec![1; 65],
+        });
+        let state: ChannelState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        store.insert(&channel_id, state);
+        let asserter = alloy::providers::mock::Asserter::new();
+        if let Some(success) = outcome {
+            asserter.push_success(&serde_json::json!({
+                "transactionHash": hash, "transactionIndex": "0x0", "blockHash": B256::repeat_byte(0xdd),
+                "blockNumber": "0x1", "from": Address::repeat_byte(0x22), "to": TEST_ESCROW,
+                "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208", "effectiveGasPrice": "0x1",
+                "contractAddress": null, "logs": [], "logsBloom": alloy::primitives::Bloom::ZERO,
+                "status": if success { "0x1" } else { "0x0" }, "type": "0x76",
+                "feePayer": Address::repeat_byte(0x22),
+            }));
+        } else {
+            asserter.push_success(&serde_json::Value::Null);
+        }
+        let method = mocked_session_method(store.clone(), asserter);
+        let state = method
+            .reconcile_pending_close(&channel_id.to_uppercase())
+            .await
+            .unwrap();
+        assert_eq!(state.finalized, outcome == Some(true));
+        assert_eq!(state.closing, outcome.is_none());
+        assert_eq!(state.pending_close.is_some(), outcome.is_none());
+    }
+}
+
+#[tokio::test]
+async fn test_submission_rejection_classification() {
+    for (code, message, remains_closing) in [
+        (-32602, "invalid params", false),
+        (-32000, "nonce too low", true),
+        (-32000, "already known", true),
+        (-32000, "insufficient funds", true),
+    ] {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store, &asserter).await;
+        asserter.push_success(&alloy::primitives::U64::ZERO);
+        asserter.push_success(&alloy::primitives::U128::from(1));
+        asserter.push_failure(
+            serde_json::from_value(serde_json::json!({ "code": code, "message": message }))
+                .unwrap(),
+        );
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+        let error = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        let state = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(state.closing, remains_closing);
+        assert_eq!(state.pending_close.is_some(), remains_closing);
+        assert_eq!(error.retryable, !remains_closing);
     }
 }

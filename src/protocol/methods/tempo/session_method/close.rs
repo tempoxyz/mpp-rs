@@ -8,7 +8,7 @@ use tempo_alloy::TempoNetwork;
 use super::chain::get_on_chain_channel;
 use super::payload::validate_settlement_route;
 use super::receipt::session_receipt;
-use super::{normalize_channel_id, ChannelState, SessionMethod};
+use super::{normalize_channel_id, ChannelState, PendingClose, SessionMethod};
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
@@ -130,6 +130,73 @@ impl<P> SessionMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
+    /// Reconcile a stored close using its transaction receipt from the configured RPC.
+    ///
+    /// Returns the unchanged state when no receipt exists. A successful receipt
+    /// finalizes the channel; a reverted receipt releases the closing guard.
+    /// RPC errors, old records without transaction evidence, and missing receipts
+    /// never reopen metering. Call this from a trusted operator/background worker;
+    /// it does not authorize a new paid operation or submit a new transaction.
+    ///
+    /// Operator usage: `let state = method.reconcile_pending_close(&channel_id).await?;`
+    /// If `state.closing` remains true, keep the channel blocked and investigate
+    /// `state.pending_close`; never clear it just because the RPC has no receipt.
+    pub async fn reconcile_pending_close(
+        &self,
+        channel_id: &str,
+    ) -> Result<ChannelState, VerificationError> {
+        let channel_id = normalize_channel_id(channel_id);
+        let channel = self
+            .store
+            .get_channel(&channel_id)
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+        let Some(pending) = channel
+            .pending_close
+            .clone()
+            .filter(|_| channel.closing && !channel.finalized)
+        else {
+            return Ok(channel);
+        };
+        let receipt = self
+            .provider
+            .get_transaction_receipt(pending.transaction_hash)
+            .await
+            .map_err(|e| {
+                VerificationError::network_error(format!("close reconciliation failed: {e}"))
+            })?;
+        let Some(receipt) = receipt else {
+            return Ok(channel);
+        };
+        if receipt.transaction_hash() != pending.transaction_hash {
+            return Err(VerificationError::network_error(
+                "close receipt hash mismatch",
+            ));
+        }
+        self.store
+            .update_channel(
+                &channel_id,
+                Box::new(move |current| {
+                    let state = current
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    if state.pending_close.as_ref() != Some(&pending)
+                        || !state.closing
+                        || state.finalized
+                    {
+                        return Ok(Some(state));
+                    }
+                    let deposit = state.deposit;
+                    Ok(Some(if receipt.status() {
+                        state.finalize_close(pending.cumulative_amount, pending.signature, deposit)
+                    } else {
+                        state.clear_pending_close()
+                    }))
+                }),
+            )
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+    }
+
     /// Handle 'close' action.
     pub(super) async fn handle_close(
         &self,
@@ -321,12 +388,30 @@ where
             let tx_bytes = Bytes::from(signed_tx.encoded_2718());
 
             let tx_hash = alloy::primitives::keccak256(&tx_bytes);
+            let evidence = PendingClose {
+                transaction_hash: tx_hash,
+                nonce,
+                cumulative_amount,
+                signature: sig_bytes.clone(),
+            };
+            self.store.update_channel(channel_id_str, Box::new(move |current| {
+                let mut state = current.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                state.pending_close = Some(evidence);
+                Ok(Some(state))
+            })).await?;
             may_have_broadcast = true;
             let pending = self
                 .provider
                 .send_raw_transaction(&tx_bytes)
                 .await
                 .map_err(|e| {
+                    // Invalid JSON-RPC parameters cannot admit these bytes. Do not
+                    // classify nonce/funds/fee errors this way: a retrying transport
+                    // may return them after an earlier attempt was accepted.
+                    if e.as_error_resp().is_some_and(|error| error.code == -32602) {
+                        may_have_broadcast = false;
+                        return VerificationError::network_error(format!("close submission rejected: {e}"));
+                    }
                     VerificationError::with_code(format!("close outcome unknown (tx: {}): {}", tx_hash, e), ErrorCode::NetworkError)
                 })?;
             let receipt = pending

@@ -646,6 +646,7 @@ mod tests {
             units: 0,
             finalized: false,
             closing: false,
+            pending_close: None,
             close_requested_at: 0,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }

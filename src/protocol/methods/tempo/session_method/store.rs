@@ -7,6 +7,15 @@ use alloy::primitives::Address;
 
 use crate::protocol::traits::VerificationError;
 
+/// Durable evidence for reconciling a submitted close after a lost response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingClose {
+    pub transaction_hash: alloy::primitives::B256,
+    pub nonce: u64,
+    pub cumulative_amount: u128,
+    pub signature: Vec<u8>,
+}
+
 /// State for an on-chain payment channel, including per-session accounting.
 ///
 /// Tracks the channel's identity, on-chain balance, the highest voucher
@@ -34,11 +43,14 @@ pub struct ChannelState {
     pub units: u64,
     pub finalized: bool,
     /// Blocks metering while a close is in flight or its outcome is unknown.
-    /// After an ambiguous broadcast error, reconcile the transaction hash in
-    /// the error with chain state before clearing this flag. An absent receipt
-    /// is not evidence of failure. Persist this guard across process restarts.
+    /// Use `SessionMethod::reconcile_pending_close` after an ambiguous error.
+    /// An absent receipt is not evidence of failure. Persist this guard and
+    /// `pending_close` across process restarts.
     #[serde(default)]
     pub closing: bool,
+    /// Recorded before submission, even if the caller discards the error.
+    #[serde(default)]
+    pub pending_close: Option<PendingClose>,
     #[serde(default)]
     pub close_requested_at: u64,
     pub created_at: String,

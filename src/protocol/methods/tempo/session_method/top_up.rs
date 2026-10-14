@@ -107,8 +107,10 @@ where
         }
         validate_settlement_route(&channel, details, settlement_route)?;
 
-        if channel.finalized {
-            return Err(VerificationError::channel_closed("channel is finalized"));
+        if channel.finalized || channel.closing {
+            return Err(VerificationError::channel_closed(
+                "channel is finalized or closing",
+            ));
         }
 
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
