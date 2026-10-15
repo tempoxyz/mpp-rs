@@ -231,9 +231,10 @@ impl Relay {
             .header("tempo-api-key", &self.api_key)
             .json(input);
 
-        // An empty value overrides custom-client defaults; the relay treats it as absent.
+        // Scope transport idempotency to this attempt, never to a reusable credential.
+        // Override custom-client defaults without relying on empty-header semantics.
         let request = if path == "v1/mpp/broadcast" {
-            request.header("idempotency-key", "")
+            request.header("idempotency-key", uuid::Uuid::new_v4().to_string())
         } else {
             request
         };
@@ -461,14 +462,18 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_broadcasts_do_not_reuse_cached_receipts() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let consumed = Arc::new(AtomicBool::new(false));
+        let consumed = Arc::new(std::sync::Mutex::new(None::<String>));
         let app = Router::new().route("/v1/mpp/broadcast", post(move |headers: HeaderMap| {
             let consumed = consumed.clone();
             async move {
-                if consumed.swap(true, Ordering::SeqCst) && headers.get("idempotency-key").is_none_or(|value| value.is_empty()) {
+                let key = headers.get("idempotency-key").unwrap().to_str().unwrap();
+                assert_ne!(key, "shared-key");
+                assert!(uuid::Uuid::parse_str(key).is_ok());
+                let mut consumed = consumed.lock().unwrap();
+                if consumed.as_deref().is_some_and(|previous| previous != key) {
                     return Json(serde_json::json!({"success": false, "error": {"code": "already_used", "message": "Used"}}));
                 }
+                *consumed = Some(key.to_string());
                 Json(serde_json::json!({"success": true, "receipt": {"method": "tempo", "reference": "0xabc", "timestamp": "2026-08-03T12:00:00Z"}}))
             }
         }));
@@ -653,7 +658,9 @@ mod tests {
             assert_eq!(call.body["source"], "did:pkh:eip155:42431:0x1234");
         }
         assert!(calls[0].headers.get("idempotency-key").is_none());
-        assert_eq!(calls[1].headers["idempotency-key"], "");
+        assert!(
+            uuid::Uuid::parse_str(calls[1].headers["idempotency-key"].to_str().unwrap()).is_ok()
+        );
     }
 
     #[tokio::test]

@@ -2,4 +2,4 @@
 mpp: patch
 ---
 
-Stopped requesting cached relay receipts during payment authorization so reused credentials are rejected. Uncertain payment outcomes require separate recovery.
+Scoped relay idempotency keys to individual broadcast attempts, overriding custom-client defaults so cached receipts cannot authorize separate operations. Uncertain payment outcomes require separate recovery.

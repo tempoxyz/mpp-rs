@@ -46,6 +46,7 @@ tempo = [
   "tempo-alloy",
   "dep:async-trait",
   "dep:p256",
+  "dep:uuid",
   "dep:reqwest",
 ]
 stripe = ["dep:reqwest", "reqwest?/form"]
@@ -150,6 +151,8 @@ axum = { version = "0.8", default-features = false, features = ["matched-path"],
 
 # WebSocket dependencies (optional)
 futures-util = { version = "0.3", features = ["sink"], optional = true }
+
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
 alloy-json-rpc = "2.0.5"
