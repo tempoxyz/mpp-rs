@@ -2383,7 +2383,6 @@ fn management_headers(mut headers: reqwest::header::HeaderMap) -> reqwest::heade
         "transfer-encoding",
         "upgrade",
         "content-length",
-        "host",
     ] {
         headers.remove(name);
     }
@@ -3745,6 +3744,7 @@ mod tests {
                 ("connection", "x-hop"),
                 ("x-hop", "private"),
                 ("x-routing", "preserved"),
+                ("host", "paid.example.test"),
             ] {
                 headers.insert(
                     reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
@@ -3771,6 +3771,7 @@ mod tests {
                 let received = received.lock().unwrap();
                 assert_eq!(received.len(), 1);
                 assert_eq!(received[0]["x-routing"], "preserved");
+                assert_eq!(received[0]["host"], "paid.example.test");
                 for name in ["proxy-authorization", "connection", "x-hop"] {
                     assert!(!received[0].contains_key(name));
                 }
