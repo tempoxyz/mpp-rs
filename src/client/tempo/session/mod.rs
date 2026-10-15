@@ -1780,6 +1780,8 @@ impl TempoSessionProvider {
     /// forgotten once a receipt is accompanied by on-chain confirmation that
     /// its escrow is no longer funded. Missing receipts, funded escrow, and RPC
     /// failures preserve the descriptor so recovery or close can be retried.
+    /// A returned receipt is the merchant's response, not proof of local RPC
+    /// confirmation. A later `410 Gone` also checks the chain before cleanup.
     pub async fn close(
         &self,
         client: &reqwest::Client,
@@ -1845,7 +1847,9 @@ impl TempoSessionProvider {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        if !status.is_success() {
+        let native_gone =
+            status == reqwest::StatusCode::GONE && is_precompile_escrow(entry.escrow_contract);
+        if !status.is_success() && !native_gone {
             let body = resp.text().await.unwrap_or_default();
             return Err(MppError::Http(format!(
                 "close request returned {}: {}",
@@ -1859,12 +1863,13 @@ impl TempoSessionProvider {
 
         // A merchant receipt is not proof of settlement. Retain recovery data
         // until the trusted RPC confirms that escrow is no longer funded.
-        if receipt.is_some() && is_precompile_escrow(entry.escrow_contract) {
-            let state = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
+        if (receipt.is_some() || native_gone) && is_precompile_escrow(entry.escrow_contract) {
+            let Ok(state) = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await
+            else {
+                return Ok(receipt);
+            };
             if state.deposit != 0 {
-                return Err(MppError::InvalidConfig(
-                    "close is not confirmed on-chain; retained descriptor for recovery".into(),
-                ));
+                return Ok(receipt);
             }
             let store_key = Self::stored_entry(&entry)?.key();
             self.channel_store
@@ -5232,8 +5237,12 @@ mod tests {
             post(move || {
                 let closes = closes.clone();
                 async move {
-                    if closes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let attempt = closes.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
                         return StatusCode::OK.into_response();
+                    }
+                    if attempt >= 3 {
+                        return StatusCode::GONE.into_response();
                     }
                     let receipt = Receipt::success("tempo", B256::repeat_byte(0x99).to_string());
                     (
@@ -5254,15 +5263,14 @@ mod tests {
         assert!(provider.channels.lock().unwrap().contains_key(&key));
         assert!(store.get(&key).await.unwrap().is_some());
 
-        assert!(provider
-            .close(&client, &url)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("not confirmed on-chain"));
+        assert!(provider.close(&client, &url).await.unwrap().is_some());
         assert!(provider.channels.lock().unwrap().contains_key(&key));
         assert!(store.get(&key).await.unwrap().is_some());
+        mock_rpc(&mut provider, &[]);
         assert!(provider.close(&client, &url).await.unwrap().is_some());
+        assert!(store.get(&key).await.unwrap().is_some());
+        mock_rpc(&mut provider, &[&channel_state_response(0)]);
+        assert!(provider.close(&client, &url).await.unwrap().is_none());
         assert!(provider.channels.lock().unwrap().is_empty());
         assert!(store.get(&key).await.unwrap().is_none());
     }
