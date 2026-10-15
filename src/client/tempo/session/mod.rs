@@ -479,6 +479,23 @@ impl TempoSessionProvider {
         let Some(channel_id) = Self::credential_channel_id(credential) else {
             return Ok(());
         };
+        // An HTTP rejection is not evidence that a funded native channel closed.
+        // Read before removing any recovery state, including ambiguous pending opens.
+        let entry = {
+            let channels = self.channels.lock().unwrap();
+            channels
+                .values()
+                .find(|entry| entry.channel_id.to_string() == channel_id)
+                .cloned()
+        };
+        if let Some(entry) = entry.filter(|entry| is_precompile_escrow(entry.escrow_contract)) {
+            let state = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
+            if state.deposit != 0 {
+                return Err(MppError::InvalidConfig(
+                    "server rejected a funded channel; retained descriptor for recovery".into(),
+                ));
+            }
+        }
         let pending_store_key = {
             let mut pending_opens = self.pending_opens.lock().unwrap();
             match pending_opens.get(&channel_id) {
@@ -727,7 +744,12 @@ impl TempoSessionProvider {
         }
 
         let state = read_on_chain_channel_state(provider, stored.channel_id).await?;
-        if state.deposit == 0 || state.close_requested_at != 0 {
+        if state.close_requested_at != 0 && state.deposit != 0 {
+            return Err(MppError::InvalidConfig(
+                "stored channel has a pending close; retained descriptor for recovery".into(),
+            ));
+        }
+        if state.deposit == 0 {
             self.channel_store
                 .delete(store_key)
                 .await
@@ -1755,8 +1777,9 @@ impl TempoSessionProvider {
     /// # Returns
     ///
     /// The payment receipt from the server, if available. The channel is only
-    /// forgotten once a receipt confirms the close; `None` after a successful
-    /// response leaves it in place so the close can be retried.
+    /// forgotten once a receipt is accompanied by on-chain confirmation that
+    /// its escrow is no longer funded. Missing receipts, funded escrow, and RPC
+    /// failures preserve the descriptor so recovery or close can be retried.
     pub async fn close(
         &self,
         client: &reqwest::Client,
@@ -1775,7 +1798,13 @@ impl TempoSessionProvider {
             }
         }
 
+        let _process_lease = self.acquire_payment_lock(&challenge).await?;
         let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        let _store_lease = self
+            .channel_store
+            .acquire(&expected_key)
+            .await
+            .map_err(Self::store_error)?;
         let entry = {
             let channels = self.channels.lock().unwrap();
             channels.get(&expected_key).filter(|e| e.opened).cloned()
@@ -1828,9 +1857,15 @@ impl TempoSessionProvider {
             .as_deref()
             .and_then(|s| crate::protocol::core::parse_receipt(s).ok());
 
-        // Only a receipt confirms the close. Without one the channel may still
-        // be open and funded, so it stays tracked and the close can be retried.
+        // A merchant receipt is not proof of settlement. Retain recovery data
+        // until the trusted RPC confirms that escrow is no longer funded.
         if receipt.is_some() && is_precompile_escrow(entry.escrow_contract) {
+            let state = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
+            if state.deposit != 0 {
+                return Err(MppError::InvalidConfig(
+                    "close is not confirmed on-chain; retained descriptor for recovery".into(),
+                ));
+            }
             let store_key = Self::stored_entry(&entry)?.key();
             self.channel_store
                 .delete(&store_key)
@@ -3116,6 +3151,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidation_requires_chain_confirmation_before_removing_recovery_data() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        for deposit in [None, Some(10_000), Some(0)] {
+            let mut provider = make_test_provider();
+            let payee = Address::repeat_byte(0x11);
+            let currency = Address::repeat_byte(0x22);
+            let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+            let entry = provider
+                .channels
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let stored = TempoSessionProvider::stored_entry(&entry).unwrap();
+            let key = stored.key();
+            provider.channel_store.set(&stored).await.unwrap();
+            let responses = deposit
+                .map(channel_state_response)
+                .into_iter()
+                .collect::<Vec<_>>();
+            mock_rpc(
+                &mut provider,
+                &responses.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            // This path needs only the echoed channel ID, never a new signature.
+            let credential = PaymentCredential::new(
+                challenge.to_echo(),
+                SessionCredentialPayload::Voucher {
+                    channel_id: channel_id.to_string(),
+                    descriptor: None,
+                    settlement_route: None,
+                    cumulative_amount: "1000".into(),
+                    signature: "0x00".into(),
+                },
+            );
+            let result = provider.invalidate_payment(&challenge, &credential).await;
+            let retained = deposit != Some(0);
+            assert_eq!(result.is_err(), retained);
+            assert_eq!(
+                provider.channel_store.get(&key).await.unwrap().is_some(),
+                retained
+            );
+            assert_eq!(!provider.channels().is_empty(), retained);
+        }
+    }
+
+    #[tokio::test]
     async fn rollback_forgets_pending_open_and_keeps_established_channel() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
@@ -3124,7 +3209,11 @@ mod tests {
         };
 
         let store = Arc::new(MemoryChannelStore::default());
-        let provider = make_test_provider().with_channel_store(store.clone());
+        let mut provider = make_test_provider().with_channel_store(store.clone());
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(0), &channel_state_response(0)],
+        );
         let payer = provider.signer.address();
         let payee = Address::repeat_byte(0x11);
         let currency = Address::repeat_byte(0x22);
@@ -3698,7 +3787,8 @@ mod tests {
 
         let payee = Address::repeat_byte(0x11);
         let currency = Address::repeat_byte(0x22);
-        let provider = make_test_provider();
+        let mut provider = make_test_provider();
+        mock_rpc(&mut provider, &[&channel_state_response(0)]);
         let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
         let expired = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
         *provider.last_challenge.lock().unwrap() = Some(expired.clone());
@@ -4949,10 +5039,11 @@ mod tests {
             (StatusCode::PAYMENT_REQUIRED, true),
             (StatusCode::INTERNAL_SERVER_ERROR, true),
             (StatusCode::TOO_MANY_REQUESTS, true),
-            (StatusCode::GONE, false),
+            (StatusCode::GONE, true),
         ] {
             let store = Arc::new(MemoryChannelStore::default());
-            let provider = make_test_provider().with_channel_store(store.clone());
+            let mut provider = make_test_provider().with_channel_store(store.clone());
+            mock_rpc(&mut provider, &[&channel_state_response(100_000)]);
             let payer = provider.signer.address();
             let channel_id = compute_precompile_channel_id(
                 payer,
@@ -5036,7 +5127,14 @@ mod tests {
                 continue;
             }
 
-            assert_eq!(result.unwrap().status(), rejection);
+            if rejection == StatusCode::GONE {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retained descriptor"));
+            } else {
+                assert_eq!(result.unwrap().status(), rejection);
+            }
             assert_eq!(
                 store.get(&key).await.unwrap().map(|entry| entry.channel_id),
                 Some(channel_id),
@@ -5056,7 +5154,7 @@ mod tests {
 
     #[cfg(feature = "axum")]
     #[tokio::test]
-    async fn close_keeps_channel_until_receipt_confirms_it() {
+    async fn close_keeps_channel_until_chain_confirms_it() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
@@ -5070,7 +5168,11 @@ mod tests {
         let salt = B256::repeat_byte(0x44);
         let nonce_hash = B256::repeat_byte(0x55);
         let store = Arc::new(MemoryChannelStore::default());
-        let provider = make_test_provider().with_channel_store(store.clone());
+        let mut provider = make_test_provider().with_channel_store(store.clone());
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(100_000), &channel_state_response(0)],
+        );
         let payer = provider.signer.address();
         let channel_id = compute_precompile_channel_id(
             payer,
@@ -5152,6 +5254,14 @@ mod tests {
         assert!(provider.channels.lock().unwrap().contains_key(&key));
         assert!(store.get(&key).await.unwrap().is_some());
 
+        assert!(provider
+            .close(&client, &url)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not confirmed on-chain"));
+        assert!(provider.channels.lock().unwrap().contains_key(&key));
+        assert!(store.get(&key).await.unwrap().is_some());
         assert!(provider.close(&client, &url).await.unwrap().is_some());
         assert!(provider.channels.lock().unwrap().is_empty());
         assert!(store.get(&key).await.unwrap().is_none());
