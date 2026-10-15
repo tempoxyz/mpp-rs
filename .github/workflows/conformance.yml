@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   conformance-policy:
-    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance-policy.yml@b6b07aac36973ca6cf2c7dc9d4e43696cee0bfc5 # 2026-08-25T20-09-20Z-b6b07aac
+    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance-policy.yml@b6b07aac36973ca6cf2c7dc9d4e43696cee0bfc5 # 2026-08-25T20-09-20Z-b6b07aac # zizmor: ignore[ref-version-mismatch] mpp-tools publishes no tags for these pins.
     with:
       protocol-paths: |
         src/**
@@ -32,7 +32,7 @@ jobs:
 
   conformance:
     needs: conformance-policy
-    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance.yml@b6b07aac36973ca6cf2c7dc9d4e43696cee0bfc5 # 2026-08-25T20-09-20Z-b6b07aac
+    uses: tempoxyz/mpp-tools/.github/workflows/sdk-conformance.yml@b6b07aac36973ca6cf2c7dc9d4e43696cee0bfc5 # 2026-08-25T20-09-20Z-b6b07aac # zizmor: ignore[ref-version-mismatch] mpp-tools publishes no tags for these pins.
     with:
       adapter: rust
       conformance-ref: ${{ needs.conformance-policy.outputs.conformance_ref }}
