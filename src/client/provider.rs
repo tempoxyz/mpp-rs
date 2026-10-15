@@ -21,6 +21,8 @@ pub struct PaymentContext {
     pub url: Url,
     /// Caller-provided request headers to preserve for management requests.
     pub headers: HeaderMap,
+    /// Caller-configured HTTP client for management requests. No default client is substituted.
+    pub http_client: Option<reqwest::Client>,
 }
 
 /// Trait for payment providers that can execute payments for challenges.

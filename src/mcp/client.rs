@@ -432,6 +432,7 @@ mod tests {
 
     fn context() -> PaymentContext {
         PaymentContext {
+            http_client: None,
             url: "https://mcp.example.test/mcp".parse().unwrap(),
             headers: reqwest::header::HeaderMap::new(),
         }

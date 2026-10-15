@@ -29,6 +29,11 @@ pub(crate) trait Exchange: Send {
     /// Error of a request that could not be sent.
     type Error: Display + Send;
 
+    /// Caller-configured client available for session management requests.
+    fn http_client(&self) -> Option<reqwest::Client> {
+        None
+    }
+
     /// Sends `request` and returns its response.
     fn send(
         &mut self,
@@ -113,6 +118,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             headers.remove(ACCEPT_PAYMENT_HEADER);
         }
         let payment_context = PaymentContext {
+            http_client: exchange.http_client(),
             url: retry.url().clone(),
             headers,
         };

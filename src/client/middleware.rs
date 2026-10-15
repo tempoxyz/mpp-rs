@@ -49,6 +49,7 @@ pub struct PaymentMiddleware<P> {
     accept_payment_policy: AcceptPaymentPolicy,
     events: ClientEvents,
     max_payment_retries: usize,
+    http_client: Option<reqwest::Client>,
 }
 
 impl<P> PaymentMiddleware<P> {
@@ -57,10 +58,29 @@ impl<P> PaymentMiddleware<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
+            http_client: None,
             accept_payment_policy: AcceptPaymentPolicy::default(),
             events: ClientEvents::default(),
             max_payment_retries: DEFAULT_MAX_PAYMENT_RETRIES,
         }
+    }
+
+    /// Use the same configured HTTP client as the middleware stack for session
+    /// management requests. Without this, automatic session top-ups are disabled.
+    /// Management requests use this client directly, without the middleware chain.
+    /// Put required redirect, proxy, TLS, and timeout policies on this client.
+    ///
+    /// ```ignore
+    /// let http = reqwest::Client::builder()
+    ///     .redirect(reqwest::redirect::Policy::none())
+    ///     .build()?;
+    /// let client = reqwest_middleware::ClientBuilder::new(http.clone())
+    ///     .with(PaymentMiddleware::new(provider).with_http_client(http))
+    ///     .build();
+    /// ```
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
     }
 
     /// Restrict where the `Accept-Payment` header is sent. The 402-retry
@@ -144,25 +164,38 @@ where
             events: &self.events,
             max_payment_retries: self.max_payment_retries,
         };
-        flow.run(&mut NextExchange { next, extensions }, req, None)
-            .await
-            .map_err(|err| match err {
-                FlowError::Payment(err) => {
-                    reqwest_middleware::Error::Middleware(anyhow::Error::new(err))
-                }
-                FlowError::Send(err) => err,
-            })
+        flow.run(
+            &mut NextExchange {
+                next,
+                extensions,
+                http_client: self.http_client.clone(),
+            },
+            req,
+            None,
+        )
+        .await
+        .map_err(|err| match err {
+            FlowError::Payment(err) => {
+                reqwest_middleware::Error::Middleware(anyhow::Error::new(err))
+            }
+            FlowError::Send(err) => err,
+        })
     }
 }
 
 /// The rest of the middleware chain.
 struct NextExchange<'a, 'b> {
     next: Next<'a>,
+    http_client: Option<reqwest::Client>,
     extensions: &'b mut http_types::Extensions,
 }
 
 impl Exchange for NextExchange<'_, '_> {
     type Error = reqwest_middleware::Error;
+
+    fn http_client(&self) -> Option<reqwest::Client> {
+        self.http_client.clone()
+    }
 
     async fn send(&mut self, request: Request) -> reqwest_middleware::Result<Response> {
         self.next.clone().run(request, self.extensions).await

@@ -47,8 +47,12 @@ impl Via {
             }
             Self::Middleware => {
                 let (client, request) = request.build_split();
-                ClientBuilder::new(client)
-                    .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+                ClientBuilder::new(client.clone())
+                    .with(
+                        PaymentMiddleware::new(provider.clone())
+                            .with_http_client(client)
+                            .with_events(events),
+                    )
                     .build()
                     .execute(request.unwrap())
                     .await
@@ -65,6 +69,7 @@ impl Via {
 struct TestProvider {
     /// Ask for a fresh challenge the first time one is prepared.
     refresh_first_challenge: bool,
+    check_management_client: bool,
     prepared: Arc<AtomicU32>,
     paid: Arc<Mutex<Vec<String>>>,
     committed: Arc<AtomicU32>,
@@ -98,6 +103,24 @@ impl PaymentProvider for TestProvider {
             challenge.to_echo(),
             PaymentPayload::hash("0xproof"),
         ))
+    }
+
+    async fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+    ) -> Result<PaymentCredential, MppError> {
+        if self.check_management_client {
+            let response = context
+                .http_client
+                .expect("configured client")
+                .get(context.url.join("/management").unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        }
+        self.pay(challenge).await
     }
 
     async fn commit_payment(
@@ -454,5 +477,60 @@ async fn request_that_cannot_be_cloned_fails_only_when_challenged() {
         assert!(matches!(err, HttpError::CloneFailed), "{via:?}: {err}");
         assert_eq!(failed.load(Ordering::SeqCst), 1, "{via:?}");
         assert!(provider.paid().is_empty(), "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn management_context_uses_the_callers_redirect_policy() {
+    for via in BOTH {
+        let challenge = www_authenticate("context", "tempo", "charge");
+        let app = Router::new()
+            .route(
+                "/management",
+                get(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [("location", "/destination")],
+                    )
+                }),
+            )
+            .route("/destination", get(|| async { StatusCode::OK }))
+            .route(
+                "/paid",
+                get(move |headers: axum::http::HeaderMap| {
+                    let challenge = challenge.clone();
+                    async move {
+                        if headers.contains_key("authorization") {
+                            StatusCode::OK.into_response()
+                        } else {
+                            (
+                                StatusCode::PAYMENT_REQUIRED,
+                                [("www-authenticate", challenge)],
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+        let url = spawn_server(app).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let provider = TestProvider {
+            check_management_client: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            via.send(
+                client.get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
     }
 }

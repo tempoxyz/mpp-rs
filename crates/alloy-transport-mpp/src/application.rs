@@ -194,6 +194,7 @@ where
         )
         .await?;
         let payment_context = PaymentContext {
+            http_client: Some(http_client.clone()),
             url: probe_url.clone(),
             headers: probe_headers.clone(),
         };

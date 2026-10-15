@@ -220,6 +220,10 @@ async fn send_with_payment<P: PaymentProvider>(
 impl Exchange for reqwest::Client {
     type Error = HttpError;
 
+    fn http_client(&self) -> Option<reqwest::Client> {
+        Some(self.clone())
+    }
+
     async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
         self.execute(request).await.map_err(HttpError::request)
     }

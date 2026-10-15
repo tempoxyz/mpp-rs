@@ -767,6 +767,7 @@ impl TempoSessionProvider {
         url: &str,
         headers: reqwest::header::HeaderMap,
     ) -> Result<Option<StoredChannelEntry>, MppError> {
+        let headers = management_headers(headers);
         // Bootstrap is a recovery optimization. Match MPPx by treating an
         // unavailable or unusable snapshot as a cache miss so the normal
         // session challenge can open or recover a channel instead.
@@ -792,6 +793,7 @@ impl TempoSessionProvider {
     ) -> Result<PaymentChallenge, MppError> {
         use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
 
+        headers = management_headers(headers);
         let bootstrap_headers = headers.clone();
         let (key, _) = self.expected_channel_key(challenge)?;
         let payer = self.signing_mode.from_address(self.signer.address());
@@ -1303,6 +1305,7 @@ impl TempoSessionProvider {
         }
         let state = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
         entry.deposit = entry.deposit.max(state.deposit);
+        headers = management_headers(headers);
         let new_deposit = entry
             .deposit
             .checked_add(additional_deposit)
@@ -2268,7 +2271,9 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         context: PaymentContext,
     ) -> Result<PaymentCredential, MppError> {
-        let client = reqwest::Client::new();
+        let Some(client) = context.http_client else {
+            return self.pay(challenge).await;
+        };
         self.application_websocket_credential_with_top_up(
             &client,
             context.url.as_str(),
@@ -2283,8 +2288,13 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         context: PaymentContext,
     ) -> Result<PaymentChallenge, MppError> {
+        let client = context.http_client.ok_or_else(|| {
+            MppError::InvalidConfig(
+                "session recovery requires a caller-configured HTTP client".into(),
+            )
+        })?;
         self.recover_application_websocket_challenge_with_headers(
-            &reqwest::Client::new(),
+            &client,
             context.url.as_str(),
             context.headers,
             challenge,
@@ -2350,6 +2360,34 @@ impl PaymentProvider for TempoSessionProvider {
             crate::protocol::methods::tempo::INTENT_SESSION,
         )]))
     }
+}
+
+/// Management requests must not replay connection credentials or body framing.
+fn management_headers(mut headers: reqwest::header::HeaderMap) -> reqwest::header::HeaderMap {
+    let connection_headers: Vec<String> = headers
+        .get_all(reqwest::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(',').map(|name| name.trim().to_owned()))
+        .collect();
+    for name in connection_headers {
+        headers.remove(name.as_str());
+    }
+    for name in [
+        "connection",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "host",
+    ] {
+        headers.remove(name);
+    }
+    headers
 }
 
 #[cfg(test)]
@@ -3658,6 +3696,93 @@ mod tests {
             assert!(error.to_string().contains("signing mode"), "{error}");
             assert_eq!(posted.lock().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn contextual_top_up_preserves_redirect_policy_and_strips_connection_headers() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::post,
+            Router,
+        };
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/",
+                post({
+                    let received = received.clone();
+                    move |headers: HeaderMap| {
+                        received.lock().unwrap().push(headers);
+                        async { (StatusCode::TEMPORARY_REDIRECT, [("location", "/internal")]) }
+                    }
+                }),
+            )
+            .route(
+                "/internal",
+                post(|| async {
+                    panic!("management redirect must not be followed");
+                    #[allow(unreachable_code)]
+                    StatusCode::OK
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for configured in [false, true] {
+            let mut provider = make_test_provider().with_max_deposit(2_000);
+            let payee = Address::repeat_byte(0x11);
+            let currency = Address::repeat_byte(0x22);
+            seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+            let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            mock_rpc(
+                &mut provider,
+                &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+            );
+            let mut headers = HeaderMap::new();
+            for (name, value) in [
+                ("proxy-authorization", "private"),
+                ("connection", "x-hop"),
+                ("x-hop", "private"),
+                ("x-routing", "preserved"),
+            ] {
+                headers.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let error = provider
+                .pay_with_context(
+                    &challenge,
+                    PaymentContext {
+                        url: url.parse().unwrap(),
+                        headers,
+                        http_client: configured.then_some(client),
+                    },
+                )
+                .await
+                .unwrap_err();
+            if configured {
+                assert!(error.to_string().contains("307"), "{error}");
+                let received = received.lock().unwrap();
+                assert_eq!(received.len(), 1);
+                assert_eq!(received[0]["x-routing"], "preserved");
+                for name in ["proxy-authorization", "connection", "x-hop"] {
+                    assert!(!received[0].contains_key(name));
+                }
+            } else {
+                assert!(
+                    error.to_string().contains("exceeds channel deposit"),
+                    "{error}"
+                );
+                assert!(received.lock().unwrap().is_empty());
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]
