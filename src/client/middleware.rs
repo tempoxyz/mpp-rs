@@ -41,8 +41,8 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 ///     .with(PaymentMiddleware::new(provider))
 ///     .build();
 ///
-/// // All requests through this client automatically handle 402
-/// let resp = client.get("https://api.example.com/paid").send().await?;
+/// // Explicitly authorize payment for this request
+/// let resp = client.get("https://api.example.com/paid").header("Accept-Payment", "tempo/charge").send().await?;
 /// ```
 pub struct PaymentMiddleware<P> {
     provider: P,

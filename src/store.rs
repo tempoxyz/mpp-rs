@@ -363,6 +363,23 @@ impl ChannelStoreAdapter {
 
 #[cfg(all(feature = "server", feature = "tempo"))]
 impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelStoreAdapter {
+    fn check_writable(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), crate::protocol::traits::VerificationError>> + Send + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let key = format!("{}:atomic-probe", self.prefix);
+            self.store
+                .compare_exchange(&key, None, None)
+                .await
+                .map_err(|e| crate::protocol::traits::VerificationError::internal(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     fn get_channel(
         &self,
         channel_id: &str,
@@ -896,6 +913,7 @@ mod adapter_tests {
         let dir = std::env::temp_dir().join(format!("mpp_cas_unsupported_{}", std::process::id()));
         let adapter =
             ChannelStoreAdapter::new(Arc::new(FileStore::new(&dir).unwrap()), "channels:");
+        assert!(adapter.check_writable().await.is_err());
         let result = adapter
             .update_channel("ch1", Box::new(|_| Ok(Some(test_channel_state("ch1")))))
             .await;

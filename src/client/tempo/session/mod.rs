@@ -2037,9 +2037,6 @@ impl TempoSessionProvider {
             chain_id,
         )?;
         let session_snapshot = session_req.session_snapshot();
-        if let Some(snapshot) = &session_snapshot {
-            self.commit_referenced_open(&snapshot.channel_id);
-        }
 
         // Check process memory first, then restore a durable native channel.
         let mut existing = self
@@ -2049,6 +2046,22 @@ impl TempoSessionProvider {
             .get(&key)
             .cloned()
             .map(|entry| (entry, false));
+        let reconcile_pending = session_snapshot.is_some()
+            && existing.as_ref().is_some_and(|(entry, _)| {
+                self.pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string())
+            });
+        if reconcile_pending {
+            let snapshot = session_snapshot.as_ref().expect("snapshot checked above");
+            if !can_sign_descriptor(&snapshot.descriptor, payer, authorized_signer)? {
+                return Err(MppError::InvalidConfig(
+                    "pending channel snapshot does not match the signer".into(),
+                ));
+            }
+            existing = None;
+        }
         if existing.is_none() && precompile {
             existing = self
                 .restore_precompile_channel(
@@ -2077,7 +2090,15 @@ impl TempoSessionProvider {
                     .unwrap()
                     .insert(key.clone(), entry.clone());
                 self.notify_update(entry);
+                if reconcile_pending {
+                    self.commit_referenced_open(&entry.channel_id.to_string());
+                }
             }
+        }
+        if reconcile_pending && existing.is_none() {
+            return Err(MppError::InvalidConfig(
+                "pending channel open could not be reconciled".into(),
+            ));
         }
 
         if let Some((mut entry, includes_request)) = existing {
@@ -4382,6 +4403,22 @@ mod tests {
             let error = provider.pay(&challenge).await.unwrap_err();
             assert!(error.to_string().contains("settlement reconciliation"));
         }
+        let mut forged_request = req.clone();
+        let mut forged_descriptor = descriptor.clone();
+        forged_descriptor.payer = Address::repeat_byte(0xee).to_string();
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"] = serde_json::json!({
+            "acceptedCumulative": "1000", "chainId": chain_id, "channelId": channel_id.to_string(),
+            "deposit": "10000", "descriptor": forged_descriptor, "escrow": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+            "requiredCumulative": "1500", "settled": "0", "spent": "1000"
+        });
+        let mut forged_challenge = challenge.clone();
+        forged_challenge.request = Base64UrlJson::from_typed(&forged_request).unwrap();
+        assert!(provider.pay(&forged_challenge).await.is_err());
+        assert!(provider
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(&channel_id.to_string()));
         let retained = provider.channels.lock().unwrap().get(&key).unwrap().clone();
         assert_eq!(retained.cumulative_amount, 1_000);
         assert_eq!(retained.descriptor, Some(descriptor.clone()));

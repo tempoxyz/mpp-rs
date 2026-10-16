@@ -100,7 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => request,
     };
     let response = request
-        .header("Accept-Payment", "tempo/charge, stripe/charge")
+        .header(
+            "Accept-Payment",
+            "tempo/charge, tempo/session, stripe/charge",
+        )
         .send_with_payment(&providers)
         .await?;
     let status = response.status();

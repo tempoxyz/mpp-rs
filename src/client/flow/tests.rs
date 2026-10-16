@@ -100,6 +100,12 @@ impl PaymentProvider for TestProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         self.paid.lock().unwrap().push(challenge.id.clone());
+        if challenge.intent.as_str() == "session" {
+            return Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
+            ));
+        }
         Ok(PaymentCredential::new(
             challenge.to_echo(),
             PaymentPayload::hash("0xproof"),
@@ -362,7 +368,7 @@ async fn stale_session_is_reopened_once() {
         assert_eq!(requests.load(Ordering::SeqCst), 4, "{via:?}");
         assert_eq!(provider.paid().len(), 2, "{via:?}");
         assert_eq!(provider.invalidated.load(Ordering::SeqCst), 1, "{via:?}");
-        assert_eq!(provider.committed.load(Ordering::SeqCst), 1, "{via:?}");
+        assert_eq!(provider.committed.load(Ordering::SeqCst), 0, "{via:?}");
         assert_eq!(provider.rolled_back.load(Ordering::SeqCst), 0, "{via:?}");
     }
 }
@@ -540,7 +546,13 @@ async fn management_context_uses_the_callers_redirect_policy() {
 async fn opaque_client_defaults_cannot_authorize_payment() {
     for via in BOTH {
         for default in ["tempo/charge;q=0", "tempo/charge"] {
-            for preference in [None, Some("tempo/charge;q=0"), Some("tempo/charge")] {
+            for preference in [
+                None,
+                Some("tempo/charge;q=0"),
+                Some("tempo/charge"),
+                Some("garbage"),
+                Some("tempo/charge;q=invalid"),
+            ] {
                 let app = Router::new().route(
                     "/",
                     get(|request: Request<Body>| async move {
@@ -587,6 +599,54 @@ async fn opaque_client_defaults_cannot_authorize_payment() {
                     assert_eq!(result.unwrap(), StatusCode::OK);
                 }
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_commit_requires_a_matching_receipt() {
+    for via in BOTH {
+        for variant in ["missing", "malformed", "wrong-challenge", "valid"] {
+            let app = Router::new().route(
+                "/",
+                get(move |request: Request<Body>| async move {
+                    if !is_paid(&request) {
+                        return payment_required("receipt-check", "session");
+                    }
+                    if variant == "missing" {
+                        return StatusCode::OK.into_response();
+                    }
+                    let mut receipt = crate::protocol::core::Receipt::success("tempo", "0xsession");
+                    receipt.extensions.insert(
+                        "challengeId".into(),
+                        serde_json::json!(if variant == "wrong-challenge" {
+                            "other"
+                        } else {
+                            "receipt-check"
+                        }),
+                    );
+                    let header = if variant == "malformed" {
+                        "bad".to_owned()
+                    } else {
+                        receipt.to_header().unwrap()
+                    };
+                    (StatusCode::OK, [("payment-receipt", header)]).into_response()
+                }),
+            );
+            let url = spawn_server(app).await;
+            let provider = TestProvider::default();
+            via.send(
+                reqwest::Client::new().get(&url),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                provider.committed.load(Ordering::SeqCst),
+                u32::from(variant == "valid"),
+                "{via:?}: {variant}"
+            );
         }
     }
 }

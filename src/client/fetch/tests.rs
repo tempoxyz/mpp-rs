@@ -1276,7 +1276,8 @@ mod integration {
         assert_eq!(requests.load(Ordering::SeqCst), 4);
         assert_eq!(provider.call_count(), 2);
         assert_eq!(provider.rollback_count(), 1);
-        assert_eq!(provider.commit_count(), 1);
+        assert_eq!(provider.commit_count(), 0);
+        assert_eq!(provider.abandon_count(), 1);
     }
 
     #[tokio::test]
