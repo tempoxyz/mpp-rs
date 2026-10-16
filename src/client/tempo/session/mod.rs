@@ -390,6 +390,7 @@ impl TempoSessionProvider {
             escrow: entry.escrow_contract,
             chain_id: entry.chain_id,
             opened: entry.opened,
+            pending_open: None,
         })
     }
 
@@ -406,8 +407,15 @@ impl TempoSessionProvider {
         if !is_precompile_escrow(entry.escrow_contract) {
             return Ok(());
         }
+        let mut stored = Self::stored_entry(entry)?;
+        stored.pending_open = self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .get(&entry.channel_id.to_string())
+            .map(|pending| pending.challenge_id.clone());
         self.channel_store
-            .set(&Self::stored_entry(entry)?)
+            .set(&stored)
             .await
             .map_err(Self::store_error)
     }
@@ -704,6 +712,13 @@ impl TempoSessionProvider {
             let snapshot_channel_id = snapshot.channel_id.parse().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot channelId: {error}"))
             })?;
+            if stored.as_ref().is_some_and(|entry| {
+                entry.pending_open.is_some() && entry.channel_id != snapshot_channel_id
+            }) {
+                return Err(MppError::InvalidConfig(
+                    "snapshot does not match pending channel".into(),
+                ));
+            }
             let state = read_on_chain_channel_state(provider, snapshot_channel_id).await?;
             let mut recovered = hydrate_session_snapshot(snapshot, scope, state)?;
             let spent = snapshot.spent.parse::<u128>().map_err(|error| {
@@ -757,11 +772,21 @@ impl TempoSessionProvider {
             return Ok(None);
         }
         let recovered = recover_stored_channel(stored, scope, state)?;
+        let pending = recovered.pending_open.clone();
+        if let Some(challenge_id) = &pending {
+            self.pending_opens.lock().unwrap().insert(
+                recovered.channel_id.to_string(),
+                PendingOpen {
+                    challenge_id: challenge_id.clone(),
+                    store_key: Some(store_key.to_owned()),
+                },
+            );
+        }
         self.channel_store
             .set(&recovered)
             .await
             .map_err(Self::store_error)?;
-        Self::channel_entry(recovered).map(|entry| Some((entry, false)))
+        Self::channel_entry(recovered).map(|entry| Some((entry, pending.is_some())))
     }
 
     /// Rehydrate a reusable native session through the server's authenticated
@@ -1036,6 +1061,18 @@ impl TempoSessionProvider {
             },
             state,
         )?;
+        if let Some(stored) = self
+            .channel_store
+            .get(&recovered.key())
+            .await
+            .map_err(Self::store_error)?
+        {
+            if stored.pending_open.is_some() && stored.channel_id != recovered.channel_id {
+                return Err(MppError::InvalidConfig(
+                    "snapshot does not match pending channel".into(),
+                ));
+            }
+        }
         self.channel_store
             .set(&recovered)
             .await
@@ -1049,6 +1086,7 @@ impl TempoSessionProvider {
             .unwrap()
             .insert(entry.channel_id.to_string(), key.clone());
         self.channels.lock().unwrap().insert(key, entry.clone());
+        self.commit_referenced_open(&entry.channel_id.to_string());
         self.notify_update(&entry);
         Ok(Some(recovered))
     }
@@ -1119,6 +1157,19 @@ impl TempoSessionProvider {
         if entry.chain_id != expected_chain_id || entry.channel_id.to_string() != channel_id_hex {
             return Err(MppError::InvalidConfig(
                 "channel does not match active session".into(),
+            ));
+        }
+
+        if required_cumulative > entry.cumulative_amount
+            && self
+                .pending_opens
+                .lock()
+                .unwrap()
+                .contains_key(channel_id_hex)
+        {
+            return Err(MppError::InvalidConfig(
+                "pending channel open requires settlement reconciliation before another payment"
+                    .into(),
             ));
         }
 
@@ -1503,6 +1554,17 @@ impl TempoSessionProvider {
         required_cumulative: u128,
         server_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
+        if self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(channel_id_hex)
+        {
+            return Err(MppError::InvalidConfig(
+                "pending channel open requires settlement reconciliation before streaming top-up"
+                    .into(),
+            ));
+        }
         let deposit = self.known_deposit(channel_id_hex, server_deposit).await?;
         let session_request: SessionRequest = challenge
             .request
@@ -2037,9 +2099,6 @@ impl TempoSessionProvider {
             chain_id,
         )?;
         let session_snapshot = session_req.session_snapshot();
-        if let Some(snapshot) = &session_snapshot {
-            self.commit_referenced_open(&snapshot.channel_id);
-        }
 
         // Check process memory first, then restore a durable native channel.
         let mut existing = self
@@ -2049,6 +2108,32 @@ impl TempoSessionProvider {
             .get(&key)
             .cloned()
             .map(|entry| (entry, false));
+        let reconcile_pending = session_snapshot.is_some()
+            && existing.as_ref().is_some_and(|(entry, _)| {
+                self.pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string())
+            });
+        if reconcile_pending {
+            let snapshot = session_snapshot.as_ref().expect("snapshot checked above");
+            let pending_id = existing
+                .as_ref()
+                .expect("pending entry exists")
+                .0
+                .channel_id;
+            if snapshot.channel_id.parse::<B256>().ok() != Some(pending_id) {
+                return Err(MppError::InvalidConfig(
+                    "snapshot does not match pending channel".into(),
+                ));
+            }
+            if !can_sign_descriptor(&snapshot.descriptor, payer, authorized_signer)? {
+                return Err(MppError::InvalidConfig(
+                    "pending channel snapshot does not match the signer".into(),
+                ));
+            }
+            existing = None;
+        }
         if existing.is_none() && precompile {
             existing = self
                 .restore_precompile_channel(
@@ -2077,13 +2162,26 @@ impl TempoSessionProvider {
                     .unwrap()
                     .insert(key.clone(), entry.clone());
                 self.notify_update(entry);
+                if reconcile_pending {
+                    self.commit_referenced_open(&entry.channel_id.to_string());
+                }
             }
+        }
+        if reconcile_pending && existing.is_none() {
+            return Err(MppError::InvalidConfig(
+                "pending channel open could not be reconciled".into(),
+            ));
         }
 
         if let Some((mut entry, includes_request)) = existing {
             if entry.opened {
-                // Increment cumulative and sign a voucher
-                if !includes_request {
+                let pending = self
+                    .pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string());
+                // Retry the authorized opening amount until a receipt reconciles it.
+                if !includes_request && !pending {
                     entry.cumulative_amount =
                         entry.cumulative_amount.checked_add(amount).ok_or_else(|| {
                             MppError::InvalidConfig("session cumulative amount overflowed".into())
@@ -2280,16 +2378,22 @@ impl TempoSessionProvider {
             challenge_id: challenge.id.clone(),
             store_key: Self::store_key(&entry)?,
         };
-        self.persist_channel(&entry).await?;
+        self.pending_opens
+            .lock()
+            .unwrap()
+            .insert(entry.channel_id.to_string(), pending);
+        if let Err(error) = self.persist_channel(&entry).await {
+            self.pending_opens
+                .lock()
+                .unwrap()
+                .remove(&entry.channel_id.to_string());
+            return Err(error);
+        }
         self.channel_id_to_key
             .lock()
             .unwrap()
             .insert(entry.channel_id.to_string(), key.clone());
         self.channels.lock().unwrap().insert(key, entry.clone());
-        self.pending_opens
-            .lock()
-            .unwrap()
-            .insert(entry.channel_id.to_string(), pending);
         self.notify_update(&entry);
 
         Ok(build_credential(challenge, payload, chain_id, payer))
@@ -2352,6 +2456,18 @@ impl PaymentProvider for TempoSessionProvider {
             .lock()
             .unwrap()
             .remove(&challenge.id);
+        if let Some(id) = Self::credential_channel_id(credential) {
+            let entry = {
+                let key = self.channel_id_to_key.lock().unwrap().get(&id).cloned();
+                key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned())
+            };
+            if let Some(entry) = entry.filter(|entry| is_precompile_escrow(entry.escrow_contract)) {
+                self.channel_store
+                    .set(&Self::stored_entry(&entry)?)
+                    .await
+                    .map_err(Self::store_error)?;
+            }
+        }
         self.commit_credential(credential);
         drop(lease);
         Ok(())
@@ -4351,6 +4467,101 @@ mod tests {
             Base64UrlJson::from_typed(&req).unwrap(),
         );
 
+        // A cancelled open retains its descriptor and amount, but cannot authorize
+        // a larger voucher until a receipt or recovery snapshot reconciles it.
+        let entry = provider.channels.lock().unwrap().get(&key).unwrap().clone();
+        provider.persist_channel(&entry).await.unwrap();
+        let store_key = TempoSessionProvider::store_key(&entry).unwrap();
+        provider.pending_opens.lock().unwrap().insert(
+            channel_id.to_string(),
+            PendingOpen {
+                challenge_id: challenge.id.clone(),
+                store_key: store_key.clone(),
+            },
+        );
+        let pending_credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xpending"),
+        );
+        provider.persist_channel(&entry).await.unwrap();
+        provider.abandon_payment(&challenge, &pending_credential);
+        let error = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 1500)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("settlement reconciliation"));
+        let mut restarted = TempoSessionProvider::new(signer.clone(), "https://rpc.example.com")
+            .unwrap()
+            .with_channel_store(provider.channel_store.clone());
+        mock_rpc(&mut restarted, &[&channel_state_response(10_000)]);
+        let retry = restarted.pay(&challenge).await.unwrap();
+        let payload: SessionCredentialPayload =
+            serde_json::from_value(retry.payload.clone()).unwrap();
+        assert!(
+            matches!(payload, SessionCredentialPayload::Voucher { cumulative_amount, .. } if cumulative_amount == "1000")
+        );
+        restarted.abandon_payment(&challenge, &retry);
+        assert!(restarted
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 1500)
+            .await
+            .is_err());
+        for _ in 0..2 {
+            let retry = provider.pay(&challenge).await.unwrap();
+            let payload: SessionCredentialPayload =
+                serde_json::from_value(retry.payload.clone()).unwrap();
+            assert!(
+                matches!(payload, SessionCredentialPayload::Voucher { cumulative_amount, .. } if cumulative_amount == "1000")
+            );
+            provider.abandon_payment(&challenge, &retry);
+        }
+        let mut forged_request = req.clone();
+        let mut forged_descriptor = descriptor.clone();
+        forged_descriptor.payer = Address::repeat_byte(0xee).to_string();
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"] = serde_json::json!({
+            "acceptedCumulative": "1000", "chainId": chain_id, "channelId": channel_id.to_string(),
+            "deposit": "10000", "descriptor": forged_descriptor, "escrow": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+            "requiredCumulative": "1500", "settled": "0", "spent": "1000"
+        });
+        let mut forged_challenge = challenge.clone();
+        forged_challenge.request = Base64UrlJson::from_typed(&forged_request).unwrap();
+        assert!(provider.pay(&forged_challenge).await.is_err());
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"]["descriptor"] =
+            serde_json::to_value(&descriptor).unwrap();
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"]["channelId"] =
+            serde_json::json!(B256::repeat_byte(0xef).to_string());
+        forged_challenge.request = Base64UrlJson::from_typed(&forged_request).unwrap();
+        assert!(provider
+            .pay(&forged_challenge)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not match pending channel"));
+        assert!(provider
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(&channel_id.to_string()));
+        let retained = provider.channels.lock().unwrap().get(&key).unwrap().clone();
+        assert_eq!(retained.cumulative_amount, 1_000);
+        assert_eq!(retained.descriptor, Some(descriptor.clone()));
+        let stored = provider
+            .channel_store
+            .get(&store_key.clone().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cumulative_amount, 1_000);
+        let retry = provider.pay(&challenge).await.unwrap();
+        provider.commit_payment(&challenge, &retry).await.unwrap();
+        assert!(provider
+            .channel_store
+            .get(&store_key.clone().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_open
+            .is_none());
+
         let credential = provider.pay(&challenge).await.expect("pay succeeds");
         assert_eq!(provider.pending_payment_leases.lock().unwrap().len(), 1);
 
@@ -4581,6 +4792,54 @@ mod tests {
             assert!(err.to_string().contains("No deposit amount"), "{err}");
             assert!(provider.channels().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn abandoned_legacy_open_retries_without_increasing_authorization() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = Address::repeat_byte(0x33);
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(payee, currency, escrow);
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        assert!(matches!(
+            credential.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Open { .. }
+        ));
+        assert_eq!(provider.channels().len(), 1);
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        let channel = provider.channels().values().next().unwrap().clone();
+        provider.abandon_payment(&challenge, &credential);
+        for _ in 0..2 {
+            let retry = provider.pay(&challenge).await.unwrap();
+            assert!(
+                matches!(retry.payload_as::<SessionCredentialPayload>().unwrap(),
+                SessionCredentialPayload::Voucher { cumulative_amount, .. }
+                if cumulative_amount == channel.cumulative_amount.to_string())
+            );
+            provider.abandon_payment(&challenge, &retry);
+        }
+        let retry = provider.pay(&challenge).await.unwrap();
+        provider.commit_payment(&challenge, &retry).await.unwrap();
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        let next = provider.pay(&challenge).await.unwrap();
+        assert!(
+            matches!(next.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Voucher { cumulative_amount, .. }
+            if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
+        );
+        provider.abandon_payment(&challenge, &next);
     }
 
     #[tokio::test]
@@ -4828,6 +5087,7 @@ mod tests {
                 escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 42431,
                 opened: true,
+                pending_open: None,
             })
             .await
             .unwrap();
@@ -5246,6 +5506,7 @@ mod tests {
 
             let result = reqwest::Client::new()
                 .get(format!("http://{address}/paid"))
+                .header("Accept-Payment", "tempo/session")
                 .send_with_payment(&provider)
                 .await;
 

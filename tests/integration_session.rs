@@ -455,6 +455,7 @@ impl Fixture {
         let opened = self
             .client
             .get(&self.url)
+            .header("Accept-Payment", "tempo/session")
             .send_with_payment(&self.provider)
             .await
             .expect("open failed");
@@ -475,6 +476,7 @@ impl Fixture {
         let response = self
             .client
             .get(&self.url)
+            .header("Accept-Payment", "tempo/session")
             .send_with_payment(&self.provider)
             .await
             .expect("stream request failed");

@@ -95,8 +95,10 @@ let client = ClientBuilder::new(reqwest::Client::new())
     .with(PaymentMiddleware::new(provider))
     .build();
 
-// Requests now handle 402 automatically
-let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
+// Explicitly authorize payment for this request.
+let resp = client.get("https://mpp.dev/api/ping/paid")
+    .header("Accept-Payment", "tempo/charge")
+    .send().await?;
 ```
 
 ### Client (Stripe)
@@ -118,6 +120,7 @@ let provider = StripeProvider::new(|params| {
 
 let resp = reqwest::Client::new()
     .get("https://api.example.com/paid")
+    .header("Accept-Payment", "stripe/charge")
     .send_with_payment(&provider)
     .await?;
 ```
@@ -197,3 +200,20 @@ Licensed under either of [Apache License, Version 2.0](./LICENSE-APACHE) or [MIT
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in these crates by you, as defined in the Apache-2.0 license,
 shall be dual licensed as above, without any additional terms or conditions.
+
+### Payment policy and store migration
+
+HTTP payment helpers now default to `AcceptPaymentPolicy::Explicit`: set a request-level `Accept-Payment` header to authorize automatic payment. Reqwest client default headers cannot be inspected by middleware and do not authorize payments. A request-level `q=0` remains an opt-out. `Disabled` prevents all automatic payment, even with an explicit header. Applications that intentionally authorize provider-selected payment can pass `Always`; this explicitly overrides opaque client defaults. Origin policies authorize automatic payment only for matching origins unless a request supplies its own preference.
+
+`ChannelStoreAdapter` requires a native atomic `Store::compare_exchange`. Implement it as a transaction or conditional write shared by every client using the backend; a read followed by a write is unsafe. `MemoryStore` supports it. `FileStore` and custom backends without this operation fail closed on channel updates. Concurrent conflicts fail before resource delivery and must be retried against fresh state.
+
+An unconfirmed channel open must be reconciled through a valid receipt or the session recovery flow before increasing its voucher authorization. Cancellation preserves the channel descriptor and durable balance for recovery; it does not erase potentially funded state.
+
+Pending session opens retain their original authorized cumulative amount across
+retries and Rust SQLite-store restarts. A retry can resubmit that amount; it cannot
+increase it until a matching payment receipt or validated recovery snapshot is
+accepted. For native sessions, `bootstrap` can reconcile a matching server
+snapshot. Streaming voucher increases and top-ups are refused while an opening
+is unresolved. Retain the channel descriptor and use `close` to recover a funded
+channel if the server cannot reconcile it. Do not share an unresolved channel
+with older SDK versions that do not preserve the pending-open marker.

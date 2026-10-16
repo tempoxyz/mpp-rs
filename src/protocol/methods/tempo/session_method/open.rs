@@ -104,6 +104,7 @@ where
         expected_token: Address,
         amount: u128,
     ) -> Result<Receipt, VerificationError> {
+        self.store.check_writable().await?;
         let (
             channel_id_str,
             descriptor,

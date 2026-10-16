@@ -464,6 +464,7 @@ async fn test_e2e_charge_round_trip() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("request with payment failed");
@@ -600,6 +601,7 @@ async fn test_e2e_premium_charge() {
 
     let resp = Client::new()
         .get(format!("{url}/premium"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("premium request failed");
@@ -807,6 +809,7 @@ async fn test_multiple_sequential_payments() {
     let provider_a = TempoProvider::new(client_a, &rpc).expect("failed to create TempoProvider A");
     let resp_a = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider_a)
         .await
         .expect("client A payment failed");
@@ -825,6 +828,7 @@ async fn test_multiple_sequential_payments() {
     let provider_b = TempoProvider::new(client_b, &rpc).expect("failed to create TempoProvider B");
     let resp_b = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider_b)
         .await
         .expect("client B payment failed");
@@ -900,6 +904,7 @@ async fn test_client_balance_decreases_after_payment() {
         TempoProvider::new(client_signer.clone(), &rpc).expect("failed to create TempoProvider");
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("payment failed");
@@ -966,6 +971,7 @@ async fn test_e2e_charge_without_fee_payer() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("non-fee-payer payment failed");
@@ -1044,6 +1050,7 @@ async fn test_e2e_charge_with_fee_payer() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("fee-payer payment failed");
@@ -1129,6 +1136,7 @@ async fn test_fee_payer_simulates_with_eth_call_without_simulate_v1() {
     let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("fee-payer payment failed");
@@ -1186,6 +1194,7 @@ async fn test_fee_payer_eth_call_fallback_rejects_reverting_transaction() {
     let provider = TempoProvider::new(client_signer, &rpc).expect("failed to create TempoProvider");
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("request failed");
@@ -1397,6 +1406,7 @@ async fn test_fee_payer_balance_accounting() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("fee-payer payment failed");
@@ -1499,6 +1509,7 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
 
     let result = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -1555,6 +1566,7 @@ async fn test_fee_payer_allows_client_without_gas_buffer() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("fee payer payment should succeed");
@@ -1738,6 +1750,7 @@ async fn test_e2e_fee_payer_premium_charge() {
 
     let resp = Client::new()
         .get(format!("{url}/premium"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("fee-payer premium payment failed");
@@ -1795,6 +1808,7 @@ async fn test_tx_hash_replay_rejected() {
     // First payment — should succeed.
     let resp1 = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("first payment failed");
@@ -2175,6 +2189,7 @@ async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("keychain fee-payer payment failed");

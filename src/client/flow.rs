@@ -79,6 +79,15 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             .get(ACCEPT_PAYMENT_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
+        let payment_allowed = !matches!(self.policy, AcceptPaymentPolicy::Disabled)
+            && if request.headers().contains_key(ACCEPT_PAYMENT_HEADER) {
+                caller_accept.as_deref().is_some_and(|value| {
+                    crate::protocol::core::accept_payment::parse(value)
+                        .is_ok_and(|entries| !entries.is_empty())
+                })
+            } else {
+                self.policy.allows(request.url())
+            };
         let provider_accept = self.provider.accept_payment_header();
 
         // Inject only if the caller didn't set their own header AND the
@@ -104,7 +113,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             None => exchange.send(request).await.map_err(FlowError::Send)?,
         };
 
-        if resp.status() != StatusCode::PAYMENT_REQUIRED {
+        if resp.status() != StatusCode::PAYMENT_REQUIRED || !payment_allowed {
             return Ok(resp);
         }
 
@@ -327,12 +336,32 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     // response was lost. Preserve optimistic provider state
                     // until a later challenge can reconcile it, while
                     // releasing any delivery lease held by the provider.
-                    pending.commit().await.map_err(HttpError::Payment)?;
+                    drop(pending);
                     return Err(FlowError::Send(err));
                 }
             };
 
             let status = resp.status();
+            let session_receipt_valid = challenge.intent.as_str() != "session"
+                || resp
+                    .headers()
+                    .get("payment-receipt")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| crate::protocol::core::parse_receipt(v).ok())
+                    .is_some_and(|receipt| {
+                        receipt.is_success()
+                            && receipt.method == challenge.method
+                            && receipt
+                                .extensions
+                                .get("challengeId")
+                                .and_then(|v| v.as_str())
+                                == Some(challenge.id.as_str())
+                            && credential
+                                .payload
+                                .get("channelId")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|id| receipt.reference.eq_ignore_ascii_case(id))
+                    });
             if status.is_success() {
                 self.events
                     .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
@@ -341,7 +370,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         status,
                     }))
                     .await;
-                pending.commit().await.map_err(HttpError::Payment)?;
+                if session_receipt_valid {
+                    pending.commit().await.map_err(HttpError::Payment)?;
+                } else {
+                    drop(pending);
+                }
                 return Ok(resp);
             }
 
@@ -364,7 +397,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             }
 
             if resp.headers().contains_key("payment-receipt") {
-                pending.commit().await.map_err(HttpError::Payment)?;
+                if session_receipt_valid {
+                    pending.commit().await.map_err(HttpError::Payment)?;
+                } else {
+                    drop(pending);
+                }
             } else {
                 pending.rollback().await.map_err(HttpError::Payment)?;
             }

@@ -33,6 +33,8 @@ pub struct StoredChannelEntry {
     pub chain_id: u64,
     /// Whether the channel remains locally eligible for reuse.
     pub opened: bool,
+    /// Challenge whose opening payment has not yet received a verified receipt.
+    pub pending_open: Option<String>,
 }
 
 impl StoredChannelEntry {
@@ -160,6 +162,8 @@ struct JsonChannelEntry {
     escrow: String,
     chain_id: u64,
     opened: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_open: Option<String>,
 }
 
 impl From<&StoredChannelEntry> for JsonChannelEntry {
@@ -173,6 +177,7 @@ impl From<&StoredChannelEntry> for JsonChannelEntry {
             escrow: format!("{:#x}", entry.escrow),
             chain_id: entry.chain_id,
             opened: entry.opened,
+            pending_open: entry.pending_open.clone(),
         }
     }
 }
@@ -200,6 +205,7 @@ impl TryFrom<JsonChannelEntry> for StoredChannelEntry {
             escrow: entry.escrow.parse().map_err(|e| invalid("escrow", e))?,
             chain_id: entry.chain_id,
             opened: entry.opened,
+            pending_open: entry.pending_open.clone(),
         })
     }
 }
@@ -420,6 +426,7 @@ mod sqlite {
                 escrow,
                 chain_id,
                 opened: state == "active",
+                pending_open: None,
             }
             .try_into()
             .map(Some)
@@ -695,6 +702,7 @@ mod tests {
                 .unwrap(),
             chain_id: 4217,
             opened: true,
+            pending_open: None,
         }
     }
 
@@ -719,7 +727,8 @@ mod tests {
     async fn sqlite_roundtrip_uses_mppx_entry_json() {
         let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
         let path = directory.join("channels.db");
-        let current = entry();
+        let mut current = entry();
+        current.pending_open = Some("unconfirmed-opening".into());
         let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
             namespace: "https://api.example.com".into(),
             path: Some(path.clone()),

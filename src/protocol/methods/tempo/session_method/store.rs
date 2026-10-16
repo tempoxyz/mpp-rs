@@ -73,6 +73,13 @@ pub struct ChannelState {
 /// This is a minimal trait defined inline. It should be consolidated with
 /// a shared store abstraction in a future refactor.
 pub trait ChannelStore: Send + Sync {
+    /// Validate required write capabilities before funding a new channel.
+    fn check_writable(
+        &self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), VerificationError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn get_channel(
         &self,
         channel_id: &str,

@@ -196,6 +196,7 @@ pub fn hydrate_session_snapshot(
         escrow,
         chain_id: snapshot.chain_id,
         opened: true,
+        pending_open: None,
     })
 }
 
@@ -364,6 +365,7 @@ mod tests {
                 escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 4217,
                 opened: true,
+                pending_open: None,
             },
             scope(authority),
             OnChainChannelState {
