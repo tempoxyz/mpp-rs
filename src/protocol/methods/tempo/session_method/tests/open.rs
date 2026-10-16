@@ -459,3 +459,47 @@ async fn test_open_stores_channel_after_broadcast() {
     assert_eq!(stored.deposit, 10_000);
     assert_eq!(stored.highest_voucher_amount, 1_000);
 }
+
+#[tokio::test]
+async fn unsupported_store_rejects_open_before_transaction_processing() {
+    use alloy::providers::{mock::Asserter, ProviderBuilder};
+    use tempo_alloy::TempoNetwork;
+
+    let directory = std::env::temp_dir().join(format!("mpp-open-{}", uuid::Uuid::new_v4()));
+    let store = Arc::new(crate::store::ChannelStoreAdapter::new(
+        Arc::new(crate::store::FileStore::new(&directory).unwrap()),
+        "channels:",
+    ));
+    // Any RPC call would fail: store capability must be checked before funding.
+    let provider =
+        ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(Asserter::new());
+    let method = SessionMethod::new(
+        provider,
+        store,
+        SessionMethodConfig {
+            escrow_contract: Address::repeat_byte(0x55),
+            chain_id: 42431,
+            min_voucher_delta: 0,
+        },
+    );
+    let (request, credential) = build_session_credential(
+        Some("0x2222222222222222222222222222222222222222"),
+        "0x3333333333333333333333333333333333333333",
+        SessionCredentialPayload::Open {
+            payload_type: "transaction".into(),
+            channel_id: B256::repeat_byte(0x11).to_string(),
+            transaction: "0x".into(),
+            descriptor: None,
+            settlement_route: None,
+            authorized_signer: None,
+            cumulative_amount: "1000".into(),
+            signature: "0x".into(),
+        },
+    );
+    let error = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("atomic operation"), "{error}");
+    std::fs::remove_dir_all(directory).unwrap();
+}
