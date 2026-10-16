@@ -41,6 +41,8 @@ impl<P> MppHttpTransport<P> {
     }
 
     /// Create an MPP transport for `url` using `provider`.
+    /// Set `Accept-Payment` through `with_headers` or per-request headers to authorize payment.
+    /// Opaque client default headers alone do not authorize automatic payment.
     pub const fn new(client: reqwest::Client, url: Url, provider: P) -> Self {
         Self {
             client,
@@ -128,25 +130,9 @@ where
             .body(body);
         let response = match self.request_limit {
             Some((_, limit)) => {
-                let mut initial = request.try_clone().ok_or_else(|| {
+                let initial = request.try_clone().ok_or_else(|| {
                     TransportErrorKind::custom_str("MPP HTTP request is not cloneable")
                 })?;
-                let has_accept_payment = initial
-                    .try_clone()
-                    .and_then(|request| request.build().ok())
-                    .is_some_and(|request| {
-                        request.headers().contains_key(
-                            mpp::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
-                        )
-                    });
-                if !has_accept_payment {
-                    if let Some(header) = self.provider.accept_payment_header() {
-                        initial = initial.header(
-                            mpp::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
-                            header,
-                        );
-                    }
-                }
                 let response = initial.send().await.map_err(|source| {
                     TransportErrorKind::custom(MppHttpRequestError {
                         origin: origin.clone(),
@@ -405,6 +391,12 @@ mod tests {
         (url, task)
     }
 
+    fn payment_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Accept-Payment", "tempo/charge".parse().unwrap());
+        headers
+    }
+
     fn client() -> reqwest::Client {
         install_default_crypto_provider();
         reqwest::Client::builder().no_proxy().build().unwrap()
@@ -424,7 +416,8 @@ mod tests {
         );
         let (url, task) = server(app).await;
         let provider = MockProvider::default();
-        let mut transport = MppHttpTransport::new(client(), url, provider.clone());
+        let mut transport =
+            MppHttpTransport::new(client(), url, provider.clone()).with_headers(payment_headers());
 
         let response = transport.call(request()).await.unwrap();
         assert!(matches!(response, ResponsePacket::Single(response) if response.is_success()));
@@ -475,7 +468,8 @@ mod tests {
             });
         let (url, task) = server(app).await;
         let provider = MockProvider::default();
-        let mut transport = MppHttpTransport::new(client(), url, provider.clone());
+        let mut transport =
+            MppHttpTransport::new(client(), url, provider.clone()).with_headers(payment_headers());
 
         let response = transport.call(request()).await.unwrap();
         assert!(matches!(response, ResponsePacket::Single(response) if response.is_success()));
@@ -581,10 +575,11 @@ mod tests {
             .with_state(state);
         let (url, task) = server(app).await;
         let provider = ManagementProvider { client: client() };
-        let headers = HeaderMap::from_iter([(
+        let mut headers = HeaderMap::from_iter([(
             HeaderName::from_static("x-api-key"),
             HeaderValue::from_static("test-key"),
         )]);
+        headers.insert("Accept-Payment", "tempo/charge".parse().unwrap());
         let mut transport = MppHttpTransport::new(client(), url, provider).with_headers(headers);
 
         transport.call(request()).await.unwrap();
@@ -624,7 +619,8 @@ mod tests {
             });
         let (url, task) = server(app).await;
         let provider = MockProvider::default();
-        let mut transport = MppHttpTransport::new(client(), url, provider.clone());
+        let mut transport =
+            MppHttpTransport::new(client(), url, provider.clone()).with_headers(payment_headers());
 
         let error = transport.call(request()).await.unwrap_err();
         assert!(error.to_string().contains("402"));
@@ -655,7 +651,8 @@ mod tests {
             }),
         );
         let (url, task) = server(app).await;
-        let mut transport = MppHttpTransport::new(client(), url, MockProvider::default());
+        let mut transport = MppHttpTransport::new(client(), url, MockProvider::default())
+            .with_headers(payment_headers());
 
         let error = transport.call(request()).await.unwrap_err().to_string();
         assert!(error.contains("denied"));
@@ -674,7 +671,8 @@ mod tests {
         let url = format!("http://user:password@{address}/rpc?api_key=query-secret")
             .parse()
             .unwrap();
-        let mut transport = MppHttpTransport::new(client(), url, MockProvider::default());
+        let mut transport = MppHttpTransport::new(client(), url, MockProvider::default())
+            .with_headers(payment_headers());
 
         let error = transport.call(request()).await.unwrap_err();
         let report = format!("{error}\n{error:?}");
@@ -718,6 +716,7 @@ mod tests {
             .with_state(state);
         let (url, task) = server(app).await;
         let transport = MppHttpTransport::new(client(), url, MockProvider::default())
+            .with_headers(payment_headers())
             .with_max_concurrent_requests(2);
 
         let requests = (0..8).map(|_| {
@@ -784,6 +783,7 @@ mod tests {
             .with_state(state);
         let (url, task) = server(app).await;
         let transport = MppHttpTransport::new(client(), url, MockProvider::default())
+            .with_headers(payment_headers())
             .with_max_concurrent_requests(2);
 
         let requests = (0..8).map(|_| {

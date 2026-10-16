@@ -79,6 +79,8 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             .get(ACCEPT_PAYMENT_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
+        let payment_allowed = !matches!(self.policy, AcceptPaymentPolicy::Disabled)
+            && (caller_accept.is_some() || self.policy.allows(request.url()));
         let provider_accept = self.provider.accept_payment_header();
 
         // Inject only if the caller didn't set their own header AND the
@@ -104,7 +106,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             None => exchange.send(request).await.map_err(FlowError::Send)?,
         };
 
-        if resp.status() != StatusCode::PAYMENT_REQUIRED {
+        if resp.status() != StatusCode::PAYMENT_REQUIRED || !payment_allowed {
             return Ok(resp);
         }
 

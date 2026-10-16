@@ -383,6 +383,7 @@ async fn test_e2e_stripe_charge() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("stripe payment failed");
@@ -559,6 +560,7 @@ async fn test_stripe_requires_action_rejected() {
     // The middleware retries once and then returns the 402.
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -687,6 +689,7 @@ async fn test_e2e_stripe_charge_with_description() {
 
     let resp = Client::new()
         .get(format!("{url}/paid-premium"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("payment failed");
@@ -785,6 +788,7 @@ async fn test_stripe_error_body_parsing() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -824,6 +828,7 @@ async fn test_stripe_rejects_replayed_credential() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -886,6 +891,7 @@ async fn test_stripe_charge_via_mpp_charge_extractor() {
 
     let resp = Client::new()
         .get(format!("{url}/paid-extractor"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("payment failed");

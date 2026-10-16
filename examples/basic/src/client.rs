@@ -90,6 +90,7 @@ async fn main() {
 
     let resp = client
         .get(&url)
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(&provider)
         .await
         .expect("request failed");

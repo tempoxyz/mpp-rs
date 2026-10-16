@@ -2082,6 +2082,16 @@ impl TempoSessionProvider {
 
         if let Some((mut entry, includes_request)) = existing {
             if entry.opened {
+                if self
+                    .pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string())
+                {
+                    return Err(MppError::InvalidConfig(
+                        "pending channel open requires settlement reconciliation before another payment".into(),
+                    ));
+                }
                 // Increment cumulative and sign a voucher
                 if !includes_request {
                     entry.cumulative_amount =
@@ -4351,6 +4361,39 @@ mod tests {
             Base64UrlJson::from_typed(&req).unwrap(),
         );
 
+        // A cancelled open retains its descriptor and amount, but cannot authorize
+        // a larger voucher until a receipt or recovery snapshot reconciles it.
+        let entry = provider.channels.lock().unwrap().get(&key).unwrap().clone();
+        provider.persist_channel(&entry).await.unwrap();
+        let store_key = TempoSessionProvider::store_key(&entry).unwrap();
+        provider.pending_opens.lock().unwrap().insert(
+            channel_id.to_string(),
+            PendingOpen {
+                challenge_id: challenge.id.clone(),
+                store_key: store_key.clone(),
+            },
+        );
+        let pending_credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xpending"),
+        );
+        provider.abandon_payment(&challenge, &pending_credential);
+        for _ in 0..2 {
+            let error = provider.pay(&challenge).await.unwrap_err();
+            assert!(error.to_string().contains("settlement reconciliation"));
+        }
+        let retained = provider.channels.lock().unwrap().get(&key).unwrap().clone();
+        assert_eq!(retained.cumulative_amount, 1_000);
+        assert_eq!(retained.descriptor, Some(descriptor.clone()));
+        let stored = provider
+            .channel_store
+            .get(&store_key.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cumulative_amount, 1_000);
+        provider.commit_referenced_open(&channel_id.to_string());
+
         let credential = provider.pay(&challenge).await.expect("pay succeeds");
         assert_eq!(provider.pending_payment_leases.lock().unwrap().len(), 1);
 
@@ -5246,6 +5289,7 @@ mod tests {
 
             let result = reqwest::Client::new()
                 .get(format!("http://{address}/paid"))
+                .header("Accept-Payment", "tempo/session")
                 .send_with_payment(&provider)
                 .await;
 

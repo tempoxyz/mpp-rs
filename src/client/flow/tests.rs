@@ -50,6 +50,7 @@ impl Via {
                 ClientBuilder::new(client.clone())
                     .with(
                         PaymentMiddleware::new(provider.clone())
+                            .with_accept_payment_policy(AcceptPaymentPolicy::Always)
                             .with_http_client(client)
                             .with_events(events),
                     )
@@ -532,5 +533,60 @@ async fn management_context_uses_the_callers_redirect_policy() {
             .status(),
             StatusCode::OK
         );
+    }
+}
+
+#[tokio::test]
+async fn opaque_client_defaults_cannot_authorize_payment() {
+    for via in BOTH {
+        for default in ["tempo/charge;q=0", "tempo/charge"] {
+            for preference in [None, Some("tempo/charge;q=0"), Some("tempo/charge")] {
+                let app = Router::new().route(
+                    "/",
+                    get(|request: Request<Body>| async move {
+                        if request.headers().contains_key("authorization") {
+                            StatusCode::OK.into_response()
+                        } else {
+                            payment_required("default-header", "charge")
+                        }
+                    }),
+                );
+                let url = spawn_server(app).await;
+                let mut defaults = reqwest::header::HeaderMap::new();
+                defaults.insert("Accept-Payment", default.parse().unwrap());
+                let client = reqwest::Client::builder()
+                    .default_headers(defaults)
+                    .build()
+                    .unwrap();
+                let mut request = client.get(&url);
+                if let Some(preference) = preference {
+                    request = request.header("Accept-Payment", preference);
+                }
+                let provider = TestProvider::default();
+                let result = match via {
+                    Via::Fetch => request
+                        .send_with_payment(&provider)
+                        .await
+                        .map(|r| r.status())
+                        .map_err(|e| e.to_string()),
+                    Via::Middleware => ClientBuilder::new(client)
+                        .with(PaymentMiddleware::new(provider.clone()))
+                        .build()
+                        .execute(request.build().unwrap())
+                        .await
+                        .map(|r| r.status())
+                        .map_err(|e| e.to_string()),
+                };
+                let permitted = preference == Some("tempo/charge");
+                assert_eq!(
+                    provider.paid().len(),
+                    usize::from(permitted),
+                    "{via:?}, {default}, {preference:?}: {result:?}"
+                );
+                if permitted {
+                    assert_eq!(result.unwrap(), StatusCode::OK);
+                }
+            }
+        }
     }
 }
