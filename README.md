@@ -207,4 +207,13 @@ HTTP payment helpers now default to `AcceptPaymentPolicy::Explicit`: set a reque
 
 `ChannelStoreAdapter` requires a native atomic `Store::compare_exchange`. Implement it as a transaction or conditional write shared by every client using the backend; a read followed by a write is unsafe. `MemoryStore` supports it. `FileStore` and custom backends without this operation fail closed on channel updates. Concurrent conflicts fail before resource delivery and must be retried against fresh state.
 
-An unconfirmed channel open must be reconciled through a valid receipt or the session recovery flow before issuing another voucher. Cancellation preserves the channel descriptor and durable balance for recovery; it does not erase potentially funded state.
+An unconfirmed channel open must be reconciled through a valid receipt or the session recovery flow before increasing its voucher authorization. Cancellation preserves the channel descriptor and durable balance for recovery; it does not erase potentially funded state.
+
+Pending session opens retain their original authorized cumulative amount across
+retries and Rust SQLite-store restarts. A retry can resubmit that amount; it cannot
+increase it until a matching payment receipt or validated recovery snapshot is
+accepted. For native sessions, `bootstrap` can reconcile a matching server
+snapshot. Streaming voucher increases and top-ups are refused while an opening
+is unresolved. Retain the channel descriptor and use `close` to recover a funded
+channel if the server cannot reconcile it. Do not share an unresolved channel
+with older SDK versions that do not preserve the pending-open marker.
