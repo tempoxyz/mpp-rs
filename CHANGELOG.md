@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.2 (2026-10-15)
+
+### Patch Changes
+
+- Limited autoswaps to the missing balance and bounded input spending independently of quotes. Added an optional max_amount_in budget, defaulting to parity plus slippage. Sponsored validation accepts positive swap outputs up to the payment amount. Existing AutoswapConfig struct literals must add max_amount_in: None; the constructor remains unchanged. (by @BrendanRyan, [#573](https://github.com/tempoxyz/mpp-rs/pull/573))
+- Scoped relay idempotency keys to individual broadcast attempts, overriding custom-client defaults so cached receipts cannot authorize separate operations. Uncertain payment outcomes require separate recovery. (by @BrendanRyan, [#573](https://github.com/tempoxyz/mpp-rs/pull/573))
+- Preserved funded native channel descriptors after server close receipts, rejections, and pending on-chain closes until trusted chain state confirms the escrow is no longer funded. (by @BrendanRyan, [#573](https://github.com/tempoxyz/mpp-rs/pull/573))
+- Fixed automatic session management to preserve the configured HTTP client and strip hop-by-hop request headers. Middleware callers can provide the same client with `with_http_client`; automatic top-ups are disabled when it is absent. (by @BrendanRyan, [#573](https://github.com/tempoxyz/mpp-rs/pull/573))
+
 ## 0.15.1 (2026-10-12)
 
 ### Patch Changes
