@@ -140,6 +140,16 @@ pub struct TempoSessionProvider {
     topping_up: Arc<Mutex<HashSet<String>>>,
 }
 
+/// A signed top-up awaiting submission.
+struct PreparedTopUp {
+    key: String,
+    chain_id: u64,
+    cumulative_amount: u128,
+    credential: PaymentCredential,
+    headers: reqwest::header::HeaderMap,
+    new_deposit: u128,
+}
+
 /// What a prepaid voucher for a URL is sized from: its latest receipt.
 #[derive(Clone, Debug)]
 struct PrepaidVoucher {
@@ -1228,14 +1238,7 @@ impl TempoSessionProvider {
         let channel_id = channel_id.to_owned();
         runtime.spawn(async move {
             let _ = provider
-                .top_up_with_headers_for_challenge(
-                    &client,
-                    &url,
-                    headers,
-                    &challenge,
-                    &channel_id,
-                    amount,
-                )
+                .top_up_in_background(&client, &url, headers, &challenge, &channel_id, amount)
                 .await;
             provider.topping_up.lock().unwrap().remove(&channel_id);
         });
@@ -1526,13 +1529,59 @@ impl TempoSessionProvider {
         &self,
         client: &reqwest::Client,
         url: &str,
-        mut headers: reqwest::header::HeaderMap,
+        headers: reqwest::header::HeaderMap,
         challenge: &PaymentChallenge,
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
-        use reqwest::header::WWW_AUTHENTICATE;
+        let prepared = self
+            .prepare_top_up(headers, challenge, channel_id_hex, additional_deposit)
+            .await?;
+        let receipt = self
+            .submit_top_up(client, url, challenge, &prepared)
+            .await?;
+        self.record_top_up(&prepared).await?;
+        Ok(receipt)
+    }
 
+    /// A top-up that holds the payment lock and store lease only while it is
+    /// signed and recorded, so vouchers can be signed while it is submitted.
+    async fn top_up_in_background(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<(), MppError> {
+        ensure_redirect_safe_credential_header(challenge)?;
+        let prepared = {
+            let _process_lease = self.acquire_payment_lock(challenge).await?;
+            let (key, _) = self.expected_channel_key(challenge)?;
+            let _store_lease = self
+                .channel_store
+                .acquire(&key)
+                .await
+                .map_err(Self::store_error)?;
+            self.prepare_top_up(headers, challenge, channel_id_hex, additional_deposit)
+                .await?
+        };
+        self.submit_top_up(client, url, challenge, &prepared)
+            .await?;
+        let _process_lease = self.acquire_payment_lock(challenge).await?;
+        self.record_top_up(&prepared).await
+    }
+
+    /// Signs a top-up against the channel's local, stored and on-chain deposit.
+    /// The caller holds the payment lock and the payment-scope store lease.
+    async fn prepare_top_up(
+        &self,
+        mut headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<PreparedTopUp, MppError> {
         ensure_redirect_safe_credential_header(challenge)?;
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
@@ -1602,6 +1651,34 @@ impl TempoSessionProvider {
                 .parse()
                 .mpp_config("invalid top-up authorization header")?,
         );
+        Ok(PreparedTopUp {
+            key,
+            chain_id: entry.chain_id,
+            cumulative_amount: entry.cumulative_amount,
+            credential,
+            headers,
+            new_deposit,
+        })
+    }
+
+    /// Sends a prepared top-up, refreshing an expired challenge echo without
+    /// signing another deposit.
+    async fn submit_top_up(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        challenge: &PaymentChallenge,
+        prepared: &PreparedTopUp,
+    ) -> Result<Option<Receipt>, MppError> {
+        use reqwest::header::WWW_AUTHENTICATE;
+
+        let PreparedTopUp {
+            key,
+            chain_id,
+            credential,
+            ..
+        } = prepared;
+        let mut headers = prepared.headers.clone();
         let mut response = client
             .post(url)
             .headers(headers.clone())
@@ -1624,7 +1701,7 @@ impl TempoSessionProvider {
             });
             if let Some(fresh_challenge) = fresh_challenge {
                 let (fresh_key, fresh_chain_id) = self.expected_channel_key(&fresh_challenge)?;
-                if fresh_key != key || fresh_chain_id != entry.chain_id {
+                if fresh_key != *key || fresh_chain_id != *chain_id {
                     return Err(MppError::InvalidConfig(
                         "top-up route challenge does not match active session".into(),
                     ));
@@ -1675,12 +1752,29 @@ impl TempoSessionProvider {
             )));
         }
 
-        entry.deposit = new_deposit;
+        Ok(receipt)
+    }
+
+    /// Records an accepted top-up on the current channel entry, which vouchers
+    /// signed while the top-up was submitted may have advanced.
+    async fn record_top_up(&self, prepared: &PreparedTopUp) -> Result<(), MppError> {
+        let mut entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&prepared.key)
+            .cloned()
+            .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        entry.deposit = entry.deposit.max(prepared.new_deposit);
+        entry.cumulative_amount = entry.cumulative_amount.max(prepared.cumulative_amount);
         entry.opened = true;
         self.persist_channel(&entry).await?;
-        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.channels
+            .lock()
+            .unwrap()
+            .insert(prepared.key.clone(), entry.clone());
         self.notify_update(&entry);
-        Ok(receipt)
+        Ok(())
     }
 
     /// Returns the deposit to plan a voucher against: the local view, raised
