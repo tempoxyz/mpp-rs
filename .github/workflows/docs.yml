@@ -28,6 +28,8 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - name: Resolve Cargo dependencies
+        run: .github/scripts/resolve-cargo-dependencies.sh
       - name: Build docs
         run: cargo doc --no-deps --all-features
         env:
