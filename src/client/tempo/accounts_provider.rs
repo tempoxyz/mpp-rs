@@ -212,6 +212,63 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Enable durable payment sessions in the shared SQLite channel store
+    /// (`$TEMPO_HOME/wallet/channels.db` by default), namespaced by
+    /// `service`'s origin so each service reuses its channel across processes.
+    #[cfg(feature = "sqlite")]
+    pub fn with_sqlite_session_store(
+        self,
+        service: &reqwest::Url,
+    ) -> Result<Self, super::session::store::ChannelStoreError> {
+        let store = super::session::store::SqliteChannelStore::open(
+            super::session::store::SqliteChannelStoreOptions {
+                namespace: service.origin().ascii_serialization(),
+                path: None,
+                request_url: Some(service.to_string()),
+            },
+        )?;
+        Ok(self.with_session_store(Arc::new(store)))
+    }
+
+    /// Prepare to pay `url` before its first request: send `body` unpaid,
+    /// which opens the connection, and restore the session channel the
+    /// selected challenge would pay from the store and the chain, without
+    /// signing anything.
+    pub async fn preconnect(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        body: String,
+    ) -> Result<(), MppError> {
+        let response = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .mpp_http("preconnect probe failed")?;
+        let challenges: Vec<_> = crate::protocol::core::parse_www_authenticate_all_bytes(
+            response
+                .headers()
+                .get_all(reqwest::header::WWW_AUTHENTICATE)
+                .iter()
+                .map(|value| value.as_bytes()),
+        )
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|challenge| self.supports(challenge.method.as_str(), challenge.intent.as_str()))
+        .collect();
+        let candidates: Vec<_> = challenges.iter().collect();
+        match self.select_challenge(&candidates) {
+            Some(challenge) if challenge.intent.as_str() == INTENT_SESSION => self
+                .configured_session_provider()?
+                .restore(challenge)
+                .await
+                .map(drop),
+            _ => Ok(()),
+        }
+    }
+
     /// Set the deposit used when a session challenge does not suggest one.
     pub fn with_session_default_deposit(mut self, amount: u128) -> Self {
         if let Some(session) = self.session.as_mut() {

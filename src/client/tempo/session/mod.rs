@@ -138,6 +138,53 @@ pub struct TempoSessionProvider {
     prepaid: Arc<Mutex<HashMap<String, PrepaidVoucher>>>,
     /// Channel IDs with a background top-up in flight.
     topping_up: Arc<Mutex<HashSet<String>>>,
+    /// What the server charged for requests paid through this provider.
+    spend: Arc<Mutex<SpendLedger>>,
+}
+
+/// Work a session SSE event triggers, such as sending a voucher.
+pub type SessionEventFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MppError>> + Send>>;
+
+/// What a session provider's channels were charged since it was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionSpend {
+    /// Total the server charged for requests paid through this provider.
+    pub spent: u128,
+    /// Charge for the latest paid request.
+    pub last: Option<u128>,
+    /// Deposit left in the channels it paid from after the server's charges.
+    pub remaining: u128,
+}
+
+/// Server charges from receipts: each request costs the change in its
+/// channel's `spent`, or its quoted price the first time a channel is seen.
+#[derive(Debug, Default)]
+struct SpendLedger {
+    channels: HashMap<String, u128>,
+    spent: u128,
+    last: Option<u128>,
+}
+
+impl SpendLedger {
+    fn record(&mut self, channel_id: &str, spent: u128, quoted: Option<u128>) {
+        let cost = match self.channels.get(channel_id) {
+            Some(previous) => spent.saturating_sub(*previous),
+            None => quoted.unwrap_or_default(),
+        };
+        self.channels.insert(channel_id.to_owned(), spent);
+        self.spent += cost;
+        self.last = Some(cost);
+    }
+}
+
+/// Body of an mppx `payment-need-voucher` SSE event.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeedVoucherEvent {
+    channel_id: String,
+    required_cumulative: String,
+    accepted_cumulative: String,
 }
 
 /// A signed top-up awaiting submission.
@@ -213,7 +260,84 @@ impl TempoSessionProvider {
             prepaid_requests: 0,
             prepaid: Arc::new(Mutex::new(HashMap::new())),
             topping_up: Arc::new(Mutex::new(HashSet::new())),
+            spend: Arc::default(),
         })
+    }
+
+    /// What the server charged for requests paid through this provider and its
+    /// clones, and the deposit left in the channels they paid from.
+    pub fn spend(&self) -> SessionSpend {
+        let ledger = self.spend.lock().unwrap();
+        let remaining = self
+            .channels
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|entry| {
+                let spent = ledger.channels.get(&entry.channel_id.to_string())?;
+                Some(entry.deposit.saturating_sub(*spent))
+            })
+            .sum();
+        SessionSpend {
+            spent: ledger.spent,
+            last: ledger.last,
+            remaining,
+        }
+    }
+
+    /// Handle an mppx session SSE event from a response to `url`: answer
+    /// `payment-need-voucher` with a voucher and resolve pending opens from
+    /// the accepted amounts in it and in `payment-receipt`. Returns `None`
+    /// for other events.
+    pub fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<SessionEventFuture> {
+        let session = self.clone();
+        let amount = |value: &str| value.parse::<u128>().mpp_config("invalid session amount");
+        match name {
+            "payment-need-voucher" => {
+                let parsed = serde_json::from_str::<NeedVoucherEvent>(data)
+                    .mpp_config("invalid payment-need-voucher event");
+                let (client, url) = (client.clone(), url.to_owned());
+                Some(Box::pin(async move {
+                    let event = parsed?;
+                    session
+                        .acknowledge_accepted(
+                            &event.channel_id,
+                            amount(&event.accepted_cumulative)?,
+                        )
+                        .await?;
+                    session
+                        .send_voucher(
+                            &client,
+                            &url,
+                            &event.channel_id,
+                            amount(&event.required_cumulative)?,
+                        )
+                        .await
+                }))
+            }
+            "payment-receipt" => {
+                let parsed =
+                    serde_json::from_str::<crate::protocol::methods::tempo::SessionReceipt>(data)
+                        .mpp_config("invalid payment-receipt event");
+                Some(Box::pin(async move {
+                    let receipt = parsed?;
+                    session
+                        .acknowledge_accepted(
+                            &receipt.channel_id,
+                            amount(&receipt.accepted_cumulative)?,
+                        )
+                        .await
+                        .map(drop)
+                }))
+            }
+            _ => None,
+        }
     }
 
     /// Keep `requests` requests' worth of balance, at the latest request's
@@ -2906,9 +3030,7 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         receipt: &Receipt,
     ) {
-        if self.prepaid_requests == 0
-            || challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION
-        {
+        if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
             return;
         }
         let Some(spent) = receipt
@@ -2928,6 +3050,13 @@ impl PaymentProvider for TempoSessionProvider {
             .decode::<SessionRequest>()
             .ok()
             .and_then(|request| request.parse_amount().ok());
+        self.spend
+            .lock()
+            .unwrap()
+            .record(&channel_id, spent, quoted);
+        if self.prepaid_requests == 0 {
+            return;
+        }
         let url = context.url.to_string();
         let mut prepaid = self.prepaid.lock().unwrap();
         let price = prepaid
