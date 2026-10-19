@@ -56,6 +56,7 @@ struct AccountsSession {
     top_up_amount: Option<u128>,
     max_deposit: Option<u128>,
     fee_token: Option<Address>,
+    prepaid_requests: Option<u32>,
 }
 
 impl TempoAccountsProvider {
@@ -206,6 +207,7 @@ impl TempoAccountsProvider {
             top_up_amount: None,
             max_deposit: None,
             fee_token: None,
+            prepaid_requests: None,
         });
         self
     }
@@ -230,6 +232,15 @@ impl TempoAccountsProvider {
     pub fn with_session_max_deposit(mut self, amount: u128) -> Self {
         if let Some(session) = self.session.as_mut() {
             session.max_deposit = Some(amount);
+        }
+        self
+    }
+
+    /// Keep `requests` requests' worth of session balance prepaid and send the
+    /// voucher with the request. See [`TempoSessionProvider::with_prepaid_requests`].
+    pub fn with_session_prepaid_requests(mut self, requests: u32) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.prepaid_requests = Some(requests);
         }
         self
     }
@@ -273,6 +284,9 @@ impl TempoAccountsProvider {
         }
         if let Some(token) = session.fee_token {
             provider = provider.with_fee_token(token);
+        }
+        if let Some(requests) = session.prepaid_requests {
+            provider = provider.with_prepaid_requests(requests);
         }
         *cached = Some(provider.clone());
         Ok(provider)
@@ -516,6 +530,30 @@ impl PaymentProvider for TempoAccountsProvider {
         if challenge.intent.as_str() == "session" {
             if let Ok(provider) = self.configured_session_provider() {
                 provider.abandon_payment(challenge, credential);
+            }
+        }
+    }
+
+    async fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> Option<(PaymentChallenge, PaymentCredential)> {
+        self.session.as_ref()?;
+        self.configured_session_provider()
+            .ok()?
+            .prepaid_credential(context)
+            .await
+    }
+
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &crate::protocol::core::Receipt,
+    ) {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            if let Ok(provider) = self.configured_session_provider() {
+                provider.observe_receipt(context, challenge, receipt);
             }
         }
     }

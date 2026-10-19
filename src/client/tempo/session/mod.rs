@@ -132,6 +132,19 @@ pub struct TempoSessionProvider {
     payment_lock: Arc<tokio::sync::Mutex<()>>,
     /// Keeps the process and durable-store leases until the server response is reconciled.
     pending_payment_leases: Arc<Mutex<HashMap<String, SessionPaymentLease>>>,
+    /// Requests' worth of balance, at the latest price, kept prepaid per URL. Zero disables it.
+    prepaid_requests: u32,
+    /// Reusable challenge and charged amounts from the latest receipt, by request URL.
+    prepaid: Arc<Mutex<HashMap<String, PrepaidVoucher>>>,
+}
+
+/// What a prepaid voucher for a URL is sized from: its latest receipt.
+#[derive(Clone, Debug)]
+struct PrepaidVoucher {
+    challenge: PaymentChallenge,
+    channel_id: String,
+    spent: u128,
+    price: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -185,7 +198,21 @@ impl TempoSessionProvider {
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
             pending_payment_leases: Arc::new(Mutex::new(HashMap::new())),
+            prepaid_requests: 0,
+            prepaid: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Keep `requests` requests' worth of balance, at the latest request's
+    /// price, prepaid on the channel, and send the voucher with the next request
+    /// to the same URL instead of waiting for a `402`.
+    ///
+    /// Requires a server whose session challenges stay valid for later requests
+    /// to the same route and charge each request its own price (mppx
+    /// `reusableChallenges`). Any `402` answer falls back to the normal flow.
+    pub fn with_prepaid_requests(mut self, requests: u32) -> Self {
+        self.prepaid_requests = requests;
+        self
     }
 
     /// Pin the escrow contract address.
@@ -2599,6 +2626,102 @@ impl PaymentProvider for TempoSessionProvider {
             .lock()
             .unwrap()
             .remove(&challenge.id);
+    }
+
+    async fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> Option<(PaymentChallenge, PaymentCredential)> {
+        if self.prepaid_requests == 0 {
+            return None;
+        }
+        let state = self
+            .prepaid
+            .lock()
+            .unwrap()
+            .get(context.url.as_str())
+            .cloned()?;
+        if state
+            .challenge
+            .expires_at()
+            .is_some_and(|expires| expires <= time::OffsetDateTime::now_utc())
+        {
+            self.prepaid.lock().unwrap().remove(context.url.as_str());
+            return None;
+        }
+        let _lock = self.acquire_payment_lock(&state.challenge).await.ok()?;
+        let entry = {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(&state.channel_id)
+                .cloned()?;
+            self.channels.lock().unwrap().get(&key).cloned()?
+        };
+        let target = state
+            .price
+            .checked_mul(u128::from(self.prepaid_requests))
+            .and_then(|headroom| state.spent.checked_add(headroom))?;
+        let cumulative = target.max(entry.cumulative_amount.checked_add(1)?);
+        if cumulative > entry.deposit {
+            return None;
+        }
+        let credential = self
+            .voucher_credential_for_challenge(&state.challenge, &state.channel_id, cumulative)
+            .await
+            .ok()?;
+        Some((state.challenge, credential))
+    }
+
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        if self.prepaid_requests == 0
+            || challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION
+        {
+            return;
+        }
+        let Some(spent) = receipt
+            .extensions
+            .get("spent")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<u128>().ok())
+        else {
+            return;
+        };
+        let Ok(channel_id) = receipt.reference.parse::<B256>() else {
+            return;
+        };
+        let channel_id = channel_id.to_string();
+        let quoted = challenge
+            .request
+            .decode::<SessionRequest>()
+            .ok()
+            .and_then(|request| request.parse_amount().ok());
+        let url = context.url.to_string();
+        let mut prepaid = self.prepaid.lock().unwrap();
+        let price = prepaid
+            .get(&url)
+            .filter(|previous| previous.channel_id == channel_id && spent > previous.spent)
+            .map(|previous| spent - previous.spent)
+            .or(quoted)
+            .filter(|price| *price > 0);
+        let Some(price) = price else {
+            return;
+        };
+        prepaid.insert(
+            url,
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id,
+                spent,
+                price,
+            },
+        );
     }
 
     fn accept_payment_header(&self) -> Option<String> {

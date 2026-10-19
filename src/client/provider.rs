@@ -6,7 +6,7 @@
 
 use crate::error::MppError;
 use crate::protocol::core::accept_payment::{self, Entry};
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use reqwest::header::HeaderMap;
 use reqwest::Url;
 use std::future::Future;
@@ -191,6 +191,31 @@ pub trait PaymentProvider: Clone + Send + Sync {
     /// state; this is only for resources such as delivery-ordering leases.
     fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         let _ = (challenge, credential);
+    }
+
+    /// Credential to send with a request before the server asks for payment.
+    ///
+    /// A session provider holding a reusable challenge for the request's URL
+    /// may return one with a fresh voucher, which saves the unpaid round trip.
+    /// A `402` answer then continues the normal payment flow. Defaults to none.
+    fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> impl Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send {
+        let _ = context;
+        async { None }
+    }
+
+    /// Observe the receipt of a response that accepted this provider's credential.
+    ///
+    /// Session providers use the amount charged to size later prepaid vouchers.
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        let _ = (context, challenge, receipt);
     }
 
     /// Build an `Accept-Payment` header value from this provider's supported methods.
@@ -511,6 +536,35 @@ impl PaymentProvider for MultiProvider {
         }
     }
 
+    async fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> Option<(PaymentChallenge, PaymentCredential)> {
+        for provider in &self.providers {
+            if let Some(prepaid) = provider.dyn_prepaid_credential(context.clone()).await {
+                return Some(prepaid);
+            }
+        }
+        None
+    }
+
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                provider.dyn_observe_receipt(context, challenge, receipt);
+                return;
+            }
+        }
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let mut entries: Vec<Entry> = Vec::new();
         for provider in &self.providers {
@@ -577,6 +631,18 @@ trait DynPaymentProvider: Send + Sync {
         credential: &'a PaymentCredential,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
     fn dyn_abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential);
+    fn dyn_prepaid_credential<'a>(
+        &'a self,
+        context: PaymentContext,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send + 'a>,
+    >;
+    fn dyn_observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    );
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -663,6 +729,24 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
 
     fn dyn_abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         PaymentProvider::abandon_payment(self, challenge, credential);
+    }
+
+    fn dyn_prepaid_credential<'a>(
+        &'a self,
+        context: PaymentContext,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send + 'a>,
+    > {
+        Box::pin(PaymentProvider::prepaid_credential(self, context))
+    }
+
+    fn dyn_observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        PaymentProvider::observe_receipt(self, context, challenge, receipt);
     }
 
     fn dyn_accept_payment_header(&self) -> Option<String> {
