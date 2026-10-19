@@ -99,7 +99,7 @@ pub struct PaymentResponseContext {
     pub url: Url,
     /// The response's `Payment-Receipt`. A session receipt is included only
     /// when it matches the challenge and the paying channel.
-    pub receipt: Option<Receipt>,
+    pub receipt: Option<Box<Receipt>>,
 }
 
 /// Structured reason for a `payment.failed` event.

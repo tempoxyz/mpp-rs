@@ -415,7 +415,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         credential,
                         status,
                         url: payment_context.url.clone(),
-                        receipt,
+                        receipt: receipt.map(Box::new),
                     }))
                     .await;
                 if session_receipt_valid {
@@ -528,7 +528,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     credential,
                     status,
                     url: context.url.clone(),
-                    receipt,
+                    receipt: receipt.map(Box::new),
                 }))
                 .await;
         }
