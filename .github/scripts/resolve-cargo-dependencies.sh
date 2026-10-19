@@ -26,3 +26,4 @@ cargo update -p quinn --precise 0.11.11
 cargo update -p quinn-proto --precise 0.11.17
 # Remove once inout 0.2.4 clears Socket's cooldown or receives an exception.
 cargo update -p inout --precise 0.2.2
+cargo update -p libc --precise 0.2.190
