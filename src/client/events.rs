@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
 
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type EventHandler = Arc<dyn Fn(ClientEvent) -> BoxFuture<Option<PaymentCredential>> + Send + Sync>;
@@ -95,6 +95,11 @@ pub struct PaymentResponseContext {
     pub credential: PaymentCredential,
     /// Status returned by the retried request.
     pub status: StatusCode,
+    /// URL of the paid request.
+    pub url: Url,
+    /// The response's `Payment-Receipt`. A session receipt is included only
+    /// when it matches the challenge and the paying channel.
+    pub receipt: Option<Receipt>,
 }
 
 /// Structured reason for a `payment.failed` event.

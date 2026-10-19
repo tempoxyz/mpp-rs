@@ -401,13 +401,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             };
 
             let status = resp.status();
-            let session_receipt = (challenge.intent.as_str() == "session")
-                .then(|| session_receipt(&resp, &challenge, &credential))
-                .flatten();
-            let session_receipt_valid =
-                challenge.intent.as_str() != "session" || session_receipt.is_some();
+            let receipt = paid_receipt(&resp, &challenge, &credential);
+            let session = challenge.intent.as_str() == "session";
+            let session_receipt_valid = !session || receipt.is_some();
             if status.is_success() {
-                if let Some(receipt) = &session_receipt {
+                if let Some(receipt) = receipt.as_ref().filter(|_| session) {
                     self.provider
                         .observe_receipt(&payment_context, &challenge, receipt);
                 }
@@ -416,6 +414,8 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         challenge,
                         credential,
                         status,
+                        url: payment_context.url.clone(),
+                        receipt,
                     }))
                     .await;
                 if session_receipt_valid {
@@ -515,14 +515,20 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 .map_err(FlowError::Send);
         }
         if status.is_success() {
-            if let Some(receipt) = session_receipt(&resp, &challenge, &credential) {
-                self.provider.observe_receipt(context, &challenge, &receipt);
+            let receipt = paid_receipt(&resp, &challenge, &credential);
+            if let Some(receipt) = receipt
+                .as_ref()
+                .filter(|_| challenge.intent.as_str() == "session")
+            {
+                self.provider.observe_receipt(context, &challenge, receipt);
             }
             self.events
                 .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
                     challenge,
                     credential,
                     status,
+                    url: context.url.clone(),
+                    receipt,
                 }))
                 .await;
         }
@@ -543,6 +549,22 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.
+/// The paid response's receipt: for a session only one that matches the
+/// challenge and the channel the credential paid from.
+fn paid_receipt(
+    resp: &Response,
+    challenge: &PaymentChallenge,
+    credential: &PaymentCredential,
+) -> Option<Receipt> {
+    if challenge.intent.as_str() == "session" {
+        return session_receipt(resp, challenge, credential);
+    }
+    resp.headers()
+        .get("payment-receipt")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_receipt(v).ok())
+}
+
 fn session_receipt(
     resp: &Response,
     challenge: &PaymentChallenge,
