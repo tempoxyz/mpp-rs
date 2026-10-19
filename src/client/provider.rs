@@ -645,6 +645,10 @@ impl PaymentProvider for MultiProvider {
 }
 
 /// Object-safe version of PaymentProvider for use in MultiProvider.
+type PrepaidFuture<'a> = std::pin::Pin<
+    Box<dyn Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send + 'a>,
+>;
+
 trait DynPaymentProvider: Send + Sync {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool;
     fn dyn_select_challenge<'a>(
@@ -688,12 +692,7 @@ trait DynPaymentProvider: Send + Sync {
         credential: &'a PaymentCredential,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
     fn dyn_abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential);
-    fn dyn_prepaid_credential<'a>(
-        &'a self,
-        context: PaymentContext,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send + 'a>,
-    >;
+    fn dyn_prepaid_credential<'a>(&'a self, context: PaymentContext) -> PrepaidFuture<'a>;
     fn dyn_observe_receipt(
         &self,
         context: &PaymentContext,
@@ -801,12 +800,7 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         PaymentProvider::abandon_payment(self, challenge, credential);
     }
 
-    fn dyn_prepaid_credential<'a>(
-        &'a self,
-        context: PaymentContext,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send + 'a>,
-    > {
+    fn dyn_prepaid_credential<'a>(&'a self, context: PaymentContext) -> PrepaidFuture<'a> {
         Box::pin(PaymentProvider::prepaid_credential(self, context))
     }
 
