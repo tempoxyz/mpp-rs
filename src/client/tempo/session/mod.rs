@@ -1174,6 +1174,80 @@ impl TempoSessionProvider {
             .unwrap_or(0)
     }
 
+    /// Load the channel a session challenge would pay from the durable store
+    /// into memory, checked against chain state, without signing anything.
+    ///
+    /// Clients call this ahead of their first request, for example with the
+    /// challenge of an unpaid probe, so that payment does not wait for the
+    /// store and the chain. Returns whether a channel is ready to pay.
+    pub async fn restore(&self, challenge: &PaymentChallenge) -> Result<bool, MppError> {
+        challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
+        let chain_id = resolve_chain_id(challenge);
+        let escrow_contract = resolve_escrow_with_policy(
+            challenge,
+            chain_id,
+            self.escrow_contract,
+            self.allow_custom_escrow,
+        )?;
+        if !is_precompile_escrow(escrow_contract) {
+            return Ok(false);
+        }
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
+        let (payee, route_operator, currency) = Self::payment_route(&session_req, chain_id)?;
+        let key = Self::payment_scope_key(
+            &session_req,
+            payee,
+            route_operator,
+            currency,
+            escrow_contract,
+            chain_id,
+        )?;
+        if self.channels.lock().unwrap().contains_key(&key) {
+            return Ok(true);
+        }
+        let _process_lease = self.acquire_payment_lock(challenge).await?;
+        let _store_lease = self
+            .channel_store
+            .acquire(&key)
+            .await
+            .map_err(Self::store_error)?;
+        if self.channels.lock().unwrap().contains_key(&key) {
+            return Ok(true);
+        }
+        let payer = self.signing_mode.from_address(self.signer.address());
+        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+        let restored = self
+            .restore_precompile_channel(
+                &self.rpc_provider,
+                &key,
+                RecoveryScope {
+                    payer,
+                    authorized_signer,
+                    payee,
+                    operator: route_operator,
+                    token: currency,
+                    escrow: escrow_contract,
+                    chain_id,
+                },
+                session_req.session_snapshot().as_ref(),
+                session_req.parse_amount()?,
+            )
+            .await?;
+        let Some((entry, _)) = restored else {
+            return Ok(false);
+        };
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(entry.channel_id.to_string(), key.clone());
+        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.notify_update(&entry);
+        Ok(true)
+    }
+
     /// Create a signed voucher credential for an active session channel.
     ///
     /// This is used by streaming transports such as SSE and WebSocket, where
