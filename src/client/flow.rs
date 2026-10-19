@@ -26,7 +26,11 @@ use crate::protocol::core::{
 };
 
 /// Sends the requests of a payment flow.
-pub(crate) trait Exchange: Send {
+///
+/// Implement this to run the HTTP 402 payment flow over a transport other
+/// than a [`reqwest::Client`], such as a host application's HTTP stack. See
+/// [`send_with_exchange`].
+pub trait Exchange: Send {
     /// Error of a request that could not be sent.
     type Error: Display + Send;
 
@@ -43,7 +47,8 @@ pub(crate) trait Exchange: Send {
 }
 
 /// Failure of a payment flow.
-pub(crate) enum FlowError<E> {
+#[derive(Debug)]
+pub enum FlowError<E> {
     /// The payment could not be made or reconciled.
     Payment(HttpError),
     /// A request could not be sent.
@@ -62,6 +67,30 @@ enum Prepaid {
     Answered(Response),
     /// The server asked for payment again; this is the unpaid request's response.
     Unpaid(Response),
+}
+
+/// Sends `request` through `exchange`, paying any `402 Payment Required`
+/// answer with `provider` and repeating the request with the credential.
+///
+/// The returned response is the last one `exchange` produced. Request
+/// failures are returned as [`FlowError::Send`] with the exchange's own error,
+/// so callers keep its retry and delivery classification.
+pub async fn send_with_exchange<P: PaymentProvider, X: Exchange>(
+    exchange: &mut X,
+    request: Request,
+    provider: &P,
+    policy: &AcceptPaymentPolicy,
+    events: &ClientEvents,
+    max_payment_retries: usize,
+) -> Result<Response, FlowError<X::Error>> {
+    PaymentFlow {
+        provider,
+        policy,
+        events,
+        max_payment_retries,
+    }
+    .run(exchange, request, None)
+    .await
 }
 
 /// Answers `402 Payment Required` responses by paying a challenge and

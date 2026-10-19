@@ -42,6 +42,7 @@ mod flow;
 mod middleware;
 
 pub use error::HttpError;
+pub use flow::{send_with_exchange, Exchange, FlowError};
 pub use provider::{MultiProvider, PaymentContext, PaymentProvider, PendingPayment};
 
 /// Default number of payment challenge retries after the initial 402 response.
