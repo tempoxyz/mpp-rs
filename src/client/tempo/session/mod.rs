@@ -1544,8 +1544,9 @@ impl TempoSessionProvider {
         Ok(receipt)
     }
 
-    /// A top-up that holds the payment lock and store lease only while it is
-    /// signed and recorded, so vouchers can be signed while it is submitted.
+    /// A top-up that holds the payment lock only while it is recorded, so
+    /// vouchers can be signed while it is read, signed and submitted. Signing
+    /// only reads channel state.
     async fn top_up_in_background(
         &self,
         client: &reqwest::Client,
@@ -1555,18 +1556,9 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<(), MppError> {
-        ensure_redirect_safe_credential_header(challenge)?;
-        let prepared = {
-            let _process_lease = self.acquire_payment_lock(challenge).await?;
-            let (key, _) = self.expected_channel_key(challenge)?;
-            let _store_lease = self
-                .channel_store
-                .acquire(&key)
-                .await
-                .map_err(Self::store_error)?;
-            self.prepare_top_up(headers, challenge, channel_id_hex, additional_deposit)
-                .await?
-        };
+        let prepared = self
+            .prepare_top_up(headers, challenge, channel_id_hex, additional_deposit)
+            .await?;
         self.submit_top_up(client, url, challenge, &prepared)
             .await?;
         let _process_lease = self.acquire_payment_lock(challenge).await?;
@@ -1574,7 +1566,6 @@ impl TempoSessionProvider {
     }
 
     /// Signs a top-up against the channel's local, stored and on-chain deposit.
-    /// The caller holds the payment lock and the payment-scope store lease.
     async fn prepare_top_up(
         &self,
         mut headers: reqwest::header::HeaderMap,
