@@ -54,6 +54,8 @@ pub enum ClientEventKind {
     PaymentResponse,
     /// The payment flow failed after a 402 response.
     PaymentFailed,
+    /// A payment channel was opened or topped up.
+    Deposit,
 }
 
 impl ClientEventKind {
@@ -64,6 +66,7 @@ impl ClientEventKind {
             Self::CredentialCreated => "credential.created",
             Self::PaymentResponse => "payment.response",
             Self::PaymentFailed => "payment.failed",
+            Self::Deposit => "channel.deposit",
         }
     }
 }
@@ -100,6 +103,30 @@ pub struct PaymentResponseContext {
     /// The response's `Payment-Receipt`. A session receipt is included only
     /// when it matches the challenge and the paying channel.
     pub receipt: Option<Box<Receipt>>,
+    /// What the server charged for the request, in base units of the
+    /// challenge's currency: a charge's amount, or for a session the change in
+    /// the channel's `spent` reported by the receipt (the quoted price the
+    /// first time a channel is seen). `None` when the provider does not track it.
+    pub amount: Option<u128>,
+}
+
+/// Context for `channel.deposit`: money moved from the wallet into a payment
+/// channel, when the server accepted the channel's open or a top-up.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DepositContext {
+    /// URL of the request that opened or topped up the channel.
+    pub url: Url,
+    /// Channel identifier.
+    pub channel_id: String,
+    /// Token the channel holds, when the channel has a descriptor.
+    pub currency: Option<String>,
+    /// Amount this deposit added, in base units of the channel's token.
+    pub amount: u128,
+    /// The channel's deposit afterwards.
+    pub deposit: u128,
+    /// Whether this deposit opened the channel; otherwise it topped it up.
+    pub opened: bool,
 }
 
 /// Structured reason for a `payment.failed` event.
@@ -151,6 +178,8 @@ pub enum ClientEvent {
     PaymentResponse(PaymentResponseContext),
     /// The payment flow failed.
     PaymentFailed(PaymentFailedContext),
+    /// A payment channel was opened or topped up.
+    Deposit(DepositContext),
 }
 
 impl ClientEvent {
@@ -161,6 +190,7 @@ impl ClientEvent {
             Self::CredentialCreated(_) => ClientEventKind::CredentialCreated,
             Self::PaymentResponse(_) => ClientEventKind::PaymentResponse,
             Self::PaymentFailed(_) => ClientEventKind::PaymentFailed,
+            Self::Deposit(_) => ClientEventKind::Deposit,
         }
     }
 }
@@ -308,6 +338,25 @@ impl ClientEvents {
         self.on(ClientEventKind::PaymentFailed, move |event| {
             let fut = match event {
                 ClientEvent::PaymentFailed(ctx) => Some(handler(ctx)),
+                _ => None,
+            };
+            async move {
+                if let Some(fut) = fut {
+                    fut.await;
+                }
+            }
+        })
+    }
+
+    /// Register a `channel.deposit` observer.
+    pub fn on_deposit<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(DepositContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on(ClientEventKind::Deposit, move |event| {
+            let fut = match event {
+                ClientEvent::Deposit(ctx) => Some(handler(ctx)),
                 _ => None,
             };
             async move {

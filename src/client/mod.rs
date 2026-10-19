@@ -47,7 +47,9 @@ mod middleware;
 
 pub use error::HttpError;
 pub use flow::{send_with_exchange, Exchange, FlowError};
-pub use provider::{MultiProvider, PaymentContext, PaymentProvider, PendingPayment};
+pub use provider::{
+    MultiProvider, PaymentContext, PaymentEventFuture, PaymentProvider, PendingPayment,
+};
 
 /// Default number of payment challenge retries after the initial 402 response.
 #[cfg(any(feature = "client", feature = "middleware"))]
@@ -59,7 +61,8 @@ pub use accept_payment_policy::AcceptPaymentPolicy;
 #[cfg(feature = "client")]
 pub use events::{
     ChallengeReceivedContext, ClientEvent, ClientEventKind, ClientEventSubscription, ClientEvents,
-    CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
+    CredentialCreatedContext, DepositContext, PaymentFailedContext, PaymentFailureReason,
+    PaymentResponseContext,
 };
 
 #[cfg(feature = "client")]

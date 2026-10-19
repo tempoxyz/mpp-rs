@@ -405,10 +405,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             let session = challenge.intent.as_str() == "session";
             let session_receipt_valid = !session || receipt.is_some();
             if status.is_success() {
-                if let Some(receipt) = receipt.as_ref().filter(|_| session) {
-                    self.provider
-                        .observe_receipt(&payment_context, &challenge, receipt);
-                }
+                let amount = self.charged(&payment_context, &challenge, receipt.as_ref(), session);
                 self.events
                     .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
                         challenge,
@@ -416,6 +413,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         status,
                         url: payment_context.url.clone(),
                         receipt: receipt.map(Box::new),
+                        amount,
                     }))
                     .await;
                 if session_receipt_valid {
@@ -516,12 +514,8 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         }
         if status.is_success() {
             let receipt = paid_receipt(&resp, &challenge, &credential);
-            if let Some(receipt) = receipt
-                .as_ref()
-                .filter(|_| challenge.intent.as_str() == "session")
-            {
-                self.provider.observe_receipt(context, &challenge, receipt);
-            }
+            let session = challenge.intent.as_str() == "session";
+            let amount = self.charged(context, &challenge, receipt.as_ref(), session);
             self.events
                 .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
                     challenge,
@@ -529,10 +523,35 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     status,
                     url: context.url.clone(),
                     receipt: receipt.map(Box::new),
+                    amount,
                 }))
                 .await;
         }
         Ok(Prepaid::Answered(resp))
+    }
+
+    /// Records a paid response's receipt and returns what the request cost: a
+    /// session's change in `spent` as the provider tracks it, or the amount a
+    /// charge challenge asked for.
+    fn charged(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: Option<&Receipt>,
+        session: bool,
+    ) -> Option<u128> {
+        if session {
+            return receipt
+                .and_then(|receipt| self.provider.record_receipt(context, challenge, receipt));
+        }
+        challenge
+            .request
+            .decode::<serde_json::Value>()
+            .ok()?
+            .get("amount")?
+            .as_str()?
+            .parse()
+            .ok()
     }
 
     /// Emits `payment.failed` for `error` and hands it back.

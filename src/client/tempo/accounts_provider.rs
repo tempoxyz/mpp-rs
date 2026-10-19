@@ -19,7 +19,7 @@ use super::{
     signing::{KeychainVersion, TempoSigningMode},
 };
 use crate::{
-    client::{PaymentContext, PaymentProvider},
+    client::{ClientEvents, PaymentContext, PaymentProvider},
     error::{MppError, ResultExt},
     protocol::core::{PaymentChallenge, PaymentCredential},
     protocol::intents::{ChargeRequest, SessionRequest},
@@ -57,6 +57,7 @@ struct AccountsSession {
     max_deposit: Option<u128>,
     fee_token: Option<Address>,
     prepaid_requests: Option<u32>,
+    events: Option<ClientEvents>,
 }
 
 impl TempoAccountsProvider {
@@ -208,6 +209,7 @@ impl TempoAccountsProvider {
             max_deposit: None,
             fee_token: None,
             prepaid_requests: None,
+            events: None,
         });
         self
     }
@@ -302,6 +304,15 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Report session channel opens and top-ups, including background top-ups,
+    /// as `channel.deposit` events. See [`TempoSessionProvider::with_events`].
+    pub fn with_session_events(mut self, events: ClientEvents) -> Self {
+        if let Some(session) = self.session.as_mut() {
+            session.events = Some(events);
+        }
+        self
+    }
+
     /// Pay gas for unsponsored session opens and top-ups in `token`.
     pub fn with_session_fee_token(mut self, token: Address) -> Self {
         if let Some(session) = self.session.as_mut() {
@@ -344,6 +355,9 @@ impl TempoAccountsProvider {
         }
         if let Some(requests) = session.prepaid_requests {
             provider = provider.with_prepaid_requests(requests);
+        }
+        if let Some(events) = &session.events {
+            provider = provider.with_events(events.clone());
         }
         *cached = Some(provider.clone());
         Ok(provider)
@@ -608,11 +622,34 @@ impl PaymentProvider for TempoAccountsProvider {
         challenge: &PaymentChallenge,
         receipt: &crate::protocol::core::Receipt,
     ) {
-        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
-            if let Ok(provider) = self.configured_session_provider() {
-                provider.observe_receipt(context, challenge, receipt);
-            }
+        let _ = self.record_receipt(context, challenge, receipt);
+    }
+
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &crate::protocol::core::Receipt,
+    ) -> Option<u128> {
+        if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
+            return None;
         }
+        self.configured_session_provider()
+            .ok()?
+            .record_receipt(context, challenge, receipt)
+    }
+
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<crate::client::PaymentEventFuture> {
+        self.session.as_ref()?;
+        self.configured_session_provider()
+            .ok()?
+            .stream_event(client, url, name, data)
     }
 
     fn accept_payment_header(&self) -> Option<String> {

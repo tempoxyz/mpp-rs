@@ -22,7 +22,10 @@ use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::Incoming,
-    header::{HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION},
+    header::{
+        HeaderName, HeaderValue, CONNECTION, CONTENT_TYPE, HOST, PROXY_AUTHENTICATE,
+        PROXY_AUTHORIZATION,
+    },
     http::uri::Authority,
     server::conn::http1,
     service::service_fn,
@@ -46,8 +49,8 @@ use tokio_rustls::{
 };
 
 use super::{
-    send_with_exchange, AcceptPaymentPolicy, ClientEvents, FlowError, PaymentProvider,
-    DEFAULT_MAX_PAYMENT_RETRIES,
+    send_with_exchange, AcceptPaymentPolicy, ClientEvent, ClientEvents, FlowError,
+    PaymentFailedContext, PaymentProvider, DEFAULT_MAX_PAYMENT_RETRIES,
 };
 use crate::error::{MppError, ResultExt};
 
@@ -383,14 +386,18 @@ impl<P: PaymentProvider + 'static> Proxy<P> {
         let mut forwarded = reqwest::Request::new(parts.method, url.clone());
         *forwarded.headers_mut() = parts.headers;
         *forwarded.body_mut() = Some(body.into());
-        let response = if self.policy.allows(&url) {
-            let provider = self
-                .provider(&url)
-                .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+        let provider = match self.policy.allows(&url) {
+            true => Some(
+                self.provider(&url)
+                    .map_err(|error| (StatusCode::BAD_GATEWAY, error))?,
+            ),
+            false => None,
+        };
+        let response = if let Some(provider) = &provider {
             send_with_exchange(
                 &mut self.client.clone(),
                 forwarded,
-                &provider,
+                provider,
                 &self.policy,
                 &self.events,
                 DEFAULT_MAX_PAYMENT_RETRIES,
@@ -409,10 +416,50 @@ impl<P: PaymentProvider + 'static> Proxy<P> {
                 .await
                 .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?
         };
+        let stream = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream"));
         let mut response = Response::<reqwest::Body>::from(response);
         strip_hop_by_hop(response.headers_mut());
         *response.version_mut() = parts.version;
-        Ok(response.map(|body| body.map_err(Into::into).boxed_unsync()))
+        Ok(match provider.filter(|_| stream) {
+            Some(provider) => response.map(|body| self.answer_events(body, provider, url)),
+            None => response.map(|body| body.map_err(Into::into).boxed_unsync()),
+        })
+    }
+
+    /// Passes a paid event stream through unchanged while the provider answers
+    /// its payment events, such as an mppx session's `payment-need-voucher`.
+    fn answer_events(&self, body: reqwest::Body, provider: P, url: Url) -> Body {
+        let (client, events) = (self.client.clone(), self.events.clone());
+        let mut stream = ServerSentEvents::default();
+        body.map_frame(move |frame| {
+            for (name, data) in frame
+                .data_ref()
+                .map(|data| stream.push(data))
+                .unwrap_or_default()
+            {
+                let Some(work) = provider.stream_event(&client, url.as_str(), &name, &data) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = work.await {
+                        events
+                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext::new(
+                                None,
+                                error.to_string(),
+                            )))
+                            .await;
+                    }
+                });
+            }
+            frame
+        })
+        .map_err(Into::into)
+        .boxed_unsync()
     }
 
     fn provider(&self, url: &Url) -> Result<P, String> {
@@ -487,6 +534,39 @@ impl CertificateAuthority {
         let config = Arc::new(config);
         configs.insert(host.to_owned(), config.clone());
         Ok(config)
+    }
+}
+
+/// Named events parsed from a `text/event-stream` body as it arrives.
+#[derive(Default)]
+struct ServerSentEvents {
+    buffer: Vec<u8>,
+    name: Option<String>,
+    data: Vec<String>,
+}
+
+impl ServerSentEvents {
+    fn push(&mut self, chunk: &[u8]) -> Vec<(String, String)> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=end).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\n', '\r']);
+            let field = |prefix: &str| {
+                line.strip_prefix(prefix)
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value).to_owned())
+            };
+            if line.is_empty() {
+                let data = std::mem::take(&mut self.data).join("\n");
+                events.extend(self.name.take().map(|name| (name, data)));
+            } else if let Some(name) = field("event:") {
+                self.name = Some(name);
+            } else if let Some(data) = field("data:") {
+                self.data.push(data);
+            }
+        }
+        events
     }
 }
 

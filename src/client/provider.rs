@@ -11,6 +11,9 @@ use reqwest::header::HeaderMap;
 use reqwest::Url;
 use std::future::Future;
 
+/// Work a payment event in a response stream triggers, such as sending a voucher.
+pub type PaymentEventFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send>>;
+
 /// HTTP request context available while creating a payment credential.
 ///
 /// Session providers use this to submit management credentials, such as a
@@ -216,6 +219,34 @@ pub trait PaymentProvider: Clone + Send + Sync {
         receipt: &Receipt,
     ) {
         let _ = (context, challenge, receipt);
+    }
+
+    /// Observe a receipt like [`observe_receipt`](Self::observe_receipt) and
+    /// return what the server charged for the request, when the provider tracks
+    /// it. Session providers report the change in the channel's `spent`. The
+    /// default observes the receipt and reports nothing.
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        self.observe_receipt(context, challenge, receipt);
+        None
+    }
+
+    /// Handle a named server-sent event from a paid response to `url`, such as
+    /// an mppx session's `payment-need-voucher`, and return the work it
+    /// triggers. Providers without in-stream payments return `None`, the default.
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        let _ = (client, url, name, data);
+        None
     }
 
     /// Build an `Accept-Payment` header value from this provider's supported methods.
@@ -565,6 +596,32 @@ impl PaymentProvider for MultiProvider {
         }
     }
 
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+        self.providers
+            .iter()
+            .find(|provider| provider.dyn_supports(method, intent))
+            .and_then(|provider| provider.dyn_record_receipt(context, challenge, receipt))
+    }
+
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.dyn_stream_event(client, url, name, data))
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let mut entries: Vec<Entry> = Vec::new();
         for provider in &self.providers {
@@ -643,6 +700,19 @@ trait DynPaymentProvider: Send + Sync {
         challenge: &PaymentChallenge,
         receipt: &Receipt,
     );
+    fn dyn_record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128>;
+    fn dyn_stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture>;
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -747,6 +817,25 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         receipt: &Receipt,
     ) {
         PaymentProvider::observe_receipt(self, context, challenge, receipt);
+    }
+
+    fn dyn_record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        PaymentProvider::record_receipt(self, context, challenge, receipt)
+    }
+
+    fn dyn_stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        PaymentProvider::stream_event(self, client, url, name, data)
     }
 
     fn dyn_accept_payment_header(&self) -> Option<String> {

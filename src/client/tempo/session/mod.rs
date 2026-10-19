@@ -36,7 +36,9 @@ use self::recovery::{
 use self::store::{ChannelStore, ChannelStoreLease, MemoryChannelStore, StoredChannelEntry};
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
-use crate::client::{PaymentContext, PaymentProvider};
+use crate::client::{
+    ClientEvent, ClientEvents, DepositContext, PaymentContext, PaymentEventFuture, PaymentProvider,
+};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
@@ -140,11 +142,12 @@ pub struct TempoSessionProvider {
     topping_up: Arc<Mutex<HashSet<String>>>,
     /// What the server charged for requests paid through this provider.
     spend: Arc<Mutex<SpendLedger>>,
+    /// Receives `channel.deposit` events for accepted opens and top-ups.
+    events: ClientEvents,
 }
 
 /// Work a session SSE event triggers, such as sending a voucher.
-pub type SessionEventFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MppError>> + Send>>;
+pub type SessionEventFuture = PaymentEventFuture;
 
 /// What a session provider's channels were charged since it was created.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -167,7 +170,7 @@ struct SpendLedger {
 }
 
 impl SpendLedger {
-    fn record(&mut self, channel_id: &str, spent: u128, quoted: Option<u128>) {
+    fn record(&mut self, channel_id: &str, spent: u128, quoted: Option<u128>) -> u128 {
         let cost = match self.channels.get(channel_id) {
             Some(previous) => spent.saturating_sub(*previous),
             None => quoted.unwrap_or_default(),
@@ -175,6 +178,7 @@ impl SpendLedger {
         self.channels.insert(channel_id.to_owned(), spent);
         self.spent += cost;
         self.last = Some(cost);
+        cost
     }
 }
 
@@ -261,6 +265,7 @@ impl TempoSessionProvider {
             prepaid: Arc::new(Mutex::new(HashMap::new())),
             topping_up: Arc::new(Mutex::new(HashSet::new())),
             spend: Arc::default(),
+            events: ClientEvents::default(),
         })
     }
 
@@ -447,6 +452,35 @@ impl TempoSessionProvider {
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
         self.channel_store = store;
         self
+    }
+
+    /// Report `channel.deposit` events to `events` when the server accepts a
+    /// channel's open or a top-up, including top-ups made in the background.
+    pub fn with_events(mut self, events: ClientEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Reports an accepted deposit without waiting for the observers.
+    fn report_deposit(&self, url: &str, entry: &ChannelEntry, amount: u128, opened: bool) {
+        let (Ok(url), Ok(runtime)) = (url.parse(), tokio::runtime::Handle::try_current()) else {
+            return;
+        };
+        let events = self.events.clone();
+        let context = DepositContext {
+            url,
+            channel_id: entry.channel_id.to_string(),
+            currency: entry
+                .descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.token.clone()),
+            amount,
+            deposit: entry.deposit,
+            opened,
+        };
+        runtime.spawn(async move {
+            events.emit(ClientEvent::Deposit(context)).await;
+        });
     }
 
     /// Set a callback for channel state changes.
@@ -1368,6 +1402,43 @@ impl TempoSessionProvider {
         });
     }
 
+    /// Sizes the prepaid voucher for the receipt's URL from what the server
+    /// charged, and tops the channel up ahead of it when needed.
+    fn prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        channel_id: String,
+        spent: u128,
+        quoted: Option<u128>,
+    ) {
+        if self.prepaid_requests == 0 {
+            return;
+        }
+        let url = context.url.to_string();
+        let mut prepaid = self.prepaid.lock().unwrap();
+        let price = prepaid
+            .get(&url)
+            .filter(|previous| previous.channel_id == channel_id && spent > previous.spent)
+            .map(|previous| spent - previous.spent)
+            .or(quoted)
+            .filter(|price| *price > 0);
+        let Some(price) = price else {
+            return;
+        };
+        prepaid.insert(
+            url,
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id: channel_id.clone(),
+                spent,
+                price,
+            },
+        );
+        drop(prepaid);
+        self.top_up_ahead(context, challenge, &channel_id, price);
+    }
+
     /// Load the channel a session challenge would pay from the durable store
     /// into memory, checked against chain state, without signing anything.
     ///
@@ -1664,7 +1735,7 @@ impl TempoSessionProvider {
         let receipt = self
             .submit_top_up(client, url, challenge, &prepared)
             .await?;
-        self.record_top_up(&prepared).await?;
+        self.record_top_up(url, &prepared).await?;
         Ok(receipt)
     }
 
@@ -1686,7 +1757,7 @@ impl TempoSessionProvider {
         self.submit_top_up(client, url, challenge, &prepared)
             .await?;
         let _process_lease = self.acquire_payment_lock(challenge).await?;
-        self.record_top_up(&prepared).await
+        self.record_top_up(url, &prepared).await
     }
 
     /// Signs a top-up against the channel's local, stored and on-chain deposit.
@@ -1872,7 +1943,7 @@ impl TempoSessionProvider {
 
     /// Records an accepted top-up on the current channel entry, which vouchers
     /// signed while the top-up was submitted may have advanced.
-    async fn record_top_up(&self, prepared: &PreparedTopUp) -> Result<(), MppError> {
+    async fn record_top_up(&self, url: &str, prepared: &PreparedTopUp) -> Result<(), MppError> {
         let mut entry = self
             .channels
             .lock()
@@ -1880,6 +1951,7 @@ impl TempoSessionProvider {
             .get(&prepared.key)
             .cloned()
             .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        let previous = entry.deposit;
         entry.deposit = entry.deposit.max(prepared.new_deposit);
         entry.cumulative_amount = entry.cumulative_amount.max(prepared.cumulative_amount);
         entry.opened = true;
@@ -1889,6 +1961,9 @@ impl TempoSessionProvider {
             .unwrap()
             .insert(prepared.key.clone(), entry.clone());
         self.notify_update(&entry);
+        if entry.deposit > previous {
+            self.report_deposit(url, &entry, entry.deposit - previous, false);
+        }
         Ok(())
     }
 
@@ -3030,55 +3105,58 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         receipt: &Receipt,
     ) {
+        let _ = self.record_receipt(context, challenge, receipt);
+    }
+
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
         if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
-            return;
+            return None;
         }
-        let Some(spent) = receipt
+        let spent = receipt
             .extensions
             .get("spent")
             .and_then(|value| value.as_str())
-            .and_then(|value| value.parse::<u128>().ok())
-        else {
-            return;
-        };
-        let Ok(channel_id) = receipt.reference.parse::<B256>() else {
-            return;
-        };
-        let channel_id = channel_id.to_string();
+            .and_then(|value| value.parse::<u128>().ok())?;
+        let channel_id = receipt.reference.parse::<B256>().ok()?.to_string();
         let quoted = challenge
             .request
             .decode::<SessionRequest>()
             .ok()
             .and_then(|request| request.parse_amount().ok());
-        self.spend
+        let cost = self
+            .spend
             .lock()
             .unwrap()
             .record(&channel_id, spent, quoted);
-        if self.prepaid_requests == 0 {
-            return;
+        if self.pending_opens.lock().unwrap().contains_key(&channel_id) {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .cloned();
+            let entry = key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned());
+            if let Some(entry) = entry {
+                self.report_deposit(context.url.as_str(), &entry, entry.deposit, true);
+            }
         }
-        let url = context.url.to_string();
-        let mut prepaid = self.prepaid.lock().unwrap();
-        let price = prepaid
-            .get(&url)
-            .filter(|previous| previous.channel_id == channel_id && spent > previous.spent)
-            .map(|previous| spent - previous.spent)
-            .or(quoted)
-            .filter(|price| *price > 0);
-        let Some(price) = price else {
-            return;
-        };
-        prepaid.insert(
-            url,
-            PrepaidVoucher {
-                challenge: challenge.clone(),
-                channel_id: channel_id.clone(),
-                spent,
-                price,
-            },
-        );
-        drop(prepaid);
-        self.top_up_ahead(context, challenge, &channel_id, price);
+        self.prepay(context, challenge, channel_id, spent, quoted);
+        Some(cost)
+    }
+
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        TempoSessionProvider::stream_event(self, client, url, name, data)
     }
 
     fn accept_payment_header(&self) -> Option<String> {
