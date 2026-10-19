@@ -102,6 +102,7 @@ where
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     machine_token_enabled: None,
+///     fee_token: None,
 ///     operator: None,
 ///     settlement_adapter: None,
 ///     settlement_recipient: None,
@@ -132,6 +133,10 @@ pub struct TempoSessionMethodDetails {
     /// canonical swapper into the request currency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_token_enabled: Option<bool>,
+
+    /// Token in which a sponsoring server pays gas for channel opens and top-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_token: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settlement_adapter: Option<String>,
@@ -441,6 +446,7 @@ mod tests {
             chain_id: Some(42431),
             fee_payer: Some(true),
             machine_token_enabled: Some(true),
+            fee_token: None,
             settlement_adapter: None,
             settlement_recipient: None,
             settlement_token: None,
@@ -482,6 +488,7 @@ mod tests {
             chain_id: None,
             fee_payer: None,
             machine_token_enabled: None,
+            fee_token: None,
             settlement_adapter: None,
             settlement_recipient: None,
             settlement_token: None,

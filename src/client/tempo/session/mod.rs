@@ -361,6 +361,33 @@ impl TempoSessionProvider {
             .unwrap_or(currency)
     }
 
+    /// The gas token for a channel open or top-up answering `session_req`.
+    ///
+    /// A sponsoring server pays gas in the `feeToken` it advertises and rejects a
+    /// transaction naming another token, such as a MACH channel defaulting to its own
+    /// currency. Without sponsorship, the configured fee token wins, then the
+    /// advertised one.
+    fn session_fee_token(
+        &self,
+        session_req: &SessionRequest,
+        currency: Address,
+    ) -> Result<Address, MppError> {
+        let advertised = session_req
+            .tempo_session_details()
+            .ok()
+            .and_then(|details| details.fee_token)
+            .map(|token| token.parse::<Address>())
+            .transpose()
+            .mpp_config("invalid session feeToken")?;
+        Ok(match advertised {
+            Some(token) if session_req.fee_payer() => token,
+            advertised => self
+                .fee_token
+                .or(advertised)
+                .unwrap_or_else(|| self.fee_token(currency)),
+        })
+    }
+
     fn required_top_up(
         &self,
         required_cumulative: u128,
@@ -1262,7 +1289,7 @@ impl TempoSessionProvider {
             TopUpPrecompilePayloadOptions {
                 prefix_calls,
                 descriptor,
-                fee_token: self.fee_token(currency),
+                fee_token: self.session_fee_token(&session_req, currency)?,
                 additional_deposit,
                 chain_id: entry.chain_id,
                 fee_payer: session_req.fee_payer(),
@@ -2393,7 +2420,7 @@ impl TempoSessionProvider {
                     authorized_signer: Some(authorized_signer),
                     payee,
                     currency,
-                    fee_token: self.fee_token(currency),
+                    fee_token: self.session_fee_token(&session_req, currency)?,
                     deposit,
                     initial_amount: amount,
                     chain_id,
@@ -5237,6 +5264,7 @@ mod tests {
                 chain_id: Some(42431),
                 fee_payer: Some(true),
                 machine_token_enabled: None,
+                fee_token: None,
                 settlement_adapter: None,
                 settlement_recipient: None,
                 settlement_token: None,
