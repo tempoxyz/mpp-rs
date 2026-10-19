@@ -34,9 +34,13 @@ pub mod ws;
 pub mod tempo;
 
 #[cfg(feature = "client")]
+pub mod directory;
+#[cfg(feature = "client")]
 mod fetch;
 #[cfg(feature = "client")]
 mod flow;
+#[cfg(feature = "forward-proxy")]
+mod forward_proxy;
 
 #[cfg(feature = "middleware")]
 mod middleware;
@@ -60,6 +64,9 @@ pub use events::{
 
 #[cfg(feature = "client")]
 pub use fetch::PaymentExt as Fetch;
+
+#[cfg(feature = "forward-proxy")]
+pub use forward_proxy::ForwardProxy;
 
 #[cfg(feature = "middleware")]
 pub use middleware::PaymentMiddleware;
