@@ -9,7 +9,7 @@
 pub mod channel_ops;
 pub mod recovery;
 pub mod store;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use alloy::{
@@ -136,6 +136,8 @@ pub struct TempoSessionProvider {
     prepaid_requests: u32,
     /// Reusable challenge and charged amounts from the latest receipt, by request URL.
     prepaid: Arc<Mutex<HashMap<String, PrepaidVoucher>>>,
+    /// Channel IDs with a background top-up in flight.
+    topping_up: Arc<Mutex<HashSet<String>>>,
 }
 
 /// What a prepaid voucher for a URL is sized from: its latest receipt.
@@ -200,6 +202,7 @@ impl TempoSessionProvider {
             pending_payment_leases: Arc::new(Mutex::new(HashMap::new())),
             prepaid_requests: 0,
             prepaid: Arc::new(Mutex::new(HashMap::new())),
+            topping_up: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -210,6 +213,10 @@ impl TempoSessionProvider {
     /// Requires a server whose session challenges stay valid for later requests
     /// to the same route and charge each request its own price (mppx
     /// `reusableChallenges`). Any `402` answer falls back to the normal flow.
+    ///
+    /// With a top-up amount configured, the channel is also topped up in the
+    /// background once its deposit no longer covers that balance plus the next
+    /// request, so the on-chain top-up does not hold up a later request.
     pub fn with_prepaid_requests(mut self, requests: u32) -> Self {
         self.prepaid_requests = requests;
         self
@@ -1172,6 +1179,66 @@ impl TempoSessionProvider {
             .map(|e| e.cumulative_amount)
             .next()
             .unwrap_or(0)
+    }
+
+    /// Starts a background top-up when the channel's deposit no longer covers
+    /// the prepaid balance plus the next request at the latest price.
+    fn top_up_ahead(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        channel_id: &str,
+        price: u128,
+    ) {
+        let (Some(amount), Some(client), Ok(runtime)) = (
+            self.top_up_amount,
+            context.http_client.clone(),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
+        };
+        let entry = {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(channel_id)
+                .cloned();
+            key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned())
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        let reserve = price.saturating_mul(u128::from(self.prepaid_requests) + 1);
+        if entry.deposit.saturating_sub(entry.cumulative_amount) >= reserve {
+            return;
+        }
+        if !self
+            .topping_up
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_owned())
+        {
+            return;
+        }
+        let provider = self.clone();
+        let url = context.url.to_string();
+        let headers = context.headers.clone();
+        let challenge = challenge.clone();
+        let channel_id = channel_id.to_owned();
+        runtime.spawn(async move {
+            let _ = provider
+                .top_up_with_headers_for_challenge(
+                    &client,
+                    &url,
+                    headers,
+                    &challenge,
+                    &channel_id,
+                    amount,
+                )
+                .await;
+            provider.topping_up.lock().unwrap().remove(&channel_id);
+        });
     }
 
     /// Load the channel a session challenge would pay from the durable store
@@ -2791,11 +2858,13 @@ impl PaymentProvider for TempoSessionProvider {
             url,
             PrepaidVoucher {
                 challenge: challenge.clone(),
-                channel_id,
+                channel_id: channel_id.clone(),
                 spent,
                 price,
             },
         );
+        drop(prepaid);
+        self.top_up_ahead(context, challenge, &channel_id, price);
     }
 
     fn accept_payment_header(&self) -> Option<String> {
