@@ -1533,6 +1533,64 @@ impl TempoSessionProvider {
         Ok(true)
     }
 
+    /// The channel a session challenge would pay from, when it is loaded in
+    /// memory, for example after [`restore`](Self::restore).
+    pub fn restored_channel_id(&self, challenge: &PaymentChallenge) -> Option<String> {
+        let (key, _) = self.expected_channel_key(challenge).ok()?;
+        self.channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.opened)
+            .map(|entry| entry.channel_id.to_string())
+    }
+
+    /// Sizes the first prepaid voucher for `url` from the server's session
+    /// snapshot in `challenge`, so a restored channel's first request carries
+    /// its voucher instead of waiting for a `402`, and draws on balance its
+    /// earlier vouchers already cover.
+    ///
+    /// The snapshot's `spent` only lowers what the voucher must cover; it is
+    /// never signed for by itself. Returns whether `url` was primed.
+    pub fn prime_prepaid(&self, url: &str, challenge: &PaymentChallenge) -> bool {
+        if self.prepaid_requests == 0 {
+            return false;
+        }
+        let Ok(session_req) = challenge.request.decode::<SessionRequest>() else {
+            return false;
+        };
+        let Some(snapshot) = session_req.session_snapshot() else {
+            return false;
+        };
+        let (Ok(spent), Ok(price)) = (snapshot.spent.parse::<u128>(), session_req.parse_amount())
+        else {
+            return false;
+        };
+        let Ok(channel_id) = snapshot.channel_id.parse::<B256>() else {
+            return false;
+        };
+        let channel_id = channel_id.to_string();
+        if self.restored_channel_id(challenge).as_deref() != Some(channel_id.as_str()) {
+            return false;
+        }
+        self.spend
+            .lock()
+            .unwrap()
+            .channels
+            .entry(channel_id.clone())
+            .or_insert(spent);
+        self.prepaid.lock().unwrap().insert(
+            url.to_owned(),
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id,
+                spent,
+                price,
+            },
+        );
+        true
+    }
+
     /// Create a signed voucher credential for an active session channel.
     ///
     /// This is used by streaming transports such as SSE and WebSocket, where

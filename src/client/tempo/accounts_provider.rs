@@ -253,14 +253,51 @@ impl TempoAccountsProvider {
         url: &str,
         body: String,
     ) -> Result<(), MppError> {
-        let response = client
+        let challenges = self.probe(client, url, body.clone(), None).await?;
+        let candidates: Vec<_> = challenges.iter().collect();
+        let Some(challenge) = self
+            .select_challenge(&candidates)
+            .filter(|challenge| challenge.intent.as_str() == INTENT_SESSION)
+        else {
+            return Ok(());
+        };
+        let session = self.configured_session_provider()?;
+        if !session.restore(challenge).await? {
+            return Ok(());
+        }
+        let Some(channel_id) = session.restored_channel_id(challenge) else {
+            return Ok(());
+        };
+        // Naming the channel makes the server describe it in its challenge.
+        let described = self.probe(client, url, body, Some(&channel_id)).await?;
+        for challenge in &described {
+            if session.prime_prepaid(url, challenge) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends an unpaid request and returns the payable challenges it receives.
+    async fn probe(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        body: String,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<PaymentChallenge>, MppError> {
+        let mut request = client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .mpp_http("preconnect probe failed")?;
-        let challenges: Vec<_> = crate::protocol::core::parse_www_authenticate_all_bytes(
+            .body(body);
+        if let Some(channel_id) = channel_id {
+            request = request.header("payment-session", channel_id).header(
+                crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
+                "tempo/session",
+            );
+        }
+        let response = request.send().await.mpp_http("preconnect probe failed")?;
+        Ok(crate::protocol::core::parse_www_authenticate_all_bytes(
             response
                 .headers()
                 .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -270,16 +307,7 @@ impl TempoAccountsProvider {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|challenge| self.supports(challenge.method.as_str(), challenge.intent.as_str()))
-        .collect();
-        let candidates: Vec<_> = challenges.iter().collect();
-        match self.select_challenge(&candidates) {
-            Some(challenge) if challenge.intent.as_str() == INTENT_SESSION => self
-                .configured_session_provider()?
-                .restore(challenge)
-                .await
-                .map(drop),
-            _ => Ok(()),
-        }
+        .collect())
     }
 
     /// Set the deposit used when a session challenge does not suggest one.
