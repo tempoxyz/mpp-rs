@@ -44,6 +44,8 @@ pub struct TempoAccountsProvider {
     expected_chain_id: Option<u64>,
     pending_authorizations: Arc<Mutex<HashMap<String, TempoAuthorizationReservation>>>,
     session: Option<AccountsSession>,
+    /// Session policy, kept when the session store changes.
+    session_settings: SessionSettings,
     /// Settlement RPC clients by URL, shared by clones so payments reuse connections.
     rpc_providers: Arc<Mutex<HashMap<reqwest::Url, RootProvider<TempoNetwork>>>>,
 }
@@ -52,6 +54,10 @@ pub struct TempoAccountsProvider {
 struct AccountsSession {
     store: Arc<dyn ChannelStore>,
     provider: Arc<Mutex<Option<TempoSessionProvider>>>,
+}
+
+#[derive(Clone, Default)]
+struct SessionSettings {
     default_deposit: Option<u128>,
     top_up_amount: Option<u128>,
     max_deposit: Option<u128>,
@@ -75,6 +81,7 @@ impl TempoAccountsProvider {
             expected_chain_id: None,
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
             session: None,
+            session_settings: SessionSettings::default(),
             rpc_providers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -200,16 +207,14 @@ impl TempoAccountsProvider {
     }
 
     /// Enable durable payment sessions alongside one-time charges.
+    ///
+    /// Session settings such as the deposit apply whether they are set before
+    /// or after the store. A new store starts a new session provider, so a
+    /// clone given another store keeps the settings but not the channels.
     pub fn with_session_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
         self.session = Some(AccountsSession {
             store,
             provider: Arc::new(Mutex::new(None)),
-            default_deposit: None,
-            top_up_amount: None,
-            max_deposit: None,
-            fee_token: None,
-            prepaid_requests: None,
-            events: None,
         });
         self
     }
@@ -217,6 +222,9 @@ impl TempoAccountsProvider {
     /// Enable durable payment sessions in the shared SQLite channel store
     /// (`$TEMPO_HOME/wallet/channels.db` by default), namespaced by
     /// `service`'s origin so each service reuses its channel across processes.
+    ///
+    /// Call it on a configured wallet to get that service's wallet: the copy
+    /// keeps the wallet's session settings with its own channels.
     #[cfg(feature = "sqlite")]
     pub fn with_sqlite_session_store(
         self,
@@ -273,51 +281,39 @@ impl TempoAccountsProvider {
 
     /// Set the deposit used when a session challenge does not suggest one.
     pub fn with_session_default_deposit(mut self, amount: u128) -> Self {
-        if let Some(session) = self.session.as_mut() {
-            session.default_deposit = Some(amount);
-        }
+        self.session_settings.default_deposit = Some(amount);
         self
     }
 
     /// Set the preferred automatic session top-up size in atomic units.
     pub fn with_session_top_up_amount(mut self, amount: u128) -> Self {
-        if let Some(session) = self.session.as_mut() {
-            session.top_up_amount = Some(amount);
-        }
+        self.session_settings.top_up_amount = Some(amount);
         self
     }
 
     /// Cap the deposit that an automatic session may reserve.
     pub fn with_session_max_deposit(mut self, amount: u128) -> Self {
-        if let Some(session) = self.session.as_mut() {
-            session.max_deposit = Some(amount);
-        }
+        self.session_settings.max_deposit = Some(amount);
         self
     }
 
     /// Keep `requests` requests' worth of session balance prepaid and send the
     /// voucher with the request. See [`TempoSessionProvider::with_prepaid_requests`].
     pub fn with_session_prepaid_requests(mut self, requests: u32) -> Self {
-        if let Some(session) = self.session.as_mut() {
-            session.prepaid_requests = Some(requests);
-        }
+        self.session_settings.prepaid_requests = Some(requests);
         self
     }
 
     /// Report session channel opens and top-ups, including background top-ups,
     /// as `channel.deposit` events. See [`TempoSessionProvider::with_events`].
     pub fn with_session_events(mut self, events: ClientEvents) -> Self {
-        if let Some(session) = self.session.as_mut() {
-            session.events = Some(events);
-        }
+        self.session_settings.events = Some(events);
         self
     }
 
     /// Pay gas for unsponsored session opens and top-ups in `token`.
     pub fn with_session_fee_token(mut self, token: Address) -> Self {
-        if let Some(session) = self.session.as_mut() {
-            session.fee_token = Some(token);
-        }
+        self.session_settings.fee_token = Some(token);
         self
     }
 
@@ -340,23 +336,24 @@ impl TempoAccountsProvider {
         if let Some(provider) = cached.as_ref() {
             return Ok(provider.clone());
         }
+        let settings = &self.session_settings;
         let mut provider = self.session_provider(session.store.clone())?;
-        if let Some(amount) = session.default_deposit {
+        if let Some(amount) = settings.default_deposit {
             provider = provider.with_default_deposit(amount);
         }
-        if let Some(amount) = session.top_up_amount {
+        if let Some(amount) = settings.top_up_amount {
             provider = provider.with_top_up_amount(amount);
         }
-        if let Some(amount) = session.max_deposit {
+        if let Some(amount) = settings.max_deposit {
             provider = provider.with_max_deposit(amount);
         }
-        if let Some(token) = session.fee_token {
+        if let Some(token) = settings.fee_token {
             provider = provider.with_fee_token(token);
         }
-        if let Some(requests) = session.prepaid_requests {
+        if let Some(requests) = settings.prepaid_requests {
             provider = provider.with_prepaid_requests(requests);
         }
-        if let Some(events) = &session.events {
+        if let Some(events) = &settings.events {
             provider = provider.with_events(events.clone());
         }
         *cached = Some(provider.clone());
@@ -770,10 +767,7 @@ mod tests {
             .with_session_default_deposit(20_000)
             .with_session_top_up_amount(20_000)
             .with_session_max_deposit(1_000_000);
-        assert_eq!(
-            provider.session.as_ref().unwrap().top_up_amount,
-            Some(20_000)
-        );
+        assert_eq!(provider.session_settings.top_up_amount, Some(20_000));
         let session = provider.configured_session_provider().unwrap();
 
         assert!(provider.supports("tempo", "charge"));
