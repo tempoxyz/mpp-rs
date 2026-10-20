@@ -56,6 +56,8 @@ pub enum ClientEventKind {
     PaymentFailed,
     /// A payment channel was opened or topped up.
     Deposit,
+    /// A session request was charged or credited while its response streamed.
+    PaymentUpdate,
 }
 
 impl ClientEventKind {
@@ -67,6 +69,7 @@ impl ClientEventKind {
             Self::PaymentResponse => "payment.response",
             Self::PaymentFailed => "payment.failed",
             Self::Deposit => "channel.deposit",
+            Self::PaymentUpdate => "payment.update",
         }
     }
 }
@@ -132,6 +135,23 @@ pub struct DepositContext {
     pub opened: bool,
 }
 
+/// Context for `payment.update`: a session server reported, in a
+/// `payment-receipt` event of a streaming response, that it charged the
+/// request more as output was delivered, or settled it at its final usage.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PaymentUpdateContext {
+    /// URL of the streaming request.
+    pub url: Url,
+    /// Channel identifier.
+    pub channel_id: String,
+    /// The channel's `spent` after the update, in base units of its token.
+    pub spent: u128,
+    /// How much `spent` changed since the channel's previous receipt:
+    /// positive for a charge, negative for a credit.
+    pub change: i128,
+}
+
 /// Structured reason for a `payment.failed` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -183,6 +203,8 @@ pub enum ClientEvent {
     PaymentFailed(PaymentFailedContext),
     /// A payment channel was opened or topped up.
     Deposit(DepositContext),
+    /// A session request was charged or credited while its response streamed.
+    PaymentUpdate(PaymentUpdateContext),
 }
 
 impl ClientEvent {
@@ -194,6 +216,7 @@ impl ClientEvent {
             Self::PaymentResponse(_) => ClientEventKind::PaymentResponse,
             Self::PaymentFailed(_) => ClientEventKind::PaymentFailed,
             Self::Deposit(_) => ClientEventKind::Deposit,
+            Self::PaymentUpdate(_) => ClientEventKind::PaymentUpdate,
         }
     }
 }
@@ -360,6 +383,25 @@ impl ClientEvents {
         self.on(ClientEventKind::Deposit, move |event| {
             let fut = match event {
                 ClientEvent::Deposit(ctx) => Some(handler(ctx)),
+                _ => None,
+            };
+            async move {
+                if let Some(fut) = fut {
+                    fut.await;
+                }
+            }
+        })
+    }
+
+    /// Register a `payment.update` callback.
+    pub fn on_payment_update<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(PaymentUpdateContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on(ClientEventKind::PaymentUpdate, move |event| {
+            let fut = match event {
+                ClientEvent::PaymentUpdate(ctx) => Some(handler(ctx)),
                 _ => None,
             };
             async move {

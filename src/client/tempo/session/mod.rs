@@ -38,6 +38,7 @@ use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
 use crate::client::{
     ClientEvent, ClientEvents, DepositContext, PaymentContext, PaymentEventFuture, PaymentProvider,
+    PaymentUpdateContext,
 };
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
@@ -179,6 +180,20 @@ impl SpendLedger {
         self.spent += cost;
         self.last = Some(cost);
         cost
+    }
+
+    /// Applies a receipt the server sent while the latest request's response
+    /// streamed, and returns how much it changed the channel's `spent`.
+    /// A channel without an earlier receipt only records its baseline.
+    fn update(&mut self, channel_id: &str, spent: u128) -> Option<i128> {
+        let previous = self.channels.insert(channel_id.to_owned(), spent)?;
+        let change = i128::try_from(spent).ok()? - i128::try_from(previous).ok()?;
+        if change == 0 {
+            return None;
+        }
+        self.spent = self.spent.saturating_add_signed(change);
+        self.last = self.last.map(|last| last.saturating_add_signed(change));
+        Some(change)
     }
 }
 
@@ -330,6 +345,7 @@ impl TempoSessionProvider {
                 let parsed =
                     serde_json::from_str::<crate::protocol::methods::tempo::SessionReceipt>(data)
                         .mpp_config("invalid payment-receipt event");
+                let url = url.parse::<reqwest::Url>().ok();
                 Some(Box::pin(async move {
                     let receipt = parsed?;
                     session
@@ -337,8 +353,11 @@ impl TempoSessionProvider {
                             &receipt.channel_id,
                             amount(&receipt.accepted_cumulative)?,
                         )
-                        .await
-                        .map(drop)
+                        .await?;
+                    session
+                        .record_stream_receipt(url, &receipt.channel_id, amount(&receipt.spent)?)
+                        .await;
+                    Ok(())
                 }))
             }
             _ => None,
@@ -2402,6 +2421,31 @@ impl TempoSessionProvider {
     /// carrying the server's accepted cumulative amount. An accepted amount
     /// covering the open's authorized cumulative amount resolves the open, so
     /// later vouchers may raise it. Returns whether an open was resolved.
+    /// Records the `spent` a streaming response's `payment-receipt` reports
+    /// and emits `payment.update` when it changed.
+    async fn record_stream_receipt(
+        &self,
+        url: Option<reqwest::Url>,
+        channel_id_hex: &str,
+        spent: u128,
+    ) {
+        let Ok(channel_id) = channel_id_hex.parse::<B256>() else {
+            return;
+        };
+        let channel_id = channel_id.to_string();
+        let change = self.spend.lock().unwrap().update(&channel_id, spent);
+        if let (Some(change), Some(url)) = (change, url) {
+            self.events
+                .emit(ClientEvent::PaymentUpdate(PaymentUpdateContext {
+                    url,
+                    channel_id,
+                    spent,
+                    change,
+                }))
+                .await;
+        }
+    }
+
     pub async fn acknowledge_accepted(
         &self,
         channel_id_hex: &str,
