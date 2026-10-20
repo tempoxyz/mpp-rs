@@ -235,6 +235,14 @@ pub trait PaymentProvider: Clone + Send + Sync {
         None
     }
 
+    /// The token the payer spent on `challenge`'s credential, when it differs from or is not
+    /// stated by the challenge, such as MACH swapped into a charge's currency. Providers that
+    /// fund payments in the challenge currency report nothing, the default.
+    fn funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        let _ = challenge;
+        None
+    }
+
     /// Handle a named server-sent event from a paid response to `url`, such as
     /// an mppx session's `payment-need-voucher`, and return the work it
     /// triggers. Providers without in-stream payments return `None`, the default.
@@ -622,6 +630,12 @@ impl PaymentProvider for MultiProvider {
             .find_map(|provider| provider.dyn_stream_event(client, url, name, data))
     }
 
+    fn funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.dyn_funding_currency(challenge))
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let mut entries: Vec<Entry> = Vec::new();
         for provider in &self.providers {
@@ -712,6 +726,7 @@ trait DynPaymentProvider: Send + Sync {
         name: &str,
         data: &str,
     ) -> Option<PaymentEventFuture>;
+    fn dyn_funding_currency(&self, challenge: &PaymentChallenge) -> Option<String>;
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -830,6 +845,10 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         data: &str,
     ) -> Option<PaymentEventFuture> {
         PaymentProvider::stream_event(self, client, url, name, data)
+    }
+
+    fn dyn_funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        PaymentProvider::funding_currency(self, challenge)
     }
 
     fn dyn_accept_payment_header(&self) -> Option<String> {

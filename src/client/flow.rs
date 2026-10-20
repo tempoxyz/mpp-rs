@@ -406,6 +406,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             let session_receipt_valid = !session || receipt.is_some();
             if status.is_success() {
                 let amount = self.charged(&payment_context, &challenge, receipt.as_ref(), session);
+                let funding_currency = self.provider.funding_currency(&challenge);
                 self.events
                     .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
                         challenge,
@@ -414,6 +415,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         url: payment_context.url.clone(),
                         receipt: receipt.map(Box::new),
                         amount,
+                        funding_currency,
                     }))
                     .await;
                 if session_receipt_valid {
@@ -516,6 +518,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             let receipt = paid_receipt(&resp, &challenge, &credential);
             let session = challenge.intent.as_str() == "session";
             let amount = self.charged(context, &challenge, receipt.as_ref(), session);
+            let funding_currency = self.provider.funding_currency(&challenge);
             self.events
                 .emit(ClientEvent::PaymentResponse(PaymentResponseContext {
                     challenge,
@@ -524,6 +527,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     url: context.url.clone(),
                     receipt: receipt.map(Box::new),
                     amount,
+                    funding_currency,
                 }))
                 .await;
         }

@@ -108,6 +108,9 @@ pub struct PaymentResponseContext {
     /// the channel's `spent` reported by the receipt (the quoted price the
     /// first time a channel is seen). `None` when the provider does not track it.
     pub amount: Option<u128>,
+    /// The token the payer spent, when the provider reports one, such as MACH swapped into a
+    /// charge's currency. See [`PaymentProvider::funding_currency`](super::PaymentProvider::funding_currency).
+    pub funding_currency: Option<String>,
 }
 
 /// Context for `channel.deposit`: money moved from the wallet into a payment

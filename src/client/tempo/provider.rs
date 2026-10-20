@@ -56,11 +56,22 @@ pub(super) async fn prepare_charge(
 }
 
 pub(super) async fn apply_funding(
-    mut charge: TempoCharge,
+    charge: TempoCharge,
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
 ) -> Result<TempoCharge, MppError> {
+    Ok(fund(charge, autoswap, provider, from).await?.0)
+}
+
+/// Funds a charge like [`apply_funding`] and returns the token the payer spends: MACH through
+/// the machine-token swapper, the autoswap input token, or the charge currency.
+pub(super) async fn fund(
+    mut charge: TempoCharge,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<(TempoCharge, alloy::primitives::Address), MppError> {
     if charge.machine_token_enabled() {
         let transfers = crate::protocol::methods::tempo::transfers::get_transfers(
             charge.amount(),
@@ -77,10 +88,15 @@ pub(super) async fn apply_funding(
         )
         .await
         {
-            return Ok(charge.with_calls(route.calls.to_vec()));
+            let funding = match route.calls[0].to {
+                alloy::primitives::TxKind::Call(token) => token,
+                alloy::primitives::TxKind::Create => charge.currency(),
+            };
+            return Ok((charge.with_calls(route.calls.to_vec()), funding));
         }
     }
 
+    let mut funding = charge.currency();
     if let Some(config) = autoswap {
         if let Some(calls) = super::autoswap::resolve_autoswap_calls(
             provider,
@@ -91,13 +107,14 @@ pub(super) async fn apply_funding(
         )
         .await?
         {
+            funding = config.token_in;
             for call in calls.into_iter().rev() {
                 charge = charge.with_prepended_call(call)?;
             }
         }
     }
 
-    Ok(charge)
+    Ok((charge, funding))
 }
 
 /// Tempo payment provider using native primitive signing.

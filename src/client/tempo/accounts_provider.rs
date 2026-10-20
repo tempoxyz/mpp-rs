@@ -43,6 +43,8 @@ pub struct TempoAccountsProvider {
     preferred_currency: Option<Address>,
     expected_chain_id: Option<u64>,
     pending_authorizations: Arc<Mutex<HashMap<String, TempoAuthorizationReservation>>>,
+    /// Token each charge was funded with, by challenge ID, until the payment flow reads it.
+    funding: Arc<Mutex<HashMap<String, Address>>>,
     session: Option<AccountsSession>,
     /// Session policy, kept when the session store changes.
     session_settings: SessionSettings,
@@ -80,6 +82,7 @@ impl TempoAccountsProvider {
             preferred_currency: None,
             expected_chain_id: None,
             pending_authorizations: Arc::new(Mutex::new(HashMap::new())),
+            funding: Arc::new(Mutex::new(HashMap::new())),
             session: None,
             session_settings: SessionSettings::default(),
             rpc_providers: Arc::new(Mutex::new(HashMap::new())),
@@ -398,6 +401,12 @@ impl TempoAccountsProvider {
             .mpp_config("failed to inspect Tempo Accounts access keys")
     }
 
+    fn forget_funding(&self, challenge: &PaymentChallenge) {
+        if let Ok(mut funding) = self.funding.lock() {
+            funding.remove(&challenge.id);
+        }
+    }
+
     fn settlement_provider(&self, chain_id: u64) -> Result<RootProvider<TempoNetwork>, MppError> {
         let url = self.settlement_rpc_url(chain_id)?;
         let mut providers = self.rpc_providers.lock().map_err(|_| {
@@ -506,9 +515,12 @@ impl PaymentProvider for TempoAccountsProvider {
             self.client_id.as_deref(),
         )?;
         let rpc_provider = self.settlement_provider(charge.chain_id())?;
-        let charge =
-            super::provider::apply_funding(charge, self.autoswap.as_ref(), &rpc_provider, from)
-                .await?;
+        let (charge, funding) =
+            super::provider::fund(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
+        self.funding
+            .lock()
+            .map_err(|_| MppError::InvalidConfig("Tempo funding state is unavailable".to_owned()))?
+            .insert(challenge.id.clone(), funding);
 
         let signed = charge
             .sign_with_accounts_provider_options(
@@ -557,6 +569,7 @@ impl PaymentProvider for TempoAccountsProvider {
                 .commit_payment(challenge, credential)
                 .await;
         }
+        self.forget_funding(challenge);
         let _ = self.take_authorization(challenge, credential)?;
         Ok(())
     }
@@ -572,6 +585,7 @@ impl PaymentProvider for TempoAccountsProvider {
                 .rollback_payment(challenge, credential)
                 .await;
         }
+        self.forget_funding(challenge);
         if let Some(reservation) = self.take_authorization(challenge, credential)? {
             self.wallet
                 .release_authorization(reservation)
@@ -620,6 +634,14 @@ impl PaymentProvider for TempoAccountsProvider {
         receipt: &crate::protocol::core::Receipt,
     ) {
         let _ = self.record_receipt(context, challenge, receipt);
+    }
+
+    fn funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        self.funding
+            .lock()
+            .ok()?
+            .remove(&challenge.id)
+            .map(|token| token.to_string())
     }
 
     fn record_receipt(
