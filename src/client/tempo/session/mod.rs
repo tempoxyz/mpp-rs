@@ -646,6 +646,26 @@ impl TempoSessionProvider {
         Self::stored_entry(entry).map(|stored| Some(stored.key()))
     }
 
+    /// Raises a channel to the vouchers and deposit that other processes
+    /// sharing the store have recorded for it since this process last used it.
+    async fn merge_stored_channel(
+        &self,
+        key: &str,
+        entry: &mut ChannelEntry,
+    ) -> Result<(), MppError> {
+        if let Some(stored) = self
+            .channel_store
+            .get(key)
+            .await
+            .map_err(Self::store_error)?
+            .filter(|stored| stored.channel_id == entry.channel_id)
+        {
+            entry.cumulative_amount = entry.cumulative_amount.max(stored.cumulative_amount);
+            entry.deposit = entry.deposit.max(stored.deposit);
+        }
+        Ok(())
+    }
+
     async fn persist_channel(&self, entry: &ChannelEntry) -> Result<(), MppError> {
         if !is_precompile_escrow(entry.escrow_contract) {
             return Ok(());
@@ -1566,6 +1586,7 @@ impl TempoSessionProvider {
                 "channel does not match active session".into(),
             ));
         }
+        self.merge_stored_channel(&key, &mut entry).await?;
 
         if required_cumulative > entry.cumulative_amount
             && self
@@ -2639,6 +2660,9 @@ impl TempoSessionProvider {
             .get(&key)
             .cloned()
             .map(|entry| (entry, false));
+        if let Some((entry, _)) = existing.as_mut() {
+            self.merge_stored_channel(&key, entry).await?;
+        }
         let reconcile_pending = session_snapshot.is_some()
             && existing.as_ref().is_some_and(|(entry, _)| {
                 self.pending_opens
@@ -3075,15 +3099,14 @@ impl PaymentProvider for TempoSessionProvider {
             return None;
         }
         let _lock = self.acquire_payment_lock(&state.challenge).await.ok()?;
-        let entry = {
-            let key = self
-                .channel_id_to_key
-                .lock()
-                .unwrap()
-                .get(&state.channel_id)
-                .cloned()?;
-            self.channels.lock().unwrap().get(&key).cloned()?
-        };
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(&state.channel_id)
+            .cloned()?;
+        let mut entry = self.channels.lock().unwrap().get(&key).cloned()?;
+        self.merge_stored_channel(&key, &mut entry).await.ok()?;
         let target = state
             .price
             .checked_mul(u128::from(self.prepaid_requests))
