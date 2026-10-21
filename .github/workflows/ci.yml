@@ -155,7 +155,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: ["1/2", "2/2"]
+        partition: ["1/3", "2/3", "3/3"]
     steps:
       - name: Secure runner
         uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
@@ -186,7 +186,7 @@ jobs:
           --exclude-features reqwest-default-tls,reqwest-native-tls,reqwest-rustls-tls,reqwest-rustls-tls-no-provider
           --partition "$PARTITION"
       - name: Check TLS backends
-        if: matrix.partition == '2/2'
+        if: matrix.partition == '1/3'
         run: |
           for tls in reqwest-default-tls reqwest-native-tls reqwest-rustls-tls reqwest-rustls-tls-no-provider; do
             cargo check --no-default-features --features "client,$tls"
