@@ -206,9 +206,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      # Pull while the toolchain and cache are set up; `docker compose up` reuses the image.
-      - name: Pull Tempo localnet image
-        run: docker compose pull --quiet > "$RUNNER_TEMP/compose-pull.log" 2>&1 &
+      # Start the containers in the background so pulling and booting them
+      # overlaps the setup below; a later step waits for `up --wait` to finish.
+      - name: Start Tempo localnet
+        run: (docker compose up -d --wait --quiet-pull > "$RUNNER_TEMP/compose-up.log" 2>&1; echo $? > "$RUNNER_TEMP/compose-up.status") &
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
@@ -217,13 +218,15 @@ jobs:
           # Pull requests restore main's cache but never save their own:
           # saving cost 8-16s at the end of every job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Compile while the image is still pulling; on its own the pull left
-      # "Start Tempo localnet" waiting ~26s with nothing else to do.
+      # Compile before waiting, so the build also overlaps the localnet start.
       - name: Build integration tests
         run: cargo test --features integration --test integration_charge --test integration_session --no-run
 
-      - name: Start Tempo localnet
-        run: docker compose up -d --wait
+      - name: Wait for Tempo localnet
+        run: |
+          timeout 180 bash -c 'until [[ -s "$RUNNER_TEMP/compose-up.status" ]]; do sleep 0.5; done' || true
+          cat "$RUNNER_TEMP/compose-up.log"
+          [[ "$(cat "$RUNNER_TEMP/compose-up.status" 2>/dev/null)" == 0 ]]
 
       - name: Run integration tests
         run: cargo test --features integration --test integration_charge --test integration_session -- --nocapture
