@@ -37,8 +37,6 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
@@ -97,11 +95,6 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
-      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-        with:
-          tool: cargo-hack
       - name: Tests
         run: cargo test --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
         env:
@@ -113,10 +106,50 @@ jobs:
             echo "Ring-only transport unexpectedly includes aws-lc-sys"
             exit 1
           fi
-      - name: Check feature combinations
-        run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --skip integration,integration-stripe,integration-ws
       - name: Check examples
         run: cargo check --workspace --exclude mpp
+
+  features:
+    name: Features ${{ matrix.partition }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ["1/2", "2/2"]
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          toolchain: stable
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          tool: cargo-hack
+      # The TLS backends only select reqwest's TLS stack, so pairing them with
+      # every other feature adds ~60 checks that test nothing new. They are
+      # checked once each with the client below.
+      - name: Check feature combinations
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: >-
+          cargo hack check --feature-powerset --depth 2 --no-dev-deps
+          --skip integration,integration-stripe,integration-ws
+          --exclude-features reqwest-default-tls,reqwest-native-tls,reqwest-rustls-tls,reqwest-rustls-tls-no-provider
+          --partition "$PARTITION"
+      - name: Check TLS backends
+        if: matrix.partition == '2/2'
+        run: |
+          for tls in reqwest-default-tls reqwest-native-tls reqwest-rustls-tls reqwest-rustls-tls-no-provider; do
+            cargo check --no-default-features --features "client,$tls"
+          done
 
   integration:
     name: Integration Test
@@ -136,9 +169,6 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
-
       - name: Start Tempo localnet
         run: docker compose up -d --wait
 
@@ -157,50 +187,10 @@ jobs:
       contents: read
       id-token: write
 
-  fuzz:
-    name: Fuzz smoke
-    # Pull requests only: a crash should stop a merge, not a release build.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.ref || '' }}
-          persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-        with:
-          toolchain: nightly
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-        with:
-          workspaces: fuzz
-      - name: Resolve Cargo dependencies
-        # The fuzz crate is its own workspace. Start it from the root lockfile
-        # so it resolves the same versions as the other jobs.
-        run: |
-          .github/scripts/resolve-cargo-dependencies.sh
-          cp Cargo.lock fuzz/Cargo.lock
-      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
-        with:
-          tool: cargo-fuzz
-      # A crash fails the job; the log prints the reproducer as base64.
-      - name: Run every target for 30 seconds
-        run: fuzz/run-all.sh 30
-        env:
-          FUZZ_JOBS: 4
-          # The prebuilt cargo-fuzz is a musl binary and defaults to its own
-          # target, which sanitizers do not support.
-          CARGO_FUZZ_ARGS: --target x86_64-unknown-linux-gnu
-
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test, integration, deny, fuzz]
+    needs: [lint, test, features, integration, deny]
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -1,7 +1,7 @@
 name: Fuzz
 
-# The 30 second smoke run on pull requests is the `fuzz` job of ci.yml. This
-# workflow gives every target more time once a day.
+# Runs every target once a day. Pull requests do not fuzz: without a warm
+# cache the sanitizer build alone took about three minutes.
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -41,12 +41,10 @@ jobs:
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           workspaces: fuzz
-      - name: Resolve Cargo dependencies
+      - name: Seed fuzz lockfile
         # The fuzz crate is its own workspace. Start it from the root lockfile
         # so it resolves the same versions as the other jobs.
-        run: |
-          .github/scripts/resolve-cargo-dependencies.sh
-          cp Cargo.lock fuzz/Cargo.lock
+        run: cp Cargo.lock fuzz/Cargo.lock
       - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           tool: cargo-fuzz
