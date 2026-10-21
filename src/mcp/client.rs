@@ -122,6 +122,11 @@ where
 {
     /// Selects and pays one supported challenge.
     ///
+    /// When paying the preferred challenge fails, for example because the
+    /// wallet cannot fund a session's suggested deposit, the next supported
+    /// challenge in preference order is paid instead, such as the server's
+    /// one-time charge. The first failure is returned when none can be paid.
+    ///
     /// Returns `Ok(None)` when the provider supports none of the challenges,
     /// so the caller can preserve the original MCP result or error.
     pub async fn prepare(
@@ -158,39 +163,57 @@ where
         management: Option<&dyn ManagementTransport>,
     ) -> Result<Option<PendingPayment<P>>, MppError> {
         let ranking = self.provider.accept_payment_header();
-        let challenge = match select_supported_challenge(
-            challenges,
-            ranking.as_deref(),
-            |challenge| {
-                self.provider
-                    .supports(challenge.method.as_str(), challenge.intent.as_str())
-            },
-            |candidates| self.provider.select_challenge(candidates),
-        ) {
-            Ok(challenge) => challenge.clone(),
-            Err(ChallengeSelectionError::Expired(challenge)) => {
-                return Err(expired_payment_error(&challenge));
-            }
-            Err(ChallengeSelectionError::NoSupportedChallenge(_)) => return Ok(None),
-        };
+        let mut remaining = challenges.to_vec();
+        let mut failure = None;
+        loop {
+            let challenge = match select_supported_challenge(
+                &remaining,
+                ranking.as_deref(),
+                |challenge| {
+                    self.provider
+                        .supports(challenge.method.as_str(), challenge.intent.as_str())
+                },
+                |candidates| self.provider.select_challenge(candidates),
+            ) {
+                Ok(challenge) => challenge.clone(),
+                Err(ChallengeSelectionError::Expired(challenge)) => {
+                    return Err(failure.unwrap_or_else(|| expired_payment_error(&challenge)));
+                }
+                Err(ChallengeSelectionError::NoSupportedChallenge(_)) => {
+                    return failure.map_or(Ok(None), Err);
+                }
+            };
 
-        let credential = match management {
-            Some(management) => {
-                self.provider
-                    .pay_with_management(&challenge, self.context.clone(), management)
-                    .await?
+            let paid = match management {
+                Some(management) => {
+                    self.provider
+                        .pay_with_management(&challenge, self.context.clone(), management)
+                        .await
+                }
+                None => {
+                    self.provider
+                        .pay_with_context(&challenge, self.context.clone())
+                        .await
+                }
+            };
+            match paid {
+                Ok(credential) => {
+                    return Ok(Some(PendingPayment::new(
+                        self.provider.clone(),
+                        challenge,
+                        credential,
+                    )));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    remaining.retain(|candidate| {
+                        candidate.id != challenge.id
+                            || candidate.method != challenge.method
+                            || candidate.intent != challenge.intent
+                    });
+                }
             }
-            None => {
-                self.provider
-                    .pay_with_context(&challenge, self.context.clone())
-                    .await?
-            }
-        };
-        Ok(Some(PendingPayment::new(
-            self.provider.clone(),
-            challenge,
-            credential,
-        )))
+        }
     }
 }
 
@@ -725,6 +748,59 @@ mod tests {
 
         assert!(matches!(error, McpClientError::Payment(_)));
         assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Clone, Default)]
+    struct UnfundedSessionProvider {
+        paid: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PaymentProvider for UnfundedSessionProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && (intent == "session" || intent == "charge")
+        }
+
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            if challenge.intent.as_str() == "session" {
+                return Err(MppError::InvalidConfig(
+                    "insufficient balance for the suggested deposit".to_owned(),
+                ));
+            }
+            self.paid.lock().unwrap().push(challenge.id.clone());
+            Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::hash("charge"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn unpayable_preferred_challenges_fall_back_to_the_next() {
+        let session = PaymentChallenge::new(
+            "session-1",
+            "mcp.example.test",
+            "tempo",
+            "session",
+            Base64UrlJson::from_value(&json!({"amount": "1"})).unwrap(),
+        );
+        let provider = UnfundedSessionProvider::default();
+        let payment = McpPayment::new(provider.clone(), context());
+
+        let pending = payment
+            .prepare(&[session.clone(), challenge()])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(pending.challenge().id, "challenge-1");
+        assert_eq!(
+            *provider.paid.lock().unwrap(),
+            vec!["challenge-1".to_owned()]
+        );
+        pending.commit().await.unwrap();
+
+        let error = payment.prepare(&[session]).await.err().unwrap();
+        assert!(error.to_string().contains("insufficient balance"));
     }
 
     #[tokio::test]
