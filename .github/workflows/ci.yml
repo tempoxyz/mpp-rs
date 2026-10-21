@@ -13,6 +13,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables keep panic backtraces readable while cutting target size
+  # (and so cache restore time) and link time.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 permissions: {}
 
@@ -37,6 +40,10 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
@@ -95,8 +102,12 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests
-        run: cargo test --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
+        run: cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
         env:
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
       - name: Check Ring transport dependency graph
@@ -108,6 +119,32 @@ jobs:
           fi
       - name: Check examples
         run: cargo check --workspace --exclude mpp
+
+  doctest:
+    name: Doc tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          toolchain: stable
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Edition 2021 compiles each doctest separately (~15s), so they run
+      # alongside the unit tests instead of after them.
+      - name: Doc tests
+        run: cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
 
   features:
     name: Features ${{ matrix.partition }}
@@ -130,6 +167,10 @@ jobs:
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           tool: cargo-hack
@@ -165,10 +206,17 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
+      # Pull while the toolchain and cache are set up; `docker compose up` reuses the image.
+      - name: Pull Tempo localnet image
+        run: docker compose pull --quiet > "$RUNNER_TEMP/compose-pull.log" 2>&1 &
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start Tempo localnet
         run: docker compose up -d --wait
 
@@ -190,7 +238,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test, features, integration, deny]
+    needs: [lint, test, doctest, features, integration, deny]
     runs-on: ubuntu-latest
     permissions:
       contents: read
