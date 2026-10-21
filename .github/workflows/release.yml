@@ -38,7 +38,7 @@ jobs:
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@83e69646d7ef76c5f35364d3a06fce3a6fe62bf9 # 2026-09-07T12-57-31Z-83e69646 # zizmor: ignore[artipacked]
+        uses: tempoxyz/changelogs@eb001118fc77cbd13336f034aedfbf065861b6b9 # 2026-10-20T15-30-35Z-eb001118 # zizmor: ignore[artipacked]
         with:
           ecosystem: rust
           conventional-commit: true
