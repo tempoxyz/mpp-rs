@@ -217,6 +217,11 @@ jobs:
           # Pull requests restore main's cache but never save their own:
           # saving cost 8-16s at the end of every job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Compile while the image is still pulling; on its own the pull left
+      # "Start Tempo localnet" waiting ~26s with nothing else to do.
+      - name: Build integration tests
+        run: cargo test --features integration --test integration_charge --test integration_session --no-run
+
       - name: Start Tempo localnet
         run: docker compose up -d --wait
 
