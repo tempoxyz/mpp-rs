@@ -61,6 +61,7 @@ async fn test_close_rejects_channel_with_wrong_payee() {
             settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
+            close_signature: None,
         },
     );
 
@@ -145,6 +146,7 @@ async fn close_setup_with(
             settlement_route: None,
             cumulative_amount: close_amount.to_string(),
             signature: alloy::hex::encode_prefixed(signature),
+            close_signature: None,
         },
     );
     (channel_id, request, credential)
@@ -327,6 +329,7 @@ async fn test_close_with_invalid_signature_does_not_disclose_spent() {
                 settlement_route: None,
                 cumulative_amount: close_amount.to_string(),
                 signature,
+                close_signature: None,
             },
         );
         // The on-chain channel is readable, so only the signature check

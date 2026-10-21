@@ -22,9 +22,10 @@ use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
-    sign_precompile_voucher, sign_precompile_voucher_primitive,
-    sign_precompile_voucher_primitive_with_escrow, sign_precompile_voucher_with_escrow,
-    PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
+    sign_precompile_close_authorization_primitive_with_escrow,
+    sign_precompile_close_authorization_with_escrow, sign_precompile_voucher,
+    sign_precompile_voucher_primitive, sign_precompile_voucher_primitive_with_escrow,
+    sign_precompile_voucher_with_escrow, PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::{
     ChannelDescriptor, SessionCredentialPayload, TempoSessionExt, SESSION_PROTOCOL_LEGACY,
@@ -351,6 +352,7 @@ pub async fn create_close_payload(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
+        close_signature: None,
     })
 }
 
@@ -363,6 +365,14 @@ pub async fn create_precompile_close_payload(
     chain_id: u64,
 ) -> Result<SessionCredentialPayload, MppError> {
     let sig = sign_precompile_voucher(signer, channel_id, cumulative_amount, chain_id).await?;
+    let close = sign_precompile_close_authorization_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
@@ -370,6 +380,7 @@ pub async fn create_precompile_close_payload(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
+        close_signature: Some(alloy::hex::encode_prefixed(&close)),
     })
 }
 
@@ -383,12 +394,21 @@ pub async fn create_precompile_close_payload_primitive(
 ) -> Result<SessionCredentialPayload, MppError> {
     let signature =
         sign_precompile_voucher_primitive(signer, channel_id, cumulative_amount, chain_id).await?;
+    let close = sign_precompile_close_authorization_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
         descriptor: None,
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
+        close_signature: Some(alloy::hex::encode_prefixed(&close)),
     })
 }
 
@@ -440,6 +460,14 @@ pub async fn create_precompile_close_payload_with_descriptor_primitive(
         chain_id,
     )
     .await?;
+    let close = sign_precompile_close_authorization_primitive_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
@@ -447,6 +475,7 @@ pub async fn create_precompile_close_payload_with_descriptor_primitive(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
+        close_signature: Some(alloy::hex::encode_prefixed(&close)),
     })
 }
 
@@ -479,6 +508,14 @@ pub async fn create_precompile_close_payload_with_descriptor_and_escrow(
         chain_id,
     )
     .await?;
+    let close = sign_precompile_close_authorization_with_escrow(
+        signer,
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )
+    .await?;
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
@@ -486,6 +523,7 @@ pub async fn create_precompile_close_payload_with_descriptor_and_escrow(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
+        close_signature: Some(alloy::hex::encode_prefixed(&close)),
     })
 }
 

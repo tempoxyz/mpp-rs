@@ -247,6 +247,10 @@ pub enum SessionCredentialPayload {
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
         signature: String,
+        /// TIP-1034 cooperative close authorization, a distinct EIP-712
+        /// signature over the channel and amount that servers require.
+        #[serde(rename = "closeSignature", skip_serializing_if = "Option::is_none")]
+        close_signature: Option<String>,
     },
 }
 
@@ -588,6 +592,7 @@ mod tests {
                 settlement_route: Some(route.clone()),
                 cumulative_amount: "1".to_string(),
                 signature: "0xsig".to_string(),
+                close_signature: None,
             },
         ];
 
@@ -726,9 +731,11 @@ mod tests {
             settlement_route: None,
             cumulative_amount: "20000".to_string(),
             signature: "0xclosesig".to_string(),
+            close_signature: Some("0xcloseauth".to_string()),
         };
 
         let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"closeSignature\":\"0xcloseauth\""));
         assert!(json.contains("\"action\":\"close\""));
         assert!(json.contains("\"channelId\":\"0xchannel123\""));
         assert!(json.contains("\"cumulativeAmount\":\"20000\""));
