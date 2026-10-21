@@ -228,7 +228,7 @@ jobs:
 
       - name: Wait for Tempo localnet
         run: |
-          timeout 180 bash -c 'until [[ -s "$RUNNER_TEMP/compose-up.status" ]]; do sleep 0.5; done' || true
+          for _ in {1..360}; do [[ -s "$RUNNER_TEMP/compose-up.status" ]] && break; sleep 0.5; done
           cat "$RUNNER_TEMP/compose-up.log"
           [[ "$(cat "$RUNNER_TEMP/compose-up.status" 2>/dev/null)" == 0 ]]
 
