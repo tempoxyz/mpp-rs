@@ -14,6 +14,28 @@ use std::future::Future;
 /// Work a payment event in a response stream triggers, such as sending a voucher.
 pub type PaymentEventFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send>>;
 
+/// Delivery of a management credential, resolving to the receipt the resource answered with.
+pub type ManagementFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<Option<Receipt>, MppError>> + Send + 'a>>;
+
+/// Delivers a session management credential, such as a channel top-up or
+/// close, to the resource that issued its challenge.
+///
+/// HTTP resources take management credentials as an empty request to the
+/// challenged URL, which session providers send themselves from a
+/// [`PaymentContext`]. Other transports implement this trait, for example an
+/// MCP client that calls the challenged tool again with the credential in its
+/// `_meta` (see [`McpManagement`](crate::mcp::client::McpManagement)).
+pub trait ManagementTransport: Send + Sync {
+    /// Sends `credential`, which answers `challenge`, and returns the
+    /// resource's receipt. Fails when the resource rejects the credential.
+    fn send<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> ManagementFuture<'a>;
+}
+
 /// HTTP request context available while creating a payment credential.
 ///
 /// Session providers use this to submit management credentials, such as a
@@ -111,6 +133,21 @@ pub trait PaymentProvider: Clone + Send + Sync {
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
         let _ = context;
         self.pay(challenge)
+    }
+
+    /// Execute payment like [`pay_with_context`](Self::pay_with_context), but
+    /// deliver any management credential the payment needs first, such as a
+    /// session channel top-up, through `management` instead of HTTP.
+    ///
+    /// Providers without management credentials inherit `pay_with_context`.
+    fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
+        let _ = management;
+        self.pay_with_context(challenge, context)
     }
 
     /// Prepare a challenge before creating an HTTP payment credential.
@@ -459,6 +496,29 @@ impl PaymentProvider for MultiProvider {
         )))
     }
 
+    async fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> Result<PaymentCredential, MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider
+                    .dyn_pay_with_management(challenge, context, management)
+                    .await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
     async fn prepare_http_payment_challenge(
         &self,
         challenge: &PaymentChallenge,
@@ -678,6 +738,12 @@ trait DynPaymentProvider: Send + Sync {
         challenge: &'a PaymentChallenge,
         context: PaymentContext,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
+    fn dyn_pay_with_management<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+        management: &'a dyn ManagementTransport,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
     fn dyn_prepare_http_payment_challenge<'a>(
         &'a self,
         challenge: &'a PaymentChallenge,
@@ -758,6 +824,18 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
     {
         Box::pin(PaymentProvider::pay_with_context(self, challenge, context))
+    }
+
+    fn dyn_pay_with_management<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+        management: &'a dyn ManagementTransport,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
+    {
+        Box::pin(PaymentProvider::pay_with_management(
+            self, challenge, context, management,
+        ))
     }
 
     fn dyn_prepare_http_payment_challenge<'a>(

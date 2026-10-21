@@ -37,8 +37,8 @@ use self::store::{ChannelStore, ChannelStoreLease, MemoryChannelStore, StoredCha
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
 use crate::client::{
-    ClientEvent, ClientEvents, DepositContext, PaymentContext, PaymentEventFuture, PaymentProvider,
-    PaymentUpdateContext,
+    ClientEvent, ClientEvents, DepositContext, ManagementTransport, PaymentContext,
+    PaymentEventFuture, PaymentProvider, PaymentUpdateContext,
 };
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
@@ -237,10 +237,16 @@ struct SessionPaymentLease {
     _store: Box<dyn ChannelStoreLease>,
 }
 
-struct ApplicationTopUp<'a> {
-    client: &'a reqwest::Client,
-    url: &'a str,
-    headers: reqwest::header::HeaderMap,
+enum TopUpRoute<'a> {
+    Http {
+        client: &'a reqwest::Client,
+        url: &'a str,
+        headers: reqwest::header::HeaderMap,
+    },
+    Management {
+        transport: &'a dyn ManagementTransport,
+        url: &'a str,
+    },
 }
 
 impl TempoSessionProvider {
@@ -1837,6 +1843,29 @@ impl TempoSessionProvider {
         Ok(receipt)
     }
 
+    /// A top-up sent through `transport` instead of HTTP, such as an MCP tool
+    /// call. The caller holds the payment lock and the payment-scope store lease.
+    async fn top_up_with_management(
+        &self,
+        transport: &dyn ManagementTransport,
+        url: &str,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<Option<Receipt>, MppError> {
+        let prepared = self
+            .prepare_top_up(
+                reqwest::header::HeaderMap::new(),
+                challenge,
+                channel_id_hex,
+                additional_deposit,
+            )
+            .await?;
+        let receipt = transport.send(challenge, &prepared.credential).await?;
+        self.record_top_up(url, &prepared).await?;
+        Ok(receipt)
+    }
+
     /// A top-up that holds the payment lock only while it is recorded, so
     /// vouchers can be signed while it is read, signed and submitted. Signing
     /// only reads channel state.
@@ -2580,25 +2609,80 @@ impl TempoSessionProvider {
             .as_deref()
             .and_then(|s| crate::protocol::core::parse_receipt(s).ok());
 
-        // A merchant receipt is not proof of settlement. Retain recovery data
-        // until the trusted RPC confirms that escrow is no longer funded.
-        if (receipt.is_some() || native_gone) && is_precompile_escrow(entry.escrow_contract) {
-            let Ok(state) = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await
-            else {
-                return Ok(receipt);
-            };
-            if state.deposit != 0 {
-                return Ok(receipt);
-            }
-            let store_key = Self::stored_entry(&entry)?.key();
-            self.channel_store
-                .delete(&store_key)
-                .await
-                .map_err(Self::store_error)?;
-            self.channels.lock().unwrap().remove(&expected_key);
+        if receipt.is_some() || native_gone {
+            self.forget_closed_channel(&entry, &expected_key).await?;
         }
 
         Ok(receipt)
+    }
+
+    /// Close the payment channel like [`close`](Self::close), sending the close
+    /// credential through `transport` instead of HTTP, such as an MCP tool call
+    /// (see [`McpManagement`](crate::mcp::client::McpManagement)).
+    ///
+    /// Returns the resource's receipt, or `None` when no channel is open. As
+    /// with `close`, the channel is only forgotten once a receipt is
+    /// accompanied by on-chain confirmation that its escrow is no longer funded.
+    pub async fn close_with(
+        &self,
+        transport: &dyn ManagementTransport,
+    ) -> Result<Option<Receipt>, MppError> {
+        let Some(challenge) = self.last_challenge.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let _process_lease = self.acquire_payment_lock(&challenge).await?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        let _store_lease = self
+            .channel_store
+            .acquire(&expected_key)
+            .await
+            .map_err(Self::store_error)?;
+        let entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&expected_key)
+            .filter(|entry| entry.opened)
+            .cloned();
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        if entry.chain_id != expected_chain_id {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
+        let credential = self
+            .close_credential_for_challenge_inner(&challenge, &entry.channel_id.to_string(), None)
+            .await?;
+        let receipt = transport.send(&challenge, &credential).await?;
+        if receipt.is_some() {
+            self.forget_closed_channel(&entry, &expected_key).await?;
+        }
+        Ok(receipt)
+    }
+
+    /// Forgets a native channel once the trusted RPC confirms its escrow is no
+    /// longer funded. A merchant receipt is not proof of settlement, so the
+    /// channel's recovery data is kept until then.
+    async fn forget_closed_channel(&self, entry: &ChannelEntry, key: &str) -> Result<(), MppError> {
+        if !is_precompile_escrow(entry.escrow_contract) {
+            return Ok(());
+        }
+        let Ok(state) = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await
+        else {
+            return Ok(());
+        };
+        if state.deposit != 0 {
+            return Ok(());
+        }
+        let store_key = Self::stored_entry(entry)?.key();
+        self.channel_store
+            .delete(&store_key)
+            .await
+            .map_err(Self::store_error)?;
+        self.channels.lock().unwrap().remove(key);
+        Ok(())
     }
 
     fn resolve_deposit(&self, suggested_deposit: Option<&str>) -> Result<u128, MppError> {
@@ -2639,7 +2723,7 @@ impl TempoSessionProvider {
     ) -> Result<PaymentCredential, MppError> {
         self.payment_credential(
             challenge,
-            Some(ApplicationTopUp {
+            Some(TopUpRoute::Http {
                 client,
                 url,
                 headers,
@@ -2651,7 +2735,7 @@ impl TempoSessionProvider {
     async fn payment_credential(
         &self,
         challenge: &PaymentChallenge,
-        top_up: Option<ApplicationTopUp<'_>>,
+        top_up: Option<TopUpRoute<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
         let process_lease = self.acquire_payment_lock(challenge).await?;
@@ -2694,7 +2778,7 @@ impl TempoSessionProvider {
     async fn payment_credential_inner(
         &self,
         challenge: &PaymentChallenge,
-        top_up: Option<ApplicationTopUp<'_>>,
+        top_up: Option<TopUpRoute<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
 
@@ -2872,15 +2956,34 @@ impl TempoSessionProvider {
                         .ok_or_else(|| {
                             MppError::InvalidConfig("session top-up amount underflowed".into())
                         })?;
-                    self.top_up_with_lease(
-                        top_up.client,
-                        top_up.url,
-                        top_up.headers,
-                        challenge,
-                        &entry.channel_id.to_string(),
-                        additional_deposit,
-                    )
-                    .await?;
+                    let channel_id = entry.channel_id.to_string();
+                    match top_up {
+                        TopUpRoute::Http {
+                            client,
+                            url,
+                            headers,
+                        } => {
+                            self.top_up_with_lease(
+                                client,
+                                url,
+                                headers,
+                                challenge,
+                                &channel_id,
+                                additional_deposit,
+                            )
+                            .await?;
+                        }
+                        TopUpRoute::Management { transport, url } => {
+                            self.top_up_with_management(
+                                transport,
+                                url,
+                                challenge,
+                                &channel_id,
+                                additional_deposit,
+                            )
+                            .await?;
+                        }
+                    }
                     entry.deposit = self
                         .channels
                         .lock()
@@ -3092,6 +3195,23 @@ impl PaymentProvider for TempoSessionProvider {
             context.url.as_str(),
             context.headers,
             challenge,
+        )
+        .await
+    }
+
+    async fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> Result<PaymentCredential, MppError> {
+        let url = context.url.to_string();
+        self.payment_credential(
+            challenge,
+            Some(TopUpRoute::Management {
+                transport: management,
+                url: &url,
+            }),
         )
         .await
     }

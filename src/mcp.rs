@@ -25,6 +25,7 @@
 //! - [`extract_challenges`]: Extract challenges from a payment-required error
 //! - [`extract_challenges_from_data`]: Extract challenges from a payment-required payload
 //! - [`attach_credential`] / [`try_attach_credential`]: Attach a credential to MCP request params `_meta`
+//! - [`extract_receipt`]: Extract the receipt from MCP result `_meta`
 //! - [`client::McpClient`]: Wrap an MCP SDK adapter with automatic payment handling
 //!
 //! # Example (server)
@@ -263,6 +264,14 @@ pub fn extract_challenges_from_data(
 ) -> Option<Vec<PaymentChallenge>> {
     let challenges_value = payment_required.get("challenges")?;
     extract_wire_challenges(challenges_value)
+}
+
+/// Extract the payment receipt from MCP result metadata (`_meta`).
+///
+/// Expects the result `_meta` object (not the complete tool result). Returns
+/// `None` if the receipt key is missing or the value is not a receipt.
+pub fn extract_receipt(meta: &serde_json::Value) -> Option<Receipt> {
+    serde_json::from_value(meta.get(RECEIPT_META_KEY)?.clone()).ok()
 }
 
 /// Extract challenges from an MCP tool result's payment-required metadata.

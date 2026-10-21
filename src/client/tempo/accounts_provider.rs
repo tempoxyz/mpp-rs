@@ -19,7 +19,7 @@ use super::{
     signing::{KeychainVersion, TempoSigningMode},
 };
 use crate::{
-    client::{ClientEvents, PaymentContext, PaymentProvider},
+    client::{ClientEvents, ManagementTransport, PaymentContext, PaymentProvider},
     error::{MppError, ResultExt},
     protocol::core::{PaymentChallenge, PaymentCredential},
     protocol::intents::{ChargeRequest, SessionRequest},
@@ -581,6 +581,21 @@ impl PaymentProvider for TempoAccountsProvider {
             return self
                 .configured_session_provider()?
                 .pay_with_context(challenge, context)
+                .await;
+        }
+        self.pay(challenge).await
+    }
+
+    async fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> Result<PaymentCredential, MppError> {
+        if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
+            return self
+                .configured_session_provider()?
+                .pay_with_management(challenge, context, management)
                 .await;
         }
         self.pay(challenge).await
