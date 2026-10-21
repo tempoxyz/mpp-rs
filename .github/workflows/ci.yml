@@ -168,6 +168,10 @@ jobs:
           toolchain: stable
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
+          # rust-cache keys on the job ID, which all partitions share: only the
+          # first to finish on main saved, and the others restored a target
+          # directory built for different features. One cache per partition.
+          key: features-${{ strategy.job-index }}
           # Pull requests restore main's cache but never save their own:
           # saving cost 8-16s at the end of every job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -209,7 +213,7 @@ jobs:
       # Start the containers in the background so pulling and booting them
       # overlaps the setup below; a later step waits for `up --wait` to finish.
       - name: Start Tempo localnet
-        run: (docker compose up -d --wait --quiet-pull > "$RUNNER_TEMP/compose-up.log" 2>&1; echo $? > "$RUNNER_TEMP/compose-up.status") &
+        run: (docker compose up -d --wait --quiet-pull > "$RUNNER_TEMP/compose-up.log" 2>&1; echo $? > "$RUNNER_TEMP/compose-up.status") > /dev/null 2>&1 &
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
