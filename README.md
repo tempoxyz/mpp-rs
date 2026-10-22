@@ -84,6 +84,26 @@ If the endpoint already uses `Authorization` (API keys, Bearer tokens), create t
 let mpp = Mpp::create(tempo(config).requires_auth(true))?;
 ```
 
+For charge requests that need both an API credential and `Payment-Authorization`,
+use `ChargeClient`. It owns its HTTP client, disables redirects on initial and
+paid requests, and returns redirect responses without following them. It accepts
+only charge intents; session management and prepaid credentials remain excluded.
+Set `Accept-Payment` on each request to authorize payment; client default headers
+do not authorize it.
+
+```rust
+use mpp::client::ChargeClient;
+use reqwest::Method;
+
+let client = ChargeClient::new(reqwest::Client::builder())?;
+let response = client.send_with_payment(
+    client.request(Method::GET, "https://api.example.com/paid")
+        .bearer_auth("api-key")
+        .header("Accept-Payment", "tempo/charge"),
+    &provider,
+).await?;
+```
+
 ### Client (Tempo)
 
 ```rust
