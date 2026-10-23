@@ -102,6 +102,48 @@ fn encode_transfer(
 ///
 /// This client always answers non-zero charges in `pull` mode
 /// (`type="transaction"`). An omitted `supportedModes` allows every mode.
+/// Resolve the token that pays an unsponsored charge's gas.
+///
+/// An explicit fee token wins; otherwise the charge currency pays its own gas.
+/// MACH is recipient-restricted and cannot pay fees, so a MACH charge pays gas
+/// in the first supported stablecoin (pathUSD, then the network's default
+/// currency) the payer holds, falling back to pathUSD. A sponsored charge's fee
+/// token is chosen by the fee payer, so it is left as the currency.
+async fn resolve_fee_token(
+    explicit: Option<Address>,
+    currency: Address,
+    fee_payer: bool,
+    chain_id: u64,
+    provider: &impl Provider<tempo_alloy::TempoNetwork>,
+    from: Address,
+) -> Address {
+    if let Some(token) = explicit {
+        return token;
+    }
+    if fee_payer || currency != crate::protocol::methods::tempo::machine_token::MACH {
+        return currency;
+    }
+    let mut candidates: Vec<Address> = Vec::with_capacity(2);
+    let defaults = [
+        Some(crate::protocol::methods::tempo::PATH_USD),
+        TempoChain::from_chain_id(chain_id).map(TempoChain::default_currency),
+    ];
+    for token in defaults.into_iter().flatten() {
+        if let Ok(token) = token.parse::<Address>() {
+            if !candidates.contains(&token) {
+                candidates.push(token);
+            }
+        }
+    }
+    for token in &candidates {
+        let balance = ITIP20::new(*token, provider).balanceOf(from).call().await;
+        if balance.is_ok_and(|balance| !balance.is_zero()) {
+            return *token;
+        }
+    }
+    candidates.first().copied().unwrap_or(currency)
+}
+
 fn ensure_pull_supported(charge: &ChargeRequest) -> Result<(), MppError> {
     let supported_modes = charge
         .method_details
@@ -465,7 +507,15 @@ impl TempoCharge {
             Some(calls) => calls,
             None => self.build_transfer_calls()?,
         };
-        let fee_token = options.fee_token.unwrap_or(self.currency);
+        let fee_token = resolve_fee_token(
+            options.fee_token,
+            self.currency,
+            self.fee_payer,
+            self.chain_id,
+            provider,
+            from,
+        )
+        .await;
         let max_fee_per_gas = options
             .max_fee_per_gas
             .unwrap_or(crate::client::tempo::MAX_FEE_PER_GAS);
@@ -596,7 +646,15 @@ impl TempoCharge {
             None => self.build_transfer_calls()?,
         };
 
-        let fee_token = options.fee_token.unwrap_or(self.currency);
+        let fee_token = resolve_fee_token(
+            options.fee_token,
+            self.currency,
+            self.fee_payer,
+            self.chain_id,
+            provider,
+            from,
+        )
+        .await;
 
         // All charge payments use expiring nonces (nonceKey=MAX, nonce=0,
         // validBefore=min(now+25s, challenge expires)) so we never need a
@@ -860,6 +918,90 @@ mod tests {
         });
         let request = Base64UrlJson::from_value(&request_json).unwrap();
         PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request)
+    }
+
+    fn mocked_provider(
+        asserter: alloy::providers::mock::Asserter,
+    ) -> impl Provider<tempo_alloy::TempoNetwork> {
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter)
+    }
+
+    fn balance(amount: u64) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(&U256::from(
+            amount,
+        )))
+    }
+
+    #[tokio::test]
+    async fn test_mach_charge_pays_gas_in_funded_stablecoin() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&balance(0));
+        asserter.push_success(&balance(5));
+        let provider = mocked_provider(asserter);
+        let usdc: Address = crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET
+            .parse()
+            .unwrap();
+
+        let token = resolve_fee_token(
+            None,
+            MACH,
+            false,
+            CHAIN_ID,
+            &provider,
+            Address::repeat_byte(1),
+        )
+        .await;
+
+        assert_eq!(token, usdc);
+    }
+
+    #[tokio::test]
+    async fn test_mach_charge_falls_back_to_path_usd_gas() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&balance(0));
+        asserter.push_success(&balance(0));
+        let provider = mocked_provider(asserter);
+        let path_usd: Address = crate::protocol::methods::tempo::PATH_USD.parse().unwrap();
+
+        let token = resolve_fee_token(
+            None,
+            MACH,
+            false,
+            CHAIN_ID,
+            &provider,
+            Address::repeat_byte(1),
+        )
+        .await;
+
+        assert_eq!(token, path_usd);
+    }
+
+    #[tokio::test]
+    async fn test_fee_token_skips_lookup_unless_unsponsored_mach() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        // No mocked responses: any RPC call would fail the lookup.
+        let provider = mocked_provider(alloy::providers::mock::Asserter::new());
+        let usdc: Address = crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET
+            .parse()
+            .unwrap();
+        let from = Address::repeat_byte(1);
+        let explicit = Address::repeat_byte(0x33);
+
+        assert_eq!(
+            resolve_fee_token(None, usdc, false, CHAIN_ID, &provider, from).await,
+            usdc
+        );
+        assert_eq!(
+            resolve_fee_token(Some(explicit), MACH, false, CHAIN_ID, &provider, from).await,
+            explicit
+        );
+        assert_eq!(
+            resolve_fee_token(None, MACH, true, CHAIN_ID, &provider, from).await,
+            MACH
+        );
     }
 
     #[test]
