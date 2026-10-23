@@ -1131,9 +1131,7 @@ async fn test_stripe_payment_intent_metadata() {
             ("mpp_challenge_id", challenge.id.as_str()),
             ("mpp_client_id", client_id.as_str()),
             ("mpp_intent", "charge"),
-            ("mpp_is_mpp", "true"),
             ("mpp_server_id", challenge.realm.as_str()),
-            ("mpp_version", "1"),
             ("order_id", "12345"),
         ]
     );
