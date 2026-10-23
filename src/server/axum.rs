@@ -78,7 +78,6 @@ use bytes::Bytes;
 use http_types::{header, HeaderValue, StatusCode};
 
 use crate::error::{MppError, PaymentError, PaymentErrorDetails};
-#[cfg(any(feature = "stripe", feature = "tempo"))]
 use crate::protocol::core::headers::parse_authorization;
 use crate::protocol::core::headers::{
     extract_payment_scheme, format_receipt, format_www_authenticate, with_private_cache_control,
@@ -437,18 +436,20 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     }
 
     /// Verify a credential string against route amount and framework scope.
+    ///
+    /// The default rejects a credential whose echoed challenge request does
+    /// not carry the route's scope in `_mppx_scope`, then delegates to
+    /// [`verify_payment_for_amount`](Self::verify_payment_for_amount). That
+    /// verifier must authenticate the echoed challenge (e.g. its HMAC `id`),
+    /// which is what binds the scope to the challenge the server issued.
     fn verify_payment_for_amount_and_scope(
         &self,
         credential_str: &str,
         amount: &str,
         mppx_scope: Option<serde_json::Value>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
-        if mppx_scope.is_some() {
-            let _ = credential_str;
-            let _ = amount;
-            return Box::pin(std::future::ready(Err(
-                "framework scope verification is not implemented for this ChargeChallenger".into(),
-            )));
+        if let Err(e) = check_credential_scope(credential_str, mppx_scope.as_ref()) {
+            return Box::pin(std::future::ready(Err(e)));
         }
         self.verify_payment_for_amount(credential_str, amount)
     }
@@ -465,6 +466,11 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     }
 
     /// Verify a credential string against route amount, framework scope, and request body bytes.
+    ///
+    /// The default checks the scope as
+    /// [`verify_payment_for_amount_and_scope`](Self::verify_payment_for_amount_and_scope)
+    /// does, then delegates to
+    /// [`verify_payment_for_amount_with_body`](Self::verify_payment_for_amount_with_body).
     fn verify_payment_for_amount_scope_and_body(
         &self,
         credential_str: &str,
@@ -472,13 +478,8 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         mppx_scope: Option<serde_json::Value>,
         body: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
-        if mppx_scope.is_some() {
-            let _ = credential_str;
-            let _ = amount;
-            let _ = body;
-            return Box::pin(std::future::ready(Err(
-                "framework scope verification is not implemented for this ChargeChallenger".into(),
-            )));
+        if let Err(e) = check_credential_scope(credential_str, mppx_scope.as_ref()) {
+            return Box::pin(std::future::ready(Err(e)));
         }
         self.verify_payment_for_amount_with_body(credential_str, amount, body)
     }
@@ -1246,6 +1247,26 @@ fn request_realm_from_parts(parts: &http_types::request::Parts) -> Option<String
         return None;
     }
     Some(authority.host().to_ascii_lowercase())
+}
+
+/// Reject a credential whose echoed challenge was not bound to `expected`.
+///
+/// Mirrors mppx's `verifyCredential`, which compares the scope bound into the
+/// credential's challenge with the route's expected scope.
+fn check_credential_scope(
+    credential_str: &str,
+    expected: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let request = parse_authorization(credential_str)
+        .and_then(|credential| credential.challenge.request.decode_value())
+        .map_err(|e| e.to_string())?;
+    if request.get("_mppx_scope") != Some(expected) {
+        return Err("credential scope does not match this route's requirements".into());
+    }
+    Ok(())
 }
 
 fn mppx_scope_from_parts(parts: &http_types::request::Parts) -> Option<serde_json::Value> {
