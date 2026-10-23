@@ -902,11 +902,13 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             };
             debug!(method = %parsed.method, intent = %parsed.intent, "MPP challenge received");
             let _ = events_tx.send(MppEvent::Challenge(parsed.clone()));
+            let proof_origin =
+                proof_http_origin(&payment_context.url).map_err(|_| TerminationReason::Fatal)?;
             if mpp::client::is_cross_realm_proof_with_trust(
                 &parsed,
                 &payment_context.url,
                 &payment_context.headers,
-                payment_provider.trusted_tempo_proof_realm(&payment_context.url),
+                payment_provider.trusted_tempo_proof_realm(&proof_origin),
             ) {
                 let _ = events_tx.send(MppEvent::Error(
                     "refusing to sign Tempo proof for a different HTTP realm".into(),
@@ -1027,6 +1029,17 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     }
 }
 
+fn proof_http_origin(url: &Url) -> Result<Url, ()> {
+    let mut origin = url.clone();
+    let scheme = match origin.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return Ok(origin),
+    };
+    origin.set_scheme(scheme)?;
+    Ok(origin)
+}
+
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 fn install_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
@@ -1042,6 +1055,28 @@ fn install_default_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_proof_lookup_uses_corresponding_http_origin() {
+        let ws = proof_http_origin(&Url::parse("ws://api.example:8545/rpc").unwrap()).unwrap();
+        let wss = proof_http_origin(&Url::parse("wss://api.example:8545/rpc").unwrap()).unwrap();
+        assert_eq!(
+            ws.origin(),
+            Url::parse("http://api.example:8545").unwrap().origin()
+        );
+        assert_eq!(
+            wss.origin(),
+            Url::parse("https://api.example:8545").unwrap().origin()
+        );
+        assert_ne!(
+            wss.origin(),
+            Url::parse("https://api.example:8546").unwrap().origin()
+        );
+        assert_ne!(
+            wss.origin(),
+            Url::parse("http://api.example:8545").unwrap().origin()
+        );
+    }
 
     #[derive(Clone)]
     struct DummyProvider;

@@ -3211,6 +3211,12 @@ impl PaymentProvider for TempoSessionProvider {
             .map(|(_, realm)| realm.as_str())
     }
 
+    fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+        self.trusted_tempo_proof_realms
+            .retain(|(existing, _)| existing.origin() != origin.origin());
+        self.trusted_tempo_proof_realms.push((origin, realm));
+    }
+
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         self.payment_credential(challenge, None).await
     }

@@ -102,6 +102,9 @@ pub trait PaymentProvider: Clone + Send + Sync {
         None
     }
 
+    /// Propagate an explicit realm pin to providers that also issue bootstrap proofs.
+    fn set_trusted_tempo_proof_realm(&mut self, _origin: reqwest::Url, _realm: String) {}
+
     /// Select one challenge from the supported, unexpired candidates.
     ///
     /// Candidates have already been ordered by the caller's `Accept-Payment`
@@ -419,7 +422,10 @@ impl MultiProvider {
     }
 
     /// Add a provider to the list.
-    pub fn with<P: PaymentProvider + 'static>(mut self, provider: P) -> Self {
+    pub fn with<P: PaymentProvider + 'static>(mut self, mut provider: P) -> Self {
+        for (origin, realm) in &self.trusted_tempo_proof_realms {
+            provider.set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
         self.providers.push(Box::new(provider));
         self
     }
@@ -430,12 +436,19 @@ impl MultiProvider {
         origin: reqwest::Url,
         realm: impl Into<String>,
     ) -> Self {
-        self.trusted_tempo_proof_realms.push((origin, realm.into()));
+        let realm = realm.into();
+        for provider in &mut self.providers {
+            provider.dyn_set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
+        self.trusted_tempo_proof_realms.push((origin, realm));
         self
     }
 
     /// Add a provider to the list (mutable reference version).
-    pub fn add<P: PaymentProvider + 'static>(&mut self, provider: P) -> &mut Self {
+    pub fn add<P: PaymentProvider + 'static>(&mut self, mut provider: P) -> &mut Self {
+        for (origin, realm) in &self.trusted_tempo_proof_realms {
+            provider.set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
         self.providers.push(Box::new(provider));
         self
     }
@@ -464,6 +477,18 @@ impl PaymentProvider for MultiProvider {
             .iter()
             .find(|(origin, _)| origin.origin() == url.origin())
             .map(|(_, realm)| realm.as_str())
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find_map(|provider| provider.dyn_trusted_tempo_proof_realm(url))
+            })
+    }
+
+    fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+        for provider in &mut self.providers {
+            provider.dyn_set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
+        self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
     fn select_challenge<'a>(
@@ -750,6 +775,8 @@ type PrepaidFuture<'a> = std::pin::Pin<
 
 trait DynPaymentProvider: Send + Sync {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool;
+    fn dyn_trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str>;
+    fn dyn_set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String);
     fn dyn_select_challenge<'a>(
         &self,
         challenges: &[&'a PaymentChallenge],
@@ -825,6 +852,14 @@ trait DynPaymentProvider: Send + Sync {
 impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool {
         PaymentProvider::supports(self, method, intent)
+    }
+
+    fn dyn_trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        PaymentProvider::trusted_tempo_proof_realm(self, url)
+    }
+
+    fn dyn_set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+        PaymentProvider::set_trusted_tempo_proof_realm(self, origin, realm);
     }
 
     fn dyn_select_challenge<'a>(
@@ -972,6 +1007,56 @@ impl Clone for Box<dyn DynPaymentProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct PinnedProvider(Option<(reqwest::Url, String)>);
+
+    impl PaymentProvider for PinnedProvider {
+        fn supports(&self, _: &str, _: &str) -> bool {
+            true
+        }
+
+        fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+            self.0
+                .as_ref()
+                .filter(|(origin, _)| origin.origin() == url.origin())
+                .map(|(_, realm)| realm.as_str())
+        }
+
+        fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+            self.0 = Some((origin, realm));
+        }
+
+        async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            Err(MppError::InvalidConfig("unused".into()))
+        }
+    }
+
+    #[test]
+    fn multi_provider_forwards_and_propagates_proof_pins() {
+        let origin = reqwest::Url::parse("https://api.example").unwrap();
+        let request = reqwest::Url::parse("https://api.example/pay").unwrap();
+        let other = reqwest::Url::parse("https://other.example/pay").unwrap();
+        let child = PinnedProvider(Some((origin.clone(), "child".into())));
+        let multi = MultiProvider::new().with(child);
+        assert_eq!(multi.trusted_tempo_proof_realm(&request), Some("child"));
+        assert_eq!(multi.trusted_tempo_proof_realm(&other), None);
+
+        let pinned = multi.with_trusted_tempo_proof_realm(origin.clone(), "outer");
+        assert_eq!(pinned.trusted_tempo_proof_realm(&request), Some("outer"));
+        assert_eq!(
+            pinned.providers[0].dyn_trusted_tempo_proof_realm(&request),
+            Some("outer")
+        );
+
+        let before_child = MultiProvider::new()
+            .with_trusted_tempo_proof_realm(origin, "outer")
+            .with(PinnedProvider::default());
+        assert_eq!(
+            before_child.providers[0].dyn_trusted_tempo_proof_realm(&request),
+            Some("outer")
+        );
+    }
 
     #[derive(Clone)]
     struct MockProvider {
