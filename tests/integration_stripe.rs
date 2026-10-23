@@ -1115,7 +1115,7 @@ async fn test_stripe_payment_intent_metadata() {
         format!("mpp_{}_spt_metadata", challenge.id)
     );
 
-    let client_id = "x".repeat(500);
+    let sdk = format!("mpp-rs/{}", env!("CARGO_PKG_VERSION"));
     let mut metadata: Vec<(&str, &str)> = params
         .iter()
         .filter_map(|(key, value)| {
@@ -1129,10 +1129,9 @@ async fn test_stripe_payment_intent_metadata() {
         [
             ("machine_payment", "true"),
             ("mpp_challenge_id", challenge.id.as_str()),
-            ("mpp_client_id", client_id.as_str()),
             ("mpp_intent", "charge"),
             ("mpp_is_mpp", "true"),
-            ("mpp_server_id", challenge.realm.as_str()),
+            ("mpp_sdk", sdk.as_str()),
             ("mpp_version", "1"),
             ("order_id", "12345"),
         ]
