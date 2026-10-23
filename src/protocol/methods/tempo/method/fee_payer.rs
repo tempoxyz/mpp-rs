@@ -20,7 +20,8 @@ const MAX_TOTAL_FEE_DEFAULT: u128 = 50_000_000_000_000_000; // lower than max_ga
 
 /// Least time, in seconds, a sponsored transaction must remain valid when it
 /// is co-signed and again when it is broadcast, matching mppx.
-pub(super) const MIN_REMAINING_VALIDITY_SECS: u64 = 15;
+pub(super) const MIN_REMAINING_VALIDITY_SECS: u64 =
+    crate::protocol::methods::tempo::FEE_PAYER_MIN_REMAINING_VALIDITY_SECS;
 
 pub(super) fn unix_now() -> Result<std::time::Duration, VerificationError> {
     std::time::SystemTime::now()

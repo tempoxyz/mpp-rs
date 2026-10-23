@@ -386,3 +386,27 @@ fn test_charge_with_options_binds_request_body_digest() {
     assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
     assert!(challenge.verify(TEST_SECRET));
 }
+
+#[cfg(feature = "tempo")]
+#[test]
+fn test_sponsored_charge_refuses_expiry_under_floor() {
+    let mpp = create_test_mpp();
+    let charge = |fee_payer, expires: &str| {
+        mpp.charge_with_options(
+            "1",
+            ChargeOptions {
+                fee_payer,
+                expires: Some(expires),
+                ..Default::default()
+            },
+        )
+    };
+
+    let error = charge(true, &crate::expires::seconds(10)).unwrap_err();
+    assert!(
+        matches!(error, crate::error::MppError::InvalidConfig(_)),
+        "{error:?}"
+    );
+    charge(true, &crate::expires::seconds(30)).unwrap();
+    charge(false, &crate::expires::seconds(10)).unwrap();
+}
