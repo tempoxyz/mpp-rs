@@ -44,6 +44,14 @@ use crate::protocol::methods::tempo::session_method::{normalize_channel_id, Chan
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 
+/// Largest inbound WebSocket frame, in bytes, that [`process_vouchers`]
+/// accepts. A larger frame gets an `error` frame and ends processing.
+///
+/// Payment frames are small; bound the transport as well, e.g. with axum's
+/// `WebSocketUpgrade::max_message_size`, so oversized frames are not
+/// buffered in the first place.
+pub const MAX_INCOMING_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// Options for [`ws_session`].
 pub struct WsSessionOptions<G> {
     /// Channel store for balance tracking.
@@ -161,6 +169,9 @@ where
         + Unpin,
 {
     while let Some(Ok(text)) = receiver.next().await {
+        if text.len() > MAX_INCOMING_MESSAGE_BYTES {
+            return;
+        }
         let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
             continue;
         };
@@ -185,7 +196,9 @@ where
 /// - rejected or malformed: an `error` frame is sent and processing stops,
 ///   since clients treat `error` as terminal
 ///
-/// Frames that are not credentials are ignored.
+/// Frames that are not credentials are ignored. A frame larger than
+/// [`MAX_INCOMING_MESSAGE_BYTES`] is answered with an `error` frame and
+/// ends processing before it is parsed.
 ///
 /// Returns `Ok(())` once the connection ends and the verification error
 /// after a credential was refused. Either way the session is over, while
@@ -205,6 +218,17 @@ where
     W: futures_util::Sink<String> + Unpin,
 {
     while let Some(Ok(text)) = receiver.next().await {
+        if text.len() > MAX_INCOMING_MESSAGE_BYTES {
+            let error = VerificationError::with_code(
+                "payment message is too large",
+                ErrorCode::InvalidPayload,
+            );
+            let msg = WsResponse::Error {
+                error: error.message.clone(),
+            };
+            let _ = sender.send(msg.to_text()).await;
+            return Err(error);
+        }
         let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
             continue;
         };
@@ -783,6 +807,11 @@ mod tests {
         let data = serde_json::json!({"type": "message", "data": "hi"}).to_string();
         let malformed =
             serde_json::json!({"type": "credential", "credential": "Payment !"}).to_string();
+        let oversized = serde_json::json!({
+            "type": "message",
+            "data": "x".repeat(MAX_INCOMING_MESSAGE_BYTES),
+        })
+        .to_string();
 
         // (incoming frames, receipts sent, error sent, error code returned)
         let cases = [
@@ -812,6 +841,12 @@ mod tests {
                 vec![],
                 Some("malformed credential"),
                 Some(ErrorCode::InvalidCredential),
+            ),
+            (
+                vec![voucher("200", "0xok"), oversized, voucher("300", "0xok")],
+                vec!["accepted-200"],
+                Some("payment message is too large"),
+                Some(ErrorCode::InvalidPayload),
             ),
         ];
 
