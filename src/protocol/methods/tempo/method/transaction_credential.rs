@@ -361,14 +361,31 @@ where
             .await;
         let receipt = match broadcast {
             Ok(receipt) => receipt,
-            Err(broadcast_error) => self
-                .recover_broadcast_receipt(keccak256(&final_tx_bytes))
-                .await
-                .ok_or_else(|| {
-                    VerificationError::network_error(format!(
-                        "Failed to broadcast: {broadcast_error}"
-                    ))
-                })?,
+            Err(broadcast_error) => {
+                let tx_hash = keccak256(&final_tx_bytes);
+                // Recover only when the store reserved this submission above:
+                // without a store, a receipt for these bytes may belong to an
+                // earlier, already accepted submission of the same credential.
+                let recovered = match &self.store {
+                    Some(_) => self.recover_broadcast_receipt(tx_hash).await,
+                    None => None,
+                };
+                match recovered {
+                    Some(receipt) => receipt,
+                    None => {
+                        // Release the reservation so a retry of the same bytes
+                        // can reach recovery once the transaction lands; the
+                        // replay claim below still prevents double acceptance.
+                        if let Some(store) = &self.store {
+                            let dedup_key = format!("mpp:charge:submission:{tx_hash:#x}");
+                            let _ = store.delete(&dedup_key).await;
+                        }
+                        return Err(VerificationError::network_error(format!(
+                            "Failed to broadcast: {broadcast_error}"
+                        )));
+                    }
+                }
+            }
         };
 
         if !receipt.status() {

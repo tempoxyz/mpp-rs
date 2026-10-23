@@ -295,6 +295,14 @@ enum RecoveryLookup {
 async fn broadcast_with_failed_sync_reply(
     lookup: RecoveryLookup,
 ) -> (B256, Result<B256, VerificationError>) {
+    let store = Arc::new(crate::store::MemoryStore::new());
+    broadcast_with_failed_sync_reply_and_store(lookup, Some(store)).await
+}
+
+async fn broadcast_with_failed_sync_reply_and_store(
+    lookup: RecoveryLookup,
+    store: Option<Arc<crate::store::MemoryStore>>,
+) -> (B256, Result<B256, VerificationError>) {
     use alloy::providers::mock::Asserter;
 
     let currency = Address::repeat_byte(0x20);
@@ -354,7 +362,10 @@ async fn broadcast_with_failed_sync_reply(
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(asserter);
-    let method = ChargeMethod::new(provider);
+    let mut method = ChargeMethod::new(provider);
+    if let Some(store) = store {
+        method = method.with_store(store);
+    }
 
     let result = method
         .broadcast_transaction(
@@ -398,4 +409,38 @@ async fn test_broadcast_recovery_reports_broadcast_error_without_matching_receip
             "got: {error}"
         );
     }
+}
+
+/// Without a store nothing reserved the submission, so a receipt for the same
+/// bytes may come from an earlier accepted credential: it must not be reused.
+#[tokio::test]
+async fn test_broadcast_without_store_does_not_recover_receipt() {
+    let (_, result) =
+        broadcast_with_failed_sync_reply_and_store(RecoveryLookup::Included, None).await;
+    let error = result.expect_err("replayed charge must not be recovered without a store");
+    assert!(
+        error.to_string().contains("Broadcast reply unavailable"),
+        "got: {error}"
+    );
+}
+
+/// An unrecovered broadcast releases its submission reservation, so a retry of
+/// the same bytes can reach recovery once the transaction lands.
+#[tokio::test]
+async fn test_broadcast_releases_submission_reservation_when_unrecovered() {
+    use crate::store::Store;
+
+    let store = Arc::new(crate::store::MemoryStore::new());
+    let (tx_hash, result) =
+        broadcast_with_failed_sync_reply_and_store(RecoveryLookup::Missing, Some(store.clone()))
+            .await;
+    assert!(result.is_err());
+    let reservation = store
+        .get(&format!("mpp:charge:submission:{tx_hash:#x}"))
+        .await
+        .unwrap();
+    assert!(
+        reservation.is_none(),
+        "reservation was kept: {reservation:?}"
+    );
 }
