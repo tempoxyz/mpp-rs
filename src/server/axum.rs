@@ -252,6 +252,8 @@ pub struct ChallengeOptions {
     pub description: Option<&'static str>,
     /// Framework adapter route/resource/query scope.
     pub mppx_scope: Option<serde_json::Value>,
+    /// Hostname of the current HTTP request, used for an unconfigured realm.
+    pub request_realm: Option<String>,
 }
 
 /// Axum extractor that gates a handler behind payment verification.
@@ -509,6 +511,19 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         Box::pin(async move { verified.await.map_err(MppError::verification_failed) })
     }
 
+    /// Verify with the hostname of the HTTP request as the default realm.
+    fn verify_payment_for_route_with_realm(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: Option<&[u8]>,
+        _request_realm: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
+    {
+        self.verify_payment_for_route(credential_str, amount, mppx_scope, body)
+    }
+
     /// HTTP field containing the Payment credential.
     ///
     /// Defaults to `Authorization`. Servers created with `requires_auth`
@@ -604,16 +619,17 @@ where
         amount: &str,
         options: ChallengeOptions,
     ) -> Result<PaymentChallenge, String> {
-        self.charge_with_options(
-            amount,
-            super::ChargeOptions {
-                description: options.description,
-                mppx_scope: options.mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        )
-        .map(|mut offers| offers.remove(0))
-        .map_err(|e| e.to_string())
+        self.for_request_realm(options.request_realm.as_deref())
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map(|mut offers| offers.remove(0))
+            .map_err(|e| e.to_string())
     }
 
     fn challenge_with_body(
@@ -622,17 +638,18 @@ where
         options: ChallengeOptions,
         body: &[u8],
     ) -> Result<PaymentChallenge, String> {
-        self.charge_with_options_and_body(
-            amount,
-            super::ChargeOptions {
-                description: options.description,
-                mppx_scope: options.mppx_scope.as_ref(),
-                ..Default::default()
-            },
-            body,
-        )
-        .map(|mut offers| offers.remove(0))
-        .map_err(|e| e.to_string())
+        self.for_request_realm(options.request_realm.as_deref())
+            .charge_with_options_and_body(
+                amount,
+                super::ChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+                body,
+            )
+            .map(|mut offers| offers.remove(0))
+            .map_err(|e| e.to_string())
     }
 
     fn verify_payment(
@@ -785,7 +802,20 @@ where
         body: Option<&[u8]>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
     {
-        let expected = self
+        self.verify_payment_for_route_with_realm(credential_str, amount, mppx_scope, body, None)
+    }
+
+    fn verify_payment_for_route_with_realm(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: Option<&[u8]>,
+        request_realm: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
+    {
+        let mpp = self.for_request_realm(request_realm);
+        let expected = mpp
             .charge_with_options(
                 amount,
                 super::ChargeOptions {
@@ -794,7 +824,7 @@ where
                 },
             )
             .map(|mut offers| offers.remove(0));
-        verify_expected(self, credential_str, expected, body)
+        verify_expected(&mpp, credential_str, expected, body)
     }
 
     fn credential_header(&self) -> &str {
@@ -806,15 +836,16 @@ where
         amount: &str,
         options: ChallengeOptions,
     ) -> Result<Vec<PaymentChallenge>, String> {
-        self.charge_with_options(
-            amount,
-            super::ChargeOptions {
-                description: options.description,
-                mppx_scope: options.mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| e.to_string())
+        self.for_request_realm(options.request_realm.as_deref())
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())
     }
 
     fn challenges_with_body(
@@ -823,16 +854,17 @@ where
         options: ChallengeOptions,
         body: &[u8],
     ) -> Result<Vec<PaymentChallenge>, String> {
-        self.charge_with_options_and_body(
-            amount,
-            super::ChargeOptions {
-                description: options.description,
-                mppx_scope: options.mppx_scope.as_ref(),
-                ..Default::default()
-            },
-            body,
-        )
-        .map_err(|e| e.to_string())
+        self.for_request_realm(options.request_realm.as_deref())
+            .charge_with_options_and_body(
+                amount,
+                super::ChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+                body,
+            )
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -846,15 +878,16 @@ where
         amount: &str,
         options: ChallengeOptions,
     ) -> Result<PaymentChallenge, String> {
-        self.stripe_charge_with_options(
-            amount,
-            super::StripeChargeOptions {
-                description: options.description,
-                mppx_scope: options.mppx_scope.as_ref(),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| e.to_string())
+        self.for_request_realm(options.request_realm.as_deref())
+            .stripe_charge_with_options(
+                amount,
+                super::StripeChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())
     }
 
     fn challenge_with_body(
@@ -863,16 +896,17 @@ where
         options: ChallengeOptions,
         body: &[u8],
     ) -> Result<PaymentChallenge, String> {
-        self.stripe_charge_with_options_and_body(
-            amount,
-            super::StripeChargeOptions {
-                description: options.description,
-                mppx_scope: options.mppx_scope.as_ref(),
-                ..Default::default()
-            },
-            body,
-        )
-        .map_err(|e| e.to_string())
+        self.for_request_realm(options.request_realm.as_deref())
+            .stripe_charge_with_options_and_body(
+                amount,
+                super::StripeChargeOptions {
+                    description: options.description,
+                    mppx_scope: options.mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+                body,
+            )
+            .map_err(|e| e.to_string())
     }
 
     fn verify_payment(
@@ -1025,14 +1059,27 @@ where
         body: Option<&[u8]>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
     {
-        let expected = self.stripe_charge_with_options(
+        self.verify_payment_for_route_with_realm(credential_str, amount, mppx_scope, body, None)
+    }
+
+    fn verify_payment_for_route_with_realm(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: Option<&[u8]>,
+        request_realm: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
+    {
+        let mpp = self.for_request_realm(request_realm);
+        let expected = mpp.stripe_charge_with_options(
             amount,
             super::StripeChargeOptions {
                 mppx_scope: mppx_scope.as_ref(),
                 ..Default::default()
             },
         );
-        verify_expected(self, credential_str, expected, body)
+        verify_expected(&mpp, credential_str, expected, body)
     }
 
     fn credential_header(&self) -> &str {
@@ -1054,6 +1101,7 @@ where
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
         let mppx_scope = mppx_scope_from_parts(parts);
+        let request_realm = request_realm_from_parts(parts);
         let auth_header = parts
             .headers
             .get(challenger.credential_header())
@@ -1065,6 +1113,7 @@ where
             let options = ChallengeOptions {
                 description: C::description(),
                 mppx_scope: mppx_scope.clone(),
+                request_realm: request_realm.clone(),
             };
 
             let credential_str = match auth_header {
@@ -1078,7 +1127,13 @@ where
             };
 
             let receipt = match challenger
-                .verify_payment_for_route(&credential_str, C::amount(), mppx_scope, None)
+                .verify_payment_for_route_with_realm(
+                    &credential_str,
+                    C::amount(),
+                    mppx_scope,
+                    None,
+                    request_realm.as_deref(),
+                )
                 .await
             {
                 Ok(r) => r,
@@ -1112,6 +1167,7 @@ where
         let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
         let (parts, body) = req.into_parts();
         let mppx_scope = mppx_scope_from_parts(&parts);
+        let request_realm = request_realm_from_parts(&parts);
         let auth_header = parts
             .headers
             .get(challenger.credential_header())
@@ -1128,6 +1184,7 @@ where
             let options = ChallengeOptions {
                 description: C::description(),
                 mppx_scope: mppx_scope.clone(),
+                request_realm: request_realm.clone(),
             };
 
             let credential_str = match auth_header {
@@ -1141,7 +1198,13 @@ where
             };
 
             let receipt = match challenger
-                .verify_payment_for_route(&credential_str, C::amount(), mppx_scope, Some(&body))
+                .verify_payment_for_route_with_realm(
+                    &credential_str,
+                    C::amount(),
+                    mppx_scope,
+                    Some(&body),
+                    request_realm.as_deref(),
+                )
                 .await
             {
                 Ok(r) => r,
@@ -1159,6 +1222,30 @@ where
             })
         }
     }
+}
+
+fn request_realm_from_parts(parts: &http_types::request::Parts) -> Option<String> {
+    if parts
+        .uri
+        .scheme_str()
+        .is_some_and(|scheme| !matches!(scheme, "http" | "https"))
+    {
+        return None;
+    }
+    let authority = match parts.uri.authority() {
+        Some(authority) => authority.clone(),
+        None => parts
+            .headers
+            .get(header::HOST)?
+            .to_str()
+            .ok()?
+            .parse::<http_types::uri::Authority>()
+            .ok()?,
+    };
+    if authority.as_str().contains('@') || authority.host().is_empty() {
+        return None;
+    }
+    Some(authority.host().to_ascii_lowercase())
 }
 
 fn mppx_scope_from_parts(parts: &http_types::request::Parts) -> Option<serde_json::Value> {

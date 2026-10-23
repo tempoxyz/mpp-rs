@@ -44,15 +44,17 @@ pub struct StripeBuilder {
     pub(crate) currency: String,
     pub(crate) decimals: u8,
     pub(crate) realm: String,
+    pub(crate) request_realm_default: bool,
     pub(crate) hmac_secret_key: Option<String>,
     pub(crate) stripe_api_base: Option<String>,
     pub(crate) requires_auth: bool,
 }
 
 impl StripeBuilder {
-    /// Override the realm (default: auto-detected from environment variables).
+    /// Override the realm (default: the HTTP request hostname in Axum).
     pub fn realm(mut self, realm: &str) -> Self {
         self.realm = realm.to_string();
+        self.request_realm_default = false;
         self
     }
 
@@ -111,6 +113,7 @@ pub fn stripe(config: StripeConfig<'_>) -> StripeBuilder {
         currency: config.currency.to_string(),
         decimals: config.decimals,
         realm: detect_realm(),
+        request_realm_default: super::mpp::request_realm_default(),
         hmac_secret_key: None,
         stripe_api_base: None,
         requires_auth: false,

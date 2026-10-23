@@ -319,8 +319,13 @@ impl TempoSessionProvider {
         origin: reqwest::Url,
         realm: impl Into<String>,
     ) -> Self {
-        self.trusted_tempo_proof_realms.push((origin, realm.into()));
+        self.set_trusted_tempo_proof_realm(origin, realm.into());
         self
+    }
+
+    /// Replace the caller-specific pins on a session cloned from shared channel state.
+    pub(crate) fn replace_trusted_tempo_proof_realms(&mut self, realms: &[(reqwest::Url, String)]) {
+        self.trusted_tempo_proof_realms = realms.to_vec();
     }
 
     /// Handle an mppx session SSE event from a response to `url`: answer
@@ -3494,6 +3499,19 @@ mod tests {
             "https://rpc.moderato.tempo.xyz/"
         );
         assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn repeated_realm_pins_replace_prior_realm() {
+        let origin = reqwest::Url::parse("https://api.example.test").unwrap();
+        let request = reqwest::Url::parse("https://api.example.test/pay").unwrap();
+        let provider =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.example.com")
+                .unwrap()
+                .with_trusted_tempo_proof_realm(origin.clone(), "old")
+                .with_trusted_tempo_proof_realm(origin, "new");
+        assert_eq!(provider.trusted_tempo_proof_realms.len(), 1);
+        assert_eq!(provider.trusted_tempo_proof_realm(&request), Some("new"));
     }
 
     #[test]

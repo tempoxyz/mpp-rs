@@ -35,6 +35,7 @@ pub struct TempoBuilder {
     pub(crate) recipient: String,
     pub(crate) rpc_url: String,
     pub(crate) realm: String,
+    pub(crate) request_realm_default: bool,
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
     pub(crate) fee_payer: bool,
@@ -92,9 +93,10 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the realm (default: auto-detected from environment variables).
+    /// Override the realm (default: the HTTP request hostname in Axum).
     pub fn realm(mut self, realm: &str) -> Self {
         self.realm = realm.to_string();
+        self.request_realm_default = false;
         self
     }
 
@@ -267,6 +269,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: detect_realm(),
+        request_realm_default: super::mpp::request_realm_default(),
         secret_key: None,
         decimals: 6,
         fee_payer: false,

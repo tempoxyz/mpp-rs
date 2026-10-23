@@ -233,6 +233,38 @@ fn test_config_overrides() {
 }
 
 #[test]
+fn test_request_realm_uses_hostname_without_port() {
+    let request = http_types::Request::builder()
+        .uri("/paid")
+        .header(header::HOST, "Api.Example.Test:8443")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    assert_eq!(
+        request_realm_from_parts(&parts).as_deref(),
+        Some("api.example.test")
+    );
+
+    let request = http_types::Request::builder()
+        .uri("https://Other.Example.Test:443/paid")
+        .header(header::HOST, "api.example.test")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    assert_eq!(
+        request_realm_from_parts(&parts).as_deref(),
+        Some("other.example.test")
+    );
+
+    let request = http_types::Request::builder()
+        .uri("/paid")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    assert_eq!(request_realm_from_parts(&parts), None);
+}
+
+#[test]
 fn test_with_receipt_attaches_header() {
     use crate::protocol::core::{MethodName, ReceiptStatus};
 
@@ -1011,6 +1043,9 @@ mod currency_offers {
     use crate::server::{tempo, ChargeMethod, Mpp, TempoConfig};
     use std::future::Future;
 
+    #[cfg(feature = "stripe")]
+    use crate::server::{stripe, StripeConfig};
+
     const RECIPIENT: &str = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2";
 
     #[derive(Clone)]
@@ -1259,6 +1294,99 @@ mod currency_offers {
         let problem = rejected(err);
         assert_eq!(problem.problem.status, 500);
         assert!(problem.offers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_default_realm_binds_challenge_and_verification_to_http_hostname() {
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: RECIPIENT,
+            })
+            .rpc_url("http://127.0.0.1:1")
+            .chain_id(CHAIN_ID)
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let first = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp.clone(), None, "https://api.example.test/test")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(first.realm, "api.example.test");
+        assert_eq!(mpp.realm(), "MPP Payment");
+
+        let credential =
+            PaymentCredential::new(first.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+        let authorization = format_authorization(&credential).unwrap();
+        let wrong_host = run_extractor_with_uri::<OneCent>(
+            mpp.clone(),
+            Some(&authorization),
+            "https://other.example.test/test",
+        )
+        .await
+        .unwrap_err();
+        let MppChargeRejection::Problem(problem) = wrong_host else {
+            panic!("expected a payment problem for a credential from another hostname");
+        };
+        assert!(problem.problem.problem_type.ends_with("/invalid-challenge"));
+        assert_eq!(problem.offers[0].realm, "other.example.test");
+
+        // The matching hostname passes realm verification and reaches the
+        // intentionally unreachable RPC provider.
+        let same_host = run_extractor_with_uri::<OneCent>(
+            mpp,
+            Some(&authorization),
+            "https://api.example.test/test",
+        )
+        .await
+        .unwrap_err();
+        let MppChargeRejection::Problem(problem) = same_host else {
+            panic!("expected the unreachable RPC to fail verification");
+        };
+        assert_eq!(problem.problem.status, 500);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_realm_overrides_http_hostname() {
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: RECIPIENT,
+            })
+            .realm("configured.example.test")
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let offer = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp, None, "https://api.example.test/test")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(offer.realm, "configured.example.test");
+    }
+
+    #[cfg(feature = "stripe")]
+    #[tokio::test]
+    async fn test_stripe_default_realm_uses_http_hostname() {
+        let mpp = Mpp::create_stripe(
+            stripe(StripeConfig {
+                secret_key: "sk_test_not_sent",
+                network_id: "internal",
+                payment_method_types: &["card"],
+                currency: "usd",
+                decimals: 2,
+            })
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let offer = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp, None, "https://billing.example.test/paid")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(offer.realm, "billing.example.test");
     }
 
     #[tokio::test]

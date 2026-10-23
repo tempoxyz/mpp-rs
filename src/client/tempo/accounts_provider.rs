@@ -381,9 +381,7 @@ impl TempoAccountsProvider {
         })?;
         if let Some(provider) = cached.as_ref() {
             let mut provider = provider.clone();
-            for (origin, realm) in &self.trusted_tempo_proof_realms {
-                provider.set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
-            }
+            provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
             return Ok(provider);
         }
         let settings = &self.session_settings;
@@ -406,7 +404,9 @@ impl TempoAccountsProvider {
         if let Some(events) = &settings.events {
             provider = provider.with_events(events.clone());
         }
-        *cached = Some(provider.clone());
+        let mut shared = provider.clone();
+        shared.replace_trusted_tempo_proof_realms(&[]);
+        *cached = Some(shared);
         Ok(provider)
     }
 
@@ -905,6 +905,36 @@ mod tests {
         let updated = provider.session().unwrap();
         assert_eq!(updated.trusted_tempo_proof_realm(&request), Some("updated"));
         assert_eq!(provider.trusted_tempo_proof_realms.len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_session_does_not_share_realm_pins_across_account_clones() {
+        let (provider, path, _) = provider();
+        let origin = reqwest::Url::parse("https://api.example").unwrap();
+        let request = reqwest::Url::parse("https://api.example/pay").unwrap();
+        let unpinned = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let pinned = unpinned
+            .clone()
+            .with_trusted_tempo_proof_realm(origin, "other clone's realm");
+        assert_eq!(
+            pinned
+                .session()
+                .unwrap()
+                .trusted_tempo_proof_realm(&request),
+            Some("other clone's realm")
+        );
+        assert_eq!(
+            unpinned
+                .session()
+                .unwrap()
+                .trusted_tempo_proof_realm(&request),
+            None
+        );
         std::fs::remove_file(path).unwrap();
     }
 
