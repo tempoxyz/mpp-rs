@@ -4,8 +4,9 @@
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{keccak256, Address, Bytes, B256};
+use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256};
 use alloy::providers::Provider;
+use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::TempoNetwork;
 
 use crate::protocol::intents::ChargeRequest;
@@ -48,6 +49,58 @@ pub(super) fn ensure_transaction_credential_source(
     }
 
     Ok(())
+}
+
+/// The token the payer spent on a recognized payment route: MACH for the
+/// machine-token swapper route, the input token of a DEX swap that buys the
+/// payment, else the payment currency for direct transfers.
+///
+/// `None` when the calls are not a recognized route bound to the expected
+/// transfers. This only labels a payment; it never decides whether one is valid.
+pub(super) fn funding_currency(
+    calls: &[Call],
+    chain_id: u64,
+    currency: Address,
+    expected: &[Transfer],
+    machine_token_enabled: bool,
+) -> Option<Address> {
+    if machine_token_enabled {
+        if let Some(route) =
+            super::super::machine_token::match_route(calls, chain_id, currency, expected)
+        {
+            return match route.calls[0].to {
+                TxKind::Call(token) => Some(token),
+                TxKind::Create => None,
+            };
+        }
+    }
+    let parsed = PaymentCalls::parse(calls).ok()?;
+    validate_fee_payer_calls(&parsed, currency, expected).ok()?;
+    match_transfers(
+        &parsed.transfer_effects(),
+        TransferSource::Calls,
+        currency,
+        expected,
+    )
+    .ok()?;
+    Some(parsed.swap_input_token().unwrap_or(currency))
+}
+
+/// [`funding_currency`] of a charge's signed Tempo transaction.
+pub(super) fn signed_transaction_funding_currency(
+    signed_tx: &str,
+    charge: &ChargeRequest,
+    chain_id: u64,
+) -> Option<Address> {
+    let tx_bytes = signed_tx.parse::<Bytes>().ok()?;
+    let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..]).ok()?;
+    funding_currency(
+        &signed.tx().calls,
+        chain_id,
+        charge.currency_address().ok()?,
+        &super::super::transfers::get_request_transfers(charge).ok()?,
+        charge.machine_token_enabled(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default)]
