@@ -99,11 +99,16 @@ pub fn scrub_response_headers(headers: &mut Vec<(String, String)>) {
     // Drop Payment credentials and challenges while preserving other schemes.
     headers.retain_mut(|(name, value)| {
         if eq_ascii_lower(name, "authorization") {
-            return !is_payment_authorization(value);
+            return !is_payment_authorization(value)
+                && crate::protocol::core::extract_payment_scheme(value).is_none();
         }
         if eq_ascii_lower(name, "www-authenticate") {
             *value = remove_payment_challenges(value);
-            return !value.is_empty();
+            // Drop the whole value if the client's own parser still finds a
+            // Payment challenge in what is left, so a value split differently
+            // by the two parsers cannot smuggle a challenge through.
+            return !value.is_empty()
+                && crate::protocol::core::parse_www_authenticate_all([value.as_str()]).is_empty();
         }
         true
     });
@@ -204,6 +209,31 @@ fn remove_payment_challenges(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scrub_response_drops_payment_hidden_by_parser_mismatch() {
+        let mut headers = vec![
+            (
+                "WWW-Authenticate".into(),
+                r#"Basic abc"def, Payment id="x", realm="r", method="tempo", intent="charge", request="e30""#.into(),
+            ),
+            ("WWW-Authenticate".into(), r#"Basic realm=a"b, Payment id="x", realm="r", method="tempo", intent="charge", request="e30""#.into()),
+            ("WWW-Authenticate".into(), r#"Basic realm="kept""#.into()),
+            ("Authorization".into(), "Bearer x, Payment abc".into()),
+            ("Authorization".into(), "Bearer kept".into()),
+        ];
+        scrub_response_headers(&mut headers);
+        assert_eq!(
+            headers,
+            vec![
+                (
+                    "WWW-Authenticate".to_string(),
+                    r#"Basic realm="kept""#.to_string()
+                ),
+                ("Authorization".to_string(), "Bearer kept".to_string()),
+            ]
+        );
+    }
 
     fn names(h: &[(String, String)]) -> Vec<String> {
         h.iter().map(|(n, _)| n.to_lowercase()).collect()
