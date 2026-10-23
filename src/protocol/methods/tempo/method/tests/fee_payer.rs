@@ -1036,3 +1036,64 @@ async fn test_sponsored_ousd_charge_on_moderato_pays_gas_in_path_usd() {
     // Nothing funded: fall back to the first allowlisted token.
     assert_sponsored_ousd_charge_succeeds(MODERATO_CHAIN_ID, &[0], token(PATH_USD)).await;
 }
+
+/// Sponsored transactions need at least 15 seconds of validity left, counted
+/// from the current time rounded up to the next second, as in mppx.
+#[test]
+fn test_ensure_remaining_validity_boundaries() {
+    use super::super::fee_payer::ensure_remaining_validity;
+    use std::time::Duration;
+
+    let base = 2_000_000_000u64;
+    for (millis, remaining, accepted) in [
+        (0, 14, false),
+        (0, 15, true),
+        (1, 15, false),
+        (1, 16, true),
+        (999, 16, true),
+    ] {
+        let now = Duration::from_secs(base) + Duration::from_millis(millis);
+        let result = ensure_remaining_validity(base + remaining, now);
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "offset {millis}ms, remaining {remaining}s: {result:?}"
+        );
+        if let Err(err) = result {
+            assert!(
+                err.to_string().contains("at least 15 seconds"),
+                "got: {err}"
+            );
+        }
+    }
+}
+
+/// cosign_fee_payer_transaction rejects txs that expire too soon to land.
+#[tokio::test]
+async fn test_cosign_rejects_short_remaining_validity() {
+    let client_signer = alloy::signers::local::PrivateKeySigner::random();
+    let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+    let fee_token = KnownTempoNetwork::Mainnet
+        .default_currency()
+        .parse::<Address>()
+        .unwrap();
+    let encoded = sign_and_encode_0x78(make_fee_payer_tx(10), &client_signer);
+
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+    let err = method
+        .cosign_fee_payer_transaction(
+            &encoded,
+            method.fee_payer_signer.as_deref().unwrap(),
+            fee_token,
+        )
+        .await
+        .expect_err("should reject a transaction with under 15s of validity");
+    assert!(
+        err.to_string().contains("at least 15 seconds"),
+        "got: {err}"
+    );
+}
