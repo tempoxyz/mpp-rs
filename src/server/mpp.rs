@@ -128,6 +128,7 @@ pub struct Mpp<M, S = ()> {
 struct Config {
     realm: String,
     request_realm_default: bool,
+    trusted_request_hosts: Vec<String>,
     secret_key: String,
     currencies: Vec<String>,
     recipient: Option<String>,
@@ -144,6 +145,7 @@ impl Config {
         Self {
             realm,
             request_realm_default: false,
+            trusted_request_hosts: Vec::new(),
             secret_key,
             currencies: Vec::new(),
             recipient: None,
@@ -291,7 +293,7 @@ where
         &self.config.realm
     }
 
-    /// Use the HTTP request hostname for a builder's default realm, without
+    /// Use a trusted HTTP request hostname for the default realm, without
     /// changing the shared handler used by concurrent requests.
     #[cfg(feature = "axum")]
     pub(crate) fn for_request_realm(&self, host: Option<&str>) -> Self
@@ -299,8 +301,15 @@ where
         S: Clone,
     {
         let mut mpp = self.clone();
-        if mpp.config.request_realm_default {
-            Arc::make_mut(&mut mpp.config).realm = host.unwrap_or(DEFAULT_REALM).to_string();
+        if let Some(host) = host.filter(|host| {
+            mpp.config.request_realm_default
+                && mpp
+                    .config
+                    .trusted_request_hosts
+                    .iter()
+                    .any(|trusted| trusted.eq_ignore_ascii_case(host))
+        }) {
+            Arc::make_mut(&mut mpp.config).realm = host.to_string();
         }
         mpp
     }
@@ -449,6 +458,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             method,
             Config {
                 request_realm_default: builder.request_realm_default,
+                trusted_request_hosts: builder.trusted_request_hosts,
                 currencies,
                 recipient: Some(builder.recipient),
                 decimals: builder.decimals,
@@ -506,6 +516,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
             method,
             Config {
                 request_realm_default: builder.request_realm_default,
+                trusted_request_hosts: builder.trusted_request_hosts,
                 currencies: vec![builder.currency],
                 decimals: builder.decimals as u32,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),

@@ -1304,6 +1304,7 @@ mod currency_offers {
             })
             .rpc_url("http://127.0.0.1:1")
             .chain_id(CHAIN_ID)
+            .trusted_hosts(["api.example.test", "other.example.test"])
             .secret_key("test-secret-key-at-least-32-bytes"),
         )
         .unwrap();
@@ -1348,6 +1349,25 @@ mod currency_offers {
     }
 
     #[tokio::test]
+    async fn test_untrusted_host_cannot_choose_proof_realm() {
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: RECIPIENT,
+            })
+            .trusted_hosts(["api.example.test"])
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let offer = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp, None, "https://attacker.example.test/test")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(offer.realm, "MPP Payment");
+    }
+
+    #[tokio::test]
     async fn test_explicit_realm_overrides_http_hostname() {
         let mpp = Mpp::create(
             tempo(TempoConfig {
@@ -1377,6 +1397,7 @@ mod currency_offers {
                 currency: "usd",
                 decimals: 2,
             })
+            .trusted_hosts(["billing.example.test"])
             .secret_key("test-secret-key-at-least-32-bytes"),
         )
         .unwrap();
