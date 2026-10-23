@@ -169,8 +169,10 @@ where
         + Unpin,
 {
     while let Some(Ok(text)) = receiver.next().await {
+        // Skip oversized frames unparsed, but keep reading: callers of this
+        // deprecated function expect it to return only once the connection ends.
         if text.len() > MAX_INCOMING_MESSAGE_BYTES {
-            return;
+            continue;
         }
         let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
             continue;
@@ -877,6 +879,71 @@ mod tests {
             }
             assert_eq!(frames.len(), expected, "unexpected frames: {frames:?}");
         }
+    }
+
+    /// Session method that counts the vouchers it is asked to verify.
+    #[derive(Clone, Default)]
+    struct CountingSession(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SessionMethod for CountingSession {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        async fn verify_session(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &SessionRequest,
+        ) -> Result<Receipt, VerificationError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Receipt::success("tempo", "counted"))
+        }
+    }
+
+    /// The deprecated processor skips an oversized frame without parsing it
+    /// and keeps verifying later vouchers until the connection ends.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_process_incoming_vouchers_skips_oversized_frames() {
+        let session = CountingSession::default();
+        let verified = session.0.clone();
+        let mpp =
+            crate::server::Mpp::new(MockCharge, "ws.test", "secret").with_session_method(session);
+        let challenge = mpp
+            .session_challenge(
+                "100",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": "0xabc",
+                "cumulativeAmount": "200",
+                "signature": "0xok",
+            }),
+        );
+        let voucher = serde_json::json!({
+            "type": "credential",
+            "credential": format_authorization(&credential).unwrap(),
+        })
+        .to_string();
+        let oversized = serde_json::json!({
+            "type": "credential",
+            "credential": "x".repeat(MAX_INCOMING_MESSAGE_BYTES),
+        })
+        .to_string();
+
+        let mut receiver = futures_util::stream::iter(
+            [voucher.clone(), oversized, voucher]
+                .into_iter()
+                .map(Ok::<_, Box<dyn std::error::Error + Send + Sync>>),
+        );
+        process_incoming_vouchers(&mut receiver, &mpp).await;
+
+        assert_eq!(verified.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
