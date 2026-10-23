@@ -5,7 +5,6 @@ version = "0.2.0"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/tempoxyz/mpp-rs"
 repository = "https://github.com/tempoxyz/mpp-rs"
 keywords = ["alloy", "mpp", "payments", "websocket", "ethereum"]
 categories = ["web-programming", "authentication", "cryptography"]
