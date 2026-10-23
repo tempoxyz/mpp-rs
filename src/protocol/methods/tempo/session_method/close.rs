@@ -19,15 +19,24 @@ use crate::protocol::traits::{ErrorCode, VerificationError};
 /// How long a server close transaction's expiring nonce stays valid.
 const CLOSE_VALID_BEFORE_SECS: u64 = 25;
 
+/// Margin past a close's `valid_before` for clock skew between this host and
+/// the chain before reconciliation treats an unmined close as expired.
+/// Matches mppx's `pendingCloseClockSkewSeconds`.
+const CLOSE_CLOCK_SKEW_SECS: u64 = 30;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Nonce fields for a server-signed close: an expiring nonce (key
 /// `U256::MAX`, nonce 0) valid for [`CLOSE_VALID_BEFORE_SECS`], matching
 /// mppx's `nonceKey: 'expiring'` for session transactions.
 pub(super) fn close_transaction_nonce_fields(
 ) -> (u64, alloy::primitives::U256, Option<std::num::NonZeroU64>) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_now();
     (
         0,
         tempo_alloy::primitives::transaction::TEMPO_EXPIRING_NONCE_KEY,
@@ -185,7 +194,33 @@ where
                 VerificationError::network_error(format!("close reconciliation failed: {e}"))
             })?;
         let Some(receipt) = receipt else {
-            return Ok(channel);
+            // An expiring close that is still unmined well past its
+            // `valid_before` can never land: release the channel.
+            let expired = pending.valid_before.is_some_and(|valid_before| {
+                unix_now() > valid_before.saturating_add(CLOSE_CLOCK_SKEW_SECS)
+            });
+            if !expired {
+                return Ok(channel);
+            }
+            return self
+                .store
+                .update_channel(
+                    &channel_id,
+                    Box::new(move |current| {
+                        let state = current.ok_or_else(|| {
+                            VerificationError::channel_not_found("channel not found")
+                        })?;
+                        if state.pending_close.as_ref() != Some(&pending)
+                            || !state.closing
+                            || state.finalized
+                        {
+                            return Ok(Some(state));
+                        }
+                        Ok(Some(state.clear_pending_close()))
+                    }),
+                )
+                .await?
+                .ok_or_else(|| VerificationError::channel_not_found("channel not found"));
         };
         if receipt.transaction_hash() != pending.transaction_hash {
             return Err(VerificationError::network_error(
@@ -350,9 +385,6 @@ where
             ))
             .abi_encode();
 
-            // An expiring nonce keeps independent server processes sharing the
-            // close signer from racing for the same sequential nonce.
-            let (nonce, nonce_key, valid_before) = close_transaction_nonce_fields();
             let gas_price = self.provider.get_gas_price().await.map_err(|e| {
                 VerificationError::network_error(format!("failed to get gas price: {}", e))
             })?;
@@ -385,6 +417,11 @@ where
                 )?;
             }
 
+            // An expiring nonce keeps independent server processes sharing the
+            // close signer from racing for the same sequential nonce. Built
+            // right before signing so the RPC calls above do not use up its
+            // validity window.
+            let (nonce, nonce_key, valid_before) = close_transaction_nonce_fields();
             let tempo_tx = TempoTransaction {
                 chain_id,
                 nonce,
@@ -410,6 +447,7 @@ where
                 nonce,
                 cumulative_amount,
                 signature: sig_bytes.clone(),
+                valid_before: valid_before.map(std::num::NonZeroU64::get),
             };
             self.store.update_channel(channel_id_str, Box::new(move |current| {
                 let mut state = current.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;

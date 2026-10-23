@@ -771,6 +771,7 @@ async fn test_reconcile_pending_close_after_restart() {
             nonce: 7,
             cumulative_amount: 1000,
             signature: vec![1; 65],
+            valid_before: None,
         });
         let state: ChannelState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
@@ -842,4 +843,36 @@ fn test_close_transaction_uses_expiring_nonce() {
     );
     let valid_before = valid_before.unwrap().get();
     assert!(valid_before > now && valid_before <= now + 26);
+}
+
+/// An expiring close still unmined past its `valid_before` plus the skew
+/// margin can never land, so reconciliation releases the channel; one still
+/// inside its window stays pending.
+#[tokio::test]
+async fn test_reconcile_releases_expired_pending_close() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (valid_before, released) in [(now - 120, true), (now + 25, false)] {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = B256::repeat_byte(0xab).to_string();
+        let mut state = test_channel_state(&channel_id);
+        state.closing = true;
+        state.pending_close = Some(super::super::PendingClose {
+            transaction_hash: B256::repeat_byte(0xcc),
+            nonce: 0,
+            cumulative_amount: 1000,
+            signature: vec![1; 65],
+            valid_before: Some(valid_before),
+        });
+        store.insert(&channel_id, state);
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&serde_json::Value::Null);
+        let method = mocked_session_method(store.clone(), asserter);
+        let state = method.reconcile_pending_close(&channel_id).await.unwrap();
+        assert_eq!(state.closing, !released);
+        assert_eq!(state.pending_close.is_some(), !released);
+        assert!(!state.finalized);
+    }
 }
