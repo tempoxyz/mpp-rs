@@ -1255,6 +1255,15 @@ impl TempoSessionProvider {
                 return Ok(None);
             };
 
+            if reqwest::Url::parse(url).ok().is_none_or(|requested| {
+                requested.origin() != challenge_response.url().origin()
+                    || crate::client::flow::is_cross_realm_proof(&challenge, &requested)
+            }) {
+                return Err(MppError::InvalidConfig(
+                    "refusing to sign a session bootstrap proof for a different HTTP origin or realm".into(),
+                ));
+            }
+
             ensure_redirect_safe_credential_header(&challenge)?;
             let request: ChargeRequest = challenge.request.decode()?;
             let chain_id = request

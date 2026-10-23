@@ -396,6 +396,45 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn relayed_zero_amount_proof_is_rejected_before_payment() {
+        let challenge = PaymentChallenge::new(
+            "proof-id",
+            "target.example",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "0",
+                "currency": "0x3333333333333333333333333333333333333333"
+            }))
+            .unwrap(),
+        );
+        let header = format_www_authenticate(&challenge).unwrap();
+        let app = Router::new().route(
+            "/paid",
+            get(move || {
+                let header = header.clone();
+                async move {
+                    (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTH_NAME, header)],
+                        "pay up",
+                    )
+                }
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let provider = MockProvider::new();
+        let err = reqwest::Client::new()
+            .get(format!("{base_url}/paid"))
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HttpError::CrossRealmProof));
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn paid_retry_targets_final_same_origin_url() {
         let (_, www_auth) = test_challenge();
         let app = Router::new()

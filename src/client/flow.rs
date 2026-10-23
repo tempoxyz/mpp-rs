@@ -307,6 +307,9 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
                 }
             };
+            if is_cross_realm_proof(&challenge, &payment_context.url) {
+                return Err(self.fail(Some(challenge), HttpError::CrossRealmProof).await);
+            }
             // The caller owns reqwest's redirect policy, which cannot be changed
             // for one request. Unlike Authorization, reqwest preserves this
             // custom header across origins. Reject before the provider pays.
@@ -569,6 +572,20 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             .await;
         FlowError::Payment(error)
     }
+}
+
+pub(crate) fn is_cross_realm_proof(challenge: &PaymentChallenge, url: &reqwest::Url) -> bool {
+    challenge.method.as_str() == "tempo"
+        && challenge.intent.as_str() == "charge"
+        && challenge
+            .request
+            .decode::<crate::protocol::intents::ChargeRequest>()
+            .ok()
+            .and_then(|request| request.parse_amount().ok())
+            == Some(0)
+        && !challenge
+            .realm
+            .eq_ignore_ascii_case(url.host_str().unwrap_or_default())
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.
