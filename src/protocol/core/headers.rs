@@ -21,6 +21,13 @@ use std::collections::HashMap;
 /// Maximum length for base64url-encoded tokens to prevent memory exhaustion DoS.
 const MAX_TOKEN_LEN: usize = 16 * 1024;
 
+/// Maximum length of a raw Authorization value, matching mppx.
+///
+/// A credential echoes its challenge, whose `request` alone may reach
+/// [`MAX_TOKEN_LEN`], so credentials need room to expand during JSON and
+/// base64url encoding.
+const MAX_AUTHORIZATION_LEN: usize = 64 * 1024;
+
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {
     ($params:expr, $key:literal) => {
@@ -36,6 +43,8 @@ macro_rules! require_param {
 /// Returns the `Payment ...` scheme string, or `None` if not found.
 /// This matches the TypeScript SDK's `Credential.extractPaymentScheme`,
 /// except that text inside a quoted-string of another scheme is not searched.
+///
+/// Headers longer than 64 KiB are rejected before tokenizing.
 ///
 /// # Examples
 ///
@@ -54,6 +63,9 @@ macro_rules! require_param {
 /// assert!(extract_payment_scheme("Bearer token123").is_none());
 /// ```
 pub fn extract_payment_scheme(header: &str) -> Option<&str> {
+    if header.len() > MAX_AUTHORIZATION_LEN {
+        return None;
+    }
     let mut tokens = Tokenizer::new(header);
     while let Some(Ok(token)) = tokens.next() {
         if token.is_payment_scheme() {
@@ -499,20 +511,22 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
 /// Parse an Authorization header into a PaymentCredential.
 ///
 /// Format: `Payment <base64url-json>`
+///
+/// Headers longer than 64 KiB are rejected before decoding.
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
+    // Enforce size limit before tokenizing to prevent memory exhaustion DoS
+    if header.len() > MAX_AUTHORIZATION_LEN {
+        return Err(MppError::malformed_credential(format!(
+            "Authorization header exceeds maximum length of {} bytes",
+            MAX_AUTHORIZATION_LEN
+        )));
+    }
+
     let payment_part = extract_payment_scheme(header)
         .ok_or_else(|| MppError::malformed_credential("Expected 'Payment' scheme"))?;
 
     // Strip "Payment " prefix to get the token
     let token = payment_part.get(8..).unwrap_or("").trim();
-
-    // Enforce size limit to prevent memory exhaustion DoS
-    if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::malformed_credential(format!(
-            "Token exceeds maximum length of {} bytes",
-            MAX_TOKEN_LEN
-        )));
-    }
 
     let decoded =
         base64url_decode(token).map_err(|_| MppError::malformed_credential("Invalid base64url"))?;
@@ -982,6 +996,55 @@ mod tests {
             let challenge = parse_www_authenticate(&header).unwrap();
             assert_eq!(challenge.request.raw(), request);
         }
+    }
+
+    #[test]
+    fn test_authorization_rejects_oversized_input_before_extraction() {
+        for header in [
+            format!("Bearer {}, Payment abc", "a".repeat(MAX_AUTHORIZATION_LEN)),
+            "Basic a,".repeat(MAX_AUTHORIZATION_LEN),
+            format!("{}Payment abc", " ".repeat(MAX_AUTHORIZATION_LEN)),
+            format!("Payment {}", "a".repeat(MAX_AUTHORIZATION_LEN)),
+        ] {
+            assert!(extract_payment_scheme(&header).is_none());
+            let err = parse_authorization(&header).unwrap_err();
+            assert!(err.to_string().contains("exceeds maximum length"));
+        }
+    }
+
+    #[test]
+    fn test_authorization_accepts_credential_echoing_request_at_the_limit() {
+        let mut challenge = test_challenge();
+        challenge.request =
+            Base64UrlJson::from_value(&serde_json::json!({ "data": "a".repeat(12277) })).unwrap();
+        assert_eq!(challenge.request.raw().len(), MAX_TOKEN_LEN);
+        let credential =
+            PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
+
+        let header = format_authorization(&credential).unwrap();
+        assert!(header.len() > MAX_TOKEN_LEN);
+        assert_eq!(extract_payment_scheme(&header), Some(header.as_str()));
+        let parsed = parse_authorization(&header).unwrap();
+        assert_eq!(parsed.challenge.request.raw(), challenge.request.raw());
+    }
+
+    #[test]
+    fn test_authorization_accepts_credential_at_the_limit() {
+        let credential = PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        );
+        let prefix = format_authorization(&credential).unwrap();
+        let mut json =
+            String::from_utf8(base64url_decode(&prefix["Payment ".len()..]).unwrap()).unwrap();
+        let padded_len = (MAX_AUTHORIZATION_LEN - "Payment ".len()) / 4 * 3;
+        json.push_str(&" ".repeat(padded_len - json.len()));
+        let header = format!("Payment {}", base64url_encode(json.as_bytes()));
+        assert_eq!(header.len(), MAX_AUTHORIZATION_LEN);
+
+        assert_eq!(extract_payment_scheme(&header), Some(header.as_str()));
+        let parsed = parse_authorization(&header).unwrap();
+        assert_eq!(parsed.challenge.id, credential.challenge.id);
     }
 
     #[test]
