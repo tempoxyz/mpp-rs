@@ -6251,7 +6251,7 @@ mod tests {
         let chain_id = 4217;
         let challenge = PaymentChallenge::new(
             "bootstrap-proof",
-            "openai.example.com",
+            "127.0.0.1",
             crate::protocol::methods::tempo::METHOD_NAME,
             crate::protocol::methods::tempo::INTENT_CHARGE,
             Base64UrlJson::from_value(&serde_json::json!({
@@ -6295,7 +6295,7 @@ mod tests {
                                     root,
                                     chain_id,
                                     "bootstrap-proof",
-                                    "openai.example.com",
+                                    "127.0.0.1",
                                     payload.proof_signature()?,
                                 )
                                 .ok()?;
