@@ -218,6 +218,11 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn fee_payer_allow_key_authorization(&self) -> bool {
+        self.fee_payer_allow_key_authorization
+    }
+
+    #[cfg(test)]
     pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
         self.fee_payer_allowed_fee_tokens.as_deref()
     }
