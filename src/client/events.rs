@@ -157,7 +157,7 @@ pub struct PaymentUpdateContext {
 #[non_exhaustive]
 pub enum PaymentFailureReason {
     /// Client refused before signing because the challenge was expired or had
-    /// an unparseable `expires`. `provider.pay()` was not called.
+    /// an unparsable `expires`. `provider.pay()` was not called.
     PreSigningExpired { expires: Option<String> },
 }
 

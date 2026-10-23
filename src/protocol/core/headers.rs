@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_www_authenticate_rejects_unparseable_challenges() {
+    fn test_format_www_authenticate_rejects_unparsable_challenges() {
         let mut empty_id = test_challenge();
         empty_id.id = String::new();
 
