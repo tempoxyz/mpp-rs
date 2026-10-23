@@ -62,6 +62,12 @@ fn caller_host_header_binds_proof_realm() {
         &HeaderMap::new(),
         Some("api.example.com")
     ));
+    assert!(super::is_cross_realm_proof_with_trust(
+        &challenge,
+        &url,
+        &HeaderMap::new(),
+        Some("API.example.com")
+    ));
 }
 
 impl Via {

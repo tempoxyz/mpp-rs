@@ -612,7 +612,7 @@ pub fn is_cross_realm_proof_with_trust(
             .and_then(|request| request.parse_amount().ok())
             == Some(0)
         && !challenge.realm.eq_ignore_ascii_case(&requested_host)
-        && !trusted_realm.is_some_and(|realm| challenge.realm.eq_ignore_ascii_case(realm))
+        && trusted_realm != Some(challenge.realm.as_str())
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.
