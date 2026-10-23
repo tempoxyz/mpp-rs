@@ -1,11 +1,12 @@
 //! The `close` action.
 
+use alloy::consensus::BlockHeader;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::chain::get_on_chain_channel;
+use super::chain::{get_on_chain_channel, get_on_chain_channel_at};
 use super::payload::validate_settlement_route;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, ChannelState, PendingClose, SessionMethod};
@@ -160,11 +161,16 @@ where
 {
     /// Reconcile a stored close using its transaction receipt from the configured RPC.
     ///
-    /// Returns the unchanged state when no receipt exists. A successful receipt
-    /// finalizes the channel; a reverted receipt releases the closing guard.
-    /// RPC errors, old records without transaction evidence, and missing receipts
-    /// never reopen metering. Call this from a trusted operator/background worker;
-    /// it does not authorize a new paid operation or submit a new transaction.
+    /// A successful receipt finalizes the channel; a reverted receipt releases
+    /// the closing guard. A missing receipt keeps the channel blocked unless
+    /// the close was signed with an expiring nonce and the chain itself has
+    /// moved past its `valid_before`: then the receipt is read again and the
+    /// escrow's channel state is read at that same block, finalizing the
+    /// channel if it closed on-chain and releasing it otherwise. The host clock
+    /// alone never releases a channel. RPC errors and old records without
+    /// transaction evidence never reopen metering. Call this from a trusted
+    /// operator/background worker; it does not authorize a new paid operation
+    /// or submit a new transaction.
     ///
     /// Operator usage: `let state = method.reconcile_pending_close(&channel_id).await?;`
     /// If `state.closing` remains true, keep the channel blocked and investigate
@@ -186,47 +192,45 @@ where
         else {
             return Ok(channel);
         };
-        let receipt = self
-            .provider
-            .get_transaction_receipt(pending.transaction_hash)
-            .await
-            .map_err(|e| {
-                VerificationError::network_error(format!("close reconciliation failed: {e}"))
-            })?;
-        let Some(receipt) = receipt else {
-            // An expiring close that is still unmined well past its
-            // `valid_before` can never land: release the channel.
-            let expired = pending.valid_before.is_some_and(|valid_before| {
-                unix_now() > valid_before.saturating_add(CLOSE_CLOCK_SKEW_SECS)
-            });
-            if !expired {
-                return Ok(channel);
+        let settled = match self.close_receipt_status(&pending).await? {
+            Some(status) => status,
+            None => {
+                // An expiring close can never land in a block past its
+                // `valid_before`. Skip the RPC round trips while the host clock
+                // says the window may still be open, then require the chain's
+                // own time to have passed it.
+                let Some(valid_before) = pending.valid_before else {
+                    return Ok(channel);
+                };
+                if unix_now() <= valid_before.saturating_add(CLOSE_CLOCK_SKEW_SECS) {
+                    return Ok(channel);
+                }
+                let Some(block) = self.expired_block(valid_before).await? else {
+                    return Ok(channel);
+                };
+                // The close may have landed before that block while the first
+                // lookup returned null: look again, then read the escrow at the
+                // observed block so a lagging receipt index cannot reopen a
+                // channel that closed on-chain.
+                match self.close_receipt_status(&pending).await? {
+                    Some(status) => status,
+                    None => {
+                        let channel_id_b256: alloy::primitives::B256 =
+                            channel_id.parse().map_err(|_| {
+                                VerificationError::invalid_payload("invalid channel id")
+                            })?;
+                        get_on_chain_channel_at(
+                            &*self.provider,
+                            channel.escrow_contract,
+                            channel_id_b256,
+                            block.into(),
+                        )
+                        .await?
+                        .finalized
+                    }
+                }
             }
-            return self
-                .store
-                .update_channel(
-                    &channel_id,
-                    Box::new(move |current| {
-                        let state = current.ok_or_else(|| {
-                            VerificationError::channel_not_found("channel not found")
-                        })?;
-                        if state.pending_close.as_ref() != Some(&pending)
-                            || !state.closing
-                            || state.finalized
-                        {
-                            return Ok(Some(state));
-                        }
-                        Ok(Some(state.clear_pending_close()))
-                    }),
-                )
-                .await?
-                .ok_or_else(|| VerificationError::channel_not_found("channel not found"));
         };
-        if receipt.transaction_hash() != pending.transaction_hash {
-            return Err(VerificationError::network_error(
-                "close receipt hash mismatch",
-            ));
-        }
         self.store
             .update_channel(
                 &channel_id,
@@ -240,7 +244,7 @@ where
                         return Ok(Some(state));
                     }
                     let deposit = state.deposit;
-                    Ok(Some(if receipt.status() {
+                    Ok(Some(if settled {
                         state.finalize_close(pending.cumulative_amount, pending.signature, deposit)
                     } else {
                         state.clear_pending_close()
@@ -249,6 +253,45 @@ where
             )
             .await?
             .ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+    }
+
+    /// The pending close transaction's receipt status, or `None` when the
+    /// RPC has no receipt for it.
+    async fn close_receipt_status(
+        &self,
+        pending: &PendingClose,
+    ) -> Result<Option<bool>, VerificationError> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(pending.transaction_hash)
+            .await
+            .map_err(|e| {
+                VerificationError::network_error(format!("close reconciliation failed: {e}"))
+            })?;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        if receipt.transaction_hash() != pending.transaction_hash {
+            return Err(VerificationError::network_error(
+                "close receipt hash mismatch",
+            ));
+        }
+        Ok(Some(receipt.status()))
+    }
+
+    /// The latest block number if that block's timestamp is past
+    /// `valid_before`, so no later block can include the close.
+    async fn expired_block(&self, valid_before: u64) -> Result<Option<u64>, VerificationError> {
+        let block = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| {
+                VerificationError::network_error(format!("close reconciliation failed: {e}"))
+            })?;
+        Ok(block
+            .filter(|block| block.header.timestamp() > valid_before)
+            .map(|block| block.header.number()))
     }
 
     /// Handle 'close' action.

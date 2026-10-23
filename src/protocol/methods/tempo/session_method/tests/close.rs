@@ -845,34 +845,150 @@ fn test_close_transaction_uses_expiring_nonce() {
     assert!(valid_before > now && valid_before <= now + 26);
 }
 
-/// An expiring close still unmined past its `valid_before` plus the skew
-/// margin can never land, so reconciliation releases the channel; one still
-/// inside its window stays pending.
+/// A `latest` block response with the given number and timestamp.
+fn mock_block(number: u64, timestamp: u64) -> serde_json::Value {
+    let header = tempo_alloy::rpc::TempoHeaderResponse {
+        inner: alloy::rpc::types::Header {
+            hash: B256::repeat_byte(0xee),
+            inner: tempo_alloy::primitives::TempoHeader {
+                inner: alloy::consensus::Header {
+                    number,
+                    timestamp,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            total_difficulty: None,
+            size: None,
+        },
+        timestamp_millis: timestamp * 1000,
+    };
+    let block: alloy::rpc::types::Block<serde_json::Value, _> =
+        alloy::rpc::types::Block::empty(header);
+    serde_json::to_value(block).unwrap()
+}
+
+/// An `eth_call` response for the escrow's `getChannel`.
+fn mock_on_chain_channel(state: &ChannelState, finalized: bool) -> Bytes {
+    use alloy::sol_types::SolValue;
+
+    Bytes::from(
+        (
+            finalized,
+            0u64,
+            state.payer,
+            state.payee,
+            state.token,
+            state.authorized_signer,
+            state.deposit,
+            if finalized { 1000u128 } else { 0 },
+        )
+            .abi_encode_params(),
+    )
+}
+
+/// What the RPC reports once the host clock is past an expiring close's
+/// `valid_before` and its first receipt lookup returned null.
+enum ExpiredCloseRpc {
+    /// The chain's latest block is not yet past `valid_before`.
+    ChainBehind,
+    /// The chain moved past it and a second lookup finds a receipt.
+    ReceiptOnRecheck,
+    /// Still no receipt; the escrow reports the channel finalized or not.
+    NoReceipt { finalized: bool },
+}
+
+/// An expiring close missing from the RPC is released only once the chain's
+/// own time is past its `valid_before`, the receipt is still missing on a
+/// second look, and the escrow at that block shows the channel open. A close
+/// that landed after all finalizes the channel instead.
 #[tokio::test]
-async fn test_reconcile_releases_expired_pending_close() {
+async fn test_reconcile_expired_pending_close_checks_chain() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    for (valid_before, released) in [(now - 120, true), (now + 25, false)] {
+    let valid_before = now - 120;
+    let hash = B256::repeat_byte(0xcc);
+    for (rpc, closing, finalized) in [
+        (ExpiredCloseRpc::ChainBehind, true, false),
+        (ExpiredCloseRpc::ReceiptOnRecheck, false, true),
+        (ExpiredCloseRpc::NoReceipt { finalized: true }, false, true),
+        (
+            ExpiredCloseRpc::NoReceipt { finalized: false },
+            false,
+            false,
+        ),
+    ] {
         let store = Arc::new(InMemoryChannelStore::new());
         let channel_id = B256::repeat_byte(0xab).to_string();
         let mut state = test_channel_state(&channel_id);
         state.closing = true;
         state.pending_close = Some(super::super::PendingClose {
-            transaction_hash: B256::repeat_byte(0xcc),
+            transaction_hash: hash,
             nonce: 0,
             cumulative_amount: 1000,
             signature: vec![1; 65],
             valid_before: Some(valid_before),
         });
-        store.insert(&channel_id, state);
+        store.insert(&channel_id, state.clone());
         let asserter = alloy::providers::mock::Asserter::new();
         asserter.push_success(&serde_json::Value::Null);
-        let method = mocked_session_method(store.clone(), asserter);
+        match rpc {
+            ExpiredCloseRpc::ChainBehind => {
+                asserter.push_success(&mock_block(9, valid_before));
+            }
+            ExpiredCloseRpc::ReceiptOnRecheck => {
+                asserter.push_success(&mock_block(9, valid_before + 1));
+                asserter.push_success(&serde_json::json!({
+                    "transactionHash": hash, "transactionIndex": "0x0", "blockHash": B256::repeat_byte(0xdd),
+                    "blockNumber": "0x8", "from": Address::repeat_byte(0x22), "to": TEST_ESCROW,
+                    "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208", "effectiveGasPrice": "0x1",
+                    "contractAddress": null, "logs": [], "logsBloom": alloy::primitives::Bloom::ZERO,
+                    "status": "0x1", "type": "0x76", "feePayer": Address::repeat_byte(0x22),
+                }));
+            }
+            ExpiredCloseRpc::NoReceipt { finalized } => {
+                asserter.push_success(&mock_block(9, valid_before + 1));
+                asserter.push_success(&serde_json::Value::Null);
+                asserter.push_success(&mock_on_chain_channel(&state, finalized));
+            }
+        }
+        let method = mocked_session_method(store.clone(), asserter.clone());
         let state = method.reconcile_pending_close(&channel_id).await.unwrap();
-        assert_eq!(state.closing, !released);
-        assert_eq!(state.pending_close.is_some(), !released);
-        assert!(!state.finalized);
+        assert_eq!(state.closing, closing);
+        assert_eq!(state.pending_close.is_some(), closing);
+        assert_eq!(state.finalized, finalized);
+        assert!(
+            asserter.read_q().is_empty(),
+            "every mocked RPC call was used"
+        );
     }
+}
+
+/// An expiring close still inside its window, by the host clock, stays
+/// pending without asking the chain for its time.
+#[tokio::test]
+async fn test_reconcile_keeps_unexpired_pending_close() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let store = Arc::new(InMemoryChannelStore::new());
+    let channel_id = B256::repeat_byte(0xab).to_string();
+    let mut state = test_channel_state(&channel_id);
+    state.closing = true;
+    state.pending_close = Some(super::super::PendingClose {
+        transaction_hash: B256::repeat_byte(0xcc),
+        nonce: 0,
+        cumulative_amount: 1000,
+        signature: vec![1; 65],
+        valid_before: Some(now + 25),
+    });
+    store.insert(&channel_id, state);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
+    let method = mocked_session_method(store.clone(), asserter);
+    let state = method.reconcile_pending_close(&channel_id).await.unwrap();
+    assert!(state.closing && state.pending_close.is_some() && !state.finalized);
 }
