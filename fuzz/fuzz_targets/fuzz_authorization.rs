@@ -39,10 +39,7 @@ fn check(header: &str) {
     let Ok(credential) = parse_authorization(header) else {
         return;
     };
-    assert!(
-        scheme.is_some(),
-        "parsed a credential without a Payment scheme"
-    );
+    assert!(scheme.is_some(), "parsed a credential without a Payment scheme");
     assert!(header.len() <= MAX_AUTHORIZATION_LEN);
 
     let echo = &credential.challenge;
