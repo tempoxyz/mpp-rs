@@ -112,6 +112,18 @@ pub fn scrub_response_headers(headers: &mut Vec<(String, String)>) {
         }
         true
     });
+    // A client that joins repeated field lines into one value (as Fetch
+    // `Headers.get` does) must not find a Payment challenge there either, such
+    // as one hidden by a quote that opens on one line and closes on the next.
+    let joined = headers
+        .iter()
+        .filter(|(name, _)| eq_ascii_lower(name, "www-authenticate"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !crate::protocol::core::parse_www_authenticate_all([joined.as_str()]).is_empty() {
+        headers.retain(|(name, _)| !eq_ascii_lower(name, "www-authenticate"));
+    }
 }
 
 /// Whether an `Authorization` value uses the Payment scheme.
@@ -189,6 +201,11 @@ fn remove_payment_challenges(value: &str) -> String {
         previous = Some(byte);
         index += 1;
     }
+    // A value that ends inside a quoted-string is malformed, and joined with
+    // the next field line it could hide a challenge: drop it.
+    if in_quotes {
+        return String::new();
+    }
 
     starts
         .iter()
@@ -233,6 +250,45 @@ mod tests {
                 ("Authorization".to_string(), "Bearer kept".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_scrub_response_drops_payment_hidden_across_field_lines() {
+        let mut headers = vec![
+            ("WWW-Authenticate".into(), r#"Basic realm="a"#.into()),
+            (
+                "WWW-Authenticate".into(),
+                r#"Basic p=", Payment id=x, realm=r, method=tempo, intent=charge, request=e30, Basic r=""#.into(),
+            ),
+            ("WWW-Authenticate".into(), r#"Basic realm="kept""#.into()),
+        ];
+        scrub_response_headers(&mut headers);
+        let joined = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            crate::protocol::core::parse_www_authenticate_all([joined.as_str()]).is_empty(),
+            "forged challenge survived: {headers:?}"
+        );
+    }
+
+    /// Comma-separated fragments that never start a challenge must be scanned
+    /// in linear time: this value took quadratic work before.
+    #[test]
+    fn test_scrub_response_handles_many_fragments_in_linear_time() {
+        let value = format!("Basic {}", "a/,".repeat(200_000));
+        let mut headers = vec![("WWW-Authenticate".to_string(), value.clone())];
+        let started = std::time::Instant::now();
+        scrub_response_headers(&mut headers);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(headers.len(), 1);
     }
 
     fn names(h: &[(String, String)]) -> Vec<String> {
