@@ -16,6 +16,25 @@ use crate::protocol::methods::tempo::session::{
 use crate::protocol::methods::tempo::voucher::verify_voucher;
 use crate::protocol::traits::{ErrorCode, VerificationError};
 
+/// How long a server close transaction's expiring nonce stays valid.
+const CLOSE_VALID_BEFORE_SECS: u64 = 25;
+
+/// Nonce fields for a server-signed close: an expiring nonce (key
+/// `U256::MAX`, nonce 0) valid for [`CLOSE_VALID_BEFORE_SECS`], matching
+/// mppx's `nonceKey: 'expiring'` for session transactions.
+pub(super) fn close_transaction_nonce_fields(
+) -> (u64, alloy::primitives::U256, Option<std::num::NonZeroU64>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (
+        0,
+        tempo_alloy::primitives::transaction::TEMPO_EXPIRING_NONCE_KEY,
+        std::num::NonZeroU64::new(now.saturating_add(CLOSE_VALID_BEFORE_SECS)),
+    )
+}
+
 /// Validate the close voucher amount against spent, on-chain settled, and deposit.
 /// Matches mppx handleClose:
 /// https://github.com/wevm/mppx/blob/c526ea6/src/tempo/server/Session.ts#L837-L846
@@ -331,13 +350,9 @@ where
             ))
             .abi_encode();
 
-            let nonce = self
-                .provider
-                .get_transaction_count(signer.address())
-                .await
-                .map_err(|e| {
-                    VerificationError::network_error(format!("failed to get nonce: {}", e))
-                })?;
+            // An expiring nonce keeps independent server processes sharing the
+            // close signer from racing for the same sequential nonce.
+            let (nonce, nonce_key, valid_before) = close_transaction_nonce_fields();
             let gas_price = self.provider.get_gas_price().await.map_err(|e| {
                 VerificationError::network_error(format!("failed to get gas price: {}", e))
             })?;
@@ -377,6 +392,8 @@ where
                 max_fee_per_gas: gas_price,
                 max_priority_fee_per_gas: gas_price,
                 calls,
+                nonce_key,
+                valid_before,
                 ..Default::default()
             };
 

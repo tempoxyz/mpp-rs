@@ -179,7 +179,7 @@ async fn test_close_without_close_signer_is_rejected() {
 /// Queues the RPC responses for a close transaction that is mined with the
 /// given receipt status, and returns its hash.
 fn push_close_transaction(asserter: &alloy::providers::mock::Asserter, success: bool) -> B256 {
-    use alloy::primitives::{U128, U64};
+    use alloy::primitives::U128;
 
     let tx_hash = B256::repeat_byte(0xcc);
     let receipt = serde_json::json!({
@@ -199,7 +199,6 @@ fn push_close_transaction(asserter: &alloy::providers::mock::Asserter, success: 
         "type": "0x76",
         "feePayer": Address::repeat_byte(0x22),
     });
-    asserter.push_success(&U64::ZERO); // eth_getTransactionCount
     asserter.push_success(&U128::from(1)); // eth_gasPrice
     asserter.push_success(&tx_hash); // eth_sendRawTransaction
     asserter.push_success(&receipt); // receipt lookup when registering the watcher
@@ -424,7 +423,7 @@ async fn test_close_resets_closing_when_submission_fails() {
     let store = Arc::new(InMemoryChannelStore::new());
     let asserter = alloy::providers::mock::Asserter::new();
     let (channel_id, request, credential) = close_setup(&store, &asserter).await;
-    // No further responses queued: the nonce lookup fails.
+    // No further responses queued: the gas price lookup fails.
     let method = mocked_session_method(store.clone(), asserter)
         .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
 
@@ -718,7 +717,7 @@ fn machine_session_close_is_settle_swap_close_and_requires_full_consumption() {
 
 #[tokio::test]
 async fn test_ambiguous_close_never_resumes_metering() {
-    use alloy::primitives::{U128, U64};
+    use alloy::primitives::U128;
     for broadcast_acknowledged in [false, true] {
         let store = Arc::new(InMemoryChannelStore::new());
         let asserter = alloy::providers::mock::Asserter::new();
@@ -726,7 +725,6 @@ async fn test_ambiguous_close_never_resumes_metering() {
         let mut state = store.get_channel_sync(&channel_id).unwrap();
         state.highest_voucher_amount = 2_000;
         store.insert(&channel_id, state);
-        asserter.push_success(&U64::ZERO);
         asserter.push_success(&U128::from(1));
         if broadcast_acknowledged {
             asserter.push_success(&B256::repeat_byte(0xcc));
@@ -812,7 +810,6 @@ async fn test_submission_rejection_classification() {
         let store = Arc::new(InMemoryChannelStore::new());
         let asserter = alloy::providers::mock::Asserter::new();
         let (channel_id, request, credential) = close_setup(&store, &asserter).await;
-        asserter.push_success(&alloy::primitives::U64::ZERO);
         asserter.push_success(&alloy::primitives::U128::from(1));
         asserter.push_failure(
             serde_json::from_value(serde_json::json!({ "code": code, "message": message }))
@@ -829,4 +826,20 @@ async fn test_submission_rejection_classification() {
         assert_eq!(state.pending_close.is_some(), remains_closing);
         assert_eq!(error.retryable, !remains_closing);
     }
+}
+
+#[test]
+fn test_close_transaction_uses_expiring_nonce() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (nonce, nonce_key, valid_before) = super::super::close::close_transaction_nonce_fields();
+    assert_eq!(nonce, 0);
+    assert_eq!(
+        nonce_key,
+        tempo_alloy::primitives::transaction::TEMPO_EXPIRING_NONCE_KEY
+    );
+    let valid_before = valid_before.unwrap().get();
+    assert!(valid_before > now && valid_before <= now + 26);
 }
