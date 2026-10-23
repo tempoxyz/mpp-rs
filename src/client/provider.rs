@@ -436,11 +436,7 @@ impl MultiProvider {
         origin: reqwest::Url,
         realm: impl Into<String>,
     ) -> Self {
-        let realm = realm.into();
-        for provider in &mut self.providers {
-            provider.dyn_set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
-        }
-        self.trusted_tempo_proof_realms.push((origin, realm));
+        self.set_trusted_tempo_proof_realm(origin, realm.into());
         self
     }
 
@@ -488,6 +484,8 @@ impl PaymentProvider for MultiProvider {
         for provider in &mut self.providers {
             provider.dyn_set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
         }
+        self.trusted_tempo_proof_realms
+            .retain(|(existing, _)| existing.origin() != origin.origin());
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
@@ -1055,6 +1053,17 @@ mod tests {
         assert_eq!(
             before_child.providers[0].dyn_trusted_tempo_proof_realm(&request),
             Some("outer")
+        );
+
+        let updated = before_child.with_trusted_tempo_proof_realm(
+            reqwest::Url::parse("https://api.example/another-path").unwrap(),
+            "updated",
+        );
+        assert_eq!(updated.trusted_tempo_proof_realm(&request), Some("updated"));
+        assert_eq!(updated.trusted_tempo_proof_realms.len(), 1);
+        assert_eq!(
+            updated.providers[0].dyn_trusted_tempo_proof_realm(&request),
+            Some("updated")
         );
     }
 
