@@ -96,6 +96,12 @@ pub trait PaymentProvider: Clone + Send + Sync {
     /// `true` if this provider can handle the combination.
     fn supports(&self, method: &str, intent: &str) -> bool;
 
+    /// Explicitly trusted Tempo proof realm for a caller-pinned HTTP origin.
+    /// Defaults to the request host when unset. Never derive this from a challenge.
+    fn trusted_tempo_proof_realm(&self, _url: &reqwest::Url) -> Option<&str> {
+        None
+    }
+
     /// Select one challenge from the supported, unexpired candidates.
     ///
     /// Candidates have already been ordered by the caller's `Accept-Payment`
@@ -400,6 +406,7 @@ impl<P: PaymentProvider> Drop for PendingPayment<P> {
 #[derive(Clone)]
 pub struct MultiProvider {
     providers: Vec<Box<dyn DynPaymentProvider>>,
+    trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
 }
 
 impl MultiProvider {
@@ -407,12 +414,23 @@ impl MultiProvider {
     pub fn new() -> Self {
         Self {
             providers: Vec::new(),
+            trusted_tempo_proof_realms: Vec::new(),
         }
     }
 
     /// Add a provider to the list.
     pub fn with<P: PaymentProvider + 'static>(mut self, provider: P) -> Self {
         self.providers.push(Box::new(provider));
+        self
+    }
+
+    /// Trust a non-hostname Tempo proof realm for one explicit HTTP origin.
+    pub fn with_trusted_tempo_proof_realm(
+        mut self,
+        origin: reqwest::Url,
+        realm: impl Into<String>,
+    ) -> Self {
+        self.trusted_tempo_proof_realms.push((origin, realm.into()));
         self
     }
 
@@ -439,6 +457,13 @@ impl Default for MultiProvider {
 impl PaymentProvider for MultiProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
         self.has_support(method, intent)
+    }
+
+    fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        self.trusted_tempo_proof_realms
+            .iter()
+            .find(|(origin, _)| origin.origin() == url.origin())
+            .map(|(_, realm)| realm.as_str())
     }
 
     fn select_challenge<'a>(

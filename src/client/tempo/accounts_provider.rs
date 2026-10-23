@@ -50,6 +50,7 @@ pub struct TempoAccountsProvider {
     session_settings: SessionSettings,
     /// Settlement RPC clients by URL, shared by clones so payments reuse connections.
     rpc_providers: Arc<Mutex<HashMap<reqwest::Url, RootProvider<TempoNetwork>>>>,
+    trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
 }
 
 #[derive(Clone)]
@@ -86,6 +87,7 @@ impl TempoAccountsProvider {
             session: None,
             session_settings: SessionSettings::default(),
             rpc_providers: Arc::new(Mutex::new(HashMap::new())),
+            trusted_tempo_proof_realms: Vec::new(),
         }
     }
 
@@ -112,6 +114,16 @@ impl TempoAccountsProvider {
     /// Set an optional client identifier for attribution memos.
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
+        self
+    }
+
+    /// Trust a non-hostname proof realm only at the specified HTTP origin.
+    pub fn with_trusted_tempo_proof_realm(
+        mut self,
+        origin: reqwest::Url,
+        realm: impl Into<String>,
+    ) -> Self {
+        self.trusted_tempo_proof_realms.push((origin, realm.into()));
         self
     }
 
@@ -203,6 +215,9 @@ impl TempoAccountsProvider {
             })
             .with_authorized_signer(access_key)
             .with_channel_store(channel_store);
+        for (origin, realm) in &self.trusted_tempo_proof_realms {
+            provider = provider.with_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
         if let Some(config) = &self.autoswap {
             provider = provider.with_autoswap(config.clone());
         }
@@ -512,6 +527,13 @@ impl PaymentProvider for TempoAccountsProvider {
             && (intent == crate::protocol::methods::tempo::INTENT_CHARGE
                 || (intent == crate::protocol::methods::tempo::INTENT_SESSION
                     && self.session.is_some()))
+    }
+
+    fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        self.trusted_tempo_proof_realms
+            .iter()
+            .find(|(origin, _)| origin.origin() == url.origin())
+            .map(|(_, realm)| realm.as_str())
     }
 
     fn select_challenge<'a>(

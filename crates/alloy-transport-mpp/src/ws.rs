@@ -902,10 +902,11 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             };
             debug!(method = %parsed.method, intent = %parsed.intent, "MPP challenge received");
             let _ = events_tx.send(MppEvent::Challenge(parsed.clone()));
-            if mpp::client::is_cross_realm_proof(
+            if mpp::client::is_cross_realm_proof_with_trust(
                 &parsed,
                 &payment_context.url,
                 &payment_context.headers,
+                payment_provider.trusted_tempo_proof_realm(&payment_context.url),
             ) {
                 let _ = events_tx.send(MppEvent::Error(
                     "refusing to sign Tempo proof for a different HTTP realm".into(),

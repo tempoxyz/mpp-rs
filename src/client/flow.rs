@@ -307,7 +307,13 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
                 }
             };
-            if is_cross_realm_proof(&challenge, &payment_context.url, &payment_context.headers) {
+            if is_cross_realm_proof_with_trust(
+                &challenge,
+                &payment_context.url,
+                &payment_context.headers,
+                self.provider
+                    .trusted_tempo_proof_realm(&payment_context.url),
+            ) {
                 return Err(self.fail(Some(challenge), HttpError::CrossRealmProof).await);
             }
             // The caller owns reqwest's redirect policy, which cannot be changed
@@ -580,6 +586,16 @@ pub fn is_cross_realm_proof(
     url: &reqwest::Url,
     headers: &HeaderMap,
 ) -> bool {
+    is_cross_realm_proof_with_trust(challenge, url, headers, None)
+}
+
+/// Apply an explicit caller-pinned proof realm for a known HTTP origin.
+pub fn is_cross_realm_proof_with_trust(
+    challenge: &PaymentChallenge,
+    url: &reqwest::Url,
+    headers: &HeaderMap,
+    trusted_realm: Option<&str>,
+) -> bool {
     let requested_host = headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
@@ -596,6 +612,7 @@ pub fn is_cross_realm_proof(
             .and_then(|request| request.parse_amount().ok())
             == Some(0)
         && !challenge.realm.eq_ignore_ascii_case(&requested_host)
+        && !trusted_realm.is_some_and(|realm| challenge.realm.eq_ignore_ascii_case(realm))
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.

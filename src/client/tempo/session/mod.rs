@@ -145,6 +145,7 @@ pub struct TempoSessionProvider {
     spend: Arc<Mutex<SpendLedger>>,
     /// Receives `channel.deposit` events for accepted opens and top-ups.
     events: ClientEvents,
+    trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
 }
 
 /// Work a session SSE event triggers, such as sending a voucher.
@@ -287,6 +288,7 @@ impl TempoSessionProvider {
             topping_up: Arc::new(Mutex::new(HashSet::new())),
             spend: Arc::default(),
             events: ClientEvents::default(),
+            trusted_tempo_proof_realms: Vec::new(),
         })
     }
 
@@ -309,6 +311,16 @@ impl TempoSessionProvider {
             last: ledger.last,
             remaining,
         }
+    }
+
+    /// Trust a non-hostname proof realm only at the specified HTTP origin.
+    pub fn with_trusted_tempo_proof_realm(
+        mut self,
+        origin: reqwest::Url,
+        realm: impl Into<String>,
+    ) -> Self {
+        self.trusted_tempo_proof_realms.push((origin, realm.into()));
+        self
     }
 
     /// Handle an mppx session SSE event from a response to `url`: answer
@@ -1257,7 +1269,12 @@ impl TempoSessionProvider {
 
             if reqwest::Url::parse(url).ok().is_none_or(|requested| {
                 requested.origin() != challenge_response.url().origin()
-                    || crate::client::flow::is_cross_realm_proof(&challenge, &requested, &headers)
+                    || crate::client::flow::is_cross_realm_proof_with_trust(
+                        &challenge,
+                        &requested,
+                        &headers,
+                        self.trusted_tempo_proof_realm(&requested),
+                    )
             }) {
                 return Err(MppError::InvalidConfig(
                     "refusing to sign a session bootstrap proof for a different HTTP origin or realm".into(),
@@ -3185,6 +3202,13 @@ impl PaymentProvider for TempoSessionProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
         method == crate::protocol::methods::tempo::METHOD_NAME
             && intent == crate::protocol::methods::tempo::INTENT_SESSION
+    }
+
+    fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        self.trusted_tempo_proof_realms
+            .iter()
+            .find(|(origin, _)| origin.origin() == url.origin())
+            .map(|(_, realm)| realm.as_str())
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {

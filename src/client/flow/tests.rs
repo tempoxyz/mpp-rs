@@ -56,6 +56,12 @@ fn caller_host_header_binds_proof_realm() {
     let mut headers = HeaderMap::new();
     headers.insert(HOST, HeaderValue::from_static("api.example.com"));
     assert!(!super::is_cross_realm_proof(&challenge, &url, &headers));
+    assert!(!super::is_cross_realm_proof_with_trust(
+        &challenge,
+        &url,
+        &HeaderMap::new(),
+        Some("api.example.com")
+    ));
 }
 
 impl Via {

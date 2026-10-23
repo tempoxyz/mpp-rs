@@ -46,7 +46,9 @@ mod forward_proxy;
 mod middleware;
 
 pub use error::HttpError;
-pub use flow::{is_cross_realm_proof, send_with_exchange, Exchange, FlowError};
+pub use flow::{
+    is_cross_realm_proof, is_cross_realm_proof_with_trust, send_with_exchange, Exchange, FlowError,
+};
 pub use provider::{
     ManagementFuture, ManagementTransport, MultiProvider, PaymentContext, PaymentEventFuture,
     PaymentProvider, PendingPayment,

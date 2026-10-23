@@ -184,10 +184,11 @@ where
                 }
             };
 
-            if crate::client::is_cross_realm_proof(
+            if crate::client::is_cross_realm_proof_with_trust(
                 &challenge,
                 &self.context.url,
                 &self.context.headers,
+                self.provider.trusted_tempo_proof_realm(&self.context.url),
             ) {
                 return Err(MppError::InvalidConfig(
                     "refusing to sign Tempo proof for a different HTTP realm".into(),
