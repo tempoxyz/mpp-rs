@@ -145,13 +145,14 @@ impl IntoResponse for PaymentOffers {
 ///
 /// Payment problems (expired, invalid challenge, failed verification, …) are
 /// answered with the problem's status and one fresh `WWW-Authenticate`
-/// challenge per offer. A server-side failure is answered with `500` and no
-/// challenge, so that clients do not pay again for a fault that is not theirs.
+/// challenge per offer. A server-side failure (`5xx`) or a final `403` (such
+/// as a replayed credential) is answered without a challenge, so that clients
+/// do not pay again when paying would not help.
 #[derive(Debug)]
 pub struct PaymentProblem {
     /// Problem details sent as the `application/problem+json` body.
     pub problem: PaymentErrorDetails,
-    /// Fresh challenges for retry. Not sent with a `5xx` problem.
+    /// Fresh challenges for retry. Not sent with a `5xx` or `403` problem.
     pub offers: Vec<PaymentChallenge>,
 }
 
@@ -169,7 +170,7 @@ impl IntoResponse for PaymentProblem {
     fn into_response(self) -> axum_core::response::Response {
         let status =
             StatusCode::from_u16(self.problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let values = if status.is_server_error() {
+        let values = if status.is_server_error() || status == StatusCode::FORBIDDEN {
             Vec::new()
         } else {
             match challenge_header_values(&self.offers) {
@@ -359,12 +360,13 @@ impl MppChargeRejection {
     /// Build the rejection for a credential that failed with `error`.
     ///
     /// `offers` generates the fresh challenges; it is only called for payment
-    /// problems, since a server-side failure is not answered with a challenge.
+    /// problems a new payment can resolve, since a server-side failure or a
+    /// replayed credential is not answered with a challenge.
     fn from_error(
         error: MppError,
         offers: impl FnOnce() -> Result<Vec<PaymentChallenge>, String>,
     ) -> Self {
-        if !error.is_payment_problem() {
+        if !error.is_payment_problem() || matches!(error, MppError::CredentialReplayed(_)) {
             return Self::Problem(PaymentProblem::new(&error, Vec::new()));
         }
         match offers() {

@@ -202,6 +202,63 @@ fn test_rejection_internal_error() {
 }
 
 #[test]
+fn test_rejection_problem_challenges_only_when_paying_again_helps() {
+    let cases = [
+        (
+            MppError::verification_failed("amount mismatch"),
+            StatusCode::PAYMENT_REQUIRED,
+            true,
+        ),
+        (
+            MppError::CredentialReplayed(Some("Transaction hash has already been used".into())),
+            StatusCode::FORBIDDEN,
+            false,
+        ),
+        (
+            MppError::CredentialReplayed(Some("memo is not bound to this challenge".into())),
+            StatusCode::FORBIDDEN,
+            false,
+        ),
+    ];
+    for (error, status, challenged) in cases {
+        let label = format!("{error:?}");
+        let rejection = MppChargeRejection::from_error(error, || Ok(vec![test_challenge()]));
+        let MppChargeRejection::Problem(problem) = &rejection else {
+            panic!("{label}: expected a problem rejection");
+        };
+        assert_eq!(
+            problem.problem.problem_type,
+            format!(
+                "{}/verification-failed",
+                crate::error::CORE_PROBLEM_TYPE_BASE
+            ),
+            "{label}"
+        );
+        assert_eq!(
+            problem.problem.challenge_id.is_some(),
+            challenged,
+            "{label}"
+        );
+
+        let resp = rejection.into_response();
+        assert_eq!(resp.status(), status, "{label}");
+        assert_eq!(
+            resp.headers().contains_key(WWW_AUTHENTICATE_HEADER),
+            challenged,
+            "{label}"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+}
+
+#[test]
 fn test_custom_amount() {
     struct FiveDollars;
     impl ChargeConfig for FiveDollars {
