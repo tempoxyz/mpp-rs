@@ -184,6 +184,16 @@ where
                 }
             };
 
+            if crate::client::is_cross_realm_proof(
+                &challenge,
+                &self.context.url,
+                &self.context.headers,
+            ) {
+                return Err(MppError::InvalidConfig(
+                    "refusing to sign Tempo proof for a different HTTP realm".into(),
+                ));
+            }
+
             let paid = match management {
                 Some(management) => {
                     self.provider

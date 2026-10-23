@@ -1257,7 +1257,7 @@ impl TempoSessionProvider {
 
             if reqwest::Url::parse(url).ok().is_none_or(|requested| {
                 requested.origin() != challenge_response.url().origin()
-                    || crate::client::flow::is_cross_realm_proof(&challenge, &requested)
+                    || crate::client::flow::is_cross_realm_proof(&challenge, &requested, &headers)
             }) {
                 return Err(MppError::InvalidConfig(
                     "refusing to sign a session bootstrap proof for a different HTTP origin or realm".into(),

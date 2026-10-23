@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::future::Future;
 
-use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
+use reqwest::header::{HeaderMap, HeaderValue, HOST, WWW_AUTHENTICATE};
 use reqwest::{Request, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
@@ -307,7 +307,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
                 }
             };
-            if is_cross_realm_proof(&challenge, &payment_context.url) {
+            if is_cross_realm_proof(&challenge, &payment_context.url, &payment_context.headers) {
                 return Err(self.fail(Some(challenge), HttpError::CrossRealmProof).await);
             }
             // The caller owns reqwest's redirect policy, which cannot be changed
@@ -574,7 +574,19 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
     }
 }
 
-pub(crate) fn is_cross_realm_proof(challenge: &PaymentChallenge, url: &reqwest::Url) -> bool {
+/// Whether a zero-amount Tempo challenge names a different host than the caller's request.
+pub fn is_cross_realm_proof(
+    challenge: &PaymentChallenge,
+    url: &reqwest::Url,
+    headers: &HeaderMap,
+) -> bool {
+    let requested_host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| reqwest::Url::parse(&format!("http://{value}")).ok())
+        .and_then(|host| host.host_str().map(str::to_owned))
+        .or_else(|| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
     challenge.method.as_str() == "tempo"
         && challenge.intent.as_str() == "charge"
         && challenge
@@ -583,9 +595,7 @@ pub(crate) fn is_cross_realm_proof(challenge: &PaymentChallenge, url: &reqwest::
             .ok()
             .and_then(|request| request.parse_amount().ok())
             == Some(0)
-        && !challenge
-            .realm
-            .eq_ignore_ascii_case(url.host_str().unwrap_or_default())
+        && !challenge.realm.eq_ignore_ascii_case(&requested_host)
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.

@@ -9,6 +9,7 @@ use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use reqwest::header::{HeaderMap, HeaderValue, HOST};
 use reqwest_middleware::ClientBuilder;
 use tokio::net::TcpListener;
 
@@ -31,6 +32,31 @@ enum Via {
 }
 
 const BOTH: [Via; 2] = [Via::Fetch, Via::Middleware];
+
+#[test]
+fn caller_host_header_binds_proof_realm() {
+    let challenge = PaymentChallenge::new(
+        "proof-id",
+        "api.example.com",
+        "tempo",
+        "charge",
+        Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "0",
+            "currency": "0x3333333333333333333333333333333333333333"
+        }))
+        .unwrap(),
+    );
+    let url = reqwest::Url::parse("http://127.0.0.1:8080/paid").unwrap();
+    assert!(super::is_cross_realm_proof(
+        &challenge,
+        &url,
+        &HeaderMap::new()
+    ));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("api.example.com"));
+    assert!(!super::is_cross_realm_proof(&challenge, &url, &headers));
+}
 
 impl Via {
     async fn send(
