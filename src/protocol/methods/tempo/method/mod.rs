@@ -334,16 +334,19 @@ where
         ensure_submission_mode_allowed(request, &payload)?;
 
         let mut transaction_sender = None;
+        let payer;
         let details = if payload.is_hash() {
-            self.verify_hash(
-                payload.tx_hash().unwrap(),
-                request,
-                credential.source.as_deref(),
-                expected_chain_id,
-                &credential.challenge,
-                false,
-            )
-            .await?;
+            let (_, hash_payer) = self
+                .verify_hash(
+                    payload.tx_hash().unwrap(),
+                    request,
+                    credential.source.as_deref(),
+                    expected_chain_id,
+                    &credential.challenge,
+                    false,
+                )
+                .await?;
+            payer = hash_payer;
             serde_json::json!({ "mode": "push" })
         } else if payload.is_proof() {
             if !is_zero_amount {
@@ -372,6 +375,7 @@ where
                     ));
                 }
             }
+            payer = Some(sender);
             serde_json::json!({ "mode": "proof", "sender": format!("{sender:#x}") })
         } else {
             let serialized_transaction = payload.signed_tx().unwrap();
@@ -388,6 +392,7 @@ where
                 expected_chain_id,
             )?;
             transaction_sender = Some(sender);
+            payer = Some(sender);
             serde_json::json!({
                 "mode": "pull",
                 "sender": format!("{sender:#x}"),
@@ -396,6 +401,7 @@ where
         };
 
         let mut validation = ChargeValidation::new(credential, request, details);
+        validation.payer = payer.map(|payer| format!("{payer:#x}"));
         // Without a claimed source, the transaction sender is the payer.
         if validation.source.is_none() {
             validation.source =
@@ -570,6 +576,7 @@ where
                     true,
                 )
                 .await
+                .map(|(receipt, _)| receipt)
             } else if charge_payload.is_proof() {
                 if !is_zero_amount {
                     return Err(VerificationError::new(

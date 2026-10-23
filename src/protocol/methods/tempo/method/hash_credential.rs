@@ -10,8 +10,8 @@ use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::VerificationError;
 
 use super::super::{proof, TempoChargeExt, METHOD_NAME};
-use super::memo::assert_challenge_bound_memo;
-use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
+use super::memo::assert_challenge_bound_memos;
+use super::receipt_logs::{match_receipt_transfers, ReceiptSenderPolicy};
 use super::ChargeMethod;
 
 /// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
@@ -56,7 +56,7 @@ where
         expected_chain_id: u64,
         challenge: &ChallengeEcho,
         reserve: bool,
-    ) -> Result<Receipt, VerificationError> {
+    ) -> Result<(Receipt, Option<Address>), VerificationError> {
         // Validate the source before reserving the hash.
         let source_address = parse_hash_credential_source(source, expected_chain_id)?;
 
@@ -96,7 +96,8 @@ where
         let expected_sender = source_address.unwrap_or_else(|| receipt.from());
 
         // Tempo uses TIP-20 tokens exclusively (no native token transfers)
-        let matched_logs = match_receipt_transfer_logs_with_settlement(
+        let settlement_senders = request_settlement_senders(charge, expected_chain_id);
+        let matched = match_receipt_transfers(
             receipt.logs(),
             currency,
             &expected,
@@ -105,11 +106,30 @@ where
                 source,
                 validate_sender: self.validate_sender.as_deref(),
                 transaction_sender: receipt.from(),
-                settlement_senders: &request_settlement_senders(charge, expected_chain_id),
+                settlement_senders: &settlement_senders,
             },
         )?;
 
-        assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
+        assert_challenge_bound_memos(
+            matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+            &challenge.id,
+            &challenge.realm,
+        )?;
+
+        // The payer is the account the matched transfers debited, not the
+        // submitter. Settlement-contract transfers are funded by the
+        // transaction sender. Unset when the matched senders differ.
+        let mut payers = matched.iter().filter_map(|transfer| {
+            transfer.from.map(|from| {
+                if settlement_senders.contains(&from) {
+                    receipt.from()
+                } else {
+                    from
+                }
+            })
+        });
+        let first = payers.next();
+        let payer = first.filter(|first| payers.all(|payer| payer == *first));
 
         if let Some(store) = &self.store {
             if reserve {
@@ -136,6 +156,6 @@ where
             }
         }
 
-        Ok(Receipt::success(METHOD_NAME, format!("{hash:#x}")))
+        Ok((Receipt::success(METHOD_NAME, format!("{hash:#x}")), payer))
     }
 }
