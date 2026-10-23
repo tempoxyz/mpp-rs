@@ -372,6 +372,22 @@ impl TempoAccountsProvider {
         self.configured_session_provider()
     }
 
+    /// The session provider for paying `challenge`, which must be on the
+    /// expected chain: the session key and RPC belong to that chain, so a
+    /// challenge for another chain is rejected as for charges.
+    fn session_provider_for(
+        &self,
+        challenge: &PaymentChallenge,
+    ) -> Result<TempoSessionProvider, MppError> {
+        if let Some(expected) = self.expected_chain_id {
+            let got = super::session::channel_ops::resolve_chain_id(challenge);
+            if got != expected {
+                return Err(MppError::ChainIdMismatch { expected, got });
+            }
+        }
+        self.configured_session_provider()
+    }
+
     fn configured_session_provider(&self) -> Result<TempoSessionProvider, MppError> {
         let session = self.session.as_ref().ok_or_else(|| {
             MppError::UnsupportedPaymentMethod("tempo.session is not configured".to_owned())
@@ -563,7 +579,7 @@ impl PaymentProvider for TempoAccountsProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
-            return self.configured_session_provider()?.pay(challenge).await;
+            return self.session_provider_for(challenge)?.pay(challenge).await;
         }
         let from = self
             .wallet
@@ -611,7 +627,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .configured_session_provider()?
+                .session_provider_for(challenge)?
                 .pay_with_context(challenge, context)
                 .await;
         }
@@ -626,7 +642,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .configured_session_provider()?
+                .session_provider_for(challenge)?
                 .pay_with_management(challenge, context, management)
                 .await;
         }
@@ -935,6 +951,49 @@ mod tests {
                 .trusted_tempo_proof_realm(&request),
             None
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_payments_follow_the_expected_chain() {
+        let (provider, path, _) = provider();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let session = |chain_id: u64| {
+            let request = Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1",
+                "currency": "0x20c0000000000000000000000000000000000000",
+                "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                "methodDetails": {"chainId": chain_id},
+            }))
+            .unwrap();
+            PaymentChallenge::new("session", "api.example.com", "tempo", "session", request)
+        };
+
+        for result in [
+            provider.pay(&session(42431)).await,
+            provider
+                .pay_with_context(
+                    &session(42431),
+                    PaymentContext {
+                        url: reqwest::Url::parse("https://api.example.com/pay").unwrap(),
+                        headers: Default::default(),
+                        http_client: None,
+                    },
+                )
+                .await,
+        ] {
+            match result.unwrap_err() {
+                MppError::ChainIdMismatch { expected, got } => {
+                    assert_eq!((expected, got), (4217, 42431));
+                }
+                other => panic!("expected ChainIdMismatch, got {other:?}"),
+            }
+        }
+        assert!(provider.session_provider_for(&session(4217)).is_ok());
         std::fs::remove_file(path).unwrap();
     }
 
