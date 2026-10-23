@@ -46,49 +46,62 @@ where
         };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
-        let channel = self
-            .store
-            .get_channel(channel_id_str)
-            .await?
-            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+        // The on-chain read does not depend on the stored channel, so it
+        // overlaps the store read. Every stored-channel check still takes
+        // precedence over a failed on-chain read: the chain branch never
+        // short-circuits the join, and a stored-channel error drops it.
+        let read_on_chain = async {
+            let escrow = self.resolve_escrow(details)?;
+            let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
+            get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await
+        };
+        let check_stored = async {
+            let channel = self
+                .store
+                .get_channel(channel_id_str)
+                .await?
+                .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
 
-        if channel.payee != expected_payee {
-            return Err(VerificationError::credential_mismatch(
-                "channel payee does not match session recipient",
-            ));
-        }
-        if channel.token != expected_token {
-            return Err(VerificationError::credential_mismatch(
-                "channel token does not match session currency",
-            ));
-        }
-        validate_settlement_route(&channel, details, settlement_route)?;
+            if channel.payee != expected_payee {
+                return Err(VerificationError::credential_mismatch(
+                    "channel payee does not match session recipient",
+                ));
+            }
+            if channel.token != expected_token {
+                return Err(VerificationError::credential_mismatch(
+                    "channel token does not match session currency",
+                ));
+            }
+            validate_settlement_route(&channel, details, settlement_route)?;
 
-        if channel.finalized {
-            return Err(VerificationError::channel_closed("channel is finalized"));
-        }
-        if channel.closing {
-            return Err(VerificationError::channel_closed("channel is closing"));
-        }
+            if channel.finalized {
+                return Err(VerificationError::channel_closed("channel is finalized"));
+            }
+            if channel.closing {
+                return Err(VerificationError::channel_closed("channel is closing"));
+            }
 
-        let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
+            let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
 
-        let escrow = self.resolve_escrow(details)?;
-        let chain_id = self.resolve_chain_id(details);
+            let escrow = self.resolve_escrow(details)?;
+            let chain_id = self.resolve_chain_id(details);
 
-        if channel.chain_id != chain_id {
-            return Err(VerificationError::credential_mismatch(
-                "channel chain_id does not match session chain_id",
-            ));
-        }
-        if channel.escrow_contract != escrow {
-            return Err(VerificationError::credential_mismatch(
-                "channel escrow does not match session escrow",
-            ));
-        }
+            if channel.chain_id != chain_id {
+                return Err(VerificationError::credential_mismatch(
+                    "channel chain_id does not match session chain_id",
+                ));
+            }
+            if channel.escrow_contract != escrow {
+                return Err(VerificationError::credential_mismatch(
+                    "channel escrow does not match session escrow",
+                ));
+            }
+            Ok(cumulative_amount)
+        };
+        let (cumulative_amount, on_chain) =
+            tokio::try_join!(check_stored, async { Ok(read_on_chain.await) })?;
+        let on_chain = on_chain?;
         let min_delta = self.resolve_min_delta(details);
-        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
-        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
 
         if on_chain.payee != expected_payee {
             return Err(VerificationError::credential_mismatch(

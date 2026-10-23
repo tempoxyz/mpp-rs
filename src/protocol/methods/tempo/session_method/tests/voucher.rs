@@ -769,3 +769,79 @@ async fn test_voucher_does_not_reopen_finalized_channel() {
     assert!(stored.finalized);
     assert_eq!(stored.highest_voucher_amount, 0);
 }
+
+/// The on-chain read runs alongside the store read, but a stored-channel
+/// error still wins over a failed on-chain read.
+#[tokio::test]
+async fn test_voucher_unknown_channel_wins_over_failed_chain_read() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    let store = Arc::new(InMemoryChannelStore::new());
+
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc down");
+    let method = mocked_session_method(store, asserter);
+
+    let (request, credential) = voucher_credential(&signer, &state, 1_000).await;
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::ChannelNotFound));
+}
+
+/// A stored channel that does not match the session is rejected as such
+/// even when the concurrent on-chain read fails.
+#[tokio::test]
+async fn test_voucher_stored_mismatch_wins_over_failed_chain_read() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    state.chain_id = 1;
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state.clone());
+
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc down");
+    let method = mocked_session_method(store, asserter);
+
+    let (request, credential) = voucher_credential(&signer, &state, 1_000).await;
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+    assert!(err.message.contains("chain_id"), "got: {}", err.message);
+}
+
+/// With a valid stored channel, a failed on-chain read is reported and
+/// the voucher is not recorded.
+#[tokio::test]
+async fn test_voucher_reports_failed_chain_read() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state.clone());
+
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc down");
+    let method = mocked_session_method(store.clone(), asserter);
+
+    let (request, credential) = voucher_credential(&signer, &state, 1_000).await;
+    method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        store
+            .get_channel_sync(&channel_id)
+            .unwrap()
+            .highest_voucher_amount,
+        state.highest_voucher_amount
+    );
+}
