@@ -170,7 +170,7 @@ where
         debug_assert!(tx.access_list.is_empty());
 
         // Both add intrinsic gas the sponsor pays for without being part of
-        // the charge. mppx rejects the former and makes the latter opt-out.
+        // the charge. mppx rejects the former and makes the latter opt-in.
         if !tx.tempo_authorization_list.is_empty() {
             return Err(VerificationError::new(
                 "Fee payer transaction must not include an authorization list",
