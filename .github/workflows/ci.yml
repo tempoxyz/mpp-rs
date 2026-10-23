@@ -23,8 +23,6 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    env:
-      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
     permissions:
       contents: read
       id-token: write
@@ -49,30 +47,6 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-      - name: Pin pnpm for Tempo Lints
-        run: |
-          set -o pipefail
-          for attempt in 1 2 3; do
-            if corepack prepare pnpm@10.28.1 --activate 2>&1 | tee "$RUNNER_TEMP/corepack.log"; then
-              exit 0
-            fi
-            if ! grep -q 'Error when performing the request' "$RUNNER_TEMP/corepack.log" || [[ "$attempt" == 3 ]]; then
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-      - name: Run Tempo Lints
-        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # 2026-08-25T05-00-01Z-f9268eb2 # zizmor: ignore[ref-version-mismatch]
-        env:
-          COREPACK_DEFAULT_TO_LATEST: "0"
-        with:
-          language: rust
-          path: "."
-          post-comment: false
-          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install ast-grep
         uses: tempoxyz/gh-actions/vendor/jaxxstorm/action-install-gh-release@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
@@ -84,6 +58,22 @@ jobs:
         run: sg scan -c sgconfig.yml src/
       - name: Run ast-grep tests
         run: sg test -c sgconfig.yml
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - name: Check for typos
+        uses: tempoxyz/gh-actions/actions/typos@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
 
   test:
     name: Test
@@ -250,7 +240,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test, doctest, features, integration, deny]
+    needs: [lint, typos, test, doctest, features, integration, deny]
     runs-on: ubuntu-latest
     permissions:
       contents: read
