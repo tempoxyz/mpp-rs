@@ -11,6 +11,7 @@ pub mod recovery;
 pub mod store;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use alloy::{
     primitives::{Address, B256, U256},
@@ -146,6 +147,30 @@ pub struct TempoSessionProvider {
     /// Receives `channel.deposit` events for accepted opens and top-ups.
     events: ClientEvents,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
+    /// Deadline for each session management request (top-up, voucher, close).
+    management_timeout: Duration,
+}
+
+/// How long a session management request may take before it fails with an
+/// unknown outcome, so a stalled server cannot hold the payment lock.
+/// Matches the TypeScript SDK.
+const MANAGEMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs a management request within `timeout`. A request that runs out of
+/// time is dropped, so a late response cannot change channel state, and is
+/// not retried: the server may still have applied it.
+async fn with_management_timeout<T>(
+    timeout: Duration,
+    context: &str,
+    request: impl std::future::Future<Output = Result<T, MppError>>,
+) -> Result<T, MppError> {
+    tokio::time::timeout(timeout, request)
+        .await
+        .unwrap_or_else(|_| {
+            Err(MppError::Http(format!(
+                "{context}: session management request timed out; payment outcome unknown"
+            )))
+        })
 }
 
 /// Work a session SSE event triggers, such as sending a voucher.
@@ -289,6 +314,7 @@ impl TempoSessionProvider {
             spend: Arc::default(),
             events: ClientEvents::default(),
             trusted_tempo_proof_realms: Vec::new(),
+            management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
         })
     }
 
@@ -1892,7 +1918,12 @@ impl TempoSessionProvider {
                 additional_deposit,
             )
             .await?;
-        let receipt = transport.send(challenge, &prepared.credential).await?;
+        let receipt = with_management_timeout(
+            self.management_timeout,
+            "top-up request failed",
+            transport.send(challenge, &prepared.credential),
+        )
+        .await?;
         self.record_top_up(url, &prepared).await?;
         Ok(receipt)
     }
@@ -2023,12 +2054,12 @@ impl TempoSessionProvider {
             ..
         } = prepared;
         let mut headers = prepared.headers.clone();
-        let mut response = client
-            .post(url)
-            .headers(headers.clone())
-            .send()
-            .await
-            .mpp_http("top-up POST failed")?;
+        let mut response = Self::send_management(
+            self.management_timeout,
+            client.post(url).headers(headers.clone()),
+            "top-up POST failed",
+        )
+        .await?;
         if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
             let fresh_challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
                 response
@@ -2075,12 +2106,12 @@ impl TempoSessionProvider {
                         .parse()
                         .mpp_config("invalid refreshed top-up authorization header")?,
                 );
-                response = client
-                    .post(url)
-                    .headers(headers)
-                    .send()
-                    .await
-                    .mpp_http("refreshed top-up POST failed")?;
+                response = Self::send_management(
+                    self.management_timeout,
+                    client.post(url).headers(headers),
+                    "refreshed top-up POST failed",
+                )
+                .await?;
             }
         }
         let status = response.status();
@@ -2357,8 +2388,21 @@ impl TempoSessionProvider {
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
+    /// Sends a management request within `timeout`.
+    async fn send_management(
+        timeout: Duration,
+        request: reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<reqwest::Response, MppError> {
+        with_management_timeout(timeout, context, async {
+            request.send().await.mpp_http(context)
+        })
+        .await
+    }
+
     /// POSTs a management credential that answers `challenge` to `url`.
     async fn post_credential(
+        &self,
         client: &reqwest::Client,
         url: &str,
         challenge: &PaymentChallenge,
@@ -2366,15 +2410,11 @@ impl TempoSessionProvider {
         context: &str,
     ) -> Result<reqwest::Response, MppError> {
         ensure_redirect_safe_credential_header(challenge)?;
-        client
-            .post(url)
-            .header(
-                crate::client::payment_credential_header_name(challenge),
-                crate::protocol::core::format_authorization(credential)?,
-            )
-            .send()
-            .await
-            .mpp_http(context)
+        let request = client.post(url).header(
+            crate::client::payment_credential_header_name(challenge),
+            crate::protocol::core::format_authorization(credential)?,
+        );
+        Self::send_management(self.management_timeout, request, context).await
     }
 
     /// The session challenge of a `402` response, which asks for the
@@ -2444,9 +2484,9 @@ impl TempoSessionProvider {
             self.voucher_credential_for_challenge(&challenge, channel_id_hex, required_cumulative)
                 .await?
         };
-        let mut resp =
-            Self::post_credential(client, url, &challenge, &credential, "voucher POST failed")
-                .await?;
+        let mut resp = self
+            .post_credential(client, url, &challenge, &credential, "voucher POST failed")
+            .await?;
         // A stream can outlive the challenge it was opened with.
         let refreshed = Self::refreshed_challenge(&resp);
         if let Some(refreshed) = &refreshed {
@@ -2454,9 +2494,9 @@ impl TempoSessionProvider {
             let credential = self
                 .voucher_credential_for_challenge(refreshed, channel_id_hex, required_cumulative)
                 .await?;
-            resp =
-                Self::post_credential(client, url, refreshed, &credential, "voucher POST failed")
-                    .await?;
+            resp = self
+                .post_credential(client, url, refreshed, &credential, "voucher POST failed")
+                .await?;
         }
 
         if !resp.status().is_success() {
@@ -2606,17 +2646,17 @@ impl TempoSessionProvider {
         let credential = self
             .close_credential_for_challenge_inner(&challenge, &channel_id, None)
             .await?;
-        let mut resp =
-            Self::post_credential(client, url, &challenge, &credential, "close request failed")
-                .await?;
+        let mut resp = self
+            .post_credential(client, url, &challenge, &credential, "close request failed")
+            .await?;
         if let Some(refreshed) = Self::refreshed_challenge(&resp) {
             ensure_redirect_safe_credential_header(&refreshed)?;
             let credential = self
                 .close_credential_for_challenge_inner(&refreshed, &channel_id, None)
                 .await?;
-            resp =
-                Self::post_credential(client, url, &refreshed, &credential, "close request failed")
-                    .await?;
+            resp = self
+                .post_credential(client, url, &refreshed, &credential, "close request failed")
+                .await?;
         }
 
         let status = resp.status();
@@ -2686,7 +2726,12 @@ impl TempoSessionProvider {
         let credential = self
             .close_credential_for_challenge_inner(&challenge, &entry.channel_id.to_string(), None)
             .await?;
-        let receipt = transport.send(&challenge, &credential).await?;
+        let receipt = with_management_timeout(
+            self.management_timeout,
+            "close request failed",
+            transport.send(&challenge, &credential),
+        )
+        .await?;
         if receipt.is_some() {
             self.forget_closed_channel(&entry, &expected_key).await?;
         }
@@ -4053,15 +4098,16 @@ mod tests {
             challenge.to_echo(),
             crate::protocol::core::PaymentPayload::hash("0x00"),
         );
-        let error = TempoSessionProvider::post_credential(
-            &reqwest::Client::new(),
-            "http://127.0.0.1:1/",
-            &challenge,
-            &credential,
-            "test",
-        )
-        .await
-        .unwrap_err();
+        let error = make_test_provider()
+            .post_credential(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                &challenge,
+                &credential,
+                "test",
+            )
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("redirect-safe client"));
     }
 
@@ -4768,6 +4814,70 @@ mod tests {
             assert_eq!(posted[0].1, posted[1].1);
             assert_eq!(provider.channels().values().next().unwrap().deposit, 11_000);
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_top_up_times_out_and_releases_the_payment_lock() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider().with_max_deposit(12_000);
+        provider.management_timeout = std::time::Duration::from_millis(200);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        // Two signing passes: the stalled top-up and the one after it.
+        mock_rpc(
+            &mut provider,
+            &[
+                &channel_state_response(10_000),
+                "0x4a817c800",
+                "0x5208",
+                &channel_state_response(10_000),
+                "0x4a817c800",
+                "0x5208",
+            ],
+        );
+        let stalled = axum::Router::new().route(
+            "/",
+            axum::routing::post(std::future::pending::<axum::response::Response>),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stalled).await.unwrap() });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.top_up_with_headers_for_challenge(
+                &reqwest::Client::new(),
+                &stalled_url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                1_000,
+            ),
+        )
+        .await
+        .expect("top-up must fail within its deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("payment outcome unknown"));
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
+
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+        provider
+            .top_up_with_headers_for_challenge(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(posted.lock().unwrap().len(), 1);
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 11_000);
     }
 
     #[tokio::test]
