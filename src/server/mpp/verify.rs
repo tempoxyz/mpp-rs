@@ -472,11 +472,11 @@ where
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
-    ) -> std::result::Result<(), VerificationError> {
+    ) -> std::result::Result<Option<ChargeValidation>, VerificationError> {
         if self.method.supports_validation() {
-            self.method.validate(credential, request).await?;
+            return self.method.validate(credential, request).await.map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Re-validate and perform the terminal payment operation.
@@ -499,7 +499,7 @@ where
         self.verify_body_digest(credential, body)?;
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request)?;
-        self.validate_before_broadcast(credential, request).await?;
+        let validation = self.validate_before_broadcast(credential, request).await?;
         let receipt = self.method.broadcast(credential, request).await?;
         self.events
             .emit_payment_success(PaymentSuccessContext {
@@ -509,6 +509,7 @@ where
                 method: credential.challenge.method.as_str().to_string(),
                 intent: credential.challenge.intent.as_str().to_string(),
                 management_response: false,
+                payer: validation.and_then(|validation| validation.payer),
             })
             .await;
         Ok(receipt)

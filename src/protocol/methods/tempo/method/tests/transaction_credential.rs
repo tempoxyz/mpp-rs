@@ -195,6 +195,7 @@ async fn test_validate_binds_transaction_credential_source_to_sender() {
             .await
             .unwrap();
         assert_eq!(validation.source, Some(expected));
+        assert_eq!(validation.payer, Some(format!("{sender:#x}")));
     }
 
     let rejected = [

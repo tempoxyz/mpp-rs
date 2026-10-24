@@ -180,6 +180,7 @@ async fn test_proof_validation_does_not_reserve_replay_state() {
         .await
         .unwrap();
     assert_eq!(validation.details["mode"], "proof");
+    assert_eq!(validation.payer, Some(format!("{:#x}", signer.address())));
 
     let key = format!("mpp:charge:proof:{}", challenge.id);
     assert!(store.get(&key).await.unwrap().is_none());

@@ -30,6 +30,14 @@ pub struct ChargeValidation {
     pub request: ChargeRequest,
     /// Optional payer identity.
     pub source: Option<String>,
+    /// Payer identity established by method-specific validation, when the
+    /// method can determine one (for example, the Tempo address that sent the
+    /// payment).
+    ///
+    /// Unlike `source`, which the credential asserts, this is derived from the
+    /// verified credential payload. Its format is method-specific.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
 }
 
 impl ChargeValidation {
@@ -47,6 +55,7 @@ impl ChargeValidation {
             method: credential.challenge.method.clone(),
             request: request.clone(),
             source: credential.source.clone(),
+            payer: None,
         }
     }
 }

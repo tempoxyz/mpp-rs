@@ -173,7 +173,7 @@ where
             )));
         }
 
-        let matched_memos = match_transfers(
+        let matched = match_transfers(
             &calls.transfer_effects(),
             TransferSource::Calls,
             currency,
@@ -181,7 +181,11 @@ where
         )?;
 
         if let Some((challenge_id, realm)) = challenge_binding {
-            assert_challenge_bound_memos(matched_memos.iter().flatten(), challenge_id, realm)?;
+            assert_challenge_bound_memos(
+                matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+                challenge_id,
+                realm,
+            )?;
         }
 
         Ok(None)

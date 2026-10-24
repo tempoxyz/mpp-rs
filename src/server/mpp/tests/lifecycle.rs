@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone)]
 struct LifecycleMethod {
     calls: Arc<Mutex<Vec<&'static str>>>,
+    payer: Option<String>,
     reject_broadcast: bool,
     reject_validation: bool,
 }
@@ -22,6 +23,7 @@ impl ChargeMethod for LifecycleMethod {
         request: &ChargeRequest,
     ) -> impl Future<Output = std::result::Result<ChargeValidation, VerificationError>> + Send {
         let calls = Arc::clone(&self.calls);
+        let payer = self.payer.clone();
         let reject_validation = self.reject_validation;
         let credential = credential.clone();
         let request = request.clone();
@@ -30,11 +32,10 @@ impl ChargeMethod for LifecycleMethod {
             if reject_validation {
                 return Err(VerificationError::new("validation rejected"));
             }
-            Ok(ChargeValidation::new(
-                &credential,
-                &request,
-                serde_json::json!({ "mode": "test" }),
-            ))
+            let mut validation =
+                ChargeValidation::new(&credential, &request, serde_json::json!({ "mode": "test" }));
+            validation.payer = payer;
+            Ok(validation)
         }
     }
 
@@ -75,6 +76,7 @@ fn lifecycle_payment(
         Mpp::new(
             LifecycleMethod {
                 calls: Arc::clone(&calls),
+                payer: None,
                 reject_broadcast: false,
                 reject_validation,
             },
@@ -92,6 +94,7 @@ fn lifecycle_payment_rejecting_broadcast() -> (Mpp<LifecycleMethod>, Arc<Mutex<V
         Mpp::new(
             LifecycleMethod {
                 calls: Arc::clone(&calls),
+                payer: None,
                 reject_broadcast: true,
                 reject_validation: false,
             },
@@ -450,4 +453,57 @@ async fn validation_only_api_rejects_legacy_method_without_verifying() {
 
     assert!(error.message.contains("does not support non-mutating"));
     assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn payment_success_exposes_the_validated_payer() {
+    for payer in [Some("0x00000000000000000000000000000000000000aa"), None] {
+        let payment = Mpp::new(
+            LifecycleMethod {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                payer: payer.map(str::to_string),
+                reject_broadcast: false,
+                reject_validation: false,
+            },
+            "api.example.com",
+            TEST_SECRET,
+        );
+        let payers = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = payment.on_payment_success({
+            let payers = Arc::clone(&payers);
+            move |context| {
+                let payers = Arc::clone(&payers);
+                async move { payers.lock().unwrap().push(context.payer) }
+            }
+        });
+        let credential = test_lifecycle_credential(TEST_SECRET, None);
+
+        payment.broadcast_credential(&credential).await.unwrap();
+
+        assert_eq!(*payers.lock().unwrap(), [payer.map(str::to_string)]);
+    }
+}
+
+#[tokio::test]
+async fn legacy_payment_success_has_no_payer() {
+    let payment = Mpp::new(
+        LegacyLifecycleMethod {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        },
+        "api.example.com",
+        TEST_SECRET,
+    );
+    let payers = Arc::new(Mutex::new(Vec::new()));
+    let _subscription = payment.on_payment_success({
+        let payers = Arc::clone(&payers);
+        move |context| {
+            let payers = Arc::clone(&payers);
+            async move { payers.lock().unwrap().push(context.payer) }
+        }
+    });
+    let credential = test_lifecycle_credential(TEST_SECRET, None);
+
+    payment.broadcast_credential(&credential).await.unwrap();
+
+    assert_eq!(*payers.lock().unwrap(), [None]);
 }
