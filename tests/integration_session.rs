@@ -344,6 +344,7 @@ async fn stream(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         generate: futures_util::stream::iter(values),
         poll_interval_ms: 50,
         min_voucher_delta: 0,
+        before_charge: None,
     });
     let body = Body::from_stream(futures_util::StreamExt::map(events, |event| {
         Ok::<_, std::convert::Infallible>(event)

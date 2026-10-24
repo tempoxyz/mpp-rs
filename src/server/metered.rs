@@ -2,7 +2,7 @@
 
 use super::sse::NeedVoucherEvent;
 use crate::protocol::methods::tempo::session_method::{
-    channel_receipt, deduct_from_channel, ChannelState, ChannelStore,
+    channel_receipt, deduct_from_channel, ChannelState, ChannelStore, StreamCheck,
 };
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::ErrorCode;
@@ -29,6 +29,8 @@ pub(super) struct Metered<'a, G> {
     pub(super) generate: G,
     pub(super) poll_interval_ms: u64,
     pub(super) min_voucher_delta: u128,
+    /// Runs before each charge; an error stops the stream.
+    pub(super) before_charge: Option<StreamCheck>,
 }
 
 impl<'a, G> Metered<'a, G>
@@ -47,6 +49,7 @@ where
             generate,
             poll_interval_ms,
             min_voucher_delta,
+            before_charge,
         } = self;
 
         async_stream::stream! {
@@ -82,6 +85,16 @@ where
                 // Try to charge, waiting for top-up if insufficient
                 let mut need_voucher_sent = false;
                 loop {
+                    // The escrow may have been closed or withdrawn since the
+                    // voucher was accepted: no voucher can fix that either.
+                    if let Some(check) = &before_charge {
+                        if check(channel_id.to_string()).await.is_err() {
+                            if let Some(receipt) = final_receipt(store, channel_id, challenge_id).await {
+                                yield MeteredEvent::Receipt(receipt);
+                            }
+                            return;
+                        }
+                    }
                     match deduct_from_channel(store, channel_id, tick_cost).await {
                         Ok(_state) => break,
                         Err(e) if e.code == Some(ErrorCode::InsufficientBalance) => {

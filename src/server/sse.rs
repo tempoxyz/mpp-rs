@@ -258,6 +258,11 @@ pub struct ServeOptions<G> {
     /// top of the accepted amount, so the requested voucher is not rejected
     /// as too small. Use `0` if no minimum is enforced.
     pub min_voucher_delta: u128,
+    /// Check run before each value is charged and delivered, such as
+    /// [`SessionMethod::stream_check`](crate::protocol::methods::tempo::session_method::SessionMethod::stream_check)
+    /// for the channel's live escrow. When it fails the stream ends with the
+    /// final receipt.
+    pub before_charge: Option<crate::protocol::methods::tempo::session_method::StreamCheck>,
 }
 
 /// Wrap an async stream with payment metering, producing SSE event bytes.
@@ -296,6 +301,7 @@ where
         generate,
         poll_interval_ms,
         min_voucher_delta,
+        before_charge,
     } = options;
     let channel_id = normalize_channel_id(&channel_id);
 
@@ -308,6 +314,7 @@ where
             generate,
             poll_interval_ms,
             min_voucher_delta,
+            before_charge,
         }
         .events();
         let mut events = std::pin::pin!(events);
@@ -697,6 +704,7 @@ mod tests {
             generate: Box::pin(async_stream::stream! { yield "hello".to_string(); }),
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         let events = collect_stream(stream).await;
@@ -708,6 +716,61 @@ mod tests {
             Some(SseEvent::PaymentReceipt(receipt)) => assert_eq!(receipt.channel_id, lower),
             other => panic!("expected a receipt, got: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_stops_when_escrow_check_fails() {
+        use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_escrow";
+        store.insert(channel_id, test_channel_state(channel_id, 1000, 5000));
+
+        // The escrow is healthy for the first value only.
+        let checks = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = checks.clone();
+        let before_charge: crate::protocol::methods::tempo::session_method::StreamCheck =
+            std::sync::Arc::new(move |_| {
+                let healthy = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    if healthy {
+                        Ok(())
+                    } else {
+                        Err(crate::protocol::traits::VerificationError::channel_closed(
+                            "channel has a pending close request",
+                        ))
+                    }
+                })
+            });
+
+        let stream = serve(ServeOptions {
+            store: store.clone(),
+            channel_id: channel_id.to_string(),
+            challenge_id: "ch-test".to_string(),
+            tick_cost: 100,
+            generate: Box::pin(async_stream::stream! {
+                yield "first".to_string();
+                yield "must not be delivered".to_string();
+            }),
+            poll_interval_ms: 10,
+            min_voucher_delta: 0,
+            before_charge: Some(before_charge),
+        });
+
+        let events = collect_stream(stream).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            parse_event(&events[0]),
+            Some(SseEvent::Message("first".into()))
+        );
+        assert!(matches!(
+            parse_event(&events[1]),
+            Some(SseEvent::PaymentReceipt(_))
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(store.get_channel_sync(channel_id).unwrap().spent, 100);
     }
 
     #[cfg(feature = "tempo")]
@@ -734,6 +797,7 @@ mod tests {
             generate: gen,
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         let events = collect_stream(stream).await;
@@ -797,6 +861,7 @@ mod tests {
             generate: gen,
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         let events = collect_stream(stream).await;
@@ -846,6 +911,7 @@ mod tests {
                 generate: gen,
                 poll_interval_ms: 10,
                 min_voucher_delta: 0,
+                before_charge: None,
             });
             collect_stream(stream).await
         });
@@ -933,6 +999,7 @@ mod tests {
             }),
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         let accept_voucher = |amount: Option<u128>| {
@@ -1014,6 +1081,7 @@ mod tests {
                 generate: Box::pin(async_stream::stream! { yield "a".to_string(); }),
                 poll_interval_ms: 10,
                 min_voucher_delta,
+                before_charge: None,
             });
 
             match parse_event(&next_item(&mut stream).await.unwrap()) {
@@ -1049,6 +1117,7 @@ mod tests {
             generate: gen,
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         let events = collect_stream(stream).await;
@@ -1101,6 +1170,7 @@ mod tests {
                 generate: gen,
                 poll_interval_ms: 10,
                 min_voucher_delta: 0,
+                before_charge: None,
             });
             collect_stream(stream).await
         });
@@ -1168,6 +1238,7 @@ mod tests {
             generate,
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         // No voucher can create the channel, so the stream must end instead of polling.
@@ -1210,6 +1281,7 @@ mod tests {
                 generate,
                 poll_interval_ms: 10,
                 min_voucher_delta: 0,
+                before_charge: None,
             }))
             .await;
 
@@ -1246,6 +1318,7 @@ mod tests {
             generate,
             poll_interval_ms: 10,
             min_voucher_delta: 0,
+            before_charge: None,
         });
 
         match parse_event(&next_item(&mut stream).await.unwrap()) {
@@ -1314,6 +1387,7 @@ mod tests {
                 }),
                 poll_interval_ms: 10,
                 min_voucher_delta: 0,
+                before_charge: None,
             }));
         }
 
