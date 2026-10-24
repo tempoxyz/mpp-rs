@@ -588,9 +588,10 @@ where
                 // broadcast_transaction already does pre-broadcast dedup and
                 // validates the receipt, so we do NOT call verify_hash here
                 // (which would self-reject since the tx hash is already marked).
+                let signed_tx = charge_payload.signed_tx().unwrap();
                 let tx_hash = this
                     .broadcast_transaction(
-                        charge_payload.signed_tx().unwrap(),
+                        signed_tx,
                         &request,
                         credential.source.as_deref(),
                         expected_chain_id,
@@ -598,7 +599,17 @@ where
                         &credential.challenge.realm,
                     )
                     .await?;
-                Ok(Receipt::success(METHOD_NAME, format!("{:#x}", tx_hash)))
+                let receipt = Receipt::success(METHOD_NAME, format!("{:#x}", tx_hash));
+                Ok(
+                    match transaction_credential::signed_transaction_funding_currency(
+                        signed_tx,
+                        &request,
+                        expected_chain_id,
+                    ) {
+                        Some(token) => receipt.with_funding_currency(token.to_checksum(None)),
+                        None => receipt,
+                    },
+                )
             }
         }
     }
