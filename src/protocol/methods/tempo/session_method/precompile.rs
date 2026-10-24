@@ -276,9 +276,10 @@ pub(super) async fn get_precompile_channel<P: Provider<TempoNetwork>>(
         deposit: state.deposit.to::<u128>(),
         settled: state.settled.to::<u128>(),
         close_requested_at: u64::from(state.closeRequestedAt),
-        // Closing or withdrawing deletes the channel, which then reads back unfunded. Report
-        // it as finalized so no caller accepts vouchers its deposit can no longer back.
-        finalized: state.deposit.is_zero(),
+        // The precompile has no finalized flag: a closed or withdrawn channel is deleted and
+        // reads back unfunded, which a lagging RPC can also return right after an open. Callers
+        // reject zero-deposit reads for the request at hand instead of persisting them.
+        finalized: false,
     })
 }
 

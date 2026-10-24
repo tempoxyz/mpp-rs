@@ -107,6 +107,14 @@ where
                 .await?
         };
 
+        // A TIP-1034 channel that reads back unfunded was closed or withdrawn (or the RPC has
+        // not seen it yet): reject this voucher without recording anything, so a stale read
+        // cannot lock the payee out of a live channel.
+        if precompile::is_precompile(escrow) && on_chain.deposit == 0 {
+            return Err(VerificationError::channel_closed(
+                "channel is not funded on-chain",
+            ));
+        }
         if on_chain.payee != expected_payee {
             return Err(VerificationError::credential_mismatch(
                 "on-chain channel payee does not match session recipient",
