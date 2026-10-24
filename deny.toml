@@ -8,6 +8,9 @@ ignore = [
     "RUSTSEC-2024-0436",
     # https://rustsec.org/advisories/RUSTSEC-2026-0173 proc-macro-error2 is unmaintained (transitive dep)
     "RUSTSEC-2026-0173",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0387 crypto-bigint timing variability: 0.7 is
+    # upgraded to the fixed 0.7.7; 0.5.5 (via elliptic-curve 0.13 in alloy/k256/p256) has no fix.
+    "RUSTSEC-2026-0387",
 ]
 
 # This section is considered when running `cargo deny check bans`.
