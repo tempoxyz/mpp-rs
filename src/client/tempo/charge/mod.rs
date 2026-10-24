@@ -124,20 +124,26 @@ fn ensure_pull_supported(charge: &ChargeRequest) -> Result<(), MppError> {
 }
 
 /// Resolve the transaction's `validBefore`: the requested timestamp, or 25
-/// seconds from now, capped at the challenge `expires`.
+/// seconds from now, capped at the second after the challenge `expires`.
 fn resolve_valid_before(challenge: &PaymentChallenge, requested: Option<u64>) -> u64 {
-    let valid_before = requested.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_add(FEE_PAYER_VALID_BEFORE_SECS)
-    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    resolve_valid_before_at(challenge, requested, now)
+}
+
+fn resolve_valid_before_at(challenge: &PaymentChallenge, requested: Option<u64>, now: u64) -> u64 {
+    let valid_before = requested.unwrap_or_else(|| now.saturating_add(FEE_PAYER_VALID_BEFORE_SECS));
     let Some(expires) = challenge.expires_at() else {
         return valid_before;
     };
-    // `0` encodes "no validBefore", which would outlive any expiry.
-    let expires = u64::try_from(expires.unix_timestamp()).unwrap_or(0).max(1);
+    // `validBefore` is an exclusive whole-second bound, so cap at the second
+    // after a (possibly fractional) expiry to stay valid as long as the challenge.
+    // This also keeps the cap non-zero: `0` encodes "no validBefore".
+    let expires = u64::try_from(expires.unix_timestamp())
+        .unwrap_or(0)
+        .saturating_add(1);
     if valid_before == 0 {
         expires
     } else {
@@ -357,8 +363,8 @@ impl TempoCharge {
     /// Power users use this to inject their own nonce resolution, gas bumping,
     /// keychain signing mode, and key authorization provisioning.
     ///
-    /// The transaction's `validBefore` is never later than the challenge
-    /// `expires`, whatever [`SignOptions::valid_before`] asks for.
+    /// The transaction's `validBefore` is never later than the second after
+    /// the challenge `expires`, whatever [`SignOptions::valid_before`] asks for.
     pub async fn sign_with_options(
         self,
         signer: &(impl alloy::signers::Signer + Clone),
@@ -1164,7 +1170,7 @@ mod tests {
         // `Some(0)` asks for no `validBefore` at all.
         let challenge = test_challenge().with_expires(crate::expires::seconds(5));
         let expires = challenge.expires_at().unwrap().unix_timestamp() as u64;
-        assert_eq!(resolve_valid_before(&challenge, Some(0)), expires);
+        assert_eq!(resolve_valid_before(&challenge, Some(0)), expires + 1);
 
         // (seconds until `expires`, explicit `valid_before` offset from now)
         let cases = [(5, None), (5, Some(600)), (3600, None), (3600, Some(600))];
@@ -1188,7 +1194,7 @@ mod tests {
             let valid_before = tx.tx().valid_before.unwrap().get();
 
             assert!(
-                valid_before <= expires,
+                valid_before <= expires + 1,
                 "expires in {expires_in}s, explicit {explicit:?}: validBefore is {}s past expires",
                 valid_before.saturating_sub(expires)
             );
@@ -1196,6 +1202,50 @@ mod tests {
                 let requested = explicit.unwrap_or(FEE_PAYER_VALID_BEFORE_SECS);
                 assert!((now + requested..=now + requested + 5).contains(&valid_before));
             }
+        }
+    }
+
+    #[test]
+    fn test_valid_before_caps_at_second_after_challenge_expires() {
+        // 2027-01-15T08:00:00Z
+        const BASE: u64 = 1_800_000_000;
+        let at = |minutes_seconds: &str| format!("2027-01-15T08:{minutes_seconds}Z");
+
+        // (label, now, challenge expires, expected validBefore)
+        let cases = [
+            ("no challenge expiry", BASE, None, BASE + 25),
+            (
+                "expiry after the window",
+                BASE,
+                Some(at("01:00")),
+                BASE + 25,
+            ),
+            (
+                "expiry inside the window",
+                BASE,
+                Some(at("00:10")),
+                BASE + 11,
+            ),
+            ("fractional expiry", BASE, Some(at("00:10.5")), BASE + 11),
+            ("sub-second expiry", BASE, Some(at("00:00.5")), BASE + 1),
+            (
+                "whole-second expiry is now",
+                BASE,
+                Some(at("00:00")),
+                BASE + 1,
+            ),
+            ("millisecond expiry", BASE, Some(at("00:00.999")), BASE + 1),
+        ];
+
+        for (label, now, expires, expected) in cases {
+            let mut challenge = test_challenge();
+            if let Some(expires) = expires {
+                challenge = challenge.with_expires(expires);
+            }
+            let valid_before = resolve_valid_before_at(&challenge, None, now);
+            assert_eq!(valid_before, expected, "{label}");
+            // Still valid at signing time, even when the challenge expires this second.
+            assert!(valid_before > now, "{label}");
         }
     }
 
