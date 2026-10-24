@@ -367,7 +367,7 @@ where
                     })?
                     .is_some()
                 {
-                    return Err(VerificationError::new(
+                    return Err(VerificationError::credential_replayed(
                         "Proof credential has already been used.",
                     ));
                 }

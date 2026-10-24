@@ -100,9 +100,13 @@ async fn test_proof_credential_replay_rejected() {
     let key = format!("mpp:charge:proof:{}", challenge.id);
     assert!(store.get(&key).await.unwrap().is_some());
 
-    // Replaying the identical credential is rejected.
+    // Replaying the identical credential is rejected as final (403).
     let err = method.verify(&credential, &request).await.unwrap_err();
     assert!(err.to_string().contains("already been used"));
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
 }
 
 #[tokio::test]

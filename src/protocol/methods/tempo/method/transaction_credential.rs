@@ -328,7 +328,7 @@ where
                 .await
                 .map_err(|e| VerificationError::internal(format!("Failed to record tx: {e}")))?;
             if !claimed {
-                return Err(VerificationError::new(
+                return Err(VerificationError::credential_replayed(
                     "Transaction has already been submitted.",
                 ));
             }
@@ -380,7 +380,7 @@ where
                     VerificationError::internal(format!("Failed to record tx hash: {e}"))
                 })?;
             if !claimed {
-                return Err(VerificationError::new(
+                return Err(VerificationError::credential_replayed(
                     "Transaction hash has already been used.",
                 ));
             }

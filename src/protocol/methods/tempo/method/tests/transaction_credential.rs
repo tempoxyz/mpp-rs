@@ -49,6 +49,11 @@ async fn test_broadcast_rejects_unbound_memo_before_rpc() {
             .contains("memo is not bound to this challenge"),
         "unexpected error: {error}"
     );
+    // Nothing settled yet, so this stays a retryable 402 failure.
+    assert_ne!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
 }
 
 #[tokio::test]

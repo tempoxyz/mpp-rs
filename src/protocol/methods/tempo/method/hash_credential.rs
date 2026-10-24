@@ -120,7 +120,7 @@ where
                         VerificationError::internal(format!("Failed to record tx hash: {e}"))
                     })?;
                 if !claimed {
-                    return Err(VerificationError::new(
+                    return Err(VerificationError::credential_replayed(
                         "Transaction hash has already been used.",
                     ));
                 }
@@ -130,7 +130,7 @@ where
                 .map_err(|e| VerificationError::internal(format!("Failed to check tx hash: {e}")))?
                 .is_some()
             {
-                return Err(VerificationError::new(
+                return Err(VerificationError::credential_replayed(
                     "Transaction hash has already been used.",
                 ));
             }
