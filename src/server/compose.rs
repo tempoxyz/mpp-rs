@@ -178,11 +178,35 @@ pub async fn compose_verify_with_expected_requests(
     routes: &[(&dyn ChargeVerifier, &ChargeRequest)],
     credential: &PaymentCredential,
 ) -> Result<Receipt, VerificationError> {
-    let (verifier, expected) =
-        select_verifier(routes, credential, |(verifier, _)| verifier.method_name())?;
+    let selected = select_verifier(routes, credential, |(verifier, _)| verifier.method_name())?;
+    // Several routes may share a method name, for example two Tempo handlers
+    // with different currencies or recipients. Prefer the one whose expected
+    // request the credential's challenge was issued for, so that it is not
+    // checked against a sibling's expectation.
+    let issued = credential.challenge.request.decode::<ChargeRequest>().ok();
+    let (verifier, expected) = issued
+        .as_ref()
+        .and_then(|issued| {
+            routes.iter().find(|(verifier, expected)| {
+                verifier.method_name() == credential.challenge.method.as_str()
+                    && issued_for(expected, issued)
+            })
+        })
+        .unwrap_or(selected);
     verifier
         .verify_credential_with_expected_request(credential, expected)
         .await
+}
+
+/// Whether a challenge issued with `issued` charges what `expected` describes.
+fn issued_for(expected: &ChargeRequest, issued: &ChargeRequest) -> bool {
+    expected.amount == issued.amount
+        && expected.currency.eq_ignore_ascii_case(&issued.currency)
+        && match (&expected.recipient, &issued.recipient) {
+            (Some(expected), Some(issued)) => expected.eq_ignore_ascii_case(issued),
+            (None, None) => true,
+            _ => false,
+        }
 }
 
 /// Pick the entry whose method matches the charge credential, else the first.
@@ -452,6 +476,37 @@ mod tests {
 
         let result = compose_verify_with_expected_requests(
             &[(&mpp_a, &beta_expected), (&mpp_b, &alpha_expected)],
+            &cred,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_selects_route_by_issued_request() {
+        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let other_currency = ChargeRequest {
+            amount: "1000".into(),
+            currency: "EUR".into(),
+            ..Default::default()
+        };
+        let issued = expected("1000");
+        // Issued by the second handler, which charges USD.
+        let cred = test_credential("alpha", "secret");
+
+        let receipt = compose_verify_with_expected_requests(
+            &[(&mpp_a, &other_currency), (&mpp_b, &issued)],
+            &cred,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.method.as_str(), "alpha");
+
+        // Without a route for the issued request, the first handler for the
+        // method still checks it and rejects it.
+        let result = compose_verify_with_expected_requests(
+            &[(&mpp_a, &other_currency), (&mpp_b, &expected("5"))],
             &cred,
         )
         .await;
