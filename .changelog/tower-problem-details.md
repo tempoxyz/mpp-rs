@@ -9,3 +9,5 @@ their status and retry challenge; internal failures return a generic 500 problem
 without exposing backend details.
 Generated 400 and 413 responses from these layers now carry
 `Cache-Control: no-store`, with or without problem details.
+Untyped `PaymentVerifier::verify` errors, including those from `from_fns`, are
+reported as a generic `verification-failed` problem without the verifier's message.

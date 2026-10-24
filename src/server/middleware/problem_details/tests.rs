@@ -271,6 +271,58 @@ async fn missing_credentials_return_payment_required_problem() {
     }
 }
 
+/// Implements only the untyped `verify` hooks, like `PaymentLayer::from_fns`.
+#[derive(Clone, Default)]
+struct UntypedVerifier(Verifier);
+
+impl PaymentVerifier for UntypedVerifier {
+    fn challenge(&self) -> Result<String, String> {
+        self.0.challenge()
+    }
+
+    fn challenge_with_body(&self, body: &[u8]) -> Result<String, String> {
+        self.0.challenge_with_body(body)
+    }
+
+    fn verify(&self, _: &str) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        Box::pin(async { Err("private database connection string".into()) })
+    }
+}
+
+#[tokio::test]
+async fn untyped_verifier_errors_are_not_exposed() {
+    for body_aware in [false, true] {
+        let request = Request::builder()
+            .uri("/paid")
+            .header(header::AUTHORIZATION, "Payment mock-credential")
+            .body(http_body_util::Full::new(Bytes::from_static(b"payload")))
+            .unwrap();
+        let body = |json: Bytes| json.to_vec();
+        let application = Application::new(StatusCode::OK);
+        let response = if body_aware {
+            PaymentBodyLayer::new(UntypedVerifier::default())
+                .with_problem_details(body)
+                .layer(application.clone())
+                .call(request)
+                .await
+                .unwrap()
+        } else {
+            PaymentLayer::new(UntypedVerifier::default())
+                .with_problem_details(body)
+                .layer(application.clone())
+                .call(request)
+                .await
+                .unwrap()
+        };
+        let actual = problem(&response);
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(response.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        assert!(actual.problem_type.ends_with("/verification-failed"));
+        assert_eq!(actual.detail, "Payment verification failed.");
+        assert_eq!(application.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[tokio::test]
 async fn challenge_failures_return_generic_500_without_challenge() {
     for body_aware in [false, true] {

@@ -92,7 +92,9 @@ pub trait PaymentVerifier: Send + Sync + 'static {
     /// payment problem gets a fresh challenge, a server-side failure a `500`
     /// without one. The default delegates to [`verify`](Self::verify) and
     /// [`verify_with_body`](Self::verify_with_body) and reports every failure
-    /// as `verification-failed`.
+    /// as `verification-failed` without the verifier's message, which may hold
+    /// backend errors. Override this method to return typed, client-safe
+    /// [`MppError`] details.
     fn verify_credential(
         &self,
         credential: &str,
@@ -102,7 +104,11 @@ pub trait PaymentVerifier: Send + Sync + 'static {
             Some(body) => self.verify_with_body(credential, body),
             None => self.verify(credential),
         };
-        Box::pin(async move { verified.await.map_err(MppError::verification_failed) })
+        Box::pin(async move {
+            verified
+                .await
+                .map_err(|_| MppError::verification_failed_default())
+        })
     }
 
     /// HTTP field containing the Payment credential.
