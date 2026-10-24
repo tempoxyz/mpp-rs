@@ -247,6 +247,22 @@ where
             .map_err(|e| VerificationError::new(format!("Failed to recover sender: {e}")))
     }
 
+    /// Look up the receipt of a transaction whose synchronous broadcast
+    /// returned an RPC error: the node may have included it before its reply
+    /// failed. Returns `None` when there is no receipt for exactly this hash,
+    /// so the caller reports the original broadcast error.
+    async fn recover_broadcast_receipt(
+        &self,
+        tx_hash: B256,
+    ) -> Option<<TempoNetwork as alloy::network::Network>::ReceiptResponse> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .ok()??;
+        (receipt.transaction_hash() == tx_hash).then_some(receipt)
+    }
+
     pub(super) async fn broadcast_transaction(
         &self,
         signed_tx: &str,
@@ -339,11 +355,38 @@ where
         // is mined/pre-confirmed and returns the full receipt, avoiding the
         // client-side polling loop of send_raw_transaction + get_receipt.
         let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
-        let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
+        let broadcast: Result<<TempoNetwork as alloy::network::Network>::ReceiptResponse, _> = self
             .provider
             .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
-            .await
-            .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
+            .await;
+        let receipt = match broadcast {
+            Ok(receipt) => receipt,
+            Err(broadcast_error) => {
+                let tx_hash = keccak256(&final_tx_bytes);
+                // Recover only when the store reserved this submission above:
+                // without a store, a receipt for these bytes may belong to an
+                // earlier, already accepted submission of the same credential.
+                let recovered = match &self.store {
+                    Some(_) => self.recover_broadcast_receipt(tx_hash).await,
+                    None => None,
+                };
+                match recovered {
+                    Some(receipt) => receipt,
+                    None => {
+                        // Release the reservation so a retry of the same bytes
+                        // can reach recovery once the transaction lands; the
+                        // replay claim below still prevents double acceptance.
+                        if let Some(store) = &self.store {
+                            let dedup_key = format!("mpp:charge:submission:{tx_hash:#x}");
+                            let _ = store.delete(&dedup_key).await;
+                        }
+                        return Err(VerificationError::network_error(format!(
+                            "Failed to broadcast: {broadcast_error}"
+                        )));
+                    }
+                }
+            }
+        };
 
         if !receipt.status() {
             return Err(VerificationError::transaction_failed(format!(
