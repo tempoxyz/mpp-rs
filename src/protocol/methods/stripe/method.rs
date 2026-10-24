@@ -177,8 +177,6 @@ impl ChargeMethod {
     fn build_analytics(credential: &PaymentCredential) -> HashMap<String, String> {
         let challenge = &credential.challenge;
         let mut meta: HashMap<String, String> = [
-            ("mpp_version", "1"),
-            ("mpp_is_mpp", "true"),
             ("mpp_intent", challenge.intent.as_str()),
             ("mpp_challenge_id", challenge.id.as_str()),
             ("mpp_server_id", challenge.realm.as_str()),
@@ -347,6 +345,33 @@ mod tests {
         assert_eq!(metadata["mpp_challenge_id"], "i".repeat(500));
         assert_eq!(metadata["mpp_intent"], "é".repeat(500));
         assert_eq!(metadata["mpp_client_id"], "s".repeat(500));
+    }
+
+    #[test]
+    fn test_build_analytics_omits_obsolete_mpp_metadata() {
+        let challenge = crate::protocol::core::ChallengeEcho {
+            id: "challenge-id".into(),
+            realm: "api.example.com".into(),
+            method: METHOD_NAME.into(),
+            intent: "charge".into(),
+            request: Default::default(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+            header: None,
+        };
+        let credential = PaymentCredential::new(
+            challenge,
+            StripeCredentialPayload {
+                spt: "spt".into(),
+                external_id: None,
+            },
+        );
+        let metadata = ChargeMethod::build_analytics(&credential);
+        assert_eq!(metadata["mpp_challenge_id"], "challenge-id");
+        assert!(!metadata.contains_key("mpp_is_mpp"));
+        assert!(!metadata.contains_key("mpp_version"));
     }
 
     #[test]
