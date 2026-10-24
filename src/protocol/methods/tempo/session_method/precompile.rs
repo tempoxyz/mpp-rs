@@ -615,15 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn unfunded_precompile_channel_reads_as_finalized() {
-        // getChannelState of a deleted (closed or withdrawn) channel is all zeros.
-        let deposit: Uint<96, 2> = Uint::ZERO;
-        assert!(deposit.is_zero());
-        let funded: Uint<96, 2> = Uint::from(1u64);
-        assert!(!funded.is_zero());
-    }
-
-    #[test]
     fn amounts_beyond_uint96_are_rejected() {
         assert!(u96(PRECOMPILE_MAX_CUMULATIVE_AMOUNT, "x").is_ok());
         assert!(u96(PRECOMPILE_MAX_CUMULATIVE_AMOUNT + 1, "x").is_err());
