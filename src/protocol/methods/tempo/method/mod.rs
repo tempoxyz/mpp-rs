@@ -173,7 +173,7 @@ where
             fee_payer_allowed_fee_tokens: None,
             relay: None,
             fee_payer_fee_token: None,
-            fee_payer_allow_key_authorization: true,
+            fee_payer_allow_key_authorization: false,
         }
     }
 
@@ -218,6 +218,11 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn fee_payer_allow_key_authorization(&self) -> bool {
+        self.fee_payer_allow_key_authorization
+    }
+
+    #[cfg(test)]
     pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
         self.fee_payer_allowed_fee_tokens.as_deref()
     }
@@ -234,9 +239,9 @@ where
 
     /// Set whether a sponsored transaction may install an access key.
     ///
-    /// Allowed by default, matching mppx. A key authorization adds intrinsic
-    /// gas the fee payer pays for; pass `false` to reject sponsored
-    /// transactions that carry one.
+    /// Rejected by default, matching mppx. A key authorization adds intrinsic
+    /// gas the fee payer pays for; pass `true` to sponsor transactions that
+    /// install an access key.
     pub fn with_fee_payer_allow_key_authorization(mut self, allow: bool) -> Self {
         self.fee_payer_allow_key_authorization = allow;
         self

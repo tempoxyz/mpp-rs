@@ -141,6 +141,25 @@ fn test_fee_payer_custom_currency_can_override_allowed_fee_tokens() {
 
 #[cfg(feature = "tempo")]
 #[test]
+fn test_mpp_create_forwards_fee_payer_allow_key_authorization() {
+    let builder = || {
+        tempo(TempoConfig {
+            recipient: TEST_RECIPIENT,
+        })
+        .fee_payer(true)
+        .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+        .secret_key(TEST_SECRET)
+    };
+
+    let default = Mpp::create(builder()).unwrap();
+    assert!(!default.method.fee_payer_allow_key_authorization());
+
+    let allowed = Mpp::create(builder().fee_payer_allow_key_authorization(true)).unwrap();
+    assert!(allowed.method.fee_payer_allow_key_authorization());
+}
+
+#[cfg(feature = "tempo")]
+#[test]
 fn test_mpp_create_rejects_fee_payer_without_sponsor() {
     let builder = || {
         tempo(TempoConfig {
