@@ -317,6 +317,20 @@ where
             self.simulate_before_broadcast(&final_tx_bytes).await?;
         }
 
+        // Simulation took a round trip since co-signing: make sure the
+        // sponsored transaction still has time to land before paying for it.
+        if charge.fee_payer() {
+            let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+                .map_err(|e| {
+                VerificationError::new(format!("Failed to decode transaction: {e}"))
+            })?;
+            let valid_before = signed.tx().valid_before.map_or(0, |vb| vb.get());
+            super::fee_payer::ensure_remaining_validity(
+                valid_before,
+                super::fee_payer::unix_now()?,
+            )?;
+        }
+
         // Pre-broadcast dedup of the final tx bytes. Separate namespace from
         // the post-broadcast hash dedup in verify_hash.
         if let Some(store) = &self.store {
