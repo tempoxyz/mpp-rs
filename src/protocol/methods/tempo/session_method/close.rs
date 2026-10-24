@@ -350,7 +350,8 @@ where
             )
         })?;
 
-        self.store
+        let marked = self
+            .store
             .update_channel(
                 channel_id_str,
                 Box::new(move |current| {
@@ -360,6 +361,12 @@ where
                 }),
             )
             .await?;
+        // Requests served between the snapshot above and the closing mark raised spent;
+        // capture what the marked state records so they are not refunded to the payer.
+        let capture = match (&precompile_descriptor, &marked) {
+            (Some(_), Some(state)) => state.spent.max(on_chain.settled).max(capture),
+            _ => capture,
+        };
 
         // Once submission starts, transport errors do not prove the transaction
         // failed. Keep metering blocked until the chain outcome is known.

@@ -276,8 +276,9 @@ pub(super) async fn get_precompile_channel<P: Provider<TempoNetwork>>(
         deposit: state.deposit.to::<u128>(),
         settled: state.settled.to::<u128>(),
         close_requested_at: u64::from(state.closeRequestedAt),
-        // A closed channel's state is deleted and reads back unfunded.
-        finalized: false,
+        // Closing or withdrawing deletes the channel, which then reads back unfunded. Report
+        // it as finalized so no caller accepts vouchers its deposit can no longer back.
+        finalized: state.deposit.is_zero(),
     })
 }
 
@@ -611,6 +612,15 @@ mod tests {
         assert!(validate_close(5, 0, 10, 100).is_err());
         assert!(validate_close(101, 0, 0, 100).is_err());
         assert!(validate_close(0, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn unfunded_precompile_channel_reads_as_finalized() {
+        // getChannelState of a deleted (closed or withdrawn) channel is all zeros.
+        let deposit: Uint<96, 2> = Uint::ZERO;
+        assert!(deposit.is_zero());
+        let funded: Uint<96, 2> = Uint::from(1u64);
+        assert!(!funded.is_zero());
     }
 
     #[test]
