@@ -1001,6 +1001,7 @@ async fn assert_sponsored_ousd_charge_succeeds(
             chain_id,
             challenge_id,
             realm,
+            None,
         )
         .await
         .expect("sponsored OUSD charge must succeed");

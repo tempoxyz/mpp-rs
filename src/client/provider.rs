@@ -493,19 +493,33 @@ impl PaymentProvider for MultiProvider {
         &self,
         challenges: &[&'a PaymentChallenge],
     ) -> Option<&'a PaymentChallenge> {
-        let first = challenges.first()?;
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.dyn_supports(first.method.as_str(), first.intent.as_str()))?;
-        let candidates = challenges
-            .iter()
-            .copied()
-            .filter(|challenge| {
+        // Ask each provider in the rank order of its best challenge, so a
+        // provider that rejects all of its offers (for example a Tempo policy
+        // skip) falls through to the next supported method.
+        let owner = |challenge: &PaymentChallenge| {
+            self.providers.iter().position(|provider| {
                 provider.dyn_supports(challenge.method.as_str(), challenge.intent.as_str())
             })
-            .collect::<Vec<_>>();
-        provider.dyn_select_challenge(&candidates)
+        };
+        let mut tried = Vec::new();
+        for challenge in challenges {
+            let Some(index) = owner(challenge) else {
+                continue;
+            };
+            if tried.contains(&index) {
+                continue;
+            }
+            tried.push(index);
+            let candidates = challenges
+                .iter()
+                .copied()
+                .filter(|candidate| owner(candidate) == Some(index))
+                .collect::<Vec<_>>();
+            if let Some(selected) = self.providers[index].dyn_select_challenge(&candidates) {
+                return Some(selected);
+            }
+        }
+        None
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -1169,6 +1183,57 @@ mod tests {
         assert!(multi.has_support("stripe", "charge"));
         assert!(!multi.has_support("bitcoin", "charge"));
         assert!(!multi.has_support("tempo", "authorize"));
+    }
+
+    #[derive(Clone)]
+    struct RejectingProvider;
+
+    impl PaymentProvider for RejectingProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && intent == "charge"
+        }
+
+        fn select_challenge<'a>(
+            &self,
+            _challenges: &[&'a PaymentChallenge],
+        ) -> Option<&'a PaymentChallenge> {
+            None
+        }
+
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            Err(MppError::UnsupportedPaymentMethod(
+                challenge.method.to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_multi_provider_select_falls_through_rejecting_provider() {
+        use crate::protocol::core::Base64UrlJson;
+
+        let challenge = |id: &str, method: &str| {
+            PaymentChallenge::new(
+                id,
+                "api.example.com",
+                method,
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({"amount": "1"})).unwrap(),
+            )
+        };
+        let tempo = challenge("tempo", "tempo");
+        let stripe = challenge("stripe", "stripe");
+        let multi = MultiProvider::new()
+            .with(RejectingProvider)
+            .with(MockProvider {
+                method: "stripe",
+                intent: "charge",
+            });
+
+        assert_eq!(
+            multi.select_challenge(&[&tempo, &stripe]).map(|c| &c.id),
+            Some(&stripe.id)
+        );
+        assert!(multi.select_challenge(&[&tempo]).is_none());
     }
 
     #[test]

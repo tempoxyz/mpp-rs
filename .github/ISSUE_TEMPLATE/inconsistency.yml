@@ -1,0 +1,38 @@
+name: Inconsistency
+description: Report behavior that differs from another MPP SDK or from the specification.
+labels: ['inconsistency']
+body:
+  - type: dropdown
+    attributes:
+      label: Compared with
+      description: Which reference does mpp-rs differ from?
+      multiple: true
+      options:
+        - The MPP specification
+        - mppx (TypeScript)
+        - pympp (Python)
+        - mpp-go (Go)
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Behavior in mpp-rs
+      description: What mpp-rs does. Include code, requests, or responses where relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Reference behavior
+      description: What the reference does instead. Link the section of the specification or the code in the other SDK.
+    validations:
+      required: true
+
+  - type: input
+    attributes:
+      label: Versions
+      description: The versions you compared.
+      placeholder: mpp-rs x.y.z, mppx x.y.z
+    validations:
+      required: true

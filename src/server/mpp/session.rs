@@ -280,6 +280,7 @@ where
                 method: credential.challenge.method.as_str().to_string(),
                 intent: credential.challenge.intent.as_str().to_string(),
                 management_response: has_management_response,
+                payer: None,
             })
             .await;
 

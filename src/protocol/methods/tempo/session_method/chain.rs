@@ -1,5 +1,6 @@
 //! Reading channel state from the escrow contract.
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
@@ -27,6 +28,16 @@ pub(super) async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     escrow_contract: Address,
     channel_id: B256,
 ) -> Result<OnChainChannel, VerificationError> {
+    get_on_chain_channel_at(provider, escrow_contract, channel_id, BlockId::latest()).await
+}
+
+/// Read channel state from the escrow contract as of `block`.
+pub(super) async fn get_on_chain_channel_at<P: Provider<TempoNetwork>>(
+    provider: &P,
+    escrow_contract: Address,
+    channel_id: B256,
+    block: BlockId,
+) -> Result<OnChainChannel, VerificationError> {
     use alloy::sol;
 
     sol! {
@@ -46,9 +57,14 @@ pub(super) async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     }
 
     let escrow = IEscrow::new(escrow_contract, provider);
-    let result = escrow.getChannel(channel_id).call().await.map_err(|e| {
-        VerificationError::network_error(format!("Failed to read on-chain channel: {}", e))
-    })?;
+    let result = escrow
+        .getChannel(channel_id)
+        .block(block)
+        .call()
+        .await
+        .map_err(|e| {
+            VerificationError::network_error(format!("Failed to read on-chain channel: {}", e))
+        })?;
 
     Ok(OnChainChannel {
         payer: result.payer,

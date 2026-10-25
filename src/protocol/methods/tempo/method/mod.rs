@@ -339,16 +339,19 @@ where
         ensure_submission_mode_allowed(request, &payload)?;
 
         let mut transaction_sender = None;
+        let payer;
         let details = if payload.is_hash() {
-            self.verify_hash(
-                payload.tx_hash().unwrap(),
-                request,
-                credential.source.as_deref(),
-                expected_chain_id,
-                &credential.challenge,
-                false,
-            )
-            .await?;
+            let (_, hash_payer) = self
+                .verify_hash(
+                    payload.tx_hash().unwrap(),
+                    request,
+                    credential.source.as_deref(),
+                    expected_chain_id,
+                    &credential.challenge,
+                    false,
+                )
+                .await?;
+            payer = hash_payer;
             serde_json::json!({ "mode": "push" })
         } else if payload.is_proof() {
             if !is_zero_amount {
@@ -372,11 +375,12 @@ where
                     })?
                     .is_some()
                 {
-                    return Err(VerificationError::new(
+                    return Err(VerificationError::credential_replayed(
                         "Proof credential has already been used.",
                     ));
                 }
             }
+            payer = Some(sender);
             serde_json::json!({ "mode": "proof", "sender": format!("{sender:#x}") })
         } else {
             let serialized_transaction = payload.signed_tx().unwrap();
@@ -393,6 +397,7 @@ where
                 expected_chain_id,
             )?;
             transaction_sender = Some(sender);
+            payer = Some(sender);
             serde_json::json!({
                 "mode": "pull",
                 "sender": format!("{sender:#x}"),
@@ -401,6 +406,7 @@ where
         };
 
         let mut validation = ChargeValidation::new(credential, request, details);
+        validation.payer = payer.map(|payer| format!("{payer:#x}"));
         // Without a claimed source, the transaction sender is the payer.
         if validation.source.is_none() {
             validation.source =
@@ -575,6 +581,7 @@ where
                     true,
                 )
                 .await
+                .map(|(receipt, _)| receipt)
             } else if charge_payload.is_proof() {
                 if !is_zero_amount {
                     return Err(VerificationError::new(
@@ -586,6 +593,7 @@ where
                 this.validate_proof_credential(&credential, sig_hex, expected_chain_id)
                     .await?;
                 this.reserve_proof_credential(&credential).await?;
+                ensure_challenge_not_expired(credential.challenge.expires.as_deref())?;
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
             } else {
@@ -601,12 +609,33 @@ where
                         expected_chain_id,
                         &credential.challenge.id,
                         &credential.challenge.realm,
+                        credential.challenge.expires.as_deref(),
                     )
                     .await?;
                 Ok(Receipt::success(METHOD_NAME, format!("{:#x}", tx_hash)))
             }
         }
     }
+}
+
+/// Reject a challenge whose `expires` is at or before now, right before an
+/// irreversible step (a broadcast or accepting a proof). Server-level
+/// verification already requires `expires`; an absent one is left to it.
+fn ensure_challenge_not_expired(expires: Option<&str>) -> Result<(), VerificationError> {
+    let Some(expires) = expires else {
+        return Ok(());
+    };
+    let expires_at =
+        time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| {
+                VerificationError::invalid_challenge("Invalid expires timestamp in challenge")
+            })?;
+    if expires_at <= time::OffsetDateTime::now_utc() {
+        return Err(VerificationError::expired(format!(
+            "Challenge expired at {expires}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
