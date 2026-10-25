@@ -42,6 +42,12 @@ pub(super) struct Tokenizer<'a> {
     pos: usize,
     /// Where the token returned last starts.
     start: usize,
+    /// `(from, stop)`: the first `=` or whitespace at or after `from`, so a
+    /// long run of comma-separated words is scanned once, not once per word.
+    name_end: Option<(usize, usize)>,
+    /// The first non-whitespace byte at or after `name_end`, cached for the
+    /// same reason.
+    name_equals: Option<(usize, usize)>,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -50,6 +56,8 @@ impl<'a> Tokenizer<'a> {
             input,
             pos: 0,
             start: 0,
+            name_end: None,
+            name_equals: None,
         }
     }
 
@@ -159,10 +167,27 @@ impl<'a> Iterator for Tokenizer<'a> {
 
         self.start = self.pos;
         let is_separator = |at| matches!(bytes.get(at), Some(b' ' | b'\t'));
-        let end = self.seek(self.start, |byte| {
-            byte == b'=' || byte.is_ascii_whitespace()
-        });
-        let equals = self.seek(end, |byte| !byte.is_ascii_whitespace());
+        // A stop found from an earlier start is still the first one from any
+        // start between the two: reuse it to keep the scan linear in the
+        // length of the value.
+        let end = match self.name_end {
+            Some((from, end)) if (from..=end).contains(&self.start) => end,
+            _ => {
+                let end = self.seek(self.start, |byte| {
+                    byte == b'=' || byte.is_ascii_whitespace()
+                });
+                self.name_end = Some((self.start, end));
+                end
+            }
+        };
+        let equals = match self.name_equals {
+            Some((cached_end, equals)) if cached_end == end => equals,
+            _ => {
+                let equals = self.seek(end, |byte| !byte.is_ascii_whitespace());
+                self.name_equals = Some((end, equals));
+                equals
+            }
+        };
 
         if bytes.get(equals) == Some(&b'=') && !(first && is_separator(end)) {
             let name = &self.input[self.start..end];
@@ -171,7 +196,10 @@ impl<'a> Iterator for Tokenizer<'a> {
         }
 
         // Not an auth-param, so the word ends at a comma too.
-        let end = self.seek(self.start, |byte| byte == b',').min(end);
+        let end = bytes[self.start..end]
+            .iter()
+            .position(|byte| *byte == b',')
+            .map_or(end, |offset| self.start + offset);
         let word = &self.input[self.start..end];
         self.pos = end;
         Some(Ok(if element_start && is_separator(end) {

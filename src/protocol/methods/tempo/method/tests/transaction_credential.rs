@@ -483,10 +483,13 @@ async fn test_failed_broadcast_releases_submission_claim() {
     );
     let request = challenge_bound_request(currency, recipient, amount);
 
-    // Both broadcasts fail before the transaction lands.
+    // Both broadcasts fail before the transaction lands: the receipt lookup
+    // that follows each failed broadcast finds nothing.
     let asserter = Asserter::new();
-    asserter.push_failure_msg("node unavailable");
-    asserter.push_failure_msg("node unavailable");
+    for _ in 0..2 {
+        asserter.push_failure_msg("node unavailable");
+        asserter.push_success(&serde_json::Value::Null);
+    }
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(asserter.clone());
@@ -516,4 +519,171 @@ async fn test_failed_broadcast_releases_submission_claim() {
         assert!(store.get(&submission_key).await.unwrap().is_none());
     }
     assert!(asserter.read_q().is_empty(), "both attempts broadcast");
+}
+
+// ==================== Broadcast receipt recovery ====================
+
+#[derive(Clone, Copy, PartialEq)]
+enum RecoveryLookup {
+    Included,
+    Reverted,
+    Missing,
+    WrongHash,
+    LookupError,
+}
+
+/// Broadcast a challenge-bound transfer whose eth_sendRawTransactionSync call
+/// fails, with the receipt lookup that follows answering per `lookup`.
+async fn broadcast_with_failed_sync_reply(
+    lookup: RecoveryLookup,
+) -> (B256, Result<B256, VerificationError>) {
+    let store = Arc::new(crate::store::MemoryStore::new());
+    broadcast_with_failed_sync_reply_and_store(lookup, Some(store)).await
+}
+
+async fn broadcast_with_failed_sync_reply_and_store(
+    lookup: RecoveryLookup,
+    store: Option<Arc<crate::store::MemoryStore>>,
+) -> (B256, Result<B256, VerificationError>) {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let memo = attribution::encode("challenge-123", "api.example.com", None);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = ChargeRequest {
+        amount: amount.to_string(),
+        currency: format!("{currency:#x}"),
+        recipient: Some(format!("{recipient:#x}")),
+        method_details: Some(serde_json::json!({ "chainId": CHAIN_ID })),
+        ..Default::default()
+    };
+
+    let receipt_hash = if lookup == RecoveryLookup::WrongHash {
+        B256::repeat_byte(0x12)
+    } else {
+        tx_hash
+    };
+    let mut log = make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
+    log["blockHash"] = serde_json::json!(B256::repeat_byte(0xdd));
+    log["blockNumber"] = serde_json::json!("0x1");
+    log["transactionHash"] = serde_json::json!(receipt_hash);
+    log["transactionIndex"] = serde_json::json!("0x0");
+    log["logIndex"] = serde_json::json!("0x0");
+    log["removed"] = serde_json::json!(false);
+
+    let asserter = Asserter::new();
+    asserter.push_failure_msg("Broadcast reply unavailable");
+    match lookup {
+        RecoveryLookup::Missing => asserter.push_success(&serde_json::Value::Null),
+        RecoveryLookup::LookupError => asserter.push_failure_msg("Lookup unavailable"),
+        _ => asserter.push_success(&serde_json::json!({
+            "transactionHash": receipt_hash,
+            "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0xdd),
+            "blockNumber": "0x1",
+            "from": sender,
+            "to": currency,
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "contractAddress": null,
+            "logs": [log],
+            "logsBloom": alloy::primitives::Bloom::ZERO,
+            "status": if lookup == RecoveryLookup::Reverted { "0x0" } else { "0x1" },
+            "type": "0x76",
+            "feePayer": sender,
+        })),
+    }
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+    let mut method = ChargeMethod::new(provider);
+    if let Some(store) = store {
+        method = method.with_store(store);
+    }
+
+    let result = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await;
+    (tx_hash, result)
+}
+
+/// A node can include a transaction and still fail the synchronous reply; the
+/// receipt for the broadcast hash then proves the payment.
+#[tokio::test]
+async fn test_broadcast_recovers_included_transaction_after_rpc_error() {
+    let (tx_hash, result) = broadcast_with_failed_sync_reply(RecoveryLookup::Included).await;
+    assert_eq!(result.expect("included charge must be recovered"), tx_hash);
+}
+
+#[tokio::test]
+async fn test_broadcast_recovery_rejects_reverted_receipt() {
+    let (_, result) = broadcast_with_failed_sync_reply(RecoveryLookup::Reverted).await;
+    let error = result.expect_err("reverted charge must fail");
+    assert!(error.to_string().contains("reverted"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_broadcast_recovery_reports_broadcast_error_without_matching_receipt() {
+    for lookup in [
+        RecoveryLookup::Missing,
+        RecoveryLookup::WrongHash,
+        RecoveryLookup::LookupError,
+    ] {
+        let (_, result) = broadcast_with_failed_sync_reply(lookup).await;
+        let error = result.expect_err("unconfirmed charge must fail");
+        assert!(
+            error.to_string().contains("Broadcast reply unavailable"),
+            "got: {error}"
+        );
+    }
+}
+
+/// Without a store nothing reserved the submission, so a receipt for the same
+/// bytes may come from an earlier accepted credential: it must not be reused.
+#[tokio::test]
+async fn test_broadcast_without_store_does_not_recover_receipt() {
+    let (_, result) =
+        broadcast_with_failed_sync_reply_and_store(RecoveryLookup::Included, None).await;
+    let error = result.expect_err("replayed charge must not be recovered without a store");
+    assert!(
+        error.to_string().contains("Broadcast reply unavailable"),
+        "got: {error}"
+    );
+}
+
+/// An unrecovered broadcast releases its submission reservation, so a retry of
+/// the same bytes can reach recovery once the transaction lands.
+#[tokio::test]
+async fn test_broadcast_releases_submission_reservation_when_unrecovered() {
+    use crate::store::Store;
+
+    let store = Arc::new(crate::store::MemoryStore::new());
+    let (tx_hash, result) =
+        broadcast_with_failed_sync_reply_and_store(RecoveryLookup::Missing, Some(store.clone()))
+            .await;
+    assert!(result.is_err());
+    let reservation = store
+        .get(&format!("mpp:charge:submission:{tx_hash:#x}"))
+        .await
+        .unwrap();
+    assert!(
+        reservation.is_none(),
+        "reservation was kept: {reservation:?}"
+    );
 }

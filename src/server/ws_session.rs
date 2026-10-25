@@ -45,6 +45,14 @@ use crate::protocol::methods::tempo::session_method::{normalize_channel_id, Chan
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod, VerificationError};
 
+/// Largest inbound WebSocket frame, in bytes, that [`process_vouchers`]
+/// accepts. A larger frame gets an `error` frame and ends processing.
+///
+/// Payment frames are small; bound the transport as well, e.g. with axum's
+/// `WebSocketUpgrade::max_message_size`, so oversized frames are not
+/// buffered in the first place.
+pub const MAX_INCOMING_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// Options for [`ws_session`].
 pub struct WsSessionOptions<G> {
     /// Channel store for balance tracking.
@@ -169,6 +177,11 @@ where
         + Unpin,
 {
     while let Some(Ok(text)) = receiver.next().await {
+        // Skip oversized frames unparsed, but keep reading: callers of this
+        // deprecated function expect it to return only once the connection ends.
+        if text.len() > MAX_INCOMING_MESSAGE_BYTES {
+            continue;
+        }
         let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
             continue;
         };
@@ -193,7 +206,9 @@ where
 /// - rejected or malformed: an `error` frame is sent and processing stops,
 ///   since clients treat `error` as terminal
 ///
-/// Frames that are not credentials are ignored.
+/// Frames that are not credentials are ignored. A frame larger than
+/// [`MAX_INCOMING_MESSAGE_BYTES`] is answered with an `error` frame and
+/// ends processing before it is parsed.
 ///
 /// Returns `Ok(())` once the connection ends and the verification error
 /// after a credential was refused. Either way the session is over, while
@@ -213,6 +228,17 @@ where
     W: futures_util::Sink<String> + Unpin,
 {
     while let Some(Ok(text)) = receiver.next().await {
+        if text.len() > MAX_INCOMING_MESSAGE_BYTES {
+            let error = VerificationError::with_code(
+                "payment message is too large",
+                ErrorCode::InvalidPayload,
+            );
+            let msg = WsResponse::Error {
+                error: error.message.clone(),
+            };
+            let _ = sender.send(msg.to_text()).await;
+            return Err(error);
+        }
         let Ok(WsMessage::Credential { credential }) = serde_json::from_str(&text) else {
             continue;
         };
@@ -802,6 +828,11 @@ mod tests {
         let data = serde_json::json!({"type": "message", "data": "hi"}).to_string();
         let malformed =
             serde_json::json!({"type": "credential", "credential": "Payment !"}).to_string();
+        let oversized = serde_json::json!({
+            "type": "message",
+            "data": "x".repeat(MAX_INCOMING_MESSAGE_BYTES),
+        })
+        .to_string();
 
         // (incoming frames, receipts sent, error sent, error code returned)
         let cases = [
@@ -832,6 +863,12 @@ mod tests {
                 Some("malformed credential"),
                 Some(ErrorCode::InvalidCredential),
             ),
+            (
+                vec![voucher("200", "0xok"), oversized, voucher("300", "0xok")],
+                vec!["accepted-200"],
+                Some("payment message is too large"),
+                Some(ErrorCode::InvalidPayload),
+            ),
         ];
 
         for (incoming, receipts, error, code) in cases {
@@ -861,6 +898,71 @@ mod tests {
             }
             assert_eq!(frames.len(), expected, "unexpected frames: {frames:?}");
         }
+    }
+
+    /// Session method that counts the vouchers it is asked to verify.
+    #[derive(Clone, Default)]
+    struct CountingSession(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SessionMethod for CountingSession {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+
+        async fn verify_session(
+            &self,
+            _credential: &PaymentCredential,
+            _request: &SessionRequest,
+        ) -> Result<Receipt, VerificationError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Receipt::success("tempo", "counted"))
+        }
+    }
+
+    /// The deprecated processor skips an oversized frame without parsing it
+    /// and keeps verifying later vouchers until the connection ends.
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_process_incoming_vouchers_skips_oversized_frames() {
+        let session = CountingSession::default();
+        let verified = session.0.clone();
+        let mpp =
+            crate::server::Mpp::new(MockCharge, "ws.test", "secret").with_session_method(session);
+        let challenge = mpp
+            .session_challenge(
+                "100",
+                "0x20c0000000000000000000000000000000000000",
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            )
+            .unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": "0xabc",
+                "cumulativeAmount": "200",
+                "signature": "0xok",
+            }),
+        );
+        let voucher = serde_json::json!({
+            "type": "credential",
+            "credential": format_authorization(&credential).unwrap(),
+        })
+        .to_string();
+        let oversized = serde_json::json!({
+            "type": "credential",
+            "credential": "x".repeat(MAX_INCOMING_MESSAGE_BYTES),
+        })
+        .to_string();
+
+        let mut receiver = futures_util::stream::iter(
+            [voucher.clone(), oversized, voucher]
+                .into_iter()
+                .map(Ok::<_, Box<dyn std::error::Error + Send + Sync>>),
+        );
+        process_incoming_vouchers(&mut receiver, &mpp).await;
+
+        assert_eq!(verified.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -193,6 +193,63 @@ pub const DEFAULT_CURRENCY: &str = USDC;
 /// Default challenge expiration in minutes.
 pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;
 
+/// Least time, in seconds, a fee-sponsored (`feePayer: true`) charge must
+/// remain valid, on both sides of the exchange:
+///
+/// - the server co-signs and broadcasts a sponsored transaction only while its
+///   `valid_before` is at least this far away;
+/// - the server refuses to issue a sponsored charge challenge whose `expires`
+///   is less than this far after issuance;
+/// - the client refuses to sign a sponsored challenge that expires in less
+///   than this.
+///
+/// The issuance check only rejects lifetimes no client could use. Delivering
+/// and signing the challenge take time out of the same window, so a sponsored
+/// challenge issued with close to this lifetime is refused by the client or
+/// the co-signer: give sponsored charges more headroom, such as the default
+/// expiry.
+pub const FEE_PAYER_MIN_REMAINING_VALIDITY_SECS: u64 = 15;
+
+/// Reject issuing a fee-sponsored charge challenge that expires less than
+/// [`FEE_PAYER_MIN_REMAINING_VALIDITY_SECS`] after `now`: no client could pay
+/// it before the sponsor's remaining-validity floor rejects the transaction.
+fn ensure_sponsored_expiry_floor(
+    request: &crate::protocol::intents::ChargeRequest,
+    expires: &str,
+    now: time::OffsetDateTime,
+) -> crate::error::Result<()> {
+    let sponsored = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("feePayer"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // Zero-amount charges are paid with a proof credential: nothing is
+    // co-signed or broadcast, so the floor does not apply.
+    let zero_amount = request.amount_u256().is_ok_and(|amount| amount.is_zero());
+    if !sponsored || zero_amount {
+        return Ok(());
+    }
+    let expires_at =
+        time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+            .map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!(
+                    "invalid expires for fee-sponsored charge: {e}"
+                ))
+            })?;
+    // `expires` is usually computed just before issuance, so round to the
+    // nearest second: `expires::seconds(15)` passes, `expires::seconds(14)` not.
+    // This is a configuration check, not a payability guarantee: delivery and
+    // signing time still count against the client and co-signing floors.
+    let expires_in = (expires_at - now + time::Duration::milliseconds(500)).whole_seconds();
+    if expires_in < FEE_PAYER_MIN_REMAINING_VALIDITY_SECS as i64 {
+        return Err(crate::error::MppError::InvalidConfig(format!(
+            "fee-sponsored charge challenges must expire at least {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS} seconds after issuance (expires in {expires_in}s)"
+        )));
+    }
+    Ok(())
+}
+
 /// Payment method name for Tempo.
 pub const METHOD_NAME: &str = "tempo";
 
@@ -324,6 +381,9 @@ pub fn charge_challenge_with_options(
             Some(default_expires.as_str())
         }
     };
+    if let Some(expires) = expires {
+        ensure_sponsored_expiry_floor(&request, expires, OffsetDateTime::now_utc())?;
+    }
 
     let id = generate_challenge_id(
         secret_key,
@@ -547,6 +607,50 @@ mod tests {
             challenge1.id, challenge2.id,
             "Different parameters should produce different challenge IDs"
         );
+    }
+
+    #[test]
+    fn test_sponsored_charge_challenge_requires_expiry_floor() {
+        use crate::protocol::intents::ChargeRequest;
+
+        let request = |method_details: serde_json::Value| ChargeRequest {
+            amount: "1000000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            method_details: Some(method_details),
+            ..Default::default()
+        };
+        let sponsored = request(serde_json::json!({ "feePayer": true }));
+        let issue = |request: &ChargeRequest, expires: Option<&str>| {
+            charge_challenge_with_options(TEST_SECRET, "api.example.com", request, expires, None)
+        };
+
+        let error = issue(&sponsored, Some(&crate::expires::seconds(14))).unwrap_err();
+        assert!(
+            matches!(error, crate::error::MppError::InvalidConfig(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("at least 15 seconds"), "{error}");
+        assert!(issue(&sponsored, Some(&crate::expires::seconds(5))).is_err());
+        assert!(issue(&sponsored, Some("2020-01-01T00:00:00Z")).is_err());
+
+        // At the floor, and the default expiry, still issue.
+        issue(&sponsored, Some(&crate::expires::seconds(15))).unwrap();
+        issue(&sponsored, None).unwrap();
+
+        // Zero-amount proof charges are never co-signed, so keep any expiry.
+        let mut zero = request(serde_json::json!({ "feePayer": true }));
+        zero.amount = "0".into();
+        issue(&zero, Some(&crate::expires::seconds(5))).unwrap();
+
+        // Unsponsored charges keep any expiry.
+        let unsponsored = request(serde_json::json!({ "feePayer": false }));
+        issue(&unsponsored, Some(&crate::expires::seconds(5))).unwrap();
+        issue(
+            &request(serde_json::json!({})),
+            Some("2020-01-01T00:00:00Z"),
+        )
+        .unwrap();
     }
 
     #[test]
