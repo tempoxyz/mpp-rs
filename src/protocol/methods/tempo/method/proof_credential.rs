@@ -86,7 +86,7 @@ where
             .await
             .map_err(|e| VerificationError::internal(format!("Failed to record proof: {e}")))?;
         if !reserved {
-            return Err(VerificationError::new(
+            return Err(VerificationError::credential_replayed(
                 "Proof credential has already been used.",
             ));
         }

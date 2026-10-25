@@ -34,6 +34,8 @@ pub mod ws;
 pub mod tempo;
 
 #[cfg(feature = "client")]
+mod charge_client;
+#[cfg(feature = "client")]
 pub mod directory;
 #[cfg(feature = "client")]
 mod fetch;
@@ -73,6 +75,9 @@ pub use fetch::PaymentExt as Fetch;
 
 #[cfg(feature = "forward-proxy")]
 pub use forward_proxy::ForwardProxy;
+
+#[cfg(feature = "client")]
+pub use charge_client::ChargeClient;
 
 #[cfg(feature = "middleware")]
 pub use middleware::PaymentMiddleware;

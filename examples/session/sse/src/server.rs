@@ -49,6 +49,7 @@ type PaymentHandler = Mpp<
 struct AppState {
     payment: PaymentHandler,
     store: Arc<SessionChannelStore>,
+    stream_check: mpp::server::StreamCheck,
 }
 
 #[derive(Deserialize)]
@@ -97,9 +98,15 @@ async fn main() {
     )
     .with_close_signer(signer);
 
+    // Stop streams whose escrow is closed or withdrawn mid-stream.
+    let stream_check = session_method.stream_check();
     let payment = base.with_session_method(session_method);
 
-    let state = Arc::new(AppState { payment, store });
+    let state = Arc::new(AppState {
+        payment,
+        store,
+        stream_check,
+    });
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -227,6 +234,7 @@ async fn chat(
         generate: token_stream,
         poll_interval_ms: 100,
         min_voucher_delta: 0,
+        before_charge: Some(state.stream_check.clone()),
     });
 
     let body_stream = async_stream::stream! {

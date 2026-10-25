@@ -72,7 +72,7 @@ pub use mpp::{Mpp, SessionVerifyResult};
 #[cfg(feature = "tempo")]
 pub use tempo::{
     deduct_from_channel, tempo, tempo_provider, SessionChannelStore, SessionMethodConfig,
-    TempoBuilder, TempoChargeExt, TempoChargeMethod, TempoConfig, TempoMethodDetails,
+    StreamCheck, TempoBuilder, TempoChargeExt, TempoChargeMethod, TempoConfig, TempoMethodDetails,
     TempoProvider, TempoRelayConfig, TempoRelayErrorCode, TempoSessionMethod, CHAIN_ID,
     METHOD_NAME,
 };
