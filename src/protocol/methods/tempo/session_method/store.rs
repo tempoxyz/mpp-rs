@@ -14,6 +14,11 @@ pub struct PendingClose {
     pub nonce: u64,
     pub cumulative_amount: u128,
     pub signature: Vec<u8>,
+    /// Unix time (seconds) after which the close transaction can no longer
+    /// land, for closes signed with an expiring nonce. `None` for evidence
+    /// written before this field existed.
+    #[serde(default)]
+    pub valid_before: Option<u64>,
 }
 
 /// State for an on-chain payment channel, including per-session accounting.

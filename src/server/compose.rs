@@ -121,6 +121,30 @@ pub trait ChargeVerifier: Send + Sync {
             "expected request verification is not implemented for this ChargeVerifier",
         ))))
     }
+
+    /// Whether this verifier issued `credential`'s challenge for a route
+    /// charging `expected`, without verifying the payment.
+    ///
+    /// [`compose_verify_with_expected_requests`] uses it to pick the route
+    /// that verifies a credential when several routes share a payment method.
+    /// The default compares the echoed request's amount, currency and
+    /// recipient with `expected`; [`Mpp`](super::Mpp) also checks its
+    /// challenge HMAC and every field its expected-request verification binds.
+    fn issued_credential_for(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+    ) -> bool {
+        credential
+            .challenge
+            .request
+            .decode::<ChargeRequest>()
+            .is_ok_and(|issued| {
+                expected.amount == issued.amount
+                    && expected.currency == issued.currency
+                    && expected.recipient == issued.recipient
+            })
+    }
 }
 
 impl<M, S> ChargeVerifier for super::Mpp<M, S>
@@ -145,6 +169,14 @@ where
         expected: &'a ChargeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Receipt, VerificationError>> + Send + 'a>> {
         Box::pin(self.broadcast_credential_with_expected_request(credential, expected))
+    }
+
+    fn issued_credential_for(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+    ) -> bool {
+        self.issued_challenge_for(credential, expected)
     }
 }
 
@@ -173,13 +205,26 @@ pub async fn compose_verify(
 /// [`Mpp::expected_charge_request()`](super::Mpp::expected_charge_request)).
 /// A credential whose challenge was issued for another amount, currency or
 /// recipient is rejected, so a payment for a cheaper route cannot be replayed
-/// here. Dispatch follows the same rules as [`compose_verify()`].
+/// here.
+///
+/// When several routes share the credential's method, the first route whose
+/// verifier issued the credential's challenge for its expected request (see
+/// [`ChargeVerifier::issued_credential_for`]) verifies it, so it is not checked
+/// against a sibling's handler. When none did, dispatch falls back to the
+/// rules of [`compose_verify()`]: the first route for the method, else the
+/// first route, which then rejects the credential.
 pub async fn compose_verify_with_expected_requests(
     routes: &[(&dyn ChargeVerifier, &ChargeRequest)],
     credential: &PaymentCredential,
 ) -> Result<Receipt, VerificationError> {
-    let (verifier, expected) =
-        select_verifier(routes, credential, |(verifier, _)| verifier.method_name())?;
+    let selected = select_verifier(routes, credential, |(verifier, _)| verifier.method_name())?;
+    let (verifier, expected) = routes
+        .iter()
+        .find(|(verifier, expected)| {
+            verifier.method_name() == credential.challenge.method.as_str()
+                && verifier.issued_credential_for(credential, expected)
+        })
+        .unwrap_or(selected);
     verifier
         .verify_credential_with_expected_request(credential, expected)
         .await
@@ -296,11 +341,22 @@ mod tests {
     }
 
     fn test_credential(method: &str, secret: &str) -> PaymentCredential {
-        let request = Base64UrlJson::from_value(&serde_json::json!({
-            "amount": "1000",
-            "currency": "USD"
-        }))
-        .unwrap();
+        credential_for_request(
+            method,
+            secret,
+            serde_json::json!({
+                "amount": "1000",
+                "currency": "USD"
+            }),
+        )
+    }
+
+    fn credential_for_request(
+        method: &str,
+        secret: &str,
+        request: serde_json::Value,
+    ) -> PaymentCredential {
+        let request = Base64UrlJson::from_value(&request).unwrap();
         let request_raw = request.raw();
         let expires = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
             .format(&time::format_description::well_known::Rfc3339)
@@ -456,6 +512,89 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_selects_route_by_issued_request() {
+        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let other_currency = ChargeRequest {
+            amount: "1000".into(),
+            currency: "EUR".into(),
+            ..Default::default()
+        };
+        let issued = expected("1000");
+        // Issued by the second handler, which charges USD.
+        let cred = test_credential("alpha", "secret");
+
+        let receipt = compose_verify_with_expected_requests(
+            &[(&mpp_a, &other_currency), (&mpp_b, &issued)],
+            &cred,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.method.as_str(), "alpha");
+
+        // Without a route for the issued request, the first handler for the
+        // method still checks it and rejects it.
+        let result = compose_verify_with_expected_requests(
+            &[(&mpp_a, &other_currency), (&mpp_b, &expected("5"))],
+            &cred,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_keeps_issuer_for_secondary_currency() {
+        // The first handler offers USD and EUR; its route's expected request
+        // names only its first currency. The second handler charges EUR with
+        // another secret.
+        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret-a")
+            .with_currencies(vec!["USD".into(), "EUR".into()]);
+        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret-b")
+            .with_currencies(vec!["EUR".into()]);
+        let usd = expected("1000");
+        let eur = ChargeRequest {
+            amount: "1000".into(),
+            currency: "EUR".into(),
+            ..Default::default()
+        };
+        // Paid in EUR on a challenge the first handler issued.
+        let cred = credential_for_request(
+            "alpha",
+            "secret-a",
+            serde_json::json!({"amount": "1000", "currency": "EUR"}),
+        );
+
+        let receipt =
+            compose_verify_with_expected_requests(&[(&mpp_a, &usd), (&mpp_b, &eur)], &cred)
+                .await
+                .unwrap();
+        assert_eq!(receipt.method.as_str(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn verify_with_expected_requests_selects_route_by_scope() {
+        // Same handler config and price; the routes differ only by scope.
+        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let scoped = |route: &str| ChargeRequest {
+            mppx_scope: Some(serde_json::json!({"route": route})),
+            ..expected("1000")
+        };
+        let (first, second) = (scoped("/a"), scoped("/b"));
+        let cred = credential_for_request(
+            "alpha",
+            "secret",
+            serde_json::json!({"amount": "1000", "currency": "USD", "_mppx_scope": {"route": "/b"}}),
+        );
+
+        let receipt =
+            compose_verify_with_expected_requests(&[(&mpp_a, &first), (&mpp_b, &second)], &cred)
+                .await
+                .unwrap();
+        assert_eq!(receipt.method.as_str(), "alpha");
     }
 
     #[tokio::test]

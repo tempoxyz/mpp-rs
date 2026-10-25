@@ -9,9 +9,11 @@ mod chain;
 mod close;
 mod open;
 mod payload;
+mod precompile;
 mod receipt;
 mod state;
 mod store;
+mod stream;
 mod top_up;
 mod voucher;
 
@@ -21,6 +23,7 @@ pub(crate) use store::normalize_channel_id;
 pub use store::{
     deduct_from_channel, ChannelState, ChannelStore, InMemoryChannelStore, PendingClose,
 };
+pub use stream::StreamCheck;
 
 use alloy::primitives::Address;
 use std::sync::Arc;
@@ -64,6 +67,8 @@ pub struct SessionMethod<P> {
     /// Signer for submitting on-chain close transactions. `close` is rejected
     /// when unset.
     close_signer: Option<Arc<super::DynSigner>>,
+    /// When each streaming channel's escrow was last read successfully.
+    stream_checks: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
 }
 
 impl<P> SessionMethod<P>
@@ -80,6 +85,7 @@ where
             store,
             config,
             close_signer: None,
+            stream_checks: Arc::default(),
         }
     }
 
