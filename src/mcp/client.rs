@@ -258,11 +258,20 @@ impl<C: ToolCaller> ManagementTransport for McpManagement<'_, C> {
         Box::pin(async move {
             let mut params = self.params.lock().unwrap().clone();
             self.caller.attach_credential(&mut params, credential)?;
-            let output = self
-                .caller
-                .call_tool(params)
-                .await
-                .map_err(|_| MppError::Http("MCP payment management call failed".to_owned()))?;
+            let output = self.caller.call_tool(params).await.map_err(|error| {
+                // A definitive JSON-RPC rejection (such as -32042 or -32043)
+                // means the credential was refused, so it cannot apply later.
+                // Only an ambiguous failure leaves the outcome unknown.
+                if self.caller.is_definitive_error(&error)
+                    || self.caller.payment_challenges_from_error(&error).is_some()
+                {
+                    MppError::InvalidConfig(
+                        "the MCP server rejected the payment management credential".to_owned(),
+                    )
+                } else {
+                    MppError::Http("MCP payment management call failed".to_owned())
+                }
+            })?;
             if self
                 .caller
                 .payment_challenges_from_output(&output)
@@ -759,6 +768,25 @@ mod tests {
 
         assert!(matches!(error, McpClientError::Payment(_)));
         assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn definitive_management_rejections_are_not_transport_failures() {
+        let credential = PaymentCredential::new(challenge().to_echo(), PaymentPayload::hash("x"));
+        for (outcome, ambiguous) in [
+            (payment_error(false), false),
+            (transport_error(true), false),
+            (transport_error(false), true),
+        ] {
+            let caller = TestCaller::new([Err(outcome)]);
+            let management = McpManagement::new(&caller, params());
+            let error = management
+                .send(&challenge(), &credential)
+                .await
+                .unwrap_err();
+            // Sessions treat only MppError::Http as an unknown top-up outcome.
+            assert_eq!(matches!(error, MppError::Http(_)), ambiguous, "{error}");
+        }
     }
 
     #[derive(Clone, Default)]
