@@ -1938,7 +1938,16 @@ impl TempoSessionProvider {
                     .into(),
             ));
         };
-        let receipt = receipt?;
+        // A transport failure after the credential may have been delivered
+        // leaves the outcome unknown, as on HTTP; a definite rejection does not.
+        let receipt = receipt.inspect_err(|error| {
+            if matches!(error, MppError::Http(_)) {
+                self.uncertain_top_ups
+                    .lock()
+                    .unwrap()
+                    .insert(prepared.channel_id);
+            }
+        })?;
         self.record_top_up(url, &prepared).await?;
         Ok(receipt)
     }
@@ -4934,6 +4943,63 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("reconcile the pending payment"));
         assert!(posted.lock().unwrap().is_empty());
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
+    }
+
+    #[tokio::test]
+    async fn failed_management_top_up_blocks_another_top_up() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        struct Failing(Arc<Mutex<usize>>);
+        impl ManagementTransport for Failing {
+            fn send<'a>(
+                &'a self,
+                _challenge: &'a PaymentChallenge,
+                _credential: &'a PaymentCredential,
+            ) -> crate::client::ManagementFuture<'a> {
+                *self.0.lock().unwrap() += 1;
+                Box::pin(async { Err(MppError::Http("MCP payment management call failed".into())) })
+            }
+        }
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider().with_max_deposit(12_000);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        // One signing pass: the top-up after the failed one is never signed.
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(10_000), "0x4a817c800", "0x5208"],
+        );
+        let sends = Arc::new(Mutex::new(0));
+        let transport = Failing(sends.clone());
+
+        let error = provider
+            .top_up_with_management(
+                &transport,
+                "mcp://tool",
+                &challenge,
+                &channel_id.to_string(),
+                1_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("management call failed"));
+
+        // The server may have received the credential, so no second deposit is signed.
+        let error = provider
+            .top_up_with_management(
+                &transport,
+                "mcp://tool",
+                &challenge,
+                &channel_id.to_string(),
+                1_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reconcile the pending payment"));
+        assert_eq!(*sends.lock().unwrap(), 1);
         assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
     }
 

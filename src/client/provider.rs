@@ -29,6 +29,10 @@ pub type ManagementFuture<'a> =
 pub trait ManagementTransport: Send + Sync {
     /// Sends `credential`, which answers `challenge`, and returns the
     /// resource's receipt. Fails when the resource rejects the credential.
+    ///
+    /// Return [`MppError::Http`] when the credential may have been delivered
+    /// but no answer arrived: a session then treats a top-up's outcome as
+    /// unknown and signs no further top-ups on that channel.
     fn send<'a>(
         &'a self,
         challenge: &'a PaymentChallenge,
