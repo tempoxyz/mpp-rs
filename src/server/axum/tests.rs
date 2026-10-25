@@ -503,6 +503,9 @@ async fn test_extractor_valid_payment_returns_receipt() {
 
 #[tokio::test]
 async fn test_extractor_fails_closed_when_challenger_does_not_verify_scope() {
+    use crate::protocol::core::headers::format_authorization;
+    use crate::protocol::core::{PaymentCredential, PaymentPayload};
+
     struct LegacyChallenger;
 
     impl ChargeChallenger for LegacyChallenger {
@@ -537,11 +540,79 @@ async fn test_extractor_fails_closed_when_challenger_does_not_verify_scope() {
         }
     }
 
-    let result =
-        run_extractor::<OneCent>(LegacyChallenger, Some("Payment eyJmYWtlIjp0cnVlfQ")).await;
+    // A well-formed credential for this challenger's own (unscoped) challenge.
+    let challenge = LegacyChallenger
+        .challenge("0.01", ChallengeOptions::default())
+        .unwrap();
+    let auth = format_authorization(&PaymentCredential::new(
+        challenge.to_echo(),
+        PaymentPayload::hash("0xabc"),
+    ))
+    .unwrap();
 
-    let err = result.unwrap_err();
+    let err = run_extractor::<OneCent>(LegacyChallenger, Some(&auth))
+        .await
+        .unwrap_err();
     assert!(matches!(err, MppChargeRejection::Problem(_)));
+    assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+
+    let err = run_body_extractor::<OneCent>(LegacyChallenger, Some(&auth), "{}")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MppChargeRejection::Problem(_)));
+    assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+// Binds the framework scope into the challenge request and implements only
+// the required verifier, relying on the default scope check.
+struct ScopedChallenger;
+
+impl ChargeChallenger for ScopedChallenger {
+    fn challenge(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<PaymentChallenge, String> {
+        let mut request = serde_json::json!({"amount": amount});
+        if let Some(scope) = options.mppx_scope {
+            request["_mppx_scope"] = scope;
+        }
+        Ok(PaymentChallenge::new(
+            "mock-id",
+            "mock-realm",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&request).unwrap(),
+        ))
+    }
+
+    fn challenge_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<PaymentChallenge, String> {
+        let mut challenge = self.challenge(amount, options)?;
+        // A stand-in for the body's content digest: the body bytes in hex.
+        let hex: String = body.iter().map(|byte| format!("{byte:02x}")).collect();
+        challenge.digest = Some(format!("sha-256={hex}"));
+        Ok(challenge)
+    }
+
+    fn verify_payment(
+        &self,
+        _credential_str: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        Box::pin(std::future::ready(Ok(Receipt {
+            status: crate::protocol::core::ReceiptStatus::Success,
+            method: crate::protocol::core::MethodName::new("tempo"),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            reference: "0xscoped".into(),
+            external_id: None,
+            subscription_id: None,
+            extensions: serde_json::Map::new(),
+        })))
+    }
 }
 
 #[tokio::test]
@@ -550,46 +621,6 @@ async fn test_custom_challenger_verifies_scoped_credential_by_default() {
     use crate::protocol::core::{PaymentCredential, PaymentPayload};
     use axum::routing::get;
     use tower::ServiceExt;
-
-    // Binds the framework scope into the challenge request and implements only
-    // the required verifier, relying on the default scope check.
-    struct ScopedChallenger;
-
-    impl ChargeChallenger for ScopedChallenger {
-        fn challenge(
-            &self,
-            amount: &str,
-            options: ChallengeOptions,
-        ) -> Result<PaymentChallenge, String> {
-            let mut request = serde_json::json!({"amount": amount});
-            if let Some(scope) = options.mppx_scope {
-                request["_mppx_scope"] = scope;
-            }
-            Ok(PaymentChallenge::new(
-                "mock-id",
-                "mock-realm",
-                "tempo",
-                "charge",
-                Base64UrlJson::from_value(&request).unwrap(),
-            ))
-        }
-
-        fn verify_payment(
-            &self,
-            _credential_str: &str,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
-        {
-            Box::pin(std::future::ready(Ok(Receipt {
-                status: crate::protocol::core::ReceiptStatus::Success,
-                method: crate::protocol::core::MethodName::new("tempo"),
-                timestamp: "2025-01-01T00:00:00Z".into(),
-                reference: "0xscoped".into(),
-                external_id: None,
-                subscription_id: None,
-                extensions: serde_json::Map::new(),
-            })))
-        }
-    }
 
     async fn paid(_charge: MppCharge<OneCent>) -> &'static str {
         "paid"
@@ -632,6 +663,109 @@ async fn test_custom_challenger_verifies_scoped_credential_by_default() {
 
     let response = app.oneshot(get_with("/other", Some(&auth))).await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+/// Pays the challenge in a 402 response by echoing it in a credential.
+fn credential_for(response: &axum::response::Response) -> String {
+    use crate::protocol::core::headers::{format_authorization, parse_www_authenticate};
+    use crate::protocol::core::{PaymentCredential, PaymentPayload};
+
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let challenge = parse_www_authenticate(
+        response.headers()[WWW_AUTHENTICATE_HEADER]
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    format_authorization(&PaymentCredential::new(
+        challenge.to_echo(),
+        PaymentPayload::hash("0xabc"),
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_custom_challenger_default_rejects_credential_for_other_amount() {
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    struct OneDollarItem;
+    impl ChargeConfig for OneDollarItem {
+        fn amount() -> &'static str {
+            "1.00"
+        }
+    }
+
+    async fn cheap(_charge: MppCharge<OneCent>) -> &'static str {
+        "cheap"
+    }
+    async fn expensive(_charge: MppCharge<OneDollarItem>) -> &'static str {
+        "expensive"
+    }
+
+    // Same path and query, so the same framework scope, but different prices.
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/item", get(cheap).post(expensive))
+        .with_state(state);
+    let request = |method: &str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder().method(method).uri("/item");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    };
+
+    let response = app.clone().oneshot(request("GET", None)).await.unwrap();
+    let cheap_auth = credential_for(&response);
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", Some(&cheap_auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(request("POST", Some(&cheap_auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn test_custom_challenger_default_rejects_credential_for_other_body() {
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    async fn paid(_charge: MppChargeWithBody<OneCent>) -> &'static str {
+        "paid"
+    }
+
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/upload", post(paid))
+        .with_state(state);
+    let request = |body: &'static str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder().method("POST").uri("/upload");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::from(body)).unwrap()
+    };
+
+    let response = app.clone().oneshot(request("a", None)).await.unwrap();
+    let auth = credential_for(&response);
+
+    let response = app
+        .clone()
+        .oneshot(request("b", Some(&auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let response = app.oneshot(request("a", Some(&auth))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
