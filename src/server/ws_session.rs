@@ -30,6 +30,7 @@
 //!     generate: my_stream,
 //!     poll_interval_ms: 100,
 //!     min_voucher_delta: 0,
+//!     before_charge: Some(session_method.stream_check()),
 //! }).await;
 //! ```
 
@@ -72,6 +73,11 @@ pub struct WsSessionOptions<G> {
     /// top of the accepted amount, so the requested voucher is not rejected
     /// as too small. Use `0` if no minimum is enforced.
     pub min_voucher_delta: u128,
+    /// Check run before each value is charged and delivered, such as
+    /// [`SessionMethod::stream_check`](crate::protocol::methods::tempo::session_method::SessionMethod::stream_check)
+    /// for the channel's live escrow. When it fails the session ends with the
+    /// final receipt.
+    pub before_charge: Option<crate::protocol::methods::tempo::session_method::StreamCheck>,
 }
 
 /// Run a metered session over a split WebSocket connection.
@@ -94,6 +100,7 @@ where
         generate,
         poll_interval_ms,
         min_voucher_delta,
+        before_charge,
     } = options;
     let channel_id = normalize_channel_id(&channel_id);
 
@@ -105,6 +112,7 @@ where
         generate,
         poll_interval_ms,
         min_voucher_delta,
+        before_charge,
     }
     .events();
     let mut events = std::pin::pin!(events);
@@ -374,6 +382,7 @@ mod tests {
                     generate: futures_util::stream::iter(["a", "b", "c"].map(String::from)),
                     poll_interval_ms: 10,
                     min_voucher_delta: 0,
+                    before_charge: None,
                 },
             )
             .await;
@@ -462,6 +471,7 @@ mod tests {
                     generate: futures_util::stream::iter(["a".to_string()]),
                     poll_interval_ms: 10,
                     min_voucher_delta,
+                    before_charge: None,
                 },
             );
             let frame = tokio::select! {
@@ -509,6 +519,7 @@ mod tests {
                     generate,
                     poll_interval_ms: 10,
                     min_voucher_delta: 0,
+                    before_charge: None,
                 },
             )
             .await;
@@ -584,6 +595,7 @@ mod tests {
                 generate: Box::pin(async_stream::stream! { yield "a".to_string(); }),
                 poll_interval_ms: 10,
                 min_voucher_delta: 0,
+                before_charge: None,
             },
         )
         .await;
@@ -614,6 +626,7 @@ mod tests {
                     generate,
                     poll_interval_ms: 10,
                     min_voucher_delta: 0,
+                    before_charge: None,
                 },
             ),
         )
@@ -638,6 +651,10 @@ mod tests {
             },
             ChannelState {
                 closing: true,
+                ..open.clone()
+            },
+            ChannelState {
+                close_requested_at: 1,
                 ..open
             },
         ] {
@@ -656,6 +673,7 @@ mod tests {
                     generate,
                     poll_interval_ms: 10,
                     min_voucher_delta: 0,
+                    before_charge: None,
                 },
             )
             .await;
@@ -697,6 +715,7 @@ mod tests {
                     generate,
                     poll_interval_ms: 10,
                     min_voucher_delta: 0,
+                    before_charge: None,
                 },
             )
             .await;
@@ -957,6 +976,7 @@ mod tests {
             generate: futures_util::stream::empty::<String>(),
             poll_interval_ms: 100,
             min_voucher_delta: 0,
+            before_charge: None,
         };
     }
 }
