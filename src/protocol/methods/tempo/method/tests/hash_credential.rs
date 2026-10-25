@@ -160,6 +160,104 @@ async fn test_verify_hash_returns_canonical_reference() {
     assert_eq!(receipt.reference, format!("{tx_hash:#x}"));
 }
 
+/// Validation reports the account the matched transfers debited as the payer,
+/// not the submitter, and no payer when the matched senders differ.
+#[tokio::test]
+async fn test_validate_hash_reports_debited_payer() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let split_recipient = Address::repeat_byte(0x44);
+    let (alice, bob) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+    let request = ChargeRequest {
+        amount: "1000".to_string(),
+        currency: format!("{currency:#x}"),
+        recipient: Some(format!("{recipient:#x}")),
+        method_details: Some(serde_json::json!({
+            "chainId": MODERATO_CHAIN_ID,
+            "splits": [{ "amount": "200", "recipient": format!("{split_recipient:#x}") }],
+        })),
+        ..Default::default()
+    };
+    let challenge = test_proof_challenge(&request);
+    let memo = attribution::encode(&challenge.id, &challenge.realm, None);
+    let tx_hash = B256::repeat_byte(0xab);
+    let block_hash = B256::repeat_byte(0xef);
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:#x}")),
+    );
+
+    let cases = [
+        ("direct", alice, [alice, alice], Some(alice)),
+        ("relayed", bob, [alice, alice], Some(alice)),
+        ("mixed-sender", alice, [alice, bob], None),
+    ];
+    for (name, submitter, senders, expected) in cases {
+        let transfers = [
+            (senders[0], recipient, 800u64),
+            (senders[1], split_recipient, 200),
+        ];
+        let logs: Vec<_> = transfers
+            .into_iter()
+            .enumerate()
+            .map(|(index, (from, to, amount))| {
+                let mut log =
+                    make_transfer_with_memo_log(currency, from, to, U256::from(amount), memo);
+                log.as_object_mut().unwrap().extend(
+                    serde_json::json!({
+                        "blockHash": format!("{block_hash:#x}"),
+                        "blockNumber": "0x1",
+                        "transactionHash": format!("{tx_hash:#x}"),
+                        "transactionIndex": "0x0",
+                        "logIndex": format!("{index:#x}"),
+                        "removed": false,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                );
+                log
+            })
+            .collect();
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "type": "0x76",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x5208",
+            "logs": logs,
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "from": format!("{submitter:#x}"),
+            "to": format!("{currency:#x}"),
+            "contractAddress": null,
+            "feePayer": format!("{submitter:#x}"),
+            "feeToken": format!("{currency:#x}"),
+        }));
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider).with_validate_sender(|_| true);
+        method.cached_chain_id.set(MODERATO_CHAIN_ID).unwrap();
+
+        let validation = ChargeMethodTrait::validate(&method, &credential, &request)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+
+        assert_eq!(
+            validation.payer,
+            expected.map(|payer| format!("{payer:#x}")),
+            "{name}"
+        );
+    }
+}
+
 // ==================== Hash credential source validation ====================
 
 const HASH_SOURCE_INVALID: &str = "Hash credential source is invalid.";

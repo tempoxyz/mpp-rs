@@ -769,3 +769,119 @@ async fn test_voucher_does_not_reopen_finalized_channel() {
     assert!(stored.finalized);
     assert_eq!(stored.highest_voucher_amount, 0);
 }
+
+/// A store whose reads yield before returning, like a networked store, so
+/// the concurrent on-chain read is polled (and fails) before the store answers.
+struct SlowReadStore(InMemoryChannelStore);
+
+impl ChannelStore for SlowReadStore {
+    fn get_channel(
+        &self,
+        channel_id: &str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    > {
+        let snapshot = self.0.get_channel_sync(channel_id);
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(snapshot)
+        })
+    }
+
+    fn update_channel(
+        &self,
+        channel_id: &str,
+        updater: Box<
+            dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                + Send,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    > {
+        self.0.update_channel(channel_id, updater)
+    }
+}
+
+/// The on-chain read runs alongside the store read, but a stored-channel
+/// error still wins over a failed on-chain read.
+#[tokio::test]
+async fn test_voucher_unknown_channel_wins_over_failed_chain_read() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    let store = Arc::new(SlowReadStore(InMemoryChannelStore::new()));
+
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc down");
+    let method = mocked_session_method(store, asserter.clone());
+
+    let (request, credential) = voucher_credential(&signer, &state, 1_000).await;
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::ChannelNotFound));
+    assert!(
+        asserter.read_q().is_empty(),
+        "the chain read ran and failed"
+    );
+}
+
+/// A stored channel that does not match the session is rejected as such
+/// even when the concurrent on-chain read fails.
+#[tokio::test]
+async fn test_voucher_stored_mismatch_wins_over_failed_chain_read() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    state.chain_id = 1;
+    let store = Arc::new(SlowReadStore(InMemoryChannelStore::new()));
+    store.0.insert(&channel_id, state.clone());
+
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc down");
+    let method = mocked_session_method(store, asserter.clone());
+
+    let (request, credential) = voucher_credential(&signer, &state, 1_000).await;
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::CredentialMismatch));
+    assert!(err.message.contains("chain_id"), "got: {}", err.message);
+    assert!(
+        asserter.read_q().is_empty(),
+        "the chain read ran and failed"
+    );
+}
+
+/// With a valid stored channel, a failed on-chain read is reported and
+/// the voucher is not recorded.
+#[tokio::test]
+async fn test_voucher_reports_failed_chain_read() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ab".repeat(32));
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state.clone());
+
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc down");
+    let method = mocked_session_method(store.clone(), asserter);
+
+    let (request, credential) = voucher_credential(&signer, &state, 1_000).await;
+    method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        store
+            .get_channel_sync(&channel_id)
+            .unwrap()
+            .highest_voucher_amount,
+        state.highest_voucher_amount
+    );
+}
