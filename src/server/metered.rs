@@ -84,10 +84,12 @@ where
             while let Some(value) = next_item(&mut stream).await {
                 // Try to charge, waiting for top-up if insufficient
                 let mut need_voucher_sent = false;
+                let mut check_escrow = true;
                 loop {
                     // The escrow may have been closed or withdrawn since the
                     // voucher was accepted: no voucher can fix that either.
-                    if let Some(check) = &before_charge {
+                    if let (true, Some(check)) = (check_escrow, &before_charge) {
+                        check_escrow = false;
                         if check(channel_id.to_string()).await.is_err() {
                             if let Some(receipt) = final_receipt(store, channel_id, challenge_id).await {
                                 yield MeteredEvent::Receipt(receipt);
@@ -112,6 +114,12 @@ where
                                 }
                             }
                             wait_for_update(store, channel_id, poll_interval_ms).await;
+                            // Check the escrow again only once a voucher covers the
+                            // charge: waiting on the client must not read it every poll.
+                            if let Ok(Some(ch)) = store.get_channel(channel_id).await {
+                                check_escrow =
+                                    ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost;
+                            }
                         }
                         Err(_) => {
                             // Closed, missing, or unreadable channel — no voucher can fix

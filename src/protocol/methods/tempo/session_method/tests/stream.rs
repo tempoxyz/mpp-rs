@@ -3,6 +3,11 @@ use alloy::providers::mock::Asserter;
 
 /// Queues the on-chain `getChannel` result for the test channel.
 fn push_escrow(asserter: &Asserter, deposit: u128, close_requested_at: u64) {
+    push_settled_escrow(asserter, deposit, close_requested_at, 0);
+}
+
+/// Queues an on-chain `getChannel` result with `settled` already settled.
+fn push_settled_escrow(asserter: &Asserter, deposit: u128, close_requested_at: u64, settled: u128) {
     use alloy::sol_types::SolValue;
 
     let state = test_channel_state("0x00");
@@ -15,7 +20,7 @@ fn push_escrow(asserter: &Asserter, deposit: u128, close_requested_at: u64) {
             state.token,
             state.authorized_signer,
             deposit,
-            0u128,
+            settled,
         )
             .abi_encode_params(),
     ));
@@ -96,4 +101,37 @@ async fn test_verify_stream_rejects_closing_channel_without_rpc() {
 
     let err = method.verify_stream(&channel_id).await.unwrap_err();
     assert_eq!(err.code, Some(ErrorCode::ChannelClosed));
+}
+
+#[tokio::test]
+async fn test_verify_stream_counts_settled_amount_as_spent() {
+    let asserter = Asserter::new();
+    push_settled_escrow(&asserter, 100_000, 0, 40_000);
+    let (channel_id, method) = streaming_method(asserter);
+
+    method.verify_stream(&channel_id).await.unwrap();
+    let stored = method
+        .store
+        .get_channel(&channel_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.settled_on_chain, 40_000);
+    assert_eq!(stored.spent, 40_000);
+}
+
+#[tokio::test]
+async fn test_verify_stream_evicts_expired_checks() {
+    let asserter = Asserter::new();
+    push_escrow(&asserter, 100_000, 0);
+    let (channel_id, method) = streaming_method(asserter);
+    let stale = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .unwrap();
+    method.stream_checks().insert("0xstale".to_string(), stale);
+
+    method.verify_stream(&channel_id).await.unwrap();
+    let checks = method.stream_checks();
+    assert!(!checks.contains_key("0xstale"));
+    assert!(checks.contains_key(&channel_id));
 }

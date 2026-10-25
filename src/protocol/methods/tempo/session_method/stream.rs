@@ -52,6 +52,8 @@ where
             return Ok(());
         }
 
+        // Only successful reads are cached: a failed check must read again.
+        self.stream_checks().remove(&channel_id);
         let id = Self::parse_channel_id(&channel_id)?;
         // Transport errors can include private RPC URLs or credentials.
         let on_chain = get_on_chain_channel(&*self.provider, channel.escrow_contract, id)
@@ -67,7 +69,21 @@ where
                 "channel has a pending close request",
             ));
         }
-        self.stream_checks().insert(channel_id, now);
+        // Amounts settled on chain, possibly by another instance, count as
+        // spent before the stream charges again.
+        self.store
+            .update_channel(
+                &channel_id,
+                Box::new(move |current| Ok(current.map(|state| state.refresh_on_chain(&on_chain)))),
+            )
+            .await?
+            .ok_or_else(closed)?;
+
+        let mut checks = self.stream_checks();
+        // Expired entries are never reused, so drop them to keep the map
+        // bounded by the channels streamed in the last few seconds.
+        checks.retain(|_, at| now.duration_since(*at) < STREAM_CHECK_TTL);
+        checks.insert(channel_id, now);
         Ok(())
     }
 
@@ -81,7 +97,7 @@ where
         })
     }
 
-    fn stream_checks(
+    pub(super) fn stream_checks(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
         self.stream_checks

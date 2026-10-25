@@ -773,6 +773,75 @@ mod tests {
         assert_eq!(store.get_channel_sync(channel_id).unwrap().spent, 100);
     }
 
+    /// While the stream waits for a voucher it does not re-run the escrow
+    /// check on every poll, only once a voucher covers the charge.
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn test_serve_skips_escrow_check_while_waiting_for_voucher() {
+        use crate::protocol::methods::tempo::session_method::{
+            ChannelState, ChannelStore, InMemoryChannelStore,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = std::sync::Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_wait";
+        store.insert(channel_id, test_channel_state(channel_id, 100, 5000));
+
+        let checks = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = checks.clone();
+        let before_charge: crate::protocol::methods::tempo::session_method::StreamCheck =
+            std::sync::Arc::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            });
+
+        let store2 = store.clone();
+        let handle = tokio::spawn(async move {
+            collect_stream(serve(ServeOptions {
+                store: store2,
+                channel_id: channel_id.to_string(),
+                challenge_id: "ch-wait".to_string(),
+                tick_cost: 100,
+                generate: Box::pin(async_stream::stream! {
+                    yield "a".to_string();
+                    yield "b".to_string();
+                }),
+                poll_interval_ms: 5,
+                min_voucher_delta: 0,
+                before_charge: Some(before_charge),
+            }))
+            .await
+        });
+
+        // "b" waits for a voucher through many poll intervals.
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        store
+            .update_channel(
+                channel_id,
+                Box::new(|current: Option<ChannelState>| {
+                    Ok(Some(ChannelState {
+                        highest_voucher_amount: 200,
+                        ..current.unwrap()
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
+
+        let events = handle.await.unwrap();
+        let messages: Vec<_> = events
+            .iter()
+            .filter_map(|e| match parse_event(e) {
+                Some(SseEvent::Message(m)) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages, vec!["a", "b"]);
+        // One check for "a", one before "b" first tried, one once covered.
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+    }
+
     #[cfg(feature = "tempo")]
     #[tokio::test]
     async fn test_serve_balance_sufficient() {
