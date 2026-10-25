@@ -5,8 +5,8 @@ use alloy::primitives::{Address, Bytes, B256};
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::chain::get_on_chain_channel;
 use super::payload::validate_settlement_route;
+use super::precompile;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, SessionMethod};
 use crate::protocol::core::{PaymentCredential, Receipt};
@@ -71,16 +71,18 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, settlement_route, additional_deposit_str, transaction_str) =
+        let (channel_id_str, descriptor, settlement_route, additional_deposit_str, transaction_str) =
             match payload {
                 SessionCredentialPayload::TopUp {
                     channel_id,
+                    descriptor,
                     settlement_route,
                     additional_deposit,
                     transaction,
                     ..
                 } => (
                     channel_id,
+                    descriptor.as_ref(),
                     settlement_route.as_ref(),
                     additional_deposit,
                     transaction,
@@ -122,7 +124,27 @@ where
         let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
             VerificationError::invalid_payload(format!("invalid topUp transaction hex: {}", e))
         })?;
-        Self::verify_top_up_transaction(&tx_bytes, channel_id_b256, escrow, additional_deposit)?;
+        let precompile_descriptor = if precompile::is_precompile(escrow) {
+            let d = precompile::validate_descriptor(
+                descriptor,
+                channel_id_b256,
+                escrow,
+                self.resolve_chain_id(details),
+                expected_payee,
+                expected_token,
+                Self::resolve_operator(details)?,
+            )?;
+            precompile::verify_top_up(&tx_bytes, &d, escrow, additional_deposit)?;
+            Some(d)
+        } else {
+            Self::verify_top_up_transaction(
+                &tx_bytes,
+                channel_id_b256,
+                escrow,
+                additional_deposit,
+            )?;
+            None
+        };
 
         let pending = self
             .provider
@@ -143,7 +165,9 @@ where
         let top_up_tx_hash = tx_receipt.transaction_hash().to_string();
 
         // Re-read on-chain state after topUp tx is broadcast.
-        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+        let on_chain = self
+            .read_channel(escrow, channel_id_b256, precompile_descriptor.as_ref())
+            .await?;
 
         if on_chain.deposit <= channel.deposit {
             return Err(VerificationError::new(

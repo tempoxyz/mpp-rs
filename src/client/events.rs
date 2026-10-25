@@ -159,6 +159,19 @@ pub enum PaymentFailureReason {
     /// Client refused before signing because the challenge was expired or had
     /// an unparsable `expires`. `provider.pay()` was not called.
     PreSigningExpired { expires: Option<String> },
+    /// The credential was sent but the paid request returned a 5xx response
+    /// (`status`) or no response at all (`status` is `None`), so the payment
+    /// may or may not have settled. Reconcile it before paying again.
+    #[non_exhaustive]
+    OutcomeUnknown {
+        /// Status of the paid response, when one arrived.
+        status: Option<u16>,
+        /// The serialized credential that was sent (an `Authorization: Payment` value).
+        credential: String,
+        /// Transaction hash the payment can be looked up by, when known: the
+        /// broadcast hash of a Tempo charge's `hash` credential.
+        transaction_hash: Option<String>,
+    },
 }
 
 /// Context for `payment.failed`.
