@@ -283,3 +283,56 @@ async fn test_verify_rejects_transaction_source_mismatch_before_cosign_or_rpc() 
         assert_eq!(signer_calls.load(Ordering::Relaxed), 0);
     }
 }
+
+#[tokio::test]
+async fn test_failed_broadcast_releases_submission_claim() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let request = ChargeRequest {
+        amount: amount.to_string(),
+        currency: format!("{currency:#x}"),
+        recipient: Some(format!("{recipient:#x}")),
+        method_details: Some(serde_json::json!({ "chainId": CHAIN_ID })),
+        ..Default::default()
+    };
+
+    // Both broadcasts fail before the transaction lands.
+    let asserter = Asserter::new();
+    asserter.push_failure_msg("node unavailable");
+    asserter.push_failure_msg("node unavailable");
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(crate::store::MemoryStore::new());
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+    let submission_key = format!("mpp:charge:submission:{:#x}", keccak256(&tx_bytes));
+
+    for attempt in 0..2 {
+        let error = method
+            .broadcast_transaction(
+                &alloy::hex::encode_prefixed(&tx_bytes),
+                &request,
+                None,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+            )
+            .await
+            .expect_err("broadcast fails");
+        // Resending after a failed broadcast retries it, never a final replay.
+        assert_eq!(
+            error.code,
+            Some(crate::protocol::traits::ErrorCode::NetworkError),
+            "attempt {attempt}: {error}"
+        );
+        assert!(store.get(&submission_key).await.unwrap().is_none());
+    }
+    assert!(asserter.read_q().is_empty(), "both attempts broadcast");
+}

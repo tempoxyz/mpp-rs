@@ -202,6 +202,19 @@ fn test_rejection_internal_error() {
 }
 
 #[test]
+fn test_payment_problem_new_drops_offers_for_final_403() {
+    let error = MppError::CredentialReplayed(Some("Transaction hash has already been used".into()));
+    let problem = PaymentProblem::new(&error, vec![test_challenge()]);
+    assert_eq!(problem.problem.status, 403);
+    assert!(problem.problem.challenge_id.is_none());
+    assert!(problem.offers.is_empty());
+
+    let resp = problem.into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+}
+
+#[test]
 fn test_rejection_problem_challenges_only_when_paying_again_helps() {
     let cases = [
         (

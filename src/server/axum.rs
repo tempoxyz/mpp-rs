@@ -159,18 +159,35 @@ pub struct PaymentProblem {
 impl PaymentProblem {
     /// Build the response for `error`, retryable with `offers`.
     ///
-    /// The problem references the first offer's challenge id.
+    /// The problem references the first offer's challenge id. A problem
+    /// answered without a challenge (`5xx` or `403`) drops the offers and
+    /// references none.
     pub fn new(error: &impl PaymentError, offers: Vec<PaymentChallenge>) -> Self {
+        let problem = error.to_problem_details(None);
+        if !sends_challenges(problem.status) {
+            return Self {
+                problem,
+                offers: Vec::new(),
+            };
+        }
         let problem = error.to_problem_details(offers.first().map(|offer| offer.id.as_str()));
         Self { problem, offers }
     }
+}
+
+/// Whether a problem with `status` is answered with fresh challenges: a
+/// server-side failure or a final `403` (such as a replayed credential) is
+/// not, since paying again would not help.
+fn sends_challenges(status: u16) -> bool {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    !(status.is_server_error() || status == StatusCode::FORBIDDEN)
 }
 
 impl IntoResponse for PaymentProblem {
     fn into_response(self) -> axum_core::response::Response {
         let status =
             StatusCode::from_u16(self.problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let values = if status.is_server_error() || status == StatusCode::FORBIDDEN {
+        let values = if !sends_challenges(self.problem.status) {
             Vec::new()
         } else {
             match challenge_header_values(&self.offers) {
