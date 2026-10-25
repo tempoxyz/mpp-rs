@@ -259,12 +259,12 @@ impl<C: ToolCaller> ManagementTransport for McpManagement<'_, C> {
             let mut params = self.params.lock().unwrap().clone();
             self.caller.attach_credential(&mut params, credential)?;
             let output = self.caller.call_tool(params).await.map_err(|error| {
-                // A definitive JSON-RPC rejection (such as -32042 or -32043)
-                // means the credential was refused, so it cannot apply later.
-                // Only an ambiguous failure leaves the outcome unknown.
-                if self.caller.is_definitive_error(&error)
-                    || self.caller.payment_challenges_from_error(&error).is_some()
-                {
+                // Only a definitive rejection (-32042 or -32043, as reported by
+                // is_definitive_error) means the credential was refused. Other
+                // errors, even ones carrying challenges such as -32603
+                // internal-payment-error after a broadcast, leave the top-up
+                // outcome unknown.
+                if self.caller.is_definitive_error(&error) {
                     MppError::InvalidConfig(
                         "the MCP server rejected the payment management credential".to_owned(),
                     )
@@ -774,7 +774,10 @@ mod tests {
     async fn definitive_management_rejections_are_not_transport_failures() {
         let credential = PaymentCredential::new(challenge().to_echo(), PaymentPayload::hash("x"));
         for (outcome, ambiguous) in [
-            (payment_error(false), false),
+            (payment_error(true), false),
+            // Challenges alone (for example -32603 internal-payment-error after
+            // a broadcast) do not make a rejection definitive.
+            (payment_error(false), true),
             (transport_error(true), false),
             (transport_error(false), true),
         ] {
