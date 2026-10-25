@@ -279,10 +279,20 @@ where
             )));
         }
 
-        if valid_before.saturating_sub(now) > policy.max_validity_window_seconds {
+        // As in mppx, a window shorter than the remaining-validity floor could
+        // never accept a transaction, and the window counts from `now`
+        // rounded up, like the floor.
+        if policy.max_validity_window_seconds < MIN_REMAINING_VALIDITY_SECS {
+            return Err(VerificationError::new(format!(
+                "sponsor max_validity_window_seconds must be at least {MIN_REMAINING_VALIDITY_SECS} seconds (got {})",
+                policy.max_validity_window_seconds
+            )));
+        }
+        let now_ceil = now + u64::from(now_since_epoch.subsec_nanos() > 0);
+        if valid_before.saturating_sub(now_ceil) > policy.max_validity_window_seconds {
             return Err(VerificationError::new(format!(
                 "valid_before window {}s exceeds policy maximum {}s",
-                valid_before.saturating_sub(now),
+                valid_before.saturating_sub(now_ceil),
                 policy.max_validity_window_seconds
             )));
         }

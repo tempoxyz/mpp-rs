@@ -21,7 +21,7 @@ use super::memo::{
     is_challenge_bound_memo,
 };
 use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
-use super::ChargeMethod;
+use super::{ensure_challenge_not_expired, ChargeMethod};
 
 /// Check a transaction credential `source` against the recovered transaction
 /// sender: `Ok` if absent or a `did:pkh:eip155` DID for `expected_chain_id`
@@ -247,6 +247,7 @@ where
             .map_err(|e| VerificationError::new(format!("Failed to recover sender: {e}")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn broadcast_transaction(
         &self,
         signed_tx: &str,
@@ -255,6 +256,7 @@ where
         expected_chain_id: u64,
         challenge_id: &str,
         realm: &str,
+        expires: Option<&str>,
     ) -> Result<B256, VerificationError> {
         let tx_bytes = signed_tx
             .parse::<Bytes>()
@@ -317,20 +319,6 @@ where
             self.simulate_before_broadcast(&final_tx_bytes).await?;
         }
 
-        // Simulation took a round trip since co-signing: make sure the
-        // sponsored transaction still has time to land before paying for it.
-        if charge.fee_payer() {
-            let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
-                .map_err(|e| {
-                VerificationError::new(format!("Failed to decode transaction: {e}"))
-            })?;
-            let valid_before = signed.tx().valid_before.map_or(0, |vb| vb.get());
-            super::fee_payer::ensure_remaining_validity(
-                valid_before,
-                super::fee_payer::unix_now()?,
-            )?;
-        }
-
         // Pre-broadcast dedup of the final tx bytes. Separate namespace from
         // the post-broadcast hash dedup in verify_hash.
         if let Some(store) = &self.store {
@@ -347,6 +335,26 @@ where
                 ));
             }
         }
+
+        // Simulation and the dedup claim took round trips since co-signing:
+        // right before broadcasting, make sure the sponsored transaction still
+        // has time to land before paying for it.
+        if charge.fee_payer() {
+            let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+                .map_err(|e| {
+                VerificationError::new(format!("Failed to decode transaction: {e}"))
+            })?;
+            let valid_before = signed.tx().valid_before.map_or(0, |vb| vb.get());
+            super::fee_payer::ensure_remaining_validity(
+                valid_before,
+                super::fee_payer::unix_now()?,
+            )?;
+        }
+
+        // Authorize before the irreversible send. Expiry is not re-checked
+        // afterwards: a paid request must not turn into a fresh challenge
+        // while settlement completes.
+        ensure_challenge_not_expired(expires)?;
 
         // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
         // receipt. The Tempo node holds the connection open until the transaction

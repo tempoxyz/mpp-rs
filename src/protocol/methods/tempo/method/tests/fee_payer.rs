@@ -1001,6 +1001,7 @@ async fn assert_sponsored_ousd_charge_succeeds(
             chain_id,
             challenge_id,
             realm,
+            None,
         )
         .await
         .expect("sponsored OUSD charge must succeed");
@@ -1094,6 +1095,32 @@ async fn test_cosign_rejects_short_remaining_validity() {
         .expect_err("should reject a transaction with under 15s of validity");
     assert!(
         err.to_string().contains("at least 15 seconds"),
+        "got: {err}"
+    );
+}
+
+/// As in mppx, a sponsor window shorter than the 15-second remaining-validity
+/// floor is a configuration error rather than a silent reject-everything.
+#[tokio::test]
+async fn test_cosign_rejects_validity_window_below_floor() {
+    let overrides = FeePayerPolicyOverride {
+        max_validity_window_seconds: Some(14),
+        ..Default::default()
+    };
+    let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
+    let encoded = sign_and_encode_0x78(make_fee_payer_tx(20), &client_signer);
+
+    let err = method
+        .cosign_fee_payer_transaction(
+            &encoded,
+            method.fee_payer_signer.as_deref().unwrap(),
+            fee_token,
+        )
+        .await
+        .expect_err("should reject a policy window below the floor");
+    assert!(
+        err.to_string()
+            .contains("max_validity_window_seconds must be at least 15 seconds"),
         "got: {err}"
     );
 }

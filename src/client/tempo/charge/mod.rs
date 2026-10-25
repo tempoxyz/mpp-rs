@@ -73,12 +73,11 @@ const EXPIRING_NONCE_KEY: U256 = U256::MAX;
 /// transactions: `valid_before = now + EXPIRING_NONCE_VALID_BEFORE_SECS`,
 /// capped at the challenge `expires`.
 ///
-/// Deliberately wider than mppx's 25 seconds. A fee-sponsored server co-signs
-/// and broadcasts only while at least
-/// [`FEE_PAYER_MIN_REMAINING_VALIDITY_SECS`] (15s) remain, so a 60-second
-/// window leaves about 45 seconds for clock skew between client and server,
-/// signing, and the round trips before the server checks it.
-const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 60;
+/// Matches mppx's 25 seconds. Tempo rejects expiring-nonce transactions whose
+/// `valid_before` is more than 30 seconds past the block timestamp (TIP-1009,
+/// `expiring_nonce_max_expiry_secs` before T11), so a wider default would make
+/// every default charge unincludable.
+const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 
 /// Encode a TIP-20 token transfer call, optionally with memo.
 fn encode_transfer(
@@ -636,7 +635,7 @@ impl TempoCharge {
         let fee_token = options.fee_token.unwrap_or(self.currency);
 
         // All charge payments use expiring nonces (nonceKey=MAX, nonce=0,
-        // validBefore=min(now+60s, challenge expires)) so we never need a
+        // validBefore=min(now+25s, challenge expires)) so we never need a
         // nonce fetch.
         // Tempo uses a fixed 20 gwei base fee, so gas fees are static.
         let max_fee_per_gas = options
@@ -1275,8 +1274,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_valid_before_window_is_60_seconds() {
-        assert_eq!(EXPIRING_NONCE_VALID_BEFORE_SECS, 60);
+    fn test_default_valid_before_window_is_25_seconds() {
+        assert_eq!(EXPIRING_NONCE_VALID_BEFORE_SECS, 25);
         let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
         for challenge in [
             test_challenge(),
@@ -1285,15 +1284,15 @@ mod tests {
         ] {
             let valid_before = resolve_valid_before(&challenge, None);
             assert!(
-                (now + 60..=now + 61).contains(&valid_before),
-                "validBefore {valid_before} is not now ({now}) + 60s"
+                (now + 25..=now + 26).contains(&valid_before),
+                "validBefore {valid_before} is not now ({now}) + 25s"
             );
         }
     }
 
     #[tokio::test]
     async fn test_sponsored_valid_before_is_capped_at_challenge_expires() {
-        let challenge = sponsored_challenge(30);
+        let challenge = sponsored_challenge(20);
         let expires = challenge.expires_at().unwrap().unix_timestamp() as u64;
         assert_eq!(resolve_valid_before(&challenge, None), expires);
         assert_eq!(sign_valid_before(&challenge).await.unwrap(), expires);

@@ -218,7 +218,10 @@ fn ensure_sponsored_expiry_floor(
         .and_then(|details| details.get("feePayer"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    if !sponsored {
+    // Zero-amount charges are paid with a proof credential: nothing is
+    // co-signed or broadcast, so the floor does not apply.
+    let zero_amount = request.amount_u256().is_ok_and(|amount| amount.is_zero());
+    if !sponsored || zero_amount {
         return Ok(());
     }
     let expires_at =
@@ -626,6 +629,11 @@ mod tests {
         // At the floor, and the default expiry, still issue.
         issue(&sponsored, Some(&crate::expires::seconds(15))).unwrap();
         issue(&sponsored, None).unwrap();
+
+        // Zero-amount proof charges are never co-signed, so keep any expiry.
+        let mut zero = request(serde_json::json!({ "feePayer": true }));
+        zero.amount = "0".into();
+        issue(&zero, Some(&crate::expires::seconds(5))).unwrap();
 
         // Unsponsored charges keep any expiry.
         let unsponsored = request(serde_json::json!({ "feePayer": false }));

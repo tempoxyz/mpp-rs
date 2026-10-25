@@ -1,0 +1,24 @@
+name: Feature request
+description: Request functionality mpp-rs does not yet provide.
+labels: ['enhancement']
+body:
+  - type: textarea
+    attributes:
+      label: Problem
+      description: What are you trying to do, and why can't you do it today?
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Proposed solution
+      description: The API or behavior you would like. Example code helps.
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Other SDKs and the specification
+      description: Does another MPP SDK already support this, or does the specification define it? Include links if so.
+    validations:
+      required: false
