@@ -227,9 +227,10 @@ impl ChargeMethodTrait for ChargeMethod {
             // before this method is called.
 
             // A request-bound externalId must be echoed by the credential.
+            // Rejected as an invalid challenge before Stripe is called, as in mppx.
             if let Some(expected) = charge_request.external_id.as_deref() {
                 if payload.external_id.as_deref() != Some(expected) {
-                    return Err(VerificationError::credential_mismatch(
+                    return Err(VerificationError::invalid_challenge(
                         "credential externalId does not match this route request",
                     ));
                 }
