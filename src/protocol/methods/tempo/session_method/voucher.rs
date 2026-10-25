@@ -4,15 +4,14 @@ use alloy::primitives::Address;
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::chain::get_on_chain_channel;
 use super::payload::validate_settlement_route;
+use super::precompile;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, ChannelState, SessionMethod};
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
 };
-use crate::protocol::methods::tempo::voucher::verify_voucher;
 use crate::protocol::traits::VerificationError;
 
 impl<P> SessionMethod<P>
@@ -28,22 +27,24 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, settlement_route, cumulative_amount_str, signature_str) = match payload
-        {
-            SessionCredentialPayload::Voucher {
-                channel_id,
-                settlement_route,
-                cumulative_amount,
-                signature,
-                ..
-            } => (
-                channel_id,
-                settlement_route.as_ref(),
-                cumulative_amount,
-                signature,
-            ),
-            _ => unreachable!(),
-        };
+        let (channel_id_str, descriptor, settlement_route, cumulative_amount_str, signature_str) =
+            match payload {
+                SessionCredentialPayload::Voucher {
+                    channel_id,
+                    descriptor,
+                    settlement_route,
+                    cumulative_amount,
+                    signature,
+                    ..
+                } => (
+                    channel_id,
+                    descriptor.as_ref(),
+                    settlement_route.as_ref(),
+                    cumulative_amount,
+                    signature,
+                ),
+                _ => unreachable!(),
+            };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
         // The on-chain read does not depend on the stored channel, so it
@@ -53,7 +54,21 @@ where
         let read_on_chain = async {
             let escrow = self.resolve_escrow(details)?;
             let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
-            get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await
+            let precompile_descriptor = if precompile::is_precompile(escrow) {
+                Some(precompile::validate_descriptor(
+                    descriptor,
+                    channel_id_b256,
+                    escrow,
+                    self.resolve_chain_id(details),
+                    expected_payee,
+                    expected_token,
+                    Self::resolve_operator(details)?,
+                )?)
+            } else {
+                None
+            };
+            self.read_channel(escrow, channel_id_b256, precompile_descriptor.as_ref())
+                .await
         };
         let check_stored = async {
             let channel = self
@@ -102,7 +117,16 @@ where
             tokio::try_join!(check_stored, async { Ok(read_on_chain.await) })?;
         let on_chain = on_chain?;
         let min_delta = self.resolve_min_delta(details);
+        let escrow = self.resolve_escrow(details)?;
 
+        // A TIP-1034 channel that reads back unfunded was closed or withdrawn (or the RPC has
+        // not seen it yet): reject this voucher without recording anything, so a stale read
+        // cannot lock the payee out of a live channel.
+        if precompile::is_precompile(escrow) && on_chain.deposit == 0 {
+            return Err(VerificationError::channel_closed(
+                "channel is not funded on-chain",
+            ));
+        }
         if on_chain.payee != expected_payee {
             return Err(VerificationError::credential_mismatch(
                 "on-chain channel payee does not match session recipient",
@@ -172,12 +196,13 @@ where
         // the delta check reports how far it is above the accepted amount,
         // which only the payer may learn. An exact replay of the stored
         // voucher was verified when it was accepted.
-        let sig_bytes = Self::parse_signature(signature_str)?;
+        let sig_bytes =
+            precompile::parse_signature_for::<P>(channel.escrow_contract, signature_str)?;
         let is_exact_replay = cumulative_amount == channel.highest_voucher_amount
             && channel.highest_voucher_signature.as_ref() == Some(&sig_bytes);
         if !is_exact_replay {
             let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
-            let is_valid = verify_voucher(
+            let is_valid = precompile::verify_voucher_for(
                 channel.escrow_contract,
                 channel.chain_id,
                 channel_id_b256,

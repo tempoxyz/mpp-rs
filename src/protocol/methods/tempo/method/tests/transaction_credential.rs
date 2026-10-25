@@ -39,6 +39,7 @@ async fn test_broadcast_rejects_unbound_memo_before_rpc() {
             CHAIN_ID,
             "challenge-123",
             "api.example.com",
+            None,
         )
         .await
         .expect_err("unbound memo must be rejected before broadcast");
@@ -99,6 +100,7 @@ async fn test_fee_payer_rejects_unbound_memo_before_cosign_or_rpc() {
             CHAIN_ID,
             "challenge-123",
             "api.example.com",
+            None,
         )
         .await
         .expect_err("unbound memo must be rejected before sponsorship");
@@ -277,4 +279,187 @@ async fn test_verify_rejects_transaction_source_mismatch_before_cosign_or_rpc() 
         );
         assert_eq!(signer_calls.load(Ordering::Relaxed), 0);
     }
+}
+
+// ==================== Expiry before broadcast ====================
+
+fn rfc3339_from_now(offset: time::Duration) -> String {
+    (time::OffsetDateTime::now_utc() + offset)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+fn challenge_bound_request(currency: Address, recipient: Address, amount: U256) -> ChargeRequest {
+    ChargeRequest {
+        amount: amount.to_string(),
+        currency: format!("{currency:#x}"),
+        recipient: Some(format!("{recipient:#x}")),
+        method_details: Some(serde_json::json!({ "chainId": CHAIN_ID })),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn test_broadcast_rejects_challenge_expired_before_send() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    // No mock responses are queued: a broadcast would fail with a different
+    // error than the expiry asserted below.
+    let asserter = Asserter::new();
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let method = ChargeMethod::new(provider);
+    let expires = rfc3339_from_now(-time::Duration::seconds(1));
+
+    let error = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            Some(&expires),
+        )
+        .await
+        .expect_err("an expired challenge must not be broadcast");
+
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::Expired),
+        "unexpected error: {error}"
+    );
+}
+
+/// Mock transport that answers `eth_sendRawTransactionSync` only after a
+/// delay, so the challenge expires while settlement is in flight.
+#[derive(Clone)]
+struct SlowSendTransport {
+    inner: alloy::transports::mock::MockTransport,
+    delay: std::time::Duration,
+}
+
+impl tower::Service<alloy_json_rpc::RequestPacket> for SlowSendTransport {
+    type Response = alloy_json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: alloy_json_rpc::RequestPacket) -> Self::Future {
+        let delay = match &request {
+            alloy_json_rpc::RequestPacket::Single(request) => {
+                request.method() == "eth_sendRawTransactionSync"
+            }
+            alloy_json_rpc::RequestPacket::Batch(_) => false,
+        }
+        .then_some(self.delay);
+        let response = self.inner.call(request);
+        Box::pin(async move {
+            let response = response.await;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            response
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_broadcast_returns_receipt_when_expiry_crosses_send() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let memo = attribution::encode("challenge-123", "api.example.com", None);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    let tx_hash = B256::repeat_byte(0x11);
+    let block_hash = B256::repeat_byte(0x22);
+    let mut log = make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
+    log.as_object_mut().unwrap().extend(
+        serde_json::json!({
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x1",
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": false,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let asserter = Asserter::new();
+    asserter.push_success(&serde_json::json!({
+        "type": "0x76",
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logs": [log],
+        "logsBloom": format!("0x{}", "00".repeat(256)),
+        "transactionHash": format!("{tx_hash:#x}"),
+        "transactionIndex": "0x0",
+        "blockHash": format!("{block_hash:#x}"),
+        "blockNumber": "0x1",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "from": format!("{sender:#x}"),
+        "to": format!("{currency:#x}"),
+        "contractAddress": null,
+        "feePayer": format!("{sender:#x}"),
+        "feeToken": format!("{currency:#x}"),
+    }));
+
+    let expires_in = time::Duration::milliseconds(500);
+    let transport = SlowSendTransport {
+        inner: alloy::transports::mock::MockTransport::new(asserter.clone()),
+        delay: std::time::Duration::from_millis(1_000),
+    };
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_client(alloy::rpc::client::RpcClient::new(transport, true));
+    let method = ChargeMethod::new(provider);
+    let expires = rfc3339_from_now(expires_in);
+
+    let hash = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            Some(&expires),
+        )
+        .await
+        .expect("expiry crossing after the send must not reject a settled payment");
+
+    assert_eq!(hash, tx_hash);
+    assert!(
+        time::OffsetDateTime::now_utc()
+            > time::OffsetDateTime::parse(&expires, &time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        "the challenge must have expired during settlement"
+    );
 }
