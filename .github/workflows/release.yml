@@ -4,8 +4,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 15 * * 1' # Monday 15:00 UTC
-  workflow_dispatch:
+    - cron: '17 15 * * 1' # Monday 15:17 UTC
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -41,7 +40,7 @@ jobs:
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@e4e806749af1be52cf0de15170acdea963d83e3d # tempoxyz/changelogs#188 # zizmor: ignore[artipacked]
+        uses: tempoxyz/changelogs@b26936c80a7a2c5e79778d8d2659be178888beb6 # tempoxyz/changelogs#188 # zizmor: ignore[artipacked]
         with:
           ecosystem: rust
           conventional-commit: true
