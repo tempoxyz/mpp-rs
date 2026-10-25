@@ -169,9 +169,13 @@ impl Transport for HttpTransport {
                 &fallback
             }
         };
-        let problem = error.to_problem_details(Some(ctx.challenge.id.as_str()));
+        let mut problem = error.to_problem_details(None);
         let status = http_types::StatusCode::from_u16(problem.status)
             .unwrap_or(http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        // Name the challenge only when it is sent in `WWW-Authenticate`.
+        if www_auth.is_some() && !status.is_server_error() {
+            problem = problem.with_challenge_id(ctx.challenge.id.as_str());
+        }
 
         let body = serde_json::to_string(&problem).unwrap_or_default();
         let mut resp = http_types::Response::new(body);
@@ -421,6 +425,41 @@ mod tests {
         assert!(!resp
             .headers()
             .contains_key(http_types::header::WWW_AUTHENTICATE));
+        let body: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert!(body.get("challengeId").is_none());
+    }
+
+    #[test]
+    fn test_http_respond_challenge_internal_error_omits_challenge_id() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+        let error = MppError::Internal("rpc unavailable".into());
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: Some(&error),
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!resp
+            .headers()
+            .contains_key(http_types::header::WWW_AUTHENTICATE));
+        let body: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert!(body.get("challengeId").is_none());
     }
 
     #[test]
