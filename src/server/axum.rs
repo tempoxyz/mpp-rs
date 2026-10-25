@@ -120,24 +120,12 @@ pub struct PaymentOffers(pub Vec<PaymentChallenge>);
 
 impl IntoResponse for PaymentOffers {
     fn into_response(self) -> axum_core::response::Response {
-        let Some(values) = challenge_header_values(&self.0) else {
-            return internal_error_response();
+        let description = self.0.first().and_then(|offer| offer.description.clone());
+        let error = MppError::PaymentRequired {
+            realm: None,
+            description,
         };
-        let mut resp = (
-            StatusCode::PAYMENT_REQUIRED,
-            serde_json::json!({ "error": "Payment Required" }).to_string(),
-        )
-            .into_response();
-        for value in values {
-            resp.headers_mut().append(WWW_AUTHENTICATE_HEADER, value);
-        }
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        resp.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        resp
+        PaymentProblem::new(&error, self.0).into_response()
     }
 }
 
@@ -381,10 +369,14 @@ impl IntoResponse for MppChargeRejection {
     fn into_response(self) -> axum_core::response::Response {
         match self {
             MppChargeRejection::Challenge(pr) => pr.into_response(),
-            MppChargeRejection::VerificationFailed(pr) => pr.into_response(),
+            MppChargeRejection::VerificationFailed(pr) => {
+                PaymentProblem::new(&MppError::VerificationFailed(None), vec![pr.0]).into_response()
+            }
             MppChargeRejection::InternalError(_) => internal_error_response(),
             MppChargeRejection::Offers(offers) => offers.into_response(),
-            MppChargeRejection::VerificationFailedOffers(offers) => offers.into_response(),
+            MppChargeRejection::VerificationFailedOffers(offers) => {
+                PaymentProblem::new(&MppError::VerificationFailed(None), offers.0).into_response()
+            }
             MppChargeRejection::Body(rejection) => rejection.into_response(),
             MppChargeRejection::Problem(problem) => problem.into_response(),
         }

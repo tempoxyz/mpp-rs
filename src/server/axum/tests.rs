@@ -164,13 +164,26 @@ fn test_unformattable_challenge_returns_500_without_challenge() {
     );
 }
 
-#[test]
-fn test_payment_required_has_json_content_type() {
-    let resp = PaymentRequired(test_challenge()).into_response();
+#[tokio::test]
+async fn test_payment_required_has_problem_body() {
+    use http_body_util::BodyExt;
+
+    let mut challenge = test_challenge();
+    challenge.description = Some("Premium access".into());
+    let resp = PaymentRequired(challenge).into_response();
     assert_eq!(
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json"
+        "application/problem+json"
     );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/payment-required"
+    );
+    assert_eq!(problem["status"], 402);
+    assert_eq!(problem["detail"], "Payment is required (Premium access).");
+    assert_eq!(problem["challengeId"], "test-id");
 }
 
 #[test]
@@ -1477,7 +1490,7 @@ mod currency_offers {
         );
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/json"
+            "application/problem+json"
         );
     }
 
