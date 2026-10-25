@@ -133,9 +133,10 @@ pub struct TempoSessionProvider {
     last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
     /// Serializes channel recovery, cumulative advancement, and credential creation.
     payment_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes funding decisions, including background top-ups that do not
-    /// hold `payment_lock` while they are signed and submitted.
-    funding_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes funding decisions per payment scope, including background
+    /// top-ups that do not hold `payment_lock` while they are signed and
+    /// submitted.
+    funding_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Keeps the process and durable-store leases until the server response is reconciled.
     pending_payment_leases: Arc<Mutex<HashMap<String, SessionPaymentLease>>>,
     /// Requests' worth of balance, at the latest price, kept prepaid per URL. Zero disables it.
@@ -285,7 +286,7 @@ impl TempoSessionProvider {
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
-            funding_lock: Arc::new(tokio::sync::Mutex::new(())),
+            funding_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_payment_leases: Arc::new(Mutex::new(HashMap::new())),
             prepaid_requests: 0,
             prepaid: Arc::new(Mutex::new(HashMap::new())),
@@ -1855,7 +1856,7 @@ impl TempoSessionProvider {
             .acquire(&key)
             .await
             .map_err(Self::store_error)?;
-        let _funding = self.funding_lock.lock().await;
+        let _funding = self.acquire_funding_lock(&key, challenge).await?;
         self.top_up_with_lease(
             client,
             url,
@@ -1928,21 +1929,23 @@ impl TempoSessionProvider {
         additional_deposit: u128,
         reserve: u128,
     ) -> Result<(), MppError> {
-        let funding = self.funding_lock.lock().await;
-        let covered = {
-            let key = self
-                .channel_id_to_key
-                .lock()
-                .unwrap()
-                .get(channel_id_hex)
-                .cloned();
-            let channels = self.channels.lock().unwrap();
-            key.and_then(|key| channels.get(&key).cloned())
-                .filter(|entry| entry.channel_id.to_string() == channel_id_hex)
-                .is_none_or(|entry| {
-                    entry.deposit.saturating_sub(entry.cumulative_amount) >= reserve
-                })
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(channel_id_hex)
+            .cloned();
+        let Some(key) = key else {
+            return Ok(());
         };
+        let funding = self.acquire_funding_lock(&key, challenge).await?;
+        let covered = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.channel_id.to_string() == channel_id_hex)
+            .is_none_or(|entry| entry.deposit.saturating_sub(entry.cumulative_amount) >= reserve);
         if covered {
             return Ok(());
         }
@@ -1951,17 +1954,20 @@ impl TempoSessionProvider {
             .await?;
         self.submit_top_up(client, url, challenge, &prepared)
             .await?;
-        let previous = self.raise_local_deposit(&prepared);
+        let previous = self.raise_local_deposit(&prepared, channel_id_hex);
         drop(funding);
         let _process_lease = self.acquire_payment_lock(challenge).await?;
         self.record_top_up(url, &prepared, previous).await
     }
 
-    /// Raises the in-memory deposit to an accepted top-up's, returning the
-    /// deposit it replaced.
-    fn raise_local_deposit(&self, prepared: &PreparedTopUp) -> Option<u128> {
+    /// Raises the in-memory deposit of the funded channel to an accepted
+    /// top-up's, returning the deposit it replaced. A channel that replaced
+    /// it in the same scope is left alone.
+    fn raise_local_deposit(&self, prepared: &PreparedTopUp, channel_id_hex: &str) -> Option<u128> {
         let mut channels = self.channels.lock().unwrap();
-        let entry = channels.get_mut(&prepared.key)?;
+        let entry = channels
+            .get_mut(&prepared.key)
+            .filter(|entry| entry.channel_id.to_string() == channel_id_hex)?;
         let previous = entry.deposit;
         entry.deposit = entry.deposit.max(prepared.new_deposit);
         Some(previous)
@@ -2179,6 +2185,9 @@ impl TempoSessionProvider {
             .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
         let previous = previous.unwrap_or(entry.deposit).min(entry.deposit);
         entry.deposit = entry.deposit.max(prepared.new_deposit);
+        // Report only this top-up's increase: a top-up recorded while a
+        // background one waited has already reported its own.
+        let amount = prepared.new_deposit.saturating_sub(previous);
         entry.cumulative_amount = entry.cumulative_amount.max(prepared.cumulative_amount);
         entry.opened = true;
         self.persist_channel(&entry).await?;
@@ -2187,8 +2196,8 @@ impl TempoSessionProvider {
             .unwrap()
             .insert(prepared.key.clone(), entry.clone());
         self.notify_update(&entry);
-        if entry.deposit > previous {
-            self.report_deposit(url, &entry, entry.deposit - previous, false);
+        if amount > 0 {
+            self.report_deposit(url, &entry, amount, false);
         }
         Ok(())
     }
@@ -2302,7 +2311,7 @@ impl TempoSessionProvider {
                 .acquire(&key)
                 .await
                 .map_err(Self::store_error)?;
-            let _funding = self.funding_lock.lock().await;
+            let _funding = self.acquire_funding_lock(&key, challenge).await?;
             // Another request may have funded the channel while this waited.
             let deposit = self.known_deposit(channel_id_hex, server_deposit).await?;
             if let Some(additional_deposit) =
@@ -2877,7 +2886,31 @@ impl TempoSessionProvider {
         &self,
         challenge: &PaymentChallenge,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
-        let lock = self.payment_lock.clone().lock_owned();
+        Self::lock_until_expiry(self.payment_lock.clone(), challenge).await
+    }
+
+    /// Waits for the payment scope's funding lock until `challenge` expires,
+    /// so a stalled top-up cannot hold a later payment past its expiry.
+    async fn acquire_funding_lock(
+        &self,
+        key: &str,
+        challenge: &PaymentChallenge,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
+        let lock = self
+            .funding_locks
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default()
+            .clone();
+        Self::lock_until_expiry(lock, challenge).await
+    }
+
+    async fn lock_until_expiry(
+        lock: Arc<tokio::sync::Mutex<()>>,
+        challenge: &PaymentChallenge,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
+        let lock = lock.lock_owned();
         let Some(expires) = challenge.expires_at() else {
             return Ok(lock.await);
         };
@@ -3062,7 +3095,7 @@ impl TempoSessionProvider {
                         ));
                     };
                     // A background top-up may have raised the deposit while this waited.
-                    let _funding = self.funding_lock.lock().await;
+                    let _funding = self.acquire_funding_lock(&key, challenge).await?;
                     if let Some(current) = self.channels.lock().unwrap().get(&key) {
                         if current.channel_id == entry.channel_id {
                             entry.deposit = entry.deposit.max(current.deposit);
@@ -5066,6 +5099,144 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(posted.lock().unwrap().len(), 1);
         assert_eq!(provider.channels().values().next().unwrap().deposit, 1_000);
+    }
+
+    #[tokio::test]
+    async fn background_top_up_reports_only_its_own_deposit_increase() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::{ClientEvent, ClientEventKind, ClientEvents};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let events = ClientEvents::default();
+        let amounts = Arc::new(Mutex::new(Vec::new()));
+        let seen = amounts.clone();
+        let _subscription = events.on(ClientEventKind::Deposit, move |event| {
+            if let ClientEvent::Deposit(context) = event {
+                seen.lock().unwrap().push((context.amount, context.deposit));
+            }
+            async {}
+        });
+        let mut provider = make_test_provider().with_events(events);
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let channel_id = channel_id.to_string();
+        let prepared = provider
+            .prepare_top_up(
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.new_deposit, 2_000);
+        let previous = provider.raise_local_deposit(&prepared, &channel_id);
+        assert_eq!(previous, Some(1_000));
+        // A foreground top-up of 1000 lands while the background one waits to
+        // record, and reports its own increase.
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut(&prepared.key)
+            .unwrap()
+            .deposit = 3_000;
+
+        provider
+            .record_top_up("https://api.example.com/", &prepared, previous)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*amounts.lock().unwrap(), vec![(1_000, 3_000)]);
+    }
+
+    #[tokio::test]
+    async fn background_top_up_leaves_a_replacement_channel_deposit_alone() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider();
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let channel_id = channel_id.to_string();
+        let prepared = provider
+            .prepare_top_up(
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_000,
+            )
+            .await
+            .unwrap();
+        // Another channel replaced the funded one in the same scope.
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut(&prepared.key)
+            .unwrap()
+            .channel_id = B256::repeat_byte(0x99);
+
+        assert_eq!(provider.raise_local_deposit(&prepared, &channel_id), None);
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 1_000);
+    }
+
+    #[tokio::test]
+    async fn funding_wait_ends_at_challenge_expiry_and_is_per_scope() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let (key, _) = provider.expected_channel_key(&challenge).unwrap();
+        // A stalled top-up, such as a background one, holds this scope's funding lock.
+        let _stalled = provider
+            .acquire_funding_lock(&key, &challenge)
+            .await
+            .unwrap();
+
+        // Other payment scopes still fund.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            provider.acquire_funding_lock("other-scope", &challenge),
+        )
+        .await
+        .expect("another scope's funding lock must be free")
+        .unwrap();
+
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::milliseconds(300))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let expiring = challenge.clone().with_expires(expires);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            provider.top_up_with_headers_for_challenge(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                reqwest::header::HeaderMap::new(),
+                &expiring,
+                &channel_id.to_string(),
+                1_000,
+            ),
+        )
+        .await
+        .expect("the funding wait must end when the challenge expires")
+        .unwrap_err();
+        assert!(matches!(error, MppError::PaymentExpired(_)), "{error}");
     }
 
     #[tokio::test]
