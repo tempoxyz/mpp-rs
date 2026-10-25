@@ -202,12 +202,6 @@ where
                 let Some(valid_before) = pending.valid_before else {
                     return Ok(channel);
                 };
-                // Reading a TIP-1034 channel needs the credential's descriptor,
-                // which the store does not keep: without on-chain evidence the
-                // channel stays blocked.
-                if precompile::is_precompile(channel.escrow_contract) {
-                    return Ok(channel);
-                }
                 if unix_now() <= valid_before.saturating_add(CLOSE_CLOCK_SKEW_SECS) {
                     return Ok(channel);
                 }
@@ -225,14 +219,33 @@ where
                             channel_id.parse().map_err(|_| {
                                 VerificationError::invalid_payload("invalid channel id")
                             })?;
-                        get_on_chain_channel_at(
-                            &*self.provider,
-                            channel.escrow_contract,
-                            channel_id_b256,
-                            block.into(),
-                        )
-                        .await?
-                        .finalized
+                        if precompile::is_precompile(channel.escrow_contract) {
+                            // The precompile deletes a closed channel, so only a
+                            // funded channel with no close request proves the
+                            // expired close never ran (mppx's
+                            // `reconcileExpiredPendingClose`). Anything else
+                            // stays blocked.
+                            let state = precompile::get_precompile_channel_state(
+                                &*self.provider,
+                                channel.escrow_contract,
+                                channel_id_b256,
+                                block.into(),
+                            )
+                            .await?;
+                            if state.deposit.is_zero() || state.closeRequestedAt != 0 {
+                                return Ok(channel);
+                            }
+                            false
+                        } else {
+                            get_on_chain_channel_at(
+                                &*self.provider,
+                                channel.escrow_contract,
+                                channel_id_b256,
+                                block.into(),
+                            )
+                            .await?
+                            .finalized
+                        }
                     }
                 }
             }

@@ -993,31 +993,56 @@ async fn test_reconcile_keeps_unexpired_pending_close() {
     assert!(state.closing && state.pending_close.is_some() && !state.finalized);
 }
 
-/// An expired close on a TIP-1034 channel cannot be checked against chain
-/// state without the descriptor, so reconciliation keeps it blocked.
+/// An expired close on a TIP-1034 channel is checked against the precompile's
+/// descriptor-free `getChannelState` at a block past `valid_before`: it is released
+/// only while the channel is still funded with no close request, as in mppx's
+/// `reconcileExpiredPendingClose`. A deleted (unfunded) or close-requested channel
+/// stays blocked.
 #[tokio::test]
-async fn test_reconcile_keeps_expired_precompile_close_blocked() {
+async fn test_reconcile_expired_precompile_close_checks_channel_state() {
+    use alloy::sol_types::SolValue;
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let store = Arc::new(InMemoryChannelStore::new());
-    let channel_id = B256::repeat_byte(0xab).to_string();
-    let mut state = test_channel_state(&channel_id);
-    state.escrow_contract = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
-    state.closing = true;
-    state.pending_close = Some(super::super::PendingClose {
-        transaction_hash: B256::repeat_byte(0xcc),
-        nonce: 0,
-        cumulative_amount: 1000,
-        signature: vec![1; 65],
-        valid_before: Some(now - 120),
-    });
-    store.insert(&channel_id, state);
-    let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&serde_json::Value::Null);
-    let method = mocked_session_method(store.clone(), asserter.clone());
-    let state = method.reconcile_pending_close(&channel_id).await.unwrap();
-    assert!(state.closing && state.pending_close.is_some() && !state.finalized);
-    assert!(asserter.read_q().is_empty());
+    let valid_before = now - 120;
+    for (deposit, close_requested_at, released) in
+        [(1000u128, 0u32, true), (0, 0, false), (1000, 7, false)]
+    {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = B256::repeat_byte(0xab).to_string();
+        let mut state = test_channel_state(&channel_id);
+        state.escrow_contract = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        state.closing = true;
+        state.pending_close = Some(super::super::PendingClose {
+            transaction_hash: B256::repeat_byte(0xcc),
+            nonce: 0,
+            cumulative_amount: 1000,
+            signature: vec![1; 65],
+            valid_before: Some(valid_before),
+        });
+        store.insert(&channel_id, state);
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&mock_block(9, valid_before + 1));
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&Bytes::from(
+            (
+                alloy::primitives::U256::ZERO,
+                alloy::primitives::U256::from(deposit),
+                close_requested_at,
+            )
+                .abi_encode(),
+        ));
+        let method = mocked_session_method(store.clone(), asserter.clone());
+        let state = method.reconcile_pending_close(&channel_id).await.unwrap();
+        assert_eq!(state.closing, !released);
+        assert_eq!(state.pending_close.is_some(), !released);
+        assert!(!state.finalized);
+        assert!(
+            asserter.read_q().is_empty(),
+            "every mocked RPC call was used"
+        );
+    }
 }
