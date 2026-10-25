@@ -302,7 +302,7 @@ impl TempoProvider {
                 "Tempo charge max_amount {max_amount} is invalid or has more fractional digits than {decimals} decimals allow"
             ))
         })?;
-        self.max_amount = Some(parse_atomic(&atomic)?);
+        self.max_amount = Some(crate::evm::parse_amount(&atomic)?);
         Ok(self)
     }
 
@@ -342,7 +342,7 @@ impl TempoProvider {
                 request.currency
             )));
         }
-        let amount = parse_atomic(&request.amount)?;
+        let amount = crate::evm::parse_amount(&request.amount)?;
         if self.max_atomic_amount.is_some_and(|max| amount > max) {
             return Err(reject(
                 "Tempo charge amount exceeds max_atomic_amount".to_string(),
@@ -387,11 +387,6 @@ impl TempoProvider {
     }
 }
 
-fn parse_atomic(amount: &str) -> Result<alloy::primitives::U256, MppError> {
-    alloy::primitives::U256::from_str_radix(amount, 10)
-        .map_err(|_| MppError::InvalidAmount(format!("Invalid amount: {amount}")))
-}
-
 impl PaymentProvider for TempoProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
         method == crate::protocol::methods::tempo::METHOD_NAME
@@ -417,6 +412,13 @@ impl PaymentProvider for TempoProvider {
         &self,
         challenges: &[&'a PaymentChallenge],
     ) -> Option<&'a PaymentChallenge> {
+        // A cap without a currency pin is a configuration error, not a policy
+        // skip: hand the first offer to `pay`, which reports it.
+        if self.currencies.is_none()
+            && (self.max_amount.is_some() || self.max_atomic_amount.is_some())
+        {
+            return challenges.first().copied();
+        }
         challenges
             .iter()
             .copied()
@@ -1084,8 +1086,33 @@ mod tests {
                 provider.check_policy(&challenge),
                 Err(MppError::InvalidConfig(_))
             ));
-            assert!(provider.select_challenge(&[&challenge]).is_none());
+            // Selection keeps the offer so `pay` surfaces the configuration error.
+            assert_eq!(
+                provider.select_challenge(&[&challenge]).map(|c| &c.id),
+                Some(&challenge.id)
+            );
         }
+    }
+
+    #[test]
+    fn test_select_challenge_skips_malformed_amounts() {
+        let provider = policy_provider("https://rpc.example.com")
+            .with_currencies([POLICY_CURRENCY])
+            .with_max_atomic_amount(alloy::primitives::U256::from(100u64));
+        let empty = policy_challenge("empty", "", POLICY_CURRENCY);
+        let underscore = policy_challenge("underscore", "1_0", POLICY_CURRENCY);
+        let valid = policy_challenge("valid", "10", POLICY_CURRENCY);
+        assert_eq!(
+            provider
+                .select_challenge(&[&empty, &underscore, &valid])
+                .unwrap()
+                .id,
+            "valid"
+        );
+        assert!(matches!(
+            provider.check_policy(&underscore),
+            Err(MppError::InvalidAmount(_))
+        ));
     }
 
     #[test]
