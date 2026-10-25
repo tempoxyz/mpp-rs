@@ -574,6 +574,9 @@ impl ChargeChallenger for ScopedChallenger {
         options: ChallengeOptions,
     ) -> Result<PaymentChallenge, String> {
         let mut request = serde_json::json!({"amount": amount});
+        if let Some(description) = options.description {
+            request["description"] = description.into();
+        }
         if let Some(scope) = options.mppx_scope {
             request["_mppx_scope"] = scope;
         }
@@ -663,6 +666,54 @@ async fn test_custom_challenger_verifies_scoped_credential_by_default() {
 
     let response = app.oneshot(get_with("/other", Some(&auth))).await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn test_custom_challenger_default_accepts_credential_with_description() {
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    struct Described;
+    impl ChargeConfig for Described {
+        fn amount() -> &'static str {
+            "0.01"
+        }
+        fn description() -> Option<&'static str> {
+            Some("Premium content")
+        }
+    }
+
+    async fn paid(_charge: MppCharge<Described>) -> &'static str {
+        "paid"
+    }
+    async fn paid_with_body(_charge: MppChargeWithBody<Described>) -> &'static str {
+        "paid"
+    }
+
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/premium", get(paid).post(paid_with_body))
+        .with_state(state);
+    let request = |method: &str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder()
+            .method(method)
+            .uri("/premium");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::from("{}")).unwrap()
+    };
+
+    for method in ["GET", "POST"] {
+        let response = app.clone().oneshot(request(method, None)).await.unwrap();
+        let auth = credential_for(&response);
+        let response = app
+            .clone()
+            .oneshot(request(method, Some(&auth)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+    }
 }
 
 /// Pays the challenge in a 402 response by echoing it in a credential.

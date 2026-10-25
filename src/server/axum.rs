@@ -440,7 +440,8 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     /// With a scope, the default re-issues this route's challenge with
     /// [`challenge`](Self::challenge) and rejects a credential whose echoed
     /// challenge does not carry the route's scope in `_mppx_scope` or whose
-    /// method, intent or request differs from it, so a credential issued for
+    /// method, intent or pinned request fields (amount, currency, recipient
+    /// and method details, as in mppx) differ from it, so a credential issued for
     /// another route, amount or HTTP method is rejected, as mppx's
     /// `verifyCredential` does. It then delegates to
     /// [`verify_payment_for_amount`](Self::verify_payment_for_amount), which
@@ -1292,12 +1293,39 @@ fn check_route_binding(
     let expected_request = expected.request.decode_value().map_err(|e| e.to_string())?;
     if echo.method != expected.method
         || echo.intent != expected.intent
-        || request != expected_request
+        || pinned_request_binding(&request) != pinned_request_binding(&expected_request)
         || echo.digest != expected.digest
     {
         return Err("credential request does not match this route's requirements".into());
     }
     Ok(())
+}
+
+/// The request fields a credential must share with the route's challenge.
+///
+/// Mirrors mppx's `getPinnedRequestBinding`: only the economically
+/// significant fields are compared, read from the request or its
+/// `methodDetails`, so fields such as `description` that the re-issued
+/// challenge may lack do not reject a valid credential. The HMAC check in
+/// `verify_payment` covers the rest of the echoed request.
+fn pinned_request_binding(request: &serde_json::Value) -> Vec<Option<&serde_json::Value>> {
+    let details = request.get("methodDetails");
+    let field = |name: &str| {
+        request
+            .get(name)
+            .or_else(|| details.and_then(|d| d.get(name)))
+    };
+    let detail = |name: &str| details.and_then(|d| d.get(name));
+    vec![
+        field("amount"),
+        field("currency"),
+        field("recipient"),
+        field("chainId"),
+        detail("memo"),
+        detail("sessionProtocol"),
+        detail("splits"),
+        field("unitType"),
+    ]
 }
 
 fn mppx_scope_from_parts(parts: &http_types::request::Parts) -> Option<serde_json::Value> {
