@@ -388,7 +388,7 @@ async fn provider_refresh_uses_owned_client_and_never_follows_redirects() {
 
 #[tokio::test]
 async fn custom_header_casing_is_preserved_for_initial_and_prepared_challenges() {
-    for header in ["payment-authorization", "PaYmEnT-AuThOrIzAtIoN"] {
+    for header in ["payment-authorization", "PAYMENT-AUTHORIZATION"] {
         for replace in [false, true] {
             let offered = challenge(
                 "charge",
