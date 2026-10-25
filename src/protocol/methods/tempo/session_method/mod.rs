@@ -9,6 +9,7 @@ mod chain;
 mod close;
 mod open;
 mod payload;
+mod precompile;
 mod receipt;
 mod state;
 mod store;

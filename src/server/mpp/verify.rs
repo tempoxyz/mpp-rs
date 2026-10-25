@@ -198,6 +198,8 @@ where
     }
 
     /// Validate a credential against expected route values without accepting payment.
+    ///
+    /// Applies core comparisons and [`ChargeMethod::validate_expected_request`].
     pub async fn validate_credential_with_expected_request(
         &self,
         credential: &PaymentCredential,
@@ -209,6 +211,8 @@ where
     }
 
     /// Validate a credential against expected route values and body bytes.
+    ///
+    /// Applies core comparisons and [`ChargeMethod::validate_expected_request`].
     pub async fn validate_credential_with_expected_request_and_body(
         &self,
         credential: &PaymentCredential,
@@ -251,6 +255,8 @@ where
     }
 
     /// Re-validate and accept a credential matching expected route values.
+    ///
+    /// Applies core comparisons and [`ChargeMethod::validate_expected_request`].
     pub async fn broadcast_credential_with_expected_request(
         &self,
         credential: &PaymentCredential,
@@ -262,6 +268,8 @@ where
     }
 
     /// Re-validate and accept a credential matching expected route values and body bytes.
+    ///
+    /// Applies core comparisons and [`ChargeMethod::validate_expected_request`].
     pub async fn broadcast_credential_with_expected_request_and_body(
         &self,
         credential: &PaymentCredential,
@@ -444,7 +452,7 @@ where
             }
         }
 
-        Ok(())
+        self.method.validate_expected_request(request, expected)
     }
 
     /// Validate a charge credential with an explicit request without accepting payment.

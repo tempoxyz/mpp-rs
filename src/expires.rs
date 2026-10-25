@@ -58,7 +58,7 @@ pub fn years(n: u64) -> String {
 /// # Errors
 ///
 /// - [`MppError::InvalidChallenge`] if `expires` is missing or malformed
-/// - [`MppError::PaymentExpired`] if the timestamp is in the past
+/// - [`MppError::PaymentExpired`] if the timestamp is now or in the past
 ///
 /// # Examples
 ///
@@ -71,6 +71,14 @@ pub fn years(n: u64) -> String {
 /// assert!(expires::assert(Some(&expires::hours(1)), None).is_ok());
 /// ```
 pub fn assert(expires: Option<&str>, challenge_id: Option<&str>) -> Result<(), MppError> {
+    assert_at(expires, challenge_id, OffsetDateTime::now_utc())
+}
+
+fn assert_at(
+    expires: Option<&str>,
+    challenge_id: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<(), MppError> {
     let expires = expires.ok_or_else(|| match challenge_id {
         Some(id) => MppError::invalid_challenge(id, "missing required expires field"),
         None => MppError::invalid_challenge_reason("missing required expires field"),
@@ -81,7 +89,7 @@ pub fn assert(expires: Option<&str>, challenge_id: Option<&str>) -> Result<(), M
         None => MppError::invalid_challenge_reason("malformed expires timestamp"),
     })?;
 
-    if dt < OffsetDateTime::now_utc() {
+    if dt <= now {
         return Err(MppError::payment_expired(expires));
     }
 
@@ -171,6 +179,14 @@ mod tests {
     fn test_assert_expired() {
         let err = assert(Some("2020-01-01T00:00:00Z"), None).unwrap_err();
         assert!(err.to_string().contains("2020-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_assert_expires_at_now_is_expired() {
+        let now = OffsetDateTime::parse("2030-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let err = assert_at(Some("2030-01-01T00:00:00Z"), None, now).unwrap_err();
+        assert!(matches!(err, MppError::PaymentExpired(_)));
+        assert!(assert_at(Some("2030-01-01T00:00:00.001Z"), None, now).is_ok());
     }
 
     #[test]
