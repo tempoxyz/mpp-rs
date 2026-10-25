@@ -69,12 +69,25 @@ where
                 "channel has a pending close request",
             ));
         }
-        // Amounts settled on chain, possibly by another instance, count as
+        // Record the on-chain settlement. Settling a voucher this store
+        // accepted does not deliver its unspent credit, so only amounts above
+        // the highest accepted voucher (settled by another instance) count as
         // spent before the stream charges again.
         self.store
             .update_channel(
                 &channel_id,
-                Box::new(move |current| Ok(current.map(|state| state.refresh_on_chain(&on_chain)))),
+                Box::new(move |current| {
+                    Ok(current.map(|state| {
+                        let spent = if on_chain.settled > state.highest_voucher_amount {
+                            std::cmp::max(on_chain.settled, state.spent)
+                        } else {
+                            state.spent
+                        };
+                        let mut state = state.refresh_on_chain(&on_chain);
+                        state.spent = spent;
+                        state
+                    }))
+                }),
             )
             .await?
             .ok_or_else(closed)?;

@@ -120,6 +120,39 @@ async fn test_verify_stream_counts_settled_amount_as_spent() {
     assert_eq!(stored.spent, 40_000);
 }
 
+/// Settling the highest accepted voucher mid-stream records the settlement
+/// but keeps the payer's unspent credit: only delivered value counts as spent.
+#[tokio::test]
+async fn test_verify_stream_keeps_credit_when_accepted_voucher_settles() {
+    let asserter = Asserter::new();
+    push_settled_escrow(&asserter, 100_000, 0, 1_000);
+    let (channel_id, method) = streaming_method(asserter);
+    method
+        .store
+        .update_channel(
+            &channel_id,
+            Box::new(|state| {
+                Ok(state.map(|state| ChannelState {
+                    highest_voucher_amount: 1_000,
+                    spent: 100,
+                    ..state
+                }))
+            }),
+        )
+        .await
+        .unwrap();
+
+    method.verify_stream(&channel_id).await.unwrap();
+    let stored = method
+        .store
+        .get_channel(&channel_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.settled_on_chain, 1_000);
+    assert_eq!(stored.spent, 100);
+}
+
 #[tokio::test]
 async fn test_verify_stream_evicts_expired_checks() {
     let asserter = Asserter::new();
