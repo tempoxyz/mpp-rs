@@ -102,6 +102,7 @@ where
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     machine_token_enabled: None,
+///     fee_token: None,
 ///     operator: None,
 ///     settlement_adapter: None,
 ///     settlement_recipient: None,
@@ -132,6 +133,10 @@ pub struct TempoSessionMethodDetails {
     /// canonical swapper into the request currency.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_token_enabled: Option<bool>,
+
+    /// Token in which a sponsoring server pays gas for channel opens and top-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_token: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settlement_adapter: Option<String>,
@@ -242,6 +247,10 @@ pub enum SessionCredentialPayload {
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
         signature: String,
+        /// TIP-1034 cooperative close authorization, a distinct EIP-712
+        /// signature over the channel and amount that servers require.
+        #[serde(rename = "closeSignature", skip_serializing_if = "Option::is_none")]
+        close_signature: Option<String>,
     },
 }
 
@@ -441,6 +450,7 @@ mod tests {
             chain_id: Some(42431),
             fee_payer: Some(true),
             machine_token_enabled: Some(true),
+            fee_token: None,
             settlement_adapter: None,
             settlement_recipient: None,
             settlement_token: None,
@@ -482,6 +492,7 @@ mod tests {
             chain_id: None,
             fee_payer: None,
             machine_token_enabled: None,
+            fee_token: None,
             settlement_adapter: None,
             settlement_recipient: None,
             settlement_token: None,
@@ -581,6 +592,7 @@ mod tests {
                 settlement_route: Some(route.clone()),
                 cumulative_amount: "1".to_string(),
                 signature: "0xsig".to_string(),
+                close_signature: None,
             },
         ];
 
@@ -719,9 +731,11 @@ mod tests {
             settlement_route: None,
             cumulative_amount: "20000".to_string(),
             signature: "0xclosesig".to_string(),
+            close_signature: Some("0xcloseauth".to_string()),
         };
 
         let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"closeSignature\":\"0xcloseauth\""));
         assert!(json.contains("\"action\":\"close\""));
         assert!(json.contains("\"channelId\":\"0xchannel123\""));
         assert!(json.contains("\"cumulativeAmount\":\"20000\""));

@@ -15,6 +15,9 @@ use super::DEFAULT_MAX_PAYMENT_RETRIES;
 ///
 /// This trait adds a `.send_with_payment()` method that automatically handles
 /// HTTP 402 responses by executing a payment and retrying the request.
+/// By default, set `Accept-Payment` on the request itself. Opaque reqwest
+/// client defaults never authorize payment. To opt into the previous implicit
+/// behavior, explicitly select `AcceptPaymentPolicy::Always`.
 /// Challenges that select `Payment-Authorization` are rejected before payment:
 /// this API accepts a caller-owned reqwest client whose redirect policy cannot
 /// be changed for the credential-bearing retry.
@@ -30,6 +33,7 @@ use super::DEFAULT_MAX_PAYMENT_RETRIES;
 ///
 /// let resp = client
 ///     .get("https://api.example.com/paid")
+///     .header("Accept-Payment", "tempo/charge")
 ///     .send_with_payment(&provider)
 ///     .await?;
 /// ```
@@ -37,12 +41,12 @@ pub trait PaymentExt: Sized {
     /// Send the request, automatically handling 402 Payment Required responses.
     ///
     /// Equivalent to [`send_with_payment_policy`](Self::send_with_payment_policy)
-    /// with [`AcceptPaymentPolicy::Always`].
+    /// with [`AcceptPaymentPolicy::Explicit`].
     fn send_with_payment<P: PaymentProvider>(
         self,
         provider: &P,
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send {
-        self.send_with_payment_policy(provider, &AcceptPaymentPolicy::Always)
+        self.send_with_payment_policy(provider, &AcceptPaymentPolicy::Explicit)
     }
 
     /// Continue an MPP flow from an initial response already sent with this
@@ -58,7 +62,7 @@ pub trait PaymentExt: Sized {
 
     /// Like [`send_with_payment`](Self::send_with_payment) but only injects
     /// `Accept-Payment` when `policy` permits the request URL. The 402-retry
-    /// path is unaffected.
+    /// path requires an explicit request preference or a policy permitting this URL.
     fn send_with_payment_policy<P: PaymentProvider>(
         self,
         provider: &P,
@@ -74,7 +78,7 @@ pub trait PaymentExt: Sized {
     ) -> impl std::future::Future<Output = Result<Response, HttpError>> + Send {
         self.send_with_payment_policy_max_retries(
             provider,
-            &AcceptPaymentPolicy::Always,
+            &AcceptPaymentPolicy::Explicit,
             max_payment_retries,
         )
     }
@@ -130,7 +134,7 @@ impl PaymentExt for RequestBuilder {
         send_with_payment(
             self,
             provider,
-            &AcceptPaymentPolicy::Always,
+            &AcceptPaymentPolicy::Explicit,
             ClientEvents::default(),
             DEFAULT_MAX_PAYMENT_RETRIES,
             Some(response),

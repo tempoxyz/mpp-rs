@@ -4,15 +4,22 @@
 //! payment methods on every cross-origin request, which can break CORS
 //! preflight and leak wallet capabilities.
 //!
-//! Defaults to [`AcceptPaymentPolicy::Always`] for backwards compatibility.
+//! Defaults to explicit request-level preferences because reqwest client defaults
+//! cannot be inspected before the payment flow.
 
 use reqwest::Url;
 
 /// Policy controlling when the `Accept-Payment` header is injected.
 #[derive(Clone, Debug, Default)]
 pub enum AcceptPaymentPolicy {
-    /// Always inject (default).
+    /// Require a request-level `Accept-Payment` preference before automatic payment.
+    /// Client default headers are opaque to reqwest middleware and cannot authorize payment.
     #[default]
+    Explicit,
+    /// Never create payment credentials, even with a request-level preference.
+    Disabled,
+    /// Explicitly permit automatic payment and inject provider preferences.
+    /// This overrides opaque client defaults; request-level preferences still win.
     Always,
     /// Inject only when the request URL origin matches `same_origin`
     /// (`scheme://host[:port]`).
@@ -29,7 +36,7 @@ impl AcceptPaymentPolicy {
     pub fn allows(&self, url: &Url) -> bool {
         match self {
             Self::Always => true,
-            Self::Never => false,
+            Self::Never | Self::Explicit | Self::Disabled => false,
             Self::SameOrigin { same_origin } => match Url::parse(same_origin) {
                 Ok(parsed) => url.origin() == parsed.origin(),
                 Err(_) => false,
@@ -86,9 +93,9 @@ mod tests {
     }
 
     #[test]
-    fn default_is_always() {
+    fn default_requires_explicit_preference() {
         let p = AcceptPaymentPolicy::default();
-        assert!(p.allows(&url("https://example.com/")));
+        assert!(!p.allows(&url("https://example.com/")));
     }
 
     #[test]

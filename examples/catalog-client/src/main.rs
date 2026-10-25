@@ -99,7 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(RequestBody::Raw(bytes)) => request.body(bytes),
         None => request,
     };
-    let response = request.send_with_payment(&providers).await?;
+    let response = request
+        .header(
+            "Accept-Payment",
+            "tempo/charge, tempo/session, stripe/charge",
+        )
+        .send_with_payment(&providers)
+        .await?;
     let status = response.status();
     let response_body = response.text().await?;
     println!("status={status}");

@@ -9,7 +9,7 @@
 pub mod channel_ops;
 pub mod recovery;
 pub mod store;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use alloy::{
@@ -36,7 +36,10 @@ use self::recovery::{
 use self::store::{ChannelStore, ChannelStoreLease, MemoryChannelStore, StoredChannelEntry};
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
-use crate::client::{PaymentContext, PaymentProvider};
+use crate::client::{
+    ClientEvent, ClientEvents, DepositContext, ManagementTransport, PaymentContext,
+    PaymentEventFuture, PaymentProvider, PaymentUpdateContext,
+};
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
@@ -114,6 +117,8 @@ pub struct TempoSessionProvider {
     top_up_amount: Option<u128>,
     /// Stablecoin used to acquire the session currency before open/top-up.
     autoswap: Option<AutoswapConfig>,
+    /// Token paying gas for unsponsored opens and top-ups.
+    fee_token: Option<Address>,
     /// Channel registry: key is `payee:currency:escrow` (lowercase).
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Durable channel view. Recovery policy remains owned by this provider.
@@ -128,8 +133,101 @@ pub struct TempoSessionProvider {
     last_challenge: Arc<Mutex<Option<PaymentChallenge>>>,
     /// Serializes channel recovery, cumulative advancement, and credential creation.
     payment_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes funding decisions per payment scope, including background
+    /// top-ups that do not hold `payment_lock` while they are signed and
+    /// submitted.
+    funding_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Keeps the process and durable-store leases until the server response is reconciled.
     pending_payment_leases: Arc<Mutex<HashMap<String, SessionPaymentLease>>>,
+    /// Requests' worth of balance, at the latest price, kept prepaid per URL. Zero disables it.
+    prepaid_requests: u32,
+    /// Reusable challenge and charged amounts from the latest receipt, by request URL.
+    prepaid: Arc<Mutex<HashMap<String, PrepaidVoucher>>>,
+    /// Channel IDs with a background top-up in flight.
+    topping_up: Arc<Mutex<HashSet<String>>>,
+    /// What the server charged for requests paid through this provider.
+    spend: Arc<Mutex<SpendLedger>>,
+    /// Receives `channel.deposit` events for accepted opens and top-ups.
+    events: ClientEvents,
+    trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
+}
+
+/// Work a session SSE event triggers, such as sending a voucher.
+pub type SessionEventFuture = PaymentEventFuture;
+
+/// What a session provider's channels were charged since it was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionSpend {
+    /// Total the server charged for requests paid through this provider.
+    pub spent: u128,
+    /// Charge for the latest paid request.
+    pub last: Option<u128>,
+    /// Deposit left in the channels it paid from after the server's charges.
+    pub remaining: u128,
+}
+
+/// Server charges from receipts: each request costs the change in its
+/// channel's `spent`, or its quoted price the first time a channel is seen.
+#[derive(Debug, Default)]
+struct SpendLedger {
+    channels: HashMap<String, u128>,
+    spent: u128,
+    last: Option<u128>,
+}
+
+impl SpendLedger {
+    fn record(&mut self, channel_id: &str, spent: u128, quoted: Option<u128>) -> u128 {
+        let cost = match self.channels.get(channel_id) {
+            Some(previous) => spent.saturating_sub(*previous),
+            None => quoted.unwrap_or_default(),
+        };
+        self.channels.insert(channel_id.to_owned(), spent);
+        self.spent += cost;
+        self.last = Some(cost);
+        cost
+    }
+
+    /// Applies a receipt the server sent while the latest request's response
+    /// streamed, and returns how much it changed the channel's `spent`.
+    /// A channel without an earlier receipt only records its baseline.
+    fn update(&mut self, channel_id: &str, spent: u128) -> Option<i128> {
+        let previous = self.channels.insert(channel_id.to_owned(), spent)?;
+        let change = i128::try_from(spent).ok()? - i128::try_from(previous).ok()?;
+        if change == 0 {
+            return None;
+        }
+        self.spent = self.spent.saturating_add_signed(change);
+        self.last = self.last.map(|last| last.saturating_add_signed(change));
+        Some(change)
+    }
+}
+
+/// Body of an mppx `payment-need-voucher` SSE event.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NeedVoucherEvent {
+    channel_id: String,
+    required_cumulative: String,
+    accepted_cumulative: String,
+}
+
+/// A signed top-up awaiting submission.
+struct PreparedTopUp {
+    key: String,
+    chain_id: u64,
+    cumulative_amount: u128,
+    credential: PaymentCredential,
+    headers: reqwest::header::HeaderMap,
+    new_deposit: u128,
+}
+
+/// What a prepaid voucher for a URL is sized from: its latest receipt.
+#[derive(Clone, Debug)]
+struct PrepaidVoucher {
+    challenge: PaymentChallenge,
+    channel_id: String,
+    spent: u128,
+    price: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -144,10 +242,16 @@ struct SessionPaymentLease {
     _store: Box<dyn ChannelStoreLease>,
 }
 
-struct ApplicationTopUp<'a> {
-    client: &'a reqwest::Client,
-    url: &'a str,
-    headers: reqwest::header::HeaderMap,
+enum TopUpRoute<'a> {
+    Http {
+        client: &'a reqwest::Client,
+        url: &'a str,
+        headers: reqwest::header::HeaderMap,
+    },
+    Management {
+        transport: &'a dyn ManagementTransport,
+        url: &'a str,
+    },
 }
 
 impl TempoSessionProvider {
@@ -174,6 +278,7 @@ impl TempoSessionProvider {
             default_deposit: None,
             top_up_amount: None,
             autoswap: None,
+            fee_token: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_store: Arc::new(MemoryChannelStore::default()),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
@@ -181,8 +286,126 @@ impl TempoSessionProvider {
             on_channel_update: None,
             last_challenge: Arc::new(Mutex::new(None)),
             payment_lock: Arc::new(tokio::sync::Mutex::new(())),
+            funding_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_payment_leases: Arc::new(Mutex::new(HashMap::new())),
+            prepaid_requests: 0,
+            prepaid: Arc::new(Mutex::new(HashMap::new())),
+            topping_up: Arc::new(Mutex::new(HashSet::new())),
+            spend: Arc::default(),
+            events: ClientEvents::default(),
+            trusted_tempo_proof_realms: Vec::new(),
         })
+    }
+
+    /// What the server charged for requests paid through this provider and its
+    /// clones, and the deposit left in the channels they paid from.
+    pub fn spend(&self) -> SessionSpend {
+        let ledger = self.spend.lock().unwrap();
+        let remaining = self
+            .channels
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|entry| {
+                let spent = ledger.channels.get(&entry.channel_id.to_string())?;
+                Some(entry.deposit.saturating_sub(*spent))
+            })
+            .sum();
+        SessionSpend {
+            spent: ledger.spent,
+            last: ledger.last,
+            remaining,
+        }
+    }
+
+    /// Trust a non-hostname proof realm only at the specified HTTP origin.
+    pub fn with_trusted_tempo_proof_realm(
+        mut self,
+        origin: reqwest::Url,
+        realm: impl Into<String>,
+    ) -> Self {
+        self.set_trusted_tempo_proof_realm(origin, realm.into());
+        self
+    }
+
+    /// Replace the caller-specific pins on a session cloned from shared channel state.
+    pub(crate) fn replace_trusted_tempo_proof_realms(&mut self, realms: &[(reqwest::Url, String)]) {
+        self.trusted_tempo_proof_realms = realms.to_vec();
+    }
+
+    /// Handle an mppx session SSE event from a response to `url`: answer
+    /// `payment-need-voucher` with a voucher and resolve pending opens from
+    /// the accepted amounts in it and in `payment-receipt`. Returns `None`
+    /// for other events.
+    pub fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<SessionEventFuture> {
+        let session = self.clone();
+        let amount = |value: &str| value.parse::<u128>().mpp_config("invalid session amount");
+        match name {
+            "payment-need-voucher" => {
+                let parsed = serde_json::from_str::<NeedVoucherEvent>(data)
+                    .mpp_config("invalid payment-need-voucher event");
+                let (client, url) = (client.clone(), url.to_owned());
+                Some(Box::pin(async move {
+                    let event = parsed?;
+                    session
+                        .acknowledge_accepted(
+                            &event.channel_id,
+                            amount(&event.accepted_cumulative)?,
+                        )
+                        .await?;
+                    session
+                        .send_voucher(
+                            &client,
+                            &url,
+                            &event.channel_id,
+                            amount(&event.required_cumulative)?,
+                        )
+                        .await
+                }))
+            }
+            "payment-receipt" => {
+                let parsed =
+                    serde_json::from_str::<crate::protocol::methods::tempo::SessionReceipt>(data)
+                        .mpp_config("invalid payment-receipt event");
+                let url = url.parse::<reqwest::Url>().ok();
+                Some(Box::pin(async move {
+                    let receipt = parsed?;
+                    session
+                        .acknowledge_accepted(
+                            &receipt.channel_id,
+                            amount(&receipt.accepted_cumulative)?,
+                        )
+                        .await?;
+                    session
+                        .record_stream_receipt(url, &receipt.channel_id, amount(&receipt.spent)?)
+                        .await;
+                    Ok(())
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    /// Keep `requests` requests' worth of balance, at the latest request's
+    /// price, prepaid on the channel, and send the voucher with the next request
+    /// to the same URL instead of waiting for a `402`.
+    ///
+    /// Requires a server whose session challenges stay valid for later requests
+    /// to the same route and charge each request its own price (mppx
+    /// `reusableChallenges`). Any `402` answer falls back to the normal flow.
+    ///
+    /// With a top-up amount configured, the channel is also topped up in the
+    /// background once its deposit no longer covers that balance plus the next
+    /// request, so the on-chain top-up does not hold up a later request.
+    pub fn with_prepaid_requests(mut self, requests: u32) -> Self {
+        self.prepaid_requests = requests;
+        self
     }
 
     /// Pin the escrow contract address.
@@ -258,6 +481,17 @@ impl TempoSessionProvider {
         self.autoswap.as_ref()
     }
 
+    /// Pay gas for unsponsored channel opens and top-ups in `token`.
+    ///
+    /// Without it, gas is paid in the autoswap input token, or else in the
+    /// session currency. A recipient-restricted currency such as MACH cannot
+    /// pay its own gas, so a MACH session without fee sponsorship needs a
+    /// separate fee token.
+    pub fn with_fee_token(mut self, token: Address) -> Self {
+        self.fee_token = Some(token);
+        self
+    }
+
     /// Persist reusable native MPP channels in `store`.
     ///
     /// The store is only a cache. Every restored channel is checked against
@@ -265,6 +499,35 @@ impl TempoSessionProvider {
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
         self.channel_store = store;
         self
+    }
+
+    /// Report `channel.deposit` events to `events` when the server accepts a
+    /// channel's open or a top-up, including top-ups made in the background.
+    pub fn with_events(mut self, events: ClientEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Reports an accepted deposit without waiting for the observers.
+    fn report_deposit(&self, url: &str, entry: &ChannelEntry, amount: u128, opened: bool) {
+        let (Ok(url), Ok(runtime)) = (url.parse(), tokio::runtime::Handle::try_current()) else {
+            return;
+        };
+        let events = self.events.clone();
+        let context = DepositContext {
+            url,
+            channel_id: entry.channel_id.to_string(),
+            currency: entry
+                .descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.token.clone()),
+            amount,
+            deposit: entry.deposit,
+            opened,
+        };
+        runtime.spawn(async move {
+            events.emit(ClientEvent::Deposit(context)).await;
+        });
     }
 
     /// Set a callback for channel state changes.
@@ -342,9 +605,36 @@ impl TempoSessionProvider {
     }
 
     fn fee_token(&self, currency: Address) -> Address {
-        self.autoswap
-            .as_ref()
-            .map_or(currency, |config| config.token_in)
+        self.fee_token
+            .or_else(|| self.autoswap.as_ref().map(|config| config.token_in))
+            .unwrap_or(currency)
+    }
+
+    /// The gas token for a channel open or top-up answering `session_req`.
+    ///
+    /// A sponsoring server pays gas in the `feeToken` it advertises and rejects a
+    /// transaction naming another token, such as a MACH channel defaulting to its own
+    /// currency. Without sponsorship, the configured fee token wins, then the
+    /// advertised one.
+    fn session_fee_token(
+        &self,
+        session_req: &SessionRequest,
+        currency: Address,
+    ) -> Result<Address, MppError> {
+        let advertised = session_req
+            .tempo_session_details()
+            .ok()
+            .and_then(|details| details.fee_token)
+            .map(|token| token.parse::<Address>())
+            .transpose()
+            .mpp_config("invalid session feeToken")?;
+        Ok(match advertised {
+            Some(token) if session_req.fee_payer() => token,
+            advertised => self
+                .fee_token
+                .or(advertised)
+                .unwrap_or_else(|| self.fee_token(currency)),
+        })
     }
 
     fn required_top_up(
@@ -390,6 +680,7 @@ impl TempoSessionProvider {
             escrow: entry.escrow_contract,
             chain_id: entry.chain_id,
             opened: entry.opened,
+            pending_open: None,
         })
     }
 
@@ -402,12 +693,39 @@ impl TempoSessionProvider {
         Self::stored_entry(entry).map(|stored| Some(stored.key()))
     }
 
+    /// Raises a channel to the vouchers and deposit that other processes
+    /// sharing the store have recorded for it since this process last used it.
+    async fn merge_stored_channel(
+        &self,
+        key: &str,
+        entry: &mut ChannelEntry,
+    ) -> Result<(), MppError> {
+        if let Some(stored) = self
+            .channel_store
+            .get(key)
+            .await
+            .map_err(Self::store_error)?
+            .filter(|stored| stored.channel_id == entry.channel_id)
+        {
+            entry.cumulative_amount = entry.cumulative_amount.max(stored.cumulative_amount);
+            entry.deposit = entry.deposit.max(stored.deposit);
+        }
+        Ok(())
+    }
+
     async fn persist_channel(&self, entry: &ChannelEntry) -> Result<(), MppError> {
         if !is_precompile_escrow(entry.escrow_contract) {
             return Ok(());
         }
+        let mut stored = Self::stored_entry(entry)?;
+        stored.pending_open = self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .get(&entry.channel_id.to_string())
+            .map(|pending| pending.challenge_id.clone());
         self.channel_store
-            .set(&Self::stored_entry(entry)?)
+            .set(&stored)
             .await
             .map_err(Self::store_error)
     }
@@ -704,6 +1022,13 @@ impl TempoSessionProvider {
             let snapshot_channel_id = snapshot.channel_id.parse().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot channelId: {error}"))
             })?;
+            if stored.as_ref().is_some_and(|entry| {
+                entry.pending_open.is_some() && entry.channel_id != snapshot_channel_id
+            }) {
+                return Err(MppError::InvalidConfig(
+                    "snapshot does not match pending channel".into(),
+                ));
+            }
             let state = read_on_chain_channel_state(provider, snapshot_channel_id).await?;
             let mut recovered = hydrate_session_snapshot(snapshot, scope, state)?;
             let spent = snapshot.spent.parse::<u128>().map_err(|error| {
@@ -757,11 +1082,21 @@ impl TempoSessionProvider {
             return Ok(None);
         }
         let recovered = recover_stored_channel(stored, scope, state)?;
+        let pending = recovered.pending_open.clone();
+        if let Some(challenge_id) = &pending {
+            self.pending_opens.lock().unwrap().insert(
+                recovered.channel_id.to_string(),
+                PendingOpen {
+                    challenge_id: challenge_id.clone(),
+                    store_key: Some(store_key.to_owned()),
+                },
+            );
+        }
         self.channel_store
             .set(&recovered)
             .await
             .map_err(Self::store_error)?;
-        Self::channel_entry(recovered).map(|entry| Some((entry, false)))
+        Self::channel_entry(recovered).map(|entry| Some((entry, pending.is_some())))
     }
 
     /// Rehydrate a reusable native session through the server's authenticated
@@ -942,6 +1277,20 @@ impl TempoSessionProvider {
                 return Ok(None);
             };
 
+            if reqwest::Url::parse(url).ok().is_none_or(|requested| {
+                requested.origin() != challenge_response.url().origin()
+                    || crate::client::flow::is_cross_realm_proof_with_trust(
+                        &challenge,
+                        &requested,
+                        &headers,
+                        self.trusted_tempo_proof_realm(&requested),
+                    )
+            }) {
+                return Err(MppError::InvalidConfig(
+                    "refusing to sign a session bootstrap proof for a different HTTP origin or realm".into(),
+                ));
+            }
+
             ensure_redirect_safe_credential_header(&challenge)?;
             let request: ChargeRequest = challenge.request.decode()?;
             let chain_id = request
@@ -1036,6 +1385,18 @@ impl TempoSessionProvider {
             },
             state,
         )?;
+        if let Some(stored) = self
+            .channel_store
+            .get(&recovered.key())
+            .await
+            .map_err(Self::store_error)?
+        {
+            if stored.pending_open.is_some() && stored.channel_id != recovered.channel_id {
+                return Err(MppError::InvalidConfig(
+                    "snapshot does not match pending channel".into(),
+                ));
+            }
+        }
         self.channel_store
             .set(&recovered)
             .await
@@ -1049,6 +1410,7 @@ impl TempoSessionProvider {
             .unwrap()
             .insert(entry.channel_id.to_string(), key.clone());
         self.channels.lock().unwrap().insert(key, entry.clone());
+        self.commit_referenced_open(&entry.channel_id.to_string());
         self.notify_update(&entry);
         Ok(Some(recovered))
     }
@@ -1066,6 +1428,236 @@ impl TempoSessionProvider {
             .map(|e| e.cumulative_amount)
             .next()
             .unwrap_or(0)
+    }
+
+    /// Starts a background top-up when the channel's deposit no longer covers
+    /// the prepaid balance plus the next request at the latest price.
+    fn top_up_ahead(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        channel_id: &str,
+        price: u128,
+    ) {
+        let (Some(amount), Some(client), Ok(runtime)) = (
+            self.top_up_amount,
+            context.http_client.clone(),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
+        };
+        let entry = {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(channel_id)
+                .cloned();
+            key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned())
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        let reserve = price.saturating_mul(u128::from(self.prepaid_requests) + 1);
+        if entry.deposit.saturating_sub(entry.cumulative_amount) >= reserve {
+            return;
+        }
+        if !self
+            .topping_up
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_owned())
+        {
+            return;
+        }
+        let provider = self.clone();
+        let url = context.url.to_string();
+        let headers = context.headers.clone();
+        let challenge = challenge.clone();
+        let channel_id = channel_id.to_owned();
+        runtime.spawn(async move {
+            let _ = provider
+                .top_up_in_background(
+                    &client,
+                    &url,
+                    headers,
+                    &challenge,
+                    &channel_id,
+                    amount,
+                    reserve,
+                )
+                .await;
+            provider.topping_up.lock().unwrap().remove(&channel_id);
+        });
+    }
+
+    /// Sizes the prepaid voucher for the receipt's URL from what the server
+    /// charged, and tops the channel up ahead of it when needed.
+    fn prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        channel_id: String,
+        spent: u128,
+        quoted: Option<u128>,
+    ) {
+        if self.prepaid_requests == 0 {
+            return;
+        }
+        let url = context.url.to_string();
+        let mut prepaid = self.prepaid.lock().unwrap();
+        let price = prepaid
+            .get(&url)
+            .filter(|previous| previous.channel_id == channel_id && spent > previous.spent)
+            .map(|previous| spent - previous.spent)
+            .or(quoted)
+            .filter(|price| *price > 0);
+        let Some(price) = price else {
+            return;
+        };
+        prepaid.insert(
+            url,
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id: channel_id.clone(),
+                spent,
+                price,
+            },
+        );
+        drop(prepaid);
+        self.top_up_ahead(context, challenge, &channel_id, price);
+    }
+
+    /// Load the channel a session challenge would pay from the durable store
+    /// into memory, checked against chain state, without signing anything.
+    ///
+    /// Clients call this ahead of their first request, for example with the
+    /// challenge of an unpaid probe, so that payment does not wait for the
+    /// store and the chain. Returns whether a channel is ready to pay.
+    pub async fn restore(&self, challenge: &PaymentChallenge) -> Result<bool, MppError> {
+        challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
+        let chain_id = resolve_chain_id(challenge);
+        let escrow_contract = resolve_escrow_with_policy(
+            challenge,
+            chain_id,
+            self.escrow_contract,
+            self.allow_custom_escrow,
+        )?;
+        if !is_precompile_escrow(escrow_contract) {
+            return Ok(false);
+        }
+        let session_req: SessionRequest = challenge
+            .request
+            .decode()
+            .mpp_config("failed to decode session request")?;
+        let (payee, route_operator, currency) = Self::payment_route(&session_req, chain_id)?;
+        let key = Self::payment_scope_key(
+            &session_req,
+            payee,
+            route_operator,
+            currency,
+            escrow_contract,
+            chain_id,
+        )?;
+        if self.channels.lock().unwrap().contains_key(&key) {
+            return Ok(true);
+        }
+        let _process_lease = self.acquire_payment_lock(challenge).await?;
+        let _store_lease = self
+            .channel_store
+            .acquire(&key)
+            .await
+            .map_err(Self::store_error)?;
+        if self.channels.lock().unwrap().contains_key(&key) {
+            return Ok(true);
+        }
+        let payer = self.signing_mode.from_address(self.signer.address());
+        let authorized_signer = self.authorized_signer.unwrap_or(self.signer.address());
+        let restored = self
+            .restore_precompile_channel(
+                &self.rpc_provider,
+                &key,
+                RecoveryScope {
+                    payer,
+                    authorized_signer,
+                    payee,
+                    operator: route_operator,
+                    token: currency,
+                    escrow: escrow_contract,
+                    chain_id,
+                },
+                session_req.session_snapshot().as_ref(),
+                session_req.parse_amount()?,
+            )
+            .await?;
+        let Some((entry, _)) = restored else {
+            return Ok(false);
+        };
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(entry.channel_id.to_string(), key.clone());
+        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.notify_update(&entry);
+        Ok(true)
+    }
+
+    /// The channel a session challenge would pay from, when it is loaded in
+    /// memory, for example after [`restore`](Self::restore).
+    pub fn restored_channel_id(&self, challenge: &PaymentChallenge) -> Option<String> {
+        let (key, _) = self.expected_channel_key(challenge).ok()?;
+        self.channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.opened)
+            .map(|entry| entry.channel_id.to_string())
+    }
+
+    /// Sizes the first prepaid voucher for `url` from the server's session
+    /// snapshot in `challenge`, so a restored channel's first request carries
+    /// its voucher instead of waiting for a `402`, and draws on balance its
+    /// earlier vouchers already cover.
+    ///
+    /// The snapshot's `spent` only lowers what the voucher must cover; it is
+    /// never signed for by itself. Returns whether `url` was primed.
+    pub fn prime_prepaid(&self, url: &str, challenge: &PaymentChallenge) -> bool {
+        if self.prepaid_requests == 0 {
+            return false;
+        }
+        let Ok(session_req) = challenge.request.decode::<SessionRequest>() else {
+            return false;
+        };
+        let Some(snapshot) = session_req.session_snapshot() else {
+            return false;
+        };
+        let (Ok(spent), Ok(price)) = (snapshot.spent.parse::<u128>(), session_req.parse_amount())
+        else {
+            return false;
+        };
+        let Ok(channel_id) = snapshot.channel_id.parse::<B256>() else {
+            return false;
+        };
+        let channel_id = channel_id.to_string();
+        if self.restored_channel_id(challenge).as_deref() != Some(channel_id.as_str()) {
+            return false;
+        }
+        self.spend
+            .lock()
+            .unwrap()
+            .channels
+            .entry(channel_id.clone())
+            .or_insert(spent);
+        self.prepaid.lock().unwrap().insert(
+            url.to_owned(),
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id,
+                spent,
+                price,
+            },
+        );
+        true
     }
 
     /// Create a signed voucher credential for an active session channel.
@@ -1121,6 +1713,20 @@ impl TempoSessionProvider {
                 "channel does not match active session".into(),
             ));
         }
+        self.merge_stored_channel(&key, &mut entry).await?;
+
+        if required_cumulative > entry.cumulative_amount
+            && self
+                .pending_opens
+                .lock()
+                .unwrap()
+                .contains_key(channel_id_hex)
+        {
+            return Err(MppError::InvalidConfig(
+                "pending channel open requires settlement reconciliation before another payment"
+                    .into(),
+            ));
+        }
 
         // Update cumulative to at least the required amount
         if required_cumulative > entry.cumulative_amount {
@@ -1161,7 +1767,7 @@ impl TempoSessionProvider {
 
         // Update the registry only after the voucher has been signed.
         self.persist_channel(&entry).await?;
-        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.insert_signed_entry(key, &mut entry);
         self.notify_update(&entry);
 
         let payer = self.signing_mode.from_address(self.signer.address());
@@ -1197,7 +1803,7 @@ impl TempoSessionProvider {
             TopUpPrecompilePayloadOptions {
                 prefix_calls,
                 descriptor,
-                fee_token: self.fee_token(currency),
+                fee_token: self.session_fee_token(&session_req, currency)?,
                 additional_deposit,
                 chain_id: entry.chain_id,
                 fee_payer: session_req.fee_payer(),
@@ -1250,6 +1856,7 @@ impl TempoSessionProvider {
             .acquire(&key)
             .await
             .map_err(Self::store_error)?;
+        let _funding = self.acquire_funding_lock(&key, challenge).await?;
         self.top_up_with_lease(
             client,
             url,
@@ -1261,18 +1868,131 @@ impl TempoSessionProvider {
         .await
     }
 
-    // The caller holds both the provider payment lock and the payment-scope store lease.
+    // The caller holds the provider payment lock, the payment-scope store lease
+    // and the funding lock.
     async fn top_up_with_lease(
         &self,
         client: &reqwest::Client,
         url: &str,
-        mut headers: reqwest::header::HeaderMap,
+        headers: reqwest::header::HeaderMap,
         challenge: &PaymentChallenge,
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
-        use reqwest::header::WWW_AUTHENTICATE;
+        let prepared = self
+            .prepare_top_up(headers, challenge, channel_id_hex, additional_deposit)
+            .await?;
+        let receipt = self
+            .submit_top_up(client, url, challenge, &prepared)
+            .await?;
+        self.record_top_up(url, &prepared, None).await?;
+        Ok(receipt)
+    }
 
+    /// A top-up sent through `transport` instead of HTTP, such as an MCP tool
+    /// call. The caller holds the payment lock, the payment-scope store lease
+    /// and the funding lock.
+    async fn top_up_with_management(
+        &self,
+        transport: &dyn ManagementTransport,
+        url: &str,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<Option<Receipt>, MppError> {
+        let prepared = self
+            .prepare_top_up(
+                reqwest::header::HeaderMap::new(),
+                challenge,
+                channel_id_hex,
+                additional_deposit,
+            )
+            .await?;
+        let receipt = transport.send(challenge, &prepared.credential).await?;
+        self.record_top_up(url, &prepared, None).await?;
+        Ok(receipt)
+    }
+
+    /// A top-up that holds the payment lock only while it is recorded, so
+    /// vouchers can be signed while it is read, signed and submitted. Signing
+    /// only reads channel state. It holds the funding lock throughout, so it
+    /// is skipped when another top-up already restored `reserve`, and a
+    /// foreground top-up waiting on it plans against the raised deposit.
+    #[allow(clippy::too_many_arguments)]
+    async fn top_up_in_background(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+        reserve: u128,
+    ) -> Result<(), MppError> {
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(channel_id_hex)
+            .cloned();
+        let Some(key) = key else {
+            return Ok(());
+        };
+        let funding = self.acquire_funding_lock(&key, challenge).await?;
+        let covered = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .filter(|entry| entry.channel_id.to_string() == channel_id_hex)
+            .is_none_or(|entry| entry.deposit.saturating_sub(entry.cumulative_amount) >= reserve);
+        if covered {
+            return Ok(());
+        }
+        let prepared = self
+            .prepare_top_up(headers, challenge, channel_id_hex, additional_deposit)
+            .await?;
+        self.submit_top_up(client, url, challenge, &prepared)
+            .await?;
+        let previous = self.raise_local_deposit(&prepared, channel_id_hex);
+        drop(funding);
+        let _process_lease = self.acquire_payment_lock(challenge).await?;
+        self.record_top_up(url, &prepared, previous).await
+    }
+
+    /// Raises the in-memory deposit of the funded channel to an accepted
+    /// top-up's, returning the deposit it replaced. A channel that replaced
+    /// it in the same scope is left alone.
+    fn raise_local_deposit(&self, prepared: &PreparedTopUp, channel_id_hex: &str) -> Option<u128> {
+        let mut channels = self.channels.lock().unwrap();
+        let entry = channels
+            .get_mut(&prepared.key)
+            .filter(|entry| entry.channel_id.to_string() == channel_id_hex)?;
+        let previous = entry.deposit;
+        entry.deposit = entry.deposit.max(prepared.new_deposit);
+        Some(previous)
+    }
+
+    /// Stores a channel entry after signing, keeping a deposit that a
+    /// concurrent top-up raised while the voucher was signed.
+    fn insert_signed_entry(&self, key: String, entry: &mut ChannelEntry) {
+        let mut channels = self.channels.lock().unwrap();
+        if let Some(current) = channels.get(&key) {
+            if current.channel_id == entry.channel_id {
+                entry.deposit = entry.deposit.max(current.deposit);
+            }
+        }
+        channels.insert(key, entry.clone());
+    }
+
+    /// Signs a top-up against the channel's local, stored and on-chain deposit.
+    async fn prepare_top_up(
+        &self,
+        mut headers: reqwest::header::HeaderMap,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        additional_deposit: u128,
+    ) -> Result<PreparedTopUp, MppError> {
         ensure_redirect_safe_credential_header(challenge)?;
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
@@ -1342,6 +2062,34 @@ impl TempoSessionProvider {
                 .parse()
                 .mpp_config("invalid top-up authorization header")?,
         );
+        Ok(PreparedTopUp {
+            key,
+            chain_id: entry.chain_id,
+            cumulative_amount: entry.cumulative_amount,
+            credential,
+            headers,
+            new_deposit,
+        })
+    }
+
+    /// Sends a prepared top-up, refreshing an expired challenge echo without
+    /// signing another deposit.
+    async fn submit_top_up(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        challenge: &PaymentChallenge,
+        prepared: &PreparedTopUp,
+    ) -> Result<Option<Receipt>, MppError> {
+        use reqwest::header::WWW_AUTHENTICATE;
+
+        let PreparedTopUp {
+            key,
+            chain_id,
+            credential,
+            ..
+        } = prepared;
+        let mut headers = prepared.headers.clone();
         let mut response = client
             .post(url)
             .headers(headers.clone())
@@ -1364,7 +2112,7 @@ impl TempoSessionProvider {
             });
             if let Some(fresh_challenge) = fresh_challenge {
                 let (fresh_key, fresh_chain_id) = self.expected_channel_key(&fresh_challenge)?;
-                if fresh_key != key || fresh_chain_id != entry.chain_id {
+                if fresh_key != *key || fresh_chain_id != *chain_id {
                     return Err(MppError::InvalidConfig(
                         "top-up route challenge does not match active session".into(),
                     ));
@@ -1415,12 +2163,43 @@ impl TempoSessionProvider {
             )));
         }
 
-        entry.deposit = new_deposit;
+        Ok(receipt)
+    }
+
+    /// Records an accepted top-up on the current channel entry, which vouchers
+    /// signed while the top-up was submitted may have advanced.
+    /// `previous` is the deposit before the top-up when it was already raised
+    /// in memory, so the deposit is still reported.
+    async fn record_top_up(
+        &self,
+        url: &str,
+        prepared: &PreparedTopUp,
+        previous: Option<u128>,
+    ) -> Result<(), MppError> {
+        let mut entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&prepared.key)
+            .cloned()
+            .ok_or_else(|| MppError::InvalidConfig("channel not found".into()))?;
+        let previous = previous.unwrap_or(entry.deposit).min(entry.deposit);
+        entry.deposit = entry.deposit.max(prepared.new_deposit);
+        // Report only this top-up's increase: a top-up recorded while a
+        // background one waited has already reported its own.
+        let amount = prepared.new_deposit.saturating_sub(previous);
+        entry.cumulative_amount = entry.cumulative_amount.max(prepared.cumulative_amount);
         entry.opened = true;
         self.persist_channel(&entry).await?;
-        self.channels.lock().unwrap().insert(key, entry.clone());
+        self.channels
+            .lock()
+            .unwrap()
+            .insert(prepared.key.clone(), entry.clone());
         self.notify_update(&entry);
-        Ok(receipt)
+        if amount > 0 {
+            self.report_deposit(url, &entry, amount, false);
+        }
+        Ok(())
     }
 
     /// Returns the deposit to plan a voucher against: the local view, raised
@@ -1503,25 +2282,51 @@ impl TempoSessionProvider {
         required_cumulative: u128,
         server_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
-        let deposit = self.known_deposit(channel_id_hex, server_deposit).await?;
+        if self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(channel_id_hex)
+        {
+            return Err(MppError::InvalidConfig(
+                "pending channel open requires settlement reconciliation before streaming top-up"
+                    .into(),
+            ));
+        }
         let session_request: SessionRequest = challenge
             .request
             .decode()
             .mpp_config("failed to decode session request")?;
-        if let Some(additional_deposit) = self.required_top_up(
-            required_cumulative,
-            deposit,
-            session_request.suggested_deposit.as_deref(),
-        )? {
-            self.top_up_with_headers_for_challenge(
-                client,
-                url,
-                headers,
-                challenge,
-                channel_id_hex,
-                additional_deposit,
-            )
-            .await?;
+        let suggested_deposit = session_request.suggested_deposit.as_deref();
+        let deposit = self.known_deposit(channel_id_hex, server_deposit).await?;
+        if self
+            .required_top_up(required_cumulative, deposit, suggested_deposit)?
+            .is_some()
+        {
+            ensure_redirect_safe_credential_header(challenge)?;
+            let _process_lease = self.acquire_payment_lock(challenge).await?;
+            let (key, _) = self.expected_channel_key(challenge)?;
+            let _store_lease = self
+                .channel_store
+                .acquire(&key)
+                .await
+                .map_err(Self::store_error)?;
+            let _funding = self.acquire_funding_lock(&key, challenge).await?;
+            // Another request may have funded the channel while this waited.
+            let deposit = self.known_deposit(channel_id_hex, server_deposit).await?;
+            if let Some(additional_deposit) =
+                self.required_top_up(required_cumulative, deposit, suggested_deposit)?
+            {
+                self.top_up_with_lease(
+                    client,
+                    url,
+                    headers,
+                    challenge,
+                    channel_id_hex,
+                    additional_deposit,
+                )
+                .await?;
+            }
         }
         self.voucher_credential_for_challenge(challenge, channel_id_hex, required_cumulative)
             .await
@@ -1760,6 +2565,69 @@ impl TempoSessionProvider {
         Ok(())
     }
 
+    /// Resolve a pending channel open that the server reports as accepted.
+    ///
+    /// The payment flow resolves an open from the `Payment-Receipt` header of
+    /// its response. Metered SSE responses report acceptance in the body
+    /// instead, through `payment-receipt` and `payment-need-voucher` events
+    /// carrying the server's accepted cumulative amount. An accepted amount
+    /// covering the open's authorized cumulative amount resolves the open, so
+    /// later vouchers may raise it. Returns whether an open was resolved.
+    /// Records the `spent` a streaming response's `payment-receipt` reports
+    /// and emits `payment.update` when it changed.
+    async fn record_stream_receipt(
+        &self,
+        url: Option<reqwest::Url>,
+        channel_id_hex: &str,
+        spent: u128,
+    ) {
+        let Ok(channel_id) = channel_id_hex.parse::<B256>() else {
+            return;
+        };
+        let channel_id = channel_id.to_string();
+        let change = self.spend.lock().unwrap().update(&channel_id, spent);
+        if let (Some(change), Some(url)) = (change, url) {
+            self.events
+                .emit(ClientEvent::PaymentUpdate(PaymentUpdateContext {
+                    url,
+                    channel_id,
+                    spent,
+                    change,
+                }))
+                .await;
+        }
+    }
+
+    pub async fn acknowledge_accepted(
+        &self,
+        channel_id_hex: &str,
+        accepted_cumulative: u128,
+    ) -> Result<bool, MppError> {
+        let channel_id = channel_id_hex
+            .parse::<B256>()
+            .map_err(|_| MppError::InvalidConfig("invalid session channel ID".into()))?
+            .to_string();
+        if !self.pending_opens.lock().unwrap().contains_key(&channel_id) {
+            return Ok(false);
+        }
+        let entry = {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .cloned();
+            key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned())
+        };
+        let Some(entry) = entry.filter(|entry| accepted_cumulative >= entry.cumulative_amount)
+        else {
+            return Ok(false);
+        };
+        self.commit_referenced_open(&channel_id);
+        self.persist_channel(&entry).await?;
+        Ok(true)
+    }
+
     /// Close the payment channel and settle on-chain.
     ///
     /// Sends a close credential to the server, which triggers on-chain settlement.
@@ -1864,25 +2732,80 @@ impl TempoSessionProvider {
             .as_deref()
             .and_then(|s| crate::protocol::core::parse_receipt(s).ok());
 
-        // A merchant receipt is not proof of settlement. Retain recovery data
-        // until the trusted RPC confirms that escrow is no longer funded.
-        if (receipt.is_some() || native_gone) && is_precompile_escrow(entry.escrow_contract) {
-            let Ok(state) = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await
-            else {
-                return Ok(receipt);
-            };
-            if state.deposit != 0 {
-                return Ok(receipt);
-            }
-            let store_key = Self::stored_entry(&entry)?.key();
-            self.channel_store
-                .delete(&store_key)
-                .await
-                .map_err(Self::store_error)?;
-            self.channels.lock().unwrap().remove(&expected_key);
+        if receipt.is_some() || native_gone {
+            self.forget_closed_channel(&entry, &expected_key).await?;
         }
 
         Ok(receipt)
+    }
+
+    /// Close the payment channel like [`close`](Self::close), sending the close
+    /// credential through `transport` instead of HTTP, such as an MCP tool call
+    /// (see [`McpManagement`](crate::mcp::client::McpManagement)).
+    ///
+    /// Returns the resource's receipt, or `None` when no channel is open. As
+    /// with `close`, the channel is only forgotten once a receipt is
+    /// accompanied by on-chain confirmation that its escrow is no longer funded.
+    pub async fn close_with(
+        &self,
+        transport: &dyn ManagementTransport,
+    ) -> Result<Option<Receipt>, MppError> {
+        let Some(challenge) = self.last_challenge.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let _process_lease = self.acquire_payment_lock(&challenge).await?;
+        let (expected_key, expected_chain_id) = self.expected_channel_key(&challenge)?;
+        let _store_lease = self
+            .channel_store
+            .acquire(&expected_key)
+            .await
+            .map_err(Self::store_error)?;
+        let entry = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&expected_key)
+            .filter(|entry| entry.opened)
+            .cloned();
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        if entry.chain_id != expected_chain_id {
+            return Err(MppError::InvalidConfig(
+                "channel does not match active session".into(),
+            ));
+        }
+        let credential = self
+            .close_credential_for_challenge_inner(&challenge, &entry.channel_id.to_string(), None)
+            .await?;
+        let receipt = transport.send(&challenge, &credential).await?;
+        if receipt.is_some() {
+            self.forget_closed_channel(&entry, &expected_key).await?;
+        }
+        Ok(receipt)
+    }
+
+    /// Forgets a native channel once the trusted RPC confirms its escrow is no
+    /// longer funded. A merchant receipt is not proof of settlement, so the
+    /// channel's recovery data is kept until then.
+    async fn forget_closed_channel(&self, entry: &ChannelEntry, key: &str) -> Result<(), MppError> {
+        if !is_precompile_escrow(entry.escrow_contract) {
+            return Ok(());
+        }
+        let Ok(state) = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await
+        else {
+            return Ok(());
+        };
+        if state.deposit != 0 {
+            return Ok(());
+        }
+        let store_key = Self::stored_entry(entry)?.key();
+        self.channel_store
+            .delete(&store_key)
+            .await
+            .map_err(Self::store_error)?;
+        self.channels.lock().unwrap().remove(key);
+        Ok(())
     }
 
     fn resolve_deposit(&self, suggested_deposit: Option<&str>) -> Result<u128, MppError> {
@@ -1923,7 +2846,7 @@ impl TempoSessionProvider {
     ) -> Result<PaymentCredential, MppError> {
         self.payment_credential(
             challenge,
-            Some(ApplicationTopUp {
+            Some(TopUpRoute::Http {
                 client,
                 url,
                 headers,
@@ -1935,7 +2858,7 @@ impl TempoSessionProvider {
     async fn payment_credential(
         &self,
         challenge: &PaymentChallenge,
-        top_up: Option<ApplicationTopUp<'_>>,
+        top_up: Option<TopUpRoute<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
         let process_lease = self.acquire_payment_lock(challenge).await?;
@@ -1963,7 +2886,31 @@ impl TempoSessionProvider {
         &self,
         challenge: &PaymentChallenge,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
-        let lock = self.payment_lock.clone().lock_owned();
+        Self::lock_until_expiry(self.payment_lock.clone(), challenge).await
+    }
+
+    /// Waits for the payment scope's funding lock until `challenge` expires,
+    /// so a stalled top-up cannot hold a later payment past its expiry.
+    async fn acquire_funding_lock(
+        &self,
+        key: &str,
+        challenge: &PaymentChallenge,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
+        let lock = self
+            .funding_locks
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default()
+            .clone();
+        Self::lock_until_expiry(lock, challenge).await
+    }
+
+    async fn lock_until_expiry(
+        lock: Arc<tokio::sync::Mutex<()>>,
+        challenge: &PaymentChallenge,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, MppError> {
+        let lock = lock.lock_owned();
         let Some(expires) = challenge.expires_at() else {
             return Ok(lock.await);
         };
@@ -1978,7 +2925,7 @@ impl TempoSessionProvider {
     async fn payment_credential_inner(
         &self,
         challenge: &PaymentChallenge,
-        top_up: Option<ApplicationTopUp<'_>>,
+        top_up: Option<TopUpRoute<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
 
@@ -2037,9 +2984,6 @@ impl TempoSessionProvider {
             chain_id,
         )?;
         let session_snapshot = session_req.session_snapshot();
-        if let Some(snapshot) = &session_snapshot {
-            self.commit_referenced_open(&snapshot.channel_id);
-        }
 
         // Check process memory first, then restore a durable native channel.
         let mut existing = self
@@ -2049,6 +2993,35 @@ impl TempoSessionProvider {
             .get(&key)
             .cloned()
             .map(|entry| (entry, false));
+        if let Some((entry, _)) = existing.as_mut() {
+            self.merge_stored_channel(&key, entry).await?;
+        }
+        let reconcile_pending = session_snapshot.is_some()
+            && existing.as_ref().is_some_and(|(entry, _)| {
+                self.pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string())
+            });
+        if reconcile_pending {
+            let snapshot = session_snapshot.as_ref().expect("snapshot checked above");
+            let pending_id = existing
+                .as_ref()
+                .expect("pending entry exists")
+                .0
+                .channel_id;
+            if snapshot.channel_id.parse::<B256>().ok() != Some(pending_id) {
+                return Err(MppError::InvalidConfig(
+                    "snapshot does not match pending channel".into(),
+                ));
+            }
+            if !can_sign_descriptor(&snapshot.descriptor, payer, authorized_signer)? {
+                return Err(MppError::InvalidConfig(
+                    "pending channel snapshot does not match the signer".into(),
+                ));
+            }
+            existing = None;
+        }
         if existing.is_none() && precompile {
             existing = self
                 .restore_precompile_channel(
@@ -2077,13 +3050,38 @@ impl TempoSessionProvider {
                     .unwrap()
                     .insert(key.clone(), entry.clone());
                 self.notify_update(entry);
+                if reconcile_pending {
+                    self.commit_referenced_open(&entry.channel_id.to_string());
+                }
             }
+        }
+        if reconcile_pending && existing.is_none() {
+            return Err(MppError::InvalidConfig(
+                "pending channel open could not be reconciled".into(),
+            ));
         }
 
         if let Some((mut entry, includes_request)) = existing {
             if entry.opened {
-                // Increment cumulative and sign a voucher
-                if !includes_request {
+                let mut pending = self
+                    .pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string());
+                // Settlement of the opening authorization on-chain proves the
+                // server accepted the open, even without a receipt. A channel
+                // restored above has already been checked against chain state.
+                if pending && precompile && !includes_request {
+                    let state =
+                        read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
+                    if state.settled != 0 && state.settled >= entry.cumulative_amount {
+                        self.commit_referenced_open(&entry.channel_id.to_string());
+                        self.persist_channel(&entry).await?;
+                        pending = false;
+                    }
+                }
+                // Retry the authorized opening amount until a receipt reconciles it.
+                if !includes_request && !pending {
                     entry.cumulative_amount =
                         entry.cumulative_amount.checked_add(amount).ok_or_else(|| {
                             MppError::InvalidConfig("session cumulative amount overflowed".into())
@@ -2096,33 +3094,61 @@ impl TempoSessionProvider {
                             "session cumulative amount exceeds channel deposit".into(),
                         ));
                     };
-                    let additional_deposit = self
-                        .required_top_up(
-                            entry.cumulative_amount,
-                            entry.deposit,
-                            session_req.suggested_deposit.as_deref(),
-                        )?
-                        .ok_or_else(|| {
-                            MppError::InvalidConfig("session top-up amount underflowed".into())
-                        })?;
-                    self.top_up_with_lease(
-                        top_up.client,
-                        top_up.url,
-                        top_up.headers,
-                        challenge,
-                        &entry.channel_id.to_string(),
-                        additional_deposit,
-                    )
-                    .await?;
-                    entry.deposit = self
-                        .channels
-                        .lock()
-                        .unwrap()
-                        .get(&key)
-                        .ok_or_else(|| {
-                            MppError::InvalidConfig("channel disappeared after top-up".into())
-                        })?
-                        .deposit;
+                    // A background top-up may have raised the deposit while this waited.
+                    let _funding = self.acquire_funding_lock(&key, challenge).await?;
+                    if let Some(current) = self.channels.lock().unwrap().get(&key) {
+                        if current.channel_id == entry.channel_id {
+                            entry.deposit = entry.deposit.max(current.deposit);
+                        }
+                    }
+                    if entry.cumulative_amount > entry.deposit {
+                        let additional_deposit = self
+                            .required_top_up(
+                                entry.cumulative_amount,
+                                entry.deposit,
+                                session_req.suggested_deposit.as_deref(),
+                            )?
+                            .ok_or_else(|| {
+                                MppError::InvalidConfig("session top-up amount underflowed".into())
+                            })?;
+                        let channel_id = entry.channel_id.to_string();
+                        match top_up {
+                            TopUpRoute::Http {
+                                client,
+                                url,
+                                headers,
+                            } => {
+                                self.top_up_with_lease(
+                                    client,
+                                    url,
+                                    headers,
+                                    challenge,
+                                    &channel_id,
+                                    additional_deposit,
+                                )
+                                .await?;
+                            }
+                            TopUpRoute::Management { transport, url } => {
+                                self.top_up_with_management(
+                                    transport,
+                                    url,
+                                    challenge,
+                                    &channel_id,
+                                    additional_deposit,
+                                )
+                                .await?;
+                            }
+                        }
+                        entry.deposit = self
+                            .channels
+                            .lock()
+                            .unwrap()
+                            .get(&key)
+                            .ok_or_else(|| {
+                                MppError::InvalidConfig("channel disappeared after top-up".into())
+                            })?
+                            .deposit;
+                    }
                 }
 
                 let payload = if precompile {
@@ -2148,7 +3174,7 @@ impl TempoSessionProvider {
 
                 // Update the registry
                 self.persist_channel(&entry).await?;
-                self.channels.lock().unwrap().insert(key, entry.clone());
+                self.insert_signed_entry(key, &mut entry);
                 self.notify_update(&entry);
 
                 return Ok(build_credential(challenge, payload, chain_id, payer));
@@ -2231,7 +3257,7 @@ impl TempoSessionProvider {
                     authorized_signer: Some(authorized_signer),
                     payee,
                     currency,
-                    fee_token: self.fee_token(currency),
+                    fee_token: self.session_fee_token(&session_req, currency)?,
                     deposit,
                     initial_amount: amount,
                     chain_id,
@@ -2280,16 +3306,22 @@ impl TempoSessionProvider {
             challenge_id: challenge.id.clone(),
             store_key: Self::store_key(&entry)?,
         };
-        self.persist_channel(&entry).await?;
+        self.pending_opens
+            .lock()
+            .unwrap()
+            .insert(entry.channel_id.to_string(), pending);
+        if let Err(error) = self.persist_channel(&entry).await {
+            self.pending_opens
+                .lock()
+                .unwrap()
+                .remove(&entry.channel_id.to_string());
+            return Err(error);
+        }
         self.channel_id_to_key
             .lock()
             .unwrap()
             .insert(entry.channel_id.to_string(), key.clone());
         self.channels.lock().unwrap().insert(key, entry.clone());
-        self.pending_opens
-            .lock()
-            .unwrap()
-            .insert(entry.channel_id.to_string(), pending);
         self.notify_update(&entry);
 
         Ok(build_credential(challenge, payload, chain_id, payer))
@@ -2300,6 +3332,19 @@ impl PaymentProvider for TempoSessionProvider {
     fn supports(&self, method: &str, intent: &str) -> bool {
         method == crate::protocol::methods::tempo::METHOD_NAME
             && intent == crate::protocol::methods::tempo::INTENT_SESSION
+    }
+
+    fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        self.trusted_tempo_proof_realms
+            .iter()
+            .find(|(origin, _)| origin.origin() == url.origin())
+            .map(|(_, realm)| realm.as_str())
+    }
+
+    fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+        self.trusted_tempo_proof_realms
+            .retain(|(existing, _)| existing.origin() != origin.origin());
+        self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -2319,6 +3364,23 @@ impl PaymentProvider for TempoSessionProvider {
             context.url.as_str(),
             context.headers,
             challenge,
+        )
+        .await
+    }
+
+    async fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> Result<PaymentCredential, MppError> {
+        let url = context.url.to_string();
+        self.payment_credential(
+            challenge,
+            Some(TopUpRoute::Management {
+                transport: management,
+                url: &url,
+            }),
         )
         .await
     }
@@ -2352,6 +3414,18 @@ impl PaymentProvider for TempoSessionProvider {
             .lock()
             .unwrap()
             .remove(&challenge.id);
+        if let Some(id) = Self::credential_channel_id(credential) {
+            let entry = {
+                let key = self.channel_id_to_key.lock().unwrap().get(&id).cloned();
+                key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned())
+            };
+            if let Some(entry) = entry.filter(|entry| is_precompile_escrow(entry.escrow_contract)) {
+                self.channel_store
+                    .set(&Self::stored_entry(&entry)?)
+                    .await
+                    .map_err(Self::store_error)?;
+            }
+        }
         self.commit_credential(credential);
         drop(lease);
         Ok(())
@@ -2392,6 +3466,111 @@ impl PaymentProvider for TempoSessionProvider {
             .lock()
             .unwrap()
             .remove(&challenge.id);
+    }
+
+    async fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> Option<(PaymentChallenge, PaymentCredential)> {
+        if self.prepaid_requests == 0 {
+            return None;
+        }
+        let state = self
+            .prepaid
+            .lock()
+            .unwrap()
+            .get(context.url.as_str())
+            .cloned()?;
+        if state
+            .challenge
+            .expires_at()
+            .is_some_and(|expires| expires <= time::OffsetDateTime::now_utc())
+        {
+            self.prepaid.lock().unwrap().remove(context.url.as_str());
+            return None;
+        }
+        let _lock = self.acquire_payment_lock(&state.challenge).await.ok()?;
+        let key = self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .get(&state.channel_id)
+            .cloned()?;
+        let mut entry = self.channels.lock().unwrap().get(&key).cloned()?;
+        self.merge_stored_channel(&key, &mut entry).await.ok()?;
+        let target = state
+            .price
+            .checked_mul(u128::from(self.prepaid_requests))
+            .and_then(|headroom| state.spent.checked_add(headroom))?;
+        let cumulative = target.max(entry.cumulative_amount.checked_add(1)?);
+        if cumulative > entry.deposit {
+            return None;
+        }
+        let credential = self
+            .voucher_credential_for_challenge(&state.challenge, &state.channel_id, cumulative)
+            .await
+            .ok()?;
+        Some((state.challenge, credential))
+    }
+
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        let _ = self.record_receipt(context, challenge, receipt);
+    }
+
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
+            return None;
+        }
+        let spent = receipt
+            .extensions
+            .get("spent")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<u128>().ok())?;
+        let channel_id = receipt.reference.parse::<B256>().ok()?.to_string();
+        let quoted = challenge
+            .request
+            .decode::<SessionRequest>()
+            .ok()
+            .and_then(|request| request.parse_amount().ok());
+        let cost = self
+            .spend
+            .lock()
+            .unwrap()
+            .record(&channel_id, spent, quoted);
+        if self.pending_opens.lock().unwrap().contains_key(&channel_id) {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .cloned();
+            let entry = key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned());
+            if let Some(entry) = entry {
+                self.report_deposit(context.url.as_str(), &entry, entry.deposit, true);
+            }
+        }
+        self.prepay(context, challenge, channel_id, spent, quoted);
+        Some(cost)
+    }
+
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        TempoSessionProvider::stream_event(self, client, url, name, data)
     }
 
     fn accept_payment_header(&self) -> Option<String> {
@@ -2445,6 +3624,19 @@ mod tests {
             "https://rpc.moderato.tempo.xyz/"
         );
         assert_eq!(provider.signer().address(), signer.address());
+    }
+
+    #[test]
+    fn repeated_realm_pins_replace_prior_realm() {
+        let origin = reqwest::Url::parse("https://api.example.test").unwrap();
+        let request = reqwest::Url::parse("https://api.example.test/pay").unwrap();
+        let provider =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.example.com")
+                .unwrap()
+                .with_trusted_tempo_proof_realm(origin.clone(), "old")
+                .with_trusted_tempo_proof_realm(origin, "new");
+        assert_eq!(provider.trusted_tempo_proof_realms.len(), 1);
+        assert_eq!(provider.trusted_tempo_proof_realm(&request), Some("new"));
     }
 
     #[test]
@@ -2534,6 +3726,13 @@ mod tests {
         assert_eq!(provider.default_deposit, Some(500_000));
         assert_eq!(provider.autoswap().unwrap().token_in, swap_token);
         assert_eq!(provider.fee_token(Address::repeat_byte(0x44)), swap_token);
+        let fee_token = Address::repeat_byte(0x55);
+        assert_eq!(
+            provider
+                .with_fee_token(fee_token)
+                .fee_token(Address::repeat_byte(0x44)),
+            fee_token
+        );
     }
 
     #[test]
@@ -3380,6 +4579,69 @@ mod tests {
         assert!(store.get(&store_key).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn on_chain_settlement_resolves_a_pending_open_before_the_next_voucher() {
+        use alloy::sol_types::SolValue;
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let mut provider = make_test_provider();
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        provider.pending_opens.lock().unwrap().insert(
+            channel_id.to_string(),
+            PendingOpen {
+                challenge_id: "open".into(),
+                store_key: None,
+            },
+        );
+        let settled =
+            alloy::primitives::Bytes::from((1_000u128, 10_000u128, 0u64).abi_encode()).to_string();
+        mock_rpc(&mut provider, &[&settled]);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+
+        let credential = provider.pay(&challenge).await.unwrap();
+        let payload: SessionCredentialPayload =
+            serde_json::from_value(credential.payload.clone()).unwrap();
+        assert!(
+            matches!(payload, SessionCredentialPayload::Voucher { cumulative_amount, .. } if cumulative_amount == "2000")
+        );
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn streamed_acceptance_resolves_a_covered_pending_open() {
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(
+            &provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            500,
+            1_000,
+        );
+        let channel = channel_id.to_string();
+        provider.pending_opens.lock().unwrap().insert(
+            channel.clone(),
+            PendingOpen {
+                challenge_id: "open".into(),
+                store_key: None,
+            },
+        );
+
+        assert!(!provider.acknowledge_accepted(&channel, 499).await.unwrap());
+        assert!(provider
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(&channel));
+        assert!(provider
+            .acknowledge_accepted(&channel.to_uppercase().replacen("0X", "0x", 1), 500)
+            .await
+            .unwrap());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        assert!(!provider.acknowledge_accepted(&channel, 900).await.unwrap());
+    }
+
     // --- send_voucher error paths ---
 
     #[tokio::test]
@@ -3708,6 +4970,273 @@ mod tests {
             assert_eq!(posted.lock().unwrap().len(), 1);
             assert_eq!(provider.channels().values().next().unwrap().deposit, 11_000);
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_need_vouchers_fund_the_channel_once() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider().with_max_deposit(2_000);
+        // Only one signing pass is answered: a second top-up would fail.
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+        let client = reqwest::Client::new();
+        let channel_id = channel_id.to_string();
+        let second = provider.clone();
+
+        let (first, second) = tokio::join!(
+            provider.voucher_credential_with_top_up_for_challenge(
+                &client,
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_500,
+                1_000,
+            ),
+            second.voucher_credential_with_top_up_for_challenge(
+                &client,
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_500,
+                1_000,
+            ),
+        );
+
+        assert_eq!(first.unwrap().payload["cumulativeAmount"], "1500");
+        assert_eq!(second.unwrap().payload["cumulativeAmount"], "1500");
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].1["action"], "topUp");
+        let deposit = provider.channels().values().next().unwrap().deposit;
+        assert!((1_500..=2_000).contains(&deposit), "{deposit}");
+    }
+
+    #[tokio::test]
+    async fn background_and_foreground_top_ups_fund_the_channel_once() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider().with_top_up_amount(1_000);
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+        let client = reqwest::Client::new();
+        let channel_id = channel_id.to_string();
+
+        let (background, foreground) = tokio::join!(
+            provider.top_up_in_background(
+                &client,
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_000,
+                500,
+            ),
+            provider.voucher_credential_with_top_up_for_challenge(
+                &client,
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_500,
+                1_000,
+            ),
+        );
+
+        background.unwrap();
+        assert_eq!(foreground.unwrap().payload["cumulativeAmount"], "1500");
+        assert_eq!(posted.lock().unwrap().len(), 1);
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 2_000);
+    }
+
+    #[tokio::test]
+    async fn failed_need_voucher_top_up_is_not_retried() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider();
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let (url, posted) =
+            management_server(|_, _| StatusCode::INTERNAL_SERVER_ERROR.into_response()).await;
+
+        let result = provider
+            .voucher_credential_with_top_up_for_challenge(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                1_500,
+                1_000,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(posted.lock().unwrap().len(), 1);
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 1_000);
+    }
+
+    #[tokio::test]
+    async fn background_top_up_reports_only_its_own_deposit_increase() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::{ClientEvent, ClientEventKind, ClientEvents};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let events = ClientEvents::default();
+        let amounts = Arc::new(Mutex::new(Vec::new()));
+        let seen = amounts.clone();
+        let _subscription = events.on(ClientEventKind::Deposit, move |event| {
+            if let ClientEvent::Deposit(context) = event {
+                seen.lock().unwrap().push((context.amount, context.deposit));
+            }
+            async {}
+        });
+        let mut provider = make_test_provider().with_events(events);
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let channel_id = channel_id.to_string();
+        let prepared = provider
+            .prepare_top_up(
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.new_deposit, 2_000);
+        let previous = provider.raise_local_deposit(&prepared, &channel_id);
+        assert_eq!(previous, Some(1_000));
+        // A foreground top-up of 1000 lands while the background one waits to
+        // record, and reports its own increase.
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut(&prepared.key)
+            .unwrap()
+            .deposit = 3_000;
+
+        provider
+            .record_top_up("https://api.example.com/", &prepared, previous)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*amounts.lock().unwrap(), vec![(1_000, 3_000)]);
+    }
+
+    #[tokio::test]
+    async fn background_top_up_leaves_a_replacement_channel_deposit_alone() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider = make_test_provider();
+        mock_rpc(
+            &mut provider,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let channel_id = channel_id.to_string();
+        let prepared = provider
+            .prepare_top_up(
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id,
+                1_000,
+            )
+            .await
+            .unwrap();
+        // Another channel replaced the funded one in the same scope.
+        provider
+            .channels
+            .lock()
+            .unwrap()
+            .get_mut(&prepared.key)
+            .unwrap()
+            .channel_id = B256::repeat_byte(0x99);
+
+        assert_eq!(provider.raise_local_deposit(&prepared, &channel_id), None);
+        assert_eq!(provider.channels().values().next().unwrap().deposit, 1_000);
+    }
+
+    #[tokio::test]
+    async fn funding_wait_ends_at_challenge_expiry_and_is_per_scope() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let (key, _) = provider.expected_channel_key(&challenge).unwrap();
+        // A stalled top-up, such as a background one, holds this scope's funding lock.
+        let _stalled = provider
+            .acquire_funding_lock(&key, &challenge)
+            .await
+            .unwrap();
+
+        // Other payment scopes still fund.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            provider.acquire_funding_lock("other-scope", &challenge),
+        )
+        .await
+        .expect("another scope's funding lock must be free")
+        .unwrap();
+
+        let expires = (time::OffsetDateTime::now_utc() + time::Duration::milliseconds(300))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let expiring = challenge.clone().with_expires(expires);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            provider.top_up_with_headers_for_challenge(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/",
+                reqwest::header::HeaderMap::new(),
+                &expiring,
+                &channel_id.to_string(),
+                1_000,
+            ),
+        )
+        .await
+        .expect("the funding wait must end when the challenge expires")
+        .unwrap_err();
+        assert!(matches!(error, MppError::PaymentExpired(_)), "{error}");
     }
 
     #[tokio::test]
@@ -4302,8 +5831,10 @@ mod tests {
             expiring_nonce_hash,
         );
 
-        let provider =
+        let mut provider =
             TempoSessionProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
+        let unsettled = channel_state_response(10_000);
+        mock_rpc(&mut provider, &[&unsettled, &unsettled, &unsettled]);
 
         // Pre-seed an open precompile channel under the registry key.
         let key = TempoSessionProvider::channel_key(
@@ -4350,6 +5881,101 @@ mod tests {
             crate::protocol::methods::tempo::INTENT_SESSION,
             Base64UrlJson::from_typed(&req).unwrap(),
         );
+
+        // A cancelled open retains its descriptor and amount, but cannot authorize
+        // a larger voucher until a receipt or recovery snapshot reconciles it.
+        let entry = provider.channels.lock().unwrap().get(&key).unwrap().clone();
+        provider.persist_channel(&entry).await.unwrap();
+        let store_key = TempoSessionProvider::store_key(&entry).unwrap();
+        provider.pending_opens.lock().unwrap().insert(
+            channel_id.to_string(),
+            PendingOpen {
+                challenge_id: challenge.id.clone(),
+                store_key: store_key.clone(),
+            },
+        );
+        let pending_credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xpending"),
+        );
+        provider.persist_channel(&entry).await.unwrap();
+        provider.abandon_payment(&challenge, &pending_credential);
+        let error = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 1500)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("settlement reconciliation"));
+        let mut restarted = TempoSessionProvider::new(signer.clone(), "https://rpc.example.com")
+            .unwrap()
+            .with_channel_store(provider.channel_store.clone());
+        mock_rpc(&mut restarted, &[&channel_state_response(10_000)]);
+        let retry = restarted.pay(&challenge).await.unwrap();
+        let payload: SessionCredentialPayload =
+            serde_json::from_value(retry.payload.clone()).unwrap();
+        assert!(
+            matches!(payload, SessionCredentialPayload::Voucher { cumulative_amount, .. } if cumulative_amount == "1000")
+        );
+        restarted.abandon_payment(&challenge, &retry);
+        assert!(restarted
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 1500)
+            .await
+            .is_err());
+        for _ in 0..2 {
+            let retry = provider.pay(&challenge).await.unwrap();
+            let payload: SessionCredentialPayload =
+                serde_json::from_value(retry.payload.clone()).unwrap();
+            assert!(
+                matches!(payload, SessionCredentialPayload::Voucher { cumulative_amount, .. } if cumulative_amount == "1000")
+            );
+            provider.abandon_payment(&challenge, &retry);
+        }
+        let mut forged_request = req.clone();
+        let mut forged_descriptor = descriptor.clone();
+        forged_descriptor.payer = Address::repeat_byte(0xee).to_string();
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"] = serde_json::json!({
+            "acceptedCumulative": "1000", "chainId": chain_id, "channelId": channel_id.to_string(),
+            "deposit": "10000", "descriptor": forged_descriptor, "escrow": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+            "requiredCumulative": "1500", "settled": "0", "spent": "1000"
+        });
+        let mut forged_challenge = challenge.clone();
+        forged_challenge.request = Base64UrlJson::from_typed(&forged_request).unwrap();
+        assert!(provider.pay(&forged_challenge).await.is_err());
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"]["descriptor"] =
+            serde_json::to_value(&descriptor).unwrap();
+        forged_request.method_details.as_mut().unwrap()["sessionSnapshot"]["channelId"] =
+            serde_json::json!(B256::repeat_byte(0xef).to_string());
+        forged_challenge.request = Base64UrlJson::from_typed(&forged_request).unwrap();
+        assert!(provider
+            .pay(&forged_challenge)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not match pending channel"));
+        assert!(provider
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(&channel_id.to_string()));
+        let retained = provider.channels.lock().unwrap().get(&key).unwrap().clone();
+        assert_eq!(retained.cumulative_amount, 1_000);
+        assert_eq!(retained.descriptor, Some(descriptor.clone()));
+        let stored = provider
+            .channel_store
+            .get(&store_key.clone().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cumulative_amount, 1_000);
+        let retry = provider.pay(&challenge).await.unwrap();
+        provider.commit_payment(&challenge, &retry).await.unwrap();
+        assert!(provider
+            .channel_store
+            .get(&store_key.clone().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_open
+            .is_none());
 
         let credential = provider.pay(&challenge).await.expect("pay succeeds");
         assert_eq!(provider.pending_payment_leases.lock().unwrap().len(), 1);
@@ -4581,6 +6207,54 @@ mod tests {
             assert!(err.to_string().contains("No deposit amount"), "{err}");
             assert!(provider.channels().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn abandoned_legacy_open_retries_without_increasing_authorization() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = Address::repeat_byte(0x33);
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(payee, currency, escrow);
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        assert!(matches!(
+            credential.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Open { .. }
+        ));
+        assert_eq!(provider.channels().len(), 1);
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        let channel = provider.channels().values().next().unwrap().clone();
+        provider.abandon_payment(&challenge, &credential);
+        for _ in 0..2 {
+            let retry = provider.pay(&challenge).await.unwrap();
+            assert!(
+                matches!(retry.payload_as::<SessionCredentialPayload>().unwrap(),
+                SessionCredentialPayload::Voucher { cumulative_amount, .. }
+                if cumulative_amount == channel.cumulative_amount.to_string())
+            );
+            provider.abandon_payment(&challenge, &retry);
+        }
+        let retry = provider.pay(&challenge).await.unwrap();
+        provider.commit_payment(&challenge, &retry).await.unwrap();
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        let next = provider.pay(&challenge).await.unwrap();
+        assert!(
+            matches!(next.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Voucher { cumulative_amount, .. }
+            if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
+        );
+        provider.abandon_payment(&challenge, &next);
     }
 
     #[tokio::test]
@@ -4828,6 +6502,7 @@ mod tests {
                 escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 42431,
                 opened: true,
+                pending_open: None,
             })
             .await
             .unwrap();
@@ -4841,6 +6516,7 @@ mod tests {
                 chain_id: Some(42431),
                 fee_payer: Some(true),
                 machine_token_enabled: None,
+                fee_token: None,
                 settlement_adapter: None,
                 settlement_recipient: None,
                 settlement_token: None,
@@ -5015,7 +6691,7 @@ mod tests {
         let chain_id = 4217;
         let challenge = PaymentChallenge::new(
             "bootstrap-proof",
-            "openai.example.com",
+            "127.0.0.1",
             crate::protocol::methods::tempo::METHOD_NAME,
             crate::protocol::methods::tempo::INTENT_CHARGE,
             Base64UrlJson::from_value(&serde_json::json!({
@@ -5059,7 +6735,7 @@ mod tests {
                                     root,
                                     chain_id,
                                     "bootstrap-proof",
-                                    "openai.example.com",
+                                    "127.0.0.1",
                                     payload.proof_signature()?,
                                 )
                                 .ok()?;
@@ -5246,6 +6922,7 @@ mod tests {
 
             let result = reqwest::Client::new()
                 .get(format!("http://{address}/paid"))
+                .header("Accept-Payment", "tempo/session")
                 .send_with_payment(&provider)
                 .await;
 

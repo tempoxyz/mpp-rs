@@ -44,15 +44,30 @@ pub struct StripeBuilder {
     pub(crate) currency: String,
     pub(crate) decimals: u8,
     pub(crate) realm: String,
+    pub(crate) request_realm_default: bool,
+    pub(crate) trusted_request_hosts: Vec<String>,
     pub(crate) hmac_secret_key: Option<String>,
     pub(crate) stripe_api_base: Option<String>,
     pub(crate) requires_auth: bool,
 }
 
 impl StripeBuilder {
-    /// Override the realm (default: auto-detected from environment variables).
+    /// Override the realm (default: environment-detected outside trusted HTTP hosts).
     pub fn realm(mut self, realm: &str) -> Self {
         self.realm = realm.to_string();
+        self.request_realm_default = false;
+        self
+    }
+
+    /// Permit these public HTTP hostnames as default realms in Axum.
+    /// Specify hostnames without schemes or ports; an unlisted Host header
+    /// cannot change the realm used for payment proofs.
+    pub fn trusted_hosts<I, T>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.trusted_request_hosts = hosts.into_iter().map(Into::into).collect();
         self
     }
 
@@ -111,6 +126,8 @@ pub fn stripe(config: StripeConfig<'_>) -> StripeBuilder {
         currency: config.currency.to_string(),
         decimals: config.decimals,
         realm: detect_realm(),
+        request_realm_default: super::mpp::request_realm_default(),
+        trusted_request_hosts: Vec::new(),
         hmac_secret_key: None,
         stripe_api_base: None,
         requires_auth: false,

@@ -113,6 +113,16 @@ impl Json {
 pub struct JsonObject(pub Vec<(String, Json)>);
 
 impl JsonObject {
+    /// Keys `serde_json` reserves for its `raw_value` feature (enabled by
+    /// dependencies of this build) and its `arbitrary_precision` feature. An
+    /// object holding one is read as that private type, so `serde_json` rejects
+    /// it and such values cannot arrive over the wire. They are dropped like
+    /// over-deep nesting.
+    const RESERVED_KEYS: [&'static str; 2] = [
+        "$serde_json::private::RawValue",
+        "$serde_json::private::Number",
+    ];
+
     pub fn to_value(&self) -> Value {
         self.to_value_at(1)
     }
@@ -121,6 +131,7 @@ impl JsonObject {
         Value::Object(
             self.0
                 .iter()
+                .filter(|(key, _)| !Self::RESERVED_KEYS.contains(&key.as_str()))
                 .map(|(key, value)| (key.clone(), value.to_value_at(depth)))
                 .collect(),
         )

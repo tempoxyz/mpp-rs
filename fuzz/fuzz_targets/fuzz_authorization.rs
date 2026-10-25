@@ -19,7 +19,8 @@ use mpp::protocol::core::extract_payment_scheme;
 use mpp::{base64url_encode, format_authorization, parse_authorization};
 use mpp_fuzz::{assert_same, is_well_formed_echo, wire_header};
 
-const MAX_TOKEN_LEN: usize = 16 * 1024;
+/// Matches `parse_authorization`'s raw-header limit (mppx's 64 KiB).
+const MAX_AUTHORIZATION_LEN: usize = 64 * 1024;
 
 fuzz_target!(|text: &str| {
     check(text);
@@ -38,8 +39,8 @@ fn check(header: &str) {
     let Ok(credential) = parse_authorization(header) else {
         return;
     };
-    let token = scheme.expect("parsed a credential without a Payment scheme")[8..].trim();
-    assert!(token.len() <= MAX_TOKEN_LEN);
+    assert!(scheme.is_some(), "parsed a credential without a Payment scheme");
+    assert!(header.len() <= MAX_AUTHORIZATION_LEN);
 
     let echo = &credential.challenge;
     assert!(echo.method.is_valid());
@@ -48,7 +49,7 @@ fn check(header: &str) {
 
     let formatted = format_authorization(&credential).expect("parsed credential formats");
     // Re-serialization can grow the JSON (`1e2` becomes `100.0`).
-    if formatted.len() <= MAX_TOKEN_LEN {
+    if formatted.len() <= MAX_AUTHORIZATION_LEN {
         let reparsed = parse_authorization(&formatted).expect("formatted credential parses");
         assert_same(&reparsed, &credential);
     }

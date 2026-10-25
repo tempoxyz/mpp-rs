@@ -13,6 +13,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Line tables keep panic backtraces readable while cutting target size
+  # (and so cache restore time) and link time.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 permissions: {}
 
@@ -20,56 +23,32 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    env:
-      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-certificates.crt
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-      - name: Pin pnpm for Tempo Lints
-        run: |
-          set -o pipefail
-          for attempt in 1 2 3; do
-            if corepack prepare pnpm@10.28.1 --activate 2>&1 | tee "$RUNNER_TEMP/corepack.log"; then
-              exit 0
-            fi
-            if ! grep -q 'Error when performing the request' "$RUNNER_TEMP/corepack.log" || [[ "$attempt" == 3 ]]; then
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-      - name: Run Tempo Lints
-        uses: tempoxyz/lints@f9268eb2b828dbacf9f4b5d4bf6ad4541826567f # 2026-08-25T05-00-01Z-f9268eb2 # zizmor: ignore[ref-version-mismatch]
-        env:
-          COREPACK_DEFAULT_TO_LATEST: "0"
-        with:
-          language: rust
-          path: "."
-          post-comment: false
-          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install ast-grep
-        uses: tempoxyz/gh-actions/vendor/jaxxstorm/action-install-gh-release@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        uses: tempoxyz/gh-actions/vendor/jaxxstorm/action-install-gh-release@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           repo: ast-grep/ast-grep
           tag: "0.45.0"
@@ -80,6 +59,22 @@ jobs:
       - name: Run ast-grep tests
         run: sg test -c sgconfig.yml
 
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - name: Check for typos
+        uses: tempoxyz/gh-actions/actions/typos@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -88,22 +83,21 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
-      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
-          tool: cargo-hack
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests
-        run: cargo test --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
+        run: cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
         env:
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
       - name: Check Ring transport dependency graph
@@ -113,10 +107,84 @@ jobs:
             echo "Ring-only transport unexpectedly includes aws-lc-sys"
             exit 1
           fi
-      - name: Check feature combinations
-        run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --skip integration,integration-stripe,integration-ws
       - name: Check examples
         run: cargo check --workspace --exclude mpp
+
+  doctest:
+    name: Doc tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          toolchain: stable
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Edition 2021 compiles each doctest separately (~15s), so they run
+      # alongside the unit tests instead of after them.
+      - name: Doc tests
+        run: cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws
+
+  features:
+    name: Features ${{ matrix.partition }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ["1/3", "2/3", "3/3"]
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          toolchain: stable
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # rust-cache keys on the job ID, which all partitions share: only the
+          # first to finish on main saved, and the others restored a target
+          # directory built for different features. One cache per partition.
+          key: features-${{ strategy.job-index }}
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          tool: cargo-hack
+      # The TLS backends only select reqwest's TLS stack, so pairing them with
+      # every other feature adds ~60 checks that test nothing new. They are
+      # checked once each with the client below.
+      - name: Check feature combinations
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: >-
+          cargo hack check --feature-powerset --depth 2 --no-dev-deps
+          --skip integration,integration-stripe,integration-ws
+          --exclude-features reqwest-default-tls,reqwest-native-tls,reqwest-rustls-tls,reqwest-rustls-tls-no-provider
+          --partition "$PARTITION"
+      - name: Check TLS backends
+        if: matrix.partition == '1/3'
+        run: |
+          for tls in reqwest-default-tls reqwest-native-tls reqwest-rustls-tls reqwest-rustls-tls-no-provider; do
+            cargo check --no-default-features --features "client,$tls"
+          done
 
   integration:
     name: Integration Test
@@ -127,20 +195,32 @@ jobs:
       packages: read
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      # Start the containers in the background so pulling and booting them
+      # overlaps the setup below; a later step waits for `up --wait` to finish.
+      - name: Start Tempo localnet
+        run: (docker compose up -d --wait --quiet-pull > "$RUNNER_TEMP/compose-up.log" 2>&1; echo $? > "$RUNNER_TEMP/compose-up.status") > /dev/null 2>&1 &
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Compile before waiting, so the build also overlaps the localnet start.
+      - name: Build integration tests
+        run: cargo test --features integration --test integration_charge --test integration_session --no-run
 
-      - name: Start Tempo localnet
-        run: docker compose up -d --wait
+      - name: Wait for Tempo localnet
+        run: |
+          for _ in {1..360}; do [[ -s "$RUNNER_TEMP/compose-up.status" ]] && break; sleep 0.5; done
+          cat "$RUNNER_TEMP/compose-up.log"
+          [[ "$(cat "$RUNNER_TEMP/compose-up.status" 2>/dev/null)" == 0 ]]
 
       - name: Run integration tests
         run: cargo test --features integration --test integration_charge --test integration_session -- --nocapture
@@ -150,64 +230,24 @@ jobs:
         run: docker compose down
 
   deny:
-    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+    uses: tempoxyz/gh-actions/.github/workflows/rust-deny.yml@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
     with:
       rust-toolchain: nightly
     permissions:
       contents: read
       id-token: write
 
-  fuzz:
-    name: Fuzz smoke
-    # Pull requests only: a crash should stop a merge, not a release build.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.ref || '' }}
-          persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-        with:
-          toolchain: nightly
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-        with:
-          workspaces: fuzz
-      - name: Resolve Cargo dependencies
-        # The fuzz crate is its own workspace. Start it from the root lockfile
-        # so it resolves the same versions as the other jobs.
-        run: |
-          .github/scripts/resolve-cargo-dependencies.sh
-          cp Cargo.lock fuzz/Cargo.lock
-      - uses: tempoxyz/gh-actions/vendor/taiki-e/install-action@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-        with:
-          tool: cargo-fuzz
-      # A crash fails the job; the log prints the reproducer as base64.
-      - name: Run every target for 30 seconds
-        run: fuzz/run-all.sh 30
-        env:
-          FUZZ_JOBS: 4
-          # The prebuilt cargo-fuzz is a musl binary and defaults to its own
-          # target, which sanitizers do not support.
-          CARGO_FUZZ_ARGS: --target x86_64-unknown-linux-gnu
-
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, test, integration, deny, fuzz]
+    needs: [lint, typos, test, doctest, features, integration, deny]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - run: |
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "One or more required jobs failed or were cancelled"

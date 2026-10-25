@@ -9,7 +9,7 @@ use crate::protocol::methods::tempo::PATH_USD;
 
 pub use crate::protocol::methods::tempo::session_method::{
     deduct_from_channel, InMemoryChannelStore as SessionChannelStore,
-    SessionMethod as TempoSessionMethod, SessionMethodConfig,
+    SessionMethod as TempoSessionMethod, SessionMethodConfig, StreamCheck,
 };
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 pub use crate::protocol::methods::tempo::{
@@ -35,6 +35,8 @@ pub struct TempoBuilder {
     pub(crate) recipient: String,
     pub(crate) rpc_url: String,
     pub(crate) realm: String,
+    pub(crate) request_realm_default: bool,
+    pub(crate) trusted_request_hosts: Vec<String>,
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
     pub(crate) fee_payer: bool,
@@ -92,9 +94,22 @@ impl TempoBuilder {
         self
     }
 
-    /// Override the realm (default: auto-detected from environment variables).
+    /// Override the realm (default: environment-detected outside trusted HTTP hosts).
     pub fn realm(mut self, realm: &str) -> Self {
         self.realm = realm.to_string();
+        self.request_realm_default = false;
+        self
+    }
+
+    /// Permit these public HTTP hostnames as default realms in Axum.
+    /// Specify hostnames without schemes or ports; an unlisted Host header
+    /// cannot change the realm used for payment proofs.
+    pub fn trusted_hosts<I, T>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.trusted_request_hosts = hosts.into_iter().map(Into::into).collect();
         self
     }
 
@@ -267,6 +282,8 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         recipient: config.recipient.to_string(),
         rpc_url: crate::protocol::methods::tempo::DEFAULT_RPC_URL.to_string(),
         realm: detect_realm(),
+        request_realm_default: super::mpp::request_realm_default(),
+        trusted_request_hosts: Vec::new(),
         secret_key: None,
         decimals: 6,
         fee_payer: false,

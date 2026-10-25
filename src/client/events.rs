@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
 
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type EventHandler = Arc<dyn Fn(ClientEvent) -> BoxFuture<Option<PaymentCredential>> + Send + Sync>;
@@ -54,6 +54,10 @@ pub enum ClientEventKind {
     PaymentResponse,
     /// The payment flow failed after a 402 response.
     PaymentFailed,
+    /// A payment channel was opened or topped up.
+    Deposit,
+    /// A session request was charged or credited while its response streamed.
+    PaymentUpdate,
 }
 
 impl ClientEventKind {
@@ -64,6 +68,8 @@ impl ClientEventKind {
             Self::CredentialCreated => "credential.created",
             Self::PaymentResponse => "payment.response",
             Self::PaymentFailed => "payment.failed",
+            Self::Deposit => "channel.deposit",
+            Self::PaymentUpdate => "payment.update",
         }
     }
 }
@@ -95,6 +101,55 @@ pub struct PaymentResponseContext {
     pub credential: PaymentCredential,
     /// Status returned by the retried request.
     pub status: StatusCode,
+    /// URL of the paid request.
+    pub url: Url,
+    /// The response's `Payment-Receipt`. A session receipt is included only
+    /// when it matches the challenge and the paying channel.
+    pub receipt: Option<Box<Receipt>>,
+    /// What the server charged for the request, in base units of the
+    /// challenge's currency: a charge's amount, or for a session the change in
+    /// the channel's `spent` reported by the receipt (the quoted price the
+    /// first time a channel is seen). `None` when the provider does not track it.
+    pub amount: Option<u128>,
+    /// The token the payer spent, when the provider reports one, such as MACH swapped into a
+    /// charge's currency. See [`PaymentProvider::funding_currency`](super::PaymentProvider::funding_currency).
+    pub funding_currency: Option<String>,
+}
+
+/// Context for `channel.deposit`: money moved from the wallet into a payment
+/// channel, when the server accepted the channel's open or a top-up.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DepositContext {
+    /// URL of the request that opened or topped up the channel.
+    pub url: Url,
+    /// Channel identifier.
+    pub channel_id: String,
+    /// Token the channel holds, when the channel has a descriptor.
+    pub currency: Option<String>,
+    /// Amount this deposit added, in base units of the channel's token.
+    pub amount: u128,
+    /// The channel's deposit afterwards.
+    pub deposit: u128,
+    /// Whether this deposit opened the channel; otherwise it topped it up.
+    pub opened: bool,
+}
+
+/// Context for `payment.update`: a session server reported, in a
+/// `payment-receipt` event of a streaming response, that it charged the
+/// request more as output was delivered, or settled it at its final usage.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PaymentUpdateContext {
+    /// URL of the streaming request.
+    pub url: Url,
+    /// Channel identifier.
+    pub channel_id: String,
+    /// The channel's `spent` after the update, in base units of its token.
+    pub spent: u128,
+    /// How much `spent` changed since the channel's previous receipt:
+    /// positive for a charge, negative for a credit.
+    pub change: i128,
 }
 
 /// Structured reason for a `payment.failed` event.
@@ -102,8 +157,21 @@ pub struct PaymentResponseContext {
 #[non_exhaustive]
 pub enum PaymentFailureReason {
     /// Client refused before signing because the challenge was expired or had
-    /// an unparseable `expires`. `provider.pay()` was not called.
+    /// an unparsable `expires`. `provider.pay()` was not called.
     PreSigningExpired { expires: Option<String> },
+    /// The credential was sent but the paid request returned a 5xx response
+    /// (`status`) or no response at all (`status` is `None`), so the payment
+    /// may or may not have settled. Reconcile it before paying again.
+    #[non_exhaustive]
+    OutcomeUnknown {
+        /// Status of the paid response, when one arrived.
+        status: Option<u16>,
+        /// The serialized credential that was sent (an `Authorization: Payment` value).
+        credential: String,
+        /// Transaction hash the payment can be looked up by, when known: the
+        /// broadcast hash of a Tempo charge's `hash` credential.
+        transaction_hash: Option<String>,
+    },
 }
 
 /// Context for `payment.failed`.
@@ -146,6 +214,10 @@ pub enum ClientEvent {
     PaymentResponse(PaymentResponseContext),
     /// The payment flow failed.
     PaymentFailed(PaymentFailedContext),
+    /// A payment channel was opened or topped up.
+    Deposit(DepositContext),
+    /// A session request was charged or credited while its response streamed.
+    PaymentUpdate(PaymentUpdateContext),
 }
 
 impl ClientEvent {
@@ -156,6 +228,8 @@ impl ClientEvent {
             Self::CredentialCreated(_) => ClientEventKind::CredentialCreated,
             Self::PaymentResponse(_) => ClientEventKind::PaymentResponse,
             Self::PaymentFailed(_) => ClientEventKind::PaymentFailed,
+            Self::Deposit(_) => ClientEventKind::Deposit,
+            Self::PaymentUpdate(_) => ClientEventKind::PaymentUpdate,
         }
     }
 }
@@ -303,6 +377,44 @@ impl ClientEvents {
         self.on(ClientEventKind::PaymentFailed, move |event| {
             let fut = match event {
                 ClientEvent::PaymentFailed(ctx) => Some(handler(ctx)),
+                _ => None,
+            };
+            async move {
+                if let Some(fut) = fut {
+                    fut.await;
+                }
+            }
+        })
+    }
+
+    /// Register a `channel.deposit` observer.
+    pub fn on_deposit<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(DepositContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on(ClientEventKind::Deposit, move |event| {
+            let fut = match event {
+                ClientEvent::Deposit(ctx) => Some(handler(ctx)),
+                _ => None,
+            };
+            async move {
+                if let Some(fut) = fut {
+                    fut.await;
+                }
+            }
+        })
+    }
+
+    /// Register a `payment.update` callback.
+    pub fn on_payment_update<F, Fut>(&self, handler: F) -> ClientEventSubscription
+    where
+        F: Fn(PaymentUpdateContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on(ClientEventKind::PaymentUpdate, move |event| {
+            let fut = match event {
+                ClientEvent::PaymentUpdate(ctx) => Some(handler(ctx)),
                 _ => None,
             };
             async move {

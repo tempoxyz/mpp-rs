@@ -164,13 +164,26 @@ fn test_unformattable_challenge_returns_500_without_challenge() {
     );
 }
 
-#[test]
-fn test_payment_required_has_json_content_type() {
-    let resp = PaymentRequired(test_challenge()).into_response();
+#[tokio::test]
+async fn test_payment_required_has_problem_body() {
+    use http_body_util::BodyExt;
+
+    let mut challenge = test_challenge();
+    challenge.description = Some("Premium access".into());
+    let resp = PaymentRequired(challenge).into_response();
     assert_eq!(
         resp.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json"
+        "application/problem+json"
     );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/payment-required"
+    );
+    assert_eq!(problem["status"], 402);
+    assert_eq!(problem["detail"], "Payment is required (Premium access).");
+    assert_eq!(problem["challengeId"], "test-id");
 }
 
 #[test]
@@ -202,6 +215,76 @@ fn test_rejection_internal_error() {
 }
 
 #[test]
+fn test_payment_problem_new_drops_offers_for_final_403() {
+    let error = MppError::CredentialReplayed(Some("Transaction hash has already been used".into()));
+    let problem = PaymentProblem::new(&error, vec![test_challenge()]);
+    assert_eq!(problem.problem.status, 403);
+    assert!(problem.problem.challenge_id.is_none());
+    assert!(problem.offers.is_empty());
+
+    let resp = problem.into_response();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+}
+
+#[test]
+fn test_rejection_problem_challenges_only_when_paying_again_helps() {
+    let cases = [
+        (
+            MppError::verification_failed("amount mismatch"),
+            StatusCode::PAYMENT_REQUIRED,
+            true,
+        ),
+        (
+            MppError::CredentialReplayed(Some("Transaction hash has already been used".into())),
+            StatusCode::FORBIDDEN,
+            false,
+        ),
+        (
+            MppError::CredentialReplayed(Some("memo is not bound to this challenge".into())),
+            StatusCode::FORBIDDEN,
+            false,
+        ),
+    ];
+    for (error, status, challenged) in cases {
+        let label = format!("{error:?}");
+        let rejection = MppChargeRejection::from_error(error, || Ok(vec![test_challenge()]));
+        let MppChargeRejection::Problem(problem) = &rejection else {
+            panic!("{label}: expected a problem rejection");
+        };
+        assert_eq!(
+            problem.problem.problem_type,
+            format!(
+                "{}/verification-failed",
+                crate::error::CORE_PROBLEM_TYPE_BASE
+            ),
+            "{label}"
+        );
+        assert_eq!(
+            problem.problem.challenge_id.is_some(),
+            challenged,
+            "{label}"
+        );
+
+        let resp = rejection.into_response();
+        assert_eq!(resp.status(), status, "{label}");
+        assert_eq!(
+            resp.headers().contains_key(WWW_AUTHENTICATE_HEADER),
+            challenged,
+            "{label}"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+}
+
+#[test]
 fn test_custom_amount() {
     struct FiveDollars;
     impl ChargeConfig for FiveDollars {
@@ -230,6 +313,38 @@ fn test_config_overrides() {
     }
     assert_eq!(Premium::amount(), "10.00");
     assert_eq!(Premium::description(), Some("Premium access"));
+}
+
+#[test]
+fn test_request_realm_uses_hostname_without_port() {
+    let request = http_types::Request::builder()
+        .uri("/paid")
+        .header(header::HOST, "Api.Example.Test:8443")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    assert_eq!(
+        request_realm_from_parts(&parts).as_deref(),
+        Some("api.example.test")
+    );
+
+    let request = http_types::Request::builder()
+        .uri("https://Other.Example.Test:443/paid")
+        .header(header::HOST, "api.example.test")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    assert_eq!(
+        request_realm_from_parts(&parts).as_deref(),
+        Some("other.example.test")
+    );
+
+    let request = http_types::Request::builder()
+        .uri("/paid")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    assert_eq!(request_realm_from_parts(&parts), None);
 }
 
 #[test]
@@ -471,6 +586,9 @@ async fn test_extractor_valid_payment_returns_receipt() {
 
 #[tokio::test]
 async fn test_extractor_fails_closed_when_challenger_does_not_verify_scope() {
+    use crate::protocol::core::headers::format_authorization;
+    use crate::protocol::core::{PaymentCredential, PaymentPayload};
+
     struct LegacyChallenger;
 
     impl ChargeChallenger for LegacyChallenger {
@@ -505,11 +623,283 @@ async fn test_extractor_fails_closed_when_challenger_does_not_verify_scope() {
         }
     }
 
-    let result =
-        run_extractor::<OneCent>(LegacyChallenger, Some("Payment eyJmYWtlIjp0cnVlfQ")).await;
+    // A well-formed credential for this challenger's own (unscoped) challenge.
+    let challenge = LegacyChallenger
+        .challenge("0.01", ChallengeOptions::default())
+        .unwrap();
+    let auth = format_authorization(&PaymentCredential::new(
+        challenge.to_echo(),
+        PaymentPayload::hash("0xabc"),
+    ))
+    .unwrap();
 
-    let err = result.unwrap_err();
+    let err = run_extractor::<OneCent>(LegacyChallenger, Some(&auth))
+        .await
+        .unwrap_err();
     assert!(matches!(err, MppChargeRejection::Problem(_)));
+    assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+
+    let err = run_body_extractor::<OneCent>(LegacyChallenger, Some(&auth), "{}")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MppChargeRejection::Problem(_)));
+    assert_eq!(err.into_response().status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+// Binds the framework scope into the challenge request and implements only
+// the required verifier, relying on the default scope check.
+struct ScopedChallenger;
+
+impl ChargeChallenger for ScopedChallenger {
+    fn challenge(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+    ) -> Result<PaymentChallenge, String> {
+        let mut request = serde_json::json!({"amount": amount});
+        if let Some(description) = options.description {
+            request["description"] = description.into();
+        }
+        if let Some(scope) = options.mppx_scope {
+            request["_mppx_scope"] = scope;
+        }
+        Ok(PaymentChallenge::new(
+            "mock-id",
+            "mock-realm",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&request).unwrap(),
+        ))
+    }
+
+    fn challenge_with_body(
+        &self,
+        amount: &str,
+        options: ChallengeOptions,
+        body: &[u8],
+    ) -> Result<PaymentChallenge, String> {
+        let mut challenge = self.challenge(amount, options)?;
+        // A stand-in for the body's content digest: the body bytes in hex.
+        let hex: String = body.iter().map(|byte| format!("{byte:02x}")).collect();
+        challenge.digest = Some(format!("sha-256={hex}"));
+        Ok(challenge)
+    }
+
+    fn verify_payment(
+        &self,
+        _credential_str: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
+        Box::pin(std::future::ready(Ok(Receipt {
+            status: crate::protocol::core::ReceiptStatus::Success,
+            method: crate::protocol::core::MethodName::new("tempo"),
+            timestamp: "2025-01-01T00:00:00Z".into(),
+            reference: "0xscoped".into(),
+            external_id: None,
+            subscription_id: None,
+            extensions: serde_json::Map::new(),
+        })))
+    }
+}
+
+#[tokio::test]
+async fn test_custom_challenger_verifies_scoped_credential_by_default() {
+    use crate::protocol::core::headers::{format_authorization, parse_www_authenticate};
+    use crate::protocol::core::{PaymentCredential, PaymentPayload};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    async fn paid(_charge: MppCharge<OneCent>) -> &'static str {
+        "paid"
+    }
+
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/premium", get(paid))
+        .route("/other", get(paid))
+        .with_state(state);
+    let get_with = |uri: &str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder().uri(uri);
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    };
+
+    let response = app
+        .clone()
+        .oneshot(get_with("/premium", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let challenge = parse_www_authenticate(
+        response.headers()[WWW_AUTHENTICATE_HEADER]
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xabc"));
+    let auth = format_authorization(&credential).unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(get_with("/premium", Some(&auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app.oneshot(get_with("/other", Some(&auth))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn test_custom_challenger_default_accepts_credential_with_description() {
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    struct Described;
+    impl ChargeConfig for Described {
+        fn amount() -> &'static str {
+            "0.01"
+        }
+        fn description() -> Option<&'static str> {
+            Some("Premium content")
+        }
+    }
+
+    async fn paid(_charge: MppCharge<Described>) -> &'static str {
+        "paid"
+    }
+    async fn paid_with_body(_charge: MppChargeWithBody<Described>) -> &'static str {
+        "paid"
+    }
+
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/premium", get(paid).post(paid_with_body))
+        .with_state(state);
+    let request = |method: &str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder()
+            .method(method)
+            .uri("/premium");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::from("{}")).unwrap()
+    };
+
+    for method in ["GET", "POST"] {
+        let response = app.clone().oneshot(request(method, None)).await.unwrap();
+        let auth = credential_for(&response);
+        let response = app
+            .clone()
+            .oneshot(request(method, Some(&auth)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+    }
+}
+
+/// Pays the challenge in a 402 response by echoing it in a credential.
+fn credential_for(response: &axum::response::Response) -> String {
+    use crate::protocol::core::headers::{format_authorization, parse_www_authenticate};
+    use crate::protocol::core::{PaymentCredential, PaymentPayload};
+
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    let challenge = parse_www_authenticate(
+        response.headers()[WWW_AUTHENTICATE_HEADER]
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    format_authorization(&PaymentCredential::new(
+        challenge.to_echo(),
+        PaymentPayload::hash("0xabc"),
+    ))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_custom_challenger_default_rejects_credential_for_other_amount() {
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    struct OneDollarItem;
+    impl ChargeConfig for OneDollarItem {
+        fn amount() -> &'static str {
+            "1.00"
+        }
+    }
+
+    async fn cheap(_charge: MppCharge<OneCent>) -> &'static str {
+        "cheap"
+    }
+    async fn expensive(_charge: MppCharge<OneDollarItem>) -> &'static str {
+        "expensive"
+    }
+
+    // Same path and query, so the same framework scope, but different prices.
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/item", get(cheap).post(expensive))
+        .with_state(state);
+    let request = |method: &str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder().method(method).uri("/item");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    };
+
+    let response = app.clone().oneshot(request("GET", None)).await.unwrap();
+    let cheap_auth = credential_for(&response);
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", Some(&cheap_auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(request("POST", Some(&cheap_auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn test_custom_challenger_default_rejects_credential_for_other_body() {
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    async fn paid(_charge: MppChargeWithBody<OneCent>) -> &'static str {
+        "paid"
+    }
+
+    let state: Arc<dyn ChargeChallenger> = Arc::new(ScopedChallenger);
+    let app = axum::Router::new()
+        .route("/upload", post(paid))
+        .with_state(state);
+    let request = |body: &'static str, auth: Option<&str>| {
+        let mut builder = http_types::Request::builder().method("POST").uri("/upload");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(axum::body::Body::from(body)).unwrap()
+    };
+
+    let response = app.clone().oneshot(request("a", None)).await.unwrap();
+    let auth = credential_for(&response);
+
+    let response = app
+        .clone()
+        .oneshot(request("b", Some(&auth)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let response = app.oneshot(request("a", Some(&auth))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1011,6 +1401,9 @@ mod currency_offers {
     use crate::server::{tempo, ChargeMethod, Mpp, TempoConfig};
     use std::future::Future;
 
+    #[cfg(feature = "stripe")]
+    use crate::server::{stripe, StripeConfig};
+
     const RECIPIENT: &str = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2";
 
     #[derive(Clone)]
@@ -1262,6 +1655,120 @@ mod currency_offers {
     }
 
     #[tokio::test]
+    async fn test_default_realm_binds_challenge_and_verification_to_http_hostname() {
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: RECIPIENT,
+            })
+            .rpc_url("http://127.0.0.1:1")
+            .chain_id(CHAIN_ID)
+            .trusted_hosts(["api.example.test", "other.example.test"])
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let first = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp.clone(), None, "https://api.example.test/test")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(first.realm, "api.example.test");
+        assert_eq!(mpp.realm(), "MPP Payment");
+
+        let credential =
+            PaymentCredential::new(first.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+        let authorization = format_authorization(&credential).unwrap();
+        let wrong_host = run_extractor_with_uri::<OneCent>(
+            mpp.clone(),
+            Some(&authorization),
+            "https://other.example.test/test",
+        )
+        .await
+        .unwrap_err();
+        let MppChargeRejection::Problem(problem) = wrong_host else {
+            panic!("expected a payment problem for a credential from another hostname");
+        };
+        assert!(problem.problem.problem_type.ends_with("/invalid-challenge"));
+        assert_eq!(problem.offers[0].realm, "other.example.test");
+
+        // The matching hostname passes realm verification and reaches the
+        // intentionally unreachable RPC provider.
+        let same_host = run_extractor_with_uri::<OneCent>(
+            mpp,
+            Some(&authorization),
+            "https://api.example.test/test",
+        )
+        .await
+        .unwrap_err();
+        let MppChargeRejection::Problem(problem) = same_host else {
+            panic!("expected the unreachable RPC to fail verification");
+        };
+        assert_eq!(problem.problem.status, 500);
+    }
+
+    #[tokio::test]
+    async fn test_untrusted_host_cannot_choose_proof_realm() {
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: RECIPIENT,
+            })
+            .trusted_hosts(["api.example.test"])
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let offer = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp, None, "https://attacker.example.test/test")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(offer.realm, "MPP Payment");
+    }
+
+    #[tokio::test]
+    async fn test_explicit_realm_overrides_http_hostname() {
+        let mpp = Mpp::create(
+            tempo(TempoConfig {
+                recipient: RECIPIENT,
+            })
+            .realm("configured.example.test")
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let offer = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp, None, "https://api.example.test/test")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(offer.realm, "configured.example.test");
+    }
+
+    #[cfg(feature = "stripe")]
+    #[tokio::test]
+    async fn test_stripe_default_realm_uses_http_hostname() {
+        let mpp = Mpp::create_stripe(
+            stripe(StripeConfig {
+                secret_key: "sk_test_not_sent",
+                network_id: "internal",
+                payment_method_types: &["card"],
+                currency: "usd",
+                decimals: 2,
+            })
+            .trusted_hosts(["billing.example.test"])
+            .secret_key("test-secret-key-at-least-32-bytes"),
+        )
+        .unwrap();
+        let offer = response_offers(
+            run_extractor_with_uri::<OneCent>(mpp, None, "https://billing.example.test/paid")
+                .await
+                .unwrap_err(),
+        )
+        .remove(0);
+        assert_eq!(offer.realm, "billing.example.test");
+    }
+
+    #[tokio::test]
     async fn test_tempo_challenger_offers_mainnet_defaults() {
         let mpp = Mpp::create(
             tempo(TempoConfig {
@@ -1328,7 +1835,7 @@ mod currency_offers {
         );
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/json"
+            "application/problem+json"
         );
     }
 

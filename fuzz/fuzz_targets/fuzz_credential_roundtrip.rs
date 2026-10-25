@@ -71,7 +71,7 @@ fuzz_target!(|input: Input| {
             assert!(
                 !well_formed
                     || !has_supported_header(credential.challenge.header.as_deref())
-                    || token.len() > 16 * 1024,
+                    || header.len() > 64 * 1024,
                 "{error}: {credential:?}"
             );
             return;

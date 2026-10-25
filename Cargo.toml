@@ -1,6 +1,6 @@
 [package]
 name = "mpp"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2021"
 description = "Rust SDK for the Machine Payments Protocol (MPP)"
 license = "MIT OR Apache-2.0"
@@ -62,6 +62,21 @@ middleware = [
   "dep:async-trait",
   "anyhow",
   "http-types",
+]
+
+# Local forward proxy that pays for 402 responses (requires client)
+forward-proxy = [
+  "client",
+  "tokio/net",
+  "tokio/io-util",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:http-body-util",
+  "dep:bytes",
+  "dep:tokio-rustls",
+  "dep:rcgen",
+  "dep:rustls-native-certs",
+  "dep:uuid",
 ]
 
 # Tower middleware support (server-side)
@@ -148,6 +163,13 @@ http-body-util = { version = "0.1", optional = true }
 # Axum dependencies (optional)
 axum-core = { version = "0.5", optional = true }
 axum = { version = "0.8", default-features = false, features = ["matched-path"], optional = true }
+
+# Forward proxy dependencies (optional)
+hyper = { version = "1", default-features = false, features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 # WebSocket dependencies (optional)
 futures-util = { version = "0.3", features = ["sink"], optional = true }

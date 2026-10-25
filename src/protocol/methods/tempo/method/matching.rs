@@ -42,7 +42,7 @@ impl TransferSource<'_> {
 }
 
 /// Assign each expected transfer a distinct transfer of the transaction and
-/// return the memos of the assigned transfers.
+/// return the assigned transfers.
 ///
 /// A transfer matches when token, recipient and amount are equal and, if the
 /// expected transfer names a memo, the memo is equal too. Expected transfers
@@ -53,12 +53,12 @@ pub(super) fn match_transfers(
     source: TransferSource<'_>,
     currency: Address,
     expected: &[Transfer],
-) -> Result<Vec<Option<[u8; 32]>>, VerificationError> {
+) -> Result<Vec<TransferEffect>, VerificationError> {
     let mut sorted_expected: Vec<&Transfer> = expected.iter().collect();
     sorted_expected.sort_by_key(|t| if t.memo.is_some() { 0 } else { 1 });
 
     let mut used = vec![false; transfers.len()];
-    let mut matched_memos = Vec::with_capacity(expected.len());
+    let mut matched = Vec::with_capacity(expected.len());
 
     for expected in sorted_expected {
         if expected.amount.is_zero() {
@@ -116,8 +116,8 @@ pub(super) fn match_transfers(
         };
 
         used[index] = true;
-        matched_memos.push(transfers[index].memo);
+        matched.push(transfers[index]);
     }
 
-    Ok(matched_memos)
+    Ok(matched)
 }

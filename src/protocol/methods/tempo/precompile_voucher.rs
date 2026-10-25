@@ -88,6 +88,17 @@ alloy::sol! {
     }
 }
 
+#[cfg(feature = "tempo")]
+alloy::sol! {
+    /// EIP-712 cooperative close authorization. Its own type keeps a voucher
+    /// signature from authorizing a close.
+    #[derive(Debug)]
+    struct CloseAuthorization {
+        bytes32 channelId;
+        uint96 cumulativeAmount;
+    }
+}
+
 /// Maximum cumulative amount the precompile accepts (2^96 − 1).
 #[cfg(feature = "tempo")]
 pub const PRECOMPILE_MAX_CUMULATIVE_AMOUNT: u128 = (1u128 << 96) - 1;
@@ -135,6 +146,76 @@ pub fn precompile_voucher_signing_hash_with_escrow(
     };
 
     Ok(voucher.eip712_signing_hash(&domain))
+}
+
+/// Compute the TIP-1034 EIP-712 signing hash of a cooperative close
+/// authorization, which servers require with a close credential.
+#[cfg(feature = "tempo")]
+pub fn precompile_close_authorization_signing_hash_with_escrow(
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<B256> {
+    if cumulative_amount > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
+        return Err(MppError::InvalidConfig(format!(
+            "cumulative_amount {cumulative_amount} exceeds precompile uint96 max"
+        )));
+    }
+    let domain = eip712_domain! {
+        name: PRECOMPILE_DOMAIN_NAME,
+        version: PRECOMPILE_DOMAIN_VERSION,
+        chain_id: chain_id,
+        verifying_contract: escrow_contract,
+    };
+    let authorization = CloseAuthorization {
+        channelId: channel_id,
+        cumulativeAmount: Uint::<96, 2>::from(cumulative_amount),
+    };
+    Ok(authorization.eip712_signing_hash(&domain))
+}
+
+/// Sign a TIP-1034 cooperative close authorization with a Tempo primitive
+/// signer, as servers verify it.
+#[cfg(feature = "tempo")]
+pub async fn sign_precompile_close_authorization_primitive_with_escrow(
+    signer: &impl Signer<PrimitiveSignature>,
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<Bytes> {
+    let signing_hash = precompile_close_authorization_signing_hash_with_escrow(
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )?;
+    let signature = signer.sign_hash(&signing_hash).await.map_err(|e| {
+        MppError::InvalidSignature(Some(format!("failed to sign close authorization: {e}")))
+    })?;
+    Ok(signature.to_bytes())
+}
+
+/// Sign a TIP-1034 cooperative close authorization with a secp256k1 signer.
+#[cfg(feature = "tempo")]
+pub async fn sign_precompile_close_authorization_with_escrow(
+    signer: &impl Signer,
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+) -> Result<Bytes> {
+    let signing_hash = precompile_close_authorization_signing_hash_with_escrow(
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+    )?;
+    let signature = signer.sign_hash(&signing_hash).await.map_err(|e| {
+        MppError::InvalidSignature(Some(format!("failed to sign close authorization: {e}")))
+    })?;
+    Ok(Bytes::from(signature.as_bytes().to_vec()))
 }
 
 /// Sign a TIP-1034 voucher (EIP-712). Returns 65-byte ECDSA signature.
@@ -428,6 +509,30 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(hash, expected);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn precompile_close_authorization_signing_hash_matches_mppx() {
+        let channel_id: B256 = "0x57e629663a75a0a49f8dc65c9f62ee38ab5dfa9124d7316d160766e4ecbc1227"
+            .parse()
+            .unwrap();
+        // viem hashTypedData of mppx's CloseAuthorization with the same domain.
+        let expected: B256 = "0x223b6a6cbf14199a5c3cbf882d847396b680bab705d0597f3d4d7227bc24e887"
+            .parse()
+            .unwrap();
+        let hash = precompile_close_authorization_signing_hash_with_escrow(
+            channel_id,
+            50,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        )
+        .unwrap();
+        assert_eq!(hash, expected);
+        assert_ne!(
+            hash,
+            precompile_voucher_signing_hash(channel_id, 50, 42431).unwrap()
+        );
     }
 
     #[cfg(feature = "tempo")]

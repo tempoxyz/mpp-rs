@@ -203,7 +203,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let resp = client
@@ -248,7 +251,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let resp = client
@@ -315,7 +321,11 @@ mod integration {
             }
         });
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let err = client
@@ -371,7 +381,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let resp = client
@@ -449,7 +462,10 @@ mod integration {
             contexts: Arc::new(Mutex::new(Vec::new())),
         };
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let mut requests = tokio::task::JoinSet::new();
@@ -537,7 +553,11 @@ mod integration {
         });
 
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let resp = client
@@ -597,7 +617,11 @@ mod integration {
             }
         });
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let resp = client
@@ -657,7 +681,11 @@ mod integration {
             }
         });
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let resp = client
@@ -713,7 +741,11 @@ mod integration {
             }
         });
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let resp = client
@@ -753,7 +785,11 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_max_payment_retries(1))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_max_payment_retries(1),
+            )
             .build();
 
         let resp = client
@@ -800,7 +836,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let resp = client
@@ -857,7 +896,11 @@ mod integration {
             }
         });
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let resp = client
@@ -877,7 +920,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let resp = client
@@ -900,7 +946,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::new();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider))
+            .with(
+                PaymentMiddleware::new(provider)
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let err = client
@@ -969,7 +1018,11 @@ mod integration {
         });
 
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider.clone()).with_events(events))
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_events(events),
+            )
             .build();
 
         let err = client
@@ -1038,7 +1091,7 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_policy_default_always_injects_header() {
+    async fn test_policy_default_requires_explicit_preference() {
         let (base_url, captured) = spawn_header_capture().await;
         let client = ClientBuilder::new(reqwest::Client::new())
             .with(PaymentMiddleware::new(AdvertisingProvider))
@@ -1048,7 +1101,7 @@ mod integration {
             .send()
             .await
             .unwrap();
-        assert_eq!(captured.lock().unwrap().as_deref(), Some("tempo/charge"));
+        assert_eq!(captured.lock().unwrap().as_deref(), None);
     }
 
     #[tokio::test]
@@ -1107,8 +1160,8 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_policy_does_not_disable_402_retry() {
-        // A blocked outbound header must not stop the 402-retry path.
+    async fn test_never_policy_honors_explicit_request_preference() {
+        // An explicit request preference authorizes payment without automatic injection.
         let (_, www_auth) = test_challenge();
         let counter = Arc::new(AtomicU32::new(0));
         let counter_clone = counter.clone();
@@ -1142,6 +1195,7 @@ mod integration {
             .build();
         let resp = client
             .get(format!("{}/paid", base_url))
+            .header("Accept-Payment", "tempo/charge")
             .send()
             .await
             .unwrap();
@@ -1170,7 +1224,10 @@ mod integration {
         let base_url = spawn_server(app).await;
         let provider = TestProvider::failing();
         let client = ClientBuilder::new(reqwest::Client::new())
-            .with(PaymentMiddleware::new(provider))
+            .with(
+                PaymentMiddleware::new(provider)
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
             .build();
 
         let err = client

@@ -34,6 +34,20 @@ pub trait Store: Send + Sync {
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
 
+    /// Atomically replace or delete a value only if it equals `expected`.
+    ///
+    /// `None` represents an absent key. Backends must perform comparison and
+    /// mutation in one transaction across all clients/processes sharing storage.
+    /// The default fails closed; get-then-put is not a valid implementation.
+    fn compare_exchange(
+        &self,
+        _key: &str,
+        _expected: Option<serde_json::Value>,
+        _value: Option<serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        Box::pin(async { Err(StoreError::AtomicUnsupported) })
+    }
+
     /// Atomically store `value` only if `key` is absent; returns `true` if inserted.
     ///
     /// A generic `get`-then-`put` is racy, so the default **fails closed** with
@@ -55,7 +69,7 @@ pub enum StoreError {
     Internal(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
-    #[error("atomic put_if_absent is not supported by this store backend")]
+    #[error("required atomic operation is not supported by this store backend")]
     AtomicUnsupported,
 }
 
@@ -120,6 +134,34 @@ impl Store for MemoryStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
         self.data.lock().unwrap().remove(key);
         Box::pin(async { Ok(()) })
+    }
+
+    fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        value: Option<serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let key = key.to_string();
+        Box::pin(async move {
+            let mut data = self.data.lock().unwrap();
+            let current = data
+                .get(&key)
+                .map(|raw| serde_json::from_str(raw))
+                .transpose()
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            if current != expected {
+                return Ok(false);
+            }
+            if let Some(value) = value {
+                let raw = serde_json::to_string(&value)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?;
+                data.insert(key, raw);
+            } else {
+                data.remove(&key);
+            }
+            Ok(true)
+        })
     }
 
     fn put_if_absent(
@@ -280,13 +322,10 @@ impl Store for FileStore {
 
 /// Adapter that implements `ChannelStore` using a generic `Store` backend.
 ///
-/// This adapter serializes `update_channel` calls for the same channel within a
-/// single Rust process so it can satisfy `ChannelStore`'s atomic
-/// read-modify-write contract over the weaker `Store` trait.
-///
-/// It does not provide distributed locking. If multiple processes share the
-/// same backend, use a store implementation with native compare-and-swap or
-/// transactional update semantics instead of relying on this adapter alone.
+/// Local locks reduce contention; correctness requires backend-native
+/// [`Store::compare_exchange`]. Unsupported stores (including `FileStore`) fail
+/// closed on updates. A conflict returns an error before authorizing delivery;
+/// the caller may retry its operation against fresh state.
 #[cfg(all(feature = "server", feature = "tempo"))]
 pub struct ChannelStoreAdapter {
     store: std::sync::Arc<dyn Store>,
@@ -324,6 +363,23 @@ impl ChannelStoreAdapter {
 
 #[cfg(all(feature = "server", feature = "tempo"))]
 impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelStoreAdapter {
+    fn check_writable(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<(), crate::protocol::traits::VerificationError>> + Send + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let key = format!("{}:atomic-probe", self.prefix);
+            self.store
+                .compare_exchange(&key, None, None)
+                .await
+                .map_err(|e| crate::protocol::traits::VerificationError::internal(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     fn get_channel(
         &self,
         channel_id: &str,
@@ -391,7 +447,7 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
                 })?;
             let current_state: Option<
                 crate::protocol::methods::tempo::session_method::ChannelState,
-            > = match current_value {
+            > = match current_value.clone() {
                 Some(v) => Some(serde_json::from_value(v).map_err(|e| {
                     crate::protocol::traits::VerificationError::internal(format!(
                         "Failed to deserialize channel state: {}",
@@ -403,26 +459,24 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
 
             let result = updater(current_state)?;
 
-            match &result {
-                Some(state) => {
-                    let value = serde_json::to_value(state).map_err(|e| {
-                        crate::protocol::traits::VerificationError::internal(format!(
-                            "Failed to serialize channel state: {}",
-                            e
-                        ))
-                    })?;
-                    self.store.put(&key, value).await.map_err(|e| {
-                        crate::protocol::traits::VerificationError::internal(e.to_string())
-                    })?;
-                }
-                None => {
-                    self.store.delete(&key).await.map_err(|e| {
-                        crate::protocol::traits::VerificationError::internal(e.to_string())
-                    })?;
-                    // Evict the per-channel lock so the map doesn't grow unboundedly.
-                    if let Ok(mut locks) = self.channel_locks.lock() {
-                        locks.remove(&key);
-                    }
+            let value = result
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| crate::protocol::traits::VerificationError::internal(e.to_string()))?;
+            let committed = self
+                .store
+                .compare_exchange(&key, current_value, value)
+                .await
+                .map_err(|e| crate::protocol::traits::VerificationError::internal(e.to_string()))?;
+            if !committed {
+                return Err(crate::protocol::traits::VerificationError::internal(
+                    "channel changed concurrently; retry against fresh state",
+                ));
+            }
+            if result.is_none() {
+                if let Ok(mut locks) = self.channel_locks.lock() {
+                    locks.remove(&key);
                 }
             }
 
@@ -751,6 +805,15 @@ mod adapter_tests {
             })
         }
 
+        fn compare_exchange(
+            &self,
+            key: &str,
+            expected: Option<serde_json::Value>,
+            value: Option<serde_json::Value>,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            self.inner.compare_exchange(key, expected, value)
+        }
+
         fn put(
             &self,
             key: &str,
@@ -775,6 +838,87 @@ mod adapter_tests {
                 self.inner.delete(&key).await
             })
         }
+    }
+
+    struct SynchronizedStore {
+        inner: MemoryStore,
+        readers: tokio::sync::Barrier,
+    }
+
+    impl Store for SynchronizedStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
+        {
+            let key = key.to_owned();
+            Box::pin(async move {
+                let value = self.inner.get(&key).await?;
+                self.readers.wait().await;
+                Ok(value)
+            })
+        }
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.inner.put(key, value)
+        }
+        fn delete(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.inner.delete(key)
+        }
+        fn compare_exchange(
+            &self,
+            key: &str,
+            expected: Option<serde_json::Value>,
+            value: Option<serde_json::Value>,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            self.inner.compare_exchange(key, expected, value)
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_adapters_cannot_spend_the_same_balance() {
+        let store = Arc::new(SynchronizedStore {
+            inner: MemoryStore::new(),
+            readers: tokio::sync::Barrier::new(2),
+        });
+        let mut state = test_channel_state("ch1");
+        state.highest_voucher_amount = 10_000;
+        store
+            .inner
+            .put("channels:ch1", serde_json::to_value(state).unwrap())
+            .await
+            .unwrap();
+        let first = ChannelStoreAdapter::new(store.clone(), "channels:");
+        let second = ChannelStoreAdapter::new(store.clone(), "channels:");
+        let (a, b) = tokio::join!(
+            deduct_from_channel(&first, "ch1", 7_000),
+            deduct_from_channel(&second, "ch1", 7_000)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        let saved: ChannelState =
+            serde_json::from_value(store.inner.get("channels:ch1").await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(saved.spent, 7_000);
+        assert_eq!(saved.units, 1);
+    }
+
+    #[tokio::test]
+    async fn adapter_requires_native_compare_exchange() {
+        let dir = std::env::temp_dir().join(format!("mpp_cas_unsupported_{}", std::process::id()));
+        let adapter =
+            ChannelStoreAdapter::new(Arc::new(FileStore::new(&dir).unwrap()), "channels:");
+        assert!(adapter.check_writable().await.is_err());
+        let result = adapter
+            .update_channel("ch1", Box::new(|_| Ok(Some(test_channel_state("ch1")))))
+            .await;
+        assert!(result.unwrap_err().to_string().contains("atomic operation"));
+        assert!(adapter.get_channel("ch1").await.unwrap().is_none());
     }
 
     fn test_channel_state(channel_id: &str) -> ChannelState {

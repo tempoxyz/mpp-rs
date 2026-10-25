@@ -4,7 +4,7 @@
 //! [`ToolCaller`] adapts a concrete MCP SDK. The wrapper deliberately knows
 //! nothing about one SDK's request, result, or error types.
 
-use std::future::Future;
+use std::{future::Future, sync::Mutex};
 
 use thiserror::Error;
 
@@ -14,9 +14,9 @@ use crate::{
         challenge_selection::{
             expired_payment_error, select_supported_challenge, ChallengeSelectionError,
         },
-        PaymentContext, PaymentProvider,
+        ManagementFuture, ManagementTransport, PaymentContext, PaymentProvider,
     },
-    MppError, PaymentChallenge, PaymentCredential,
+    MppError, PaymentChallenge, PaymentCredential, Receipt,
 };
 
 /// Adapts one concrete MCP SDK's tool-call boundary.
@@ -50,6 +50,15 @@ pub trait ToolCaller: Send + Sync {
         &self,
         _output: &Self::Output,
     ) -> Option<Vec<PaymentChallenge>> {
+        None
+    }
+
+    /// Extracts the payment receipt from tool-result metadata, such as
+    /// [`extract_receipt`](super::extract_receipt) of its `_meta`.
+    ///
+    /// Session providers learn what each call charged from it, and session
+    /// management calls (top-ups and closes) return it.
+    fn receipt_from_output(&self, _output: &Self::Output) -> Option<Receipt> {
         None
     }
 
@@ -113,38 +122,158 @@ where
 {
     /// Selects and pays one supported challenge.
     ///
+    /// When paying the preferred challenge fails, for example because the
+    /// wallet cannot fund a session's suggested deposit, the next supported
+    /// challenge in preference order is paid instead, such as the server's
+    /// one-time charge. The first failure is returned when none can be paid.
+    ///
     /// Returns `Ok(None)` when the provider supports none of the challenges,
     /// so the caller can preserve the original MCP result or error.
     pub async fn prepare(
         &self,
         challenges: &[PaymentChallenge],
     ) -> Result<Option<PendingPayment<P>>, MppError> {
-        let ranking = self.provider.accept_payment_header();
-        let challenge = match select_supported_challenge(
-            challenges,
-            ranking.as_deref(),
-            |challenge| {
-                self.provider
-                    .supports(challenge.method.as_str(), challenge.intent.as_str())
-            },
-            |candidates| self.provider.select_challenge(candidates),
-        ) {
-            Ok(challenge) => challenge.clone(),
-            Err(ChallengeSelectionError::Expired(challenge)) => {
-                return Err(expired_payment_error(&challenge));
-            }
-            Err(ChallengeSelectionError::NoSupportedChallenge(_)) => return Ok(None),
-        };
+        self.prepare_inner(challenges, None).await
+    }
 
-        let credential = self
-            .provider
-            .pay_with_context(&challenge, self.context.clone())
-            .await?;
-        Ok(Some(PendingPayment::new(
-            self.provider.clone(),
-            challenge,
-            credential,
-        )))
+    /// Selects and pays one supported challenge like [`prepare`](Self::prepare),
+    /// sending any management credential the payment needs first, such as a
+    /// session top-up when the channel's deposit does not cover the call,
+    /// through `management`, for example an [`McpManagement`] for the same
+    /// tool call.
+    pub async fn prepare_with_management(
+        &self,
+        challenges: &[PaymentChallenge],
+        management: &dyn ManagementTransport,
+    ) -> Result<Option<PendingPayment<P>>, MppError> {
+        self.prepare_inner(challenges, Some(management)).await
+    }
+
+    /// Records the receipt of a paid call that accepted `challenge`'s credential
+    /// and returns what it charged when the provider tracks it, such as the
+    /// change in a session channel's `spent`.
+    pub fn record_receipt(&self, challenge: &PaymentChallenge, receipt: &Receipt) -> Option<u128> {
+        self.provider
+            .record_receipt(&self.context, challenge, receipt)
+    }
+
+    async fn prepare_inner(
+        &self,
+        challenges: &[PaymentChallenge],
+        management: Option<&dyn ManagementTransport>,
+    ) -> Result<Option<PendingPayment<P>>, MppError> {
+        let ranking = self.provider.accept_payment_header();
+        let mut remaining = challenges.to_vec();
+        let mut failure = None;
+        loop {
+            let challenge = match select_supported_challenge(
+                &remaining,
+                ranking.as_deref(),
+                |challenge| {
+                    self.provider
+                        .supports(challenge.method.as_str(), challenge.intent.as_str())
+                },
+                |candidates| self.provider.select_challenge(candidates),
+            ) {
+                Ok(challenge) => challenge.clone(),
+                Err(ChallengeSelectionError::Expired(challenge)) => {
+                    return Err(failure.unwrap_or_else(|| expired_payment_error(&challenge)));
+                }
+                Err(ChallengeSelectionError::NoSupportedChallenge(_)) => {
+                    return failure.map_or(Ok(None), Err);
+                }
+            };
+
+            if crate::client::is_cross_realm_proof_with_trust(
+                &challenge,
+                &self.context.url,
+                &self.context.headers,
+                self.provider.trusted_tempo_proof_realm(&self.context.url),
+            ) {
+                return Err(MppError::InvalidConfig(
+                    "refusing to sign Tempo proof for a different HTTP realm".into(),
+                ));
+            }
+
+            let paid = match management {
+                Some(management) => {
+                    self.provider
+                        .pay_with_management(&challenge, self.context.clone(), management)
+                        .await
+                }
+                None => {
+                    self.provider
+                        .pay_with_context(&challenge, self.context.clone())
+                        .await
+                }
+            };
+            match paid {
+                Ok(credential) => {
+                    return Ok(Some(PendingPayment::new(
+                        self.provider.clone(),
+                        challenge,
+                        credential,
+                    )));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    remaining.retain(|candidate| {
+                        candidate.id != challenge.id
+                            || candidate.method != challenge.method
+                            || candidate.intent != challenge.intent
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Sends session management credentials as a repeat of one MCP tool call,
+/// with the credential in its `_meta`, as MPP servers on MCP accept them.
+///
+/// The server answers a top-up or close with a result carrying only its
+/// receipt; a result asking for payment again rejects the credential.
+pub struct McpManagement<'a, C: ToolCaller> {
+    caller: &'a C,
+    params: Mutex<C::Params>,
+}
+
+impl<'a, C: ToolCaller> McpManagement<'a, C> {
+    /// Sends management credentials through `caller` as `params` with the
+    /// credential attached.
+    pub fn new(caller: &'a C, params: C::Params) -> Self {
+        Self {
+            caller,
+            params: Mutex::new(params),
+        }
+    }
+}
+
+impl<C: ToolCaller> ManagementTransport for McpManagement<'_, C> {
+    fn send<'b>(
+        &'b self,
+        _challenge: &'b PaymentChallenge,
+        credential: &'b PaymentCredential,
+    ) -> ManagementFuture<'b> {
+        Box::pin(async move {
+            let mut params = self.params.lock().unwrap().clone();
+            self.caller.attach_credential(&mut params, credential)?;
+            let output = self
+                .caller
+                .call_tool(params)
+                .await
+                .map_err(|_| MppError::Http("MCP payment management call failed".to_owned()))?;
+            if self
+                .caller
+                .payment_challenges_from_output(&output)
+                .is_some()
+            {
+                return Err(MppError::InvalidConfig(
+                    "the MCP server rejected the payment management credential".to_owned(),
+                ));
+            }
+            Ok(self.caller.receipt_from_output(&output))
+        })
     }
 }
 
@@ -178,6 +307,16 @@ impl<C, P> McpClient<C, P> {
     pub fn into_caller(self) -> C {
         self.caller
     }
+
+    /// Sends session management credentials as `params`, a call of a paid
+    /// tool, for example to close a session channel with
+    /// [`TempoSessionProvider::close_with`](crate::client::TempoSessionProvider::close_with).
+    pub fn management(&self, params: C::Params) -> McpManagement<'_, C>
+    where
+        C: ToolCaller,
+    {
+        McpManagement::new(&self.caller, params)
+    }
 }
 
 impl<C, P> McpClient<C, P>
@@ -189,9 +328,11 @@ where
     ///
     /// Free calls pass through unchanged. A supported, unexpired challenge is
     /// paid once and the exact request is retried with its credential in
-    /// `_meta`. Successful retries commit provider state. Definitive rejection
-    /// rolls it back; cancellation and transport ambiguity invoke only the
-    /// provider's synchronous abandonment hook.
+    /// `_meta`. A session channel whose deposit does not cover the call is
+    /// topped up first by the same call carrying the top-up credential.
+    /// Successful retries record their receipt and commit provider state.
+    /// Definitive rejection rolls it back; cancellation and transport
+    /// ambiguity invoke only the provider's synchronous abandonment hook.
     pub async fn call_tool(
         &self,
         params: C::Params,
@@ -205,7 +346,12 @@ where
             return initial.map_err(McpClientError::Transport);
         };
 
-        let Some(pending) = self.payment.prepare(&challenges).await? else {
+        let management = McpManagement::new(&self.caller, params.clone());
+        let Some(pending) = self
+            .payment
+            .prepare_with_management(&challenges, &management)
+            .await?
+        else {
             return initial.map_err(McpClientError::Transport);
         };
 
@@ -227,6 +373,9 @@ where
                 {
                     pending.rollback().await?;
                 } else {
+                    if let Some(receipt) = self.caller.receipt_from_output(&output) {
+                        self.payment.record_receipt(pending.challenge(), &receipt);
+                    }
                     pending.commit().await?;
                 }
                 Ok(output)
@@ -255,7 +404,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        mcp::{extract_result_challenges, CREDENTIAL_META_KEY, PAYMENT_REQUIRED_META_KEY},
+        mcp::{
+            extract_receipt, extract_result_challenges, CREDENTIAL_META_KEY,
+            PAYMENT_REQUIRED_META_KEY, RECEIPT_META_KEY,
+        },
         Base64UrlJson, PaymentPayload,
     };
 
@@ -264,7 +416,9 @@ mod tests {
         abandons: AtomicUsize,
         commits: AtomicUsize,
         fail_commit: AtomicBool,
+        management_receipts: Mutex<Vec<Option<Receipt>>>,
         pays: AtomicUsize,
+        receipts: AtomicUsize,
         rollbacks: AtomicUsize,
     }
 
@@ -272,6 +426,7 @@ mod tests {
     struct TestProvider {
         lifecycle: Arc<Lifecycle>,
         supported: bool,
+        tops_up: bool,
     }
 
     impl TestProvider {
@@ -279,13 +434,21 @@ mod tests {
             Self {
                 lifecycle: Arc::new(Lifecycle::default()),
                 supported: true,
+                tops_up: false,
             }
         }
 
         fn unsupported() -> Self {
             Self {
-                lifecycle: Arc::new(Lifecycle::default()),
                 supported: false,
+                ..Self::new()
+            }
+        }
+
+        fn topping_up() -> Self {
+            Self {
+                tops_up: true,
+                ..Self::new()
             }
         }
     }
@@ -301,6 +464,35 @@ mod tests {
                 challenge.to_echo(),
                 PaymentPayload::hash("test-proof"),
             ))
+        }
+
+        async fn pay_with_management(
+            &self,
+            challenge: &PaymentChallenge,
+            _context: PaymentContext,
+            management: &dyn ManagementTransport,
+        ) -> Result<PaymentCredential, MppError> {
+            if self.tops_up {
+                let top_up =
+                    PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("top-up"));
+                let receipt = management.send(challenge, &top_up).await?;
+                self.lifecycle
+                    .management_receipts
+                    .lock()
+                    .unwrap()
+                    .push(receipt);
+            }
+            self.pay(challenge).await
+        }
+
+        fn record_receipt(
+            &self,
+            _context: &PaymentContext,
+            _challenge: &PaymentChallenge,
+            _receipt: &Receipt,
+        ) -> Option<u128> {
+            self.lifecycle.receipts.fetch_add(1, Ordering::SeqCst);
+            None
         }
 
         async fn commit_payment(
@@ -390,6 +582,10 @@ mod tests {
             output.get("_meta").and_then(extract_result_challenges)
         }
 
+        fn receipt_from_output(&self, output: &Self::Output) -> Option<Receipt> {
+            output.get("_meta").and_then(extract_receipt)
+        }
+
         fn attach_credential(
             &self,
             params: &mut Self::Params,
@@ -402,6 +598,21 @@ mod tests {
         fn is_definitive_error(&self, error: &Self::Error) -> bool {
             error.definitive
         }
+    }
+
+    fn receipt_result(reference: &str) -> Value {
+        json!({
+            "content": [],
+            "_meta": {
+                RECEIPT_META_KEY: {
+                    "status": "success",
+                    "method": "tempo",
+                    "timestamp": "2026-10-20T00:00:00Z",
+                    "reference": reference,
+                    "challengeId": "challenge-1",
+                }
+            }
+        })
     }
 
     fn challenge() -> PaymentChallenge {
@@ -491,6 +702,116 @@ mod tests {
 
         assert_eq!(result["content"], "paid");
         assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paid_calls_record_their_receipt() {
+        let caller = TestCaller::new([Err(payment_error(true)), Ok(receipt_result("0xpaid"))]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller, provider.clone(), context());
+
+        client.call_tool(params()).await.unwrap();
+
+        assert_eq!(provider.lifecycle.receipts.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn management_credentials_repeat_the_tool_call() {
+        let caller = TestCaller::new([
+            Err(payment_error(true)),
+            Ok(receipt_result("0xtopup")),
+            Ok(json!({"content": "paid"})),
+        ]);
+        let provider = TestProvider::topping_up();
+        let client = McpClient::new(caller.clone(), provider.clone(), context());
+
+        let result = client.call_tool(params()).await.unwrap();
+
+        assert_eq!(result["content"], "paid");
+        let calls = caller.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1]["name"], "paid_tool");
+        let top_up = crate::mcp::extract_credential(&calls[1]["_meta"]).unwrap();
+        assert_eq!(top_up.charge_payload().unwrap().tx_hash(), Some("top-up"));
+        assert!(calls[2]["_meta"].get(CREDENTIAL_META_KEY).is_some());
+        let receipts = provider.lifecycle.management_receipts.lock().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].as_ref().unwrap().reference, "0xtopup");
+        assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_management_credentials_fail_the_payment() {
+        let caller = TestCaller::new([
+            Err(payment_error(true)),
+            Ok(json!({
+                "_meta": {
+                    PAYMENT_REQUIRED_META_KEY: {"challenges": [challenge()]}
+                },
+                "isError": true
+            })),
+        ]);
+        let provider = TestProvider::topping_up();
+        let client = McpClient::new(caller, provider.clone(), context());
+
+        let error = client.call_tool(params()).await.unwrap_err();
+
+        assert!(matches!(error, McpClientError::Payment(_)));
+        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Clone, Default)]
+    struct UnfundedSessionProvider {
+        paid: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PaymentProvider for UnfundedSessionProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && (intent == "session" || intent == "charge")
+        }
+
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            if challenge.intent.as_str() == "session" {
+                return Err(MppError::InvalidConfig(
+                    "insufficient balance for the suggested deposit".to_owned(),
+                ));
+            }
+            self.paid.lock().unwrap().push(challenge.id.clone());
+            Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::hash("charge"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn unpayable_preferred_challenges_fall_back_to_the_next() {
+        let session = PaymentChallenge::new(
+            "session-1",
+            "mcp.example.test",
+            "tempo",
+            "session",
+            Base64UrlJson::from_value(&json!({"amount": "1"})).unwrap(),
+        );
+        let provider = UnfundedSessionProvider::default();
+        let payment = McpPayment::new(provider.clone(), context());
+
+        let pending = payment
+            .prepare(&[session.clone(), challenge()])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(pending.challenge().id, "challenge-1");
+        assert_eq!(
+            *provider.paid.lock().unwrap(),
+            vec!["challenge-1".to_owned()]
+        );
+        pending.commit().await.unwrap();
+
+        let error = payment.prepare(&[session]).await.err().unwrap();
+        assert!(error.to_string().contains("insufficient balance"));
     }
 
     #[tokio::test]
