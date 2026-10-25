@@ -7,4 +7,4 @@ rules:
   - ignore: true
     conditions:
       - expr: |
-          ActionName == "tempoxyz/changelogs" && ActionVersion == "b26936c80a7a2c5e79778d8d2659be178888beb6"
+          ActionName == "tempoxyz/changelogs" && ActionVersion == "af1c4b05ccca335f8b45223494a93312c14c4cb3"
