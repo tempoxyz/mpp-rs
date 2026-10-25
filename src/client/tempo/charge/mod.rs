@@ -60,7 +60,7 @@ use crate::protocol::methods::tempo::network::TempoNetwork as TempoChain;
 use crate::protocol::methods::tempo::proof;
 use crate::protocol::methods::tempo::transfers::get_transfers;
 use crate::protocol::methods::tempo::types::Split;
-use crate::protocol::methods::tempo::CHAIN_ID;
+use crate::protocol::methods::tempo::{CHAIN_ID, FEE_PAYER_MIN_REMAINING_VALIDITY_SECS};
 use alloy::sol_types::SolCall;
 use tempo_alloy::accounts::{TempoAccountsWallet, TempoAuthorizationReservation};
 use tempo_alloy::contracts::precompiles::ITIP20;
@@ -69,8 +69,15 @@ use tempo_alloy::rpc::TempoTransactionRequest;
 /// Nonce key for expiring nonce transactions, the default for every charge.
 const EXPIRING_NONCE_KEY: U256 = U256::MAX;
 
-/// Default validity window (in seconds) for charge transactions.
-const FEE_PAYER_VALID_BEFORE_SECS: u64 = 25;
+/// Default expiring-nonce validity window (in seconds) for charge
+/// transactions: `valid_before = now + EXPIRING_NONCE_VALID_BEFORE_SECS`,
+/// capped at the challenge `expires`.
+///
+/// Matches mppx's 25 seconds. Tempo rejects expiring-nonce transactions whose
+/// `valid_before` is more than 30 seconds past the block timestamp (TIP-1009,
+/// `expiring_nonce_max_expiry_secs` before T11), so a wider default would make
+/// every default charge unincludable.
+const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 
 /// Encode a TIP-20 token transfer call, optionally with memo.
 fn encode_transfer(
@@ -168,15 +175,16 @@ fn ensure_pull_supported(charge: &ChargeRequest) -> Result<(), MppError> {
     }
 }
 
-/// Resolve the transaction's `validBefore`: the requested timestamp, or 25
-/// seconds from now, capped at the challenge `expires`.
+/// Resolve the transaction's `validBefore`: the requested timestamp, or
+/// [`EXPIRING_NONCE_VALID_BEFORE_SECS`] from now, capped at the challenge
+/// `expires`.
 fn resolve_valid_before(challenge: &PaymentChallenge, requested: Option<u64>) -> u64 {
     let valid_before = requested.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
-            .saturating_add(FEE_PAYER_VALID_BEFORE_SECS)
+            .saturating_add(EXPIRING_NONCE_VALID_BEFORE_SECS)
     });
     let Some(expires) = challenge.expires_at() else {
         return valid_before;
@@ -188,6 +196,26 @@ fn resolve_valid_before(challenge: &PaymentChallenge, requested: Option<u64>) ->
     } else {
         valid_before.min(expires)
     }
+}
+
+/// Refuse to sign a fee-sponsored challenge that expires in less than
+/// [`FEE_PAYER_MIN_REMAINING_VALIDITY_SECS`]: the server would refuse to
+/// co-sign or broadcast the transaction, so nothing is signed or sent.
+fn ensure_sponsored_expiry_floor(
+    challenge: &PaymentChallenge,
+    now: time::OffsetDateTime,
+) -> Result<(), MppError> {
+    let Some(expires) = challenge.expires_at() else {
+        return Ok(());
+    };
+    let remaining = expires - now;
+    if remaining < time::Duration::seconds(FEE_PAYER_MIN_REMAINING_VALIDITY_SECS as i64) {
+        let expires_in = remaining.whole_seconds();
+        return Err(MppError::bad_request(format!(
+            "fee-sponsored challenge expires in {expires_in}s, less than the {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS}s the server needs to co-sign and broadcast; request a new challenge"
+        )));
+    }
+    Ok(())
 }
 
 fn apply_estimation_signer_hints(
@@ -522,6 +550,10 @@ impl TempoCharge {
             });
         }
 
+        if self.fee_payer {
+            ensure_sponsored_expiry_floor(&self.challenge, time::OffsetDateTime::now_utc())?;
+        }
+
         let machine_token = self.pays_in_machine_token();
         let calls = match self.calls {
             Some(calls) => calls,
@@ -644,6 +676,10 @@ impl TempoCharge {
                 signing_mode,
                 transaction: None,
             });
+        }
+
+        if self.fee_payer {
+            ensure_sponsored_expiry_floor(&self.challenge, time::OffsetDateTime::now_utc())?;
         }
 
         let managed_key_authorization = if options.key_authorization.is_none() {
@@ -1402,10 +1438,98 @@ mod tests {
                 valid_before.saturating_sub(expires)
             );
             if expires_in == 3600 {
-                let requested = explicit.unwrap_or(FEE_PAYER_VALID_BEFORE_SECS);
+                let requested = explicit.unwrap_or(EXPIRING_NONCE_VALID_BEFORE_SECS);
                 assert!((now + requested..=now + requested + 5).contains(&valid_before));
             }
         }
+    }
+
+    fn sponsored_challenge(expires_in: u64) -> PaymentChallenge {
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1000000",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 42431, "feePayer": true },
+        }))
+        .unwrap();
+        PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request)
+            .with_expires(crate::expires::seconds(expires_in))
+    }
+
+    async fn sign_valid_before(challenge: &PaymentChallenge) -> Result<u64, MppError> {
+        use alloy::eips::Decodable2718;
+        use tempo_alloy::primitives::transaction::AASigned;
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let options = SignOptions {
+            gas_limit: Some(100_000),
+            ..Default::default()
+        };
+        let signed = TempoCharge::from_challenge(challenge)?
+            .sign_with_options(&signer, options)
+            .await?;
+        let tx_bytes = signed.tx_bytes();
+        // A sponsored credential is a fee-payer envelope; unsponsored is 2718.
+        let valid_before = match AASigned::decode_2718(&mut &tx_bytes[..]) {
+            Ok(tx) => tx.tx().valid_before,
+            Err(_) => {
+                crate::protocol::methods::tempo::FeePayerEnvelope78::decode_envelope(tx_bytes)
+                    .unwrap()
+                    .valid_before
+                    .and_then(NonZeroU64::new)
+            }
+        };
+        Ok(valid_before.expect("charge sets validBefore").get())
+    }
+
+    #[test]
+    fn test_default_valid_before_window_is_25_seconds() {
+        assert_eq!(EXPIRING_NONCE_VALID_BEFORE_SECS, 25);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+        for challenge in [
+            test_challenge(),
+            test_challenge().with_expires(crate::expires::seconds(3600)),
+            sponsored_challenge(3600),
+        ] {
+            let valid_before = resolve_valid_before(&challenge, None);
+            assert!(
+                (now + 25..=now + 26).contains(&valid_before),
+                "validBefore {valid_before} is not now ({now}) + 25s"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sponsored_valid_before_is_capped_at_challenge_expires() {
+        let challenge = sponsored_challenge(20);
+        let expires = challenge.expires_at().unwrap().unix_timestamp() as u64;
+        assert_eq!(resolve_valid_before(&challenge, None), expires);
+        assert_eq!(sign_valid_before(&challenge).await.unwrap(), expires);
+    }
+
+    #[tokio::test]
+    async fn test_sponsored_challenge_expiring_within_floor_is_refused() {
+        for expires_in in [5, 14] {
+            let challenge = sponsored_challenge(expires_in);
+            let error = sign_valid_before(&challenge).await.unwrap_err();
+            assert!(
+                matches!(error, MppError::BadRequest(_)),
+                "expires in {expires_in}s: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("fee-sponsored challenge expires in"),
+                "{error}"
+            );
+        }
+
+        // Sponsored with room left still signs; unsponsored keeps signing
+        // short-lived challenges, capped at their expiry.
+        sign_valid_before(&sponsored_challenge(20)).await.unwrap();
+        let unsponsored = test_challenge().with_expires(crate::expires::seconds(5));
+        let expires = unsponsored.expires_at().unwrap().unix_timestamp() as u64;
+        assert_eq!(sign_valid_before(&unsponsored).await.unwrap(), expires);
     }
 
     #[tokio::test]

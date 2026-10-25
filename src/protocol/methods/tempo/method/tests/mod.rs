@@ -24,6 +24,7 @@ use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
 use crate::tempo::attribution;
 
 mod fee_payer;
+mod funding;
 mod hash_credential;
 mod proof_credential;
 mod receipt_logs;

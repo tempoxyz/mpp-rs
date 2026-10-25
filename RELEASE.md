@@ -39,11 +39,12 @@ This creates a file like `.changelog/brave-lions-dance.md` (random name) with yo
 
 ## When Releases Happen
 
-Releases are **not scheduled** - they happen when you merge the RC PR:
+Releases happen when the RC PR is merged, either by hand or by the weekly scheduled run:
 
 | Event | What Happens |
 |-------|--------------|
 | PR merged to main | RC PR created/updated (if changelogs exist) |
+| Monday 15:17 UTC | RC PR refreshed and set to auto-merge once checks pass |
 | RC PR merged | Packages published immediately |
 | Multiple PRs merged | Single RC PR accumulates all changes |
 
@@ -113,7 +114,7 @@ See [config.toml](./.changelog/config.toml) for changelog settings:
 | Workflow | Trigger | Action |
 |----------|---------|--------|
 | `changelog.yml` | PR opened/updated | Comments on PR with changelog status and AI-generated add link |
-| `release.yml` | Push to main | Creates RC PR or publishes packages |
+| `release.yml` | Push to main, weekly schedule | Creates RC PR or publishes packages; scheduled runs enable auto-merge on the RC PR |
 
 ## Required Secrets
 

@@ -1,8 +1,9 @@
 //! Hash credentials (push mode): the client broadcast the transaction itself.
 
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::TempoNetwork;
 
 use crate::protocol::core::{ChallengeEcho, Receipt};
@@ -12,6 +13,7 @@ use crate::protocol::traits::VerificationError;
 use super::super::{proof, TempoChargeExt, METHOD_NAME};
 use super::memo::assert_challenge_bound_memos;
 use super::receipt_logs::{match_receipt_transfers, ReceiptSenderPolicy};
+use super::transaction_credential::funding_currency;
 use super::ChargeMethod;
 
 /// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
@@ -134,6 +136,16 @@ where
         let first = payers.next();
         let payer = first.filter(|first| payers.all(|payer| payer == *first));
 
+        // Only a final receipt is labelled; validation stays receipt-only. The
+        // lookup runs before the hash is claimed, so a slow or cancelled RPC can
+        // never strand a reserved payment without its receipt.
+        let funding_currency = if reserve {
+            self.hash_funding_currency(hash, expected_sender, charge, expected_chain_id)
+                .await
+        } else {
+            None
+        };
+
         if let Some(store) = &self.store {
             if reserve {
                 let claimed = store
@@ -159,6 +171,49 @@ where
             }
         }
 
-        Ok((Receipt::success(METHOD_NAME, format!("{hash:#x}")), payer))
+        let receipt = Receipt::success(METHOD_NAME, format!("{hash:#x}"));
+        let receipt = match funding_currency {
+            Some(token) => receipt.with_funding_currency(token.to_checksum(None)),
+            None => receipt,
+        };
+        Ok((receipt, payer))
+    }
+
+    /// The token `sender` spent on the payment route of transaction `hash`,
+    /// if it is a recognized route. Lookup failures leave the already verified
+    /// payment unlabelled.
+    async fn hash_funding_currency(
+        &self,
+        hash: B256,
+        sender: Address,
+        charge: &ChargeRequest,
+        chain_id: u64,
+    ) -> Option<Address> {
+        let transaction = self
+            .provider
+            .get_transaction_by_hash(hash)
+            .await
+            .ok()
+            .flatten()?;
+        if transaction.inner.signer() != sender {
+            return None;
+        }
+        let calls: Vec<Call> = transaction
+            .inner
+            .inner()
+            .calls()
+            .map(|(to, input)| Call {
+                to,
+                value: U256::ZERO,
+                input: input.clone(),
+            })
+            .collect();
+        funding_currency(
+            &calls,
+            chain_id,
+            charge.currency_address().ok()?,
+            &Self::expected_transfers(charge).ok()?,
+            charge.machine_token_enabled(),
+        )
     }
 }

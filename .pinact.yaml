@@ -1,10 +1,10 @@
 version: 3
 rules:
-  # tempoxyz/changelogs has no release tag with the locked install and
-  # publish-only Python tooling fixes yet. Allow this exact 2026-10-21 commit
-  # before the 7-day cooldown; remove after 2026-10-28 or once it is tagged.
-  # The exception also skips version-comment verification.
+  # tempoxyz/changelogs has no release tag with the `auto-merge` input yet.
+  # Allow this exact commit from tempoxyz/changelogs#188 before the 7-day
+  # cooldown; remove once it is tagged. The exception also skips
+  # version-comment verification.
   - ignore: true
     conditions:
       - expr: |
-          ActionName == "tempoxyz/changelogs" && ActionVersion == "4cdda943b3452daf4f6af3dfc25859e03f7b4a31"
+          ActionName == "tempoxyz/changelogs" && ActionVersion == "af1c4b05ccca335f8b45223494a93312c14c4cb3"
