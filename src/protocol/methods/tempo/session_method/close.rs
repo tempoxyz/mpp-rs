@@ -5,15 +5,14 @@ use alloy::primitives::Address;
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::chain::get_on_chain_channel;
 use super::payload::validate_settlement_route;
+use super::precompile;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, ChannelState, PendingClose, SessionMethod};
 use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
 };
-use crate::protocol::methods::tempo::voucher::verify_voucher;
 use crate::protocol::traits::{ErrorCode, VerificationError};
 
 /// Validate the close voucher amount against spent, on-chain settled, and deposit.
@@ -206,24 +205,31 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, descriptor, settlement_route, cumulative_amount_str, signature_str) =
-            match payload {
-                SessionCredentialPayload::Close {
-                    channel_id,
-                    descriptor,
-                    settlement_route,
-                    cumulative_amount,
-                    signature,
-                    ..
-                } => (
-                    channel_id,
-                    descriptor.as_ref(),
-                    settlement_route.as_ref(),
-                    cumulative_amount,
-                    signature,
-                ),
-                _ => unreachable!(),
-            };
+        let (
+            channel_id_str,
+            descriptor,
+            settlement_route,
+            cumulative_amount_str,
+            signature_str,
+            close_signature,
+        ) = match payload {
+            SessionCredentialPayload::Close {
+                channel_id,
+                descriptor,
+                settlement_route,
+                cumulative_amount,
+                signature,
+                close_signature,
+            } => (
+                channel_id,
+                descriptor.as_ref(),
+                settlement_route.as_ref(),
+                cumulative_amount,
+                signature,
+                close_signature.as_deref(),
+            ),
+            _ => unreachable!(),
+        };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel = self
@@ -259,8 +265,8 @@ where
         // Authenticate the voucher before comparing it against the channel:
         // the amount checks report the channel's spent amount, which only the
         // payer may learn.
-        let sig_bytes = Self::parse_signature(signature_str)?;
-        let is_valid = verify_voucher(
+        let sig_bytes = precompile::parse_signature_for::<P>(escrow, signature_str)?;
+        let is_valid = precompile::verify_voucher_for(
             escrow,
             chain_id,
             channel_id_b256,
@@ -275,8 +281,43 @@ where
             ));
         }
 
+        // TIP-1034 closes also need the payer's cooperative close authorization.
+        let precompile_descriptor = if precompile::is_precompile(escrow) {
+            let d = precompile::validate_descriptor(
+                descriptor,
+                channel_id_b256,
+                escrow,
+                chain_id,
+                expected_payee,
+                expected_token,
+                Self::resolve_operator(details)?,
+            )?;
+            let close_sig = close_signature
+                .ok_or_else(|| {
+                    VerificationError::invalid_payload("TIP-1034 close requires closeSignature")
+                })
+                .and_then(|s| precompile::parse_signature_for::<P>(escrow, s))?;
+            if !precompile::verify_close_authorization(
+                &close_sig,
+                &[channel.payer, channel.authorized_signer],
+                channel_id_b256,
+                cumulative_amount,
+                escrow,
+                chain_id,
+            ) {
+                return Err(VerificationError::invalid_signature(
+                    "invalid close authorization signature",
+                ));
+            }
+            Some(d)
+        } else {
+            None
+        };
+
         // For close, always re-read on-chain state.
-        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+        let on_chain = self
+            .read_channel(escrow, channel_id_b256, precompile_descriptor.as_ref())
+            .await?;
 
         if on_chain.finalized {
             return Err(VerificationError::channel_closed(
@@ -284,12 +325,24 @@ where
             ));
         }
 
-        validate_close_amount(
-            cumulative_amount,
-            channel.spent,
-            on_chain.settled,
-            on_chain.deposit,
-        )?;
+        // The precompile settles what the payee captures (what was spent) and
+        // refunds the rest; the legacy escrow settles the whole voucher.
+        let capture = if precompile_descriptor.is_some() {
+            precompile::validate_close(
+                cumulative_amount,
+                channel.spent,
+                on_chain.settled,
+                on_chain.deposit,
+            )?
+        } else {
+            validate_close_amount(
+                cumulative_amount,
+                channel.spent,
+                on_chain.settled,
+                on_chain.deposit,
+            )?;
+            cumulative_amount
+        };
 
         let signer = self.close_signer.as_ref().ok_or_else(|| {
             VerificationError::new(
@@ -297,7 +350,8 @@ where
             )
         })?;
 
-        self.store
+        let marked = self
+            .store
             .update_channel(
                 channel_id_str,
                 Box::new(move |current| {
@@ -307,6 +361,12 @@ where
                 }),
             )
             .await?;
+        // Requests served between the snapshot above and the closing mark raised spent;
+        // capture what the marked state records so they are not refunded to the payer.
+        let capture = match (&precompile_descriptor, &marked) {
+            (Some(_), Some(state)) => state.spent.max(on_chain.settled).max(capture),
+            _ => capture,
+        };
 
         // Once submission starts, transport errors do not prove the transaction
         // failed. Keep metering blocked until the chain outcome is known.
@@ -368,6 +428,14 @@ where
                     on_chain.settled,
                     &sig_bytes,
                 )?;
+            } else if let Some(d) = precompile_descriptor.clone() {
+                calls = vec![precompile::close_call(
+                    escrow,
+                    d,
+                    cumulative_amount,
+                    capture,
+                    &sig_bytes,
+                )?];
             }
 
             let tempo_tx = TempoTransaction {
