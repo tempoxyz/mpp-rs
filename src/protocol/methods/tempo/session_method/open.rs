@@ -5,7 +5,7 @@ use alloy::primitives::{Address, Bytes, B256};
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::chain::get_on_chain_channel;
+use super::precompile;
 use super::receipt::session_receipt;
 use super::state::Opening;
 use super::{normalize_channel_id, ChannelState, SessionMethod};
@@ -13,7 +13,6 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
 };
-use crate::protocol::methods::tempo::voucher::verify_voucher;
 use crate::protocol::traits::VerificationError;
 
 impl<P> SessionMethod<P>
@@ -181,14 +180,30 @@ where
         })?;
 
         // Verify the open transaction's derived channel ID matches the claimed channelId
-        let (voucher_signer, open_deposit) = Self::verify_open_channel_id_binding(
-            &tx_bytes,
-            channel_id_b256,
-            escrow,
-            chain_id,
-            expected_payee,
-            expected_token,
-        )?;
+        let (precompile_descriptor, voucher_signer, open_deposit) =
+            if precompile::is_precompile(escrow) {
+                let (descriptor, signer, deposit) = precompile::verify_open(
+                    &tx_bytes,
+                    descriptor,
+                    channel_id_b256,
+                    escrow,
+                    chain_id,
+                    expected_payee,
+                    expected_token,
+                    Self::resolve_operator(details)?,
+                )?;
+                (Some(descriptor), signer, deposit)
+            } else {
+                let (signer, deposit) = Self::verify_open_channel_id_binding(
+                    &tx_bytes,
+                    channel_id_b256,
+                    escrow,
+                    chain_id,
+                    expected_payee,
+                    expected_token,
+                )?;
+                (None, signer, deposit)
+            };
 
         // Check the voucher against the transaction before broadcasting it:
         // once the channel is funded, rejecting the credential would leave the
@@ -204,8 +219,8 @@ where
                 "open deposit is less than the session amount",
             ));
         }
-        let sig_bytes = Self::parse_signature(signature_str)?;
-        if !verify_voucher(
+        let sig_bytes = precompile::parse_signature_for::<P>(escrow, signature_str)?;
+        if !precompile::verify_voucher_for(
             escrow,
             chain_id,
             channel_id_b256,
@@ -237,7 +252,9 @@ where
         }
         let open_tx_hash = tx_receipt.transaction_hash().to_string();
 
-        let on_chain = get_on_chain_channel(&*self.provider, escrow, channel_id_b256).await?;
+        let on_chain = self
+            .read_channel(escrow, channel_id_b256, precompile_descriptor.as_ref())
+            .await?;
 
         if on_chain.payee != expected_payee {
             return Err(VerificationError::credential_mismatch(
@@ -292,7 +309,7 @@ where
         // The signature was verified against the transaction's signer above;
         // only a channel that reports a different one needs another check.
         if authorized_signer != voucher_signer
-            && !verify_voucher(
+            && !precompile::verify_voucher_for(
                 escrow,
                 chain_id,
                 channel_id_b256,

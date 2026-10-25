@@ -59,6 +59,12 @@ pub enum ErrorCode {
     Internal,
     /// Payment needs further action from the payer (e.g. 3D Secure).
     PaymentActionRequired,
+    /// The payment behind the credential was already used, is being settled
+    /// by a concurrent request, or is bound to another challenge.
+    ///
+    /// Reported as `verification-failed` with status 403 and no challenge,
+    /// since paying again would not help.
+    CredentialReplayed,
 }
 
 impl ErrorCode {
@@ -84,6 +90,7 @@ impl ErrorCode {
             Self::InvalidChallenge => "invalid-challenge",
             Self::Internal => "internal",
             Self::PaymentActionRequired => "payment-action-required",
+            Self::CredentialReplayed => "credential-replayed",
         }
     }
 
@@ -242,6 +249,11 @@ impl VerificationError {
     pub fn delta_too_small(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::DeltaTooSmall)
     }
+
+    /// Create a "credential-replayed" verification error.
+    pub fn credential_replayed(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::CredentialReplayed)
+    }
 }
 
 impl fmt::Display for VerificationError {
@@ -301,6 +313,7 @@ impl From<VerificationError> for MppError {
             Some(ErrorCode::PaymentActionRequired) => {
                 MppError::PaymentActionRequired(Some(err.message))
             }
+            Some(ErrorCode::CredentialReplayed) => MppError::CredentialReplayed(Some(err.message)),
             Some(ErrorCode::CredentialMismatch)
             | Some(ErrorCode::InvalidAmount)
             | Some(ErrorCode::InvalidRecipient)
@@ -493,10 +506,14 @@ mod tests {
             (ErrorCode::InvalidChallenge, "invalid-challenge"),
             (ErrorCode::Internal, "internal-payment-error"),
             (ErrorCode::PaymentActionRequired, "payment-action-required"),
+            (ErrorCode::CredentialReplayed, "verification-failed"),
         ];
         for (code, suffix) in codes {
             let label = format!("{code:?}");
             assert_eq!(code.spec_code(), suffix, "{label}");
+            if code == ErrorCode::CredentialReplayed {
+                continue;
+            }
             let error = VerificationError::with_code("message", code);
             assert_spec_problem(&label, error.to_problem_details(None), suffix);
         }
@@ -522,5 +539,25 @@ mod tests {
                 "internal-payment-error",
             );
         }
+    }
+
+    #[test]
+    fn test_credential_replayed_is_final_verification_failure() {
+        let problem =
+            VerificationError::credential_replayed("Transaction hash has already been used")
+                .to_problem_details(None);
+        assert_eq!(
+            problem.problem_type,
+            format!(
+                "{}/verification-failed",
+                crate::error::CORE_PROBLEM_TYPE_BASE
+            )
+        );
+        assert_eq!(problem.title, "VerificationFailedError");
+        assert_eq!(problem.status, 403);
+        assert_eq!(
+            problem.detail,
+            "Payment verification failed: Transaction hash has already been used."
+        );
     }
 }

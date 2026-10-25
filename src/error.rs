@@ -256,6 +256,15 @@ pub enum MppError {
     #[error("{}", format_verification_failed(.0))]
     VerificationFailed(Option<String>),
 
+    /// The payment behind the credential was already used, is being settled
+    /// by a concurrent request, or its settled transfer is bound to another
+    /// challenge.
+    ///
+    /// Reported as `verification-failed` with status 403 and answered without
+    /// a challenge: the payment was valid, but paying again would not help.
+    #[error("{}", format_verification_failed(.0))]
+    CredentialReplayed(Option<String>),
+
     /// Payment has expired.
     #[error("{}", format_payment_expired(.0))]
     PaymentExpired(Option<String>),
@@ -626,7 +635,9 @@ impl MppError {
         match self {
             Self::MalformedCredential(_) => Some("malformed-credential"),
             Self::InvalidChallenge { .. } => Some("invalid-challenge"),
-            Self::VerificationFailed(_) => Some("verification-failed"),
+            Self::VerificationFailed(_) | Self::CredentialReplayed(_) => {
+                Some("verification-failed")
+            }
             Self::PaymentExpired(_) => Some("payment-expired"),
             Self::PaymentRequired { .. } => Some("payment-required"),
             Self::InvalidPayload(_) => Some("invalid-payload"),
@@ -665,6 +676,9 @@ impl PaymentError for MppError {
             Self::VerificationFailed(_) => PaymentErrorDetails::core("verification-failed")
                 .with_title("VerificationFailedError")
                 .with_status(402),
+            Self::CredentialReplayed(_) => PaymentErrorDetails::core("verification-failed")
+                .with_title("VerificationFailedError")
+                .with_status(403),
             Self::PaymentExpired(_) => PaymentErrorDetails::core("payment-expired")
                 .with_title("PaymentExpiredError")
                 .with_status(402),

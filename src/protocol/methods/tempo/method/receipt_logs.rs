@@ -102,6 +102,22 @@ fn receipt_transfer_effects(logs: &[Log]) -> Vec<TransferEffect> {
     effects
 }
 
+/// Verify that all expected transfers are present in the receipt logs and
+/// return the matched transfers.
+pub(super) fn match_receipt_transfers(
+    logs: &[Log],
+    currency: Address,
+    expected: &[Transfer],
+    sender_policy: ReceiptSenderPolicy<'_>,
+) -> Result<Vec<TransferEffect>, VerificationError> {
+    match_transfers(
+        &receipt_transfer_effects(logs),
+        TransferSource::ReceiptLogs(sender_policy),
+        currency,
+        expected,
+    )
+}
+
 /// Verify that all expected transfers are present in the receipt logs.
 pub(super) fn match_receipt_transfer_logs_with_settlement(
     logs: &[Log],
@@ -109,17 +125,16 @@ pub(super) fn match_receipt_transfer_logs_with_settlement(
     expected: &[Transfer],
     sender_policy: ReceiptSenderPolicy<'_>,
 ) -> Result<Vec<MatchedTransferLog>, VerificationError> {
-    let matched = match_transfers(
-        &receipt_transfer_effects(logs),
-        TransferSource::ReceiptLogs(sender_policy),
-        currency,
-        expected,
-    )?;
-
-    Ok(matched
-        .into_iter()
-        .map(|memo| memo.map_or(MatchedTransferLog::Transfer, MatchedTransferLog::Memo))
-        .collect())
+    Ok(
+        match_receipt_transfers(logs, currency, expected, sender_policy)?
+            .into_iter()
+            .map(|transfer| {
+                transfer
+                    .memo
+                    .map_or(MatchedTransferLog::Transfer, MatchedTransferLog::Memo)
+            })
+            .collect(),
+    )
 }
 
 /// Arguments passed to a [`ValidateSenderCallback`] on a sender mismatch.

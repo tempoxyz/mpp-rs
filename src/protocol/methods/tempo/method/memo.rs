@@ -5,6 +5,12 @@ use crate::tempo::attribution;
 
 use super::receipt_logs::MatchedTransferLog;
 
+/// Require challenge-bound attribution on the matched transfers of a settled
+/// receipt.
+///
+/// The transfer already settled to the recipient, so another payment would
+/// not help: a failure is reported as a replayed credential (403, no
+/// challenge) rather than a retryable verification failure.
 pub(super) fn assert_challenge_bound_memo(
     matched_logs: &[MatchedTransferLog],
     challenge_id: &str,
@@ -15,6 +21,7 @@ pub(super) fn assert_challenge_bound_memo(
         MatchedTransferLog::Memo(memo) => Some(memo),
     });
     assert_challenge_bound_memos(memos, challenge_id, realm)
+        .map_err(|error| VerificationError::credential_replayed(error.message))
 }
 
 /// Require a challenge-bound attribution memo among the memos of the matched

@@ -29,7 +29,7 @@
 //! }
 //! ```
 
-use crate::error::MppError;
+use crate::error::{MppError, PaymentError};
 use crate::protocol::core::{
     with_private_cache_control, PaymentChallenge, PaymentCredential, Receipt,
 };
@@ -40,8 +40,9 @@ pub struct ChallengeContext<'a, I> {
     pub challenge: &'a PaymentChallenge,
     /// The original transport input (e.g., HTTP request).
     pub input: &'a I,
-    /// Optional error message for the client.
-    pub error: Option<&'a str>,
+    /// The payment error that triggered the challenge, if any, sent
+    /// as the RFC 9457 problem; a bare challenge sends `payment-required`.
+    pub error: Option<&'a MppError>,
 }
 
 /// Context passed to [`Transport::respond_receipt`].
@@ -153,24 +154,41 @@ impl Transport for HttpTransport {
             .ok()
             .and_then(|value| http_types::HeaderValue::from_str(&value).ok());
 
-        let (status, error) = match (&www_auth, ctx.error) {
-            (None, _) => (
-                http_types::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to format challenge",
-            ),
-            (Some(_), Some(msg)) => (http_types::StatusCode::PAYMENT_REQUIRED, msg),
-            (Some(_), None) => (http_types::StatusCode::PAYMENT_REQUIRED, "Payment Required"),
+        let fallback;
+        let error = match (&www_auth, ctx.error) {
+            (None, _) => {
+                fallback = MppError::Internal("Failed to format challenge".into());
+                &fallback
+            }
+            (Some(_), Some(error)) => error,
+            (Some(_), None) => {
+                fallback = MppError::PaymentRequired {
+                    realm: None,
+                    description: ctx.challenge.description.clone(),
+                };
+                &fallback
+            }
         };
+        let mut problem = error.to_problem_details(None);
+        let status = http_types::StatusCode::from_u16(problem.status)
+            .unwrap_or(http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        // Name the challenge only when it is sent in `WWW-Authenticate`.
+        if www_auth.is_some() && !status.is_server_error() {
+            problem = problem.with_challenge_id(ctx.challenge.id.as_str());
+        }
 
-        let mut resp = http_types::Response::new(serde_json::json!({ "error": error }).to_string());
+        let body = serde_json::to_string(&problem).unwrap_or_default();
+        let mut resp = http_types::Response::new(body);
         *resp.status_mut() = status;
-        if let Some(www_auth) = www_auth {
+        // A server-side failure carries no challenge, so that clients do not
+        // pay again for a fault that is not theirs.
+        if let Some(www_auth) = www_auth.filter(|_| !status.is_server_error()) {
             resp.headers_mut()
                 .insert(http_types::header::WWW_AUTHENTICATE, www_auth);
         }
         resp.headers_mut().insert(
             http_types::header::CONTENT_TYPE,
-            http_types::HeaderValue::from_static("application/json"),
+            http_types::HeaderValue::from_static("application/problem+json"),
         );
 
         // Add Cache-Control: no-store to prevent caching of challenges
@@ -343,7 +361,7 @@ mod tests {
             .headers()
             .get(http_types::header::WWW_AUTHENTICATE)
             .is_some());
-        assert!(resp.body().contains("Payment Required"));
+        assert!(resp.body().contains("payment-required"));
     }
 
     #[test]
@@ -407,6 +425,41 @@ mod tests {
         assert!(!resp
             .headers()
             .contains_key(http_types::header::WWW_AUTHENTICATE));
+        let body: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert!(body.get("challengeId").is_none());
+    }
+
+    #[test]
+    fn test_http_respond_challenge_internal_error_omits_challenge_id() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+        let error = MppError::Internal("rpc unavailable".into());
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: Some(&error),
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!resp
+            .headers()
+            .contains_key(http_types::header::WWW_AUTHENTICATE));
+        let body: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert!(body.get("challengeId").is_none());
     }
 
     #[test]
@@ -427,14 +480,110 @@ mod tests {
             .body(())
             .unwrap();
 
+        let error = MppError::VerificationFailed(Some("bad signature".into()));
         let resp = transport.respond_challenge(ChallengeContext {
             challenge: &challenge,
             input: &req,
-            error: Some("Verification failed"),
+            error: Some(&error),
         });
 
         assert_eq!(resp.status(), http_types::StatusCode::PAYMENT_REQUIRED);
-        assert!(resp.body().contains("Verification failed"));
+        assert!(resp
+            .headers()
+            .contains_key(http_types::header::WWW_AUTHENTICATE));
+        assert_eq!(
+            resp.headers()
+                .get(http_types::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/problem+json"
+        );
+        let problem: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/verification-failed"
+        );
+        assert_eq!(problem["status"], 402);
+        assert_eq!(problem["challengeId"], "test-id");
+        assert!(problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("bad signature"));
+    }
+
+    #[test]
+    fn test_http_respond_challenge_uses_error_status() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+
+        // Like mppx, the response takes the problem's status.
+        let error = MppError::ChannelNotFound(Some("unknown channel".into()));
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: Some(&error),
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::GONE);
+        assert!(resp
+            .headers()
+            .contains_key(http_types::header::WWW_AUTHENTICATE));
+        let problem: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert_eq!(problem["status"], 410);
+    }
+
+    #[test]
+    fn test_http_respond_challenge_bare_is_payment_required_problem() {
+        let transport = http();
+        let mut challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        challenge.description = Some("Premium access".into());
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: None,
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            resp.headers()
+                .get(http_types::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/problem+json"
+        );
+        let problem: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/payment-required"
+        );
+        assert_eq!(problem["status"], 402);
+        assert_eq!(problem["detail"], "Payment is required (Premium access).");
+        assert_eq!(problem["challengeId"], "test-id");
     }
 
     #[test]
