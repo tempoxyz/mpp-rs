@@ -162,6 +162,7 @@ pub enum PaymentFailureReason {
     /// The credential was sent but the paid request returned a 5xx response
     /// (`status`) or no response at all (`status` is `None`), so the payment
     /// may or may not have settled. Reconcile it before paying again.
+    #[non_exhaustive]
     OutcomeUnknown {
         /// Status of the paid response, when one arrived.
         status: Option<u16>,

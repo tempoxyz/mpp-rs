@@ -454,19 +454,12 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 continue;
             }
 
-            if resp.headers().contains_key("payment-receipt") {
-                if session_receipt_valid {
-                    pending.commit().await.map_err(HttpError::Payment)?;
-                } else {
-                    drop(pending);
-                }
-            } else {
-                pending.rollback().await.map_err(HttpError::Payment)?;
-            }
+            let has_receipt = resp.headers().contains_key("payment-receipt");
 
             // The credential was spent but the server failed, so the payment
-            // may have settled. Report it like mppx, and still return the
-            // response so callers can inspect it. The request is not retried.
+            // may have settled. Report it like mppx before any fallible state
+            // transition, and still return the response so callers can inspect
+            // it. The request is not retried.
             if status.is_server_error() {
                 let reason = outcome_unknown(Some(status.as_u16()), &challenge, &credential);
                 self.events
@@ -476,7 +469,24 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         reason,
                     }))
                     .await;
+                if has_receipt && session_receipt_valid {
+                    pending.commit().await.map_err(HttpError::Payment)?;
+                } else {
+                    // Like a lost response, an unknown outcome must not roll
+                    // back state the server may already have accepted.
+                    drop(pending);
+                }
                 return Ok(resp);
+            }
+
+            if has_receipt {
+                if session_receipt_valid {
+                    pending.commit().await.map_err(HttpError::Payment)?;
+                } else {
+                    drop(pending);
+                }
+            } else {
+                pending.rollback().await.map_err(HttpError::Payment)?;
             }
 
             // Any other completed HTTP response is the application's answer,
@@ -521,8 +531,32 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 credential: credential.clone(),
             }))
             .await;
-        let resp = exchange.send(request).await.map_err(FlowError::Send)?;
+        let resp = match exchange.send(request).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let reason = outcome_unknown(None, &challenge, &credential);
+                self.events
+                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                        challenge: Some(challenge),
+                        error: err.to_string(),
+                        reason,
+                    }))
+                    .await;
+                return Err(FlowError::Send(err));
+            }
+        };
         let status = resp.status();
+        if status.is_server_error() {
+            let reason = outcome_unknown(Some(status.as_u16()), &challenge, &credential);
+            self.events
+                .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                    challenge: Some(challenge),
+                    error: format!("payment outcome unknown: paid request returned {status}"),
+                    reason,
+                }))
+                .await;
+            return Ok(Prepaid::Answered(resp));
+        }
         if status == StatusCode::PAYMENT_REQUIRED || status == StatusCode::GONE {
             if status == StatusCode::GONE {
                 self.provider
