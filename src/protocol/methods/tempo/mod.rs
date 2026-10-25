@@ -202,6 +202,12 @@ pub const DEFAULT_EXPIRES_MINUTES: u64 = 5;
 ///   is less than this far after issuance;
 /// - the client refuses to sign a sponsored challenge that expires in less
 ///   than this.
+///
+/// The issuance check only rejects lifetimes no client could use. Delivering
+/// and signing the challenge take time out of the same window, so a sponsored
+/// challenge issued with close to this lifetime is refused by the client or
+/// the co-signer: give sponsored charges more headroom, such as the default
+/// expiry.
 pub const FEE_PAYER_MIN_REMAINING_VALIDITY_SECS: u64 = 15;
 
 /// Reject issuing a fee-sponsored charge challenge that expires less than
@@ -233,6 +239,8 @@ fn ensure_sponsored_expiry_floor(
             })?;
     // `expires` is usually computed just before issuance, so round to the
     // nearest second: `expires::seconds(15)` passes, `expires::seconds(14)` not.
+    // This is a configuration check, not a payability guarantee: delivery and
+    // signing time still count against the client and co-signing floors.
     let expires_in = (expires_at - now + time::Duration::milliseconds(500)).whole_seconds();
     if expires_in < FEE_PAYER_MIN_REMAINING_VALIDITY_SECS as i64 {
         return Err(crate::error::MppError::InvalidConfig(format!(
