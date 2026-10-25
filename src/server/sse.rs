@@ -1195,6 +1195,10 @@ mod tests {
             },
             ChannelState {
                 closing: true,
+                ..open.clone()
+            },
+            ChannelState {
+                close_requested_at: 1,
                 ..open
             },
         ] {

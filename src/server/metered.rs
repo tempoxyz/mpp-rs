@@ -59,7 +59,7 @@ where
                 let Ok(Some(ch)) = store.get_channel(channel_id).await else {
                     return;
                 };
-                if ch.finalized || ch.closing {
+                if ch.finalized || ch.closing || ch.close_requested_at != 0 {
                     yield MeteredEvent::Receipt(channel_receipt(challenge_id, channel_id, &ch));
                     return;
                 }
