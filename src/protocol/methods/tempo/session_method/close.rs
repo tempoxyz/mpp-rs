@@ -1,10 +1,12 @@
 //! The `close` action.
 
+use alloy::consensus::BlockHeader;
 use alloy::network::ReceiptResponse;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
+use super::chain::get_on_chain_channel_at;
 use super::payload::validate_settlement_route;
 use super::precompile;
 use super::receipt::session_receipt;
@@ -14,6 +16,34 @@ use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
 };
 use crate::protocol::traits::{ErrorCode, VerificationError};
+
+/// How long a server close transaction's expiring nonce stays valid.
+const CLOSE_VALID_BEFORE_SECS: u64 = 25;
+
+/// Margin past a close's `valid_before` for clock skew between this host and
+/// the chain before reconciliation treats an unmined close as expired.
+/// Matches mppx's `pendingCloseClockSkewSeconds`.
+const CLOSE_CLOCK_SKEW_SECS: u64 = 30;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Nonce fields for a server-signed close: an expiring nonce (key
+/// `U256::MAX`, nonce 0) valid for [`CLOSE_VALID_BEFORE_SECS`], matching
+/// mppx's `nonceKey: 'expiring'` for session transactions.
+pub(super) fn close_transaction_nonce_fields(
+) -> (u64, alloy::primitives::U256, Option<std::num::NonZeroU64>) {
+    let now = unix_now();
+    (
+        0,
+        tempo_alloy::primitives::transaction::TEMPO_EXPIRING_NONCE_KEY,
+        std::num::NonZeroU64::new(now.saturating_add(CLOSE_VALID_BEFORE_SECS)),
+    )
+}
 
 /// Validate the close voucher amount against spent, on-chain settled, and deposit.
 /// Matches mppx handleClose:
@@ -131,11 +161,16 @@ where
 {
     /// Reconcile a stored close using its transaction receipt from the configured RPC.
     ///
-    /// Returns the unchanged state when no receipt exists. A successful receipt
-    /// finalizes the channel; a reverted receipt releases the closing guard.
-    /// RPC errors, old records without transaction evidence, and missing receipts
-    /// never reopen metering. Call this from a trusted operator/background worker;
-    /// it does not authorize a new paid operation or submit a new transaction.
+    /// A successful receipt finalizes the channel; a reverted receipt releases
+    /// the closing guard. A missing receipt keeps the channel blocked unless
+    /// the close was signed with an expiring nonce and the chain itself has
+    /// moved past its `valid_before`: then the receipt is read again and the
+    /// escrow's channel state is read at that same block, finalizing the
+    /// channel if it closed on-chain and releasing it otherwise. The host clock
+    /// alone never releases a channel. RPC errors and old records without
+    /// transaction evidence never reopen metering. Call this from a trusted
+    /// operator/background worker; it does not authorize a new paid operation
+    /// or submit a new transaction.
     ///
     /// Operator usage: `let state = method.reconcile_pending_close(&channel_id).await?;`
     /// If `state.closing` remains true, keep the channel blocked and investigate
@@ -157,21 +192,64 @@ where
         else {
             return Ok(channel);
         };
-        let receipt = self
-            .provider
-            .get_transaction_receipt(pending.transaction_hash)
-            .await
-            .map_err(|e| {
-                VerificationError::network_error(format!("close reconciliation failed: {e}"))
-            })?;
-        let Some(receipt) = receipt else {
-            return Ok(channel);
+        let settled = match self.close_receipt_status(&pending).await? {
+            Some(status) => status,
+            None => {
+                // An expiring close can never land in a block past its
+                // `valid_before`. Skip the RPC round trips while the host clock
+                // says the window may still be open, then require the chain's
+                // own time to have passed it.
+                let Some(valid_before) = pending.valid_before else {
+                    return Ok(channel);
+                };
+                if unix_now() <= valid_before.saturating_add(CLOSE_CLOCK_SKEW_SECS) {
+                    return Ok(channel);
+                }
+                let Some(block) = self.expired_block(valid_before).await? else {
+                    return Ok(channel);
+                };
+                // The close may have landed before that block while the first
+                // lookup returned null: look again, then read the escrow at the
+                // observed block so a lagging receipt index cannot reopen a
+                // channel that closed on-chain.
+                match self.close_receipt_status(&pending).await? {
+                    Some(status) => status,
+                    None => {
+                        let channel_id_b256: alloy::primitives::B256 =
+                            channel_id.parse().map_err(|_| {
+                                VerificationError::invalid_payload("invalid channel id")
+                            })?;
+                        if precompile::is_precompile(channel.escrow_contract) {
+                            // The precompile deletes a closed channel, so only a
+                            // funded channel with no close request proves the
+                            // expired close never ran (mppx's
+                            // `reconcileExpiredPendingClose`). Anything else
+                            // stays blocked.
+                            let state = precompile::get_precompile_channel_state(
+                                &*self.provider,
+                                channel.escrow_contract,
+                                channel_id_b256,
+                                block.into(),
+                            )
+                            .await?;
+                            if state.deposit.is_zero() || state.closeRequestedAt != 0 {
+                                return Ok(channel);
+                            }
+                            false
+                        } else {
+                            get_on_chain_channel_at(
+                                &*self.provider,
+                                channel.escrow_contract,
+                                channel_id_b256,
+                                block.into(),
+                            )
+                            .await?
+                            .finalized
+                        }
+                    }
+                }
+            }
         };
-        if receipt.transaction_hash() != pending.transaction_hash {
-            return Err(VerificationError::network_error(
-                "close receipt hash mismatch",
-            ));
-        }
         self.store
             .update_channel(
                 &channel_id,
@@ -185,7 +263,7 @@ where
                         return Ok(Some(state));
                     }
                     let deposit = state.deposit;
-                    Ok(Some(if receipt.status() {
+                    Ok(Some(if settled {
                         state.finalize_close(pending.cumulative_amount, pending.signature, deposit)
                     } else {
                         state.clear_pending_close()
@@ -194,6 +272,45 @@ where
             )
             .await?
             .ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+    }
+
+    /// The pending close transaction's receipt status, or `None` when the
+    /// RPC has no receipt for it.
+    async fn close_receipt_status(
+        &self,
+        pending: &PendingClose,
+    ) -> Result<Option<bool>, VerificationError> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(pending.transaction_hash)
+            .await
+            .map_err(|e| {
+                VerificationError::network_error(format!("close reconciliation failed: {e}"))
+            })?;
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        if receipt.transaction_hash() != pending.transaction_hash {
+            return Err(VerificationError::network_error(
+                "close receipt hash mismatch",
+            ));
+        }
+        Ok(Some(receipt.status()))
+    }
+
+    /// The latest block number if that block's timestamp is past
+    /// `valid_before`, so no later block can include the close.
+    async fn expired_block(&self, valid_before: u64) -> Result<Option<u64>, VerificationError> {
+        let block = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| {
+                VerificationError::network_error(format!("close reconciliation failed: {e}"))
+            })?;
+        Ok(block
+            .filter(|block| block.header.timestamp() > valid_before)
+            .map(|block| block.header.number()))
     }
 
     /// Handle 'close' action.
@@ -391,13 +508,6 @@ where
             ))
             .abi_encode();
 
-            let nonce = self
-                .provider
-                .get_transaction_count(signer.address())
-                .await
-                .map_err(|e| {
-                    VerificationError::network_error(format!("failed to get nonce: {}", e))
-                })?;
             let gas_price = self.provider.get_gas_price().await.map_err(|e| {
                 VerificationError::network_error(format!("failed to get gas price: {}", e))
             })?;
@@ -438,6 +548,11 @@ where
                 )?];
             }
 
+            // An expiring nonce keeps independent server processes sharing the
+            // close signer from racing for the same sequential nonce. Built
+            // right before signing so the RPC calls above do not use up its
+            // validity window.
+            let (nonce, nonce_key, valid_before) = close_transaction_nonce_fields();
             let tempo_tx = TempoTransaction {
                 chain_id,
                 nonce,
@@ -445,6 +560,8 @@ where
                 max_fee_per_gas: gas_price,
                 max_priority_fee_per_gas: gas_price,
                 calls,
+                nonce_key,
+                valid_before,
                 ..Default::default()
             };
 
@@ -461,6 +578,7 @@ where
                 nonce,
                 cumulative_amount,
                 signature: sig_bytes.clone(),
+                valid_before: valid_before.map(std::num::NonZeroU64::get),
             };
             self.store.update_channel(channel_id_str, Box::new(move |current| {
                 let mut state = current.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;

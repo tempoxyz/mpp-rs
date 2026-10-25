@@ -241,6 +241,36 @@ pub(super) fn verify_close_authorization(
         .is_ok_and(|signer| signers.contains(&signer))
 }
 
+alloy::sol! {
+    #[sol(rpc)]
+    interface IChannelReserveState {
+        struct ChannelState {
+            uint96 settled;
+            uint96 deposit;
+            uint32 closeRequestedAt;
+        }
+        function getChannelState(bytes32 channelId) external view returns (ChannelState memory);
+    }
+}
+
+/// Read the precompile's `getChannelState` for `channel_id` as of `block`.
+/// It needs no descriptor; a closed or withdrawn channel reads back unfunded.
+pub(super) async fn get_precompile_channel_state<P: Provider<TempoNetwork>>(
+    provider: &P,
+    escrow: Address,
+    channel_id: B256,
+    block: alloy::eips::BlockId,
+) -> Result<IChannelReserveState::ChannelState, VerificationError> {
+    IChannelReserveState::new(escrow, provider)
+        .getChannelState(channel_id)
+        .block(block)
+        .call()
+        .await
+        .map_err(|e| {
+            VerificationError::network_error(format!("Failed to read on-chain channel: {e}"))
+        })
+}
+
 /// Read channel state from the precompile. Parties come from the descriptor,
 /// which the caller has validated against the channel id.
 pub(super) async fn get_precompile_channel<P: Provider<TempoNetwork>>(
@@ -249,25 +279,9 @@ pub(super) async fn get_precompile_channel<P: Provider<TempoNetwork>>(
     channel_id: B256,
     descriptor: &WireDescriptor,
 ) -> Result<OnChainChannel, VerificationError> {
-    alloy::sol! {
-        #[sol(rpc)]
-        interface IChannelReserveState {
-            struct ChannelState {
-                uint96 settled;
-                uint96 deposit;
-                uint32 closeRequestedAt;
-            }
-            function getChannelState(bytes32 channelId) external view returns (ChannelState memory);
-        }
-    }
-    let reserve = IChannelReserveState::new(escrow, provider);
-    let state = reserve
-        .getChannelState(channel_id)
-        .call()
-        .await
-        .map_err(|e| {
-            VerificationError::network_error(format!("Failed to read on-chain channel: {e}"))
-        })?;
+    let state =
+        get_precompile_channel_state(provider, escrow, channel_id, alloy::eips::BlockId::latest())
+            .await?;
     Ok(OnChainChannel {
         payer: descriptor.payer,
         payee: descriptor.payee,

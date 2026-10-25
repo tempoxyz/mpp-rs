@@ -50,6 +50,11 @@ async fn test_broadcast_rejects_unbound_memo_before_rpc() {
             .contains("memo is not bound to this challenge"),
         "unexpected error: {error}"
     );
+    // Nothing settled yet, so this stays a retryable 402 failure.
+    assert_ne!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
 }
 
 #[tokio::test]
@@ -197,6 +202,7 @@ async fn test_validate_binds_transaction_credential_source_to_sender() {
             .await
             .unwrap();
         assert_eq!(validation.source, Some(expected));
+        assert_eq!(validation.payer, Some(format!("{sender:#x}")));
     }
 
     let rejected = [
@@ -462,6 +468,57 @@ async fn test_broadcast_returns_receipt_when_expiry_crosses_send() {
                 .unwrap(),
         "the challenge must have expired during settlement"
     );
+}
+
+#[tokio::test]
+async fn test_failed_broadcast_releases_submission_claim() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    // Both broadcasts fail before the transaction lands: the receipt lookup
+    // that follows each failed broadcast finds nothing.
+    let asserter = Asserter::new();
+    for _ in 0..2 {
+        asserter.push_failure_msg("node unavailable");
+        asserter.push_success(&serde_json::Value::Null);
+    }
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(crate::store::MemoryStore::new());
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+    let submission_key = format!("mpp:charge:submission:{:#x}", keccak256(&tx_bytes));
+
+    for attempt in 0..2 {
+        let error = method
+            .broadcast_transaction(
+                &alloy::hex::encode_prefixed(&tx_bytes),
+                &request,
+                None,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+                None,
+            )
+            .await
+            .expect_err("broadcast fails");
+        // Resending after a failed broadcast retries it, never a final replay.
+        assert_eq!(
+            error.code,
+            Some(crate::protocol::traits::ErrorCode::NetworkError),
+            "attempt {attempt}: {error}"
+        );
+        assert!(store.get(&submission_key).await.unwrap().is_none());
+    }
+    assert!(asserter.read_q().is_empty(), "both attempts broadcast");
 }
 
 // ==================== Broadcast receipt recovery ====================

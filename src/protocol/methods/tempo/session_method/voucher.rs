@@ -47,55 +47,19 @@ where
             };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
-        let channel = self
-            .store
-            .get_channel(channel_id_str)
-            .await?
-            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-
-        if channel.payee != expected_payee {
-            return Err(VerificationError::credential_mismatch(
-                "channel payee does not match session recipient",
-            ));
-        }
-        if channel.token != expected_token {
-            return Err(VerificationError::credential_mismatch(
-                "channel token does not match session currency",
-            ));
-        }
-        validate_settlement_route(&channel, details, settlement_route)?;
-
-        if channel.finalized {
-            return Err(VerificationError::channel_closed("channel is finalized"));
-        }
-        if channel.closing {
-            return Err(VerificationError::channel_closed("channel is closing"));
-        }
-
-        let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
-
-        let escrow = self.resolve_escrow(details)?;
-        let chain_id = self.resolve_chain_id(details);
-
-        if channel.chain_id != chain_id {
-            return Err(VerificationError::credential_mismatch(
-                "channel chain_id does not match session chain_id",
-            ));
-        }
-        if channel.escrow_contract != escrow {
-            return Err(VerificationError::credential_mismatch(
-                "channel escrow does not match session escrow",
-            ));
-        }
-        let min_delta = self.resolve_min_delta(details);
-        let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
-        let on_chain = {
+        // The on-chain read does not depend on the stored channel, so it
+        // overlaps the store read. Every stored-channel check still takes
+        // precedence over a failed on-chain read: the chain branch never
+        // short-circuits the join, and a stored-channel error drops it.
+        let read_on_chain = async {
+            let escrow = self.resolve_escrow(details)?;
+            let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
             let precompile_descriptor = if precompile::is_precompile(escrow) {
                 Some(precompile::validate_descriptor(
                     descriptor,
                     channel_id_b256,
                     escrow,
-                    chain_id,
+                    self.resolve_chain_id(details),
                     expected_payee,
                     expected_token,
                     Self::resolve_operator(details)?,
@@ -104,8 +68,56 @@ where
                 None
             };
             self.read_channel(escrow, channel_id_b256, precompile_descriptor.as_ref())
-                .await?
+                .await
         };
+        let check_stored = async {
+            let channel = self
+                .store
+                .get_channel(channel_id_str)
+                .await?
+                .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+
+            if channel.payee != expected_payee {
+                return Err(VerificationError::credential_mismatch(
+                    "channel payee does not match session recipient",
+                ));
+            }
+            if channel.token != expected_token {
+                return Err(VerificationError::credential_mismatch(
+                    "channel token does not match session currency",
+                ));
+            }
+            validate_settlement_route(&channel, details, settlement_route)?;
+
+            if channel.finalized {
+                return Err(VerificationError::channel_closed("channel is finalized"));
+            }
+            if channel.closing {
+                return Err(VerificationError::channel_closed("channel is closing"));
+            }
+
+            let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
+
+            let escrow = self.resolve_escrow(details)?;
+            let chain_id = self.resolve_chain_id(details);
+
+            if channel.chain_id != chain_id {
+                return Err(VerificationError::credential_mismatch(
+                    "channel chain_id does not match session chain_id",
+                ));
+            }
+            if channel.escrow_contract != escrow {
+                return Err(VerificationError::credential_mismatch(
+                    "channel escrow does not match session escrow",
+                ));
+            }
+            Ok(cumulative_amount)
+        };
+        let (cumulative_amount, on_chain) =
+            tokio::try_join!(check_stored, async { Ok(read_on_chain.await) })?;
+        let on_chain = on_chain?;
+        let min_delta = self.resolve_min_delta(details);
+        let escrow = self.resolve_escrow(details)?;
 
         // A TIP-1034 channel that reads back unfunded was closed or withdrawn (or the RPC has
         // not seen it yet): reject this voucher without recording anything, so a stale read

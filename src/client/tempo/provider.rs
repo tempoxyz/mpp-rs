@@ -159,6 +159,9 @@ pub struct TempoProvider {
     expected_chain_id: Option<u64>,
     rpc_chain_id: Arc<OnceCell<u64>>,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
+    currencies: Option<Vec<String>>,
+    max_amount: Option<alloy::primitives::U256>,
+    max_atomic_amount: Option<alloy::primitives::U256>,
 }
 
 impl TempoProvider {
@@ -183,6 +186,9 @@ impl TempoProvider {
             expected_chain_id: None,
             rpc_chain_id: Arc::new(OnceCell::new()),
             trusted_tempo_proof_realms: Vec::new(),
+            currencies: None,
+            max_amount: None,
+            max_atomic_amount: None,
         })
     }
 
@@ -250,6 +256,104 @@ impl TempoProvider {
         self
     }
 
+    /// Only pay in these TIP-20 currencies, compared case-insensitively.
+    ///
+    /// Offers in other currencies are skipped during challenge selection and
+    /// rejected by [`pay`](PaymentProvider::pay) before any RPC or signing work;
+    /// an empty list rejects all. Required with
+    /// [`with_max_amount`](Self::with_max_amount) and
+    /// [`with_max_atomic_amount`](Self::with_max_atomic_amount), which are
+    /// denominated in the challenge currency.
+    pub fn with_currencies<I, S>(mut self, currencies: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.currencies = Some(currencies.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Cap each charge at `max_amount` in display units (e.g. `"1.5"`), parsed
+    /// with the currency's `decimals`, since challenges do not carry them.
+    ///
+    /// The cap is compared with the challenge amount, which includes splits, and
+    /// applies per credential. Larger offers are skipped during selection and
+    /// rejected before signing. Requires [`with_currencies`](Self::with_currencies).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `max_amount` is malformed or has more fractional
+    /// digits than `decimals` allow (it is never rounded).
+    pub fn with_max_amount(mut self, max_amount: &str, decimals: u8) -> Result<Self, MppError> {
+        // Trailing fractional zeros are exact; anything beyond `decimals` is rejected.
+        let trimmed = match max_amount.split_once('.') {
+            Some((int, frac)) => {
+                let frac = frac.trim_end_matches('0');
+                if frac.is_empty() {
+                    int.to_string()
+                } else {
+                    format!("{int}.{frac}")
+                }
+            }
+            None => max_amount.to_string(),
+        };
+        let atomic = crate::protocol::intents::parse_units(&trimmed, decimals).map_err(|_| {
+            MppError::InvalidConfig(format!(
+                "Tempo charge max_amount {max_amount} is invalid or has more fractional digits than {decimals} decimals allow"
+            ))
+        })?;
+        self.max_amount = Some(crate::evm::parse_amount(&atomic)?);
+        Ok(self)
+    }
+
+    /// Cap each charge at `max_atomic_amount` raw base units of the challenge
+    /// currency. Checked like [`with_max_amount`](Self::with_max_amount).
+    /// Requires [`with_currencies`](Self::with_currencies).
+    pub fn with_max_atomic_amount(mut self, max_atomic_amount: alloy::primitives::U256) -> Self {
+        self.max_atomic_amount = Some(max_atomic_amount);
+        self
+    }
+
+    /// Reject a challenge whose currency or amount violates the client policy.
+    /// Runs during challenge selection and again before any RPC or signing work.
+    fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
+        if self.max_amount.is_none()
+            && self.max_atomic_amount.is_none()
+            && self.currencies.is_none()
+        {
+            return Ok(());
+        }
+        let Some(currencies) = &self.currencies else {
+            return Err(MppError::InvalidConfig(
+                "Tempo charge max_amount and max_atomic_amount require currencies".to_string(),
+            ));
+        };
+        let reject = |reason: String| MppError::InvalidChallenge {
+            id: Some(challenge.id.clone()),
+            reason: Some(reason),
+        };
+        let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
+        if !currencies
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&request.currency))
+        {
+            return Err(reject(format!(
+                "Tempo charge currency is not allowed: {}",
+                request.currency
+            )));
+        }
+        let amount = crate::evm::parse_amount(&request.amount)?;
+        if self.max_atomic_amount.is_some_and(|max| amount > max) {
+            return Err(reject(
+                "Tempo charge amount exceeds max_atomic_amount".to_string(),
+            ));
+        }
+        if self.max_amount.is_some_and(|max| amount > max) {
+            return Err(reject("Tempo charge amount exceeds max_amount".to_string()));
+        }
+        Ok(())
+    }
+
     /// Get the pinned expected chain ID, if set.
     pub fn expected_chain_id(&self) -> Option<u64> {
         self.expected_chain_id
@@ -302,7 +406,27 @@ impl PaymentProvider for TempoProvider {
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
+    /// Skip offers that violate the currency or amount policy so an acceptable
+    /// offer can be chosen.
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        // A cap without a currency pin is a configuration error, not a policy
+        // skip: hand the first offer to `pay`, which reports it.
+        if self.currencies.is_none()
+            && (self.max_amount.is_some() || self.max_atomic_amount.is_some())
+        {
+            return challenges.first().copied();
+        }
+        challenges
+            .iter()
+            .copied()
+            .find(|challenge| self.check_policy(challenge).is_ok())
+    }
+
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         let from = self
             .signing_mode
             .from_address(alloy::signers::Signer::address(&self.signer));
@@ -915,5 +1039,137 @@ mod tests {
                 Some("my-client")
             ))
         );
+    }
+    fn policy_challenge(id: &str, amount: &str, currency: &str) -> PaymentChallenge {
+        let request = crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+            "amount": amount,
+            "currency": currency,
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "feePayer": true },
+        }))
+        .unwrap();
+        PaymentChallenge::new(id, "api.example.com", "tempo", "charge", request)
+    }
+
+    const POLICY_CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
+    const OTHER_CURRENCY: &str = "0x20c0000000000000000000000000000000000001";
+
+    fn policy_provider(rpc_url: &str) -> TempoProvider {
+        TempoProvider::new(alloy::signers::local::PrivateKeySigner::random(), rpc_url).unwrap()
+    }
+
+    #[test]
+    fn test_max_amount_rejects_excess_fractional_digits() {
+        let provider = policy_provider("https://rpc.example.com");
+        assert!(matches!(
+            provider.clone().with_max_amount("1.0000001", 6),
+            Err(MppError::InvalidConfig(_))
+        ));
+        let provider = provider.with_max_amount("1.500000000", 6).unwrap();
+        assert_eq!(
+            provider.max_amount,
+            Some(alloy::primitives::U256::from(1_500_000u64))
+        );
+    }
+
+    #[test]
+    fn test_caps_without_currencies_are_config_errors() {
+        let challenge = policy_challenge("a", "1", POLICY_CURRENCY);
+        for provider in [
+            policy_provider("https://rpc.example.com")
+                .with_max_amount("1", 6)
+                .unwrap(),
+            policy_provider("https://rpc.example.com")
+                .with_max_atomic_amount(alloy::primitives::U256::from(1u64)),
+        ] {
+            assert!(matches!(
+                provider.check_policy(&challenge),
+                Err(MppError::InvalidConfig(_))
+            ));
+            // Selection keeps the offer so `pay` surfaces the configuration error.
+            assert_eq!(
+                provider.select_challenge(&[&challenge]).map(|c| &c.id),
+                Some(&challenge.id)
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_challenge_skips_malformed_amounts() {
+        let provider = policy_provider("https://rpc.example.com")
+            .with_currencies([POLICY_CURRENCY])
+            .with_max_atomic_amount(alloy::primitives::U256::from(100u64));
+        let empty = policy_challenge("empty", "", POLICY_CURRENCY);
+        let underscore = policy_challenge("underscore", "1_0", POLICY_CURRENCY);
+        let valid = policy_challenge("valid", "10", POLICY_CURRENCY);
+        assert_eq!(
+            provider
+                .select_challenge(&[&empty, &underscore, &valid])
+                .unwrap()
+                .id,
+            "valid"
+        );
+        assert!(matches!(
+            provider.check_policy(&underscore),
+            Err(MppError::InvalidAmount(_))
+        ));
+    }
+
+    #[test]
+    fn test_select_challenge_skips_disallowed_and_over_cap_offers() {
+        let provider = policy_provider("https://rpc.example.com")
+            .with_currencies(["0x20C0000000000000000000000000000000000000"])
+            .with_max_amount("0.0001", 6)
+            .unwrap();
+        let other = policy_challenge("other", "1", OTHER_CURRENCY);
+        let over = policy_challenge("over", "101", POLICY_CURRENCY);
+        let exact = policy_challenge("exact", "100", POLICY_CURRENCY);
+        let chosen = provider.select_challenge(&[&other, &over, &exact]).unwrap();
+        assert_eq!(chosen.id, "exact");
+        assert!(provider.select_challenge(&[&other, &over]).is_none());
+
+        let atomic = policy_provider("https://rpc.example.com")
+            .with_currencies([POLICY_CURRENCY])
+            .with_max_atomic_amount(alloy::primitives::U256::from(100u64));
+        assert_eq!(
+            atomic.select_challenge(&[&over, &exact]).unwrap().id,
+            "exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pay_rejects_policy_violations_before_rpc() {
+        use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+
+        let (rpc_url, requests) = chain_id_rpc(MODERATO_CHAIN_ID).await;
+        let provider = policy_provider(&rpc_url)
+            .with_currencies([POLICY_CURRENCY])
+            .with_max_atomic_amount(alloy::primitives::U256::from(99u64));
+        for challenge in [
+            policy_challenge("over", "100", POLICY_CURRENCY),
+            policy_challenge("other", "1", OTHER_CURRENCY),
+        ] {
+            let err = provider.pay(&challenge).await.unwrap_err();
+            assert!(
+                matches!(err, MppError::InvalidChallenge { .. }),
+                "got {err:?}"
+            );
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pay_allows_amount_equal_to_cap() {
+        use crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+
+        let (rpc_url, _) = chain_id_rpc(MODERATO_CHAIN_ID).await;
+        let provider = policy_provider(&rpc_url)
+            .with_currencies([POLICY_CURRENCY])
+            .with_max_amount("0.0001", 6)
+            .unwrap();
+        provider
+            .pay(&sponsored_challenge(Some(MODERATO_CHAIN_ID)))
+            .await
+            .unwrap();
     }
 }
