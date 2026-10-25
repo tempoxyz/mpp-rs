@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: '17 15 * * 1' # Monday 15:17 UTC
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -38,9 +40,10 @@ jobs:
         id: auth
 
       - name: Changelogs
-        uses: tempoxyz/changelogs@4cdda943b3452daf4f6af3dfc25859e03f7b4a31 # 2026-10-21T18-48-43Z-4cdda943 # zizmor: ignore[artipacked]
+        uses: tempoxyz/changelogs@af1c4b05ccca335f8b45223494a93312c14c4cb3 # tempoxyz/changelogs#188 # zizmor: ignore[artipacked]
         with:
           ecosystem: rust
           conventional-commit: true
           crate-token: ${{ steps.auth.outputs.token }}
           github-token: ${{ steps.app-token.outputs.token }}
+          auto-merge: ${{ github.event_name == 'schedule' }}

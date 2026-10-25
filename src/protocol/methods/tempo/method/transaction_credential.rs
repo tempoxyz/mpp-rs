@@ -4,8 +4,9 @@
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::network::ReceiptResponse;
-use alloy::primitives::{keccak256, Address, Bytes, B256};
+use alloy::primitives::{keccak256, Address, Bytes, TxKind, B256};
 use alloy::providers::Provider;
+use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::TempoNetwork;
 
 use crate::protocol::intents::ChargeRequest;
@@ -48,6 +49,67 @@ pub(super) fn ensure_transaction_credential_source(
     }
 
     Ok(())
+}
+
+/// The token the payer spent on a recognized payment route: MACH for the
+/// machine-token swapper route, the input token of a DEX swap that buys the
+/// payment, else the payment currency for direct transfers.
+///
+/// `None` when the calls are not a recognized route bound to the expected
+/// transfers. This only labels a payment; it never decides whether one is valid.
+pub(super) fn funding_currency(
+    calls: &[Call],
+    chain_id: u64,
+    currency: Address,
+    expected: &[Transfer],
+    machine_token_enabled: bool,
+) -> Option<Address> {
+    if machine_token_enabled {
+        if let Some(route) =
+            super::super::machine_token::match_route(calls, chain_id, currency, expected)
+        {
+            return match route.calls[0].to {
+                TxKind::Call(token) => Some(token),
+                TxKind::Create => None,
+            };
+        }
+    }
+    let parsed = PaymentCalls::parse(calls).ok()?;
+    validate_fee_payer_calls(&parsed, currency, expected).ok()?;
+    match_transfers(
+        &parsed.transfer_effects(),
+        TransferSource::Calls,
+        currency,
+        expected,
+    )
+    .ok()?;
+    Some(parsed.swap_input_token().unwrap_or(currency))
+}
+
+/// [`funding_currency`] of a charge's signed Tempo transaction: a 0x76
+/// transaction or a sponsored 0x78 fee-payer envelope.
+pub(super) fn signed_transaction_funding_currency(
+    signed_tx: &str,
+    charge: &ChargeRequest,
+    chain_id: u64,
+) -> Option<Address> {
+    use super::super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
+
+    let tx_bytes = signed_tx.parse::<Bytes>().ok()?;
+    let signed = if tx_bytes.first() == Some(&TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID) {
+        FeePayerEnvelope78::decode_envelope(&tx_bytes)
+            .ok()?
+            .to_recoverable_signed()
+    } else {
+        tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..]).ok()?
+    };
+    funding_currency(
+        &signed.tx().calls,
+        chain_id,
+        charge.currency_address().ok()?,
+        &super::super::transfers::get_request_transfers(charge).ok()?,
+        charge.machine_token_enabled(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -251,6 +313,22 @@ where
             .map_err(|e| VerificationError::new(format!("Failed to recover sender: {e}")))
     }
 
+    /// Look up the receipt of a transaction whose synchronous broadcast
+    /// returned an RPC error: the node may have included it before its reply
+    /// failed. Returns `None` when there is no receipt for exactly this hash,
+    /// so the caller reports the original broadcast error.
+    async fn recover_broadcast_receipt(
+        &self,
+        tx_hash: B256,
+    ) -> Option<<TempoNetwork as alloy::network::Network>::ReceiptResponse> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .ok()??;
+        (receipt.transaction_hash() == tx_hash).then_some(receipt)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn broadcast_transaction(
         &self,
@@ -347,6 +425,22 @@ where
         };
 
         let result: Result<B256, VerificationError> = async {
+            // Simulation and the dedup claim took round trips since co-signing:
+            // right before broadcasting, make sure the sponsored transaction
+            // still has time to land before paying for it.
+            if charge.fee_payer() {
+                let signed =
+                    tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+                        .map_err(|e| {
+                            VerificationError::new(format!("Failed to decode transaction: {e}"))
+                        })?;
+                let valid_before = signed.tx().valid_before.map_or(0, |vb| vb.get());
+                super::fee_payer::ensure_remaining_validity(
+                    valid_before,
+                    super::fee_payer::unix_now()?,
+                )?;
+            }
+
             // Authorize before the irreversible send. Expiry is not re-checked
             // afterwards: a paid request must not turn into a fresh challenge
             // while settlement completes.
@@ -357,13 +451,35 @@ where
             // is mined/pre-confirmed and returns the full receipt, avoiding the
             // client-side polling loop of send_raw_transaction + get_receipt.
             let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
-            let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
-                .provider
-                .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
-                .await
-                .map_err(|e| {
-                    VerificationError::network_error(format!("Failed to broadcast: {}", e))
-                })?;
+            let broadcast: Result<<TempoNetwork as alloy::network::Network>::ReceiptResponse, _> =
+                self.provider
+                    .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
+                    .await;
+            let receipt = match broadcast {
+                Ok(receipt) => receipt,
+                Err(broadcast_error) => {
+                    // The node may have included the transaction before its
+                    // reply failed. Recover only when the store reserved this
+                    // submission above: without a store, a receipt for these
+                    // bytes may belong to an earlier, already accepted
+                    // submission of the same credential. An unrecovered
+                    // broadcast releases the reservation below, so a retry of
+                    // the same bytes can reach recovery once the transaction
+                    // lands; the replay claim still prevents double acceptance.
+                    let recovered = match &submission_key {
+                        Some(_) => {
+                            self.recover_broadcast_receipt(keccak256(&final_tx_bytes))
+                                .await
+                        }
+                        None => None,
+                    };
+                    recovered.ok_or_else(|| {
+                        VerificationError::network_error(format!(
+                            "Failed to broadcast: {broadcast_error}"
+                        ))
+                    })?
+                }
+            };
 
             if !receipt.status() {
                 return Err(VerificationError::transaction_failed(format!(

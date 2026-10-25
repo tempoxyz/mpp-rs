@@ -18,6 +18,33 @@ const MAX_PRIORITY_FEE_PER_GAS_DEFAULT: u128 = 10_000_000_000;
 const MAX_VALIDITY_WINDOW_SECS_DEFAULT: u64 = 15 * 60;
 const MAX_TOTAL_FEE_DEFAULT: u128 = 50_000_000_000_000_000; // lower than max_gas * max_fee_per_gas
 
+/// Least time, in seconds, a sponsored transaction must remain valid when it
+/// is co-signed and again when it is broadcast, matching mppx.
+pub(super) const MIN_REMAINING_VALIDITY_SECS: u64 =
+    crate::protocol::methods::tempo::FEE_PAYER_MIN_REMAINING_VALIDITY_SECS;
+
+pub(super) fn unix_now() -> Result<std::time::Duration, VerificationError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| VerificationError::internal(format!("System clock error: {e}")))
+}
+
+/// Reject a sponsored transaction whose `valid_before` leaves less than
+/// [`MIN_REMAINING_VALIDITY_SECS`] after `now` (rounded up to the next
+/// second), so the sponsor never pays for one that may expire in flight.
+pub(super) fn ensure_remaining_validity(
+    valid_before: u64,
+    now: std::time::Duration,
+) -> Result<(), VerificationError> {
+    let now_secs = now.as_secs() + u64::from(now.subsec_nanos() > 0);
+    if valid_before < now_secs.saturating_add(MIN_REMAINING_VALIDITY_SECS) {
+        return Err(VerificationError::new(format!(
+            "fee-sponsored transaction needs at least {MIN_REMAINING_VALIDITY_SECS} seconds of remaining validity (valid_before={valid_before})"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct FeePayerPolicy {
     pub max_gas: u64,
@@ -170,7 +197,7 @@ where
         debug_assert!(tx.access_list.is_empty());
 
         // Both add intrinsic gas the sponsor pays for without being part of
-        // the charge. mppx rejects the former and makes the latter opt-out.
+        // the charge. mppx rejects the former and makes the latter opt-in.
         if !tx.tempo_authorization_list.is_empty() {
             return Err(VerificationError::new(
                 "Fee payer transaction must not include an authorization list",
@@ -189,10 +216,8 @@ where
             ));
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| VerificationError::internal(format!("System clock error: {e}")))?
-            .as_secs();
+        let now_since_epoch = unix_now()?;
+        let now = now_since_epoch.as_secs();
 
         let valid_before = match tx.valid_before {
             None => {
@@ -206,6 +231,7 @@ where
                         "Fee payer envelope expired: valid_before ({vb}) is not in the future (now={now})"
                     )));
                 }
+                ensure_remaining_validity(vb.get(), now_since_epoch)?;
                 vb.get()
             }
         };
@@ -253,10 +279,20 @@ where
             )));
         }
 
-        if valid_before.saturating_sub(now) > policy.max_validity_window_seconds {
+        // As in mppx, a window shorter than the remaining-validity floor could
+        // never accept a transaction, and the window counts from `now`
+        // rounded up, like the floor.
+        if policy.max_validity_window_seconds < MIN_REMAINING_VALIDITY_SECS {
+            return Err(VerificationError::new(format!(
+                "sponsor max_validity_window_seconds must be at least {MIN_REMAINING_VALIDITY_SECS} seconds (got {})",
+                policy.max_validity_window_seconds
+            )));
+        }
+        let now_ceil = now + u64::from(now_since_epoch.subsec_nanos() > 0);
+        if valid_before.saturating_sub(now_ceil) > policy.max_validity_window_seconds {
             return Err(VerificationError::new(format!(
                 "valid_before window {}s exceeds policy maximum {}s",
-                valid_before.saturating_sub(now),
+                valid_before.saturating_sub(now_ceil),
                 policy.max_validity_window_seconds
             )));
         }

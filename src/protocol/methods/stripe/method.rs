@@ -23,6 +23,9 @@ use crate::protocol::traits::{ChargeMethod as ChargeMethodTrait, VerificationErr
 use super::types::{StripeCredentialPayload, StripeMethodDetails};
 use super::{DEFAULT_STRIPE_API_BASE, METHOD_NAME};
 
+/// SDK identifier recorded in PaymentIntent metadata as `mpp_sdk`.
+const SDK_IDENTIFIER: &str = concat!("mpp-rs/", env!("CARGO_PKG_VERSION"));
+
 /// Stripe's limit for a metadata value, in characters.
 const MAX_METADATA_VALUE_CHARS: usize = 500;
 
@@ -171,24 +174,23 @@ impl ChargeMethod {
         Ok((pi.id, pi.status))
     }
 
-    /// Build analytics metadata for the PaymentIntent. Values are truncated
-    /// to Stripe's metadata value limit so a long client-supplied `source`
-    /// cannot make the request fail.
+    /// Build the metadata that identifies and analyzes MPP PaymentIntents:
+    /// the machine-payment marker, the SDK identifier, and the challenge's ID
+    /// and intent. Values are truncated to Stripe's metadata value limit so a
+    /// long challenge field cannot make the request fail.
     fn build_analytics(credential: &PaymentCredential) -> HashMap<String, String> {
         let challenge = &credential.challenge;
         let mut meta: HashMap<String, String> = [
+            ("machine_payment", "true"),
+            ("mpp_sdk", SDK_IDENTIFIER),
             ("mpp_version", "1"),
             ("mpp_is_mpp", "true"),
             ("mpp_intent", challenge.intent.as_str()),
             ("mpp_challenge_id", challenge.id.as_str()),
-            ("mpp_server_id", challenge.realm.as_str()),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        if let Some(ref source) = credential.source {
-            meta.insert("mpp_client_id".into(), source.clone());
-        }
         for value in meta.values_mut() {
             if let Some((end, _)) = value.char_indices().nth(MAX_METADATA_VALUE_CHARS) {
                 value.truncate(end);
@@ -248,7 +250,6 @@ impl ChargeMethodTrait for ChargeMethod {
             if let Some(user_meta) = details.metadata {
                 metadata.extend(user_meta);
             }
-            metadata.insert("machine_payment".into(), "true".into());
 
             let idempotency_key = Self::idempotency_key(&challenge.id, &payload.spt);
 
@@ -347,7 +348,40 @@ mod tests {
         let metadata = ChargeMethod::build_analytics(&credential);
         assert_eq!(metadata["mpp_challenge_id"], "i".repeat(500));
         assert_eq!(metadata["mpp_intent"], "é".repeat(500));
-        assert_eq!(metadata["mpp_client_id"], "s".repeat(500));
+    }
+
+    #[test]
+    fn test_build_analytics_standardizes_metadata() {
+        let challenge = crate::protocol::core::ChallengeEcho {
+            id: "challenge-id".into(),
+            realm: "api.example.com".into(),
+            method: METHOD_NAME.into(),
+            intent: "charge".into(),
+            request: Default::default(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+            header: None,
+        };
+        let credential = PaymentCredential::with_source(
+            challenge,
+            "did:pkh:eip155:4217:0x0000000000000000000000000000000000000001",
+            StripeCredentialPayload {
+                spt: "spt".into(),
+                external_id: None,
+            },
+        );
+        let metadata = ChargeMethod::build_analytics(&credential);
+        assert_eq!(metadata["machine_payment"], "true");
+        assert_eq!(
+            metadata["mpp_sdk"],
+            format!("mpp-rs/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(metadata["mpp_challenge_id"], "challenge-id");
+        assert_eq!(metadata["mpp_intent"], "charge");
+        assert!(!metadata.contains_key("mpp_server_id"));
+        assert!(!metadata.contains_key("mpp_client_id"));
     }
 
     #[test]

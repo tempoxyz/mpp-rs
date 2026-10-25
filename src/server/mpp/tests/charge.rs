@@ -141,6 +141,25 @@ fn test_fee_payer_custom_currency_can_override_allowed_fee_tokens() {
 
 #[cfg(feature = "tempo")]
 #[test]
+fn test_mpp_create_forwards_fee_payer_allow_key_authorization() {
+    let builder = || {
+        tempo(TempoConfig {
+            recipient: TEST_RECIPIENT,
+        })
+        .fee_payer(true)
+        .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+        .secret_key(TEST_SECRET)
+    };
+
+    let default = Mpp::create(builder()).unwrap();
+    assert!(!default.method.fee_payer_allow_key_authorization());
+
+    let allowed = Mpp::create(builder().fee_payer_allow_key_authorization(true)).unwrap();
+    assert!(allowed.method.fee_payer_allow_key_authorization());
+}
+
+#[cfg(feature = "tempo")]
+#[test]
 fn test_mpp_create_rejects_fee_payer_without_sponsor() {
     let builder = || {
         tempo(TempoConfig {
@@ -385,4 +404,28 @@ fn test_charge_with_options_binds_request_body_digest() {
     let digest = crate::body_digest::compute(body);
     assert_eq!(challenge.digest.as_deref(), Some(digest.as_str()));
     assert!(challenge.verify(TEST_SECRET));
+}
+
+#[cfg(feature = "tempo")]
+#[test]
+fn test_sponsored_charge_refuses_expiry_under_floor() {
+    let mpp = create_test_mpp();
+    let charge = |fee_payer, expires: &str| {
+        mpp.charge_with_options(
+            "1",
+            ChargeOptions {
+                fee_payer,
+                expires: Some(expires),
+                ..Default::default()
+            },
+        )
+    };
+
+    let error = charge(true, &crate::expires::seconds(10)).unwrap_err();
+    assert!(
+        matches!(error, crate::error::MppError::InvalidConfig(_)),
+        "{error:?}"
+    );
+    charge(true, &crate::expires::seconds(30)).unwrap();
+    charge(false, &crate::expires::seconds(10)).unwrap();
 }
