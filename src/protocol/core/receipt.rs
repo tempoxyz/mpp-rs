@@ -51,6 +51,25 @@ impl Receipt {
         }
     }
 
+    /// Report the token the payer spent to fund the payment, serialized as
+    /// `fundingCurrency`. It can differ from the challenge currency when the
+    /// payment was funded through a swap.
+    #[must_use]
+    pub fn with_funding_currency(mut self, currency: impl Into<String>) -> Self {
+        self.extensions.insert(
+            "fundingCurrency".to_string(),
+            serde_json::Value::String(currency.into()),
+        );
+        self
+    }
+
+    /// The token the payer spent to fund the payment, when the method reported it.
+    pub fn funding_currency(&self) -> Option<&str> {
+        self.extensions
+            .get("fundingCurrency")
+            .and_then(serde_json::Value::as_str)
+    }
+
     /// Set the merchant correlation reference.
     #[must_use]
     pub fn with_external_id(mut self, external_id: impl Into<String>) -> Self {

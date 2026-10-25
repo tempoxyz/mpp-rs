@@ -214,8 +214,8 @@ async fn test_cosign_rejects_authorization_list() {
     assert!(err.to_string().contains("authorization list"), "got: {err}");
 }
 
-/// Key authorizations are sponsored by default and rejected once the
-/// server opts out.
+/// Key authorizations are rejected by default and sponsored once the
+/// server opts in.
 #[tokio::test]
 async fn test_cosign_key_authorization_follows_policy() {
     use alloy::signers::SignerSync;
@@ -244,16 +244,6 @@ async fn test_cosign_key_authorization_follows_policy() {
         Some(authorization.into_signed(PrimitiveSignature::Secp256k1(signature)));
     let encoded = sign_and_encode_0x78(tx, &client_signer);
 
-    method
-        .cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_deref().unwrap(),
-            fee_token,
-        )
-        .await
-        .expect("key authorization is sponsored by default");
-
-    let method = method.with_fee_payer_allow_key_authorization(false);
     let err = method
         .cosign_fee_payer_transaction(
             &encoded,
@@ -261,8 +251,18 @@ async fn test_cosign_key_authorization_follows_policy() {
             fee_token,
         )
         .await
-        .expect_err("key authorization must be rejected when disallowed");
+        .expect_err("key authorization must be rejected by default");
     assert!(err.to_string().contains("key authorization"), "got: {err}");
+
+    let method = method.with_fee_payer_allow_key_authorization(true);
+    method
+        .cosign_fee_payer_transaction(
+            &encoded,
+            method.fee_payer_signer.as_deref().unwrap(),
+            fee_token,
+        )
+        .await
+        .expect("key authorization is sponsored once allowed");
 }
 
 /// cosign_fee_payer_transaction rejects txs with expired valid_before.
@@ -1036,4 +1036,91 @@ async fn test_sponsored_ousd_charge_on_moderato_pays_gas_in_path_usd() {
     assert_sponsored_ousd_charge_succeeds(MODERATO_CHAIN_ID, &[42], token(PATH_USD)).await;
     // Nothing funded: fall back to the first allowlisted token.
     assert_sponsored_ousd_charge_succeeds(MODERATO_CHAIN_ID, &[0], token(PATH_USD)).await;
+}
+
+/// Sponsored transactions need at least 15 seconds of validity left, counted
+/// from the current time rounded up to the next second, as in mppx.
+#[test]
+fn test_ensure_remaining_validity_boundaries() {
+    use super::super::fee_payer::ensure_remaining_validity;
+    use std::time::Duration;
+
+    let base = 2_000_000_000u64;
+    for (millis, remaining, accepted) in [
+        (0, 14, false),
+        (0, 15, true),
+        (1, 15, false),
+        (1, 16, true),
+        (999, 16, true),
+    ] {
+        let now = Duration::from_secs(base) + Duration::from_millis(millis);
+        let result = ensure_remaining_validity(base + remaining, now);
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "offset {millis}ms, remaining {remaining}s: {result:?}"
+        );
+        if let Err(err) = result {
+            assert!(
+                err.to_string().contains("at least 15 seconds"),
+                "got: {err}"
+            );
+        }
+    }
+}
+
+/// cosign_fee_payer_transaction rejects txs that expire too soon to land.
+#[tokio::test]
+async fn test_cosign_rejects_short_remaining_validity() {
+    let client_signer = alloy::signers::local::PrivateKeySigner::random();
+    let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+    let fee_token = KnownTempoNetwork::Mainnet
+        .default_currency()
+        .parse::<Address>()
+        .unwrap();
+    let encoded = sign_and_encode_0x78(make_fee_payer_tx(10), &client_signer);
+
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let method = ChargeMethod::new(provider).with_fee_payer(fee_payer_signer);
+
+    let err = method
+        .cosign_fee_payer_transaction(
+            &encoded,
+            method.fee_payer_signer.as_deref().unwrap(),
+            fee_token,
+        )
+        .await
+        .expect_err("should reject a transaction with under 15s of validity");
+    assert!(
+        err.to_string().contains("at least 15 seconds"),
+        "got: {err}"
+    );
+}
+
+/// As in mppx, a sponsor window shorter than the 15-second remaining-validity
+/// floor is a configuration error rather than a silent reject-everything.
+#[tokio::test]
+async fn test_cosign_rejects_validity_window_below_floor() {
+    let overrides = FeePayerPolicyOverride {
+        max_validity_window_seconds: Some(14),
+        ..Default::default()
+    };
+    let (method, client_signer, fee_token) = make_cosign_method(Some(overrides));
+    let encoded = sign_and_encode_0x78(make_fee_payer_tx(20), &client_signer);
+
+    let err = method
+        .cosign_fee_payer_transaction(
+            &encoded,
+            method.fee_payer_signer.as_deref().unwrap(),
+            fee_token,
+        )
+        .await
+        .expect_err("should reject a policy window below the floor");
+    assert!(
+        err.to_string()
+            .contains("max_validity_window_seconds must be at least 15 seconds"),
+        "got: {err}"
+    );
 }

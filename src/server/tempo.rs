@@ -45,6 +45,7 @@ pub struct TempoBuilder {
     pub(crate) fee_payer_signer: Option<std::sync::Arc<crate::protocol::methods::tempo::DynSigner>>,
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     pub(crate) fee_payer_fee_token: Option<Address>,
+    pub(crate) fee_payer_allow_key_authorization: bool,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
@@ -188,6 +189,17 @@ impl TempoBuilder {
         self
     }
 
+    /// Set whether the local fee payer may sponsor a transaction that installs
+    /// an access key (default: `false`, matching mppx).
+    ///
+    /// A key authorization adds intrinsic gas the fee payer pays for. Pass
+    /// `true` to sponsor a keychain client's first payment with an access key
+    /// that is not yet on-chain.
+    pub fn fee_payer_allow_key_authorization(mut self, allow: bool) -> Self {
+        self.fee_payer_allow_key_authorization = allow;
+        self
+    }
+
     /// Set the replay-protection store (default: in-memory).
     ///
     /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
@@ -292,6 +304,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer_signer: None,
         fee_payer_allowed_fee_tokens: None,
         fee_payer_fee_token: None,
+        fee_payer_allow_key_authorization: false,
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         relay: None,

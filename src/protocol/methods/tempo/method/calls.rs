@@ -95,6 +95,14 @@ impl<'a> PaymentCalls<'a> {
         })
     }
 
+    /// The token the swap prefix spends to buy the payment currency, if any.
+    pub(super) fn swap_input_token(&self) -> Option<Address> {
+        match self.swap_prefix?.0.to {
+            TxKind::Call(token) => Some(token),
+            TxKind::Create => None,
+        }
+    }
+
     /// The transfers the calls make. A call that is not sent to a contract,
     /// or whose calldata does not have the exact length, makes none.
     pub(super) fn transfer_effects(&self) -> Vec<TransferEffect> {

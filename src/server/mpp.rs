@@ -447,6 +447,8 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(fee_token) = builder.fee_payer_fee_token {
             method = method.with_fee_payer_fee_token(fee_token);
         }
+        method = method
+            .with_fee_payer_allow_key_authorization(builder.fee_payer_allow_key_authorization);
         if let Some(store) = builder.store {
             method = method.with_store(store);
         }
