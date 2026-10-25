@@ -123,19 +123,7 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
-        let expected_id = crate::protocol::core::compute_challenge_id_with_header(
-            &self.config.secret_key,
-            &self.config.realm,
-            credential.challenge.method.as_str(),
-            credential.challenge.intent.as_str(),
-            credential.challenge.request.raw(),
-            credential.challenge.expires.as_deref(),
-            credential.challenge.digest.as_deref(),
-            credential.challenge.opaque.as_ref().map(|o| o.raw()),
-            credential.challenge.header.as_deref(),
-        );
-
-        if !crate::protocol::core::constant_time_eq(&credential.challenge.id, &expected_id) {
+        if !self.issued_challenge(credential) {
             return Err(VerificationError::with_code(
                 "Challenge ID mismatch - not issued by this server",
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
@@ -163,6 +151,42 @@ where
         }
 
         Ok(())
+    }
+
+    /// Whether the credential's challenge ID is this handler's HMAC over the
+    /// echoed challenge, i.e. this handler issued it.
+    fn issued_challenge(&self, credential: &PaymentCredential) -> bool {
+        let expected_id = crate::protocol::core::compute_challenge_id_with_header(
+            &self.config.secret_key,
+            &self.config.realm,
+            credential.challenge.method.as_str(),
+            credential.challenge.intent.as_str(),
+            credential.challenge.request.raw(),
+            credential.challenge.expires.as_deref(),
+            credential.challenge.digest.as_deref(),
+            credential.challenge.opaque.as_ref().map(|o| o.raw()),
+            credential.challenge.header.as_deref(),
+        );
+        crate::protocol::core::constant_time_eq(&credential.challenge.id, &expected_id)
+    }
+
+    /// Whether this handler issued the credential's challenge for a route
+    /// charging `expected`: its HMAC matches and the echoed request passes the
+    /// same expected-request checks as
+    /// [`broadcast_credential_with_expected_request`](Self::broadcast_credential_with_expected_request).
+    ///
+    /// Checks nothing else (expiry, payload) and accepts no payment; composed
+    /// verification uses it to pick which route verifies a credential.
+    pub(crate) fn issued_challenge_for(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+    ) -> bool {
+        self.issued_challenge(credential)
+            && Self::decode_credential_request(credential).is_ok_and(|request| {
+                self.verify_expected_request_matches(credential, &request, expected)
+                    .is_ok()
+            })
     }
 
     fn decode_credential_request(
