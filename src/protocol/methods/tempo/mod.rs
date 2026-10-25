@@ -237,14 +237,16 @@ fn ensure_sponsored_expiry_floor(
                     "invalid expires for fee-sponsored charge: {e}"
                 ))
             })?;
-    // `expires` is usually computed just before issuance, so round to the
-    // nearest second: `expires::seconds(15)` passes, `expires::seconds(14)` not.
-    // This is a configuration check, not a payability guarantee: delivery and
-    // signing time still count against the client and co-signing floors.
-    let expires_in = (expires_at - now + time::Duration::milliseconds(500)).whole_seconds();
-    if expires_in < FEE_PAYER_MIN_REMAINING_VALIDITY_SECS as i64 {
+    // Compare the exact remaining lifetime, as the client does before signing
+    // and as mpp-go and pympp do at issuance: a lifetime rounded up to the
+    // floor is already too short for the client. This is a configuration
+    // check, not a payability guarantee: delivery and signing time still count
+    // against the client and co-signing floors.
+    let expires_in = expires_at - now;
+    if expires_in < time::Duration::seconds(FEE_PAYER_MIN_REMAINING_VALIDITY_SECS as i64) {
         return Err(crate::error::MppError::InvalidConfig(format!(
-            "fee-sponsored charge challenges must expire at least {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS} seconds after issuance (expires in {expires_in}s)"
+            "fee-sponsored charge challenges must expire at least {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS} seconds after issuance (expires in {:.3}s)",
+            expires_in.as_seconds_f64()
         )));
     }
     Ok(())
@@ -634,9 +636,22 @@ mod tests {
         assert!(issue(&sponsored, Some(&crate::expires::seconds(5))).is_err());
         assert!(issue(&sponsored, Some("2020-01-01T00:00:00Z")).is_err());
 
-        // At the floor, and the default expiry, still issue.
-        issue(&sponsored, Some(&crate::expires::seconds(15))).unwrap();
+        // Above the floor, and the default expiry, still issue.
+        issue(&sponsored, Some(&crate::expires::seconds(16))).unwrap();
         issue(&sponsored, None).unwrap();
+
+        // The floor is exact: 14.75 seconds is not rounded up to 15, since the
+        // client refuses to sign a challenge with under 15 seconds left.
+        let now = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+        let expires = "2033-05-18T03:33:35Z"; // 2_000_000_015
+        ensure_sponsored_expiry_floor(&sponsored, expires, now).unwrap();
+        let error = ensure_sponsored_expiry_floor(
+            &sponsored,
+            expires,
+            now + time::Duration::milliseconds(250),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expires in 14.750s"), "{error}");
 
         // Zero-amount proof charges are never co-signed, so keep any expiry.
         let mut zero = request(serde_json::json!({ "feePayer": true }));
