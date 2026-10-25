@@ -617,8 +617,8 @@ fn rejection_response<B: Default>(
         .unwrap_or(StatusCode::PAYMENT_REQUIRED);
     if status == StatusCode::FORBIDDEN {
         let mut resp = error_response(status, "");
-        resp.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        resp.extensions_mut()
+            .insert(ProblemDetails(error.to_problem_details(None)));
         return resp;
     }
     match challenge() {
@@ -1125,6 +1125,12 @@ mod tests {
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+        // with_problem_details serializes the replay problem, as axum does.
+        let ProblemDetails(problem) = resp.extensions().get::<ProblemDetails>().unwrap();
+        assert!(problem.problem_type.ends_with("verification-failed"));
+        assert_eq!(problem.status, 403);
+        assert!(problem.detail.contains("already been used"));
+        assert!(problem.challenge_id.is_none());
     }
 
     /// Test: invalid auth → retryable 402 with a fresh challenge.
