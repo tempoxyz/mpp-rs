@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://t.me/mpp_devs
+    about: Ask questions and get help in the MPP Developers Telegram group.
+  - name: Report a security vulnerability
+    url: https://github.com/tempoxyz/mpp-rs/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.

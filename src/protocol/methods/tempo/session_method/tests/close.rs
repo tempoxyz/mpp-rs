@@ -992,3 +992,32 @@ async fn test_reconcile_keeps_unexpired_pending_close() {
     let state = method.reconcile_pending_close(&channel_id).await.unwrap();
     assert!(state.closing && state.pending_close.is_some() && !state.finalized);
 }
+
+/// An expired close on a TIP-1034 channel cannot be checked against chain
+/// state without the descriptor, so reconciliation keeps it blocked.
+#[tokio::test]
+async fn test_reconcile_keeps_expired_precompile_close_blocked() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let store = Arc::new(InMemoryChannelStore::new());
+    let channel_id = B256::repeat_byte(0xab).to_string();
+    let mut state = test_channel_state(&channel_id);
+    state.escrow_contract = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+    state.closing = true;
+    state.pending_close = Some(super::super::PendingClose {
+        transaction_hash: B256::repeat_byte(0xcc),
+        nonce: 0,
+        cumulative_amount: 1000,
+        signature: vec![1; 65],
+        valid_before: Some(now - 120),
+    });
+    store.insert(&channel_id, state);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
+    let method = mocked_session_method(store.clone(), asserter.clone());
+    let state = method.reconcile_pending_close(&channel_id).await.unwrap();
+    assert!(state.closing && state.pending_close.is_some() && !state.finalized);
+    assert!(asserter.read_q().is_empty());
+}
