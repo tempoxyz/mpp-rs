@@ -149,6 +149,11 @@ impl ChannelState {
         if self.closing {
             return Err(VerificationError::channel_closed("channel is closing"));
         }
+        if self.close_requested_at != 0 {
+            return Err(VerificationError::channel_closed(
+                "channel has a pending close request",
+            ));
+        }
         let available = self.highest_voucher_amount.saturating_sub(self.spent);
         if available >= amount {
             Ok(Self {

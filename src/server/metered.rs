@@ -2,7 +2,7 @@
 
 use super::sse::NeedVoucherEvent;
 use crate::protocol::methods::tempo::session_method::{
-    channel_receipt, deduct_from_channel, ChannelState, ChannelStore,
+    channel_receipt, deduct_from_channel, ChannelState, ChannelStore, StreamCheck,
 };
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
 use crate::protocol::traits::ErrorCode;
@@ -29,6 +29,8 @@ pub(super) struct Metered<'a, G> {
     pub(super) generate: G,
     pub(super) poll_interval_ms: u64,
     pub(super) min_voucher_delta: u128,
+    /// Runs before each charge; an error stops the stream.
+    pub(super) before_charge: Option<StreamCheck>,
 }
 
 impl<'a, G> Metered<'a, G>
@@ -47,6 +49,7 @@ where
             generate,
             poll_interval_ms,
             min_voucher_delta,
+            before_charge,
         } = self;
 
         async_stream::stream! {
@@ -59,7 +62,7 @@ where
                 let Ok(Some(ch)) = store.get_channel(channel_id).await else {
                     return;
                 };
-                if ch.finalized || ch.closing {
+                if ch.finalized || ch.closing || ch.close_requested_at != 0 {
                     yield MeteredEvent::Receipt(channel_receipt(challenge_id, channel_id, &ch));
                     return;
                 }
@@ -81,7 +84,19 @@ where
             while let Some(value) = next_item(&mut stream).await {
                 // Try to charge, waiting for top-up if insufficient
                 let mut need_voucher_sent = false;
+                let mut check_escrow = true;
                 loop {
+                    // The escrow may have been closed or withdrawn since the
+                    // voucher was accepted: no voucher can fix that either.
+                    if let (true, Some(check)) = (check_escrow, &before_charge) {
+                        check_escrow = false;
+                        if check(channel_id.to_string()).await.is_err() {
+                            if let Some(receipt) = final_receipt(store, channel_id, challenge_id).await {
+                                yield MeteredEvent::Receipt(receipt);
+                            }
+                            return;
+                        }
+                    }
                     match deduct_from_channel(store, channel_id, tick_cost).await {
                         Ok(_state) => break,
                         Err(e) if e.code == Some(ErrorCode::InsufficientBalance) => {
@@ -99,6 +114,12 @@ where
                                 }
                             }
                             wait_for_update(store, channel_id, poll_interval_ms).await;
+                            // Check the escrow again only once a voucher covers the
+                            // charge: waiting on the client must not read it every poll.
+                            if let Ok(Some(ch)) = store.get_channel(channel_id).await {
+                                check_escrow =
+                                    ch.highest_voucher_amount.saturating_sub(ch.spent) >= tick_cost;
+                            }
                         }
                         Err(_) => {
                             // Closed, missing, or unreadable channel — no voucher can fix

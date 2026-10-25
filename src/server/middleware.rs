@@ -604,7 +604,8 @@ fn internal_error_response<B: Default>() -> Response<B> {
 ///
 /// A payment problem is answered with its status and the fresh challenge
 /// from `challenge` so the client can retry. A server-side failure is
-/// answered with `500` and no challenge, so the client does not pay again.
+/// answered with `500` and a replayed credential with `403`, both without a
+/// challenge, so the client does not pay again.
 fn rejection_response<B: Default>(
     error: &MppError,
     challenge: impl FnOnce() -> Result<String, String>,
@@ -614,6 +615,12 @@ fn rejection_response<B: Default>(
     }
     let status = StatusCode::from_u16(error.to_problem_details(None).status)
         .unwrap_or(StatusCode::PAYMENT_REQUIRED);
+    if status == StatusCode::FORBIDDEN {
+        let mut resp = error_response(status, "");
+        resp.extensions_mut()
+            .insert(ProblemDetails(error.to_problem_details(None)));
+        return resp;
+    }
     match challenge() {
         Ok(challenge) => {
             let mut response = challenge_response(status, &challenge);
@@ -1103,6 +1110,27 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
             assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
         }
+    }
+
+    #[test]
+    fn test_replayed_credential_returns_403_without_challenge() {
+        let error =
+            MppError::CredentialReplayed(Some("Proof credential has already been used".into()));
+        let resp: Response<()> = rejection_response(&error, || {
+            panic!("a replayed credential must not be answered with a challenge")
+        });
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        // with_problem_details serializes the replay problem, as axum does.
+        let ProblemDetails(problem) = resp.extensions().get::<ProblemDetails>().unwrap();
+        assert!(problem.problem_type.ends_with("verification-failed"));
+        assert_eq!(problem.status, 403);
+        assert!(problem.detail.contains("already been used"));
+        assert!(problem.challenge_id.is_none());
     }
 
     /// Test: invalid auth → retryable 402 with a fresh challenge.

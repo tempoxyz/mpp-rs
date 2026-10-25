@@ -173,7 +173,7 @@ where
             )));
         }
 
-        let matched_memos = match_transfers(
+        let matched = match_transfers(
             &calls.transfer_effects(),
             TransferSource::Calls,
             currency,
@@ -181,7 +181,11 @@ where
         )?;
 
         if let Some((challenge_id, realm)) = challenge_binding {
-            assert_challenge_bound_memos(matched_memos.iter().flatten(), challenge_id, realm)?;
+            assert_challenge_bound_memos(
+                matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+                challenge_id,
+                realm,
+            )?;
         }
 
         Ok(None)
@@ -321,93 +325,117 @@ where
 
         // Pre-broadcast dedup of the final tx bytes. Separate namespace from
         // the post-broadcast hash dedup in verify_hash.
-        if let Some(store) = &self.store {
-            let tx_hash_pre = keccak256(&final_tx_bytes);
-            let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
-            // Atomically reserve before broadcasting.
-            let claimed = store
-                .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
-                .await
-                .map_err(|e| VerificationError::internal(format!("Failed to record tx: {e}")))?;
-            if !claimed {
-                return Err(VerificationError::new(
-                    "Transaction has already been submitted.",
-                ));
+        let submission_key = match &self.store {
+            Some(store) => {
+                let tx_hash_pre = keccak256(&final_tx_bytes);
+                let dedup_key = format!("mpp:charge:submission:{:#x}", tx_hash_pre);
+                // Atomically reserve before broadcasting.
+                let claimed = store
+                    .put_if_absent(&dedup_key, serde_json::Value::Bool(true))
+                    .await
+                    .map_err(|e| {
+                        VerificationError::internal(format!("Failed to record tx: {e}"))
+                    })?;
+                if !claimed {
+                    return Err(VerificationError::credential_replayed(
+                        "Transaction has already been submitted.",
+                    ));
+                }
+                Some(dedup_key)
             }
-        }
+            None => None,
+        };
 
-        // Simulation and the dedup claim took round trips since co-signing:
-        // right before broadcasting, make sure the sponsored transaction still
-        // has time to land before paying for it.
-        if charge.fee_payer() {
-            let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
-                .map_err(|e| {
-                VerificationError::new(format!("Failed to decode transaction: {e}"))
-            })?;
-            let valid_before = signed.tx().valid_before.map_or(0, |vb| vb.get());
-            super::fee_payer::ensure_remaining_validity(
-                valid_before,
-                super::fee_payer::unix_now()?,
-            )?;
-        }
+        let result: Result<B256, VerificationError> = async {
+            // Simulation and the dedup claim took round trips since co-signing:
+            // right before broadcasting, make sure the sponsored transaction
+            // still has time to land before paying for it.
+            if charge.fee_payer() {
+                let signed =
+                    tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+                        .map_err(|e| {
+                            VerificationError::new(format!("Failed to decode transaction: {e}"))
+                        })?;
+                let valid_before = signed.tx().valid_before.map_or(0, |vb| vb.get());
+                super::fee_payer::ensure_remaining_validity(
+                    valid_before,
+                    super::fee_payer::unix_now()?,
+                )?;
+            }
 
-        // Authorize before the irreversible send. Expiry is not re-checked
-        // afterwards: a paid request must not turn into a fresh challenge
-        // while settlement completes.
-        ensure_challenge_not_expired(expires)?;
+            // Authorize before the irreversible send. Expiry is not re-checked
+            // afterwards: a paid request must not turn into a fresh challenge
+            // while settlement completes.
+            ensure_challenge_not_expired(expires)?;
 
-        // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
-        // receipt. The Tempo node holds the connection open until the transaction
-        // is mined/pre-confirmed and returns the full receipt, avoiding the
-        // client-side polling loop of send_raw_transaction + get_receipt.
-        let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
-        let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
-            .provider
-            .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
-            .await
-            .map_err(|e| VerificationError::network_error(format!("Failed to broadcast: {}", e)))?;
-
-        if !receipt.status() {
-            return Err(VerificationError::transaction_failed(format!(
-                "Transaction {} reverted",
-                receipt.transaction_hash()
-            )));
-        }
-
-        // Verify the receipt contains the expected TIP-20 transfer(s).
-        let settlement_senders = settlement_sender.into_iter().collect::<Vec<_>>();
-        let matched_logs = match_receipt_transfer_logs_with_settlement(
-            receipt.logs(),
-            currency,
-            &expected,
-            ReceiptSenderPolicy {
-                expected_sender: receipt.from(),
-                source: None,
-                validate_sender: None,
-                transaction_sender: receipt.from(),
-                settlement_senders: &settlement_senders,
-            },
-        )?;
-        assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
-
-        // Record the on-chain tx hash for hash-based replay protection. Use the
-        // atomic claim so a concurrent hash credential for the same tx cannot
-        // also succeed.
-        if let Some(store) = &self.store {
-            let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
-            let claimed = store
-                .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+            // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
+            // receipt. The Tempo node holds the connection open until the transaction
+            // is mined/pre-confirmed and returns the full receipt, avoiding the
+            // client-side polling loop of send_raw_transaction + get_receipt.
+            let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
+            let receipt: <TempoNetwork as alloy::network::Network>::ReceiptResponse = self
+                .provider
+                .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
                 .await
                 .map_err(|e| {
-                    VerificationError::internal(format!("Failed to record tx hash: {e}"))
+                    VerificationError::network_error(format!("Failed to broadcast: {}", e))
                 })?;
-            if !claimed {
-                return Err(VerificationError::new(
-                    "Transaction hash has already been used.",
-                ));
+
+            if !receipt.status() {
+                return Err(VerificationError::transaction_failed(format!(
+                    "Transaction {} reverted",
+                    receipt.transaction_hash()
+                )));
+            }
+
+            // Verify the receipt contains the expected TIP-20 transfer(s).
+            let settlement_senders = settlement_sender.into_iter().collect::<Vec<_>>();
+            let matched_logs = match_receipt_transfer_logs_with_settlement(
+                receipt.logs(),
+                currency,
+                &expected,
+                ReceiptSenderPolicy {
+                    expected_sender: receipt.from(),
+                    source: None,
+                    validate_sender: None,
+                    transaction_sender: receipt.from(),
+                    settlement_senders: &settlement_senders,
+                },
+            )?;
+            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
+
+            // Record the on-chain tx hash for hash-based replay protection. Use the
+            // atomic claim so a concurrent hash credential for the same tx cannot
+            // also succeed.
+            if let Some(store) = &self.store {
+                let replay_key = format!("mpp:charge:{:#x}", receipt.transaction_hash());
+                let claimed = store
+                    .put_if_absent(&replay_key, serde_json::Value::Bool(true))
+                    .await
+                    .map_err(|e| {
+                        VerificationError::internal(format!("Failed to record tx hash: {e}"))
+                    })?;
+                if !claimed {
+                    return Err(VerificationError::credential_replayed(
+                        "Transaction hash has already been used.",
+                    ));
+                }
+            }
+
+            Ok(receipt.transaction_hash())
+        }
+        .await;
+
+        // Only a settled payment consumes the credential, as in mppx: release
+        // the submission claim when settlement failed, so resending the same
+        // credential retries it instead of being rejected as a replay. The
+        // transaction can be mined at most once, and a mined one is still
+        // caught by its transaction hash claim.
+        if result.is_err() {
+            if let (Some(store), Some(key)) = (&self.store, &submission_key) {
+                let _ = store.delete(key).await;
             }
         }
-
-        Ok(receipt.transaction_hash())
+        result
     }
 }
