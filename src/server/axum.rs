@@ -78,7 +78,6 @@ use bytes::Bytes;
 use http_types::{header, HeaderValue, StatusCode};
 
 use crate::error::{MppError, PaymentError, PaymentErrorDetails};
-#[cfg(any(feature = "stripe", feature = "tempo"))]
 use crate::protocol::core::headers::parse_authorization;
 use crate::protocol::core::headers::{
     extract_payment_scheme, format_receipt, format_www_authenticate, with_private_cache_control,
@@ -120,24 +119,12 @@ pub struct PaymentOffers(pub Vec<PaymentChallenge>);
 
 impl IntoResponse for PaymentOffers {
     fn into_response(self) -> axum_core::response::Response {
-        let Some(values) = challenge_header_values(&self.0) else {
-            return internal_error_response();
+        let description = self.0.first().and_then(|offer| offer.description.clone());
+        let error = MppError::PaymentRequired {
+            realm: None,
+            description,
         };
-        let mut resp = (
-            StatusCode::PAYMENT_REQUIRED,
-            serde_json::json!({ "error": "Payment Required" }).to_string(),
-        )
-            .into_response();
-        for value in values {
-            resp.headers_mut().append(WWW_AUTHENTICATE_HEADER, value);
-        }
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        resp.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        resp
+        PaymentProblem::new(&error, self.0).into_response()
     }
 }
 
@@ -145,31 +132,49 @@ impl IntoResponse for PaymentOffers {
 ///
 /// Payment problems (expired, invalid challenge, failed verification, …) are
 /// answered with the problem's status and one fresh `WWW-Authenticate`
-/// challenge per offer. A server-side failure is answered with `500` and no
-/// challenge, so that clients do not pay again for a fault that is not theirs.
+/// challenge per offer. A server-side failure (`5xx`) or a final `403` (such
+/// as a replayed credential) is answered without a challenge, so that clients
+/// do not pay again when paying would not help.
 #[derive(Debug)]
 pub struct PaymentProblem {
     /// Problem details sent as the `application/problem+json` body.
     pub problem: PaymentErrorDetails,
-    /// Fresh challenges for retry. Not sent with a `5xx` problem.
+    /// Fresh challenges for retry. Not sent with a `5xx` or `403` problem.
     pub offers: Vec<PaymentChallenge>,
 }
 
 impl PaymentProblem {
     /// Build the response for `error`, retryable with `offers`.
     ///
-    /// The problem references the first offer's challenge id.
+    /// The problem references the first offer's challenge id. A problem
+    /// answered without a challenge (`5xx` or `403`) drops the offers and
+    /// references none.
     pub fn new(error: &impl PaymentError, offers: Vec<PaymentChallenge>) -> Self {
+        let problem = error.to_problem_details(None);
+        if !sends_challenges(problem.status) {
+            return Self {
+                problem,
+                offers: Vec::new(),
+            };
+        }
         let problem = error.to_problem_details(offers.first().map(|offer| offer.id.as_str()));
         Self { problem, offers }
     }
+}
+
+/// Whether a problem with `status` is answered with fresh challenges: a
+/// server-side failure or a final `403` (such as a replayed credential) is
+/// not, since paying again would not help.
+fn sends_challenges(status: u16) -> bool {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    !(status.is_server_error() || status == StatusCode::FORBIDDEN)
 }
 
 impl IntoResponse for PaymentProblem {
     fn into_response(self) -> axum_core::response::Response {
         let status =
             StatusCode::from_u16(self.problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let values = if status.is_server_error() {
+        let values = if !sends_challenges(self.problem.status) {
             Vec::new()
         } else {
             match challenge_header_values(&self.offers) {
@@ -359,12 +364,13 @@ impl MppChargeRejection {
     /// Build the rejection for a credential that failed with `error`.
     ///
     /// `offers` generates the fresh challenges; it is only called for payment
-    /// problems, since a server-side failure is not answered with a challenge.
+    /// problems a new payment can resolve, since a server-side failure or a
+    /// replayed credential is not answered with a challenge.
     fn from_error(
         error: MppError,
         offers: impl FnOnce() -> Result<Vec<PaymentChallenge>, String>,
     ) -> Self {
-        if !error.is_payment_problem() {
+        if !error.is_payment_problem() || matches!(error, MppError::CredentialReplayed(_)) {
             return Self::Problem(PaymentProblem::new(&error, Vec::new()));
         }
         match offers() {
@@ -381,10 +387,14 @@ impl IntoResponse for MppChargeRejection {
     fn into_response(self) -> axum_core::response::Response {
         match self {
             MppChargeRejection::Challenge(pr) => pr.into_response(),
-            MppChargeRejection::VerificationFailed(pr) => pr.into_response(),
+            MppChargeRejection::VerificationFailed(pr) => {
+                PaymentProblem::new(&MppError::VerificationFailed(None), vec![pr.0]).into_response()
+            }
             MppChargeRejection::InternalError(_) => internal_error_response(),
             MppChargeRejection::Offers(offers) => offers.into_response(),
-            MppChargeRejection::VerificationFailedOffers(offers) => offers.into_response(),
+            MppChargeRejection::VerificationFailedOffers(offers) => {
+                PaymentProblem::new(&MppError::VerificationFailed(None), offers.0).into_response()
+            }
             MppChargeRejection::Body(rejection) => rejection.into_response(),
             MppChargeRejection::Problem(problem) => problem.into_response(),
         }
@@ -437,18 +447,30 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     }
 
     /// Verify a credential string against route amount and framework scope.
+    ///
+    /// With a scope, the default re-issues this route's challenge with
+    /// [`challenge`](Self::challenge) and rejects a credential whose echoed
+    /// challenge does not carry the route's scope in `_mppx_scope` or whose
+    /// method, intent or pinned request fields (amount, currency, recipient
+    /// and method details, as in mppx) differ from it, so a credential issued for
+    /// another route, amount or HTTP method is rejected, as mppx's
+    /// `verifyCredential` does. It then delegates to
+    /// [`verify_payment_for_amount`](Self::verify_payment_for_amount), which
+    /// must authenticate the echoed challenge (e.g. its HMAC `id`): that is
+    /// what binds the echoed request to a challenge the server issued.
+    /// Override this method if `challenge` output is not deterministic for a
+    /// given amount and scope.
     fn verify_payment_for_amount_and_scope(
         &self,
         credential_str: &str,
         amount: &str,
         mppx_scope: Option<serde_json::Value>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
-        if mppx_scope.is_some() {
-            let _ = credential_str;
-            let _ = amount;
-            return Box::pin(std::future::ready(Err(
-                "framework scope verification is not implemented for this ChargeChallenger".into(),
-            )));
+        if let Some(scope) = mppx_scope {
+            let expected = self.challenge(amount, scoped_challenge_options(&scope));
+            if let Err(e) = check_route_binding(credential_str, &scope, expected) {
+                return Box::pin(std::future::ready(Err(e)));
+            }
         }
         self.verify_payment_for_amount(credential_str, amount)
     }
@@ -465,6 +487,13 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     }
 
     /// Verify a credential string against route amount, framework scope, and request body bytes.
+    ///
+    /// The default checks the credential against this route's challenge as
+    /// [`verify_payment_for_amount_and_scope`](Self::verify_payment_for_amount_and_scope)
+    /// does, re-issuing it with
+    /// [`challenge_with_body`](Self::challenge_with_body) so its body
+    /// `digest` must match too, then delegates to
+    /// [`verify_payment_for_amount_with_body`](Self::verify_payment_for_amount_with_body).
     fn verify_payment_for_amount_scope_and_body(
         &self,
         credential_str: &str,
@@ -472,13 +501,11 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         mppx_scope: Option<serde_json::Value>,
         body: &[u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>> {
-        if mppx_scope.is_some() {
-            let _ = credential_str;
-            let _ = amount;
-            let _ = body;
-            return Box::pin(std::future::ready(Err(
-                "framework scope verification is not implemented for this ChargeChallenger".into(),
-            )));
+        if let Some(scope) = mppx_scope {
+            let expected = self.challenge_with_body(amount, scoped_challenge_options(&scope), body);
+            if let Err(e) = check_route_binding(credential_str, &scope, expected) {
+                return Box::pin(std::future::ready(Err(e)));
+            }
         }
         self.verify_payment_for_amount_with_body(credential_str, amount, body)
     }
@@ -1246,6 +1273,70 @@ fn request_realm_from_parts(parts: &http_types::request::Parts) -> Option<String
         return None;
     }
     Some(authority.host().to_ascii_lowercase())
+}
+
+/// Challenge options the default scoped verifiers re-issue a route's challenge with.
+fn scoped_challenge_options(scope: &serde_json::Value) -> ChallengeOptions {
+    ChallengeOptions {
+        mppx_scope: Some(scope.clone()),
+        ..Default::default()
+    }
+}
+
+/// Reject a credential whose echoed challenge was not issued for this route.
+///
+/// Mirrors mppx's `verifyCredential`, which rejects a credential whose
+/// challenge scope differs from the route's and then compares the route's
+/// re-issued challenge with the echoed one (`getChallengeBindingMismatch`).
+fn check_route_binding(
+    credential_str: &str,
+    scope: &serde_json::Value,
+    expected: Result<PaymentChallenge, String>,
+) -> Result<(), String> {
+    let echo = parse_authorization(credential_str)
+        .map_err(|e| e.to_string())?
+        .challenge;
+    let request = echo.request.decode_value().map_err(|e| e.to_string())?;
+    if request.get("_mppx_scope") != Some(scope) {
+        return Err("credential scope does not match this route's requirements".into());
+    }
+    let expected = expected?;
+    let expected_request = expected.request.decode_value().map_err(|e| e.to_string())?;
+    if echo.method != expected.method
+        || echo.intent != expected.intent
+        || pinned_request_binding(&request) != pinned_request_binding(&expected_request)
+        || echo.digest != expected.digest
+    {
+        return Err("credential request does not match this route's requirements".into());
+    }
+    Ok(())
+}
+
+/// The request fields a credential must share with the route's challenge.
+///
+/// Mirrors mppx's `getPinnedRequestBinding`: only the economically
+/// significant fields are compared, read from the request or its
+/// `methodDetails`, so fields such as `description` that the re-issued
+/// challenge may lack do not reject a valid credential. The HMAC check in
+/// `verify_payment` covers the rest of the echoed request.
+fn pinned_request_binding(request: &serde_json::Value) -> Vec<Option<&serde_json::Value>> {
+    let details = request.get("methodDetails");
+    let field = |name: &str| {
+        request
+            .get(name)
+            .or_else(|| details.and_then(|d| d.get(name)))
+    };
+    let detail = |name: &str| details.and_then(|d| d.get(name));
+    vec![
+        field("amount"),
+        field("currency"),
+        field("recipient"),
+        field("chainId"),
+        detail("memo"),
+        detail("sessionProtocol"),
+        detail("splits"),
+        field("unitType"),
+    ]
 }
 
 fn mppx_scope_from_parts(parts: &http_types::request::Parts) -> Option<serde_json::Value> {

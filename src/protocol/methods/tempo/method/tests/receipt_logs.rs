@@ -456,6 +456,11 @@ fn test_assert_challenge_bound_memo_rejects_wrong_challenge() {
     assert!(error
         .to_string()
         .contains("memo is not bound to this challenge"));
+    // The transfer already settled, so paying again would not help.
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
 }
 
 #[test]

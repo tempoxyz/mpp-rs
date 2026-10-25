@@ -414,19 +414,20 @@ async fn test_deduct_rejects_when_close_requested() {
     state.close_requested_at = 99999;
     store.insert("0xchannel_closing", state);
 
-    let retrieved = store
+    // Once the payer requested a forced close, nothing more may be charged:
+    // the channel can be withdrawn before the server settles it.
+    let err = deduct_from_channel(&*store, "0xchannel_closing", 1_000)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::ChannelClosed));
+
+    let unchanged = store
         .get_channel("0xchannel_closing")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(retrieved.close_requested_at, 99999);
-
-    // Deduction should still work (close_requested_at is checked at voucher level)
-    let result = deduct_from_channel(&*store, "0xchannel_closing", 1_000).await;
-    assert!(result.is_ok());
-    let updated = result.unwrap();
-    assert_eq!(updated.spent, 1_000);
-    assert_eq!(updated.close_requested_at, 99999);
+    assert_eq!(unchanged.spent, 0);
+    assert_eq!(unchanged.units, 0);
 }
 
 #[tokio::test]
