@@ -181,7 +181,7 @@ fn test_match_receipt_transfer_logs_accepts_canonical_settlement_sender() {
     let recipient = Address::repeat_byte(0x33);
     let amount = U256::from(100u64);
     let memo = attribution::encode("challenge-123", "api.example.com", None);
-    let swapper = super::super::super::machine_token::MACHINE_TOKEN_SWAPPER_MAINNET;
+    let swapper = super::super::super::machine_token::MACH_SWAPPER_MAINNET;
     let logs = vec![make_transfer_with_memo_log(
         currency, recipient, recipient, amount, memo,
     )];
@@ -456,6 +456,11 @@ fn test_assert_challenge_bound_memo_rejects_wrong_challenge() {
     assert!(error
         .to_string()
         .contains("memo is not bound to this challenge"));
+    // The transfer already settled, so paying again would not help.
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
 }
 
 #[test]

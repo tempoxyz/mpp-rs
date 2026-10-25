@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.16.0 (2026-10-19)
+
+### Minor Changes
+
+- Require explicit HTTP request payment preferences by default; opaque reqwest client defaults cannot trigger automatic payments. Add `AcceptPaymentPolicy::Explicit` and `Disabled`. Set request-level `Accept-Payment`, or opt into provider-selected payment with `Always`. Channel store adapters now require native atomic compare-and-exchange; unsupported backends fail closed. Prevent unconfirmed channel opens from increasing cumulative vouchers before settlement reconciliation. (by @DerekCofausper, [#580](https://github.com/tempoxyz/mpp-rs/pull/580))
+
+### Patch Changes
+
+- Limited autoswaps to the missing balance and bounded input spending independently of quotes. Added an optional max_amount_in budget, defaulting to parity plus slippage. Sponsored validation accepts positive swap outputs up to the payment amount. Existing AutoswapConfig struct literals must add max_amount_in: None; the constructor remains unchanged. (by @DerekCofausper, [#580](https://github.com/tempoxyz/mpp-rs/pull/580))
+- Scoped relay idempotency keys to individual broadcast attempts, overriding custom-client defaults so cached receipts cannot authorize separate operations. Uncertain payment outcomes require separate recovery. (by @DerekCofausper, [#580](https://github.com/tempoxyz/mpp-rs/pull/580))
+- Preserved funded native channel descriptors after server close receipts, rejections, and pending on-chain closes until trusted chain state confirms the escrow is no longer funded. (by @DerekCofausper, [#580](https://github.com/tempoxyz/mpp-rs/pull/580))
+- Fixed automatic session management to preserve the configured HTTP client and strip hop-by-hop request headers. Middleware callers can provide the same client with `with_http_client`; automatic top-ups are disabled when it is absent. (by @DerekCofausper, [#580](https://github.com/tempoxyz/mpp-rs/pull/580))
+
 ## 0.15.1 (2026-10-12)
 
 ### Patch Changes

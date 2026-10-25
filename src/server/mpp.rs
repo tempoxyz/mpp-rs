@@ -65,6 +65,12 @@ pub(crate) fn detect_realm() -> String {
     realm_from_env(|name| std::env::var(name).ok())
 }
 
+pub(crate) fn request_realm_default() -> bool {
+    std::env::var("MPP_REALM")
+        .ok()
+        .is_none_or(|value| value.is_empty())
+}
+
 fn realm_from_env(lookup: impl Fn(&str) -> Option<String>) -> String {
     REALM_ENV_VARS
         .iter()
@@ -121,6 +127,8 @@ pub struct Mpp<M, S = ()> {
 #[derive(Clone)]
 struct Config {
     realm: String,
+    request_realm_default: bool,
+    trusted_request_hosts: Vec<String>,
     secret_key: String,
     currencies: Vec<String>,
     recipient: Option<String>,
@@ -136,6 +144,8 @@ impl Config {
     fn new(realm: String, secret_key: String) -> Self {
         Self {
             realm,
+            request_realm_default: false,
+            trusted_request_hosts: Vec::new(),
             secret_key,
             currencies: Vec::new(),
             recipient: None,
@@ -283,6 +293,27 @@ where
         &self.config.realm
     }
 
+    /// Use a trusted HTTP request hostname for the default realm, without
+    /// changing the shared handler used by concurrent requests.
+    #[cfg(feature = "axum")]
+    pub(crate) fn for_request_realm(&self, host: Option<&str>) -> Self
+    where
+        S: Clone,
+    {
+        let mut mpp = self.clone();
+        if let Some(host) = host.filter(|host| {
+            mpp.config.request_realm_default
+                && mpp
+                    .config
+                    .trusted_request_hosts
+                    .iter()
+                    .any(|trusted| trusted.eq_ignore_ascii_case(host))
+        }) {
+            Arc::make_mut(&mut mpp.config).realm = host.to_string();
+        }
+        mpp
+    }
+
     /// Get the method name.
     pub fn method_name(&self) -> &str {
         self.method.method()
@@ -426,6 +457,8 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         Ok(Self::from_config(
             method,
             Config {
+                request_realm_default: builder.request_realm_default,
+                trusted_request_hosts: builder.trusted_request_hosts,
                 currencies,
                 recipient: Some(builder.recipient),
                 decimals: builder.decimals,
@@ -482,6 +515,8 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
         Ok(Self::from_config(
             method,
             Config {
+                request_realm_default: builder.request_realm_default,
+                trusted_request_hosts: builder.trusted_request_hosts,
                 currencies: vec![builder.currency],
                 decimals: builder.decimals as u32,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),

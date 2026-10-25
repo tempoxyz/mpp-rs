@@ -1,0 +1,39 @@
+name: Close external pull requests
+
+on:
+  # This workflow never checks out or runs pull request code. It only reads
+  # the author's permission, then comments on and closes the pull request.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  close:
+    name: Close external pull request
+    if: github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    # secure-runner needs an OIDC token.
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+
+      - name: Close unless the author can write to the repository
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          PERM=$(gh api "repos/${REPOSITORY}/collaborators/${AUTHOR}/permission" --jq '.permission' 2>/dev/null || echo none)
+          case "$PERM" in
+            admin|maintain|write)
+              echo "${AUTHOR} has ${PERM} access; keeping the pull request open."
+              exit 0
+              ;;
+          esac
+          gh pr close "$PR_NUMBER" --repo "$REPOSITORY" --comment "This repository does not accept pull requests from external contributors. Please open an issue instead; see [CONTRIBUTING.md](https://github.com/tempoxyz/mpp-rs/blob/main/.github/CONTRIBUTING.md)."

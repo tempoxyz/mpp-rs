@@ -1,8 +1,13 @@
 //! Canonical first-party machine-token settlement routes.
 //!
-//! A machine-token payment approves the canonical swapper and calls `swapTo`
-//! atomically. The merchant continues to receive the challenge currency while
-//! the payer spends machineUSD.
+//! A machine-token charge approves the canonical MACH swapper and calls
+//! `swapTo` atomically. The merchant continues to receive the challenge
+//! currency while the payer spends MACH, matching mppx's charge deployment.
+//!
+//! Sessions denominated in MACH are ordinary TIP-1034 channels whose token is
+//! MACH. TIP-1095 applies MACH's recipient policy to the logical payer to payee
+//! path and returns refunds to the payer, so they need no swapper route. The
+//! machineUSD session route below remains for channels that already use it.
 
 use alloy::primitives::{address, Address, Bytes, TxKind, U256};
 use alloy::providers::Provider;
@@ -43,9 +48,9 @@ alloy::sol! {
     }
 }
 
-/// Resolve the canonical machine-token and swapper for a supported chain.
+/// Resolve the legacy machineUSD session token and swapper for a supported chain.
 pub fn session_addresses(chain_id: u64) -> Option<(Address, Address)> {
-    deployment(chain_id).map(|deployment| (deployment.token, deployment.swapper))
+    session_deployment(chain_id).map(|deployment| (deployment.token, deployment.swapper))
 }
 
 /// Bind a logical merchant settlement route into a TIP-1034 descriptor salt.
@@ -123,7 +128,14 @@ pub fn settle_session_call(
     })
 }
 
-/// machineUSD on Tempo mainnet.
+/// MACH, the canonical machine token on Tempo mainnet and Moderato.
+pub const MACH: Address = address!("20c000000000000000000000f37de3740ADec032");
+/// Canonical MACH swapper on Tempo mainnet.
+pub const MACH_SWAPPER_MAINNET: Address = address!("F72E5107c32C655ffA7539a3C8e97B7C3cE16A3F");
+/// Canonical MACH swapper on Tempo Moderato.
+pub const MACH_SWAPPER_TESTNET: Address = address!("d05f8EdFBB54Da0d765C9fE9b2B3f7d2E3a8C466");
+
+/// machineUSD on Tempo mainnet, used only by the legacy session route.
 pub const MACHINE_TOKEN_MAINNET: Address = address!("20C0000000000000000000003793c39601711f19");
 /// Canonical machineUSD swapper on Tempo mainnet.
 pub const MACHINE_TOKEN_SWAPPER_MAINNET: Address =
@@ -154,6 +166,20 @@ pub struct MachineTokenRoute {
 fn deployment(chain_id: u64) -> Option<Deployment> {
     match chain_id {
         CHAIN_ID => Some(Deployment {
+            token: MACH,
+            swapper: MACH_SWAPPER_MAINNET,
+        }),
+        MODERATO_CHAIN_ID => Some(Deployment {
+            token: MACH,
+            swapper: MACH_SWAPPER_TESTNET,
+        }),
+        _ => None,
+    }
+}
+
+fn session_deployment(chain_id: u64) -> Option<Deployment> {
+    match chain_id {
+        CHAIN_ID => Some(Deployment {
             token: MACHINE_TOKEN_MAINNET,
             swapper: MACHINE_TOKEN_SWAPPER_MAINNET,
         }),
@@ -163,6 +189,11 @@ fn deployment(chain_id: u64) -> Option<Deployment> {
         }),
         _ => None,
     }
+}
+
+/// Returns the canonical machine token that funds charges on `chain_id`.
+pub fn token(chain_id: u64) -> Option<Address> {
+    deployment(chain_id).map(|deployment| deployment.token)
 }
 
 /// Returns whether a canonical machine-token route exists on `chain_id`.
@@ -263,23 +294,17 @@ pub async fn find_route<P: Provider<tempo_alloy::TempoNetwork>>(
         TxKind::Call(token) => token,
         TxKind::Create => return None,
     };
-    let balance = ITIP20::new(token, provider)
-        .balanceOf(account)
-        .call()
-        .await
-        .ok()?;
-    if balance < route.transfer.amount {
-        return None;
-    }
-
     let mut request = TempoTransactionRequest {
         calls: route.calls.to_vec(),
         ..Default::default()
     };
     request.inner.from = Some(account);
     request.inner.chain_id = Some(chain_id);
-    provider.call(request).await.ok()?;
-    Some(route)
+    // Both reads gate the same decision, so issue them together.
+    let token = ITIP20::new(token, provider);
+    let balance = token.balanceOf(account);
+    let (balance, simulation) = tokio::join!(balance.call(), provider.call(request));
+    (balance.ok()? >= route.transfer.amount && simulation.is_ok()).then_some(route)
 }
 
 #[cfg(test)]
@@ -300,22 +325,25 @@ mod tests {
         let currency = Address::repeat_byte(0x33);
         let route = route(MODERATO_CHAIN_ID, currency, &[transfer()]).unwrap();
 
-        assert_eq!(route.calls[0].to, TxKind::Call(MACHINE_TOKEN_TESTNET));
-        assert_eq!(
-            route.calls[1].to,
-            TxKind::Call(MACHINE_TOKEN_SWAPPER_TESTNET)
-        );
+        assert_eq!(route.calls[0].to, TxKind::Call(MACH));
+        assert_eq!(route.calls[1].to, TxKind::Call(MACH_SWAPPER_TESTNET));
         assert_eq!(
             match_route(&route.calls, MODERATO_CHAIN_ID, currency, &[transfer()]),
             Some(route.clone())
         );
 
         let approve = ITIP20::approveCall::abi_decode_raw(&route.calls[0].input[4..]).unwrap();
-        assert_eq!(approve.spender, MACHINE_TOKEN_SWAPPER_TESTNET);
+        assert_eq!(approve.spender, MACH_SWAPPER_TESTNET);
         assert_eq!(approve.amount, U256::from(1_000_000));
         let swap =
             IMachineTokenSwapper::swapToCall::abi_decode_raw(&route.calls[1].input[4..]).unwrap();
-        assert_eq!(swap.inputToken, MACHINE_TOKEN_TESTNET);
+        assert_eq!(swap.inputToken, MACH);
+        assert_eq!(token(CHAIN_ID), Some(MACH));
+        assert_eq!(settlement_sender(CHAIN_ID), Some(MACH_SWAPPER_MAINNET));
+        assert_eq!(
+            session_addresses(CHAIN_ID),
+            Some((MACHINE_TOKEN_MAINNET, MACHINE_TOKEN_SWAPPER_MAINNET))
+        );
         assert_eq!(swap.targetToken, currency);
         assert_eq!(swap.recipient, Address::repeat_byte(0x22));
     }

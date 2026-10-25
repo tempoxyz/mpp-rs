@@ -23,27 +23,27 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
+      # Pull while the toolchain and cache are set up; `docker compose up` reuses the image.
+      - name: Pull Tempo localnet image
+        run: docker compose pull --quiet > "$RUNNER_TEMP/compose-pull.log" 2>&1 &
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           toolchain: stable
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@947d9a3ccb2425a9c94d563fd721cc0e33c89e26 # 2026-10-15T00-15-06Z-947d9a3c
-      - name: Resolve Cargo dependencies
-        run: .github/scripts/resolve-cargo-dependencies.sh
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          # Pull requests restore main's cache but never save their own:
+          # saving cost 8-16s at the end of every job.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
       - name: Start Tempo localnet
         run: docker compose up -d --wait
-
-      - name: Run integration tests
-        run: cargo test --features integration --test integration_charge -- --nocapture
-        env:
-          TEMPO_RPC_URL: http://localhost:8545
 
       - name: Fund client account # well-known Hardhat dev account[1]
         run: |

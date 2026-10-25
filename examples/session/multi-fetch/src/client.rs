@@ -94,7 +94,11 @@ async fn main() {
         let url = format!("https://example.com/page/{i}");
         let request_url = format!("{base_url}/api/scrape?url={}", urlencoding(&url));
 
-        let response = client.get(&request_url).send_with_payment(&session).await;
+        let response = client
+            .get(&request_url)
+            .header("Accept-Payment", "tempo/session")
+            .send_with_payment(&session)
+            .await;
 
         match response {
             Ok(resp) => {

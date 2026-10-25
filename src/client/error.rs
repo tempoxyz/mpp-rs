@@ -24,6 +24,9 @@ pub enum HttpError {
     /// A redirect changed the request origin before returning a payment challenge
     CrossOriginRedirect,
 
+    /// A zero-amount Tempo proof was requested for a different HTTP realm.
+    CrossRealmProof,
+
     /// The caller-owned HTTP client may forward a custom credential header across redirects.
     UnsafeCredentialHeader,
 
@@ -50,6 +53,7 @@ impl fmt::Display for HttpError {
             Self::CrossOriginRedirect => {
                 write!(f, "Refusing to send payment credential across redirect")
             }
+            Self::CrossRealmProof => write!(f, "Refusing to sign Tempo proof for a different HTTP realm"),
             Self::UnsafeCredentialHeader => write!(
                 f,
                 "Payment-Authorization requires a redirect-safe client; refusing to create a credential"

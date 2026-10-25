@@ -72,6 +72,7 @@ async fn main() {
 
     let resp = Client::new()
         .get(&fortune_url)
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("request failed");

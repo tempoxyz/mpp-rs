@@ -19,7 +19,7 @@ use mpp::PaymentPayload;
 use mpp::{
     client::{
         ws::{WsClientMessage, WsServerMessage},
-        PaymentProvider, PendingPayment, DEFAULT_MAX_PAYMENT_RETRIES,
+        PaymentContext, PaymentProvider, PendingPayment, DEFAULT_MAX_PAYMENT_RETRIES,
     },
     format_authorization, MppError, PaymentChallenge, PaymentCredential, Receipt,
 };
@@ -433,6 +433,11 @@ where
             .clone()
             .into_client_request()
             .map_err(TransportErrorKind::custom)?;
+        let payment_context = PaymentContext {
+            url: Url::parse(&self.url).map_err(TransportErrorKind::custom)?,
+            headers: request.headers().clone(),
+            http_client: None,
+        };
         let (socket, _) = connect_async_with_config(request, self.config, false)
             .await
             .map_err(TransportErrorKind::custom)?;
@@ -442,6 +447,7 @@ where
         run_translator(
             socket,
             interface,
+            payment_context,
             self.payment_provider.clone(),
             self.voucher_provider.clone(),
             self.keepalive_interval,
@@ -464,6 +470,7 @@ where
 async fn run_translator<P, V>(
     mut socket: WsStream,
     mut interface: ConnectionInterface,
+    payment_context: PaymentContext,
     payment_provider: P,
     voucher_provider: V,
     keepalive_interval: Duration,
@@ -638,6 +645,7 @@ async fn run_translator<P, V>(
                         match handle_message(
                             item,
                             &interface,
+                            &payment_context,
                             &payment_provider,
                             &voucher_provider,
                             &receipt_tx,
@@ -778,6 +786,7 @@ async fn send_credential(
 async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
     msg: Message,
     interface: &ConnectionInterface,
+    payment_context: &PaymentContext,
     payment_provider: &P,
     voucher_provider: &V,
     receipt_tx: &watch::Sender<Option<Receipt>>,
@@ -794,6 +803,7 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
             handle_text(
                 &text,
                 interface,
+                payment_context,
                 payment_provider,
                 voucher_provider,
                 receipt_tx,
@@ -831,6 +841,7 @@ fn is_fatal_close(code: Option<CloseCode>) -> bool {
 async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     text: &str,
     interface: &ConnectionInterface,
+    payment_context: &PaymentContext,
     payment_provider: &P,
     voucher_provider: &V,
     receipt_tx: &watch::Sender<Option<Receipt>>,
@@ -891,6 +902,19 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             };
             debug!(method = %parsed.method, intent = %parsed.intent, "MPP challenge received");
             let _ = events_tx.send(MppEvent::Challenge(parsed.clone()));
+            let proof_origin =
+                proof_http_origin(&payment_context.url).map_err(|_| TerminationReason::Fatal)?;
+            if mpp::client::is_cross_realm_proof_with_trust(
+                &parsed,
+                &payment_context.url,
+                &payment_context.headers,
+                payment_provider.trusted_tempo_proof_realm(&proof_origin),
+            ) {
+                let _ = events_tx.send(MppEvent::Error(
+                    "refusing to sign Tempo proof for a different HTTP realm".into(),
+                ));
+                return Err(TerminationReason::Fatal);
+            }
 
             // Skip `pay()` if the provider doesn't support (method, intent).
             if !payment_provider.supports(parsed.method.as_str(), parsed.intent.as_str()) {
@@ -1005,6 +1029,17 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     }
 }
 
+fn proof_http_origin(url: &Url) -> Result<Url, ()> {
+    let mut origin = url.clone();
+    let scheme = match origin.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        _ => return Ok(origin),
+    };
+    origin.set_scheme(scheme)?;
+    Ok(origin)
+}
+
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 fn install_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
@@ -1020,6 +1055,28 @@ fn install_default_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_proof_lookup_uses_corresponding_http_origin() {
+        let ws = proof_http_origin(&Url::parse("ws://api.example:8545/rpc").unwrap()).unwrap();
+        let wss = proof_http_origin(&Url::parse("wss://api.example:8545/rpc").unwrap()).unwrap();
+        assert_eq!(
+            ws.origin(),
+            Url::parse("http://api.example:8545").unwrap().origin()
+        );
+        assert_eq!(
+            wss.origin(),
+            Url::parse("https://api.example:8545").unwrap().origin()
+        );
+        assert_ne!(
+            wss.origin(),
+            Url::parse("https://api.example:8546").unwrap().origin()
+        );
+        assert_ne!(
+            wss.origin(),
+            Url::parse("http://api.example:8545").unwrap().origin()
+        );
+    }
 
     #[derive(Clone)]
     struct DummyProvider;

@@ -114,6 +114,10 @@ pub fn recover_stored_channel(
             "stored cumulative amount exceeds the on-chain channel deposit",
         ));
     }
+    // An opening authorization already settled on-chain was accepted by the server.
+    if state.settled != 0 && state.settled >= entry.cumulative_amount {
+        entry.pending_open = None;
+    }
     entry.cumulative_amount = cumulative;
     entry.deposit = state.deposit;
     entry.opened = true;
@@ -196,6 +200,7 @@ pub fn hydrate_session_snapshot(
         escrow,
         chain_id: snapshot.chain_id,
         opened: true,
+        pending_open: None,
     })
 }
 
@@ -364,6 +369,7 @@ mod tests {
                 escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
                 chain_id: 4217,
                 opened: true,
+                pending_open: None,
             },
             scope(authority),
             OnChainChannelState {
@@ -375,6 +381,42 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.cumulative_amount, 300);
         assert_eq!(recovered.deposit, 1_000);
+    }
+
+    #[test]
+    fn stored_recovery_resolves_an_open_settled_on_chain() {
+        let authority = signer().address();
+        let descriptor = descriptor(authority);
+        let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+            &descriptor,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            4217,
+        )
+        .unwrap();
+        let entry = StoredChannelEntry {
+            channel_id,
+            cumulative_amount: 200,
+            deposit: 900,
+            descriptor,
+            settlement_route: None,
+            escrow: TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id: 4217,
+            opened: true,
+            pending_open: Some("open".into()),
+        };
+        let state = |settled| OnChainChannelState {
+            settled,
+            deposit: 900,
+            close_requested_at: 0,
+        };
+
+        let unsettled = recover_stored_channel(entry.clone(), scope(authority), state(0)).unwrap();
+        assert_eq!(unsettled.pending_open.as_deref(), Some("open"));
+        let partial = recover_stored_channel(entry.clone(), scope(authority), state(199)).unwrap();
+        assert_eq!(partial.pending_open.as_deref(), Some("open"));
+        let settled = recover_stored_channel(entry, scope(authority), state(200)).unwrap();
+        assert_eq!(settled.pending_open, None);
+        assert_eq!(settled.cumulative_amount, 200);
     }
 
     #[test]

@@ -28,6 +28,7 @@ fn interop_entry(cumulative_amount: u128) -> StoredChannelEntry {
             .unwrap(),
         chain_id: 4217,
         opened: true,
+        pending_open: None,
     }
 }
 

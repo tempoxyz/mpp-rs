@@ -68,6 +68,7 @@ async fn fetch_fortune(client: &Client, provider: &TempoProvider, url: &str) {
 
     let resp = client
         .get(url)
+        .header("Accept-Payment", "tempo/charge")
         .send_with_payment(provider)
         .await
         .expect("request failed");

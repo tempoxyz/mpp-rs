@@ -1,0 +1,11 @@
+# Advisories accepted for the committed Cargo.lock. paste matches the
+# `[advisories] ignore` list in deny.toml; cargo-deny never sees derivative
+# because it is not in the build graph.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste is unmaintained; transitive proc-macro dependency of alloy-primitives."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0388"
+reason = "derivative is unmaintained; locked only as an optional dependency of ark-ff and never compiled."

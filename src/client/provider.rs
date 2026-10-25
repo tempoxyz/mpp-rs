@@ -6,10 +6,35 @@
 
 use crate::error::MppError;
 use crate::protocol::core::accept_payment::{self, Entry};
-use crate::protocol::core::{PaymentChallenge, PaymentCredential};
+use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 use reqwest::header::HeaderMap;
 use reqwest::Url;
 use std::future::Future;
+
+/// Work a payment event in a response stream triggers, such as sending a voucher.
+pub type PaymentEventFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send>>;
+
+/// Delivery of a management credential, resolving to the receipt the resource answered with.
+pub type ManagementFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<Option<Receipt>, MppError>> + Send + 'a>>;
+
+/// Delivers a session management credential, such as a channel top-up or
+/// close, to the resource that issued its challenge.
+///
+/// HTTP resources take management credentials as an empty request to the
+/// challenged URL, which session providers send themselves from a
+/// [`PaymentContext`]. Other transports implement this trait, for example an
+/// MCP client that calls the challenged tool again with the credential in its
+/// `_meta` (see [`McpManagement`](crate::mcp::client::McpManagement)).
+pub trait ManagementTransport: Send + Sync {
+    /// Sends `credential`, which answers `challenge`, and returns the
+    /// resource's receipt. Fails when the resource rejects the credential.
+    fn send<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        credential: &'a PaymentCredential,
+    ) -> ManagementFuture<'a>;
+}
 
 /// HTTP request context available while creating a payment credential.
 ///
@@ -71,6 +96,15 @@ pub trait PaymentProvider: Clone + Send + Sync {
     /// `true` if this provider can handle the combination.
     fn supports(&self, method: &str, intent: &str) -> bool;
 
+    /// Explicitly trusted Tempo proof realm for a caller-pinned HTTP origin.
+    /// Defaults to the request host when unset. Never derive this from a challenge.
+    fn trusted_tempo_proof_realm(&self, _url: &reqwest::Url) -> Option<&str> {
+        None
+    }
+
+    /// Propagate an explicit realm pin to providers that also issue bootstrap proofs.
+    fn set_trusted_tempo_proof_realm(&mut self, _origin: reqwest::Url, _realm: String) {}
+
     /// Select one challenge from the supported, unexpired candidates.
     ///
     /// Candidates have already been ordered by the caller's `Accept-Payment`
@@ -108,6 +142,21 @@ pub trait PaymentProvider: Clone + Send + Sync {
     ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
         let _ = context;
         self.pay(challenge)
+    }
+
+    /// Execute payment like [`pay_with_context`](Self::pay_with_context), but
+    /// deliver any management credential the payment needs first, such as a
+    /// session channel top-up, through `management` instead of HTTP.
+    ///
+    /// Providers without management credentials inherit `pay_with_context`.
+    fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> impl Future<Output = Result<PaymentCredential, MppError>> + Send {
+        let _ = management;
+        self.pay_with_context(challenge, context)
     }
 
     /// Prepare a challenge before creating an HTTP payment credential.
@@ -191,6 +240,67 @@ pub trait PaymentProvider: Clone + Send + Sync {
     /// state; this is only for resources such as delivery-ordering leases.
     fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         let _ = (challenge, credential);
+    }
+
+    /// Credential to send with a request before the server asks for payment.
+    ///
+    /// A session provider holding a reusable challenge for the request's URL
+    /// may return one with a fresh voucher, which saves the unpaid round trip.
+    /// A `402` answer then continues the normal payment flow. Defaults to none.
+    fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> impl Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send {
+        let _ = context;
+        async { None }
+    }
+
+    /// Observe the receipt of a response that accepted this provider's credential.
+    ///
+    /// Session providers use the amount charged to size later prepaid vouchers.
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        let _ = (context, challenge, receipt);
+    }
+
+    /// Observe a receipt like [`observe_receipt`](Self::observe_receipt) and
+    /// return what the server charged for the request, when the provider tracks
+    /// it. Session providers report the change in the channel's `spent`. The
+    /// default observes the receipt and reports nothing.
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        self.observe_receipt(context, challenge, receipt);
+        None
+    }
+
+    /// The token the payer spent on `challenge`'s credential, when it differs from or is not
+    /// stated by the challenge, such as MACH swapped into a charge's currency. Providers that
+    /// fund payments in the challenge currency report nothing, the default.
+    fn funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        let _ = challenge;
+        None
+    }
+
+    /// Handle a named server-sent event from a paid response to `url`, such as
+    /// an mppx session's `payment-need-voucher`, and return the work it
+    /// triggers. Providers without in-stream payments return `None`, the default.
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        let _ = (client, url, name, data);
+        None
     }
 
     /// Build an `Accept-Payment` header value from this provider's supported methods.
@@ -299,6 +409,7 @@ impl<P: PaymentProvider> Drop for PendingPayment<P> {
 #[derive(Clone)]
 pub struct MultiProvider {
     providers: Vec<Box<dyn DynPaymentProvider>>,
+    trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
 }
 
 impl MultiProvider {
@@ -306,17 +417,34 @@ impl MultiProvider {
     pub fn new() -> Self {
         Self {
             providers: Vec::new(),
+            trusted_tempo_proof_realms: Vec::new(),
         }
     }
 
     /// Add a provider to the list.
-    pub fn with<P: PaymentProvider + 'static>(mut self, provider: P) -> Self {
+    pub fn with<P: PaymentProvider + 'static>(mut self, mut provider: P) -> Self {
+        for (origin, realm) in &self.trusted_tempo_proof_realms {
+            provider.set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
         self.providers.push(Box::new(provider));
         self
     }
 
+    /// Trust a non-hostname Tempo proof realm for one explicit HTTP origin.
+    pub fn with_trusted_tempo_proof_realm(
+        mut self,
+        origin: reqwest::Url,
+        realm: impl Into<String>,
+    ) -> Self {
+        self.set_trusted_tempo_proof_realm(origin, realm.into());
+        self
+    }
+
     /// Add a provider to the list (mutable reference version).
-    pub fn add<P: PaymentProvider + 'static>(&mut self, provider: P) -> &mut Self {
+    pub fn add<P: PaymentProvider + 'static>(&mut self, mut provider: P) -> &mut Self {
+        for (origin, realm) in &self.trusted_tempo_proof_realms {
+            provider.set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
         self.providers.push(Box::new(provider));
         self
     }
@@ -340,23 +468,58 @@ impl PaymentProvider for MultiProvider {
         self.has_support(method, intent)
     }
 
+    fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        self.trusted_tempo_proof_realms
+            .iter()
+            .find(|(origin, _)| origin.origin() == url.origin())
+            .map(|(_, realm)| realm.as_str())
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find_map(|provider| provider.dyn_trusted_tempo_proof_realm(url))
+            })
+    }
+
+    fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+        for provider in &mut self.providers {
+            provider.dyn_set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
+        }
+        self.trusted_tempo_proof_realms
+            .retain(|(existing, _)| existing.origin() != origin.origin());
+        self.trusted_tempo_proof_realms.push((origin, realm));
+    }
+
     fn select_challenge<'a>(
         &self,
         challenges: &[&'a PaymentChallenge],
     ) -> Option<&'a PaymentChallenge> {
-        let first = challenges.first()?;
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.dyn_supports(first.method.as_str(), first.intent.as_str()))?;
-        let candidates = challenges
-            .iter()
-            .copied()
-            .filter(|challenge| {
+        // Ask each provider in the rank order of its best challenge, so a
+        // provider that rejects all of its offers (for example a Tempo policy
+        // skip) falls through to the next supported method.
+        let owner = |challenge: &PaymentChallenge| {
+            self.providers.iter().position(|provider| {
                 provider.dyn_supports(challenge.method.as_str(), challenge.intent.as_str())
             })
-            .collect::<Vec<_>>();
-        provider.dyn_select_challenge(&candidates)
+        };
+        let mut tried = Vec::new();
+        for challenge in challenges {
+            let Some(index) = owner(challenge) else {
+                continue;
+            };
+            if tried.contains(&index) {
+                continue;
+            }
+            tried.push(index);
+            let candidates = challenges
+                .iter()
+                .copied()
+                .filter(|candidate| owner(candidate) == Some(index))
+                .collect::<Vec<_>>();
+            if let Some(selected) = self.providers[index].dyn_select_challenge(&candidates) {
+                return Some(selected);
+            }
+        }
+        None
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
@@ -386,6 +549,29 @@ impl PaymentProvider for MultiProvider {
         for provider in &self.providers {
             if provider.dyn_supports(method, intent) {
                 return provider.dyn_pay_with_context(challenge, context).await;
+            }
+        }
+
+        Err(MppError::UnsupportedPaymentMethod(format!(
+            "no provider supports method={}, intent={}",
+            method, intent
+        )))
+    }
+
+    async fn pay_with_management(
+        &self,
+        challenge: &PaymentChallenge,
+        context: PaymentContext,
+        management: &dyn ManagementTransport,
+    ) -> Result<PaymentCredential, MppError> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                return provider
+                    .dyn_pay_with_management(challenge, context, management)
+                    .await;
             }
         }
 
@@ -511,6 +697,67 @@ impl PaymentProvider for MultiProvider {
         }
     }
 
+    async fn prepaid_credential(
+        &self,
+        context: PaymentContext,
+    ) -> Option<(PaymentChallenge, PaymentCredential)> {
+        for provider in &self.providers {
+            if let Some(prepaid) = provider.dyn_prepaid_credential(context.clone()).await {
+                return Some(prepaid);
+            }
+        }
+        None
+    }
+
+    fn observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+
+        for provider in &self.providers {
+            if provider.dyn_supports(method, intent) {
+                provider.dyn_observe_receipt(context, challenge, receipt);
+                return;
+            }
+        }
+    }
+
+    fn record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+        self.providers
+            .iter()
+            .find(|provider| provider.dyn_supports(method, intent))
+            .and_then(|provider| provider.dyn_record_receipt(context, challenge, receipt))
+    }
+
+    fn stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.dyn_stream_event(client, url, name, data))
+    }
+
+    fn funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        self.providers
+            .iter()
+            .find_map(|provider| provider.dyn_funding_currency(challenge))
+    }
+
     fn accept_payment_header(&self) -> Option<String> {
         let mut entries: Vec<Entry> = Vec::new();
         for provider in &self.providers {
@@ -534,8 +781,14 @@ impl PaymentProvider for MultiProvider {
 }
 
 /// Object-safe version of PaymentProvider for use in MultiProvider.
+type PrepaidFuture<'a> = std::pin::Pin<
+    Box<dyn Future<Output = Option<(PaymentChallenge, PaymentCredential)>> + Send + 'a>,
+>;
+
 trait DynPaymentProvider: Send + Sync {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool;
+    fn dyn_trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str>;
+    fn dyn_set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String);
     fn dyn_select_challenge<'a>(
         &self,
         challenges: &[&'a PaymentChallenge],
@@ -548,6 +801,12 @@ trait DynPaymentProvider: Send + Sync {
         &'a self,
         challenge: &'a PaymentChallenge,
         context: PaymentContext,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
+    fn dyn_pay_with_management<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+        management: &'a dyn ManagementTransport,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>;
     fn dyn_prepare_http_payment_challenge<'a>(
         &'a self,
@@ -577,6 +836,27 @@ trait DynPaymentProvider: Send + Sync {
         credential: &'a PaymentCredential,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send + 'a>>;
     fn dyn_abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential);
+    fn dyn_prepaid_credential<'a>(&'a self, context: PaymentContext) -> PrepaidFuture<'a>;
+    fn dyn_observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    );
+    fn dyn_record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128>;
+    fn dyn_stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture>;
+    fn dyn_funding_currency(&self, challenge: &PaymentChallenge) -> Option<String>;
     fn dyn_accept_payment_header(&self) -> Option<String>;
     fn clone_box(&self) -> Box<dyn DynPaymentProvider>;
 }
@@ -584,6 +864,14 @@ trait DynPaymentProvider: Send + Sync {
 impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     fn dyn_supports(&self, method: &str, intent: &str) -> bool {
         PaymentProvider::supports(self, method, intent)
+    }
+
+    fn dyn_trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+        PaymentProvider::trusted_tempo_proof_realm(self, url)
+    }
+
+    fn dyn_set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+        PaymentProvider::set_trusted_tempo_proof_realm(self, origin, realm);
     }
 
     fn dyn_select_challenge<'a>(
@@ -608,6 +896,18 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
     {
         Box::pin(PaymentProvider::pay_with_context(self, challenge, context))
+    }
+
+    fn dyn_pay_with_management<'a>(
+        &'a self,
+        challenge: &'a PaymentChallenge,
+        context: PaymentContext,
+        management: &'a dyn ManagementTransport,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<PaymentCredential, MppError>> + Send + 'a>>
+    {
+        Box::pin(PaymentProvider::pay_with_management(
+            self, challenge, context, management,
+        ))
     }
 
     fn dyn_prepare_http_payment_challenge<'a>(
@@ -665,6 +965,42 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         PaymentProvider::abandon_payment(self, challenge, credential);
     }
 
+    fn dyn_prepaid_credential<'a>(&'a self, context: PaymentContext) -> PrepaidFuture<'a> {
+        Box::pin(PaymentProvider::prepaid_credential(self, context))
+    }
+
+    fn dyn_observe_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) {
+        PaymentProvider::observe_receipt(self, context, challenge, receipt);
+    }
+
+    fn dyn_record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        PaymentProvider::record_receipt(self, context, challenge, receipt)
+    }
+
+    fn dyn_stream_event(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        name: &str,
+        data: &str,
+    ) -> Option<PaymentEventFuture> {
+        PaymentProvider::stream_event(self, client, url, name, data)
+    }
+
+    fn dyn_funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
+        PaymentProvider::funding_currency(self, challenge)
+    }
+
     fn dyn_accept_payment_header(&self) -> Option<String> {
         PaymentProvider::accept_payment_header(self)
     }
@@ -683,6 +1019,67 @@ impl Clone for Box<dyn DynPaymentProvider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct PinnedProvider(Option<(reqwest::Url, String)>);
+
+    impl PaymentProvider for PinnedProvider {
+        fn supports(&self, _: &str, _: &str) -> bool {
+            true
+        }
+
+        fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+            self.0
+                .as_ref()
+                .filter(|(origin, _)| origin.origin() == url.origin())
+                .map(|(_, realm)| realm.as_str())
+        }
+
+        fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
+            self.0 = Some((origin, realm));
+        }
+
+        async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            Err(MppError::InvalidConfig("unused".into()))
+        }
+    }
+
+    #[test]
+    fn multi_provider_forwards_and_propagates_proof_pins() {
+        let origin = reqwest::Url::parse("https://api.example").unwrap();
+        let request = reqwest::Url::parse("https://api.example/pay").unwrap();
+        let other = reqwest::Url::parse("https://other.example/pay").unwrap();
+        let child = PinnedProvider(Some((origin.clone(), "child".into())));
+        let multi = MultiProvider::new().with(child);
+        assert_eq!(multi.trusted_tempo_proof_realm(&request), Some("child"));
+        assert_eq!(multi.trusted_tempo_proof_realm(&other), None);
+
+        let pinned = multi.with_trusted_tempo_proof_realm(origin.clone(), "outer");
+        assert_eq!(pinned.trusted_tempo_proof_realm(&request), Some("outer"));
+        assert_eq!(
+            pinned.providers[0].dyn_trusted_tempo_proof_realm(&request),
+            Some("outer")
+        );
+
+        let before_child = MultiProvider::new()
+            .with_trusted_tempo_proof_realm(origin, "outer")
+            .with(PinnedProvider::default());
+        assert_eq!(
+            before_child.providers[0].dyn_trusted_tempo_proof_realm(&request),
+            Some("outer")
+        );
+
+        let updated = before_child.with_trusted_tempo_proof_realm(
+            reqwest::Url::parse("https://api.example/another-path").unwrap(),
+            "updated",
+        );
+        assert_eq!(updated.trusted_tempo_proof_realm(&request), Some("updated"));
+        assert_eq!(updated.trusted_tempo_proof_realms.len(), 1);
+        assert_eq!(
+            updated.providers[0].dyn_trusted_tempo_proof_realm(&request),
+            Some("updated")
+        );
+    }
 
     #[derive(Clone)]
     struct MockProvider {
@@ -786,6 +1183,57 @@ mod tests {
         assert!(multi.has_support("stripe", "charge"));
         assert!(!multi.has_support("bitcoin", "charge"));
         assert!(!multi.has_support("tempo", "authorize"));
+    }
+
+    #[derive(Clone)]
+    struct RejectingProvider;
+
+    impl PaymentProvider for RejectingProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && intent == "charge"
+        }
+
+        fn select_challenge<'a>(
+            &self,
+            _challenges: &[&'a PaymentChallenge],
+        ) -> Option<&'a PaymentChallenge> {
+            None
+        }
+
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            Err(MppError::UnsupportedPaymentMethod(
+                challenge.method.to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn test_multi_provider_select_falls_through_rejecting_provider() {
+        use crate::protocol::core::Base64UrlJson;
+
+        let challenge = |id: &str, method: &str| {
+            PaymentChallenge::new(
+                id,
+                "api.example.com",
+                method,
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({"amount": "1"})).unwrap(),
+            )
+        };
+        let tempo = challenge("tempo", "tempo");
+        let stripe = challenge("stripe", "stripe");
+        let multi = MultiProvider::new()
+            .with(RejectingProvider)
+            .with(MockProvider {
+                method: "stripe",
+                intent: "charge",
+            });
+
+        assert_eq!(
+            multi.select_challenge(&[&tempo, &stripe]).map(|c| &c.id),
+            Some(&stripe.id)
+        );
+        assert!(multi.select_challenge(&[&tempo]).is_none());
     }
 
     #[test]

@@ -201,7 +201,7 @@ mod integration {
             let provider = MockProvider::new();
             let error = client
                 .get(origin)
-                .send_with_payment(&provider)
+                .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
                 .await
                 .unwrap_err();
             assert!(matches!(error, HttpError::UnsafeCredentialHeader));
@@ -243,7 +243,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -317,7 +317,7 @@ mod integration {
         let provider = MockProvider::new();
         let resp = reqwest::Client::new()
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -396,6 +396,45 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn relayed_zero_amount_proof_is_rejected_before_payment() {
+        let challenge = PaymentChallenge::new(
+            "proof-id",
+            "target.example",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "0",
+                "currency": "0x3333333333333333333333333333333333333333"
+            }))
+            .unwrap(),
+        );
+        let header = format_www_authenticate(&challenge).unwrap();
+        let app = Router::new().route(
+            "/paid",
+            get(move || {
+                let header = header.clone();
+                async move {
+                    (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTH_NAME, header)],
+                        "pay up",
+                    )
+                }
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let provider = MockProvider::new();
+        let err = reqwest::Client::new()
+            .get(format!("{base_url}/paid"))
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HttpError::CrossRealmProof));
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[tokio::test]
     async fn paid_retry_targets_final_same_origin_url() {
         let (_, www_auth) = test_challenge();
         let app = Router::new()
@@ -436,7 +475,7 @@ mod integration {
 
         let resp = reqwest::Client::new()
             .get(format!("{base_url}/start"))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -476,7 +515,7 @@ mod integration {
         let task = tokio::spawn(async move {
             reqwest::Client::new()
                 .get(format!("{url}/paid"))
-                .send_with_payment(&task_provider)
+                .send_with_payment_policy(&task_provider, &AcceptPaymentPolicy::Always)
                 .await
         });
 
@@ -529,7 +568,7 @@ mod integration {
         let resp = client
             .get(format!("{}/paid", base_url))
             .bearer_auth("upstream-token")
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -809,6 +848,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
+            .header("Accept-Payment", "tempo/charge")
             .send_with_payment_max_retries(&provider, 1)
             .await
             .unwrap();
@@ -854,7 +894,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -970,7 +1010,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/free", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1002,7 +1042,7 @@ mod integration {
 
         let err = client
             .get(format!("{}/no-header", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap_err();
 
@@ -1039,6 +1079,7 @@ mod integration {
         let provider = MockProvider::new();
         let response = reqwest::Client::new()
             .get(format!("{base_url}/paid"))
+            .header("Accept-Payment", "tempo/charge")
             .send_with_payment_max_retries(&provider, 1)
             .await
             .unwrap();
@@ -1126,7 +1167,7 @@ mod integration {
         let base_url = spawn_server(app).await;
         let response = reqwest::Client::new()
             .get(format!("{base_url}/paid"))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1156,7 +1197,7 @@ mod integration {
 
         let err = client
             .get(format!("{}/bad-header", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap_err();
 
@@ -1195,7 +1236,7 @@ mod integration {
         let err = client
             .get(format!("{}/paid", base_url))
             .header("cookie", "session=user-secret")
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap_err();
 
@@ -1226,7 +1267,7 @@ mod integration {
 
         let err = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap_err();
 
@@ -1266,7 +1307,7 @@ mod integration {
         let provider = MockProvider::new();
         let response = reqwest::Client::new()
             .get(format!("{base_url}/paid"))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1274,7 +1315,8 @@ mod integration {
         assert_eq!(requests.load(Ordering::SeqCst), 4);
         assert_eq!(provider.call_count(), 2);
         assert_eq!(provider.rollback_count(), 1);
-        assert_eq!(provider.commit_count(), 1);
+        assert_eq!(provider.commit_count(), 0);
+        assert_eq!(provider.abandon_count(), 1);
     }
 
     #[tokio::test]
@@ -1431,7 +1473,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1472,7 +1514,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1521,7 +1563,7 @@ mod integration {
         let resp = client
             .get(format!("{}/paid", base_url))
             .header("Accept-Payment", "tempo/charge, stripe/charge;q=0.5")
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1573,7 +1615,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1608,7 +1650,7 @@ mod integration {
 
         let err = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap_err();
 
@@ -1646,7 +1688,7 @@ mod integration {
 
         let resp = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 
@@ -1678,7 +1720,7 @@ mod integration {
 
         let err = client
             .get(format!("{}/paid", base_url))
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap_err();
 
@@ -1725,14 +1767,14 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_send_with_payment_default_injects() {
+    async fn test_send_with_payment_default_requires_explicit_preference() {
         let (base_url, captured) = spawn_header_capture().await;
         reqwest::Client::new()
             .get(format!("{}/probe", base_url))
             .send_with_payment(&AdvertisingProvider)
             .await
             .unwrap();
-        assert_eq!(captured.lock().unwrap().as_deref(), Some("tempo/charge"));
+        assert_eq!(captured.lock().unwrap().as_deref(), None);
     }
 
     #[tokio::test]
@@ -1798,7 +1840,7 @@ mod integration {
         reqwest::Client::new()
             .get(format!("{}/paid", base_url))
             .header("Accept-Payment", "stripe/charge, tempo/charge;q=0.1")
-            .send_with_payment(&provider)
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
         let used = picked.lock().unwrap().clone().unwrap_or_default();
@@ -1847,7 +1889,7 @@ mod integration {
 
         let resp = reqwest::Client::new()
             .get(format!("{base_url}/paid"))
-            .send_with_payment(&multi)
+            .send_with_payment_policy(&multi, &AcceptPaymentPolicy::Always)
             .await
             .unwrap();
 

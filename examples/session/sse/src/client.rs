@@ -104,7 +104,12 @@ async fn main() {
 
     // Step 1: send_with_payment handles the 402 → open channel flow.
     // The server returns a management JSON response (not SSE) for the channel open.
-    let open_resp = match client.get(&url).send_with_payment(&provider).await {
+    let open_resp = match client
+        .get(&url)
+        .header("Accept-Payment", "tempo/session")
+        .send_with_payment(&provider)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -133,7 +138,12 @@ async fn main() {
     let _ = open_resp.text().await;
 
     // Step 2: Send a second request with a voucher to start the actual SSE stream.
-    let response = match client.get(&url).send_with_payment(&provider).await {
+    let response = match client
+        .get(&url)
+        .header("Accept-Payment", "tempo/session")
+        .send_with_payment(&provider)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error starting stream: {}", e);

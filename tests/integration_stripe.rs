@@ -383,6 +383,7 @@ async fn test_e2e_stripe_charge() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("stripe payment failed");
@@ -559,6 +560,7 @@ async fn test_stripe_requires_action_rejected() {
     // The middleware retries once and then returns the 402.
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -687,6 +689,7 @@ async fn test_e2e_stripe_charge_with_description() {
 
     let resp = Client::new()
         .get(format!("{url}/paid-premium"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("payment failed");
@@ -785,6 +788,7 @@ async fn test_stripe_error_body_parsing() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -824,6 +828,7 @@ async fn test_stripe_rejects_replayed_credential() {
 
     let resp = Client::new()
         .get(format!("{url}/paid"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await;
 
@@ -886,6 +891,7 @@ async fn test_stripe_charge_via_mpp_charge_extractor() {
 
     let resp = Client::new()
         .get(format!("{url}/paid-extractor"))
+        .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
         .expect("payment failed");
@@ -1002,9 +1008,16 @@ async fn test_stripe_external_id_binding() {
                 let err = result.expect_err(&case);
                 assert_eq!(
                     err.code,
-                    Some(mpp::protocol::traits::ErrorCode::CredentialMismatch),
+                    Some(mpp::protocol::traits::ErrorCode::InvalidChallenge),
                     "{case}"
                 );
+                // Same problem as mppx's InvalidChallengeError.
+                let problem = err.to_problem_details(Some(&credential.challenge.id));
+                assert_eq!(
+                    problem.problem_type, "https://paymentauth.org/problems/invalid-challenge",
+                    "{case}"
+                );
+                assert_eq!(problem.status, 402, "{case}");
                 assert!(
                     captured.lock().unwrap().is_empty(),
                     "{case}: no PaymentIntent may be created"
@@ -1012,6 +1025,45 @@ async fn test_stripe_external_id_binding() {
             }
         }
     }
+
+    stripe_handle.abort();
+}
+
+/// The conformance `replayed_payment_intent_rejected` scenario: a replayed
+/// PaymentIntent cannot satisfy a request-bound externalId, and fails as
+/// verification-failed, as in mppx.
+#[tokio::test]
+async fn test_stripe_external_id_binding_rejects_replayed_payment_intent() {
+    let (stripe_url, stripe_handle) = start_mock_stripe_replayed().await;
+    let mpp = create_mock_mpp(&stripe_url);
+
+    let challenge = mpp
+        .stripe_charge_with_options(
+            "0.25",
+            StripeChargeOptions {
+                external_id: Some("server-order-123"),
+                ..Default::default()
+            },
+        )
+        .expect("challenge creation");
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        StripeCredentialPayload {
+            spt: "spt_conformance_123".to_string(),
+            external_id: Some("server-order-123".to_string()),
+        },
+    );
+
+    let err = mpp
+        .broadcast_credential(&credential)
+        .await
+        .expect_err("a replayed PaymentIntent must be rejected");
+    let problem = err.to_problem_details(Some(&credential.challenge.id));
+    assert_eq!(
+        problem.problem_type,
+        "https://paymentauth.org/problems/verification-failed"
+    );
+    assert_eq!(problem.status, 402);
 
     stripe_handle.abort();
 }
@@ -1065,7 +1117,7 @@ async fn test_stripe_charges_the_request_passed_to_verify() {
         .expect_err("the credential does not echo the request's externalId");
     assert_eq!(
         err.code,
-        Some(mpp::protocol::traits::ErrorCode::CredentialMismatch)
+        Some(mpp::protocol::traits::ErrorCode::InvalidChallenge)
     );
     assert!(captured.lock().unwrap().is_empty());
 

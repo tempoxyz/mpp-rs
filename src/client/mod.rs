@@ -14,7 +14,8 @@
 //! use mpp::client::{Fetch, TempoProvider};
 //!
 //! let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
-//! let resp = client.get(url).send_with_payment(&provider).await?;
+//! let resp = client.get(url).header("Accept-Payment", "tempo/charge")
+//!     .send_with_payment(&provider).await?;
 //! ```
 
 #[cfg(feature = "client")]
@@ -33,15 +34,27 @@ pub mod ws;
 pub mod tempo;
 
 #[cfg(feature = "client")]
+mod charge_client;
+#[cfg(feature = "client")]
+pub mod directory;
+#[cfg(feature = "client")]
 mod fetch;
 #[cfg(feature = "client")]
 mod flow;
+#[cfg(feature = "forward-proxy")]
+mod forward_proxy;
 
 #[cfg(feature = "middleware")]
 mod middleware;
 
 pub use error::HttpError;
-pub use provider::{MultiProvider, PaymentContext, PaymentProvider, PendingPayment};
+pub use flow::{
+    is_cross_realm_proof, is_cross_realm_proof_with_trust, send_with_exchange, Exchange, FlowError,
+};
+pub use provider::{
+    ManagementFuture, ManagementTransport, MultiProvider, PaymentContext, PaymentEventFuture,
+    PaymentProvider, PendingPayment,
+};
 
 /// Default number of payment challenge retries after the initial 402 response.
 #[cfg(any(feature = "client", feature = "middleware"))]
@@ -53,11 +66,18 @@ pub use accept_payment_policy::AcceptPaymentPolicy;
 #[cfg(feature = "client")]
 pub use events::{
     ChallengeReceivedContext, ClientEvent, ClientEventKind, ClientEventSubscription, ClientEvents,
-    CredentialCreatedContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
+    CredentialCreatedContext, DepositContext, PaymentFailedContext, PaymentFailureReason,
+    PaymentResponseContext, PaymentUpdateContext,
 };
 
 #[cfg(feature = "client")]
 pub use fetch::PaymentExt as Fetch;
+
+#[cfg(feature = "forward-proxy")]
+pub use forward_proxy::ForwardProxy;
+
+#[cfg(feature = "client")]
+pub use charge_client::ChargeClient;
 
 #[cfg(feature = "middleware")]
 pub use middleware::PaymentMiddleware;

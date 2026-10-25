@@ -41,8 +41,8 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 ///     .with(PaymentMiddleware::new(provider))
 ///     .build();
 ///
-/// // All requests through this client automatically handle 402
-/// let resp = client.get("https://api.example.com/paid").send().await?;
+/// // Explicitly authorize payment for this request
+/// let resp = client.get("https://api.example.com/paid").header("Accept-Payment", "tempo/charge").send().await?;
 /// ```
 pub struct PaymentMiddleware<P> {
     provider: P,
@@ -54,7 +54,7 @@ pub struct PaymentMiddleware<P> {
 
 impl<P> PaymentMiddleware<P> {
     /// Create middleware with the given provider. Defaults to
-    /// [`AcceptPaymentPolicy::Always`].
+    /// [`AcceptPaymentPolicy::Explicit`].
     pub fn new(provider: P) -> Self {
         Self {
             provider,
@@ -83,8 +83,8 @@ impl<P> PaymentMiddleware<P> {
         self
     }
 
-    /// Restrict where the `Accept-Payment` header is sent. The 402-retry
-    /// path is unaffected.
+    /// Explicitly permit provider preferences for matching URLs, or require
+    /// request-level preferences. `Disabled` prevents payment regardless of headers.
     pub fn with_accept_payment_policy(mut self, policy: AcceptPaymentPolicy) -> Self {
         self.accept_payment_policy = policy;
         self

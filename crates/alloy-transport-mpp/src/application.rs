@@ -202,6 +202,18 @@ where
             .payment_provider
             .prepare_application_websocket_challenge(&challenge, payment_context.clone())
             .await?;
+        if mpp::client::is_cross_realm_proof_with_trust(
+            &challenge,
+            &payment_context.url,
+            &payment_context.headers,
+            self.payment_provider
+                .trusted_tempo_proof_realm(&payment_context.url),
+        ) {
+            return Err(mpp::MppError::InvalidConfig(
+                "refusing to sign Tempo proof for a different HTTP realm".into(),
+            )
+            .into());
+        }
         let _ = self
             .events_tx
             .send(MppApplicationEvent::Challenge(challenge.clone()));
