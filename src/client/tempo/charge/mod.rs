@@ -98,6 +98,51 @@ fn encode_transfer(
     }
 }
 
+/// Resolve the token that pays an unsponsored charge's gas.
+///
+/// An explicit fee token wins; otherwise the charge currency pays its own gas.
+/// MACH is recipient-restricted and cannot pay fees, so a charge the payer
+/// funds with the chain's canonical machine token (`machine_token`: a MACH
+/// charge or a MACH swapper route) pays gas in the first supported stablecoin
+/// (pathUSD, then the network's default currency) the payer holds, falling
+/// back to pathUSD. A sponsored charge's fee token is chosen by the fee payer,
+/// so it is left as the currency.
+async fn resolve_fee_token(
+    explicit: Option<Address>,
+    currency: Address,
+    machine_token: bool,
+    fee_payer: bool,
+    chain_id: u64,
+    provider: &impl Provider<tempo_alloy::TempoNetwork>,
+    from: Address,
+) -> Address {
+    if let Some(token) = explicit {
+        return token;
+    }
+    if fee_payer || !machine_token {
+        return currency;
+    }
+    let mut candidates: Vec<Address> = Vec::with_capacity(2);
+    let defaults = [
+        Some(crate::protocol::methods::tempo::PATH_USD),
+        TempoChain::from_chain_id(chain_id).map(TempoChain::default_currency),
+    ];
+    for token in defaults.into_iter().flatten() {
+        if let Ok(token) = token.parse::<Address>() {
+            if !candidates.contains(&token) {
+                candidates.push(token);
+            }
+        }
+    }
+    for token in &candidates {
+        let balance = ITIP20::new(*token, provider).balanceOf(from).call().await;
+        if balance.is_ok_and(|balance| !balance.is_zero()) {
+            return *token;
+        }
+    }
+    candidates.first().copied().unwrap_or(currency)
+}
+
 /// Reject a charge the server will not accept as a signed transaction.
 ///
 /// This client always answers non-zero charges in `pull` mode
@@ -178,6 +223,22 @@ pub struct TempoCharge {
 }
 
 impl TempoCharge {
+    /// Whether the payer spends the chain's canonical machine token (MACH),
+    /// either as the charge currency or through the machine-token swapper
+    /// route, whose first call approves MACH.
+    fn pays_in_machine_token(&self) -> bool {
+        let Some(mach) = crate::protocol::methods::tempo::machine_token::token(self.chain_id)
+        else {
+            return false;
+        };
+        self.currency == mach
+            || self
+                .calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .is_some_and(|call| call.to == TxKind::Call(mach))
+    }
+
     /// Parse and validate a [`PaymentChallenge`] into a [`TempoCharge`].
     ///
     /// Validates that the challenge is a Tempo charge, decodes the
@@ -461,11 +522,21 @@ impl TempoCharge {
             });
         }
 
+        let machine_token = self.pays_in_machine_token();
         let calls = match self.calls {
             Some(calls) => calls,
             None => self.build_transfer_calls()?,
         };
-        let fee_token = options.fee_token.unwrap_or(self.currency);
+        let fee_token = resolve_fee_token(
+            options.fee_token,
+            self.currency,
+            machine_token,
+            self.fee_payer,
+            self.chain_id,
+            provider,
+            from,
+        )
+        .await;
         let max_fee_per_gas = options
             .max_fee_per_gas
             .unwrap_or(crate::client::tempo::MAX_FEE_PER_GAS);
@@ -591,12 +662,22 @@ impl TempoCharge {
             .cloned()
             .or(managed_key_authorization);
 
+        let machine_token = self.pays_in_machine_token();
         let calls = match self.calls {
             Some(c) => c,
             None => self.build_transfer_calls()?,
         };
 
-        let fee_token = options.fee_token.unwrap_or(self.currency);
+        let fee_token = resolve_fee_token(
+            options.fee_token,
+            self.currency,
+            machine_token,
+            self.fee_payer,
+            self.chain_id,
+            provider,
+            from,
+        )
+        .await;
 
         // All charge payments use expiring nonces (nonceKey=MAX, nonce=0,
         // validBefore=min(now+25s, challenge expires)) so we never need a
@@ -860,6 +941,134 @@ mod tests {
         });
         let request = Base64UrlJson::from_value(&request_json).unwrap();
         PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request)
+    }
+
+    fn mocked_provider(
+        asserter: alloy::providers::mock::Asserter,
+    ) -> impl Provider<tempo_alloy::TempoNetwork> {
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter)
+    }
+
+    fn balance(amount: u64) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(&U256::from(
+            amount,
+        )))
+    }
+
+    #[tokio::test]
+    async fn test_mach_charge_pays_gas_in_funded_stablecoin() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&balance(0));
+        asserter.push_success(&balance(5));
+        let provider = mocked_provider(asserter);
+        let usdc: Address = crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET
+            .parse()
+            .unwrap();
+
+        let token = resolve_fee_token(
+            None,
+            MACH,
+            true,
+            false,
+            CHAIN_ID,
+            &provider,
+            Address::repeat_byte(1),
+        )
+        .await;
+
+        assert_eq!(token, usdc);
+    }
+
+    #[tokio::test]
+    async fn test_mach_charge_falls_back_to_path_usd_gas() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&balance(0));
+        asserter.push_success(&balance(0));
+        let provider = mocked_provider(asserter);
+        let path_usd: Address = crate::protocol::methods::tempo::PATH_USD.parse().unwrap();
+
+        let token = resolve_fee_token(
+            None,
+            MACH,
+            true,
+            false,
+            CHAIN_ID,
+            &provider,
+            Address::repeat_byte(1),
+        )
+        .await;
+
+        assert_eq!(token, path_usd);
+    }
+
+    #[test]
+    fn test_pays_in_machine_token_on_canonical_deployments_only() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        let charge = |currency: Address, chain_id: u64| {
+            let request = Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000000",
+                "currency": currency.to_string(),
+                "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                "methodDetails": { "chainId": chain_id }
+            }))
+            .unwrap();
+            TempoCharge::from_challenge(&PaymentChallenge::new(
+                "id",
+                "api.example.com",
+                "tempo",
+                "charge",
+                request,
+            ))
+            .unwrap()
+        };
+        let usdc: Address = crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET
+            .parse()
+            .unwrap();
+        let approve_mach = Call {
+            to: TxKind::Call(MACH),
+            value: U256::ZERO,
+            input: Default::default(),
+        };
+
+        assert!(charge(MACH, CHAIN_ID).pays_in_machine_token());
+        // The same address on a chain without a canonical deployment is not MACH.
+        assert!(!charge(MACH, 1337).pays_in_machine_token());
+        assert!(!charge(usdc, CHAIN_ID).pays_in_machine_token());
+        // A MACH swapper route funds a USDC.e charge with MACH.
+        assert!(charge(usdc, CHAIN_ID)
+            .with_calls(vec![approve_mach.clone()])
+            .pays_in_machine_token());
+        assert!(!charge(usdc, 1337)
+            .with_calls(vec![approve_mach])
+            .pays_in_machine_token());
+    }
+
+    #[tokio::test]
+    async fn test_fee_token_skips_lookup_unless_unsponsored_mach() {
+        use crate::protocol::methods::tempo::machine_token::MACH;
+        // No mocked responses: any RPC call would fail the lookup.
+        let provider = mocked_provider(alloy::providers::mock::Asserter::new());
+        let usdc: Address = crate::protocol::methods::tempo::DEFAULT_CURRENCY_MAINNET
+            .parse()
+            .unwrap();
+        let from = Address::repeat_byte(1);
+        let explicit = Address::repeat_byte(0x33);
+
+        assert_eq!(
+            resolve_fee_token(None, usdc, false, false, CHAIN_ID, &provider, from).await,
+            usdc
+        );
+        assert_eq!(
+            resolve_fee_token(Some(explicit), MACH, true, false, CHAIN_ID, &provider, from).await,
+            explicit
+        );
+        assert_eq!(
+            resolve_fee_token(None, MACH, true, true, CHAIN_ID, &provider, from).await,
+            MACH
+        );
     }
 
     #[test]

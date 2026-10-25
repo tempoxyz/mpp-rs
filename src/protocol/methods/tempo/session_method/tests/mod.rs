@@ -8,6 +8,7 @@ mod close;
 mod open;
 mod state;
 mod store;
+mod stream;
 mod top_up;
 mod voucher;
 

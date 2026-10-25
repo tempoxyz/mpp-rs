@@ -25,6 +25,7 @@ mod binding;
 mod charge;
 #[cfg(feature = "tempo")]
 mod currencies;
+mod expected_request;
 mod lifecycle;
 mod session;
 #[cfg(feature = "stripe")]

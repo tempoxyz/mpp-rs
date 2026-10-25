@@ -14,8 +14,8 @@ use reqwest_middleware::ClientBuilder;
 use tokio::net::TcpListener;
 
 use crate::client::{
-    AcceptPaymentPolicy, ClientEvents, Fetch, HttpError, PaymentContext, PaymentMiddleware,
-    PaymentProvider,
+    AcceptPaymentPolicy, ClientEvents, Fetch, HttpError, PaymentContext, PaymentFailureReason,
+    PaymentMiddleware, PaymentProvider,
 };
 use crate::error::MppError;
 use crate::protocol::core::{
@@ -114,6 +114,8 @@ struct TestProvider {
     committed: Arc<AtomicU32>,
     rolled_back: Arc<AtomicU32>,
     invalidated: Arc<AtomicU32>,
+    /// Send a session voucher before the server asks for payment.
+    prepaid: bool,
 }
 
 impl TestProvider {
@@ -193,6 +195,23 @@ impl PaymentProvider for TestProvider {
     ) -> Result<(), MppError> {
         self.invalidated.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn prepaid_credential(
+        &self,
+        _context: PaymentContext,
+    ) -> Option<(PaymentChallenge, PaymentCredential)> {
+        if !self.prepaid {
+            return None;
+        }
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+        let challenge =
+            PaymentChallenge::new("prepaid-1", "flow.example.com", "tempo", "session", request);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
+        );
+        Some((challenge, credential))
     }
 
     fn accept_payment_header(&self) -> Option<String> {
@@ -686,5 +705,127 @@ async fn session_commit_requires_a_matching_receipt() {
                 "{via:?}: {variant}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn paid_server_error_reports_unknown_outcome() {
+    let app = Router::new().route(
+        "/paid/{status}",
+        get(
+            |axum::extract::Path(status): axum::extract::Path<u16>,
+             request: Request<Body>| async move {
+                if is_paid(&request) {
+                    (StatusCode::from_u16(status).unwrap(), "answer").into_response()
+                } else {
+                    payment_required("charge-1", "charge")
+                }
+            },
+        ),
+    );
+    let url = spawn_server(app).await;
+
+    for via in BOTH {
+        for status in [500u16, 503, 400, 200] {
+            let provider = TestProvider::default();
+            let events = ClientEvents::default();
+            let failed = Arc::new(Mutex::new(Vec::new()));
+            let _subscription = events.on_payment_failed({
+                let failed = failed.clone();
+                move |ctx| {
+                    failed.lock().unwrap().push(ctx);
+                    async {}
+                }
+            });
+            let request = reqwest::Client::new().get(format!("{url}/paid/{status}"));
+            let response = via
+                .send(request, &provider, events)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?} {status}: {err}"));
+
+            assert_eq!(response.status().as_u16(), status, "{via:?}");
+            assert_eq!(response.text().await.unwrap(), "answer", "{via:?}");
+            assert_eq!(provider.paid(), ["charge-1"], "{via:?} {status}");
+            // An unknown outcome keeps optimistic state, like a lost response.
+            assert_eq!(
+                provider.rolled_back.load(Ordering::SeqCst),
+                u32::from(status == 400),
+                "{via:?} {status}"
+            );
+            let failed = failed.lock().unwrap().clone();
+            if status < 500 {
+                assert!(failed.is_empty(), "{via:?} {status}: {failed:?}");
+                continue;
+            }
+            assert_eq!(failed.len(), 1, "{via:?} {status}");
+            assert_eq!(failed[0].challenge.as_ref().unwrap().id, "charge-1");
+            let Some(PaymentFailureReason::OutcomeUnknown {
+                status: reported,
+                credential,
+                transaction_hash,
+            }) = &failed[0].reason
+            else {
+                panic!("{via:?} {status}: {:?}", failed[0].reason);
+            };
+            assert_eq!(*reported, Some(status), "{via:?}");
+            assert!(credential.starts_with("Payment "), "{via:?}: {credential}");
+            assert_eq!(transaction_hash.as_deref(), Some("0xproof"), "{via:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn prepaid_server_error_reports_unknown_outcome() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                (StatusCode::SERVICE_UNAVAILABLE, "answer").into_response()
+            } else {
+                payment_required("charge-1", "charge")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+
+    for via in BOTH {
+        let provider = TestProvider {
+            prepaid: true,
+            ..TestProvider::default()
+        };
+        let events = ClientEvents::default();
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = events.on_payment_failed({
+            let failed = failed.clone();
+            move |ctx| {
+                failed.lock().unwrap().push(ctx);
+                async {}
+            }
+        });
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via
+            .send(request, &provider, events)
+            .await
+            .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{via:?}"
+        );
+        assert!(provider.paid().is_empty(), "{via:?}");
+        let failed = failed.lock().unwrap().clone();
+        assert_eq!(failed.len(), 1, "{via:?}");
+        assert_eq!(failed[0].challenge.as_ref().unwrap().id, "prepaid-1");
+        let Some(PaymentFailureReason::OutcomeUnknown {
+            status,
+            transaction_hash,
+            ..
+        }) = &failed[0].reason
+        else {
+            panic!("{via:?}: {:?}", failed[0].reason);
+        };
+        assert_eq!(*status, Some(503), "{via:?}");
+        assert_eq!(*transaction_hash, None, "{via:?}");
     }
 }

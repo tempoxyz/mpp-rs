@@ -43,6 +43,10 @@ pub struct PaymentSuccessContext {
     pub intent: String,
     /// Whether session verification produced a management response.
     pub management_response: bool,
+    /// Payer identity verified by the method before settlement (for example,
+    /// the Tempo sender address). `None` when the method does not report one.
+    /// See [`ChargeValidation::payer`](crate::protocol::traits::ChargeValidation::payer).
+    pub payer: Option<String>,
 }
 
 /// Server payment event payload.
