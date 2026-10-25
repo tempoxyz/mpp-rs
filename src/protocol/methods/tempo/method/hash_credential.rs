@@ -113,6 +113,16 @@ where
 
         assert_challenge_bound_memo(&matched_logs, &challenge.id, &challenge.realm)?;
 
+        // Only a final receipt is labelled; validation stays receipt-only. The
+        // lookup runs before the hash is claimed, so a slow or cancelled RPC can
+        // never strand a reserved payment without its receipt.
+        let funding_currency = if reserve {
+            self.hash_funding_currency(hash, expected_sender, charge, expected_chain_id)
+                .await
+        } else {
+            None
+        };
+
         if let Some(store) = &self.store {
             if reserve {
                 let claimed = store
@@ -139,19 +149,10 @@ where
         }
 
         let receipt = Receipt::success(METHOD_NAME, format!("{hash:#x}"));
-        // Only a final receipt is labelled; validation stays receipt-only.
-        if !reserve {
-            return Ok(receipt);
-        }
-        Ok(
-            match self
-                .hash_funding_currency(hash, expected_sender, charge, expected_chain_id)
-                .await
-            {
-                Some(token) => receipt.with_funding_currency(token.to_checksum(None)),
-                None => receipt,
-            },
-        )
+        Ok(match funding_currency {
+            Some(token) => receipt.with_funding_currency(token.to_checksum(None)),
+            None => receipt,
+        })
     }
 
     /// The token `sender` spent on the payment route of transaction `hash`,

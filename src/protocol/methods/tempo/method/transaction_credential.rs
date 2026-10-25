@@ -86,14 +86,23 @@ pub(super) fn funding_currency(
     Some(parsed.swap_input_token().unwrap_or(currency))
 }
 
-/// [`funding_currency`] of a charge's signed Tempo transaction.
+/// [`funding_currency`] of a charge's signed Tempo transaction: a 0x76
+/// transaction or a sponsored 0x78 fee-payer envelope.
 pub(super) fn signed_transaction_funding_currency(
     signed_tx: &str,
     charge: &ChargeRequest,
     chain_id: u64,
 ) -> Option<Address> {
+    use super::super::fee_payer_envelope::{FeePayerEnvelope78, TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID};
+
     let tx_bytes = signed_tx.parse::<Bytes>().ok()?;
-    let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..]).ok()?;
+    let signed = if tx_bytes.first() == Some(&TEMPO_FEE_PAYER_ENVELOPE_TYPE_ID) {
+        FeePayerEnvelope78::decode_envelope(&tx_bytes)
+            .ok()?
+            .to_recoverable_signed()
+    } else {
+        tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..]).ok()?
+    };
     funding_currency(
         &signed.tx().calls,
         chain_id,
