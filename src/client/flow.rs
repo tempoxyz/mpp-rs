@@ -187,6 +187,17 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             }
             _ => None,
         };
+        let prepaid = prepaid.filter(|(challenge, credential)| {
+            if self
+                .check_challenge(exchange, challenge, ranking_accept.as_deref())
+                .is_err()
+            {
+                self.provider.abandon_payment(challenge, credential);
+                false
+            } else {
+                true
+            }
+        });
         let mut resp = match (initial_response, prepaid, &payment_context) {
             (Some(response), _, _) => response,
             (None, Some((challenge, credential)), Some(context)) => match self

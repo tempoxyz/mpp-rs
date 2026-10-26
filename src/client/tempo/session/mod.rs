@@ -3604,6 +3604,19 @@ impl PaymentProvider for TempoSessionProvider {
             self.prepaid.lock().unwrap().remove(context.url.as_str());
             return None;
         }
+        // Reject excluded cached offers before signing or advancing durable authorization.
+        if let Some(header) = context.headers.get("accept-payment") {
+            let preferences =
+                crate::protocol::core::accept_payment::parse(header.to_str().ok()?).ok()?;
+            if crate::protocol::core::accept_payment::rank(
+                std::slice::from_ref(&state.challenge),
+                &preferences,
+            )
+            .is_empty()
+            {
+                return None;
+            }
+        }
         let _lock = self.acquire_payment_lock(&state.challenge).await.ok()?;
         let key = self
             .channel_id_to_key
@@ -4263,6 +4276,82 @@ mod tests {
             .unwrap()
             .insert("key".to_string(), entry);
         assert_eq!(cloned.channels().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepaid_preferences_preserve_cumulative_authorization() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        for (preference, allowed) in [
+            (Some("tempo/session;q=0"), false),
+            (Some("tempo/charge"), false),
+            (Some("tempo/charge, tempo/session;q=0"), false),
+            (Some("invalid"), false),
+            (Some(""), false),
+            (Some("tempo/session"), true),
+            (Some("tempo/*"), true),
+            (None, true),
+        ] {
+            let store = Arc::new(MemoryChannelStore::default());
+            let updates = Arc::new(AtomicUsize::new(0));
+            let observed = updates.clone();
+            let provider = make_test_provider()
+                .with_prepaid_requests(2)
+                .with_channel_store(store.clone())
+                .with_on_channel_update(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                });
+            let payee = Address::repeat_byte(0x11);
+            let currency = Address::repeat_byte(0x22);
+            let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+            let entry = provider.channels().into_values().next().unwrap();
+            let stored = TempoSessionProvider::stored_entry(&entry).unwrap();
+            store.set(&stored).await.unwrap();
+            let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+            provider.prepaid.lock().unwrap().insert(
+                url.to_string(),
+                PrepaidVoucher {
+                    challenge,
+                    channel_id: channel_id.to_string(),
+                    spent: 1_000,
+                    price: 1_000,
+                },
+            );
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(preference) = preference {
+                headers.insert("accept-payment", preference.parse().unwrap());
+            }
+            let credential = provider
+                .prepaid_credential(PaymentContext {
+                    url,
+                    headers,
+                    http_client: None,
+                })
+                .await;
+            assert_eq!(credential.is_some(), allowed, "{preference:?}");
+            let expected = if allowed { 3_000 } else { 1_000 };
+            assert_eq!(
+                provider
+                    .channels()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .cumulative_amount,
+                expected
+            );
+            assert_eq!(
+                store
+                    .get(&stored.key())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cumulative_amount,
+                expected
+            );
+            assert_eq!(updates.load(Ordering::SeqCst), usize::from(allowed));
+        }
     }
 
     // --- shared test helpers ---

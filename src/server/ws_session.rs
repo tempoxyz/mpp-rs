@@ -40,6 +40,7 @@ use futures_util::{SinkExt, StreamExt};
 
 use super::metered::{final_receipt, Metered, MeteredEvent};
 use super::ws::{WsMessage, WsResponse};
+use crate::error::PaymentError;
 use crate::protocol::core::parse_authorization;
 use crate::protocol::methods::tempo::session_method::{normalize_channel_id, ChannelStore};
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
@@ -261,7 +262,7 @@ where
             }
             Err(error) => {
                 let msg = WsResponse::Error {
-                    error: error.message.clone(),
+                    error: error.to_problem_details(None).detail,
                 };
                 let _ = sender.send(msg.to_text()).await;
                 return Err(error);
@@ -897,6 +898,74 @@ mod tests {
                 );
             }
             assert_eq!(frames.len(), expected, "unexpected frames: {frames:?}");
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingSession(VerificationError);
+
+    impl SessionMethod for FailingSession {
+        fn method(&self) -> &str {
+            "tempo"
+        }
+        async fn verify_session(
+            &self,
+            _: &PaymentCredential,
+            _: &SessionRequest,
+        ) -> Result<Receipt, VerificationError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn voucher_error_frames_sanitize_internal_diagnostics() {
+        for (error, expected) in [
+            (
+                VerificationError::internal("private backend diagnostic"),
+                "An internal payment error occurred.",
+            ),
+            (
+                VerificationError::with_code("private backend diagnostic", ErrorCode::NetworkError),
+                "An internal payment error occurred.",
+            ),
+            (
+                VerificationError::new("private backend diagnostic").retryable(),
+                "An internal payment error occurred.",
+            ),
+            (
+                VerificationError::invalid_signature("invalid voucher signature"),
+                "Invalid signature: invalid voucher signature.",
+            ),
+        ] {
+            let mpp = crate::server::Mpp::new(MockCharge, "ws.test", "secret")
+                .with_session_method(FailingSession(error.clone()));
+            let challenge = mpp
+                .session_challenge(
+                    "100",
+                    "0x20c0000000000000000000000000000000000000",
+                    "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                )
+                .unwrap();
+            let credential = PaymentCredential::new(
+                challenge.to_echo(),
+                serde_json::json!({
+                    "action": "voucher", "channelId": "0xabc", "cumulativeAmount": "200", "signature": "0xbad"
+                }),
+            );
+            let frame = serde_json::json!({"type": "credential", "credential": format_authorization(&credential).unwrap()}).to_string();
+            let mut receiver = futures_util::stream::iter([Ok(frame.clone()), Ok(frame)]);
+            let (mut sink, frames) = recording_sink();
+            let returned = process_vouchers(&mut receiver, &mut sink, &mpp)
+                .await
+                .unwrap_err();
+            assert_eq!(returned.message, error.message);
+            assert_eq!(returned.code, error.code);
+            assert_eq!(returned.retryable, error.retryable);
+            let frames = frames.lock().unwrap();
+            assert!(
+                matches!(frames.as_slice(), [WsResponse::Error { error }] if error == expected),
+                "{frames:?}"
+            );
         }
     }
 

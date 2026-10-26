@@ -251,6 +251,12 @@ pub trait PaymentProvider: Clone + Send + Sync {
     /// A session provider holding a reusable challenge for the request's URL
     /// may return one with a fresh voucher, which saves the unpaid round trip.
     /// A `402` answer then continues the normal payment flow. Defaults to none.
+    ///
+    /// Before signing or reserving authorization, implementations must check the
+    /// cached challenge against `context.headers`' `Accept-Payment` preference.
+    /// Return `None` for an excluded challenge so unpaid negotiation can proceed.
+    /// The flow checks eligibility again before sending, but cannot undo signing
+    /// or durable state changes made by this hook.
     fn prepaid_credential(
         &self,
         context: PaymentContext,
