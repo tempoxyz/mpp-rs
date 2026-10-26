@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.1 (2026-10-26)
+
+### Patch Changes
+
+- A fee-sponsored charge challenge must now expire at least 15 seconds after issuance, measured exactly rather than rounded to the nearest second, matching the client's check before signing. A challenge with 14.75 seconds left is refused at issuance instead of being issued and then refused by the client. (by @BrendanRyan, [#653](https://github.com/tempoxyz/mpp-rs/pull/653))
+- An MCP payment management call that the server definitively rejects (a JSON-RPC payment error such as -32042 or -32043, as reported by ToolCaller::is_definitive_error) now fails as a rejection rather than as an unknown outcome, so a refused top-up no longer blocks later top-ups on that channel. Other errors, including -32603 internal-payment-error responses that carry challenges, still leave the top-up outcome unknown. (by @BrendanRyan, [#653](https://github.com/tempoxyz/mpp-rs/pull/653))
+- Honor request Accept-Payment preferences before creating prepaid Tempo session vouchers and defensively validate cached challenges before transmission. Custom prepaid providers must check request preferences before signing or reserving authorization.
+- Sanitize internal WebSocket voucher errors using the same typed conversion as HTTP responses, while retaining the original error for server diagnostics. (by @BrendanRyan, [#653](https://github.com/tempoxyz/mpp-rs/pull/653))
+
 ## 0.17.0 (2026-10-25)
 
 ### Minor Changes
