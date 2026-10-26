@@ -28,7 +28,7 @@ jobs:
         with:
           node-version: 22
       - name: Check changelog
-        uses: tempoxyz/changelogs/check@bd50cca508d81505924dfa3997b1696ac2b7b1aa # v0.9.0
+        uses: tempoxyz/changelogs/check@35288d5b399317c9412f9dd4bfaf8cccf2d22215 # v0.11.0
         with:
           # `--prefix` moves npm's project root out of the checkout, so the pull
           # request's `.npmrc` and `node_modules` have no say in what runs with
