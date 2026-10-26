@@ -114,6 +114,7 @@ struct TestProvider {
     committed: Arc<AtomicU32>,
     rolled_back: Arc<AtomicU32>,
     invalidated: Arc<AtomicU32>,
+    abandoned: Arc<AtomicU32>,
     /// Send a session voucher before the server asks for payment.
     prepaid: bool,
 }
@@ -195,6 +196,10 @@ impl PaymentProvider for TestProvider {
     ) -> Result<(), MppError> {
         self.invalidated.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn abandon_payment(&self, _: &PaymentChallenge, _: &PaymentCredential) {
+        self.abandoned.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn prepaid_credential(
@@ -827,5 +832,91 @@ async fn prepaid_server_error_reports_unknown_outcome() {
         };
         assert_eq!(*status, Some(503), "{via:?}");
         assert_eq!(*transaction_hash, None, "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn prepaid_credentials_respect_request_preferences() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("session-1", "session")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        for warm in [false, true] {
+            for (preference, allowed) in [
+                ("tempo/session;q=0", false),
+                ("tempo/charge", false),
+                ("tempo/charge, tempo/session;q=0", false),
+                ("tempo/session", true),
+                ("tempo/*", true),
+            ] {
+                let provider = TestProvider {
+                    prepaid: warm,
+                    ..TestProvider::default()
+                };
+                let response = via
+                    .send(
+                        reqwest::Client::new()
+                            .get(format!("{url}/paid"))
+                            .header("Accept-Payment", preference),
+                        &provider,
+                        ClientEvents::default(),
+                    )
+                    .await;
+                assert_eq!(
+                    response.is_ok(),
+                    allowed,
+                    "{via:?} warm={warm} {preference}: {response:?}"
+                );
+                if let Ok(response) = response {
+                    assert_eq!(response.status(), StatusCode::OK);
+                }
+                if !allowed {
+                    assert!(provider.paid().is_empty());
+                    assert_eq!(provider.abandoned.load(Ordering::SeqCst), u32::from(warm));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn excluded_prepaid_session_falls_back_to_allowed_charge() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("charge-1", "charge")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            prepaid: true,
+            ..TestProvider::default()
+        };
+        let response = via
+            .send(
+                reqwest::Client::new()
+                    .get(format!("{url}/paid"))
+                    .header("Accept-Payment", "tempo/charge, tempo/session;q=0"),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider.paid(), vec!["charge-1"]);
+        assert_eq!(provider.abandoned.load(Ordering::SeqCst), 1);
     }
 }
