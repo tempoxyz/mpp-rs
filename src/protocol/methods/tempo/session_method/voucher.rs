@@ -4,6 +4,7 @@ use alloy::primitives::Address;
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
+use super::chain::OnChainChannel;
 use super::payload::validate_settlement_route;
 use super::precompile;
 use super::receipt::session_receipt;
@@ -138,26 +139,10 @@ where
             ));
         }
 
-        let refreshed = self
-            .store
-            .update_channel(
-                channel_id_str,
-                Box::new(move |current| {
-                    let state = current
-                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    Ok(Some(ChannelState {
-                        finalized: state.finalized || on_chain.finalized,
-                        ..state.refresh_on_chain(&on_chain)
-                    }))
-                }),
-            )
-            .await?
-            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-
         let state = self
             .verify_and_accept_voucher(
                 channel_id_str,
-                &refreshed,
+                Some(on_chain),
                 cumulative_amount,
                 signature_str,
                 min_delta,
@@ -167,21 +152,55 @@ where
         Ok(session_receipt(&credential.challenge.id, &state, None))
     }
 
-    /// Check a voucher against `channel`, the state as last refreshed from
-    /// chain, and record it.
-    ///
-    /// The signature is verified for the channel's own escrow and chain; the
-    /// caller has checked that the challenge names the same ones.
-    ///
-    /// Returns the channel state with the voucher applied.
+    /// Authenticate and accept a voucher in the same atomic transition as any
+    /// on-chain refresh. Rejected vouchers must leave all accounting untouched.
     pub(super) async fn verify_and_accept_voucher(
         &self,
         channel_id_str: &str,
-        channel: &ChannelState,
+        on_chain: Option<OnChainChannel>,
         cumulative_amount: u128,
         signature_str: &str,
         min_delta: u128,
     ) -> Result<ChannelState, VerificationError> {
+        let channel_id = channel_id_str.to_owned();
+        let signature = signature_str.to_owned();
+        self.store
+            .update_channel(
+                channel_id_str,
+                Box::new(move |current| {
+                    let state = current
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    let state = match on_chain {
+                        Some(on_chain) => ChannelState {
+                            finalized: state.finalized || on_chain.finalized,
+                            ..state.refresh_on_chain(&on_chain)
+                        },
+                        None => state,
+                    };
+                    Self::accept_authenticated_voucher(
+                        state,
+                        &channel_id,
+                        cumulative_amount,
+                        &signature,
+                        min_delta,
+                    )
+                    .map(Some)
+                }),
+            )
+            .await?
+            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+    }
+
+    fn accept_authenticated_voucher(
+        channel: ChannelState,
+        channel_id_str: &str,
+        cumulative_amount: u128,
+        signature_str: &str,
+        min_delta: u128,
+    ) -> Result<ChannelState, VerificationError> {
+        if channel.closing {
+            return Err(VerificationError::channel_closed("channel is closing"));
+        }
         if channel.finalized {
             return Err(VerificationError::channel_closed(
                 "channel is finalized on-chain",
@@ -228,37 +247,6 @@ where
             ));
         }
 
-        // A successful voucher must add new funds for the current metered
-        // request.
-        if cumulative_amount <= channel.highest_voucher_amount {
-            return Err(VerificationError::delta_too_small(
-                "voucher does not add new funds",
-            ));
-        }
-
-        let delta = cumulative_amount - channel.highest_voucher_amount;
-        if delta < min_delta {
-            return Err(VerificationError::delta_too_small(format!(
-                "voucher delta {} below minimum {}",
-                delta, min_delta
-            )));
-        }
-
-        // Update store with new highest voucher.
-        let updated = self
-            .store
-            .update_channel(
-                channel_id_str,
-                Box::new(move |current| {
-                    let state = current
-                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    state
-                        .accept_voucher(cumulative_amount, sig_bytes, min_delta)
-                        .map(Some)
-                }),
-            )
-            .await?;
-
-        updated.ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+        channel.accept_voucher(cumulative_amount, sig_bytes, min_delta)
     }
 }

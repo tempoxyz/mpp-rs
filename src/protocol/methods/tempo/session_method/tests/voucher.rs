@@ -25,7 +25,7 @@ async fn test_stale_voucher_with_garbage_signature_rejected() {
     let result = method
         .verify_and_accept_voucher(
             &channel_id,
-            &state,
+            None,
             0,            // cumulative_amount <= highest_voucher_amount
             &garbage_sig, // garbage signature
             0,            // min_delta
@@ -69,7 +69,7 @@ async fn test_stale_voucher_same_amount_different_signature_rejected() {
     let result = method
         .verify_and_accept_voucher(
             &channel_id_hex,
-            &state,
+            None,
             1000,        // same amount as highest
             &forged_sig, // different signature
             0,
@@ -109,7 +109,7 @@ async fn test_exact_replay_of_highest_voucher_rejected() {
 
     // Exact replay: same amount and same signature does not add new funds.
     let result = method
-        .verify_and_accept_voucher(&channel_id_hex, &state, 1000, &sig_hex, 0)
+        .verify_and_accept_voucher(&channel_id_hex, None, 1000, &sig_hex, 0)
         .await;
 
     assert!(result.is_err());
@@ -132,7 +132,7 @@ async fn test_unsigned_voucher_does_not_disclose_accepted_amount() {
     let method = test_session_method(store);
     let garbage_sig = format!("0x{}", "ff".repeat(65));
     let err = method
-        .verify_and_accept_voucher(&channel_id, &state, 123_457, &garbage_sig, 1_000)
+        .verify_and_accept_voucher(&channel_id, None, 123_457, &garbage_sig, 1_000)
         .await
         .unwrap_err();
 
@@ -165,7 +165,7 @@ async fn test_concurrent_voucher_acceptance_has_one_winner() {
     store.insert(&channel_id, state.clone());
 
     let method = test_session_method(store.clone());
-    let verify = || method.verify_and_accept_voucher(&channel_id, &state, 2_000, &signature, 0);
+    let verify = || method.verify_and_accept_voucher(&channel_id, None, 2_000, &signature, 0);
     let (first, second) = tokio::join!(verify(), verify());
 
     assert_eq!(
@@ -211,10 +211,9 @@ async fn test_concurrent_vouchers_recheck_minimum_delta_atomically() {
     store.insert(&channel_id, state.clone());
 
     let method = test_session_method(store.clone());
-    let lower =
-        method.verify_and_accept_voucher(&channel_id, &state, 2_000, &lower_signature, 1_000);
+    let lower = method.verify_and_accept_voucher(&channel_id, None, 2_000, &lower_signature, 1_000);
     let higher =
-        method.verify_and_accept_voucher(&channel_id, &state, 2_500, &higher_signature, 1_000);
+        method.verify_and_accept_voucher(&channel_id, None, 2_500, &higher_signature, 1_000);
     let (lower, higher) = tokio::join!(lower, higher);
 
     assert!(lower.is_ok());
@@ -257,7 +256,7 @@ async fn test_accept_voucher_preserves_concurrent_deposit_update() {
 
     let method = test_session_method(store.clone());
     method
-        .verify_and_accept_voucher(&channel_id_hex, &stale_state, 2_000, &sig_hex, 0)
+        .verify_and_accept_voucher(&channel_id_hex, None, 2_000, &sig_hex, 0)
         .await
         .unwrap();
 
@@ -294,7 +293,7 @@ async fn test_stale_voucher_with_forged_keychain_envelope_rejected() {
     let result = method
         .verify_and_accept_voucher(
             &channel_id,
-            &state,
+            None,
             500, // stale: below highest_voucher_amount of 1000
             &forged_sig,
             0,
@@ -337,10 +336,10 @@ async fn test_voucher_signature_must_be_canonical() {
     let method = test_session_method(store.clone());
     let submit = |signature: Vec<u8>| {
         let signature = alloy::hex::encode_prefixed(signature);
-        let (method, channel_id, state) = (&method, &channel_id, &state);
+        let (method, channel_id) = (&method, &channel_id);
         async move {
             method
-                .verify_and_accept_voucher(channel_id, state, 2_000, &signature, 0)
+                .verify_and_accept_voucher(channel_id, None, 2_000, &signature, 0)
                 .await
         }
     };
@@ -884,4 +883,48 @@ async fn test_voucher_reports_failed_chain_read() {
             .highest_voucher_amount,
         state.highest_voucher_amount
     );
+}
+
+#[tokio::test]
+async fn test_rejected_voucher_does_not_refresh_prepaid_credit() {
+    use alloy::sol_types::SolValue;
+    for (amount, valid_signature) in [(2_000, false), (1_000, true), (200_000, true)] {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.spent = 100;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id, state.clone());
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&Bytes::from(
+            (
+                false,
+                0u64,
+                state.payer,
+                state.payee,
+                state.token,
+                state.authorized_signer,
+                state.deposit,
+                1_000u128,
+            )
+                .abi_encode_params(),
+        ));
+        let method = mocked_session_method(store.clone(), asserter);
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        let (request, credential) = voucher_credential(
+            if valid_signature { &signer } else { &other },
+            &state,
+            amount,
+        )
+        .await;
+        assert!(method.verify_session(&credential, &request).await.is_err());
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        assert!(stored.deduct(900).is_ok());
+    }
 }
