@@ -13,7 +13,10 @@
 
 #![cfg(feature = "integration-stripe")]
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use axum::extract::Form;
 use axum::{routing::get, Json, Router};
@@ -820,26 +823,23 @@ async fn test_stripe_rejects_replayed_credential() {
     .expect("create mpp");
 
     let mpp = Arc::new(mpp);
-    let (url, handle) = start_server(mpp).await;
-
-    let provider = StripeProvider::new(|_| {
-        Box::pin(async move { Ok(CreateTokenResult::from("spt_replayed_token".to_string())) })
+    let (url, handle) = start_server_with_extractor(mpp).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let token_calls = calls.clone();
+    let provider = StripeProvider::new(move |_| {
+        let count = token_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(CreateTokenResult::from(format!("spt_fresh_{count}"))) })
     });
 
-    let resp = Client::new()
-        .get(format!("{url}/paid"))
+    let response = Client::new()
+        .get(format!("{url}/paid-extractor"))
         .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
-        .await;
-
-    // Should get 402 back (server rejects replayed credential, re-issues challenge)
-    if let Ok(r) = resp {
-        assert_eq!(
-            r.status(),
-            402,
-            "should get 402 when Stripe returns idempotent-replayed"
-        );
-    }
+        .await
+        .expect("terminal replay response");
+    assert_eq!(response.status(), 403);
+    assert!(!response.headers().contains_key("www-authenticate"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     handle.abort();
     stripe_handle.abort();
@@ -1031,7 +1031,7 @@ async fn test_stripe_external_id_binding() {
 
 /// The conformance `replayed_payment_intent_rejected` scenario: a replayed
 /// PaymentIntent cannot satisfy a request-bound externalId, and fails as
-/// verification-failed, as in mppx.
+/// a terminal credential-replayed error.
 #[tokio::test]
 async fn test_stripe_external_id_binding_rejects_replayed_payment_intent() {
     let (stripe_url, stripe_handle) = start_mock_stripe_replayed().await;
@@ -1058,12 +1058,16 @@ async fn test_stripe_external_id_binding_rejects_replayed_payment_intent() {
         .broadcast_credential(&credential)
         .await
         .expect_err("a replayed PaymentIntent must be rejected");
+    assert_eq!(
+        err.code,
+        Some(mpp::protocol::traits::ErrorCode::CredentialReplayed)
+    );
     let problem = err.to_problem_details(Some(&credential.challenge.id));
     assert_eq!(
         problem.problem_type,
         "https://paymentauth.org/problems/verification-failed"
     );
-    assert_eq!(problem.status, 402);
+    assert_eq!(problem.status, 403);
 
     stripe_handle.abort();
 }

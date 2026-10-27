@@ -162,7 +162,7 @@ impl ChargeMethod {
             .and_then(|v| v.to_str().ok())
             == Some("true");
         if replayed {
-            return Err(VerificationError::new(
+            return Err(VerificationError::credential_replayed(
                 "Payment has already been processed.",
             ));
         }
