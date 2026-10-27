@@ -581,7 +581,7 @@ where
                 signature: sig_bytes.clone(),
                 valid_before: valid_before.map(std::num::NonZeroU64::get),
             };
-            attempted_close = Some(evidence.clone());
+            let installed_evidence = evidence.clone();
             self.store.update_channel(channel_id_str, Box::new(move |current| {
                 let mut state = current.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
                 if !state.closing || state.finalized || state.pending_close.is_some() {
@@ -590,6 +590,7 @@ where
                 state.pending_close = Some(evidence);
                 Ok(Some(state))
             })).await?;
+            attempted_close = Some(installed_evidence);
             may_have_broadcast = true;
             let pending = self
                 .provider
