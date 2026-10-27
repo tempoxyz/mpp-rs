@@ -172,17 +172,17 @@ impl Transport for HttpTransport {
         let mut problem = error.to_problem_details(None);
         let status = http_types::StatusCode::from_u16(problem.status)
             .unwrap_or(http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        let retryable = !status.is_server_error() && status != http_types::StatusCode::FORBIDDEN;
         // Name the challenge only when it is sent in `WWW-Authenticate`.
-        if www_auth.is_some() && !status.is_server_error() {
+        if www_auth.is_some() && retryable {
             problem = problem.with_challenge_id(ctx.challenge.id.as_str());
         }
 
         let body = serde_json::to_string(&problem).unwrap_or_default();
         let mut resp = http_types::Response::new(body);
         *resp.status_mut() = status;
-        // A server-side failure carries no challenge, so that clients do not
-        // pay again for a fault that is not theirs.
-        if let Some(www_auth) = www_auth.filter(|_| !status.is_server_error()) {
+        // Terminal failures carry no challenge, so clients do not pay again.
+        if let Some(www_auth) = www_auth.filter(|_| retryable) {
             resp.headers_mut()
                 .insert(http_types::header::WWW_AUTHENTICATE, www_auth);
         }
@@ -455,6 +455,39 @@ mod tests {
         });
 
         assert_eq!(resp.status(), http_types::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!resp
+            .headers()
+            .contains_key(http_types::header::WWW_AUTHENTICATE));
+        let body: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
+        assert!(body.get("challengeId").is_none());
+    }
+
+    #[test]
+    fn test_http_respond_challenge_replay_omits_offer() {
+        let transport = http();
+        let challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(
+                &serde_json::json!({"amount": "1000"}),
+            )
+            .unwrap(),
+        );
+        let req = http_types::Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap();
+        let error = MppError::CredentialReplayed(Some("already processed".into()));
+
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &req,
+            error: Some(&error),
+        });
+
+        assert_eq!(resp.status(), http_types::StatusCode::FORBIDDEN);
         assert!(!resp
             .headers()
             .contains_key(http_types::header::WWW_AUTHENTICATE));

@@ -148,10 +148,10 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 /// Mock Stripe API that returns a replayed idempotent response.
-async fn start_mock_stripe_replayed() -> (String, tokio::task::JoinHandle<()>) {
+async fn start_mock_stripe_replayed(status: &'static str) -> (String, tokio::task::JoinHandle<()>) {
     let app = Router::new().route(
         "/v1/payment_intents",
-        axum::routing::post(|| async {
+        axum::routing::post(move || async move {
             (
                 [(
                     axum::http::header::HeaderName::from_static("idempotent-replayed"),
@@ -159,7 +159,7 @@ async fn start_mock_stripe_replayed() -> (String, tokio::task::JoinHandle<()>) {
                 )],
                 Json(serde_json::json!({
                     "id": "pi_replayed",
-                    "status": "succeeded",
+                    "status": status,
                 })),
             )
         }),
@@ -807,7 +807,7 @@ async fn test_stripe_error_body_parsing() {
 /// Replayed idempotent Stripe responses should be rejected.
 #[tokio::test]
 async fn test_stripe_rejects_replayed_credential() {
-    let (stripe_url, stripe_handle) = start_mock_stripe_replayed().await;
+    let (stripe_url, stripe_handle) = start_mock_stripe_replayed("succeeded").await;
 
     let mpp = Mpp::create_stripe(
         stripe(StripeConfig {
@@ -1034,7 +1034,7 @@ async fn test_stripe_external_id_binding() {
 /// a terminal credential-replayed error.
 #[tokio::test]
 async fn test_stripe_external_id_binding_rejects_replayed_payment_intent() {
-    let (stripe_url, stripe_handle) = start_mock_stripe_replayed().await;
+    let (stripe_url, stripe_handle) = start_mock_stripe_replayed("succeeded").await;
     let mpp = create_mock_mpp(&stripe_url);
 
     let challenge = mpp
@@ -1354,4 +1354,33 @@ async fn test_live_stripe_invalid_spt_rejected() {
 
     let result = mpp.stripe_verify_charge(&credential, "0.10").await;
     assert!(result.is_err(), "invalid SPT should fail verification");
+}
+
+#[tokio::test]
+async fn test_stripe_unsuccessful_replay_preserves_status_error() {
+    for (status, problem_type) in [
+        ("requires_action", "payment-action-required"),
+        ("requires_payment_method", "verification-failed"),
+        ("canceled", "verification-failed"),
+    ] {
+        let (stripe_url, handle) = start_mock_stripe_replayed(status).await;
+        let mpp = create_mock_mpp(&stripe_url);
+        let challenge = mpp.stripe_charge("0.25").unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            StripeCredentialPayload {
+                spt: "spt_unsuccessful".into(),
+                external_id: None,
+            },
+        );
+        let err = mpp.broadcast_credential(&credential).await.unwrap_err();
+        let problem = err.to_problem_details(None);
+        assert_eq!(problem.status, 402, "{status}");
+        assert_eq!(
+            problem.problem_type,
+            format!("https://paymentauth.org/problems/{problem_type}"),
+            "{status}"
+        );
+        handle.abort();
+    }
 }
