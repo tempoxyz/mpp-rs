@@ -1046,3 +1046,84 @@ async fn test_reconcile_expired_precompile_close_checks_channel_state() {
         );
     }
 }
+
+/// Models reconciliation releasing A and a replacement B being stored just
+/// before A applies its late receipt result.
+struct ReplacementCloseStore {
+    inner: InMemoryChannelStore,
+    updates: std::sync::atomic::AtomicUsize,
+}
+
+impl ChannelStore for ReplacementCloseStore {
+    fn get_channel(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ChannelState>, VerificationError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.get_channel(id)
+    }
+    fn update_channel(
+        &self,
+        id: &str,
+        updater: Box<
+            dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                + Send,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ChannelState>, VerificationError>>
+                + Send
+                + '_,
+        >,
+    > {
+        if self
+            .updates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 2
+        {
+            let state = self.inner.get_channel_sync(id).unwrap();
+            let mut replacement = state.pending_close.clone().unwrap();
+            replacement.transaction_hash = B256::repeat_byte(0xbb);
+            let mut state = state
+                .clear_pending_close()
+                .mark_pending_close(1_000)
+                .unwrap();
+            state.pending_close = Some(replacement);
+            self.inner.insert(id, state);
+        }
+        self.inner.update_channel(id, updater)
+    }
+}
+
+#[tokio::test]
+async fn test_late_close_receipt_preserves_replacement_attempt() {
+    for succeeded in [false, true] {
+        let store = Arc::new(ReplacementCloseStore {
+            inner: InMemoryChannelStore::new(),
+            updates: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store.inner, &asserter).await;
+        push_close_transaction(&asserter, succeeded);
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+        let result = method.verify_session(&credential, &request).await;
+        assert_eq!(result.is_ok(), succeeded);
+        let stored = store.inner.get_channel_sync(&channel_id).unwrap();
+        assert!(stored.closing);
+        assert!(!stored.finalized);
+        assert_eq!(
+            stored.pending_close.as_ref().unwrap().transaction_hash,
+            B256::repeat_byte(0xbb)
+        );
+        assert_eq!(
+            stored.deduct(1).unwrap_err().code,
+            Some(ErrorCode::ChannelClosed)
+        );
+    }
+}
