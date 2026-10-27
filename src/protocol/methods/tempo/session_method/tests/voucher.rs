@@ -928,3 +928,51 @@ async fn test_rejected_voucher_does_not_refresh_prepaid_credit() {
         assert!(stored.deduct(900).is_ok());
     }
 }
+
+#[tokio::test]
+async fn test_rejected_voucher_records_chain_closure_without_refreshing_credit() {
+    use alloy::sol_types::SolValue;
+    for (finalized, close_requested_at) in [(true, 0u64), (false, 123u64)] {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let channel_id = format!("0x{}", "ab".repeat(32));
+        let mut state = test_channel_state(&channel_id);
+        state.authorized_signer = signer.address();
+        state.highest_voucher_amount = 1_000;
+        state.spent = 100;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id, state.clone());
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&Bytes::from(
+            (
+                finalized,
+                close_requested_at,
+                state.payer,
+                state.payee,
+                state.token,
+                state.authorized_signer,
+                state.deposit + 1_000,
+                1_000u128,
+            )
+                .abi_encode_params(),
+        ));
+        let method = mocked_session_method(store.clone(), asserter);
+        let other = alloy::signers::local::PrivateKeySigner::random();
+        let (request, credential) = voucher_credential(&other, &state, 2_000).await;
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::ChannelClosed));
+        let stored = store.get_channel_sync(&channel_id).unwrap();
+        state.finalized = finalized;
+        state.close_requested_at = close_requested_at;
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        assert!(
+            stored.deduct(1).is_err(),
+            "chain closure must stop delivery"
+        );
+    }
+}

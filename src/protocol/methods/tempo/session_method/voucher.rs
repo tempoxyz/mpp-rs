@@ -153,7 +153,8 @@ where
     }
 
     /// Authenticate and accept a voucher in the same atomic transition as any
-    /// on-chain refresh. Rejected vouchers must leave all accounting untouched.
+    /// on-chain refresh. Rejected vouchers leave accounting untouched, but
+    /// authoritative closure flags must still block further metered delivery.
     pub(super) async fn verify_and_accept_voucher(
         &self,
         channel_id_str: &str,
@@ -162,6 +163,33 @@ where
         signature_str: &str,
         min_delta: u128,
     ) -> Result<ChannelState, VerificationError> {
+        if let Some(ref on_chain) = on_chain {
+            if on_chain.finalized || on_chain.close_requested_at != 0 {
+                let finalized = on_chain.finalized;
+                let close_requested_at = on_chain.close_requested_at;
+                self.store
+                    .update_channel(
+                        channel_id_str,
+                        Box::new(move |current| {
+                            let mut state = current.ok_or_else(|| {
+                                VerificationError::channel_not_found("channel not found")
+                            })?;
+                            // These trusted flags only restrict delivery; do not refresh
+                            // deposits, settlement, or spent credit for a rejected voucher.
+                            state.finalized |= finalized;
+                            state.close_requested_at =
+                                state.close_requested_at.max(close_requested_at);
+                            Ok(Some(state))
+                        }),
+                    )
+                    .await?;
+                return Err(VerificationError::channel_closed(if finalized {
+                    "channel is finalized on-chain"
+                } else {
+                    "channel has a pending close request"
+                }));
+            }
+        }
         let channel_id = channel_id_str.to_owned();
         let signature = signature_str.to_owned();
         self.store
