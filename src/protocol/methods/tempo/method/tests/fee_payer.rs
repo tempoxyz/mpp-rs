@@ -214,10 +214,9 @@ async fn test_cosign_rejects_authorization_list() {
     assert!(err.to_string().contains("authorization list"), "got: {err}");
 }
 
-/// Key authorizations are rejected by default and sponsored once the
-/// server opts in.
+/// A sponsored transaction may install an access key.
 #[tokio::test]
-async fn test_cosign_key_authorization_follows_policy() {
+async fn test_cosign_sponsors_key_authorization() {
     use alloy::signers::SignerSync;
     use tempo_alloy::primitives::transaction::{
         KeyAuthorization, PrimitiveSignature, SignatureType,
@@ -244,17 +243,6 @@ async fn test_cosign_key_authorization_follows_policy() {
         Some(authorization.into_signed(PrimitiveSignature::Secp256k1(signature)));
     let encoded = sign_and_encode_0x78(tx, &client_signer);
 
-    let err = method
-        .cosign_fee_payer_transaction(
-            &encoded,
-            method.fee_payer_signer.as_deref().unwrap(),
-            fee_token,
-        )
-        .await
-        .expect_err("key authorization must be rejected by default");
-    assert!(err.to_string().contains("key authorization"), "got: {err}");
-
-    let method = method.with_fee_payer_allow_key_authorization(true);
     method
         .cosign_fee_payer_transaction(
             &encoded,
@@ -262,7 +250,7 @@ async fn test_cosign_key_authorization_follows_policy() {
             fee_token,
         )
         .await
-        .expect("key authorization is sponsored once allowed");
+        .expect("key authorization is sponsored");
 }
 
 /// cosign_fee_payer_transaction rejects txs with expired valid_before.

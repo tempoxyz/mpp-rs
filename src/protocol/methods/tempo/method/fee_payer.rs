@@ -196,17 +196,12 @@ where
         // Stripped by `to_recoverable_signed`; guard against regression.
         debug_assert!(tx.access_list.is_empty());
 
-        // Both add intrinsic gas the sponsor pays for without being part of
-        // the charge. mppx rejects the former and makes the latter opt-in.
+        // Adds intrinsic gas the sponsor pays for without being part of the
+        // charge. A key authorization is allowed: it lets an access key pay in
+        // the transaction that installs it, and the fee policy bounds its gas.
         if !tx.tempo_authorization_list.is_empty() {
             return Err(VerificationError::new(
                 "Fee payer transaction must not include an authorization list",
-            ));
-        }
-
-        if tx.key_authorization.is_some() && !self.fee_payer_allow_key_authorization {
-            return Err(VerificationError::new(
-                "Fee payer transaction must not include a key authorization",
             ));
         }
 

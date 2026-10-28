@@ -146,7 +146,6 @@ pub struct ChargeMethod<P> {
     fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     relay: Option<Relay>,
     fee_payer_fee_token: Option<Address>,
-    fee_payer_allow_key_authorization: bool,
 }
 
 impl<P> ChargeMethod<P>
@@ -173,7 +172,6 @@ where
             fee_payer_allowed_fee_tokens: None,
             relay: None,
             fee_payer_fee_token: None,
-            fee_payer_allow_key_authorization: false,
         }
     }
 
@@ -218,11 +216,6 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn fee_payer_allow_key_authorization(&self) -> bool {
-        self.fee_payer_allow_key_authorization
-    }
-
-    #[cfg(test)]
     pub(crate) fn fee_payer_allowed_fee_tokens(&self) -> Option<&[Address]> {
         self.fee_payer_allowed_fee_tokens.as_deref()
     }
@@ -234,16 +227,6 @@ where
     /// allowed token. An explicit token must also be in the allowlist.
     pub fn with_fee_payer_fee_token(mut self, fee_token: Address) -> Self {
         self.fee_payer_fee_token = Some(fee_token);
-        self
-    }
-
-    /// Set whether a sponsored transaction may install an access key.
-    ///
-    /// Rejected by default, matching mppx. A key authorization adds intrinsic
-    /// gas the fee payer pays for; pass `true` to sponsor transactions that
-    /// install an access key.
-    pub fn with_fee_payer_allow_key_authorization(mut self, allow: bool) -> Self {
-        self.fee_payer_allow_key_authorization = allow;
         self
     }
 
@@ -500,7 +483,6 @@ where
         let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
         let relay = self.relay.clone();
         let fee_payer_fee_token = self.fee_payer_fee_token;
-        let fee_payer_allow_key_authorization = self.fee_payer_allow_key_authorization;
 
         async move {
             if let Some(relay) = relay {
@@ -518,7 +500,6 @@ where
                 fee_payer_allowed_fee_tokens,
                 relay: None,
                 fee_payer_fee_token,
-                fee_payer_allow_key_authorization,
             };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
