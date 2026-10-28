@@ -65,7 +65,8 @@ pub struct ChannelState {
 ///
 /// Implementations must provide atomic read-modify-write semantics for
 /// `update_channel`. The callback receives the current state (or `None`)
-/// and returns the next state (or `None` to delete).
+/// and returns the next state (or `None` to delete). If the callback returns
+/// an error, the stored state must remain unchanged.
 ///
 /// Object-safe so it can be used as `Arc<dyn ChannelStore>`.
 ///
