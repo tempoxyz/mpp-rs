@@ -161,15 +161,14 @@ impl ChargeMethod {
             .get("idempotent-replayed")
             .and_then(|v| v.to_str().ok())
             == Some("true");
-        if replayed {
-            return Err(VerificationError::new(
-                "Payment has already been processed.",
-            ));
-        }
-
         let pi: PaymentIntentResponse = response.json().await.map_err(|e| {
             VerificationError::internal(format!("Failed to parse Stripe response: {e}"))
         })?;
+        if replayed && pi.status == "succeeded" {
+            return Err(VerificationError::credential_replayed(
+                "Payment has already been processed.",
+            ));
+        }
 
         Ok((pi.id, pi.status))
     }
