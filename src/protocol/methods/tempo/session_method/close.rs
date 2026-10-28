@@ -488,6 +488,7 @@ where
         // Once submission starts, transport errors do not prove the transaction
         // failed. Keep metering blocked until the chain outcome is known.
         let mut may_have_broadcast = false;
+        let mut attempted_close = None;
         let close_tx_result: Result<String, VerificationError> = async {
             use alloy::eips::Encodable2718;
             use alloy::primitives::Bytes;
@@ -580,11 +581,16 @@ where
                 signature: sig_bytes.clone(),
                 valid_before: valid_before.map(std::num::NonZeroU64::get),
             };
+            let installed_evidence = evidence.clone();
             self.store.update_channel(channel_id_str, Box::new(move |current| {
                 let mut state = current.ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                if !state.closing || state.finalized || state.pending_close.is_some() {
+                    return Err(VerificationError::channel_closed("close attempt is no longer current"));
+                }
                 state.pending_close = Some(evidence);
                 Ok(Some(state))
             })).await?;
+            attempted_close = Some(installed_evidence);
             may_have_broadcast = true;
             let pending = self
                 .provider
@@ -623,7 +629,17 @@ where
                     self.store
                         .update_channel(
                             channel_id_str,
-                            Box::new(|current| Ok(current.map(ChannelState::clear_pending_close))),
+                            Box::new(move |current| {
+                                Ok(current.map(|state| {
+                                    // Before evidence exists reconciliation cannot release this
+                                    // attempt. Afterwards only its own evidence may be cleared.
+                                    if state.pending_close == attempted_close {
+                                        state.clear_pending_close()
+                                    } else {
+                                        state
+                                    }
+                                }))
+                            }),
                         )
                         .await?;
                 }
@@ -638,7 +654,11 @@ where
                 channel_id_str,
                 Box::new(move |current| {
                     Ok(current.map(|state| {
-                        state.finalize_close(cumulative_amount, sig_bytes, on_chain.deposit)
+                        if state.pending_close == attempted_close && state.closing {
+                            state.finalize_close(cumulative_amount, sig_bytes, on_chain.deposit)
+                        } else {
+                            state
+                        }
                     }))
                 }),
             )

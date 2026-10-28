@@ -1046,3 +1046,117 @@ async fn test_reconcile_expired_precompile_close_checks_channel_state() {
         );
     }
 }
+
+/// Injects an evidence-write failure or a replacement before late cleanup.
+struct ReplacementCloseStore {
+    inner: InMemoryChannelStore,
+    updates: std::sync::atomic::AtomicUsize,
+    fail_evidence: bool,
+}
+
+impl ChannelStore for ReplacementCloseStore {
+    fn get_channel(
+        &self,
+        id: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ChannelState>, VerificationError>>
+                + Send
+                + '_,
+        >,
+    > {
+        self.inner.get_channel(id)
+    }
+    fn update_channel(
+        &self,
+        id: &str,
+        updater: Box<
+            dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                + Send,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ChannelState>, VerificationError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let update = self
+            .updates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_evidence && update == 1 {
+            return Box::pin(async {
+                Err(VerificationError::network_error("evidence write failed"))
+            });
+        }
+        if !self.fail_evidence && update == 2 {
+            let state = self.inner.get_channel_sync(id).unwrap();
+            let mut replacement = state.pending_close.clone().unwrap();
+            replacement.transaction_hash = B256::repeat_byte(0xbb);
+            let mut state = state
+                .clear_pending_close()
+                .mark_pending_close(1_000)
+                .unwrap();
+            state.pending_close = Some(replacement);
+            self.inner.insert(id, state);
+        }
+        self.inner.update_channel(id, updater)
+    }
+}
+
+#[tokio::test]
+async fn test_late_close_receipt_preserves_replacement_attempt() {
+    for succeeded in [false, true] {
+        let store = Arc::new(ReplacementCloseStore {
+            inner: InMemoryChannelStore::new(),
+            updates: std::sync::atomic::AtomicUsize::new(0),
+            fail_evidence: false,
+        });
+        let asserter = alloy::providers::mock::Asserter::new();
+        let (channel_id, request, credential) = close_setup(&store.inner, &asserter).await;
+        push_close_transaction(&asserter, succeeded);
+        let method = mocked_session_method(store.clone(), asserter)
+            .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+        let result = method.verify_session(&credential, &request).await;
+        assert_eq!(result.is_ok(), succeeded);
+        let stored = store.inner.get_channel_sync(&channel_id).unwrap();
+        assert!(stored.closing);
+        assert!(!stored.finalized);
+        assert_eq!(
+            stored.pending_close.as_ref().unwrap().transaction_hash,
+            B256::repeat_byte(0xbb)
+        );
+        assert_eq!(
+            stored.deduct(1).unwrap_err().code,
+            Some(ErrorCode::ChannelClosed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_failed_close_evidence_write_releases_unbroadcast_attempt() {
+    let store = Arc::new(ReplacementCloseStore {
+        inner: InMemoryChannelStore::new(),
+        updates: std::sync::atomic::AtomicUsize::new(0),
+        fail_evidence: true,
+    });
+    let asserter = alloy::providers::mock::Asserter::new();
+    let (channel_id, request, credential) = close_setup(&store.inner, &asserter).await;
+    let original = store.inner.get_channel_sync(&channel_id).unwrap();
+    push_close_transaction(&asserter, true);
+    let method = mocked_session_method(store.clone(), asserter.clone())
+        .with_close_signer(alloy::signers::local::PrivateKeySigner::random());
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("evidence write failed"));
+    assert_eq!(asserter.read_q().len(), 3, "no transaction was broadcast");
+    let stored = store.inner.get_channel_sync(&channel_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&stored).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    assert!(stored.clone().deduct(1).is_ok());
+    assert!(stored.mark_pending_close(1_000).is_ok());
+}
