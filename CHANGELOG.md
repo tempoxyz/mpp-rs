@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.18.0 (2026-10-28)
+
+### Minor Changes
+
+- Added `RouteDocs` and `ServiceBuilder::route_with_docs` so proxy routes, paid or free, can declare a `summary` and an OpenAPI `requestBody` that `generate_openapi` emits in the proxy's `/openapi.json`. `Route` gains a `docs` field. (by Georgios Konstantopoulos, [#661](https://github.com/tempoxyz/mpp-rs/pull/661))
+- Removed `TempoBuilder::fee_payer_allow_key_authorization` and `ChargeMethod::with_fee_payer_allow_key_authorization`: the fee payer now sponsors transactions that carry a key authorization, so an access key can pay in the transaction that installs it. The fee payer's gas and total-fee policy still bounds the cost. (by Georgios Konstantopoulos, [#661](https://github.com/tempoxyz/mpp-rs/pull/661))
+
+### Patch Changes
+
+- Authenticate vouchers and commit channel refreshes atomically so rejected credentials cannot consume recognized prepaid credit. (by Georgios Konstantopoulos, [#661](https://github.com/tempoxyz/mpp-rs/pull/661))
+- Keep replacement close evidence and metering guards intact when an older close handler finishes late. (by Georgios Konstantopoulos, [#661](https://github.com/tempoxyz/mpp-rs/pull/661))
+- Reject confirmed Stripe PaymentIntent replays as terminal credential-replayed errors, without replacement payment challenges. (by Georgios Konstantopoulos, [#661](https://github.com/tempoxyz/mpp-rs/pull/661))
+
 ## 0.17.1 (2026-10-26)
 
 ### Patch Changes
