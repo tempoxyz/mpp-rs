@@ -41,6 +41,41 @@ pub struct Route {
     pub pattern: String,
     /// Endpoint configuration.
     pub endpoint: Endpoint,
+    /// Discovery metadata emitted in the generated OpenAPI document.
+    pub docs: RouteDocs,
+}
+
+/// Per-route discovery metadata emitted in the proxy's generated
+/// `/openapi.json`, for paid and free routes alike.
+///
+/// Created with [`RouteDocs::new`] and passed to
+/// [`ServiceBuilder::route_with_docs`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct RouteDocs {
+    /// Short summary of the operation (OpenAPI `summary`).
+    pub summary: Option<String>,
+    /// OpenAPI request body object (OpenAPI `requestBody`).
+    pub request_body: Option<Value>,
+}
+
+impl RouteDocs {
+    /// Empty route metadata.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the operation summary.
+    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    /// Set the OpenAPI request body object.
+    pub fn with_request_body(mut self, request_body: Value) -> Self {
+        self.request_body = Some(request_body);
+        self
+    }
 }
 
 /// Endpoint payment configuration.
@@ -202,13 +237,20 @@ impl ServiceBuilder {
     ///
     /// Routes are matched in the order they are added; see
     /// [`ProxyConfig::match_route`].
-    pub fn route(mut self, pattern: &str, endpoint: Endpoint) -> Self {
+    pub fn route(self, pattern: &str, endpoint: Endpoint) -> Self {
+        self.route_with_docs(pattern, endpoint, RouteDocs::default())
+    }
+
+    /// Add a route with discovery metadata (summary, request body) for the
+    /// generated OpenAPI document.
+    pub fn route_with_docs(mut self, pattern: &str, endpoint: Endpoint, docs: RouteDocs) -> Self {
         let (method, path) = parse_route_pattern(pattern);
         self.routes.push(Route {
             method,
             path,
             pattern: pattern.to_string(),
             endpoint,
+            docs,
         });
         self
     }
@@ -597,8 +639,14 @@ pub fn generate_openapi(config: &ProxyConfig) -> Value {
             let method_key = route.method.as_deref().unwrap_or("GET").to_lowercase();
 
             let mut operation = serde_json::Map::new();
+            if let Some(summary) = route.docs.summary.as_deref().filter(|s| !s.is_empty()) {
+                operation.insert("summary".to_string(), json!(summary));
+            }
             if !parameters.is_empty() {
                 operation.insert("parameters".to_string(), Value::Array(parameters));
+            }
+            if let Some(request_body) = &route.docs.request_body {
+                operation.insert("requestBody".to_string(), request_body.clone());
             }
 
             let mut responses = serde_json::Map::new();
@@ -1260,5 +1308,84 @@ mod tests {
 
         // POST should not match
         assert!(config.handle_discovery("POST", "/openapi.json").is_none());
+    }
+
+    #[test]
+    fn test_generate_openapi_route_summary_and_request_body() {
+        let request_body = json!({
+            "content": {
+                "application/json": {
+                    "schema": { "properties": { "prompt": { "type": "string" } }, "type": "object" },
+                },
+            },
+            "required": true,
+        });
+        let svc = Service::new("api", "https://api.example.com")
+            .route_with_docs(
+                "GET /v1/models",
+                Endpoint::Free,
+                RouteDocs::new().with_summary("List models"),
+            )
+            .route_with_docs(
+                "POST /v1/generate",
+                Endpoint::Paid(PaidEndpoint::new("tempo", "charge", "1")),
+                RouteDocs::new()
+                    .with_summary("Generate text")
+                    .with_request_body(request_body.clone()),
+            )
+            .route_with_docs(
+                "POST /v1/validate",
+                Endpoint::Free,
+                RouteDocs::new()
+                    .with_summary("Validate a prompt")
+                    .with_request_body(request_body.clone()),
+            )
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+        let doc = generate_openapi(&config);
+        let paths = &doc["paths"];
+
+        let generate = &paths["/api/v1/generate"]["post"];
+        assert_eq!(generate["summary"], "Generate text");
+        assert_eq!(generate["requestBody"], request_body);
+        assert!(generate["x-payment-info"].is_object());
+
+        assert_eq!(
+            paths["/api/v1/validate"]["post"],
+            json!({
+                "requestBody": request_body,
+                "responses": { "200": { "description": "Successful response" } },
+                "summary": "Validate a prompt",
+            })
+        );
+
+        let models = &paths["/api/v1/models"]["get"];
+        assert_eq!(models["summary"], "List models");
+        assert!(models.get("requestBody").is_none());
+    }
+
+    #[test]
+    fn test_documented_free_route_is_a_free_passthrough() {
+        let svc = Service::new("api", "https://api.example.com")
+            .route_with_docs(
+                "GET /v1/models",
+                Endpoint::Free,
+                RouteDocs::new().with_summary("List models"),
+            )
+            .build();
+        let config = ProxyConfig {
+            base_path: None,
+            services: vec![svc],
+            title: None,
+            description: None,
+        };
+        let parsed = config.match_route("GET", "/api/v1/models").unwrap();
+        assert!(matches!(parsed.route.endpoint, Endpoint::Free));
+        assert_eq!(parsed.upstream_path, "/v1/models");
     }
 }

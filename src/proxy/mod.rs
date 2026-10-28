@@ -13,5 +13,5 @@ pub use headers::{
 };
 pub use service::{
     apply_proxy_request_headers, generate_openapi, Endpoint, PaidEndpoint, ProxyConfig, Route,
-    Service, ServiceBuilder,
+    RouteDocs, Service, ServiceBuilder,
 };
