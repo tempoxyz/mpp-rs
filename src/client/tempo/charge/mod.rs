@@ -225,6 +225,33 @@ fn ensure_sponsored_expiry_floor(
     Ok(())
 }
 
+/// Refuse to sign a fee-sponsored transaction once less than
+/// [`FEE_PAYER_MIN_REMAINING_VALIDITY_SECS`] remain of the challenge expiry or
+/// of its `valid_before`. The fee payer enforces the floor on the signed
+/// `valid_before`, which is fixed before asynchronous preparation and signing,
+/// so this re-check runs just before and again just after signing.
+fn ensure_sponsorable_before_signing(
+    challenge: &PaymentChallenge,
+    valid_before: Option<u64>,
+    now: time::OffsetDateTime,
+) -> Result<(), MppError> {
+    ensure_sponsored_expiry_floor(challenge, now)?;
+    let Some(valid_before) = valid_before.filter(|v| *v != 0) else {
+        return Ok(());
+    };
+    // Match the fee payer's `ensure_remaining_validity`: a fractional `now` is
+    // rounded up to the next whole second before applying the floor.
+    let nanos = now.unix_timestamp_nanos();
+    let now_secs =
+        nanos.div_euclid(1_000_000_000) + i128::from(nanos.rem_euclid(1_000_000_000) > 0);
+    if i128::from(valid_before) < now_secs + i128::from(FEE_PAYER_MIN_REMAINING_VALIDITY_SECS) {
+        return Err(MppError::bad_request(format!(
+            "sponsored transaction preparation took too long: less than {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS}s of its validity window remain, so the fee payer would reject it; request a new challenge"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_estimation_signer_hints(
     request: &mut TempoTransactionRequest,
     signing_mode: &TempoSigningMode,
@@ -618,15 +645,44 @@ impl TempoCharge {
             Some(gas_limit) => gas_limit,
             None => estimate_gas(provider, request.clone()).await?,
         });
+        if self.fee_payer {
+            ensure_sponsorable_before_signing(
+                &self.challenge,
+                valid_before,
+                time::OffsetDateTime::now_utc(),
+            )?;
+        }
         let signed = access_key
             .sign_request(request)
             .await
             .mpp_http("failed to sign Tempo transaction")?;
+        // Signing may reserve a pending one-time key authorization. Take it now so
+        // an error before the credential is returned releases it: nothing was
+        // handed to a transport, and a retry must be able to sign it again.
         let authorization_reservation = access_key.authorization_reservation();
-        let tx_bytes = if self.fee_payer {
-            encode_signed_fee_payer_envelope(signed, from)?
-        } else {
-            signed.encoded_2718()
+        let encoded = (|| {
+            if self.fee_payer {
+                // A slow signer (hardware wallet, KMS) can use up the window:
+                // re-check so a credential the fee payer would refuse is never
+                // returned.
+                ensure_sponsorable_before_signing(
+                    &self.challenge,
+                    valid_before,
+                    time::OffsetDateTime::now_utc(),
+                )?;
+                encode_signed_fee_payer_envelope(signed, from)
+            } else {
+                Ok(signed.encoded_2718())
+            }
+        })();
+        let tx_bytes = match encoded {
+            Ok(tx_bytes) => tx_bytes,
+            Err(error) => {
+                if let Some(reservation) = authorization_reservation {
+                    let _ = access_key.release_authorization(reservation);
+                }
+                return Err(error);
+            }
         };
         let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
         Ok(SignedTempoCharge {
@@ -818,12 +874,17 @@ impl PreparedTempoCharge {
             .await?;
             return Ok(self.proof(signature));
         };
+        let valid_before = transaction.valid_before.map(NonZeroU64::get);
+        self.ensure_sponsorable(valid_before)?;
         let tx_bytes = if self.fee_payer {
             sign_and_encode_fee_payer_envelope_async(transaction, signer, &self.signing_mode)
                 .await?
         } else {
             sign_and_encode_async(transaction, signer, &self.signing_mode).await?
         };
+        // A slow signer (hardware wallet, KMS) can use up the window: re-check
+        // so a credential the fee payer would refuse is never returned.
+        self.ensure_sponsorable(valid_before)?;
         Ok(self.transaction(tx_bytes))
     }
 
@@ -842,6 +903,8 @@ impl PreparedTempoCharge {
             .await?;
             return Ok(self.proof(signature));
         };
+        let valid_before = transaction.valid_before.map(NonZeroU64::get);
+        self.ensure_sponsorable(valid_before)?;
         let tx_bytes = if self.fee_payer {
             sign_and_encode_fee_payer_envelope_primitive_async(
                 transaction,
@@ -852,6 +915,9 @@ impl PreparedTempoCharge {
         } else {
             sign_and_encode_primitive_async(transaction, signer, &self.signing_mode).await?
         };
+        // A slow signer (hardware wallet, KMS) can use up the window: re-check
+        // so a credential the fee payer would refuse is never returned.
+        self.ensure_sponsorable(valid_before)?;
         Ok(self.transaction(tx_bytes))
     }
 
@@ -868,6 +934,17 @@ impl PreparedTempoCharge {
             from: self.from,
             authorization_reservation: None,
         }
+    }
+
+    fn ensure_sponsorable(&self, valid_before: Option<u64>) -> Result<(), MppError> {
+        if !self.fee_payer {
+            return Ok(());
+        }
+        ensure_sponsorable_before_signing(
+            &self.challenge,
+            valid_before,
+            time::OffsetDateTime::now_utc(),
+        )
     }
 
     fn transaction(self, tx_bytes: Vec<u8>) -> SignedTempoCharge {
@@ -1582,6 +1659,62 @@ mod tests {
         let unsponsored = test_challenge().with_expires(crate::expires::seconds(5));
         let expires = unsponsored.expires_at().unwrap().unix_timestamp() as u64;
         assert_eq!(sign_valid_before(&unsponsored).await.unwrap(), expires + 1);
+    }
+    #[tokio::test]
+    async fn test_sponsored_valid_before_within_floor_is_refused_before_signing() {
+        // The fee payer enforces the floor on the signed validBefore, which is
+        // fixed before preparation: a slow preparation must not sign it.
+        let challenge = sponsored_challenge(300);
+        let now = time::OffsetDateTime::from_unix_timestamp(
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .unwrap();
+        // Like the fee payer, a fractional `now` rounds up to the next second:
+        // floor(now) + 15 is refused just after a whole second.
+        let fractional = now + time::Duration::nanoseconds(1);
+        let at_floor = (now.unix_timestamp() + 15) as u64;
+        assert!(ensure_sponsorable_before_signing(&challenge, Some(at_floor), fractional).is_err());
+        ensure_sponsorable_before_signing(&challenge, Some(at_floor + 1), fractional).unwrap();
+        let at = |secs: i64| (now.unix_timestamp() + secs) as u64;
+        let error = ensure_sponsorable_before_signing(&challenge, Some(at(14)), now).unwrap_err();
+        assert!(matches!(error, MppError::BadRequest(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("preparation took too long"),
+            "{error}"
+        );
+        ensure_sponsorable_before_signing(&challenge, Some(at(15)), now).unwrap();
+        ensure_sponsorable_before_signing(&challenge, None, now).unwrap();
+        // The challenge expiry floor still applies at signing time.
+        let error = ensure_sponsorable_before_signing(
+            &challenge,
+            Some(at(60)),
+            now + time::Duration::seconds(290),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fee-sponsored challenge expires in"),
+            "{error}"
+        );
+
+        let options = SignOptions {
+            valid_before: Some(at(10)),
+            ..Default::default()
+        };
+        let signer: alloy::signers::local::PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let error = TempoCharge::from_challenge(&challenge)
+            .unwrap()
+            .sign_with_options(&signer, options)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("preparation took too long"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
