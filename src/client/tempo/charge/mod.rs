@@ -228,8 +228,8 @@ fn ensure_sponsored_expiry_floor(
 /// Refuse to sign a fee-sponsored transaction once less than
 /// [`FEE_PAYER_MIN_REMAINING_VALIDITY_SECS`] remain of the challenge expiry or
 /// of its `valid_before`. The fee payer enforces the floor on the signed
-/// `valid_before`, which is fixed before asynchronous preparation, so this
-/// re-check runs just before signing.
+/// `valid_before`, which is fixed before asynchronous preparation and signing,
+/// so this re-check runs just before and again just after signing.
 fn ensure_sponsorable_before_signing(
     challenge: &PaymentChallenge,
     valid_before: Option<u64>,
@@ -652,6 +652,15 @@ impl TempoCharge {
             .sign_request(request)
             .await
             .mpp_http("failed to sign Tempo transaction")?;
+        if self.fee_payer {
+            // A slow signer (hardware wallet, KMS) can use up the window: re-check
+            // so a credential the fee payer would refuse is never returned.
+            ensure_sponsorable_before_signing(
+                &self.challenge,
+                valid_before,
+                time::OffsetDateTime::now_utc(),
+            )?;
+        }
         let authorization_reservation = access_key.authorization_reservation();
         let tx_bytes = if self.fee_payer {
             encode_signed_fee_payer_envelope(signed, from)?
@@ -848,13 +857,17 @@ impl PreparedTempoCharge {
             .await?;
             return Ok(self.proof(signature));
         };
-        self.ensure_sponsorable(&transaction)?;
+        let valid_before = transaction.valid_before.map(NonZeroU64::get);
+        self.ensure_sponsorable(valid_before)?;
         let tx_bytes = if self.fee_payer {
             sign_and_encode_fee_payer_envelope_async(transaction, signer, &self.signing_mode)
                 .await?
         } else {
             sign_and_encode_async(transaction, signer, &self.signing_mode).await?
         };
+        // A slow signer (hardware wallet, KMS) can use up the window: re-check
+        // so a credential the fee payer would refuse is never returned.
+        self.ensure_sponsorable(valid_before)?;
         Ok(self.transaction(tx_bytes))
     }
 
@@ -873,7 +886,8 @@ impl PreparedTempoCharge {
             .await?;
             return Ok(self.proof(signature));
         };
-        self.ensure_sponsorable(&transaction)?;
+        let valid_before = transaction.valid_before.map(NonZeroU64::get);
+        self.ensure_sponsorable(valid_before)?;
         let tx_bytes = if self.fee_payer {
             sign_and_encode_fee_payer_envelope_primitive_async(
                 transaction,
@@ -884,6 +898,9 @@ impl PreparedTempoCharge {
         } else {
             sign_and_encode_primitive_async(transaction, signer, &self.signing_mode).await?
         };
+        // A slow signer (hardware wallet, KMS) can use up the window: re-check
+        // so a credential the fee payer would refuse is never returned.
+        self.ensure_sponsorable(valid_before)?;
         Ok(self.transaction(tx_bytes))
     }
 
@@ -902,13 +919,13 @@ impl PreparedTempoCharge {
         }
     }
 
-    fn ensure_sponsorable(&self, transaction: &TempoTransaction) -> Result<(), MppError> {
+    fn ensure_sponsorable(&self, valid_before: Option<u64>) -> Result<(), MppError> {
         if !self.fee_payer {
             return Ok(());
         }
         ensure_sponsorable_before_signing(
             &self.challenge,
-            transaction.valid_before.map(NonZeroU64::get),
+            valid_before,
             time::OffsetDateTime::now_utc(),
         )
     }
