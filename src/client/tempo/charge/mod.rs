@@ -225,6 +225,29 @@ fn ensure_sponsored_expiry_floor(
     Ok(())
 }
 
+/// Refuse to sign a fee-sponsored transaction once less than
+/// [`FEE_PAYER_MIN_REMAINING_VALIDITY_SECS`] remain of the challenge expiry or
+/// of its `valid_before`. The fee payer enforces the floor on the signed
+/// `valid_before`, which is fixed before asynchronous preparation, so this
+/// re-check runs just before signing.
+fn ensure_sponsorable_before_signing(
+    challenge: &PaymentChallenge,
+    valid_before: Option<u64>,
+    now: time::OffsetDateTime,
+) -> Result<(), MppError> {
+    ensure_sponsored_expiry_floor(challenge, now)?;
+    let Some(valid_before) = valid_before.filter(|v| *v != 0) else {
+        return Ok(());
+    };
+    let remaining = i128::from(valid_before) * 1000 - now.unix_timestamp_nanos() / 1_000_000;
+    if remaining < i128::from(FEE_PAYER_MIN_REMAINING_VALIDITY_SECS) * 1000 {
+        return Err(MppError::bad_request(format!(
+            "sponsored transaction preparation took too long: less than {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS}s of its validity window remain, so the fee payer would reject it; request a new challenge"
+        )));
+    }
+    Ok(())
+}
+
 fn apply_estimation_signer_hints(
     request: &mut TempoTransactionRequest,
     signing_mode: &TempoSigningMode,
@@ -618,6 +641,13 @@ impl TempoCharge {
             Some(gas_limit) => gas_limit,
             None => estimate_gas(provider, request.clone()).await?,
         });
+        if self.fee_payer {
+            ensure_sponsorable_before_signing(
+                &self.challenge,
+                valid_before,
+                time::OffsetDateTime::now_utc(),
+            )?;
+        }
         let signed = access_key
             .sign_request(request)
             .await
@@ -818,6 +848,7 @@ impl PreparedTempoCharge {
             .await?;
             return Ok(self.proof(signature));
         };
+        self.ensure_sponsorable(&transaction)?;
         let tx_bytes = if self.fee_payer {
             sign_and_encode_fee_payer_envelope_async(transaction, signer, &self.signing_mode)
                 .await?
@@ -842,6 +873,7 @@ impl PreparedTempoCharge {
             .await?;
             return Ok(self.proof(signature));
         };
+        self.ensure_sponsorable(&transaction)?;
         let tx_bytes = if self.fee_payer {
             sign_and_encode_fee_payer_envelope_primitive_async(
                 transaction,
@@ -868,6 +900,17 @@ impl PreparedTempoCharge {
             from: self.from,
             authorization_reservation: None,
         }
+    }
+
+    fn ensure_sponsorable(&self, transaction: &TempoTransaction) -> Result<(), MppError> {
+        if !self.fee_payer {
+            return Ok(());
+        }
+        ensure_sponsorable_before_signing(
+            &self.challenge,
+            transaction.valid_before.map(NonZeroU64::get),
+            time::OffsetDateTime::now_utc(),
+        )
     }
 
     fn transaction(self, tx_bytes: Vec<u8>) -> SignedTempoCharge {
@@ -1582,6 +1625,56 @@ mod tests {
         let unsponsored = test_challenge().with_expires(crate::expires::seconds(5));
         let expires = unsponsored.expires_at().unwrap().unix_timestamp() as u64;
         assert_eq!(sign_valid_before(&unsponsored).await.unwrap(), expires + 1);
+    }
+    #[tokio::test]
+    async fn test_sponsored_valid_before_within_floor_is_refused_before_signing() {
+        // The fee payer enforces the floor on the signed validBefore, which is
+        // fixed before preparation: a slow preparation must not sign it.
+        let challenge = sponsored_challenge(300);
+        let now = time::OffsetDateTime::from_unix_timestamp(
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .unwrap();
+        let at = |secs: i64| (now.unix_timestamp() + secs) as u64;
+        let error = ensure_sponsorable_before_signing(&challenge, Some(at(14)), now).unwrap_err();
+        assert!(matches!(error, MppError::BadRequest(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("preparation took too long"),
+            "{error}"
+        );
+        ensure_sponsorable_before_signing(&challenge, Some(at(15)), now).unwrap();
+        ensure_sponsorable_before_signing(&challenge, None, now).unwrap();
+        // The challenge expiry floor still applies at signing time.
+        let error = ensure_sponsorable_before_signing(
+            &challenge,
+            Some(at(60)),
+            now + time::Duration::seconds(290),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fee-sponsored challenge expires in"),
+            "{error}"
+        );
+
+        let options = SignOptions {
+            valid_before: Some(at(10)),
+            ..Default::default()
+        };
+        let signer: alloy::signers::local::PrivateKeySigner =
+            "0x1234567890123456789012345678901234567890123456789012345678901234"
+                .parse()
+                .unwrap();
+        let error = TempoCharge::from_challenge(&challenge)
+            .unwrap()
+            .sign_with_options(&signer, options)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("preparation took too long"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
