@@ -239,8 +239,12 @@ fn ensure_sponsorable_before_signing(
     let Some(valid_before) = valid_before.filter(|v| *v != 0) else {
         return Ok(());
     };
-    let remaining = i128::from(valid_before) * 1000 - now.unix_timestamp_nanos() / 1_000_000;
-    if remaining < i128::from(FEE_PAYER_MIN_REMAINING_VALIDITY_SECS) * 1000 {
+    // Match the fee payer's `ensure_remaining_validity`: a fractional `now` is
+    // rounded up to the next whole second before applying the floor.
+    let nanos = now.unix_timestamp_nanos();
+    let now_secs =
+        nanos.div_euclid(1_000_000_000) + i128::from(nanos.rem_euclid(1_000_000_000) > 0);
+    if i128::from(valid_before) < now_secs + i128::from(FEE_PAYER_MIN_REMAINING_VALIDITY_SECS) {
         return Err(MppError::bad_request(format!(
             "sponsored transaction preparation took too long: less than {FEE_PAYER_MIN_REMAINING_VALIDITY_SECS}s of its validity window remain, so the fee payer would reject it; request a new challenge"
         )));
@@ -652,20 +656,33 @@ impl TempoCharge {
             .sign_request(request)
             .await
             .mpp_http("failed to sign Tempo transaction")?;
-        if self.fee_payer {
-            // A slow signer (hardware wallet, KMS) can use up the window: re-check
-            // so a credential the fee payer would refuse is never returned.
-            ensure_sponsorable_before_signing(
-                &self.challenge,
-                valid_before,
-                time::OffsetDateTime::now_utc(),
-            )?;
-        }
+        // Signing may reserve a pending one-time key authorization. Take it now so
+        // an error before the credential is returned releases it: nothing was
+        // handed to a transport, and a retry must be able to sign it again.
         let authorization_reservation = access_key.authorization_reservation();
-        let tx_bytes = if self.fee_payer {
-            encode_signed_fee_payer_envelope(signed, from)?
-        } else {
-            signed.encoded_2718()
+        let encoded = (|| {
+            if self.fee_payer {
+                // A slow signer (hardware wallet, KMS) can use up the window:
+                // re-check so a credential the fee payer would refuse is never
+                // returned.
+                ensure_sponsorable_before_signing(
+                    &self.challenge,
+                    valid_before,
+                    time::OffsetDateTime::now_utc(),
+                )?;
+                encode_signed_fee_payer_envelope(signed, from)
+            } else {
+                Ok(signed.encoded_2718())
+            }
+        })();
+        let tx_bytes = match encoded {
+            Ok(tx_bytes) => tx_bytes,
+            Err(error) => {
+                if let Some(reservation) = authorization_reservation {
+                    let _ = access_key.release_authorization(reservation);
+                }
+                return Err(error);
+            }
         };
         let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
         Ok(SignedTempoCharge {
@@ -1652,6 +1669,12 @@ mod tests {
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )
         .unwrap();
+        // Like the fee payer, a fractional `now` rounds up to the next second:
+        // floor(now) + 15 is refused just after a whole second.
+        let fractional = now + time::Duration::nanoseconds(1);
+        let at_floor = (now.unix_timestamp() + 15) as u64;
+        assert!(ensure_sponsorable_before_signing(&challenge, Some(at_floor), fractional).is_err());
+        ensure_sponsorable_before_signing(&challenge, Some(at_floor + 1), fractional).unwrap();
         let at = |secs: i64| (now.unix_timestamp() + secs) as u64;
         let error = ensure_sponsorable_before_signing(&challenge, Some(at(14)), now).unwrap_err();
         assert!(matches!(error, MppError::BadRequest(_)), "{error:?}");
