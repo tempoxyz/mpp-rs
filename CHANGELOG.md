@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.1 (2026-10-29)
+
+### Patch Changes
+
+- Fixed the Tempo charge client signing a fee-sponsored transaction whose `valid_before` had fewer than 15 seconds left after slow preparation: the pre-sign check now measures `valid_before` as well as the challenge expiry. (by @brendanjryan, [#662](https://github.com/tempoxyz/mpp-rs/pull/662))
+
 ## 0.18.0 (2026-10-28)
 
 ### Minor Changes
