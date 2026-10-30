@@ -1277,7 +1277,8 @@ mod tests {
             message: "transaction pooled but not yet confirmed".into(),
             data: None,
         });
-        assert!(push_with(&wallet, asserter).await.is_err());
+        let error = push_with(&wallet, asserter).await.unwrap_err();
+        assert!(error.to_string().contains("outcome unknown (tx 0x"));
         assert_eq!(
             wallet.in_flight_authorization_reservations().unwrap().len(),
             1

@@ -1176,9 +1176,22 @@ impl SignedTempoCharge {
                 [alloy::hex::encode_prefixed(tx_bytes)],
             )
             .await
-            .map_err(|error| PushError {
-                rejected: push_refused(&error),
-                error: MppError::Http(format!("failed to broadcast push payment: {error}")),
+            .map_err(|error| {
+                let rejected = push_refused(&error);
+                // The node may have accepted the transaction: name its hash
+                // so the payment can be reconciled rather than paid again.
+                let message = if rejected {
+                    format!("failed to broadcast push payment: {error}")
+                } else {
+                    format!(
+                        "push payment outcome unknown (tx {}): {error}",
+                        alloy::primitives::keccak256(tx_bytes)
+                    )
+                };
+                PushError {
+                    rejected,
+                    error: MppError::Http(message),
+                }
             })?;
         let hash = receipt
             .get("transactionHash")
