@@ -368,6 +368,8 @@ where
         // a signer or hosted fee payer. Co-signing then replaces the
         // placeholder fee_payer_signature and sets the fee_token.
         let mut sponsor = None;
+        let mut hosted_record = None;
+        let mut reconciling = false;
         let final_tx_bytes = if charge.fee_payer() {
             let (signed, sender) = self.validate_fee_payer_transaction(&tx_bytes, None)?;
             if self.fee_payer_signer.is_none() && self.remote_fee_payer.is_none() {
@@ -375,9 +377,32 @@ where
                     "feePayer requested but fee sponsorship is not configured on this server",
                 ));
             }
-            self.simulate_sender_calls(&signed, sender).await?;
 
-            let (cosigned, fee_payer) = if let Some(fee_payer_signer) = &self.fee_payer_signer {
+            // A hosted fee payer may answer a retry with another fee token or
+            // signature, and so another transaction hash. Keep the exact
+            // sponsored transaction under the client envelope's hash, and on a
+            // retry reconcile that transaction instead of asking again.
+            let prior_hosted = match (&self.store, &self.remote_fee_payer) {
+                (Some(store), Some(_)) if self.fee_payer_signer.is_none() => {
+                    let key = format!("mpp:charge-broadcast:{:#x}", keccak256(&tx_bytes));
+                    let prior = store.get(&key).await.map_err(|e| {
+                        VerificationError::internal(format!("Failed to read sponsorship: {e}"))
+                    })?;
+                    hosted_record = Some(key);
+                    prior
+                        .map(|record| parse_hosted_record(&record))
+                        .transpose()?
+                }
+                _ => None,
+            };
+            if prior_hosted.is_none() {
+                self.simulate_sender_calls(&signed, sender).await?;
+            }
+
+            let (cosigned, fee_payer) = if let Some((cosigned, fee_payer)) = prior_hosted {
+                reconciling = true;
+                (cosigned, fee_payer)
+            } else if let Some(fee_payer_signer) = &self.fee_payer_signer {
                 let fee_token = self
                     .resolve_fee_payer_fee_token(expected_chain_id, fee_payer_signer.address())
                     .await?;
@@ -386,8 +411,26 @@ where
                     .await?;
                 (cosigned, fee_payer_signer.address())
             } else if let Some(hosted) = &self.remote_fee_payer {
-                self.fill_hosted_fee_payer_transaction(hosted, &tx_bytes)
-                    .await?
+                let (cosigned, fee_payer) = self
+                    .fill_hosted_fee_payer_transaction(hosted, &tx_bytes)
+                    .await?;
+                if let (Some(store), Some(key)) = (&self.store, &hosted_record) {
+                    store
+                        .put(
+                            key,
+                            serde_json::json!({
+                                "transaction": alloy::hex::encode_prefixed(&cosigned),
+                                "feePayer": fee_payer,
+                            }),
+                        )
+                        .await
+                        .map_err(|e| {
+                            VerificationError::internal(format!(
+                                "Failed to record sponsorship: {e}"
+                            ))
+                        })?;
+                }
+                (cosigned, fee_payer)
             } else {
                 unreachable!("checked above")
             };
@@ -412,7 +455,9 @@ where
         // The sponsor pays the gas here, so simulate the exact co-signed
         // transaction with its concrete fee payer and fee token, and bail if
         // it would revert. Fails closed: no simulation, no broadcast.
-        if let Some(sponsor) = sponsor {
+        // A reconciled transaction may already be on chain, where simulating
+        // it again would fail: broadcast it and recover its receipt instead.
+        if let (Some(sponsor), false) = (sponsor, reconciling) {
             self.simulate_sponsored_transaction(&final_tx_bytes, sponsor)
                 .await?;
         }
@@ -551,7 +596,29 @@ where
             if let (Some(store), Some(key)) = (&self.store, &submission_key) {
                 let _ = store.delete(key).await;
             }
+        } else if let (Some(store), Some(key)) = (&self.store, &hosted_record) {
+            // Settled: the transaction hash claim now guards it.
+            let _ = store.delete(key).await;
         }
         result
     }
+}
+
+/// The hosted sponsorship a retry reconciles: the exact co-signed transaction
+/// and the fee payer recovered from it when it was filled.
+fn parse_hosted_record(
+    record: &serde_json::Value,
+) -> Result<(Vec<u8>, Address), VerificationError> {
+    let invalid = || VerificationError::internal("Invalid hosted sponsorship record");
+    let transaction = record
+        .get("transaction")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|hex| hex.parse::<Bytes>().ok())
+        .ok_or_else(invalid)?;
+    let fee_payer = record
+        .get("feePayer")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|address| address.parse::<Address>().ok())
+        .ok_or_else(invalid)?;
+    Ok((transaction.to_vec(), fee_payer))
 }

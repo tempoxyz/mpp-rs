@@ -1318,6 +1318,44 @@ mod tests {
         );
     }
 
+    /// A challenge that expires before the broadcast is never paid: nothing is broadcast, and the
+    /// authorization is released for the next payment.
+    #[tokio::test]
+    async fn expired_push_challenge_is_not_broadcast() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        let rpc = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+        let mut challenge = push_only_challenge();
+        let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        challenge.expires = Some(
+            expires
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+        let charge = super::super::charge::TempoCharge::from_challenge(&challenge).unwrap();
+        // The challenge expires while the payment is being prepared.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let from = wallet.active_account().unwrap();
+        let error = charge
+            .sign_with_accounts_provider_options(
+                &wallet,
+                &rpc,
+                from,
+                SignOptions {
+                    gas_limit: Some(200_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error}");
+        assert!(wallet
+            .in_flight_authorization_reservations()
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn pooled_push_keeps_its_authorization_reserved() {
         let wallet = one_time_authorization_wallet();

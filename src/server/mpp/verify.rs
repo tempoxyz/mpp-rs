@@ -337,8 +337,18 @@ where
         let expected = self.expected_charge_request(amount, options).map_err(|e| {
             VerificationError::new(format!("Failed to build expected charge request: {e}"))
         })?;
-        self.broadcast_credential_with_expected_request(credential, &expected)
-            .await
+        // A route that does not sponsor (it opted out with fee_payer:
+        // Some(false), or has no fee payer) must not sponsor a credential
+        // issued for a sponsored route at the same price.
+        let request = Self::decode_credential_request(credential)?;
+        self.verify_expected_request_matches(credential, &request, &expected)?;
+        if charge_fee_payer(&request) && !charge_fee_payer(&expected) {
+            return Err(VerificationError::with_code(
+                "Fee payer mismatch: credential was issued for a sponsored route",
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
+            ));
+        }
+        self.broadcast(credential, &request).await
     }
 
     /// Backwards-compatible alias for [`Self::broadcast_credential`].
@@ -628,4 +638,15 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         self.broadcast_credential_with_expected_request(credential, &expected)
             .await
     }
+}
+
+/// Whether a charge request asks for fee sponsorship (`methodDetails.feePayer`).
+#[cfg(feature = "tempo")]
+fn charge_fee_payer(request: &ChargeRequest) -> bool {
+    request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("feePayer"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }

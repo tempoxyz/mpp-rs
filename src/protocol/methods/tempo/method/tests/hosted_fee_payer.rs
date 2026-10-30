@@ -402,3 +402,44 @@ fn test_remote_fee_payer_config_is_validated() {
     let debug = format!("{:?}", hosted("https://sponsor.example"));
     assert!(!debug.contains("sponsor-secret"), "{debug}");
 }
+
+/// A retry after an unknown broadcast outcome reconciles the transaction the
+/// hosted fee payer already signed instead of asking it again, which could
+/// return another fee token and so another transaction.
+#[tokio::test]
+async fn test_hosted_sponsorship_retry_reconciles_the_signed_transaction() {
+    let client = alloy::signers::local::PrivateKeySigner::random();
+    let sponsor = alloy::signers::local::PrivateKeySigner::random();
+    let fee_token = USDC.parse::<Address>().unwrap();
+    let (envelope, request) = sponsored_charge_envelope(&client);
+    let (url, requests) = mock_fee_payer(fill_answer(&envelope, &sponsor, fee_token, |_| {})).await;
+    let tx_hash = B256::repeat_byte(0x11);
+    let (method, asserter) = node(vec![
+        Ok(serde_json::json!("0x")),
+        Ok(serde_json::json!("0x")),
+        Err(alloy_json_rpc::ErrorPayload {
+            code: -32000,
+            message: "upstream timeout".into(),
+            data: None,
+        }),
+        Ok(serde_json::Value::Null),
+        Ok(receipt(
+            client.address(),
+            sponsor.address(),
+            fee_token,
+            tx_hash,
+        )),
+    ]);
+    let method = method
+        .with_remote_fee_payer(hosted(&url))
+        .unwrap()
+        .with_store(Arc::new(crate::store::MemoryStore::new()));
+
+    assert!(broadcast(&method, &envelope, &request).await.is_err());
+    assert_eq!(
+        broadcast(&method, &envelope, &request).await.unwrap(),
+        tx_hash
+    );
+    assert!(asserter.read_q().is_empty(), "all node calls consumed");
+    assert_eq!(requests.lock().unwrap().len(), 1, "the sponsor signed once");
+}

@@ -1197,6 +1197,25 @@ impl SignedTempoCharge {
         let Some(tx_bytes) = &self.tx_bytes else {
             return Ok(self);
         };
+        // Signing and gas lookups took time since the challenge was checked:
+        // never broadcast a payment the server would refuse as expired.
+        if let Some(expires) = challenge.expires.as_deref() {
+            let expired = time::OffsetDateTime::parse(
+                expires,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .map_or(true, |expires_at| {
+                expires_at <= time::OffsetDateTime::now_utc()
+            });
+            if expired {
+                return Err(PushError {
+                    rejected: true,
+                    error: MppError::InvalidConfig(format!(
+                        "challenge expired at {expires} before the push payment was broadcast"
+                    )),
+                });
+            }
+        }
         let receipt: serde_json::Value = provider
             .raw_request(
                 "eth_sendRawTransactionSync".into(),

@@ -512,3 +512,41 @@ fn test_hosted_fee_payer_configuration() {
         crate::error::MppError::InvalidConfig(_)
     ));
 }
+
+/// A route that opts out of sponsorship refuses a credential issued for a
+/// sponsored route at the same price.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_unsponsored_route_rejects_sponsored_credential() {
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        })
+        .chain_id(CHAIN_ID)
+        .fee_payer(true)
+        .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+        .secret_key(TEST_SECRET),
+    )
+    .unwrap();
+    let sponsored = mpp.charge("1").unwrap().remove(0);
+    let credential =
+        PaymentCredential::new(sponsored.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+
+    let err = mpp
+        .verify_charge_with_options(
+            &credential,
+            "1",
+            crate::server::ChargeOptions {
+                fee_payer: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
+    assert!(
+        err.message.contains("Fee payer mismatch"),
+        "{}",
+        err.message
+    );
+}
