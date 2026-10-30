@@ -105,6 +105,8 @@ impl RemoteFeePayer {
             Some(client) => client,
             None => reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(|e| {
                     MppError::InvalidConfig(format!("failed to build fee payer client: {e}"))
@@ -218,7 +220,7 @@ fn parse_fee_payer_signature(value: &serde_json::Value) -> Option<Signature> {
         Some(parity) => parity,
         None => signature_word(value.get("v"))?.checked_sub(U256::from(27))?,
     };
-    let parity = match parity.to::<u64>() {
+    let parity = match u64::try_from(parity).ok()? {
         0 => false,
         1 => true,
         _ => return None,

@@ -769,10 +769,26 @@ impl TempoCharge {
             from,
             authorization_reservation,
         };
-        if self.push {
-            signed.pushed(&self.challenge, provider).await
-        } else {
-            Ok(signed)
+        if !self.push {
+            return Ok(signed);
+        }
+        match signed.push(&self.challenge, provider).await {
+            // The authorization went on chain with the payment, so it is spent:
+            // drop the reservation rather than leave it for a rollback to release.
+            Ok(mut pushed) => {
+                pushed.authorization_reservation = None;
+                Ok(pushed)
+            }
+            Err(PushError { error, rejected }) => {
+                // Only a node that refused the transaction proves the
+                // authorization was not used; otherwise keep it reserved.
+                if rejected {
+                    if let Some(reservation) = authorization_reservation {
+                        let _ = access_key.release_authorization(reservation);
+                    }
+                }
+                Err(error)
+            }
         }
     }
 
@@ -1111,14 +1127,31 @@ pub struct SignedTempoCharge {
     authorization_reservation: Option<TempoAuthorizationReservation>,
 }
 
+/// A failed push broadcast. `rejected` is true only when the node answered
+/// with an error, so the transaction cannot have been included.
+struct PushError {
+    error: MppError,
+    rejected: bool,
+}
+
 impl SignedTempoCharge {
     /// Broadcast a `push` payment's transaction and answer with its hash, as
     /// mppx's client does: `{ type: "hash", hash }` with the payer as source.
     async fn pushed(
-        mut self,
+        self,
         challenge: &PaymentChallenge,
         provider: &impl Provider<tempo_alloy::TempoNetwork>,
     ) -> Result<Self, MppError> {
+        self.push(challenge, provider)
+            .await
+            .map_err(|error| error.error)
+    }
+
+    async fn push(
+        mut self,
+        challenge: &PaymentChallenge,
+        provider: &impl Provider<tempo_alloy::TempoNetwork>,
+    ) -> Result<Self, PushError> {
         let Some(tx_bytes) = &self.tx_bytes else {
             return Ok(self);
         };
@@ -1128,15 +1161,22 @@ impl SignedTempoCharge {
                 [alloy::hex::encode_prefixed(tx_bytes)],
             )
             .await
-            .mpp_http("failed to broadcast push payment")?;
+            .map_err(|error| PushError {
+                rejected: error.is_error_resp(),
+                error: MppError::Http(format!("failed to broadcast push payment: {error}")),
+            })?;
         let hash = receipt
             .get("transactionHash")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| MppError::Http("No transaction receipt returned.".into()))?;
+            .ok_or_else(|| PushError {
+                rejected: false,
+                error: MppError::Http("No transaction receipt returned.".into()),
+            })?;
         if receipt.get("status").and_then(serde_json::Value::as_str) != Some("0x1") {
-            return Err(MppError::Http(format!(
-                "push payment transaction {hash} reverted"
-            )));
+            return Err(PushError {
+                rejected: false,
+                error: MppError::Http(format!("push payment transaction {hash} reverted")),
+            });
         }
         self.credential = PaymentCredential::with_source(
             challenge.to_echo(),
