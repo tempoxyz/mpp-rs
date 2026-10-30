@@ -934,12 +934,14 @@ async fn assert_sponsored_ousd_charge_succeeds(
     };
 
     let asserter = Asserter::new();
+    // The sender's calls are simulated before fee-token selection and
+    // co-signing, and the co-signed transaction after (mppx
+    // preflightSponsorship).
+    asserter.push_success(&serde_json::json!("0x"));
     for &balance in balances {
         push_balance(&asserter, balance);
     }
-    asserter.push_success(&serde_json::json!({
-        "blocks": [{ "calls": [{ "returnData": "0x", "gasUsed": "0x5208", "status": "0x1" }] }]
-    }));
+    asserter.push_success(&serde_json::json!("0x"));
     let tx_hash = B256::repeat_byte(0x11);
     let block_hash = B256::repeat_byte(0x22);
     let mut log =
@@ -1111,4 +1113,48 @@ async fn test_cosign_rejects_validity_window_below_floor() {
             .contains("max_validity_window_seconds must be at least 15 seconds"),
         "got: {err}"
     );
+}
+
+/// As mppx's local fee payer, co-signing accepts P256 and keychain (access
+/// key) sender signatures, the latter bound to the wallet as sender.
+#[cfg(feature = "client")]
+#[tokio::test]
+async fn test_cosign_accepts_p256_and_keychain_senders() {
+    use crate::client::tempo::signing::{
+        sign_and_encode_fee_payer_envelope_primitive_async, KeychainVersion, TempoP256Signer,
+        TempoSigningMode,
+    };
+    use alloy::signers::Signer;
+
+    let (method, _, fee_token) = make_cosign_method(None);
+    let fee_payer = alloy::signers::local::PrivateKeySigner::random();
+    let p256 = TempoP256Signer::from_slice(&[7_u8; 32]).unwrap();
+    let wallet = Address::repeat_byte(0xab);
+    for (mode, sender) in [
+        (TempoSigningMode::Direct, p256.address()),
+        (
+            TempoSigningMode::Keychain {
+                wallet,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            },
+            wallet,
+        ),
+    ] {
+        let envelope =
+            sign_and_encode_fee_payer_envelope_primitive_async(make_fee_payer_tx(60), &p256, &mode)
+                .await
+                .unwrap();
+        let (_, recovered) = method
+            .validate_fee_payer_transaction(&envelope, None)
+            .unwrap();
+        assert_eq!(recovered, sender);
+        let cosigned = method
+            .cosign_fee_payer_transaction(&envelope, &fee_payer, fee_token)
+            .await
+            .unwrap();
+        let decoded =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        assert_eq!(decoded.recover_signer().unwrap(), sender);
+    }
 }

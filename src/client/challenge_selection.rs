@@ -32,9 +32,7 @@ pub(crate) fn select_supported_challenge<'a>(
     let payable = rank_challenges(&payable, ranking_preferences.as_deref());
     if !payable.is_empty() {
         return select(&payable).ok_or_else(|| {
-            ChallengeSelectionError::NoSupportedChallenge(
-                "provider rejected all supported payment challenges".to_string(),
-            )
+            ChallengeSelectionError::NoSupportedChallenge(no_method_found(challenges))
         });
     }
 
@@ -45,14 +43,36 @@ pub(crate) fn select_supported_challenge<'a>(
         )));
     }
 
+    Err(ChallengeSelectionError::NoSupportedChallenge(
+        no_method_found(challenges),
+    ))
+}
+
+/// The start of mppx's error for a `402` with no payable challenge:
+/// `No method found for challenges: tempo.charge, stripe.charge`. Callers
+/// that know the client's methods append `. Available: ...` with
+/// [`with_available_methods`].
+fn no_method_found(challenges: &[PaymentChallenge]) -> String {
     let offered: Vec<_> = challenges
         .iter()
         .map(|challenge| format!("{}.{}", challenge.method, challenge.intent))
         .collect();
-    Err(ChallengeSelectionError::NoSupportedChallenge(format!(
-        "server offered [{}], but provider does not support any",
-        offered.join(", ")
-    )))
+    format!("No method found for challenges: {}", offered.join(", "))
+}
+
+/// Complete a [`ChallengeSelectionError::NoSupportedChallenge`] message with
+/// the methods the client can pay, as mppx does (`Available: tempo.charge`).
+///
+/// `accept_payment` is the provider's `Accept-Payment` header, which lists
+/// its `method/intent` pairs.
+pub(crate) fn with_available_methods(message: String, accept_payment: Option<&str>) -> String {
+    let available: Vec<String> = accept_payment
+        .and_then(|header| accept_payment::parse(header).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| format!("{}.{}", entry.method, entry.intent))
+        .collect();
+    format!("{message}. Available: {}", available.join(", "))
 }
 
 fn rank_challenges<'a>(
@@ -140,5 +160,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected.id, "challenge-preferred");
+    }
+
+    /// The message matches mppx's `Fetch.ts` error for an unpayable `402`.
+    #[test]
+    fn unsupported_challenges_report_mppx_message() {
+        let challenges = vec![
+            PaymentChallenge::new(
+                "a",
+                "api.example.com",
+                "stripe",
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            ),
+            PaymentChallenge::new(
+                "b",
+                "api.example.com",
+                "tempo",
+                "session",
+                Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+            ),
+        ];
+        let err = select_supported_challenge(
+            &challenges,
+            None,
+            |_| false,
+            |candidates| candidates.first().copied(),
+        )
+        .unwrap_err();
+        let ChallengeSelectionError::NoSupportedChallenge(message) = err else {
+            panic!("expected NoSupportedChallenge");
+        };
+        assert_eq!(
+            with_available_methods(message, Some("tempo/charge, stripe/charge")),
+            "No method found for challenges: stripe.charge, tempo.session. Available: tempo.charge, stripe.charge"
+        );
     }
 }

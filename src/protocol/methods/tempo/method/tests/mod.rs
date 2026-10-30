@@ -26,6 +26,7 @@ use crate::tempo::attribution;
 mod fee_payer;
 mod funding;
 mod hash_credential;
+mod hosted_fee_payer;
 mod proof_credential;
 mod receipt_logs;
 mod simulate;
