@@ -1260,12 +1260,31 @@ mod tests {
     async fn push_rejected_by_the_node_releases_its_one_time_authorization() {
         let wallet = one_time_authorization_wallet();
         let asserter = unauthorized_key_asserter();
-        asserter.push_failure_msg("nonce too low");
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: -32602,
+            message: "invalid params".into(),
+            data: None,
+        });
         assert!(push_with(&wallet, asserter).await.is_err());
         assert!(wallet
             .in_flight_authorization_reservations()
             .unwrap()
             .is_empty());
+    }
+
+    /// A retrying transport may resend bytes the chain already accepted, so a
+    /// nonce error is no proof the payment was refused.
+    #[tokio::test]
+    async fn nonce_error_keeps_its_authorization_reserved() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure_msg("nonce too low");
+        let error = push_with(&wallet, asserter).await.unwrap_err();
+        assert!(error.to_string().contains("outcome unknown (tx 0x"));
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

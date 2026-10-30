@@ -1128,18 +1128,14 @@ pub struct SignedTempoCharge {
 }
 
 /// Whether a failed `eth_sendRawTransactionSync` proves the node never
-/// accepted the transaction. EIP-7966's code 4 (pooled, not yet confirmed) and
-/// "already known" come after the pool took it, so they are not refusals, and
-/// neither is a transport failure.
+/// admitted the transaction: only invalid JSON-RPC parameters (-32602) do, as
+/// for session closes. Nonce, replay, funds and fee errors, EIP-7966's code 4
+/// and transport failures may follow an earlier attempt that a retrying
+/// transport sent and the chain accepted, so their outcome is unknown.
 fn push_refused(error: &alloy::transports::TransportError) -> bool {
-    let Some(response) = error.as_error_resp() else {
-        return false;
-    };
-    let message = response.message.to_ascii_lowercase();
-    response.code != 4
-        && !message.contains("already known")
-        && !message.contains("alreadyknown")
-        && !message.contains("known transaction")
+    error
+        .as_error_resp()
+        .is_some_and(|response| response.code == -32602)
 }
 
 /// A failed push broadcast. `rejected` is true only when the node answered
