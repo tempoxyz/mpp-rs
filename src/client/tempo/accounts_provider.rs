@@ -1287,6 +1287,36 @@ mod tests {
         );
     }
 
+    /// A push the node plainly refused (no receipt, key still not installed)
+    /// releases its authorization so a later payment can carry it again.
+    #[tokio::test]
+    async fn refused_push_with_no_trace_on_chain_releases_its_authorization() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure_msg("insufficient funds for gas");
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&alloy::primitives::Bytes::from(vec![0u8; 32 * 8]));
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert!(wallet
+            .in_flight_authorization_reservations()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A push whose transaction has a receipt used its authorization.
+    #[tokio::test]
+    async fn push_with_a_receipt_keeps_its_authorization_spent() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure_msg("nonce too low");
+        asserter.push_success(&serde_json::json!({"status": "0x1"}));
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn pooled_push_keeps_its_authorization_reserved() {
         let wallet = one_time_authorization_wallet();

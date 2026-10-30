@@ -772,6 +772,7 @@ impl TempoCharge {
         if !self.push {
             return Ok(signed);
         }
+        let tx_hash = alloy::primitives::keccak256(signed.tx_bytes());
         match signed.push(&self.challenge, provider).await {
             // The authorization went on chain with the payment, so it is spent:
             // drop the reservation rather than leave it for a rollback to release.
@@ -780,10 +781,13 @@ impl TempoCharge {
                 Ok(pushed)
             }
             Err(PushError { error, rejected }) => {
-                // Only a node that refused the transaction proves the
-                // authorization was not used; otherwise keep it reserved.
-                if rejected {
-                    if let Some(reservation) = authorization_reservation {
+                // A node that refused the transaction proves the authorization
+                // was not used. Otherwise settle the outcome from the chain:
+                // keep the reservation while the transaction landed or the key
+                // shows up installed, and release it when neither did, so a
+                // later payment can carry the authorization again.
+                if let Some(reservation) = authorization_reservation {
+                    if rejected || authorization_unused(provider, tx_hash, reservation).await {
                         let _ = access_key.release_authorization(reservation);
                     }
                 }
@@ -1136,6 +1140,29 @@ fn push_refused(error: &alloy::transports::TransportError) -> bool {
     error
         .as_error_resp()
         .is_some_and(|response| response.code == -32602)
+}
+
+/// Whether a push whose broadcast outcome is unknown provably left its
+/// one-time key authorization unused: the chain has no receipt for its
+/// transaction and the AccountKeychain does not list the key. Any lookup that
+/// fails counts as used, so the reservation stays held.
+async fn authorization_unused(
+    provider: &impl Provider<tempo_alloy::TempoNetwork>,
+    tx_hash: alloy::primitives::B256,
+    reservation: TempoAuthorizationReservation,
+) -> bool {
+    use tempo_alloy::provider::ext::TempoProviderExt;
+
+    let receipt: Result<Option<serde_json::Value>, _> = provider
+        .raw_request("eth_getTransactionReceipt".into(), [tx_hash])
+        .await;
+    if !matches!(receipt, Ok(None)) {
+        return false;
+    }
+    provider
+        .get_keychain_key(reservation.account(), reservation.key_id())
+        .await
+        .is_ok_and(|key| key.keyId == Address::ZERO)
 }
 
 /// A failed push broadcast. `rejected` is true only when the node answered
