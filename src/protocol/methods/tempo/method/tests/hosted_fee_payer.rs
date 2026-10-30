@@ -443,3 +443,42 @@ async fn test_hosted_sponsorship_retry_reconciles_the_signed_transaction() {
     assert!(asserter.read_q().is_empty(), "all node calls consumed");
     assert_eq!(requests.lock().unwrap().len(), 1, "the sponsor signed once");
 }
+
+/// A sponsorship whose final simulation failed was never sent: a retry asks
+/// and simulates again rather than broadcasting it unchecked.
+#[tokio::test]
+async fn test_hosted_sponsorship_retry_after_failed_simulation_simulates_again() {
+    let client = alloy::signers::local::PrivateKeySigner::random();
+    let sponsor = alloy::signers::local::PrivateKeySigner::random();
+    let (envelope, request) = sponsored_charge_envelope(&client);
+    let (url, requests) = mock_fee_payer(fill_answer(
+        &envelope,
+        &sponsor,
+        PATH_USD.parse().unwrap(),
+        |_| {},
+    ))
+    .await;
+    let reverted = || alloy_json_rpc::ErrorPayload {
+        code: 3,
+        message: "execution reverted: sponsor".into(),
+        data: None,
+    };
+    let (method, asserter) = node(vec![
+        Ok(serde_json::json!("0x")),
+        Err(reverted()),
+        Ok(serde_json::json!("0x")),
+        Err(reverted()),
+    ]);
+    let method = method
+        .with_remote_fee_payer(hosted(&url))
+        .unwrap()
+        .with_store(Arc::new(crate::store::MemoryStore::new()));
+
+    assert!(broadcast(&method, &envelope, &request).await.is_err());
+    assert!(broadcast(&method, &envelope, &request).await.is_err());
+    assert!(
+        asserter.read_q().is_empty(),
+        "both attempts simulated twice"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}

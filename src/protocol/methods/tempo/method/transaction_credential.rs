@@ -369,6 +369,7 @@ where
         // placeholder fee_payer_signature and sets the fee_token.
         let mut sponsor = None;
         let mut hosted_record = None;
+        let mut hosted_fill = None;
         let mut reconciling = false;
         let final_tx_bytes = if charge.fee_payer() {
             let (signed, sender) = self.validate_fee_payer_transaction(&tx_bytes, None)?;
@@ -414,22 +415,13 @@ where
                 let (cosigned, fee_payer) = self
                     .fill_hosted_fee_payer_transaction(hosted, &tx_bytes)
                     .await?;
-                if let (Some(store), Some(key)) = (&self.store, &hosted_record) {
-                    store
-                        .put(
-                            key,
-                            serde_json::json!({
-                                "transaction": alloy::hex::encode_prefixed(&cosigned),
-                                "feePayer": fee_payer,
-                            }),
-                        )
-                        .await
-                        .map_err(|e| {
-                            VerificationError::internal(format!(
-                                "Failed to record sponsorship: {e}"
-                            ))
-                        })?;
-                }
+                // Recorded only once it passed simulation and is about to be
+                // broadcast, so a retry never skips simulation for a
+                // transaction that was never sent.
+                hosted_fill = Some(serde_json::json!({
+                    "transaction": alloy::hex::encode_prefixed(&cosigned),
+                    "feePayer": fee_payer,
+                }));
                 (cosigned, fee_payer)
             } else {
                 unreachable!("checked above")
@@ -506,6 +498,14 @@ where
             // afterwards: a paid request must not turn into a fresh challenge
             // while settlement completes.
             ensure_challenge_not_expired(expires)?;
+
+            if let (Some(store), Some(key), Some(fill)) =
+                (&self.store, &hosted_record, hosted_fill.take())
+            {
+                store.put(key, fill).await.map_err(|e| {
+                    VerificationError::internal(format!("Failed to record sponsorship: {e}"))
+                })?;
+            }
 
             // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
             // receipt. The Tempo node holds the connection open until the transaction

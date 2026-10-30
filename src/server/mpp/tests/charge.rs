@@ -550,3 +550,41 @@ async fn test_unsponsored_route_rejects_sponsored_credential() {
         err.message
     );
 }
+
+/// The opt-out holds on every expected-request path, body-bound ones included.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_unsponsored_expected_request_rejects_sponsored_credential() {
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        })
+        .chain_id(CHAIN_ID)
+        .fee_payer(true)
+        .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+        .secret_key(TEST_SECRET),
+    )
+    .unwrap();
+    let sponsored = mpp.charge("1").unwrap().remove(0);
+    let credential =
+        PaymentCredential::new(sponsored.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+    let expected = mpp
+        .expected_charge_request(
+            "1",
+            crate::server::ChargeOptions {
+                fee_payer: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let err = mpp
+        .broadcast_credential_with_expected_request_and_body(&credential, &expected, b"{}")
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("Fee payer mismatch"),
+        "{}",
+        err.message
+    );
+}

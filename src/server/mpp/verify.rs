@@ -450,6 +450,20 @@ where
             ));
         }
 
+        // A route that does not sponsor must not sponsor a credential issued
+        // for a sponsored route. An expected request without method details
+        // (built by hand) does not say, so it is not compared here.
+        #[cfg(feature = "tempo")]
+        if expected.method_details.is_some()
+            && charge_fee_payer(request)
+            && !charge_fee_payer(expected)
+        {
+            return Err(VerificationError::with_code(
+                "Fee payer mismatch: credential was issued for a sponsored route",
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
+            ));
+        }
+
         #[cfg(feature = "tempo")]
         if _credential.challenge.method.as_str() == crate::protocol::methods::tempo::METHOD_NAME {
             let req_transfers =
