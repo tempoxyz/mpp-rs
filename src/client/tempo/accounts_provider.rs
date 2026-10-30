@@ -1269,6 +1269,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pooled_push_keeps_its_authorization_reserved() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: 4,
+            message: "transaction pooled but not yet confirmed".into(),
+            data: None,
+        });
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn landed_push_keeps_its_one_time_authorization_spent() {
         let wallet = one_time_authorization_wallet();
         let asserter = unauthorized_key_asserter();

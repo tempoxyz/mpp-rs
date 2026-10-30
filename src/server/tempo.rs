@@ -48,7 +48,6 @@ pub struct TempoBuilder {
     pub(crate) fee_payer_fee_token: Option<Address>,
     pub(crate) remote_fee_payer: Option<TempoRemoteFeePayer>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
-    pub(crate) store_explicit: bool,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
 }
@@ -221,19 +220,16 @@ impl TempoBuilder {
     /// Set the replay-protection store (default: in-memory).
     ///
     /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
-    /// As in mppx, an explicitly configured store also makes zero-amount proof
-    /// credentials single-use per challenge; the default in-memory store only
-    /// records transaction hashes.
+    /// The store, the default one included, also makes zero-amount proof
+    /// credentials single-use per challenge.
     pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
         self.store = Some(store);
-        self.store_explicit = true;
         self
     }
 
     /// Disable replay-protection storage (removes the default in-memory store).
     pub fn without_store(mut self) -> Self {
         self.store = None;
-        self.store_explicit = false;
         self
     }
 
@@ -330,7 +326,6 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         remote_fee_payer: None,
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
-        store_explicit: false,
         relay: None,
         requires_auth: false,
     }

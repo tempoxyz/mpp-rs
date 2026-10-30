@@ -250,14 +250,6 @@ where
         self
     }
 
-    /// Record transaction hashes in `store` without making zero-amount proofs
-    /// single-use, as mppx does with its default store: a proof is claimed
-    /// only in a store the server configured explicitly.
-    pub(crate) fn with_hash_store(mut self, store: Arc<dyn Store>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
     /// Configure a fee payer signer for sponsoring transaction fees.
     ///
     /// When set, requests with `feePayer: true` will be accepted and

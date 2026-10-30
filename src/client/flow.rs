@@ -529,6 +529,16 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 pending.rollback().await.map_err(HttpError::Payment)?;
             }
 
+            // A hash credential's transfer is already on chain: paying a new
+            // challenge for the same request would pay twice, so its answer is
+            // final.
+            if credential
+                .charge_payload()
+                .is_ok_and(|payload| payload.is_hash())
+            {
+                return Ok(resp);
+            }
+
             // Any other completed HTTP response is the application's answer,
             // not a payment flow error. Match MPPx by returning non-402
             // responses and the final 402 without emitting `payment.failed`.

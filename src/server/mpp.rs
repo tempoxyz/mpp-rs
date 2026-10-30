@@ -464,11 +464,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             method = method.with_remote_fee_payer(remote_fee_payer)?;
         }
         if let Some(store) = builder.store {
-            method = if builder.store_explicit {
-                method.with_store(store)
-            } else {
-                method.with_hash_store(store)
-            };
+            method = method.with_store(store);
         }
         if let Some(relay) = builder.relay {
             method = method.with_relay(relay)?;

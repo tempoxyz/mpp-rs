@@ -1127,6 +1127,21 @@ pub struct SignedTempoCharge {
     authorization_reservation: Option<TempoAuthorizationReservation>,
 }
 
+/// Whether a failed `eth_sendRawTransactionSync` proves the node never
+/// accepted the transaction. EIP-7966's code 4 (pooled, not yet confirmed) and
+/// "already known" come after the pool took it, so they are not refusals, and
+/// neither is a transport failure.
+fn push_refused(error: &alloy::transports::TransportError) -> bool {
+    let Some(response) = error.as_error_resp() else {
+        return false;
+    };
+    let message = response.message.to_ascii_lowercase();
+    response.code != 4
+        && !message.contains("already known")
+        && !message.contains("alreadyknown")
+        && !message.contains("known transaction")
+}
+
 /// A failed push broadcast. `rejected` is true only when the node answered
 /// with an error, so the transaction cannot have been included.
 struct PushError {
@@ -1162,7 +1177,7 @@ impl SignedTempoCharge {
             )
             .await
             .map_err(|error| PushError {
-                rejected: error.is_error_resp(),
+                rejected: push_refused(&error),
                 error: MppError::Http(format!("failed to broadcast push payment: {error}")),
             })?;
         let hash = receipt

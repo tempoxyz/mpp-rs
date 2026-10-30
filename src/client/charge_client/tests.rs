@@ -67,7 +67,7 @@ impl PaymentProvider for Provider {
         self.paid.lock().unwrap().push(challenge.id.clone());
         Ok(PaymentCredential::new(
             challenge.to_echo(),
-            PaymentPayload::hash("offline-proof"),
+            PaymentPayload::transaction("offline-proof"),
         ))
     }
 }

@@ -454,10 +454,10 @@ async fn test_keychain_proof_for_another_account_is_rejected() {
         .contains("Proof signature does not match source"));
 }
 
-/// As in mppx, proofs are claimed only in an explicitly configured store: the
-/// store `Mpp::create` installs by default records transaction hashes only.
+/// Every store, the default one Mpp::create installs included, makes a
+/// zero-amount proof single-use per challenge.
 #[tokio::test]
-async fn test_hash_store_does_not_claim_proofs() {
+async fn test_store_claims_proofs() {
     use crate::store::MemoryStore;
 
     let signer = alloy::signers::local::PrivateKeySigner::random();
@@ -480,12 +480,9 @@ async fn test_hash_store_does_not_claim_proofs() {
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_http("http://127.0.0.1:1".parse().unwrap());
-    let store = Arc::new(MemoryStore::new());
-    let method = ChargeMethod::new(provider).with_hash_store(store.clone());
+    let method = ChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
     method.cached_chain_id.set(42431).unwrap();
 
     method.verify(&credential, &request).await.unwrap();
-    method.verify(&credential, &request).await.unwrap();
-    let key = format!("mpp:charge:proof:{}", challenge.id);
-    assert!(store.get(&key).await.unwrap().is_none());
+    assert!(method.verify(&credential, &request).await.is_err());
 }
