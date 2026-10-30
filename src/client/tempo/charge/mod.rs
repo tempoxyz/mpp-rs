@@ -1143,8 +1143,9 @@ fn push_refused(error: &alloy::transports::TransportError) -> bool {
 }
 
 /// Whether a push whose broadcast outcome is unknown provably left its
-/// one-time key authorization unused: the chain has no receipt for its
-/// transaction and the AccountKeychain does not list the key. Any lookup that
+/// one-time key authorization unused: the node has neither a receipt for its
+/// transaction nor the transaction itself (pooled), and the AccountKeychain
+/// does not list the key. Any lookup that
 /// fails counts as used, so the reservation stays held.
 async fn authorization_unused(
     provider: &impl Provider<tempo_alloy::TempoNetwork>,
@@ -1153,11 +1154,14 @@ async fn authorization_unused(
 ) -> bool {
     use tempo_alloy::provider::ext::TempoProviderExt;
 
-    let receipt: Result<Option<serde_json::Value>, _> = provider
-        .raw_request("eth_getTransactionReceipt".into(), [tx_hash])
-        .await;
-    if !matches!(receipt, Ok(None)) {
-        return false;
+    // A mined transaction has a receipt and a pooled one is still known by
+    // hash: either may use the authorization.
+    for method in ["eth_getTransactionReceipt", "eth_getTransactionByHash"] {
+        let found: Result<Option<serde_json::Value>, _> =
+            provider.raw_request(method.into(), [tx_hash]).await;
+        if !matches!(found, Ok(None)) {
+            return false;
+        }
     }
     provider
         .get_keychain_key(reservation.account(), reservation.key_id())

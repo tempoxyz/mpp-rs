@@ -1295,6 +1295,7 @@ mod tests {
         let asserter = unauthorized_key_asserter();
         asserter.push_failure_msg("insufficient funds for gas");
         asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
         asserter.push_success(&alloy::primitives::Bytes::from(vec![0u8; 32 * 8]));
         assert!(push_with(&wallet, asserter).await.is_err());
         assert!(wallet
@@ -1326,6 +1327,10 @@ mod tests {
             message: "transaction pooled but not yet confirmed".into(),
             data: None,
         });
+        // The pooled transaction has no receipt yet but the node knows it.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::json!({"hash": format!("0x{}", "ab".repeat(32))}));
+        asserter.push_success(&alloy::primitives::Bytes::from(vec![0u8; 32 * 8]));
         let error = push_with(&wallet, asserter).await.unwrap_err();
         assert!(error.to_string().contains("outcome unknown (tx 0x"));
         assert_eq!(
