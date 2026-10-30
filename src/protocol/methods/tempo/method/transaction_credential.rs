@@ -272,7 +272,7 @@ where
         let expected = Self::expected_transfers(charge)?;
 
         if charge.fee_payer() {
-            if self.fee_payer_signer.is_none() {
+            if self.fee_payer_signer.is_none() && self.remote_fee_payer.is_none() {
                 return Err(VerificationError::new(
                     "feePayer requested but fee sponsorship is not configured on this server",
                 ));
@@ -363,21 +363,36 @@ where
             ensure_transaction_credential_source(source, sender, expected_chain_id)?;
         }
 
-        // Fee payer co-signing replaces the placeholder fee_payer_signature
-        // with a real co-signature and sets the fee_token.
+        // Sponsorship runs inside mppx's `preflightSponsorship`: the sender's
+        // calls are simulated first, so a reverting transaction never reaches
+        // a signer or hosted fee payer. Co-signing then replaces the
+        // placeholder fee_payer_signature and sets the fee_token.
+        let mut sponsor = None;
         let final_tx_bytes = if charge.fee_payer() {
-            let fee_payer_signer = self.fee_payer_signer.as_ref().ok_or_else(|| {
-                VerificationError::new(
-                    "feePayer requested but fee sponsorship is not configured on this server"
-                        .to_string(),
-                )
-            })?;
+            let (signed, sender) = self.validate_fee_payer_transaction(&tx_bytes, None)?;
+            if self.fee_payer_signer.is_none() && self.remote_fee_payer.is_none() {
+                return Err(VerificationError::new(
+                    "feePayer requested but fee sponsorship is not configured on this server",
+                ));
+            }
+            self.simulate_sender_calls(&signed, sender).await?;
 
-            let fee_token = self
-                .resolve_fee_payer_fee_token(expected_chain_id, fee_payer_signer.address())
-                .await?;
-            self.cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer.as_ref(), fee_token)
-                .await?
+            let (cosigned, fee_payer) = if let Some(fee_payer_signer) = &self.fee_payer_signer {
+                let fee_token = self
+                    .resolve_fee_payer_fee_token(expected_chain_id, fee_payer_signer.address())
+                    .await?;
+                let cosigned = self
+                    .cosign_fee_payer_transaction(&tx_bytes, fee_payer_signer.as_ref(), fee_token)
+                    .await?;
+                (cosigned, fee_payer_signer.address())
+            } else if let Some(hosted) = &self.remote_fee_payer {
+                self.fill_hosted_fee_payer_transaction(hosted, &tx_bytes)
+                    .await?
+            } else {
+                unreachable!("checked above")
+            };
+            sponsor = Some(fee_payer);
+            cosigned
         } else {
             tx_bytes.to_vec()
         };
@@ -394,11 +409,12 @@ where
             },
         )?;
 
-        // The sponsor pays the gas here, so simulate first and bail if the tx
-        // would revert. Static validation above only checks call shape, not
-        // execution. Fails closed: no simulation, no broadcast.
-        if charge.fee_payer() {
-            self.simulate_before_broadcast(&final_tx_bytes).await?;
+        // The sponsor pays the gas here, so simulate the exact co-signed
+        // transaction with its concrete fee payer and fee token, and bail if
+        // it would revert. Fails closed: no simulation, no broadcast.
+        if let Some(sponsor) = sponsor {
+            self.simulate_sponsored_transaction(&final_tx_bytes, sponsor)
+                .await?;
         }
 
         // Pre-broadcast dedup of the final tx bytes. Separate namespace from

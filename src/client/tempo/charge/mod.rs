@@ -48,6 +48,7 @@ use tempo_alloy::primitives::transaction::{
 
 use self::tx_builder::{build_charge_credential, build_tempo_tx, estimate_gas, TempoTxOptions};
 use crate::client::tempo::signing::{
+    build_tempo_signature, build_tempo_signature_primitive, effective_signing_hash,
     encode_signed_fee_payer_envelope, sign_and_encode_async,
     sign_and_encode_fee_payer_envelope_async, sign_and_encode_fee_payer_envelope_primitive_async,
     sign_and_encode_primitive_async, TempoPrimitiveSigner, TempoSigningMode,
@@ -150,27 +151,34 @@ async fn resolve_fee_token(
     candidates.first().copied().unwrap_or(currency)
 }
 
-/// Reject a charge the server will not accept as a signed transaction.
+/// Whether a non-zero charge is paid in `push` mode.
 ///
-/// This client always answers non-zero charges in `pull` mode
-/// (`type="transaction"`). An omitted `supportedModes` allows every mode.
-fn ensure_pull_supported(charge: &ChargeRequest) -> Result<(), MppError> {
+/// As mppx's client with a local account, this client prefers `pull` mode
+/// (`type="transaction"`: the server broadcasts) and pays in `push` mode
+/// (`type="hash"`: the client broadcasts) when the challenge's
+/// `supportedModes` lists only `push`. An omitted `supportedModes` allows
+/// every mode.
+fn resolve_push_mode(charge: &ChargeRequest) -> Result<bool, MppError> {
     let supported_modes = charge
         .method_details
         .as_ref()
         .and_then(|details| details.get("supportedModes"))
         .filter(|modes| !modes.is_null());
     let Some(supported_modes) = supported_modes else {
-        return Ok(());
+        return Ok(false);
     };
-    let pull_supported = supported_modes
-        .as_array()
-        .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("pull")));
-    if pull_supported {
-        Ok(())
+    let supports = |wanted: &str| {
+        supported_modes
+            .as_array()
+            .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some(wanted)))
+    };
+    if supports("pull") {
+        Ok(false)
+    } else if supports("push") {
+        Ok(true)
     } else {
         Err(MppError::UnsupportedPaymentMethod(
-            "challenge does not support pull mode (signed transaction credentials)".into(),
+            "challenge supports neither pull nor push mode".into(),
         ))
     }
 }
@@ -282,6 +290,7 @@ pub struct TempoCharge {
     machine_token_enabled: bool,
     splits: Option<Vec<Split>>,
     calls: Option<Vec<Call>>,
+    push: bool,
 }
 
 impl TempoCharge {
@@ -309,9 +318,10 @@ impl TempoCharge {
     /// # Errors
     ///
     /// Returns an error if the challenge is malformed, or if it is a non-zero
-    /// charge whose `methodDetails.supportedModes` does not list `pull`: the
-    /// charge is always answered with a signed transaction for the server to
-    /// broadcast.
+    /// charge whose `methodDetails.supportedModes` lists neither `pull` nor
+    /// `push`. A charge that lists only `push` is paid by broadcasting the
+    /// transaction and sending its hash, without fee sponsorship (see
+    /// [`is_push`](Self::is_push)).
     pub fn from_challenge(challenge: &PaymentChallenge) -> Result<Self, MppError> {
         challenge.validate_for_charge("tempo")?;
 
@@ -321,16 +331,15 @@ impl TempoCharge {
         let recipient = charge_req.recipient_address()?;
         let currency = charge_req.currency_address()?;
         let amount = charge_req.amount_u256()?;
-        if !amount.is_zero() {
-            ensure_pull_supported(&charge_req)?;
-        }
+        let push = !amount.is_zero() && resolve_push_mode(&charge_req)?;
         let memo = Some(crate::tempo::attribution::encode(
             &challenge.id,
             &challenge.realm,
             None,
         ));
         let chain_id = details.chain_id.unwrap_or(CHAIN_ID);
-        let fee_payer = details.fee_payer();
+        // The client broadcasts a push payment itself and pays its own fees.
+        let fee_payer = details.fee_payer() && !push;
         let machine_token_enabled = details.machine_token_enabled();
         let splits = details.splits;
 
@@ -347,7 +356,38 @@ impl TempoCharge {
             machine_token_enabled,
             splits,
             calls: None,
+            push,
         })
+    }
+
+    /// Whether this charge is paid in `push` mode: the signing methods that
+    /// reach an RPC broadcast the transaction and return a `hash` credential.
+    pub fn is_push(&self) -> bool {
+        self.push
+    }
+
+    /// The RPC client the simple signing path uses: [`SignOptions::rpc_url`]
+    /// or the chain's default RPC.
+    fn rpc_for(
+        &self,
+        options: &SignOptions,
+    ) -> Result<alloy::providers::RootProvider<tempo_alloy::TempoNetwork>, MppError> {
+        let rpc_url = match options.rpc_url.as_deref() {
+            Some(url) => url.parse().mpp_config("invalid RPC URL")?,
+            None => {
+                let network = TempoChain::from_chain_id(self.chain_id).ok_or_else(|| {
+                    MppError::InvalidConfig(format!(
+                        "unknown chain ID {}: provide rpc_url in SignOptions",
+                        self.chain_id
+                    ))
+                })?;
+                network
+                    .default_rpc_url()
+                    .parse()
+                    .mpp_config("invalid RPC URL")?
+            }
+        };
+        Ok(super::rpc_provider(rpc_url))
     }
 
     /// Get the chain ID extracted from the challenge.
@@ -487,10 +527,17 @@ impl TempoCharge {
         signer: &(impl alloy::signers::Signer + Clone),
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
-        self.prepare(signer.address(), SignatureType::Secp256k1, options)
+        let push = self.push.then(|| self.rpc_for(&options)).transpose()?;
+        let challenge = self.challenge.clone();
+        let signed = self
+            .prepare(signer.address(), SignatureType::Secp256k1, options)
             .await?
             .sign_secp256k1(signer)
-            .await
+            .await?;
+        match push {
+            Some(provider) => signed.pushed(&challenge, &provider).await,
+            None => Ok(signed),
+        }
     }
 
     /// Sign the charge with a native Tempo primitive signer.
@@ -504,14 +551,21 @@ impl TempoCharge {
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
         let signature_type = signer.signature_type();
-        self.prepare(
-            alloy::signers::Signer::address(signer),
-            signature_type,
-            options,
-        )
-        .await?
-        .sign_primitive(signer)
-        .await
+        let push = self.push.then(|| self.rpc_for(&options)).transpose()?;
+        let challenge = self.challenge.clone();
+        let signed = self
+            .prepare(
+                alloy::signers::Signer::address(signer),
+                signature_type,
+                options,
+            )
+            .await?
+            .sign_primitive(signer)
+            .await?;
+        match push {
+            Some(provider) => signed.pushed(&challenge, &provider).await,
+            None => Ok(signed),
+        }
     }
 
     pub(crate) async fn sign_with_primitive_provider_options(
@@ -521,15 +575,23 @@ impl TempoCharge {
         options: SignOptions,
     ) -> Result<SignedTempoCharge, MppError> {
         let signature_type = signer.signature_type();
-        self.prepare_with_provider(
-            alloy::signers::Signer::address(signer),
-            signature_type,
-            options,
-            provider,
-        )
-        .await?
-        .sign_primitive(signer)
-        .await
+        let push = self.push;
+        let challenge = self.challenge.clone();
+        let signed = self
+            .prepare_with_provider(
+                alloy::signers::Signer::address(signer),
+                signature_type,
+                options,
+                provider,
+            )
+            .await?
+            .sign_primitive(signer)
+            .await?;
+        if push {
+            signed.pushed(&challenge, provider).await
+        } else {
+            Ok(signed)
+        }
     }
 
     pub(crate) async fn sign_with_accounts_provider_options(
@@ -562,14 +624,29 @@ impl TempoCharge {
                     got: self.chain_id,
                 });
             }
-            let signature = proof::sign_proof_primitive(
-                &access_key,
-                from,
-                self.chain_id,
-                &self.challenge.id,
-                &self.challenge.realm,
-            )
-            .await?;
+            // An access key signs a Keychain V2 envelope naming the account,
+            // as it signs transactions and as viem's access-key accounts sign
+            // proofs in mppx.
+            let mode = TempoSigningMode::Keychain {
+                wallet: from,
+                key_authorization: None,
+                version: crate::client::tempo::signing::KeychainVersion::V2,
+            };
+            let hash = effective_signing_hash(
+                proof::signing_hash(
+                    from,
+                    self.chain_id,
+                    &self.challenge.id,
+                    &self.challenge.realm,
+                ),
+                &mode,
+            );
+            let inner = alloy::signers::Signer::sign_hash(&access_key, &hash)
+                .await
+                .mpp_http("failed to sign proof")?;
+            let signature = alloy::hex::encode_prefixed(
+                build_tempo_signature_primitive(inner, &mode).to_bytes(),
+            );
             let credential = PaymentCredential::with_source(
                 self.challenge.to_echo(),
                 proof::proof_source(from, self.chain_id),
@@ -685,13 +762,18 @@ impl TempoCharge {
             }
         };
         let credential = build_charge_credential(&self.challenge, &tx_bytes, self.chain_id, from);
-        Ok(SignedTempoCharge {
+        let signed = SignedTempoCharge {
             credential,
             tx_bytes: Some(tx_bytes),
             chain_id: self.chain_id,
             from,
             authorization_reservation,
-        })
+        };
+        if self.push {
+            signed.pushed(&self.challenge, provider).await
+        } else {
+            Ok(signed)
+        }
     }
 
     async fn prepare(
@@ -700,22 +782,7 @@ impl TempoCharge {
         signature_type: SignatureType,
         options: SignOptions,
     ) -> Result<PreparedTempoCharge, MppError> {
-        let rpc_url = match options.rpc_url.as_deref() {
-            Some(url) => url.parse().mpp_config("invalid RPC URL")?,
-            None => {
-                let network = TempoChain::from_chain_id(self.chain_id).ok_or_else(|| {
-                    MppError::InvalidConfig(format!(
-                        "unknown chain ID {}: provide rpc_url in SignOptions",
-                        self.chain_id
-                    ))
-                })?;
-                network
-                    .default_rpc_url()
-                    .parse()
-                    .mpp_config("invalid RPC URL")?
-            }
-        };
-        let provider = super::rpc_provider(rpc_url);
+        let provider = self.rpc_for(&options)?;
         self.prepare_with_provider(signer_address, signature_type, options, &provider)
             .await
     }
@@ -864,14 +931,26 @@ impl PreparedTempoCharge {
         signer: &(impl alloy::signers::Signer + Clone),
     ) -> Result<SignedTempoCharge, MppError> {
         let Some(transaction) = self.transaction.take() else {
-            let signature = proof::sign_proof(
-                signer,
-                self.from,
-                self.chain_id,
-                &self.challenge.id,
-                &self.challenge.realm,
-            )
-            .await?;
+            let signature = match &self.signing_mode {
+                TempoSigningMode::Direct => {
+                    proof::sign_proof(
+                        signer,
+                        self.from,
+                        self.chain_id,
+                        &self.challenge.id,
+                        &self.challenge.realm,
+                    )
+                    .await?
+                }
+                mode => {
+                    let hash = effective_signing_hash(self.proof_hash(), mode);
+                    let inner = signer
+                        .sign_hash(&hash)
+                        .await
+                        .mpp_http("failed to sign proof")?;
+                    alloy::hex::encode_prefixed(build_tempo_signature(inner, mode).to_bytes())
+                }
+            };
             return Ok(self.proof(signature));
         };
         let valid_before = transaction.valid_before.map(NonZeroU64::get);
@@ -893,14 +972,13 @@ impl PreparedTempoCharge {
         signer: &TempoPrimitiveSigner,
     ) -> Result<SignedTempoCharge, MppError> {
         let Some(transaction) = self.transaction.take() else {
-            let signature = proof::sign_proof_primitive(
-                signer,
-                self.from,
-                self.chain_id,
-                &self.challenge.id,
-                &self.challenge.realm,
-            )
-            .await?;
+            let hash = effective_signing_hash(self.proof_hash(), &self.signing_mode);
+            let inner = alloy::signers::Signer::sign_hash(signer, &hash)
+                .await
+                .mpp_http("failed to sign proof")?;
+            let signature = alloy::hex::encode_prefixed(
+                build_tempo_signature_primitive(inner, &self.signing_mode).to_bytes(),
+            );
             return Ok(self.proof(signature));
         };
         let valid_before = transaction.valid_before.map(NonZeroU64::get);
@@ -921,6 +999,20 @@ impl PreparedTempoCharge {
         Ok(self.transaction(tx_bytes))
     }
 
+    /// The EIP-712 digest of this zero-amount charge's proof, bound to the
+    /// paying account (the wallet, for an access key).
+    fn proof_hash(&self) -> alloy::primitives::B256 {
+        proof::signing_hash(
+            self.from,
+            self.chain_id,
+            &self.challenge.id,
+            &self.challenge.realm,
+        )
+    }
+
+    /// Wrap a proof signature as a credential. An access key's proof is a
+    /// Keychain envelope naming the wallet, as viem's access-key accounts sign
+    /// it in mppx.
     fn proof(self, signature: String) -> SignedTempoCharge {
         let credential = PaymentCredential::with_source(
             self.challenge.to_echo(),
@@ -1020,6 +1112,40 @@ pub struct SignedTempoCharge {
 }
 
 impl SignedTempoCharge {
+    /// Broadcast a `push` payment's transaction and answer with its hash, as
+    /// mppx's client does: `{ type: "hash", hash }` with the payer as source.
+    async fn pushed(
+        mut self,
+        challenge: &PaymentChallenge,
+        provider: &impl Provider<tempo_alloy::TempoNetwork>,
+    ) -> Result<Self, MppError> {
+        let Some(tx_bytes) = &self.tx_bytes else {
+            return Ok(self);
+        };
+        let receipt: serde_json::Value = provider
+            .raw_request(
+                "eth_sendRawTransactionSync".into(),
+                [alloy::hex::encode_prefixed(tx_bytes)],
+            )
+            .await
+            .mpp_http("failed to broadcast push payment")?;
+        let hash = receipt
+            .get("transactionHash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| MppError::Http("No transaction receipt returned.".into()))?;
+        if receipt.get("status").and_then(serde_json::Value::as_str) != Some("0x1") {
+            return Err(MppError::Http(format!(
+                "push payment transaction {hash} reverted"
+            )));
+        }
+        self.credential = PaymentCredential::with_source(
+            challenge.to_echo(),
+            PaymentCredential::evm_did(self.chain_id, &self.from.to_string()),
+            PaymentPayload::hash(hash),
+        );
+        Ok(self)
+    }
+
     /// Convert the signed charge into a [`PaymentCredential`].
     pub fn into_credential(self) -> PaymentCredential {
         self.credential
@@ -1455,7 +1581,7 @@ mod tests {
             ("1000000", json!(null), true),
             ("1000000", json!(["pull"]), true),
             ("1000000", json!(["push", "pull"]), true),
-            ("1000000", json!(["push"]), false),
+            ("1000000", json!(["push"]), true),
             ("1000000", json!([]), false),
             ("1000000", json!("pull"), false),
             // Zero-amount charges are answered with a proof, which has no mode.

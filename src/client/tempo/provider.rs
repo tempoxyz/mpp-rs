@@ -128,9 +128,12 @@ pub(super) async fn fund(
 /// 2. Builds and signs a TIP-20 transfer transaction
 /// 3. Returns a credential with the signed transaction (server broadcasts)
 ///
-/// The provider only pays on one chain: the one set with
-/// [`with_expected_chain_id`](Self::with_expected_chain_id), or else the chain
-/// its RPC reports. A challenge for any other chain is rejected before signing.
+/// A provider built with [`new`](Self::new) only pays on one chain: the one set
+/// with [`with_expected_chain_id`](Self::with_expected_chain_id), or else the
+/// chain its RPC reports. A challenge for any other chain is rejected before
+/// signing. A provider built with [`from_signer`](Self::from_signer) has no RPC
+/// of its own and, as mppx's client, pays on the chain each challenge names
+/// through that chain's default RPC.
 ///
 /// # Examples
 ///
@@ -162,9 +165,33 @@ pub struct TempoProvider {
     currencies: Option<Vec<String>>,
     max_amount: Option<alloy::primitives::U256>,
     max_atomic_amount: Option<alloy::primitives::U256>,
+    /// No RPC was configured: pay on the challenge's chain via its default RPC.
+    follow_challenge_chain: bool,
+    allowed_chain_ids: Option<Vec<u64>>,
+    chain_providers: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                u64,
+                alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
+            >,
+        >,
+    >,
 }
 
 impl TempoProvider {
+    /// Create a Tempo provider without an RPC URL, as mppx's `tempo.charge()`
+    /// client without a custom client: it pays on the chain each challenge
+    /// names (`methodDetails.chainId`) through that chain's default RPC, or
+    /// on the pinned chain ([`with_expected_chain_id`](Self::with_expected_chain_id))
+    /// when the challenge names none, else on Tempo mainnet. A challenge for a
+    /// chain without a default RPC is rejected; use [`new`](Self::new) for one.
+    pub fn from_signer(signer: impl Into<TempoPrimitiveSigner>) -> Self {
+        let mut provider = Self::new(signer, crate::protocol::methods::tempo::DEFAULT_RPC_URL)
+            .expect("the default Tempo RPC URL is valid");
+        provider.follow_challenge_chain = true;
+        provider
+    }
+
     /// Create a new Tempo provider with the given signer and RPC URL.
     ///
     /// # Errors
@@ -189,7 +216,87 @@ impl TempoProvider {
             currencies: None,
             max_amount: None,
             max_atomic_amount: None,
+            follow_challenge_chain: false,
+            allowed_chain_ids: None,
+            chain_providers: Arc::default(),
         })
+    }
+
+    /// Only pay on these chain IDs, as mppx's `allowedChainIds`.
+    ///
+    /// A challenge naming another chain is skipped during challenge selection
+    /// and rejected before signing; the chain actually signed on (the RPC's,
+    /// for a challenge that names none) is checked again before signing. An
+    /// empty list pays on no chain.
+    pub fn with_allowed_chain_ids(mut self, chain_ids: impl IntoIterator<Item = u64>) -> Self {
+        self.allowed_chain_ids = Some(chain_ids.into_iter().collect());
+        self
+    }
+
+    fn ensure_allowed_chain(&self, chain_id: Option<u64>) -> Result<(), MppError> {
+        let Some(allowed) = &self.allowed_chain_ids else {
+            return Ok(());
+        };
+        match chain_id {
+            Some(chain_id) if allowed.contains(&chain_id) => Ok(()),
+            Some(chain_id) => Err(MppError::InvalidConfig(format!(
+                "Tempo chain ID {chain_id} is not allowed by the client"
+            ))),
+            None => Err(MppError::InvalidConfig(
+                "Tempo client allows no chain".to_string(),
+            )),
+        }
+    }
+
+    /// The chain to sign on and its RPC client: the challenge's chain via its
+    /// default RPC for a [`from_signer`](Self::from_signer) provider, else the
+    /// configured RPC's chain (or the pin).
+    async fn resolve_chain(
+        &self,
+        challenge_chain_id: Option<u64>,
+    ) -> Result<
+        (
+            u64,
+            alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
+        ),
+        MppError,
+    > {
+        if !self.follow_challenge_chain {
+            let chain_id = match self.expected_chain_id {
+                Some(chain_id) => chain_id,
+                None => self.rpc_chain_id().await?,
+            };
+            return Ok((chain_id, self.rpc_provider.clone()));
+        }
+        let single_allowed = match self.allowed_chain_ids.as_deref() {
+            Some([chain_id]) => Some(*chain_id),
+            _ => None,
+        };
+        let chain_id = challenge_chain_id
+            .or(self.expected_chain_id)
+            .or(single_allowed)
+            .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
+        let mut providers = self
+            .chain_providers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(provider) = providers.get(&chain_id) {
+            return Ok((chain_id, provider.clone()));
+        }
+        let network =
+            crate::protocol::methods::tempo::network::TempoNetwork::from_chain_id(chain_id)
+                .ok_or_else(|| {
+                    MppError::InvalidConfig(format!(
+                        "no default RPC for chain ID {chain_id}: create the provider with TempoProvider::new"
+                    ))
+                })?;
+        let url: reqwest::Url = network
+            .default_rpc_url()
+            .parse()
+            .mpp_config("invalid RPC URL")?;
+        let provider = super::rpc_provider(url);
+        providers.insert(chain_id, provider.clone());
+        Ok((chain_id, provider))
     }
 
     /// Set an optional client identifier for attribution memos.
@@ -317,6 +424,19 @@ impl TempoProvider {
     /// Reject a challenge whose currency or amount violates the client policy.
     /// Runs during challenge selection and again before any RPC or signing work.
     fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
+        if let Some(allowed) = &self.allowed_chain_ids {
+            use crate::protocol::methods::tempo::charge::TempoChargeExt;
+            let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
+            // A challenge naming no chain is checked against the chain signed
+            // on, once it is known (mppx `assertChallengePolicy`).
+            if request.chain_id().is_some() || allowed.is_empty() {
+                self.ensure_allowed_chain(request.chain_id())
+                    .map_err(|error| MppError::InvalidChallenge {
+                        id: Some(challenge.id.clone()),
+                        reason: Some(error.to_string()),
+                    })?;
+            }
+        }
         if self.max_amount.is_none()
             && self.max_atomic_amount.is_none()
             && self.currencies.is_none()
@@ -430,16 +550,27 @@ impl PaymentProvider for TempoProvider {
         let from = self
             .signing_mode
             .from_address(alloy::signers::Signer::address(&self.signer));
-        let chain_id = match self.expected_chain_id {
-            Some(chain_id) => chain_id,
-            None => self.rpc_chain_id().await?,
+        let challenge_chain_id = {
+            use crate::protocol::methods::tempo::charge::TempoChargeExt;
+            challenge
+                .request
+                .decode::<crate::protocol::intents::ChargeRequest>()?
+                .chain_id()
         };
+        // An explicit pin is enforced against the challenge's chain.
+        if let (Some(expected), Some(got)) = (self.expected_chain_id, challenge_chain_id) {
+            if expected != got {
+                return Err(MppError::ChainIdMismatch { expected, got });
+            }
+        }
+        let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
+        self.ensure_allowed_chain(Some(chain_id))?;
         let charge = prepare_charge(
             challenge,
             Some(chain_id),
             self.client_id.as_deref(),
             self.autoswap.as_ref(),
-            &self.rpc_provider,
+            &rpc_provider,
             from,
         )
         .await?;
@@ -450,7 +581,7 @@ impl PaymentProvider for TempoProvider {
             ..Default::default()
         };
         let signed = charge
-            .sign_with_primitive_provider_options(&self.signer, &self.rpc_provider, options)
+            .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
             .await?;
         Ok(signed.into_credential())
     }
@@ -684,6 +815,68 @@ mod tests {
 
         // Sanity: wallet and access key are different addresses.
         assert_ne!(wallet_address, access_key.address());
+    }
+
+    /// Zero-amount proofs are byte-identical to viem's in mppx: a root key
+    /// signs the EIP-712 proof directly, and an access key signs a Keychain V2
+    /// envelope naming the wallet (pympp tests/test_tempo_proof.py fixtures).
+    #[tokio::test]
+    async fn test_zero_amount_proofs_match_viem() {
+        use crate::client::tempo::signing::KeychainVersion;
+        use crate::protocol::core::Base64UrlJson;
+
+        let key = |byte: u8| {
+            alloy::signers::local::PrivateKeySigner::from_bytes(
+                &alloy::primitives::B256::repeat_byte(byte),
+            )
+            .unwrap()
+        };
+        let root = key(0x11);
+        let challenge = PaymentChallenge::new(
+            "kM9xPqWvT2nJrHsY4aDfEb",
+            "api.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "0",
+                "currency": "0x20c0000000000000000000000000000000000000",
+                "recipient": "0x742d35Cc6634c0532925a3b844bC9e7595F8fE00",
+                "methodDetails": { "chainId": 42431 }
+            }))
+            .unwrap(),
+        );
+        let signature = |credential: PaymentCredential| {
+            credential.payload["signature"].as_str().unwrap().to_owned()
+        };
+
+        let direct = TempoProvider::new(root.clone(), "https://rpc.example.com")
+            .unwrap()
+            .with_expected_chain_id(42431);
+        assert_eq!(
+            signature(direct.pay(&challenge).await.unwrap()),
+            "0x3baf02ba159042829a9bcaa17774cecb25b0194cccff0dd076db7474befcaa2b26592fc409ed59c24888f9d3b276debe61696c86793e9a35632cbff79c3496d01c"
+        );
+
+        let access = TempoProvider::new(key(0x22), "https://rpc.example.com")
+            .unwrap()
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: root.address(),
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            })
+            .with_expected_chain_id(42431);
+        let credential = access.pay(&challenge).await.unwrap();
+        assert_eq!(
+            credential.source,
+            Some(PaymentCredential::evm_did(
+                42431,
+                &root.address().to_string()
+            ))
+        );
+        assert_eq!(
+            signature(credential),
+            "0x0419e7e376e7c213b7e7e7e46cc70a5dd086daff2aa64ad10a15b8ed2c208c147daf58f5ec3989b4de18173565f10d3acad84fc1cf3ccc20181099d57723b7b9f9ed3821442c44f641e0eb4e8a4f2965d15be9e8621c"
+        );
     }
 
     #[tokio::test]
@@ -1171,5 +1364,217 @@ mod tests {
             .pay(&sponsored_challenge(Some(MODERATO_CHAIN_ID)))
             .await
             .unwrap();
+    }
+
+    fn proof_challenge(chain_id: Option<u64>) -> PaymentChallenge {
+        let mut details = serde_json::Map::new();
+        if let Some(chain_id) = chain_id {
+            details.insert("chainId".into(), chain_id.into());
+        }
+        PaymentChallenge::new(
+            "chain-follow",
+            "api.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "0",
+                "currency": "0x20c0000000000000000000000000000000000000",
+                "recipient": "0x742d35Cc6634c0532925a3b844bC9e7595F8fE00",
+                "methodDetails": details,
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn signed_chain(credential: &PaymentCredential) -> u64 {
+        crate::protocol::methods::tempo::proof::parse_proof_source(
+            credential.source.as_deref().unwrap(),
+        )
+        .unwrap()
+        .chain_id
+    }
+
+    /// As mppx, a provider without an RPC of its own pays on the chain the
+    /// challenge names through that chain's default RPC, and on mainnet when
+    /// the challenge names none.
+    #[tokio::test]
+    async fn test_from_signer_pays_on_the_challenge_chain() {
+        use crate::protocol::methods::tempo::{CHAIN_ID, MODERATO_CHAIN_ID};
+
+        let provider =
+            TempoProvider::from_signer(alloy::signers::local::PrivateKeySigner::random());
+        let credential = provider
+            .pay(&proof_challenge(Some(MODERATO_CHAIN_ID)))
+            .await
+            .unwrap();
+        assert_eq!(signed_chain(&credential), MODERATO_CHAIN_ID);
+        assert!(provider
+            .chain_providers
+            .lock()
+            .unwrap()
+            .contains_key(&MODERATO_CHAIN_ID));
+        let credential = provider.pay(&proof_challenge(None)).await.unwrap();
+        assert_eq!(signed_chain(&credential), CHAIN_ID);
+
+        let err = provider.pay(&proof_challenge(Some(999))).await.unwrap_err();
+        assert!(matches!(err, MppError::InvalidConfig(_)), "{err:?}");
+    }
+
+    /// Explicit pins are still enforced, and pick the chain of a challenge
+    /// that names none.
+    #[tokio::test]
+    async fn test_from_signer_enforces_explicit_pins() {
+        use crate::protocol::methods::tempo::{CHAIN_ID, MODERATO_CHAIN_ID};
+
+        let provider =
+            TempoProvider::from_signer(alloy::signers::local::PrivateKeySigner::random())
+                .with_expected_chain_id(MODERATO_CHAIN_ID);
+        let err = provider
+            .pay(&proof_challenge(Some(CHAIN_ID)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MppError::ChainIdMismatch { .. }), "{err:?}");
+        let credential = provider.pay(&proof_challenge(None)).await.unwrap();
+        assert_eq!(signed_chain(&credential), MODERATO_CHAIN_ID);
+    }
+
+    /// Allowed chain IDs skip other chains' offers and are checked against
+    /// the chain actually signed on.
+    #[tokio::test]
+    async fn test_allowed_chain_ids_are_checked_against_the_signed_chain() {
+        use crate::protocol::methods::tempo::{CHAIN_ID, MODERATO_CHAIN_ID};
+
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let provider =
+            TempoProvider::from_signer(signer.clone()).with_allowed_chain_ids([MODERATO_CHAIN_ID]);
+        let mainnet = proof_challenge(Some(CHAIN_ID));
+        let moderato = proof_challenge(Some(MODERATO_CHAIN_ID));
+        assert_eq!(
+            provider
+                .select_challenge(&[&mainnet, &moderato])
+                .unwrap()
+                .request
+                .raw(),
+            moderato.request.raw()
+        );
+        assert!(provider.pay(&mainnet).await.is_err());
+        // The single allowed chain is used for a challenge that names none.
+        let credential = provider.pay(&proof_challenge(None)).await.unwrap();
+        assert_eq!(signed_chain(&credential), MODERATO_CHAIN_ID);
+
+        // An RPC-pinned provider signs on its RPC's chain, which must be allowed.
+        let (rpc_url, _) = chain_id_rpc(MODERATO_CHAIN_ID).await;
+        let provider = TempoProvider::new(signer, rpc_url)
+            .unwrap()
+            .with_allowed_chain_ids([CHAIN_ID]);
+        let err = provider.pay(&proof_challenge(None)).await.unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    /// Serve a JSON-RPC node for a push payment, answering its broadcast with
+    /// a receipt of `status`. Returns its URL and the raw transactions sent.
+    async fn push_rpc(status: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::{routing::post, Json, Router};
+
+        let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let app = Router::new().route(
+            "/",
+            post({
+                let sent = sent.clone();
+                move |Json(request): Json<serde_json::Value>| {
+                    let sent = sent.clone();
+                    async move {
+                        let result = match request["method"].as_str().unwrap() {
+                            "eth_chainId" => serde_json::json!("0xa5bf"),
+                            "eth_estimateGas" => serde_json::json!("0x5208"),
+                            "eth_sendRawTransactionSync" => {
+                                sent.lock()
+                                    .unwrap()
+                                    .push(request["params"][0].as_str().unwrap().to_owned());
+                                serde_json::json!({
+                                    "transactionHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(0xab)),
+                                    "status": status,
+                                })
+                            }
+                            method => panic!("unexpected RPC {method}"),
+                        };
+                        Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, sent)
+    }
+
+    fn modes_challenge(modes: serde_json::Value) -> PaymentChallenge {
+        PaymentChallenge::new(
+            "push-challenge",
+            "api.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": "0x20c0000000000000000000000000000000000000",
+                "recipient": "0x742d35Cc6634c0532925a3b844bC9e7595F8fE00",
+                "methodDetails": { "chainId": 42431, "supportedModes": modes, "feePayer": true },
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// As mppx's client with a local account, a push-only challenge is paid by
+    /// broadcasting the transaction and sending its hash; pull is preferred
+    /// when offered.
+    #[tokio::test]
+    async fn test_push_only_challenge_is_paid_with_a_hash() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let (rpc_url, sent) = push_rpc("0x1").await;
+        let provider = TempoProvider::new(signer.clone(), &rpc_url)
+            .unwrap()
+            .with_expected_chain_id(42431);
+
+        let credential = provider
+            .pay(&modes_challenge(serde_json::json!(["push"])))
+            .await
+            .unwrap();
+        assert_eq!(credential.payload["type"], "hash");
+        assert_eq!(
+            credential.payload["hash"],
+            format!("{:#x}", alloy::primitives::B256::repeat_byte(0xab))
+        );
+        assert_eq!(
+            credential.source,
+            Some(PaymentCredential::evm_did(
+                42431,
+                &signer.address().to_string()
+            ))
+        );
+        // A push payment is not sponsored: the client pays its own fees.
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with("0x76"), "{}", sent[0]);
+
+        let credential = provider
+            .pay(&modes_challenge(serde_json::json!(["push", "pull"])))
+            .await
+            .unwrap();
+        assert_eq!(credential.payload["type"], "transaction");
+    }
+
+    #[tokio::test]
+    async fn test_reverted_push_payment_is_reported() {
+        let (rpc_url, _) = push_rpc("0x0").await;
+        let provider =
+            TempoProvider::new(alloy::signers::local::PrivateKeySigner::random(), &rpc_url)
+                .unwrap()
+                .with_expected_chain_id(42431);
+        let err = provider
+            .pay(&modes_challenge(serde_json::json!(["push"])))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reverted"), "{err}");
     }
 }

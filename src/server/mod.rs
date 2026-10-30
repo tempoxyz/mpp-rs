@@ -73,8 +73,8 @@ pub use mpp::{Mpp, SessionVerifyResult};
 pub use tempo::{
     deduct_from_channel, tempo, tempo_provider, SessionChannelStore, SessionMethodConfig,
     StreamCheck, TempoBuilder, TempoChargeExt, TempoChargeMethod, TempoConfig, TempoMethodDetails,
-    TempoProvider, TempoRelayConfig, TempoRelayErrorCode, TempoSessionMethod, CHAIN_ID,
-    METHOD_NAME,
+    TempoProvider, TempoRelayConfig, TempoRelayErrorCode, TempoRemoteFeePayer, TempoSessionMethod,
+    CHAIN_ID, METHOD_NAME,
 };
 
 // Re-export stripe types at server level for backward compatibility
@@ -111,8 +111,14 @@ pub struct ChargeOptions<'a> {
     pub external_id: Option<&'a str>,
     /// Custom expiration (ISO 8601). Default: now + 5 minutes.
     pub expires: Option<&'a str>,
-    /// Enable fee sponsorship.
-    pub fee_payer: bool,
+    /// Fee sponsorship for this charge, as mppx's `feePayer` route option.
+    ///
+    /// `None` (the default) sponsors the charge when the handler has a fee
+    /// payer (a fee-payer signer, a hosted fee payer, or `fee_payer(true)`
+    /// with a relay), `Some(false)` opts this charge out, and `Some(true)`
+    /// sponsors it when the handler can. A handler without a fee payer never
+    /// advertises `feePayer`.
+    pub fee_payer: Option<bool>,
     /// Credential modes advertised to clients: `"pull"` and/or `"push"` (for
     /// example, `&["pull"]`). Credentials of any other mode are rejected.
     pub supported_modes: Option<&'a [&'a str]>,

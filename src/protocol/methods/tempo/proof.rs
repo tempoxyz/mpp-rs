@@ -163,6 +163,12 @@ pub fn recover_proof_signer(
     let recovered = if let TempoSignature::Primitive(signature) = &signature {
         signature.recover_signer(&hash)
     } else if let TempoSignature::Keychain(signature) = &signature {
+        // As in mppx, a Keychain envelope must name the proof's account.
+        if signature.user_address != account {
+            return Err(MppError::invalid_payload(
+                "keychain proof signature names another account",
+            ));
+        }
         signature.key_id(&hash)
     } else {
         return Err(MppError::invalid_payload("unsupported proof signature"));
@@ -370,5 +376,110 @@ mod tests {
                 .parse::<B256>()
                 .unwrap()
         );
+    }
+
+    // mppx parity fixture (pympp tests/test_tempo_proof.py): computed with viem
+    // 2.57.1 from mppx's src/tempo/internal/proof.ts typedData for the root key
+    // 0x11..11, then signTypedData by that key and by viem/tempo
+    // Account.fromSecp256k1(0x22..22, { access: root }) (a Keychain V2 envelope).
+    const FIXTURE_CHAIN_ID: u64 = 42431;
+    const FIXTURE_CHALLENGE_ID: &str = "kM9xPqWvT2nJrHsY4aDfEb";
+    const FIXTURE_REALM: &str = "api.example.com";
+    const VIEM_PROOF_HASH: &str =
+        "0x2db9f3ad46355ef4479f0b322396221c624618117d42cfa3ddcce707682ab155";
+    const VIEM_SIGNATURE: &str = "0x3baf02ba159042829a9bcaa17774cecb25b0194cccff0dd076db7474befcaa2b26592fc409ed59c24888f9d3b276debe61696c86793e9a35632cbff79c3496d01c";
+    const VIEM_KEYCHAIN_SIGNATURE: &str = "0x0419e7e376e7c213b7e7e7e46cc70a5dd086daff2aa64ad10a15b8ed2c208c147daf58f5ec3989b4de18173565f10d3acad84fc1cf3ccc20181099d57723b7b9f9ed3821442c44f641e0eb4e8a4f2965d15be9e8621c";
+
+    fn fixture_key(byte: u8) -> alloy::signers::local::PrivateKeySigner {
+        alloy::signers::local::PrivateKeySigner::from_bytes(&B256::repeat_byte(byte)).unwrap()
+    }
+
+    #[test]
+    fn test_signing_hash_matches_viem() {
+        let root = fixture_key(0x11);
+        assert_eq!(
+            signing_hash(
+                root.address(),
+                FIXTURE_CHAIN_ID,
+                FIXTURE_CHALLENGE_ID,
+                FIXTURE_REALM
+            )
+            .to_string(),
+            VIEM_PROOF_HASH
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_proof_matches_viem() {
+        let root = fixture_key(0x11);
+        let signature = sign_proof(
+            &root,
+            root.address(),
+            FIXTURE_CHAIN_ID,
+            FIXTURE_CHALLENGE_ID,
+            FIXTURE_REALM,
+        )
+        .await
+        .unwrap();
+        assert_eq!(signature, VIEM_SIGNATURE);
+    }
+
+    #[test]
+    fn test_recovers_viem_keychain_v2_proof() {
+        let root = fixture_key(0x11);
+        let access = fixture_key(0x22);
+        let other = fixture_key(0x33);
+        let recover = |account| {
+            recover_proof_signer(
+                account,
+                FIXTURE_CHAIN_ID,
+                FIXTURE_CHALLENGE_ID,
+                FIXTURE_REALM,
+                VIEM_KEYCHAIN_SIGNATURE,
+            )
+        };
+        assert_eq!(recover(root.address()).unwrap(), access.address());
+        // A Keychain envelope must name the proof's account as its user.
+        assert!(recover(other.address()).is_err());
+        assert_eq!(
+            recover_proof_signer(
+                root.address(),
+                FIXTURE_CHAIN_ID,
+                FIXTURE_CHALLENGE_ID,
+                FIXTURE_REALM,
+                VIEM_SIGNATURE,
+            )
+            .unwrap(),
+            root.address()
+        );
+    }
+
+    #[test]
+    fn test_recovers_keychain_v1_proof() {
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::KeychainSignature;
+
+        let root = fixture_key(0x11);
+        let access = fixture_key(0x22);
+        let hash = signing_hash(
+            root.address(),
+            FIXTURE_CHAIN_ID,
+            FIXTURE_CHALLENGE_ID,
+            FIXTURE_REALM,
+        );
+        let inner = access.sign_hash_sync(&hash).unwrap();
+        let v1 = TempoSignature::Keychain(KeychainSignature::new_v1(
+            root.address(),
+            PrimitiveSignature::Secp256k1(inner),
+        ));
+        let recovered = recover_proof_signer(
+            root.address(),
+            FIXTURE_CHAIN_ID,
+            FIXTURE_CHALLENGE_ID,
+            FIXTURE_REALM,
+            &alloy::hex::encode_prefixed(v1.to_bytes()),
+        )
+        .unwrap();
+        assert_eq!(recovered, access.address());
     }
 }

@@ -10,7 +10,8 @@ use reqwest::{Request, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
 use super::challenge_selection::{
-    expired_payment_error, select_supported_challenge, ChallengeSelectionError,
+    expired_payment_error, select_supported_challenge, with_available_methods,
+    ChallengeSelectionError,
 };
 use super::error::HttpError;
 use super::events::{
@@ -304,6 +305,10 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     if !paid_challenge_ids.is_empty() {
                         return Ok(resp);
                     }
+                    let message = with_available_methods(
+                        message,
+                        self.provider.accept_payment_header().as_deref(),
+                    );
                     return Err(self
                         .fail(None, HttpError::NoSupportedChallenge(message))
                         .await);

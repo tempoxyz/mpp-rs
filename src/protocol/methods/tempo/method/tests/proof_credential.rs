@@ -351,3 +351,141 @@ async fn test_concurrent_proof_submissions_only_one_succeeds() {
     let err = res1.err().or(res2.err()).unwrap();
     assert!(err.to_string().contains("already been used"));
 }
+
+// mppx parity fixture: see `proof.rs` tests. Root key 0x11..11, access key
+// 0x22..22, Keychain V2 envelope signed by viem/tempo.
+const VIEM_KEYCHAIN_SIGNATURE: &str = "0x0419e7e376e7c213b7e7e7e46cc70a5dd086daff2aa64ad10a15b8ed2c208c147daf58f5ec3989b4de18173565f10d3acad84fc1cf3ccc20181099d57723b7b9f9ed3821442c44f641e0eb4e8a4f2965d15be9e8621c";
+
+fn fixture_key(byte: u8) -> alloy::signers::local::PrivateKeySigner {
+    alloy::signers::local::PrivateKeySigner::from_bytes(&B256::repeat_byte(byte)).unwrap()
+}
+
+/// The AccountKeychain `getKey` answer for the fixture's access key.
+fn get_key_result(expiry: u64, revoked: bool) -> serde_json::Value {
+    let word = |value: &[u8]| {
+        let mut word = [0u8; 32];
+        word[32 - value.len()..].copy_from_slice(value);
+        alloy::hex::encode(word)
+    };
+    serde_json::Value::String(format!(
+        "0x{}{}{}{}{}",
+        word(&[0]),
+        word(fixture_key(0x22).address().as_slice()),
+        word(&expiry.to_be_bytes()),
+        word(&[0]),
+        word(&[u8::from(revoked)]),
+    ))
+}
+
+fn keychain_proof_credential() -> (PaymentCredential, ChargeRequest) {
+    let request = test_charge_request_with_amount("0");
+    let challenge = PaymentChallenge::new(
+        "kM9xPqWvT2nJrHsY4aDfEb",
+        "api.example.com",
+        "tempo",
+        "charge",
+        Base64UrlJson::from_typed(&request).unwrap(),
+    );
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        proof::proof_source(fixture_key(0x11).address(), 42431),
+        crate::protocol::core::PaymentPayload::proof(VIEM_KEYCHAIN_SIGNATURE),
+    );
+    (credential, request)
+}
+
+fn keychain_method(
+    expiry: u64,
+    revoked: bool,
+) -> ChargeMethod<impl alloy::providers::Provider<tempo_alloy::TempoNetwork> + Clone> {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&get_key_result(expiry, revoked));
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+    let method = ChargeMethod::new(provider);
+    method.cached_chain_id.set(42431).unwrap();
+    method
+}
+
+/// A Keychain V2 proof from viem's access-key account is accepted when the
+/// AccountKeychain lists the access key as active for the account (mppx
+/// `recoverAuthorizedProofSigner` and `isActiveAccessKey`).
+#[tokio::test]
+async fn test_viem_keychain_v2_proof_accepted_for_active_access_key() {
+    let (credential, request) = keychain_proof_credential();
+    let receipt = keychain_method(u64::MAX, false)
+        .verify(&credential, &request)
+        .await
+        .unwrap();
+    assert_eq!(receipt.reference, "kM9xPqWvT2nJrHsY4aDfEb");
+}
+
+#[tokio::test]
+async fn test_viem_keychain_v2_proof_rejected_for_inactive_access_key() {
+    let (credential, request) = keychain_proof_credential();
+    for (expiry, revoked) in [(u64::MAX, true), (1, false), (0, false)] {
+        let err = keychain_method(expiry, revoked)
+            .verify(&credential, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Proof signature does not match source"),
+            "expiry {expiry}, revoked {revoked}: {err}"
+        );
+    }
+}
+
+/// A Keychain envelope that names another account is rejected before any
+/// AccountKeychain lookup.
+#[tokio::test]
+async fn test_keychain_proof_for_another_account_is_rejected() {
+    let (mut credential, request) = keychain_proof_credential();
+    credential.source = Some(proof::proof_source(fixture_key(0x33).address(), 42431));
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let method = ChargeMethod::new(provider);
+    method.cached_chain_id.set(42431).unwrap();
+    let err = method.verify(&credential, &request).await.unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Proof signature does not match source"));
+}
+
+/// As in mppx, proofs are claimed only in an explicitly configured store: the
+/// store `Mpp::create` installs by default records transaction hashes only.
+#[tokio::test]
+async fn test_hash_store_does_not_claim_proofs() {
+    use crate::store::MemoryStore;
+
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let request = test_charge_request_with_amount("0");
+    let challenge = test_proof_challenge(&request);
+    let signature = proof::sign_proof(
+        &signer,
+        signer.address(),
+        42431,
+        &challenge.id,
+        &challenge.realm,
+    )
+    .await
+    .unwrap();
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        proof::proof_source(signer.address(), 42431),
+        crate::protocol::core::PaymentPayload::proof(signature),
+    );
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let store = Arc::new(MemoryStore::new());
+    let method = ChargeMethod::new(provider).with_hash_store(store.clone());
+    method.cached_chain_id.set(42431).unwrap();
+
+    method.verify(&credential, &request).await.unwrap();
+    method.verify(&credential, &request).await.unwrap();
+    let key = format!("mpp:charge:proof:{}", challenge.id);
+    assert!(store.get(&key).await.unwrap().is_none());
+}

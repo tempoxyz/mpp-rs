@@ -702,12 +702,13 @@ fn test_per_request_fee_payer_offers_ousd() {
             .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random()),
     )
     .unwrap();
-    assert!(!mpp.fee_payer());
+    // A configured fee payer sponsors charges by default, as in mppx.
+    assert!(mpp.fee_payer());
     let offers = mpp
         .charge_with_options(
             "1",
             ChargeOptions {
-                fee_payer: true,
+                fee_payer: Some(true),
                 ..Default::default()
             },
         )
