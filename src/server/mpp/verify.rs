@@ -340,15 +340,8 @@ where
         // A route that does not sponsor (it opted out with fee_payer:
         // Some(false), or has no fee payer) must not sponsor a credential
         // issued for a sponsored route at the same price.
-        let request = Self::decode_credential_request(credential)?;
-        self.verify_expected_request_matches(credential, &request, &expected)?;
-        if charge_fee_payer(&request) && !charge_fee_payer(&expected) {
-            return Err(VerificationError::with_code(
-                "Fee payer mismatch: credential was issued for a sponsored route",
-                crate::protocol::traits::ErrorCode::InvalidChallenge,
-            ));
-        }
-        self.broadcast(credential, &request).await
+        self.broadcast_credential_with_expected_request(credential, &expected)
+            .await
     }
 
     /// Backwards-compatible alias for [`Self::broadcast_credential`].
@@ -446,20 +439,6 @@ where
         if request.external_id != expected.external_id {
             return Err(VerificationError::with_code(
                 "External ID mismatch: credential was issued for a different order",
-                crate::protocol::traits::ErrorCode::InvalidChallenge,
-            ));
-        }
-
-        // A route that does not sponsor must not sponsor a credential issued
-        // for a sponsored route. An expected request without method details
-        // (built by hand) does not say, so it is not compared here.
-        #[cfg(feature = "tempo")]
-        if expected.method_details.is_some()
-            && charge_fee_payer(request)
-            && !charge_fee_payer(expected)
-        {
-            return Err(VerificationError::with_code(
-                "Fee payer mismatch: credential was issued for a sponsored route",
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
@@ -652,15 +631,4 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         self.broadcast_credential_with_expected_request(credential, &expected)
             .await
     }
-}
-
-/// Whether a charge request asks for fee sponsorship (`methodDetails.feePayer`).
-#[cfg(feature = "tempo")]
-fn charge_fee_payer(request: &ChargeRequest) -> bool {
-    request
-        .method_details
-        .as_ref()
-        .and_then(|details| details.get("feePayer"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
