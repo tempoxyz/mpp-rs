@@ -550,6 +550,56 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn redirected_402_after_paid_retry_is_returned() {
+        let (_, www_auth) = test_challenge();
+        let posts = Arc::new(AtomicU32::new(0));
+        let observed = posts.clone();
+        let app = Router::new()
+            .route(
+                "/jobs",
+                axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    let observed = observed.clone();
+                    async move {
+                        if req.headers().contains_key("authorization") {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            return (
+                                AxumStatusCode::SEE_OTHER,
+                                [(axum::http::header::LOCATION, "/result")],
+                                "",
+                            )
+                                .into_response();
+                        }
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/result",
+                get(|| async { (AxumStatusCode::PAYMENT_REQUIRED, "pay up").into_response() }),
+            );
+        let base_url = spawn_server(app).await;
+        let provider = MockProvider::new();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base_url}/jobs"))
+            .body("original")
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(resp.url().path(), "/result");
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn paid_retry_preserves_method_and_body() {
         for method in [reqwest::Method::POST, reqwest::Method::PUT] {
             let (_, www_auth) = test_challenge();

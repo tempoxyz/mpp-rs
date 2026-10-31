@@ -246,6 +246,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 && *method != Method::HEAD
                 && !same_resource(&payment_context.url, resp.url())
             {
+                // After a paid retry the request may already have run, so hand
+                // back the redirected 402 instead of an error that reads unpaid.
+                if payment_attempt > 0 {
+                    return Ok(resp);
+                }
                 return Err(self
                     .fail(None, HttpError::RedirectedRequest(method.to_string()))
                     .await);
