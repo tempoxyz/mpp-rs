@@ -215,10 +215,9 @@ async fn wait_for_receipt(
     ))
 }
 
-/// Start a JSON-RPC proxy to `rpc` that answers `tempo_simulateV1` the way a
-/// node without the method does, as the public Tempo RPC endpoints do.
-/// Returns its URL and the methods it was asked for, in order.
-async fn start_rpc_without_simulate(rpc: &str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+/// Start a JSON-RPC proxy to `rpc` that records the methods it is asked for.
+/// Returns its URL and those methods, in order.
+async fn start_recording_rpc(rpc: &str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
     let upstream = rpc.to_string();
     let client = Client::new();
@@ -232,17 +231,7 @@ async fn start_rpc_without_simulate(rpc: &str) -> (String, Arc<std::sync::Mutex<
                     (methods.clone(), upstream.clone(), client.clone());
                 async move {
                     let method = request["method"].as_str().unwrap_or_default().to_string();
-                    methods.lock().unwrap().push(method.clone());
-                    if method == "tempo_simulateV1" {
-                        return Json(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": request["id"],
-                            "error": {
-                                "code": -32601,
-                                "message": "the method tempo_simulateV1 does not exist/is not available",
-                            },
-                        }));
-                    }
+                    methods.lock().unwrap().push(method);
                     let response = client
                         .post(&upstream)
                         .json(&request)
@@ -1106,14 +1095,14 @@ async fn test_e2e_charge_with_fee_payer() {
     let _ = handle.await;
 }
 
-/// A node without `tempo_simulateV1` (the public RPC endpoints) still gets a
-/// pre-broadcast check: the sponsored transaction is simulated with `eth_call`
-/// and then broadcast.
+/// As in mppx, a sponsored transaction is simulated with two `eth_call`s
+/// before it is broadcast: the sender's calls, then the co-signed transaction
+/// with its fee payer and fee token.
 #[tokio::test]
-async fn test_fee_payer_simulates_with_eth_call_without_simulate_v1() {
+async fn test_fee_payer_simulates_with_eth_call_before_broadcast() {
     let rpc = rpc_url();
     let chain_id = get_chain_id(&rpc).await;
-    let (server_rpc, methods) = start_rpc_without_simulate(&rpc).await;
+    let (server_rpc, methods) = start_recording_rpc(&rpc).await;
 
     let server_signer = PrivateKeySigner::random();
     let client_signer = PrivateKeySigner::random();
@@ -1143,30 +1132,34 @@ async fn test_fee_payer_simulates_with_eth_call_without_simulate_v1() {
     assert_eq!(resp.status(), 200);
 
     let methods = methods.lock().unwrap().clone();
-    let simulate = methods
-        .iter()
-        .position(|method| method == "tempo_simulateV1")
-        .expect("tempo_simulateV1 was not tried");
     let broadcast = methods
         .iter()
         .position(|method| method.starts_with("eth_sendRawTransaction"))
         .unwrap_or_else(|| panic!("transaction was not broadcast: {methods:?}"));
     assert!(
-        methods[simulate..broadcast].iter().any(|m| m == "eth_call"),
-        "no eth_call between the failed simulation and the broadcast: {methods:?}"
+        methods[..broadcast]
+            .iter()
+            .filter(|m| *m == "eth_call")
+            .count()
+            >= 2,
+        "the sender and the co-signed transaction were not both simulated: {methods:?}"
+    );
+    assert!(
+        !methods.iter().any(|m| m == "tempo_simulateV1"),
+        "{methods:?}"
     );
 
     handle.abort();
     let _ = handle.await;
 }
 
-/// The `eth_call` fallback rejects a sponsored transaction that would revert,
-/// so the fee payer does not broadcast and pay for it.
+/// The sender simulation rejects a sponsored transaction that would revert,
+/// so the fee payer does not sign, broadcast or pay for it.
 #[tokio::test]
-async fn test_fee_payer_eth_call_fallback_rejects_reverting_transaction() {
+async fn test_fee_payer_simulation_rejects_reverting_transaction() {
     let rpc = rpc_url();
     let chain_id = get_chain_id(&rpc).await;
-    let (server_rpc, methods) = start_rpc_without_simulate(&rpc).await;
+    let (server_rpc, methods) = start_recording_rpc(&rpc).await;
 
     let server_signer = PrivateKeySigner::random();
     let fee_payer_addr = server_signer.address();
@@ -1202,7 +1195,7 @@ async fn test_fee_payer_eth_call_fallback_rejects_reverting_transaction() {
 
     let methods = methods.lock().unwrap().clone();
     assert!(
-        methods.iter().any(|m| m == "tempo_simulateV1") && methods.iter().any(|m| m == "eth_call"),
+        methods.iter().any(|m| m == "eth_call"),
         "the transaction was not simulated: {methods:?}"
     );
     assert!(

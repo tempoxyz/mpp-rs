@@ -13,8 +13,9 @@ pub use crate::protocol::methods::tempo::session_method::{
 };
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 pub use crate::protocol::methods::tempo::{
-    RelayConfig as TempoRelayConfig, RelayErrorCode as TempoRelayErrorCode, TempoChargeExt,
-    TempoMethodDetails, CHAIN_ID, METHOD_NAME,
+    RelayConfig as TempoRelayConfig, RelayErrorCode as TempoRelayErrorCode,
+    RemoteFeePayer as TempoRemoteFeePayer, TempoChargeExt, TempoMethodDetails, CHAIN_ID,
+    METHOD_NAME,
 };
 
 /// Configuration for the Tempo payment method.
@@ -39,12 +40,13 @@ pub struct TempoBuilder {
     pub(crate) trusted_request_hosts: Vec<String>,
     pub(crate) secret_key: Option<String>,
     pub(crate) decimals: u32,
-    pub(crate) fee_payer: bool,
+    pub(crate) fee_payer: Option<bool>,
     pub(crate) machine_token_enabled: bool,
     pub(crate) chain_id: Option<u64>,
     pub(crate) fee_payer_signer: Option<std::sync::Arc<crate::protocol::methods::tempo::DynSigner>>,
     pub(crate) fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     pub(crate) fee_payer_fee_token: Option<Address>,
+    pub(crate) remote_fee_payer: Option<TempoRemoteFeePayer>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
@@ -128,17 +130,21 @@ impl TempoBuilder {
         self
     }
 
-    /// Enable fee sponsorship for all challenges (default: `false`).
+    /// Enable or disable fee sponsorship for all challenges.
+    ///
+    /// By default, as in mppx, charges are sponsored whenever a fee payer is
+    /// configured ([`fee_payer_signer`](Self::fee_payer_signer)); a route can
+    /// opt out with [`ChargeOptions::fee_payer`](super::ChargeOptions::fee_payer)
+    /// set to `Some(false)`. `fee_payer(false)` turns default sponsorship off.
     ///
     /// When enabled, all charge challenges will include `feePayer: true` in
     /// their `methodDetails`, and so will session challenges if the session
     /// method sponsors client transactions (Tempo's `SessionMethod` does
-    /// not). Requires [`fee_payer_signer`](Self::fee_payer_signer), the
-    /// signer that sponsors transaction fees, or a [`relay`](Self::relay):
-    /// [`Mpp::create()`](super::Mpp::create) rejects the configuration
-    /// otherwise.
+    /// not). `fee_payer(true)` requires a fee payer or a
+    /// [`relay`](Self::relay): [`Mpp::create()`](super::Mpp::create) rejects
+    /// the configuration otherwise.
     pub fn fee_payer(mut self, enabled: bool) -> Self {
-        self.fee_payer = enabled;
+        self.fee_payer = Some(enabled);
         self
     }
 
@@ -161,6 +167,29 @@ impl TempoBuilder {
         S: alloy::signers::Signer + Send + Sync + 'static,
     {
         self.fee_payer_signer = Some(std::sync::Arc::new(signer));
+        self
+    }
+
+    /// Sponsor charges through a hosted fee-payer service at `url`, as mppx's
+    /// `feePayer: url` server option.
+    ///
+    /// The service co-signs each sponsored transaction over JSON-RPC
+    /// `eth_fillTransaction`; the server keeps every sender-committed field,
+    /// checks the service's fee token against an explicit
+    /// [`fee_payer_allowed_fee_tokens`](Self::fee_payer_allowed_fee_tokens)
+    /// list when one is set, simulates the co-signed transaction and
+    /// broadcasts it itself. Charges are sponsored by default once a fee payer
+    /// is configured. Use [`remote_fee_payer`](Self::remote_fee_payer) to send
+    /// headers, such as credentials, with each request.
+    pub fn fee_payer_url(self, url: &str) -> Self {
+        self.remote_fee_payer(TempoRemoteFeePayer::new(url))
+    }
+
+    /// Sponsor charges through a hosted fee-payer service, as mppx's
+    /// `feePayer: { url, headers }` server option. See
+    /// [`fee_payer_url`](Self::fee_payer_url).
+    pub fn remote_fee_payer(mut self, fee_payer: TempoRemoteFeePayer) -> Self {
+        self.remote_fee_payer = Some(fee_payer);
         self
     }
 
@@ -191,6 +220,8 @@ impl TempoBuilder {
     /// Set the replay-protection store (default: in-memory).
     ///
     /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
+    /// The store, the default one included, also makes zero-amount proof
+    /// credentials single-use per challenge.
     pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
         self.store = Some(store);
         self
@@ -286,12 +317,13 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         trusted_request_hosts: Vec::new(),
         secret_key: None,
         decimals: 6,
-        fee_payer: false,
+        fee_payer: None,
         machine_token_enabled: false,
         chain_id: None,
         fee_payer_signer: None,
         fee_payer_allowed_fee_tokens: None,
         fee_payer_fee_token: None,
+        remote_fee_payer: None,
         // Default in-memory store; replay protection on by default.
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         relay: None,
