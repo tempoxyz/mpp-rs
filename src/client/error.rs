@@ -24,6 +24,10 @@ pub enum HttpError {
     /// A redirect changed the request origin before returning a payment challenge
     CrossOriginRedirect,
 
+    /// A redirect may have changed a non-GET/HEAD request's method before it
+    /// returned a payment challenge, so the paid retry cannot be resent safely.
+    RedirectedRequest(String),
+
     /// A zero-amount Tempo proof was requested for a different HTTP realm.
     CrossRealmProof,
 
@@ -53,6 +57,10 @@ impl fmt::Display for HttpError {
             Self::CrossOriginRedirect => {
                 write!(f, "Refusing to send payment credential across redirect")
             }
+            Self::RedirectedRequest(method) => write!(
+                f,
+                "Cannot automatically pay a redirected {method} request"
+            ),
             Self::CrossRealmProof => write!(f, "Refusing to sign Tempo proof for a different HTTP realm"),
             Self::UnsafeCredentialHeader => write!(
                 f,

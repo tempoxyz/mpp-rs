@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::future::Future;
 
 use reqwest::header::{HeaderMap, HeaderValue, HOST, WWW_AUTHENTICATE};
-use reqwest::{Request, Response, StatusCode};
+use reqwest::{Method, Request, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
 use super::challenge_selection::{
@@ -236,6 +236,24 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             if payment_context.url.origin() != resp.url().origin() {
                 return Err(self.fail(None, HttpError::CrossOriginRedirect).await);
+            }
+
+            // reqwest does not expose the redirect chain, so a redirected
+            // non-GET/HEAD request may have become a GET (301/302/303) before
+            // reaching the challenge. Refuse to guess the method to pay with.
+            let method = retry.method();
+            if *method != Method::GET
+                && *method != Method::HEAD
+                && !same_resource(&payment_context.url, resp.url())
+            {
+                // After a paid retry the request may already have run, so hand
+                // back the redirected 402 instead of an error that reads unpaid.
+                if payment_attempt > 0 {
+                    return Ok(resp);
+                }
+                return Err(self
+                    .fail(None, HttpError::RedirectedRequest(method.to_string()))
+                    .await);
             }
 
             let www_auth_values: Vec<&[u8]> = resp
@@ -692,6 +710,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             .await;
         FlowError::Payment(error)
     }
+}
+
+/// Whether two URLs name the same resource; fragments are never sent.
+fn same_resource(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.as_str().split('#').next() == b.as_str().split('#').next()
 }
 
 /// Whether a zero-amount Tempo challenge names a different host than the caller's request.
