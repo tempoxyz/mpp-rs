@@ -163,10 +163,11 @@ pub fn recover_proof_signer(
     let recovered = if let TempoSignature::Primitive(signature) = &signature {
         signature.recover_signer(&hash)
     } else if let TempoSignature::Keychain(signature) = &signature {
-        // As in mppx, a Keychain envelope must name the proof's account.
+        // The envelope must act for the account the proof names; otherwise an
+        // access key of that account could vouch for a proof built for another user.
         if signature.user_address != account {
             return Err(MppError::invalid_payload(
-                "keychain proof signature names another account",
+                "proof keychain envelope names a different account",
             ));
         }
         signature.key_id(&hash)
@@ -251,6 +252,48 @@ mod tests {
             &signature,
             signer.address(),
         ));
+    }
+
+    #[tokio::test]
+    async fn test_recover_proof_signer_checks_keychain_account() {
+        use alloy::signers::SignerSync;
+        use tempo_alloy::primitives::transaction::KeychainSignature;
+
+        let account = alloy::signers::local::PrivateKeySigner::random().address();
+        let other = alloy::signers::local::PrivateKeySigner::random().address();
+        let access_key = alloy::signers::local::PrivateKeySigner::random();
+        let hash = signing_hash(account, 4217, "challenge-123", "api.example.com");
+        let envelope = |user| {
+            let keychain = KeychainSignature::new(
+                user,
+                PrimitiveSignature::Secp256k1(
+                    access_key
+                        .sign_hash_sync(&KeychainSignature::signing_hash(hash, user))
+                        .unwrap(),
+                ),
+            );
+            alloy::hex::encode_prefixed(TempoSignature::Keychain(keychain).to_bytes())
+        };
+
+        assert_eq!(
+            recover_proof_signer(
+                account,
+                4217,
+                "challenge-123",
+                "api.example.com",
+                &envelope(account)
+            )
+            .unwrap(),
+            access_key.address()
+        );
+        assert!(recover_proof_signer(
+            account,
+            4217,
+            "challenge-123",
+            "api.example.com",
+            &envelope(other)
+        )
+        .is_err());
     }
 
     #[tokio::test]
