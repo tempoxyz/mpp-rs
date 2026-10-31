@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.2 (2026-10-31)
+
+### Patch Changes
+
+- Rejected zero-amount proof credentials whose Keychain envelope names a different account than the proof's source, even when its access key is active for the source. (by @brendanjryan, [#666](https://github.com/tempoxyz/mpp-rs/pull/666))
+
 ## 0.18.1 (2026-10-29)
 
 ### Patch Changes
