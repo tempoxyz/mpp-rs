@@ -58,9 +58,11 @@
 //!
 //! # Fee Sponsorship
 //!
-//! When `feePayer: true` is set, the server forwards the signed transaction to a
-//! fee payer service (either `feePayerUrl` or the default testnet sponsor) which
-//! adds its signature and broadcasts.
+//! When `feePayer: true` is set, the client signs a `0x78` fee payer envelope
+//! and the server sponsors it: a local fee payer signer co-signs it, or a
+//! hosted fee payer configured on the server ([`RemoteFeePayer`]) co-signs it
+//! over `eth_fillTransaction`. The server then simulates and broadcasts the
+//! co-signed transaction. Challenges never carry a fee payer URL.
 //!
 //! ```
 //! use mpp::protocol::intents::ChargeRequest;
@@ -150,7 +152,7 @@ pub use types::{Split, TempoMethodDetails};
 pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
 #[cfg(feature = "server")]
-pub use method::{ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride};
+pub use method::{ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride, RemoteFeePayer};
 #[cfg(feature = "server")]
 pub use relay::{RelayConfig, RelayErrorCode};
 #[cfg(feature = "server")]
@@ -224,10 +226,17 @@ fn ensure_sponsored_expiry_floor(
         .and_then(|details| details.get("feePayer"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    // Zero-amount charges are paid with a proof credential: nothing is
-    // co-signed or broadcast, so the floor does not apply.
+    // Zero-amount charges are paid with a proof credential, and push-only
+    // charges with a transaction the client broadcasts itself: nothing is
+    // co-signed, so the floor does not apply (mppx `Charge.request`).
     let zero_amount = request.amount_u256().is_ok_and(|amount| amount.is_zero());
-    if !sponsored || zero_amount {
+    let push_only = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("supportedModes"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|modes| !modes.iter().any(|mode| mode.as_str() == Some("pull")));
+    if !sponsored || zero_amount || push_only {
         return Ok(());
     }
     let expires_at =
