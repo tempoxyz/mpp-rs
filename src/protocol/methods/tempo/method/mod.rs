@@ -246,6 +246,9 @@ where
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
+    /// Once authenticated proof verification enables expiry in this store, all proof
+    /// consumers sharing it must use the HMAC-authenticated server path. Direct
+    /// verification then fails closed, even after individual replay markers expire.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.proof_store = Some(Arc::clone(&store));
         self.store = Some(store);

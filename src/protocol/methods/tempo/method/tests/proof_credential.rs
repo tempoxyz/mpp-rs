@@ -516,6 +516,21 @@ async fn proof_reservation_lifetime_covers_challenge_expiry_and_skew() {
     let ttl = store.1.lock().unwrap().unwrap();
     assert!(ttl > Duration::from_secs(329) && ttl <= Duration::from_secs(330));
     assert!(method.reserve_proof_credential(&credential).await.is_err());
+    // Simulate ordinary TTL reclamation, then strip the unsigned expiry before direct reuse.
+    store
+        .0
+        .delete(&format!("mpp:charge:proof:{}", credential.challenge.id))
+        .await
+        .unwrap();
+    let mut direct = method.clone();
+    direct.authenticated_expiry = false;
+    let mut without_expiry = credential.clone();
+    without_expiry.challenge.expires = None;
+    let error = direct
+        .reserve_proof_credential(&without_expiry)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("HMAC-authenticated"));
     for expires in ["invalid", "2000-01-01T00:00:00Z"] {
         let mut invalid = credential.clone();
         invalid.challenge.expires = Some(expires.into());
