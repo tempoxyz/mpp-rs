@@ -34,7 +34,10 @@ use self::recovery::{
     can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
     recover_stored_channel, RecoveryScope,
 };
-use self::store::{ChannelStore, ChannelStoreLease, MemoryChannelStore, StoredChannelEntry};
+use self::store::{
+    ChannelStore, ChannelStoreLease, MemoryChannelStore, OriginBoundChannelStore,
+    StoredChannelEntry,
+};
 use super::autoswap::AutoswapConfig;
 use super::signing::TempoPrimitiveSigner;
 use crate::client::{
@@ -43,6 +46,19 @@ use crate::client::{
 };
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
+
+/// The default client for requests that carry a `Payment-Session` channel
+/// hint, which never follows redirects: reqwest forwards custom headers across
+/// redirects, so a caller's client could hand the hint to another origin.
+///
+/// Built per use: hint requests are rare, and a pooled client would outlive
+/// the runtime its connections were opened on.
+fn default_hint_client() -> Result<reqwest::Client, MppError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .mpp_http("failed to build the session hint client")
+}
 
 fn ensure_redirect_safe_credential_header(challenge: &PaymentChallenge) -> Result<(), MppError> {
     if challenge.credential_header() != "Authorization" {
@@ -156,6 +172,13 @@ pub struct TempoSessionProvider {
     /// Channels whose top-up may have been applied without a response. They
     /// get no further top-ups until reconciled, as in the TypeScript SDK.
     uncertain_top_ups: Arc<Mutex<HashSet<B256>>>,
+    /// HTTP origin of the first request this provider paid. Later requests to
+    /// another origin, and stored channels bound to one, are refused, as
+    /// mppx's `SessionManager` does. Shared by clones.
+    origin: Arc<Mutex<Option<String>>>,
+    /// Client for requests carrying a `Payment-Session` channel hint; a
+    /// no-redirect default client when unset.
+    hint_client: Option<reqwest::Client>,
 }
 
 /// How long a session management request may take before it fails with an
@@ -267,8 +290,24 @@ struct PendingOpen {
 }
 
 struct SessionPaymentLease {
+    /// Channel the leased credential pays from, so commit and rollback are
+    /// routed to the provider whose lease matches the credential's channel.
+    channel_id: Option<String>,
     _process: tokio::sync::OwnedMutexGuard<()>,
     _store: Box<dyn ChannelStoreLease>,
+}
+
+/// How strongly a session provider holds a payment, strongest first, so a
+/// commit or rollback reaches the provider holding its lease rather than one
+/// that only knows the channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PaymentHold {
+    /// A pending lease for the challenge, paying from the credential's channel.
+    LeaseOnChannel,
+    /// A pending lease for the challenge, recorded for another or no channel.
+    Lease,
+    /// No lease, but the provider knows the credential's channel.
+    Channel,
 }
 
 enum TopUpRoute<'a> {
@@ -295,6 +334,7 @@ impl TempoSessionProvider {
     ) -> Result<Self, MppError> {
         let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
         let rpc_provider = super::rpc_provider(url.clone());
+        let origin = Arc::new(Mutex::new(None));
         Ok(Self {
             signer: signer.into(),
             rpc_url: url,
@@ -309,7 +349,10 @@ impl TempoSessionProvider {
             autoswap: None,
             fee_token: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
-            channel_store: Arc::new(MemoryChannelStore::default()),
+            channel_store: Arc::new(OriginBoundChannelStore {
+                inner: Arc::new(MemoryChannelStore::default()),
+                origin: origin.clone(),
+            }),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
             pending_opens: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
@@ -325,6 +368,8 @@ impl TempoSessionProvider {
             trusted_tempo_proof_realms: Vec::new(),
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
             uncertain_top_ups: Arc::new(Mutex::new(HashSet::new())),
+            origin,
+            hint_client: None,
         })
     }
 
@@ -379,11 +424,22 @@ impl TempoSessionProvider {
         let amount = |value: &str| value.parse::<u128>().mpp_config("invalid session amount");
         match name {
             "payment-need-voucher" => {
+                // Only a well-formed payment event for a channel this provider
+                // holds signs or discloses session state, so only it binds the
+                // provider to the stream's origin.
                 let parsed = serde_json::from_str::<NeedVoucherEvent>(data)
                     .mpp_config("invalid payment-need-voucher event");
+                let bound = match &parsed {
+                    Ok(event) if self.holds_channel_hex(&event.channel_id) => self.bind_origin(url),
+                    Ok(_) => Err(MppError::InvalidConfig(
+                        "payment-need-voucher event for an unknown session channel".into(),
+                    )),
+                    Err(_) => Ok(()),
+                };
                 let (client, url) = (client.clone(), url.to_owned());
                 Some(Box::pin(async move {
                     let event = parsed?;
+                    bound?;
                     session
                         .acknowledge_accepted(
                             &event.channel_id,
@@ -404,9 +460,18 @@ impl TempoSessionProvider {
                 let parsed =
                     serde_json::from_str::<crate::protocol::methods::tempo::SessionReceipt>(data)
                         .mpp_config("invalid payment-receipt event");
+                // A receipt for a channel this provider does not hold changes
+                // nothing, so it neither binds the origin nor fails the stream.
+                let known =
+                    matches!(&parsed, Ok(receipt) if self.holds_channel_hex(&receipt.channel_id));
+                let bound = if known { self.bind_origin(url) } else { Ok(()) };
                 let url = url.parse::<reqwest::Url>().ok();
                 Some(Box::pin(async move {
                     let receipt = parsed?;
+                    bound?;
+                    if !known {
+                        return Ok(());
+                    }
                     session
                         .acknowledge_accepted(
                             &receipt.channel_id,
@@ -527,9 +592,193 @@ impl TempoSessionProvider {
     ///
     /// The store is only a cache. Every restored channel is checked against
     /// its descriptor, the active challenge, and current on-chain state.
+    ///
+    /// Channels are persisted with this provider's HTTP origin, and a channel
+    /// bound to another origin is never reused.
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
-        self.channel_store = store;
+        self.channel_store = Arc::new(OriginBoundChannelStore {
+            inner: store,
+            origin: self.origin.clone(),
+        });
         self
+    }
+
+    /// Binds this provider to `url`'s HTTP origin on first use and refuses
+    /// any other origin afterwards, so a session's channel hints, vouchers and
+    /// stored channels only ever reach the service that opened them.
+    pub(crate) fn bind_origin(&self, url: &str) -> Result<(), MppError> {
+        let url = reqwest::Url::parse(url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .ok_or_else(|| {
+                MppError::InvalidConfig("session payments require an HTTP origin".into())
+            })?;
+        let origin = url.origin().ascii_serialization();
+        let mut bound = self.origin.lock().unwrap();
+        match bound.as_ref() {
+            Some(bound) if *bound != origin => Err(MppError::InvalidConfig(
+                "session payment origin mismatch".into(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *bound = Some(origin);
+                Ok(())
+            }
+        }
+    }
+
+    /// Like [`Self::bind_origin`] for a URL the provider sends nothing to,
+    /// such as an MCP resource: an HTTP(S) URL binds, and any other URL
+    /// leaves the provider unbound, so its stored channels' origins still
+    /// guard their reuse.
+    pub(crate) fn bind_http_origin(&self, url: &str) -> Result<(), MppError> {
+        match reqwest::Url::parse(url) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => self.bind_origin(url),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether this provider holds the channel named by `channel_id_hex`,
+    /// in any hex spelling.
+    fn holds_channel_hex(&self, channel_id_hex: &str) -> bool {
+        let Ok(channel_id) = channel_id_hex.parse::<B256>() else {
+            return false;
+        };
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .contains_key(&channel_id.to_string())
+    }
+
+    /// Whether this provider is already bound to `url`'s HTTP origin. Never
+    /// binds, so a request that only reads state cannot claim the provider.
+    fn is_bound_to(&self, url: &str) -> bool {
+        let Some(url) = reqwest::Url::parse(url)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+        else {
+            return false;
+        };
+        self.origin.lock().unwrap().as_deref() == Some(url.origin().ascii_serialization().as_str())
+    }
+
+    /// How this provider holds `challenge`'s payment with `credential`, if at
+    /// all: through its pending lease, on the credential's channel or not, or
+    /// only by knowing the channel. Commit and rollback go to the strongest
+    /// holder, so they release the lease that blocks later payments.
+    pub(crate) fn payment_hold(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Option<PaymentHold> {
+        let channel_id = Self::credential_channel_id(credential);
+        let knows_channel = channel_id
+            .as_deref()
+            .is_some_and(|id| self.knows_channel(id));
+        let leases = self.pending_payment_leases.lock().unwrap();
+        match leases.get(&challenge.id) {
+            Some(lease) => {
+                let on_channel = match (&lease.channel_id, &channel_id) {
+                    (Some(leased), Some(paid)) => leased.eq_ignore_ascii_case(paid),
+                    // A lease that recorded no channel matches through the
+                    // channel this provider knows.
+                    (None, Some(_)) => knows_channel,
+                    _ => false,
+                };
+                Some(if on_channel {
+                    PaymentHold::LeaseOnChannel
+                } else {
+                    PaymentHold::Lease
+                })
+            }
+            None => knows_channel.then_some(PaymentHold::Channel),
+        }
+    }
+
+    /// Whether this provider knows the channel `channel_id`.
+    fn knows_channel(&self, channel_id: &str) -> bool {
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .contains_key(channel_id)
+    }
+
+    /// Send requests that carry a `Payment-Session` channel hint (the
+    /// session-snapshot probe of WebSocket challenge recovery and
+    /// `TempoAccountsProvider::preconnect`'s hint probe) through `client`, for example one with the caller's CA
+    /// roots, client certificate, proxy or default headers.
+    ///
+    /// `client` must not follow redirects, for example one built with
+    /// `redirect(reqwest::redirect::Policy::none())`: reqwest forwards custom
+    /// headers across redirects, so the channel hint could reach another
+    /// origin. Hint requests still time out after the management request
+    /// timeout. Without it, a default client that follows no redirect is used.
+    pub fn with_hint_client(mut self, client: reqwest::Client) -> Self {
+        self.hint_client = Some(client);
+        self
+    }
+
+    /// The client for requests carrying a `Payment-Session` channel hint.
+    pub(crate) fn hint_client(&self) -> Result<reqwest::Client, MppError> {
+        match &self.hint_client {
+            Some(client) => Ok(client.clone()),
+            None => default_hint_client(),
+        }
+    }
+
+    /// Sends a request carrying a `Payment-Session` channel hint through
+    /// [`Self::hint_client`], within the management request timeout.
+    pub(crate) async fn send_hint(
+        &self,
+        request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<reqwest::Response, MppError> {
+        let client = self.hint_client()?;
+        with_management_timeout(self.management_timeout, context, async {
+            request(&client).send().await.mpp_http(context)
+        })
+        .await
+    }
+
+    /// Whether `self` and `other` share one session's channel state.
+    #[cfg(test)]
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.channels, &other.channels)
+    }
+
+    /// Holds a pending payment lease for `challenge_id` on `channel_id`.
+    #[cfg(test)]
+    pub(crate) async fn hold_test_lease(&self, challenge_id: &str, channel_id: Option<&str>) {
+        let process = self.payment_lock.clone().lock_owned().await;
+        // Providers may share one store: lease a key of this provider's own.
+        let key = format!("{challenge_id}:{:p}", Arc::as_ptr(&self.channels));
+        let store = self.channel_store.acquire(&key).await.unwrap();
+        self.pending_payment_leases.lock().unwrap().insert(
+            challenge_id.to_owned(),
+            SessionPaymentLease {
+                channel_id: channel_id.map(str::to_owned),
+                _process: process,
+                _store: store,
+            },
+        );
+    }
+
+    /// Whether a payment lease for `challenge_id` is pending.
+    #[cfg(test)]
+    pub(crate) fn has_pending_lease(&self, challenge_id: &str) -> bool {
+        self.pending_payment_leases
+            .lock()
+            .unwrap()
+            .contains_key(challenge_id)
+    }
+
+    /// Records `channel_id` as known under `key`, without its state.
+    #[cfg(test)]
+    pub(crate) fn know_test_channel(&self, channel_id: &str, key: &str) {
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_owned(), key.to_owned());
     }
 
     /// Report `channel.deposit` events to `events` when the server accepts a
@@ -712,6 +961,7 @@ impl TempoSessionProvider {
             chain_id: entry.chain_id,
             opened: entry.opened,
             pending_open: None,
+            origin: None,
         })
     }
 
@@ -1181,6 +1431,7 @@ impl TempoSessionProvider {
     ) -> Result<PaymentChallenge, MppError> {
         use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
 
+        self.bind_origin(url)?;
         headers = management_headers(headers);
         let bootstrap_headers = headers.clone();
         let (key, _) = self.expected_channel_key(challenge)?;
@@ -1223,7 +1474,15 @@ impl TempoSessionProvider {
             {
                 headers.remove(AUTHORIZATION);
             }
-            if let Ok(response) = client.get(url).headers(headers.clone()).send().await {
+            // reqwest forwards custom headers across redirects, so the channel
+            // hint goes through a client that never follows one.
+            if let Ok(response) = self
+                .send_hint(
+                    |client| client.get(url).headers(headers.clone()),
+                    "session snapshot request failed",
+                )
+                .await
+            {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
                     let refreshed = crate::protocol::core::parse_www_authenticate_all_bytes(
                         response
@@ -1262,6 +1521,7 @@ impl TempoSessionProvider {
     ) -> Result<Option<StoredChannelEntry>, MppError> {
         use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
 
+        self.bind_origin(url)?;
         headers.insert(
             crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
             HeaderValue::from_static("tempo/charge"),
@@ -1673,6 +1933,9 @@ impl TempoSessionProvider {
         if self.restored_channel_id(challenge).as_deref() != Some(channel_id.as_str()) {
             return false;
         }
+        if self.bind_origin(url).is_err() {
+            return false;
+        }
         self.spend
             .lock()
             .unwrap()
@@ -1879,6 +2142,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
+        self.bind_origin(url)?;
         ensure_redirect_safe_credential_header(challenge)?;
         let _process_lease = self.acquire_payment_lock(challenge).await?;
         let (key, _) = self.expected_channel_key(challenge)?;
@@ -2372,6 +2636,7 @@ impl TempoSessionProvider {
             .required_top_up(required_cumulative, deposit, suggested_deposit)?
             .is_some()
         {
+            self.bind_origin(url)?;
             ensure_redirect_safe_credential_header(challenge)?;
             let _process_lease = self.acquire_payment_lock(challenge).await?;
             let (key, _) = self.expected_channel_key(challenge)?;
@@ -2624,6 +2889,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         required_cumulative: u128,
     ) -> Result<(), MppError> {
+        self.bind_origin(url)?;
         let challenge =
             self.last_challenge.lock().unwrap().clone().ok_or_else(|| {
                 MppError::InvalidConfig("no challenge available for voucher".into())
@@ -2768,6 +3034,7 @@ impl TempoSessionProvider {
         client: &reqwest::Client,
         url: &str,
     ) -> Result<Option<Receipt>, MppError> {
+        self.bind_origin(url)?;
         let challenge = self.last_challenge.lock().unwrap().clone();
         let challenge = match challenge {
             Some(c) => c,
@@ -2959,6 +3226,7 @@ impl TempoSessionProvider {
         headers: reqwest::header::HeaderMap,
         challenge: &PaymentChallenge,
     ) -> Result<PaymentCredential, MppError> {
+        self.bind_origin(url)?;
         self.payment_credential(
             challenge,
             Some(TopUpRoute::Http {
@@ -2987,6 +3255,7 @@ impl TempoSessionProvider {
         self.pending_payment_leases.lock().unwrap().insert(
             challenge.id.clone(),
             SessionPaymentLease {
+                channel_id: Self::credential_channel_id(&credential),
                 _process: process_lease,
                 _store: store_lease,
             },
@@ -3471,7 +3740,10 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         context: PaymentContext,
     ) -> Result<PaymentCredential, MppError> {
+        // Without a client nothing is sent to the URL, which may be an MCP
+        // resource rather than an HTTP one.
         let Some(client) = context.http_client else {
+            self.bind_http_origin(context.url.as_str())?;
             return self.pay(challenge).await;
         };
         self.application_websocket_credential_with_top_up(
@@ -3489,6 +3761,8 @@ impl PaymentProvider for TempoSessionProvider {
         context: PaymentContext,
         management: &dyn ManagementTransport,
     ) -> Result<PaymentCredential, MppError> {
+        // Management goes through the transport, not to this URL.
+        self.bind_http_origin(context.url.as_str())?;
         let url = context.url.to_string();
         self.payment_credential(
             challenge,
@@ -3596,6 +3870,10 @@ impl PaymentProvider for TempoSessionProvider {
             .unwrap()
             .get(context.url.as_str())
             .cloned()?;
+        // Priming bound the provider; a request never binds it from here.
+        if !self.is_bound_to(context.url.as_str()) {
+            return None;
+        }
         if state
             .challenge
             .expires_at()
@@ -4310,6 +4588,8 @@ mod tests {
             store.set(&stored).await.unwrap();
             let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
             let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+            // Priming binds the provider to the voucher's origin.
+            provider.bind_origin(url.as_str()).unwrap();
             provider.prepaid.lock().unwrap().insert(
                 url.to_string(),
                 PrepaidVoucher {
@@ -4432,6 +4712,491 @@ mod tests {
                 .cumulative_amount,
             1_000
         );
+    }
+
+    #[tokio::test]
+    async fn session_payments_are_bound_to_their_first_origin() {
+        let provider = make_test_provider();
+        provider
+            .bind_origin("https://API.example.com:443/data")
+            .unwrap();
+        for url in [
+            "https://evil.example/data",
+            "http://api.example.com/data",
+            "https://api.example.com:8443/data",
+        ] {
+            let error = provider.bind_origin(url).unwrap_err();
+            assert!(error.to_string().contains("origin mismatch"), "{url}");
+            let error = provider
+                .send_voucher(&reqwest::Client::new(), url, "0xdeadbeef", 1_000)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("origin mismatch"), "{url}");
+        }
+        provider
+            .bind_origin("https://api.example.com/another")
+            .unwrap();
+        // Clones are the same session and share its origin.
+        assert!(provider
+            .clone()
+            .bind_origin("https://evil.example/data")
+            .is_err());
+    }
+
+    #[test]
+    fn session_payments_require_an_http_origin() {
+        let provider = make_test_provider();
+        for url in [
+            "app://trusted/data",
+            "ipfs://content/data",
+            "data:text/plain,hello",
+            "file:///tmp/data",
+            "not a url",
+        ] {
+            let error = provider.bind_origin(url).unwrap_err();
+            assert!(
+                error.to_string().contains("require an HTTP origin"),
+                "{url}"
+            );
+        }
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_channel_is_not_authorized_for_another_origin() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let seeded = make_test_provider();
+        seed_precompile_channel(&seeded, payee, currency, 1_000, 10_000);
+        let entry = seeded.channels().into_values().next().unwrap();
+        seeded.channels.lock().unwrap().clear();
+        let stored = StoredChannelEntry {
+            origin: Some("https://trusted.example".into()),
+            ..TempoSessionProvider::stored_entry(&entry).unwrap()
+        };
+        let inner = Arc::new(MemoryChannelStore::default());
+        inner.set(&stored).await.unwrap();
+        let provider = seeded.with_channel_store(inner.clone());
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let error = provider.restore(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert!(provider.restored_channel_id(&challenge).is_none());
+        let error = provider
+            .channel_store
+            .set(&TempoSessionProvider::stored_entry(&entry).unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert_eq!(inner.get(&stored.key()).await.unwrap(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn persisted_channels_take_the_providers_origin() {
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let inner = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider().with_channel_store(inner.clone());
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        let key = TempoSessionProvider::store_key(&entry).unwrap().unwrap();
+        assert_eq!(
+            inner.get(&key).await.unwrap().unwrap().origin.as_deref(),
+            Some("https://api.example.com")
+        );
+
+        // A provider that has not paid yet adopts a stored channel's origin.
+        let other = make_test_provider().with_channel_store(inner.clone());
+        other.channel_store.get(&key).await.unwrap().unwrap();
+        assert!(other.bind_origin("https://evil.example/data").is_err());
+        other.bind_origin("https://api.example.com/other").unwrap();
+    }
+
+    #[tokio::test]
+    async fn reading_state_never_binds_the_origin() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider().with_prepaid_requests(1);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let context = |url: &str| PaymentContext {
+            url: url.parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+
+        // A request with no prepaid voucher, or with one the provider was
+        // never bound for, neither signs nor binds.
+        assert!(provider
+            .prepaid_credential(context("https://evil.example/data"))
+            .await
+            .is_none());
+        provider.prepaid.lock().unwrap().insert(
+            "https://evil.example/data".into(),
+            PrepaidVoucher {
+                challenge,
+                channel_id: channel_id.to_string(),
+                spent: 0,
+                price: 1_000,
+            },
+        );
+        assert!(provider
+            .prepaid_credential(context("https://evil.example/data"))
+            .await
+            .is_none());
+        assert_eq!(provider.cumulative(), 1_000);
+
+        // Events that carry no payment state don't bind either.
+        for name in ["message", "payment-close-ready", "ping"] {
+            assert!(provider
+                .stream_event(
+                    &reqwest::Client::new(),
+                    "https://evil.example/stream",
+                    name,
+                    "{}",
+                )
+                .is_none());
+        }
+
+        // Malformed payment events, and payment events for a channel this
+        // provider does not hold, fail or do nothing without binding.
+        let unknown = format!("{:#x}", B256::repeat_byte(0x99));
+        let unknown_voucher = format!(
+            r#"{{"channelId":"{unknown}","requiredCumulative":"2000","acceptedCumulative":"1000"}}"#
+        );
+        let unknown_receipt = format!(
+            r#"{{"method":"tempo","intent":"session","status":"success","timestamp":"2026-01-01T00:00:00Z","reference":"{unknown}","challengeId":"c","channelId":"{unknown}","acceptedCumulative":"1000","spent":"1000"}}"#
+        );
+        for (name, data) in [
+            ("payment-need-voucher", "not json".to_owned()),
+            ("payment-receipt", "not json".to_owned()),
+            ("payment-need-voucher", unknown_voucher),
+            ("payment-receipt", unknown_receipt),
+        ] {
+            let future = provider
+                .stream_event(
+                    &reqwest::Client::new(),
+                    "https://evil.example/stream",
+                    name,
+                    &data,
+                )
+                .expect("payment events are handled");
+            let _ = future.await;
+            assert!(
+                !provider.is_bound_to("https://evil.example/stream"),
+                "{name} {data} bound the origin"
+            );
+        }
+
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+        assert!(provider
+            .prepaid_credential(context("https://evil.example/data"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn management_requests_to_another_origin_are_refused_before_signing() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider().with_max_deposit(100_000);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        *provider.last_challenge.lock().unwrap() = Some(challenge.clone());
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+        let client = reqwest::Client::new();
+        let foreign = "https://evil.example/manage";
+
+        let error = provider.close(&client, foreign).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        let error = provider
+            .top_up_with_headers_for_challenge(
+                &client,
+                foreign,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                1_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        let error = provider
+            .top_up_with_headers(
+                &client,
+                foreign,
+                reqwest::header::HeaderMap::new(),
+                &channel_id.to_string(),
+                1_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        let error = provider
+            .voucher_credential_with_top_up_for_challenge(
+                &client,
+                foreign,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+                &channel_id.to_string(),
+                20_000,
+                10_000,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+
+        let entry = provider.channels().into_values().next().unwrap();
+        assert_eq!((entry.cumulative_amount, entry.deposit), (1_000, 10_000));
+        assert!(provider.channels().values().all(|entry| entry.opened));
+    }
+
+    #[tokio::test]
+    async fn channel_hint_never_follows_a_redirect() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+        fn record(seen: &Seen, method: &str, headers: &axum::http::HeaderMap) {
+            seen.lock().unwrap().push((
+                method.to_owned(),
+                headers
+                    .get("payment-session")
+                    .map(|value| value.to_str().unwrap().to_owned()),
+            ));
+        }
+
+        let elsewhere = Seen::default();
+        let app = axum::Router::new().fallback({
+            let seen = elsewhere.clone();
+            move |method: axum::http::Method, headers: axum::http::HeaderMap| {
+                record(&seen, method.as_str(), &headers);
+                async { "ok" }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let service = Seen::default();
+        let app = axum::Router::new().fallback({
+            let seen = service.clone();
+            move |method: axum::http::Method, headers: axum::http::HeaderMap| {
+                record(&seen, method.as_str(), &headers);
+                let target = target.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, target)],
+                    )
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ws", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        // The caller's client follows redirects.
+        let recovered = provider
+            .recover_application_websocket_challenge_with_headers(
+                &reqwest::Client::new(),
+                &url,
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.id, challenge.id);
+
+        let hinted = service.lock().unwrap().clone();
+        assert!(hinted.iter().any(|(method, hint)| method == "GET"
+            && hint.as_deref() == Some(channel_id.to_string().as_str())));
+        let leaked = elsewhere.lock().unwrap().clone();
+        assert!(leaked.iter().all(|(_, hint)| hint.is_none()), "{leaked:?}");
+    }
+
+    #[tokio::test]
+    async fn channel_hint_uses_the_configured_hint_client_within_the_management_timeout() {
+        let seen = Arc::new(Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+        let app = axum::Router::new().fallback({
+            let seen = seen.clone();
+            move |headers: axum::http::HeaderMap| {
+                let header = |name: &str| {
+                    headers
+                        .get(name)
+                        .map(|value| value.to_str().unwrap().to_owned())
+                };
+                seen.lock()
+                    .unwrap()
+                    .push((header("x-hint-client"), header("payment-session")));
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    "late"
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/pay", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-hint-client", "configured".parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut provider = make_test_provider().with_hint_client(client);
+        provider.management_timeout = std::time::Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .send_hint(
+                |client| client.get(&url).header("payment-session", "0xabc"),
+                "hint request failed",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some("configured".to_owned()), Some("0xabc".to_owned()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn non_http_payment_contexts_leave_the_provider_unbound() {
+        struct Unused;
+        impl ManagementTransport for Unused {
+            fn send<'a>(
+                &'a self,
+                _challenge: &'a PaymentChallenge,
+                _credential: &'a PaymentCredential,
+            ) -> crate::client::ManagementFuture<'a> {
+                Box::pin(async { Err(MppError::Http("unused".into())) })
+            }
+        }
+
+        let provider = make_test_provider();
+        let context = |http_client| PaymentContext {
+            url: "mcp://tool".parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client,
+        };
+        let challenge = make_test_challenge();
+        for result in [
+            provider.pay_with_context(&challenge, context(None)).await,
+            provider
+                .pay_with_management(&challenge, context(None), &Unused)
+                .await,
+        ] {
+            let error = result.unwrap_err();
+            assert!(!error.to_string().contains("HTTP origin"), "{error}");
+        }
+        // HTTP management to a non-HTTP URL is still refused.
+        let error = provider
+            .pay_with_context(&challenge, context(Some(reqwest::Client::new())))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("require an HTTP origin"));
+
+        // Nothing was bound, so the first HTTP payment still binds.
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+        assert!(provider.bind_origin("https://evil.example/data").is_err());
+        // An HTTP context binds and is checked like any request.
+        let error = provider
+            .pay_with_context(
+                &challenge,
+                PaymentContext {
+                    url: "https://evil.example/data".parse().unwrap(),
+                    headers: reqwest::header::HeaderMap::new(),
+                    http_client: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+    }
+
+    #[tokio::test]
+    async fn foreign_sse_is_rejected_before_signing_or_disclosing_a_channel() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let provider = make_test_provider();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        *provider.last_challenge.lock().unwrap() = Some(make_scoped_challenge(
+            payee,
+            currency,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+        ));
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+
+        let data = serde_json::json!({
+            "channelId": channel_id.to_string(),
+            "requiredCumulative": "2000",
+            "acceptedCumulative": "1000",
+            "deposit": "10000",
+        })
+        .to_string();
+        let error = provider
+            .stream_event(
+                &reqwest::Client::new(),
+                "https://evil.example/stream",
+                "payment-need-voucher",
+                &data,
+            )
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert_eq!(provider.cumulative(), 1_000);
+
+        // Restored channels are not hinted to, or primed for, another origin.
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let error = provider
+            .recover_application_websocket_challenge_with_headers(
+                &reqwest::Client::new(),
+                "https://evil.example/ws",
+                reqwest::header::HeaderMap::new(),
+                &challenge,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert!(!provider
+            .clone()
+            .with_prepaid_requests(1)
+            .prime_prepaid("https://evil.example/data", &challenge));
     }
 
     fn make_test_challenge() -> PaymentChallenge {
@@ -5102,7 +5867,6 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_top_up_times_out_and_blocks_another_top_up() {
-        use axum::{http::StatusCode, response::IntoResponse};
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
         let payee = Address::repeat_byte(0x11);
@@ -5116,9 +5880,16 @@ mod tests {
             &mut provider,
             &[&channel_state_response(10_000), "0x4a817c800", "0x5208"],
         );
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stalled = axum::Router::new().route(
             "/",
-            axum::routing::post(std::future::pending::<axum::response::Response>),
+            axum::routing::post({
+                let received = received.clone();
+                move || {
+                    received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::pending::<axum::response::Response>()
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stalled_url = format!("http://{}/", listener.local_addr().unwrap());
@@ -5143,11 +5914,10 @@ mod tests {
 
         // The server may still apply the stalled top-up, so the released
         // payment lock does not let another deposit be signed.
-        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
         let error = provider
             .top_up_with_headers_for_challenge(
                 &reqwest::Client::new(),
-                &url,
+                &stalled_url,
                 reqwest::header::HeaderMap::new(),
                 &challenge,
                 &channel_id.to_string(),
@@ -5156,7 +5926,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("reconcile the pending payment"));
-        assert!(posted.lock().unwrap().is_empty());
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
     }
 
@@ -6874,6 +7644,7 @@ mod tests {
                 chain_id: 42431,
                 opened: true,
                 pending_open: None,
+                origin: None,
             })
             .await
             .unwrap();

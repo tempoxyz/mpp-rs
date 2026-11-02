@@ -436,6 +436,50 @@ async fn stale_session_is_reopened_once() {
 }
 
 #[tokio::test]
+async fn session_responses_redirected_to_another_origin_are_rejected() {
+    let foreign = spawn_server(
+        Router::new().route("/landing", get(|| async { StatusCode::OK.into_response() })),
+    )
+    .await;
+    for prepaid in [false, true] {
+        let app = Router::new().route(
+            "/paid",
+            get({
+                let foreign = foreign.clone();
+                move |request: Request<Body>| async move {
+                    if is_paid(&request) {
+                        axum::response::Redirect::temporary(&format!("{foreign}/landing"))
+                            .into_response()
+                    } else {
+                        payment_required("session-1", "session")
+                    }
+                }
+            }),
+        );
+        let url = spawn_server(app).await;
+        for via in BOTH {
+            let provider = TestProvider {
+                prepaid,
+                ..TestProvider::default()
+            };
+            // The caller's client follows redirects.
+            let request = reqwest::Client::new().get(format!("{url}/paid"));
+            let error = via
+                .send(request, &provider, ClientEvents::default())
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("session response origin mismatch"),
+                "{via:?} prepaid={prepaid}: {error}"
+            );
+            assert_eq!(provider.committed.load(Ordering::SeqCst), 0, "{via:?}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn session_that_stays_gone_is_returned() {
     let app = Router::new().route(
         "/paid",

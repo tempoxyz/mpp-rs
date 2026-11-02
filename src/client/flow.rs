@@ -450,9 +450,16 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 }
             };
 
+            let session = challenge.intent.as_str() == "session";
+            if session && resp.url().origin() != payment_context.url.origin() {
+                // The credential may have been applied before the redirect.
+                drop(pending);
+                return Err(self
+                    .fail(Some(challenge), session_response_origin_mismatch())
+                    .await);
+            }
             let status = resp.status();
             let receipt = paid_receipt(&resp, &challenge, &credential);
-            let session = challenge.intent.as_str() == "session";
             let session_receipt_valid = !session || receipt.is_some();
             if status.is_success() {
                 let amount = self.charged(&payment_context, &challenge, receipt.as_ref(), session);
@@ -624,6 +631,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Err(FlowError::Send(err));
             }
         };
+        if challenge.intent.as_str() == "session" && resp.url().origin() != context.url.origin() {
+            return Err(self
+                .fail(Some(challenge), session_response_origin_mismatch())
+                .await);
+        }
         let status = resp.status();
         if status.is_server_error() {
             let reason = outcome_unknown(Some(status.as_u16()), &challenge, &credential);
@@ -804,6 +816,15 @@ fn outcome_unknown(
         credential: format_authorization(credential).ok()?,
         transaction_hash,
     })
+}
+
+/// A paid session request answered from another origin, after a redirect the
+/// caller's client followed. Its receipt must not update session state, as in
+/// mppx's `SessionManager`.
+fn session_response_origin_mismatch() -> HttpError {
+    HttpError::Payment(MppError::InvalidConfig(
+        "session response origin mismatch".into(),
+    ))
 }
 
 fn authorization_value(credential: &PaymentCredential) -> Result<HeaderValue, HttpError> {

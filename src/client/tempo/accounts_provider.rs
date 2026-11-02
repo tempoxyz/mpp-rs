@@ -56,10 +56,16 @@ pub struct TempoAccountsProvider {
 #[derive(Clone)]
 struct AccountsSession {
     store: Arc<dyn ChannelStore>,
-    /// Session providers by pinned chain ID: clones share this cache, and a
-    /// clone re-pinned to another chain must not reuse another chain's key.
-    provider: Arc<Mutex<HashMap<u64, TempoSessionProvider>>>,
+    /// Session providers by pinned chain ID and request origin: clones share
+    /// this cache, a clone re-pinned to another chain must not reuse another
+    /// chain's key, and each service gets its own provider bound to its
+    /// origin, as mppx gives each origin its own session manager. Payments
+    /// without an HTTP origin share the `None` entry.
+    provider: Arc<Mutex<HashMap<SessionKey, TempoSessionProvider>>>,
 }
+
+/// A cached session provider's pinned chain ID and HTTP origin, if any.
+type SessionKey = (u64, Option<String>);
 
 #[derive(Clone, Default)]
 struct SessionSettings {
@@ -69,6 +75,7 @@ struct SessionSettings {
     fee_token: Option<Address>,
     prepaid_requests: Option<u32>,
     events: Option<ClientEvents>,
+    hint_client: Option<reqwest::Client>,
 }
 
 impl TempoAccountsProvider {
@@ -270,7 +277,7 @@ impl TempoAccountsProvider {
         url: &str,
         body: String,
     ) -> Result<(), MppError> {
-        let challenges = self.probe(client, url, body.clone(), None).await?;
+        let challenges = self.probe(client, url, body.clone(), None, None).await?;
         let candidates: Vec<_> = challenges.iter().collect();
         let Some(challenge) = self
             .select_challenge(&candidates)
@@ -278,7 +285,9 @@ impl TempoAccountsProvider {
         else {
             return Ok(());
         };
-        let session = self.session_provider_for(challenge)?;
+        let session = self.session_provider_for(challenge, Some(url))?;
+        // The channel hint below names a stored channel: only to its origin.
+        session.bind_origin(url)?;
         if !session.restore(challenge).await? {
             return Ok(());
         }
@@ -286,7 +295,9 @@ impl TempoAccountsProvider {
             return Ok(());
         };
         // Naming the channel makes the server describe it in its challenge.
-        let described = self.probe(client, url, body, Some(&channel_id)).await?;
+        let described = self
+            .probe(client, url, body, Some(&channel_id), Some(&session))
+            .await?;
         for challenge in &described {
             if self.check_expected_chain(challenge).is_ok() && session.prime_prepaid(url, challenge)
             {
@@ -297,24 +308,48 @@ impl TempoAccountsProvider {
     }
 
     /// Sends an unpaid request and returns the payable challenges it receives.
+    ///
+    /// A probe that names a channel goes through `session`'s hint client,
+    /// which never follows a redirect (reqwest forwards custom headers across
+    /// redirects), within its management request timeout.
     async fn probe(
         &self,
         client: &reqwest::Client,
         url: &str,
         body: String,
         channel_id: Option<&str>,
+        session: Option<&TempoSessionProvider>,
     ) -> Result<Vec<PaymentChallenge>, MppError> {
-        let mut request = client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body);
-        if let Some(channel_id) = channel_id {
-            request = request.header("payment-session", channel_id).header(
-                crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
-                "tempo/session",
-            );
-        }
-        let response = request.send().await.mpp_http("preconnect probe failed")?;
+        let post = |client: &reqwest::Client| {
+            client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+        };
+        let response = match (channel_id, session) {
+            (Some(channel_id), Some(session)) => {
+                session
+                    .send_hint(
+                        |client| {
+                            post(client).header("payment-session", channel_id).header(
+                                crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
+                                "tempo/session",
+                            )
+                        },
+                        "preconnect probe failed",
+                    )
+                    .await?
+            }
+            (Some(_), None) => {
+                return Err(MppError::InvalidConfig(
+                    "a channel hint probe requires its session provider".to_owned(),
+                ))
+            }
+            (None, _) => post(client)
+                .send()
+                .await
+                .mpp_http("preconnect probe failed")?,
+        };
         Ok(crate::protocol::core::parse_www_authenticate_all_bytes(
             response
                 .headers()
@@ -360,30 +395,122 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Send session requests that carry a `Payment-Session` channel hint
+    /// through `client`. See [`TempoSessionProvider::with_hint_client`]: `client`
+    /// must not follow redirects, for example one built with
+    /// `redirect(reqwest::redirect::Policy::none())`.
+    pub fn with_session_hint_client(mut self, client: reqwest::Client) -> Self {
+        self.session_settings.hint_client = Some(client);
+        self
+    }
+
     /// Pay gas for unsponsored session opens and top-ups in `token`.
     pub fn with_session_fee_token(mut self, token: Address) -> Self {
         self.session_settings.fee_token = Some(token);
         self
     }
 
-    /// Get the session provider that pays this provider's session challenges.
+    /// Get the session provider for the pinned chain, so callers can close or
+    /// top up the channels it opened.
+    ///
+    /// Returns the one cached session provider when exactly one exists,
+    /// whether bound to a service's origin by its requests or used without an
+    /// origin, such as through [`PaymentProvider::pay`]. When none exists yet,
+    /// returns the provider for payments without an origin. When providers
+    /// for several origins are cached, it fails rather than pick one: use
+    /// [`Self::session_for`] with the service's URL.
     ///
     /// Clones share channel state, so streaming transports can answer
     /// `payment-need-voucher` events and acknowledge streamed receipts for the
-    /// channels opened through [`PaymentProvider::pay`].
+    /// channels opened through it.
     pub fn session(&self) -> Result<TempoSessionProvider, MppError> {
-        self.configured_session_provider()
+        if let (Some(session), Some(chain_id)) = (self.session.as_ref(), self.expected_chain_id) {
+            let cached = session.provider.lock().map_err(|_| {
+                MppError::InvalidConfig("Tempo Accounts session state is unavailable".to_owned())
+            })?;
+            let mut providers = cached
+                .iter()
+                .filter(|((chain, _), _)| *chain == chain_id)
+                .map(|(_, provider)| provider);
+            match (providers.next(), providers.next()) {
+                (Some(provider), None) => {
+                    let mut provider = provider.clone();
+                    provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
+                    return Ok(provider);
+                }
+                (Some(_), Some(_)) => {
+                    return Err(MppError::InvalidConfig(
+                        "Tempo Accounts has session providers for several origins; use session_for(url) to pick the service's provider".to_owned(),
+                    ))
+                }
+                (None, _) => {}
+            }
+        }
+        self.configured_session_provider(None)
     }
 
-    /// The session provider for paying `challenge`, which must be on the
-    /// expected chain: the session key and RPC belong to that chain, so a
-    /// challenge for another chain is rejected as for charges.
+    /// Get the session provider that pays session challenges from `url`'s
+    /// HTTP origin, bound to that origin.
+    ///
+    /// Each origin has its own provider, so one wallet pays several services
+    /// while each service keeps reusing its own channels, as mppx keeps a
+    /// session manager per origin. A URL that is not HTTP(S) gets the provider
+    /// of [`Self::session`].
+    pub fn session_for(&self, url: &str) -> Result<TempoSessionProvider, MppError> {
+        self.configured_session_provider(Some(url))
+    }
+
+    /// The session provider for paying `challenge` from `url`, which must be
+    /// on the expected chain: the session key and RPC belong to that chain, so
+    /// a challenge for another chain is rejected as for charges.
     fn session_provider_for(
         &self,
         challenge: &PaymentChallenge,
+        url: Option<&str>,
     ) -> Result<TempoSessionProvider, MppError> {
         self.check_expected_chain(challenge)?;
-        self.configured_session_provider()
+        self.configured_session_provider(url)
+    }
+
+    /// The cached session provider that paid `challenge` with `credential`, so
+    /// its commit or rollback reaches the origin's provider that holds it.
+    ///
+    /// Prefers a provider holding the challenge's pending lease on the
+    /// credential's channel, then any provider holding the challenge's lease,
+    /// and only then one that merely knows the channel, so the lease that
+    /// blocks later payments is released. Ties go to the first origin in
+    /// order, so the choice does not depend on the cache's iteration order.
+    fn session_provider_holding(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Result<TempoSessionProvider, MppError> {
+        if let (Some(session), Some(chain_id)) = (self.session.as_ref(), self.expected_chain_id) {
+            let holder = session
+                .provider
+                .lock()
+                .map_err(|_| {
+                    MppError::InvalidConfig(
+                        "Tempo Accounts session state is unavailable".to_owned(),
+                    )
+                })?
+                .iter()
+                .filter(|((chain, _), _)| *chain == chain_id)
+                .filter_map(|((_, origin), provider)| {
+                    provider
+                        .payment_hold(challenge, credential)
+                        .map(|hold| (hold, origin.clone(), provider))
+                })
+                .min_by(|(a, a_origin, _), (b, b_origin, _)| {
+                    a.cmp(b).then_with(|| a_origin.cmp(b_origin))
+                })
+                .map(|(_, _, provider)| provider.clone());
+            if let Some(mut provider) = holder {
+                provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
+                return Ok(provider);
+            }
+        }
+        self.configured_session_provider(None)
     }
 
     /// Reject a session challenge for a chain other than the pinned one.
@@ -397,16 +524,22 @@ impl TempoAccountsProvider {
         Ok(())
     }
 
-    fn configured_session_provider(&self) -> Result<TempoSessionProvider, MppError> {
+    /// The session provider for requests to `url`'s HTTP origin, or for
+    /// payments without one, built and cached on first use.
+    fn configured_session_provider(
+        &self,
+        url: Option<&str>,
+    ) -> Result<TempoSessionProvider, MppError> {
         let session = self.session.as_ref().ok_or_else(|| {
             MppError::UnsupportedPaymentMethod("tempo.session is not configured".to_owned())
         })?;
+        let origin = url.and_then(http_origin);
         let mut cached = session.provider.lock().map_err(|_| {
             MppError::InvalidConfig("Tempo Accounts session state is unavailable".to_owned())
         })?;
         if let Some(provider) = self
             .expected_chain_id
-            .and_then(|chain_id| cached.get(&chain_id))
+            .and_then(|chain_id| cached.get(&(chain_id, origin.clone())))
         {
             let mut provider = provider.clone();
             provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
@@ -432,10 +565,16 @@ impl TempoAccountsProvider {
         if let Some(events) = &settings.events {
             provider = provider.with_events(events.clone());
         }
+        if let Some(client) = &settings.hint_client {
+            provider = provider.with_hint_client(client.clone());
+        }
+        if let Some(origin) = &origin {
+            provider.bind_origin(origin)?;
+        }
         if let Some(chain_id) = self.expected_chain_id {
             let mut shared = provider.clone();
             shared.replace_trusted_tempo_proof_realms(&[]);
-            cached.insert(chain_id, shared);
+            cached.insert((chain_id, origin), shared);
         }
         Ok(provider)
     }
@@ -593,7 +732,10 @@ impl PaymentProvider for TempoAccountsProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
-            return self.session_provider_for(challenge)?.pay(challenge).await;
+            return self
+                .session_provider_for(challenge, None)?
+                .pay(challenge)
+                .await;
         }
         let from = self
             .wallet
@@ -641,7 +783,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .session_provider_for(challenge)?
+                .session_provider_for(challenge, Some(context.url.as_str()))?
                 .pay_with_context(challenge, context)
                 .await;
         }
@@ -656,7 +798,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<PaymentCredential, MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .session_provider_for(challenge)?
+                .session_provider_for(challenge, Some(context.url.as_str()))?
                 .pay_with_management(challenge, context, management)
                 .await;
         }
@@ -670,7 +812,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<(), MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .configured_session_provider()?
+                .session_provider_holding(challenge, credential)?
                 .commit_payment(challenge, credential)
                 .await;
         }
@@ -686,7 +828,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<(), MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .configured_session_provider()?
+                .session_provider_holding(challenge, credential)?
                 .rollback_payment(challenge, credential)
                 .await;
         }
@@ -706,7 +848,7 @@ impl PaymentProvider for TempoAccountsProvider {
     ) -> Result<(), MppError> {
         if challenge.intent.as_str() == crate::protocol::methods::tempo::INTENT_SESSION {
             return self
-                .configured_session_provider()?
+                .session_provider_holding(challenge, credential)?
                 .invalidate_payment(challenge, credential)
                 .await;
         }
@@ -715,7 +857,7 @@ impl PaymentProvider for TempoAccountsProvider {
 
     fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         if challenge.intent.as_str() == "session" {
-            if let Ok(provider) = self.configured_session_provider() {
+            if let Ok(provider) = self.session_provider_holding(challenge, credential) {
                 provider.abandon_payment(challenge, credential);
             }
         }
@@ -726,7 +868,9 @@ impl PaymentProvider for TempoAccountsProvider {
         context: PaymentContext,
     ) -> Option<(PaymentChallenge, PaymentCredential)> {
         self.session.as_ref()?;
-        let provider = self.configured_session_provider().ok()?;
+        let provider = self
+            .configured_session_provider(Some(context.url.as_str()))
+            .ok()?;
         let (challenge, credential) = provider.prepaid_credential(context).await?;
         if self.check_expected_chain(&challenge).is_err() {
             provider.abandon_payment(&challenge, &credential);
@@ -761,7 +905,7 @@ impl PaymentProvider for TempoAccountsProvider {
         if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
             return None;
         }
-        self.configured_session_provider()
+        self.configured_session_provider(Some(context.url.as_str()))
             .ok()?
             .record_receipt(context, challenge, receipt)
     }
@@ -774,7 +918,7 @@ impl PaymentProvider for TempoAccountsProvider {
         data: &str,
     ) -> Option<crate::client::PaymentEventFuture> {
         self.session.as_ref()?;
-        self.configured_session_provider()
+        self.configured_session_provider(Some(url))
             .ok()?
             .stream_event(client, url, name, data)
     }
@@ -785,6 +929,14 @@ impl PaymentProvider for TempoAccountsProvider {
             None => "tempo/charge".to_owned(),
         })
     }
+}
+
+/// `url`'s origin when it is an HTTP(S) URL.
+fn http_origin(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .map(|url| url.origin().ascii_serialization())
 }
 
 /// Whether `challenge` is paid from `currency`: a Tempo charge or session
@@ -898,7 +1050,7 @@ mod tests {
             .with_session_top_up_amount(20_000)
             .with_session_max_deposit(1_000_000);
         assert_eq!(provider.session_settings.top_up_amount, Some(20_000));
-        let session = provider.configured_session_provider().unwrap();
+        let session = provider.configured_session_provider(None).unwrap();
 
         assert!(provider.supports("tempo", "charge"));
         assert!(provider.supports("tempo", "session"));
@@ -989,6 +1141,225 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn each_origin_gets_its_own_bound_session() {
+        let (provider, path, _) = provider();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let first = provider.session_for("https://a.example/pay").unwrap();
+        let second = provider
+            .clone()
+            .session_for("https://b.example/pay")
+            .unwrap();
+
+        // One wallet pays both services, each from its own bound session.
+        assert!(!first.shares_state_with(&second));
+        assert!(first.bind_origin("https://b.example/pay").is_err());
+        second.bind_origin("https://b.example/other").unwrap();
+        assert!(second.bind_origin("https://a.example/pay").is_err());
+
+        // A service keeps reusing its cached session and channels.
+        let again = provider.session_for("https://a.example/other").unwrap();
+        assert!(first.shares_state_with(&again));
+        let unbound = provider.session_for("mcp://tool").unwrap();
+        assert!(!unbound.shares_state_with(&first));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_returns_the_only_cached_provider_and_refuses_to_guess() {
+        let (provider, path, _) = provider();
+        let provider = provider.with_expected_chain_id(4217);
+        let with_store = || {
+            provider.clone().with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ))
+        };
+
+        // Without cached providers, it is the provider for payments without an origin.
+        let fresh = with_store();
+        let unbound = fresh.session().unwrap();
+        assert!(unbound.shares_state_with(&fresh.session_for("mcp://tool").unwrap()));
+        assert!(unbound.shares_state_with(&fresh.session().unwrap()));
+
+        // The one provider a service's requests used, with its channels.
+        let service = with_store();
+        let paid = service.session_for("https://a.example/pay").unwrap();
+        assert!(service.session().unwrap().shares_state_with(&paid));
+
+        // Several origins: the caller must name the service.
+        service.session_for("https://b.example/pay").unwrap();
+        match service.session() {
+            Err(MppError::InvalidConfig(message)) => assert!(message.contains("session_for")),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected an error for several origins"),
+        }
+        assert!(service
+            .session_for("https://a.example/other")
+            .unwrap()
+            .shares_state_with(&paid));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_and_rollback_release_the_lease_holders_lease() {
+        let (provider, path, _) = provider();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let channel = format!("0x{}", "ab".repeat(32));
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {"chainId": 4217},
+        }))
+        .unwrap();
+        let challenge =
+            PaymentChallenge::new("pending", "api.example.com", "tempo", "session", request);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({
+                "action": "voucher",
+                "channelId": channel,
+                "cumulativeAmount": "1",
+                "signature": "0x00",
+            }),
+        );
+        // The first origin in order only knows the channel; the lease holder
+        // comes later, so routing by position alone would miss it.
+        let knows = provider.session_for("https://a.example/pay").unwrap();
+        knows.know_test_channel(&channel, "elsewhere");
+        let holder = provider.session_for("https://b.example/pay").unwrap();
+
+        holder.hold_test_lease(&challenge.id, Some(&channel)).await;
+        provider
+            .commit_payment(&challenge, &credential)
+            .await
+            .unwrap();
+        assert!(!holder.has_pending_lease(&challenge.id));
+
+        // Two leases under one challenge ID: the one on the credential's
+        // channel is released, whatever the origins' order.
+        holder.hold_test_lease(&challenge.id, Some(&channel)).await;
+        knows
+            .hold_test_lease(&challenge.id, Some(&format!("0x{}", "cd".repeat(32))))
+            .await;
+        let _ = provider.rollback_payment(&challenge, &credential).await;
+        assert!(!holder.has_pending_lease(&challenge.id));
+        assert!(knows.has_pending_lease(&challenge.id));
+
+        // A lease without a recorded channel still outranks knowing the channel.
+        knows.abandon_payment(&challenge, &credential);
+        holder.hold_test_lease(&challenge.id, None).await;
+        let _ = provider.rollback_payment(&challenge, &credential).await;
+        assert!(!holder.has_pending_lease(&challenge.id));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preconnect_hint_probe_uses_the_session_hint_client() {
+        let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let app = axum::Router::new().fallback({
+            let seen = seen.clone();
+            move |headers: axum::http::HeaderMap| {
+                seen.lock().unwrap().push(
+                    headers
+                        .get("x-hint-client")
+                        .map(|value| value.to_str().unwrap().to_owned()),
+                );
+                async { "ok" }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/pay", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-hint-client", "configured".parse().unwrap());
+        let hint_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let (provider, path, _) = provider();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_hint_client(hint_client)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let session = provider.session_for(&url).unwrap();
+        provider
+            .probe(
+                &reqwest::Client::new(),
+                &url,
+                "{}".into(),
+                Some("0xabc"),
+                Some(&session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![Some("configured".to_owned())]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn preconnect_channel_hint_never_follows_a_redirect() {
+        let hints = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let app = axum::Router::new().fallback({
+            let hints = hints.clone();
+            move |headers: axum::http::HeaderMap| {
+                hints.lock().unwrap().push(
+                    headers
+                        .get("payment-session")
+                        .map(|value| value.to_str().unwrap().to_owned()),
+                );
+                async { "ok" }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let app = axum::Router::new().fallback(move || {
+            let target = target.clone();
+            async move {
+                (
+                    axum::http::StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, target)],
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/pay", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (provider, path, _) = provider();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let session = provider.session_for(&url).unwrap();
+        // The caller's client follows redirects; the unhinted probe does too.
+        let client = reqwest::Client::new();
+        provider
+            .probe(&client, &url, "{}".into(), None, None)
+            .await
+            .unwrap();
+        provider
+            .probe(&client, &url, "{}".into(), Some("0xabc"), Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(*hints.lock().unwrap(), vec![None]);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     async fn session_payments_follow_the_expected_chain() {
         let (provider, path, _) = provider();
@@ -1028,7 +1399,7 @@ mod tests {
                 other => panic!("expected ChainIdMismatch, got {other:?}"),
             }
         }
-        assert!(provider.session_provider_for(&session(4217)).is_ok());
+        assert!(provider.session_provider_for(&session(4217), None).is_ok());
         std::fs::remove_file(path).unwrap();
     }
 

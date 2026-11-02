@@ -35,6 +35,10 @@ pub struct StoredChannelEntry {
     pub opened: bool,
     /// Challenge whose opening payment has not yet received a verified receipt.
     pub pending_open: Option<String>,
+    /// HTTP origin the channel pays, bound by the session provider that
+    /// persisted it. Absent on legacy entries, which stay usable and take an
+    /// origin on their next reuse.
+    pub origin: Option<String>,
 }
 
 impl StoredChannelEntry {
@@ -68,6 +72,26 @@ pub fn channel_key(payee: &str, token: &str, escrow: Address, chain_id: u64) -> 
         escrow,
         chain_id
     )
+}
+
+/// Keeps the origin a stored channel is bound to: a new entry may name no
+/// origin or the same one, never another, as mppx's `persistChannel` does.
+fn merge_origin(
+    current: Option<&StoredChannelEntry>,
+    entry: &StoredChannelEntry,
+) -> ChannelStoreResult<Option<String>> {
+    match (
+        current.and_then(|current| current.origin.as_ref()),
+        &entry.origin,
+    ) {
+        (Some(current), Some(origin)) if current != origin => Err(origin_mismatch()),
+        (Some(current), _) => Ok(Some(current.clone())),
+        (None, origin) => Ok(origin.clone()),
+    }
+}
+
+fn origin_mismatch() -> ChannelStoreError {
+    ChannelStoreError::InvalidEntry("stored channel origin mismatch".into())
 }
 
 /// Store failures are deliberately separate from session recovery failures.
@@ -132,7 +156,9 @@ impl ChannelStore for MemoryChannelStore {
 
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
         let mut entries = self.entries.lock().unwrap();
-        let merged = match entries.get(&entry.key()) {
+        let current = entries.get(&entry.key());
+        let origin = merge_origin(current, entry)?;
+        let mut merged = match current {
             Some(current) if current.channel_id == entry.channel_id => StoredChannelEntry {
                 cumulative_amount: current.cumulative_amount.max(entry.cumulative_amount),
                 deposit: current.deposit.max(entry.deposit),
@@ -140,6 +166,7 @@ impl ChannelStore for MemoryChannelStore {
             },
             _ => entry.clone(),
         };
+        merged.origin = origin;
         entries.insert(merged.key(), merged);
         Ok(())
     }
@@ -150,9 +177,55 @@ impl ChannelStore for MemoryChannelStore {
     }
 }
 
+/// A session provider's view of its channel store, bound to the provider's
+/// HTTP origin: entries it writes carry that origin, and an entry bound to
+/// another origin is refused. An unbound provider adopts the origin of the
+/// first bound entry it reads, so it cannot later pay another origin with it.
+pub(crate) struct OriginBoundChannelStore {
+    pub(crate) inner: Arc<dyn ChannelStore>,
+    pub(crate) origin: Arc<Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ChannelStore for OriginBoundChannelStore {
+    async fn acquire(&self, key: &str) -> ChannelStoreResult<Box<dyn ChannelStoreLease>> {
+        self.inner.acquire(key).await
+    }
+
+    async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
+        let entry = self.inner.get(key).await?;
+        if let Some(stored) = entry.as_ref().and_then(|entry| entry.origin.as_ref()) {
+            let mut bound = self.origin.lock().unwrap();
+            match bound.as_ref() {
+                Some(bound) if bound != stored => return Err(origin_mismatch()),
+                Some(_) => {}
+                None => *bound = Some(stored.clone()),
+            }
+        }
+        Ok(entry)
+    }
+
+    async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+        let bound = self.origin.lock().unwrap().clone();
+        let mut entry = entry.clone();
+        match (&entry.origin, bound) {
+            (Some(origin), Some(bound)) if *origin != bound => return Err(origin_mismatch()),
+            (_, Some(bound)) => entry.origin = Some(bound),
+            (_, None) => {}
+        }
+        self.inner.set(&entry).await
+    }
+
+    async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
+        self.inner.delete(key).await
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonChannelEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
     channel_id: String,
     cumulative_amount: String,
     deposit: String,
@@ -169,6 +242,7 @@ struct JsonChannelEntry {
 impl From<&StoredChannelEntry> for JsonChannelEntry {
     fn from(entry: &StoredChannelEntry) -> Self {
         Self {
+            origin: entry.origin.clone(),
             channel_id: format!("{:#x}", entry.channel_id),
             cumulative_amount: entry.cumulative_amount.to_string(),
             deposit: entry.deposit.to_string(),
@@ -206,6 +280,7 @@ impl TryFrom<JsonChannelEntry> for StoredChannelEntry {
             chain_id: entry.chain_id,
             opened: entry.opened,
             pending_open: entry.pending_open.clone(),
+            origin: entry.origin,
         })
     }
 }
@@ -346,6 +421,12 @@ mod sqlite {
                 .transpose()
         }
 
+        /// The store's namespace as an HTTP origin, which its channels are bound to.
+        fn http_origin(&self) -> Option<String> {
+            (self.origin.starts_with("http://") || self.origin.starts_with("https://"))
+                .then(|| self.origin.clone())
+        }
+
         fn scoped_key(&self, key: &str) -> String {
             format!("{}\n{}", self.namespace, key)
         }
@@ -411,12 +492,14 @@ mod sqlite {
                 let mut entry: JsonChannelEntry = serde_json::from_str(&json)
                     .map_err(|e| ChannelStoreError::InvalidEntry(e.to_string()))?;
                 entry.opened = state == "active";
+                entry.origin = entry.origin.or_else(|| self.http_origin());
                 return entry.try_into().map(Some);
             }
             let descriptor = descriptor.ok_or_else(|| {
                 ChannelStoreError::InvalidEntry("v2 row is missing descriptor_json".into())
             })?;
             JsonChannelEntry {
+                origin: self.http_origin(),
                 channel_id,
                 cumulative_amount: cumulative,
                 deposit,
@@ -452,7 +535,15 @@ mod sqlite {
                         .try_into()
                 })
                 .transpose()?;
-            let merged = match current {
+            let mut entry = entry.clone();
+            if let Some(origin) = self.http_origin() {
+                if entry.origin.as_ref().is_some_and(|entry| *entry != origin) {
+                    return Err(origin_mismatch());
+                }
+                entry.origin = Some(origin);
+            }
+            let origin = merge_origin(current.as_ref(), &entry)?;
+            let mut merged = match current {
                 Some(current) if current.channel_id == entry.channel_id => StoredChannelEntry {
                     cumulative_amount: current.cumulative_amount.max(entry.cumulative_amount),
                     deposit: current.deposit.max(entry.deposit),
@@ -460,6 +551,7 @@ mod sqlite {
                 },
                 _ => entry.clone(),
             };
+            merged.origin = origin;
             let json = serde_json::to_string(&JsonChannelEntry::from(&merged))
                 .map_err(|e| ChannelStoreError::InvalidEntry(e.to_string()))?;
             let descriptor = serde_json::to_string(&merged.descriptor)
@@ -703,6 +795,7 @@ mod tests {
             chain_id: 4217,
             opened: true,
             pending_open: None,
+            origin: None,
         }
     }
 
@@ -722,6 +815,41 @@ mod tests {
         assert_eq!(store.get(&current.key()).await.unwrap(), Some(current));
     }
 
+    #[tokio::test]
+    async fn stored_channel_origin_is_retained_and_cannot_be_rebound() {
+        let store = MemoryChannelStore::default();
+        let bound = StoredChannelEntry {
+            origin: Some("https://api.example.test".into()),
+            ..entry()
+        };
+        store.set(&bound).await.unwrap();
+        store.set(&entry()).await.unwrap();
+        assert_eq!(
+            store.get(&bound.key()).await.unwrap().unwrap().origin,
+            bound.origin
+        );
+        let error = store
+            .set(&StoredChannelEntry {
+                origin: Some("https://evil.example".into()),
+                ..entry()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert_eq!(store.get(&bound.key()).await.unwrap(), Some(bound));
+    }
+
+    #[test]
+    fn legacy_json_entry_without_origin_still_decodes() {
+        let json = serde_json::to_value(JsonChannelEntry::from(&entry())).unwrap();
+        assert!(json.get("origin").is_none());
+        let decoded: StoredChannelEntry = serde_json::from_value::<JsonChannelEntry>(json)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(decoded, entry());
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_roundtrip_uses_mppx_entry_json() {
@@ -729,6 +857,7 @@ mod tests {
         let path = directory.join("channels.db");
         let mut current = entry();
         current.pending_open = Some("unconfirmed-opening".into());
+        current.origin = Some("https://api.example.com".into());
         let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
             namespace: "https://api.example.com".into(),
             path: Some(path.clone()),
@@ -856,6 +985,11 @@ mod tests {
             request_url: None,
         })
         .unwrap();
+        // A migrated row is bound to the store's namespace origin.
+        let current = StoredChannelEntry {
+            origin: Some("https://api.example.com".into()),
+            ..current
+        };
         assert_eq!(store.get(&current.key()).await.unwrap(), Some(current));
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();

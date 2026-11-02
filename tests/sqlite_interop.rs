@@ -29,6 +29,8 @@ fn interop_entry(cumulative_amount: u128) -> StoredChannelEntry {
         chain_id: 4217,
         opened: true,
         pending_open: None,
+        // The store's namespace is the HTTP origin its channels are bound to.
+        origin: Some("https://api.example.com".into()),
     }
 }
 
