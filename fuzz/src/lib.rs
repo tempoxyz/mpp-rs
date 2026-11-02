@@ -39,13 +39,15 @@ impl<'a> Arbitrary<'a> for Method {
     }
 }
 
-/// An intent name matching `1*( ALPHA / DIGIT / "-" / "_" )`.
+/// An intent name of letters, digits, `-`, `_` and spaces, such as the custom
+/// intent `"payment plan"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Intent(pub String);
 
 impl<'a> Arbitrary<'a> for Intent {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        const ALPHABET: &[u8] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ";
         let mut name = String::new();
         for _ in 0..u.int_in_range(1..=12)? {
             name.push(*u.choose(ALPHABET)? as char);
@@ -335,8 +337,9 @@ pub fn wire_header(header: Option<&str>) -> Option<String> {
 }
 
 /// Whether the `id` and the fields it binds have the wire form that the
-/// formatters and parsers require: a non-empty `id`, an intent name, an
-/// RFC 3339 `expires`, a `sha-256=` digest and a base64url `opaque`.
+/// formatters and parsers require: a non-empty `id`, a non-empty intent
+/// without `|`, an RFC 3339 `expires`, a `sha-256=` digest and a base64url
+/// `opaque`.
 ///
 /// `method` and `request` are valid in every generated challenge.
 pub fn is_well_formed(challenge: &PaymentChallenge) -> bool {
@@ -348,9 +351,7 @@ pub fn is_well_formed_echo(echo: &ChallengeEcho) -> bool {
     let intent = echo.intent.as_str();
     !echo.id.is_empty()
         && !intent.is_empty()
-        && intent
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && !intent.contains('|')
         && echo.expires.as_deref().is_none_or(is_rfc3339)
         && echo.digest.as_deref().is_none_or(is_sha256_digest)
         && echo
@@ -415,5 +416,32 @@ pub fn json_eq(left: &Value, right: &Value) -> bool {
                     .all(|(key, l)| r.get(key).is_some_and(|r| json_eq(l, r)))
         }
         _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The oracle agrees with the formatter on custom intents.
+    #[test]
+    fn is_well_formed_matches_the_intent_rule() {
+        let header =
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30""#;
+        let mut challenge = mpp::parse_www_authenticate(header).unwrap();
+        for (intent, valid) in [
+            ("charge", true),
+            ("payment plan", true),
+            ("", false),
+            ("charge|x", false),
+        ] {
+            challenge.intent = intent.into();
+            assert_eq!(is_well_formed(&challenge), valid, "{intent:?}");
+            assert_eq!(
+                mpp::format_www_authenticate(&challenge).is_ok(),
+                valid,
+                "{intent:?}"
+            );
+        }
     }
 }

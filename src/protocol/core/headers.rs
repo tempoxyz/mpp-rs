@@ -135,13 +135,11 @@ fn is_valid_digest_format(d: &str) -> bool {
         })
 }
 
-/// Validate an intent name: the spec grammar `1*( ALPHA / DIGIT / "-" )`,
-/// plus `_`, which mppx accepts in custom intents.
+/// Validate an intent name. Like mppx, any custom intent is accepted (such as
+/// "payment plan"), except an empty one or one containing the "|" that
+/// separates the fields the challenge id binds.
 fn is_valid_intent_name(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    !value.is_empty() && !value.contains('|')
 }
 
 /// Validate the method identifier grammar used by mppx.
@@ -1293,6 +1291,18 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_intent_round_trips() {
+        // mppx treats intent as an unrestricted string.
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="payment plan", request="e30""#;
+        let challenge = parse_www_authenticate(header).unwrap();
+        assert_eq!(challenge.intent.as_str(), "payment plan");
+
+        let formatted = format_www_authenticate(&challenge).unwrap();
+        let reparsed = parse_www_authenticate(&formatted).unwrap();
+        assert_eq!(reparsed.intent.as_str(), "payment plan");
+    }
+
+    #[test]
     fn test_format_www_authenticate_rejects_unparsable_challenges() {
         let mut empty_id = test_challenge();
         empty_id.id = String::new();
@@ -1306,9 +1316,6 @@ mod tests {
         let mut invalid_json = test_challenge();
         invalid_json.request = Base64UrlJson::from_raw("bm90IGpzb24");
 
-        let mut invalid_intent = test_challenge();
-        invalid_intent.intent = "payment plan".into();
-
         let mut request_not_object = test_challenge();
         request_not_object.request = Base64UrlJson::from_raw("W10");
 
@@ -1320,7 +1327,6 @@ mod tests {
             invalid_method,
             invalid_base64,
             invalid_json,
-            invalid_intent,
             request_not_object,
             invalid_opaque,
         ] {
@@ -1646,7 +1652,6 @@ mod tests {
         for case in [
             ("id", ""),
             ("intent", ""),
-            ("intent", "Charge Me"),
             ("intent", "charge|x"),
             // `[]`
             ("request", "W10"),
