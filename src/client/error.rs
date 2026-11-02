@@ -44,9 +44,7 @@ impl fmt::Display for HttpError {
             Self::MissingChallenge => {
                 write!(f, "402 response missing WWW-Authenticate header")
             }
-            Self::NoSupportedChallenge(msg) => {
-                write!(f, "no supported challenge: {}", msg)
-            }
+            Self::NoSupportedChallenge(msg) => write!(f, "{msg}"),
             Self::InvalidChallenge(msg) => write!(f, "invalid challenge: {}", msg),
             Self::InvalidCredential(msg) => write!(f, "invalid credential: {}", msg),
             Self::CloneFailed => write!(f, "request could not be cloned for retry"),

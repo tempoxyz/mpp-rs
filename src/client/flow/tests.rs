@@ -920,3 +920,33 @@ async fn excluded_prepaid_session_falls_back_to_allowed_charge() {
         assert_eq!(provider.abandoned.load(Ordering::SeqCst), 1);
     }
 }
+
+/// A hash credential's transfer is already on chain: a 402 answering it is
+/// final, and the client never pays a fresh challenge for the same request.
+#[tokio::test]
+async fn refused_hash_credential_is_not_paid_again() {
+    for via in BOTH {
+        let calls = Arc::new(AtomicU32::new(0));
+        let app = Router::new().route(
+            "/paid",
+            get({
+                let calls = calls.clone();
+                move || async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    payment_required(&format!("charge-{n}"), "charge")
+                }
+            }),
+        );
+        let url = spawn_server(app).await;
+        let provider = TestProvider::default();
+
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert_eq!(provider.paid(), ["charge-0"], "{via:?}");
+    }
+}

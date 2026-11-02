@@ -75,7 +75,7 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> Result<(), VerificationError> {
-        let Some(store) = &self.store else {
+        let Some(store) = &self.proof_store else {
             return Ok(());
         };
         let reserved = store
