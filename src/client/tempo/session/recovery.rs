@@ -201,6 +201,7 @@ pub fn hydrate_session_snapshot(
         chain_id: snapshot.chain_id,
         opened: true,
         pending_open: None,
+        origin: None,
     })
 }
 
@@ -370,6 +371,7 @@ mod tests {
                 chain_id: 4217,
                 opened: true,
                 pending_open: None,
+                origin: None,
             },
             scope(authority),
             OnChainChannelState {
@@ -403,6 +405,7 @@ mod tests {
             chain_id: 4217,
             opened: true,
             pending_open: Some("open".into()),
+            origin: None,
         };
         let state = |settled| OnChainChannelState {
             settled,

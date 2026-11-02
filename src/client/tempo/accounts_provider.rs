@@ -279,6 +279,8 @@ impl TempoAccountsProvider {
             return Ok(());
         };
         let session = self.session_provider_for(challenge)?;
+        // The channel hint below names a stored channel: only to its origin.
+        session.bind_origin(url)?;
         if !session.restore(challenge).await? {
             return Ok(());
         }
