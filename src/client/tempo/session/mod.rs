@@ -424,15 +424,22 @@ impl TempoSessionProvider {
         let amount = |value: &str| value.parse::<u128>().mpp_config("invalid session amount");
         match name {
             "payment-need-voucher" => {
-                // Only payment events sign or disclose session state, so only
-                // they bind the provider to the stream's origin.
-                let bound = self.bind_origin(url);
+                // Only a well-formed payment event for a channel this provider
+                // holds signs or discloses session state, so only it binds the
+                // provider to the stream's origin.
                 let parsed = serde_json::from_str::<NeedVoucherEvent>(data)
                     .mpp_config("invalid payment-need-voucher event");
+                let bound = match &parsed {
+                    Ok(event) if self.holds_channel_hex(&event.channel_id) => self.bind_origin(url),
+                    Ok(_) => Err(MppError::InvalidConfig(
+                        "payment-need-voucher event for an unknown session channel".into(),
+                    )),
+                    Err(_) => Ok(()),
+                };
                 let (client, url) = (client.clone(), url.to_owned());
                 Some(Box::pin(async move {
-                    bound?;
                     let event = parsed?;
+                    bound?;
                     session
                         .acknowledge_accepted(
                             &event.channel_id,
@@ -450,14 +457,21 @@ impl TempoSessionProvider {
                 }))
             }
             "payment-receipt" => {
-                let bound = self.bind_origin(url);
                 let parsed =
                     serde_json::from_str::<crate::protocol::methods::tempo::SessionReceipt>(data)
                         .mpp_config("invalid payment-receipt event");
+                // A receipt for a channel this provider does not hold changes
+                // nothing, so it neither binds the origin nor fails the stream.
+                let known =
+                    matches!(&parsed, Ok(receipt) if self.holds_channel_hex(&receipt.channel_id));
+                let bound = if known { self.bind_origin(url) } else { Ok(()) };
                 let url = url.parse::<reqwest::Url>().ok();
                 Some(Box::pin(async move {
-                    bound?;
                     let receipt = parsed?;
+                    bound?;
+                    if !known {
+                        return Ok(());
+                    }
                     session
                         .acknowledge_accepted(
                             &receipt.channel_id,
@@ -622,6 +636,18 @@ impl TempoSessionProvider {
             Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => self.bind_origin(url),
             _ => Ok(()),
         }
+    }
+
+    /// Whether this provider holds the channel named by `channel_id_hex`,
+    /// in any hex spelling.
+    fn holds_channel_hex(&self, channel_id_hex: &str) -> bool {
+        let Ok(channel_id) = channel_id_hex.parse::<B256>() else {
+            return false;
+        };
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .contains_key(&channel_id.to_string())
     }
 
     /// Whether this provider is already bound to `url`'s HTTP origin. Never
@@ -4843,6 +4869,36 @@ mod tests {
                     "{}",
                 )
                 .is_none());
+        }
+
+        // Malformed payment events, and payment events for a channel this
+        // provider does not hold, fail or do nothing without binding.
+        let unknown = format!("{:#x}", B256::repeat_byte(0x99));
+        let unknown_voucher = format!(
+            r#"{{"channelId":"{unknown}","requiredCumulative":"2000","acceptedCumulative":"1000"}}"#
+        );
+        let unknown_receipt = format!(
+            r#"{{"method":"tempo","intent":"session","status":"success","timestamp":"2026-01-01T00:00:00Z","reference":"{unknown}","challengeId":"c","channelId":"{unknown}","acceptedCumulative":"1000","spent":"1000"}}"#
+        );
+        for (name, data) in [
+            ("payment-need-voucher", "not json".to_owned()),
+            ("payment-receipt", "not json".to_owned()),
+            ("payment-need-voucher", unknown_voucher),
+            ("payment-receipt", unknown_receipt),
+        ] {
+            let future = provider
+                .stream_event(
+                    &reqwest::Client::new(),
+                    "https://evil.example/stream",
+                    name,
+                    &data,
+                )
+                .expect("payment events are handled");
+            let _ = future.await;
+            assert!(
+                !provider.is_bound_to("https://evil.example/stream"),
+                "{name} {data} bound the origin"
+            );
         }
 
         provider
