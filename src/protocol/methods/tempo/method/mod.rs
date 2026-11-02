@@ -593,6 +593,7 @@ where
                     .await?;
                 ensure_challenge_not_expired(credential.challenge.expires.as_deref())?;
                 this.reserve_proof_credential(&credential).await?;
+                ensure_challenge_not_expired(credential.challenge.expires.as_deref())?;
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
             } else {

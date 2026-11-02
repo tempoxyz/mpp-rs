@@ -353,6 +353,93 @@ async fn test_concurrent_proof_submissions_only_one_succeeds() {
 }
 
 #[tokio::test]
+async fn proof_expiring_during_reservation_is_rejected() {
+    use crate::store::{MemoryStore, Store, StoreError};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    // Hold the store response until the challenge has expired.
+    struct SlowStore {
+        inner: MemoryStore,
+        expires: time::OffsetDateTime,
+    }
+    impl Store for SlowStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
+        {
+            self.inner.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.inner.put(key, value)
+        }
+        fn delete(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.inner.delete(key)
+        }
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            let key = key.to_string();
+            let expires = self.expires;
+            Box::pin(async move {
+                while time::OffsetDateTime::now_utc() <= expires {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                self.inner.put_if_absent(&key, value).await
+            })
+        }
+    }
+
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let request = test_charge_request_with_amount("0");
+    let mut challenge = test_proof_challenge(&request);
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+    challenge.expires = Some(
+        expires
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    let signature = proof::sign_proof(
+        &signer,
+        signer.address(),
+        42431,
+        &challenge.id,
+        &challenge.realm,
+    )
+    .await
+    .unwrap();
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        proof::proof_source(signer.address(), 42431),
+        crate::protocol::core::PaymentPayload::proof(signature),
+    );
+
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let store = Arc::new(SlowStore {
+        inner: MemoryStore::new(),
+        expires,
+    });
+    let method = ChargeMethod::new(provider).with_store(store);
+    method.cached_chain_id.set(42431).unwrap();
+
+    let err = method.verify(&credential, &request).await.unwrap_err();
+    assert!(err.to_string().contains("expired"), "got: {err}");
+}
+
+#[tokio::test]
 async fn proof_reservation_lifetime_covers_challenge_expiry_and_skew() {
     use crate::store::{MemoryStore, Store, StoreError};
     use std::{future::Future, pin::Pin, sync::Mutex, time::Duration};
