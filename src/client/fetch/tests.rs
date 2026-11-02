@@ -102,7 +102,7 @@ mod integration {
             let echo = challenge.to_echo();
             Ok(PaymentCredential::new(
                 echo,
-                PaymentPayload::hash("0xmockhash"),
+                PaymentPayload::transaction("0xmocktx"),
             ))
         }
 
@@ -1413,7 +1413,7 @@ mod integration {
             let echo = challenge.to_echo();
             Ok(PaymentCredential::new(
                 echo,
-                PaymentPayload::hash("0xmockhash"),
+                PaymentPayload::transaction("0xmocktx"),
             ))
         }
 

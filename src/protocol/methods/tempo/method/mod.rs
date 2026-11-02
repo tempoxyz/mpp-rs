@@ -48,6 +48,7 @@ use super::{
 mod calls;
 mod fee_payer;
 mod hash_credential;
+mod hosted_fee_payer;
 mod matching;
 mod memo;
 mod proof_credential;
@@ -56,6 +57,7 @@ mod simulate;
 mod transaction_credential;
 
 pub use fee_payer::{FeePayerPolicy, FeePayerPolicyOverride};
+pub use hosted_fee_payer::RemoteFeePayer;
 pub use receipt_logs::{SenderValidation, ValidateSenderCallback};
 
 use transaction_credential::ensure_transaction_credential_source;
@@ -140,12 +142,14 @@ pub struct ChargeMethod<P> {
     provider: Arc<P>,
     fee_payer_signer: Option<Arc<super::DynSigner>>,
     store: Option<Arc<dyn Store>>,
+    proof_store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
     fee_payer_allowed_fee_tokens: Option<Vec<Address>>,
     relay: Option<Relay>,
     fee_payer_fee_token: Option<Address>,
+    remote_fee_payer: Option<hosted_fee_payer::HostedFeePayer>,
 }
 
 impl<P> ChargeMethod<P>
@@ -166,12 +170,14 @@ where
             provider: Arc::new(provider),
             fee_payer_signer: None,
             store: None,
+            proof_store: None,
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,
             fee_payer_allowed_fee_tokens: None,
             relay: None,
             fee_payer_fee_token: None,
+            remote_fee_payer: None,
         }
     }
 
@@ -239,6 +245,7 @@ where
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
+        self.proof_store = Some(Arc::clone(&store));
         self.store = Some(store);
         self
     }
@@ -253,6 +260,22 @@ where
     {
         self.fee_payer_signer = Some(Arc::new(signer));
         self
+    }
+
+    /// Sponsor fee-payer charges through a hosted fee payer, as mppx's
+    /// `feePayer: url` option: the service co-signs with `eth_fillTransaction`
+    /// and this method simulates and broadcasts the result. A local fee payer
+    /// signer, when also configured, takes precedence.
+    ///
+    /// The service's fee token is accepted as returned unless
+    /// [`with_fee_payer_allowed_fee_tokens`](Self::with_fee_payer_allowed_fee_tokens)
+    /// restricts it.
+    pub fn with_remote_fee_payer(
+        mut self,
+        remote_fee_payer: RemoteFeePayer,
+    ) -> crate::error::Result<Self> {
+        self.remote_fee_payer = Some(remote_fee_payer.resolve()?);
+        Ok(self)
     }
 
     pub(crate) fn with_fee_payer_arc(mut self, signer: Arc<super::DynSigner>) -> Self {
@@ -349,7 +372,7 @@ where
                     expected_chain_id,
                 )
                 .await?;
-            if let Some(store) = &self.store {
+            if let Some(store) = &self.proof_store {
                 if store
                     .get(&Self::proof_replay_key(credential))
                     .await
@@ -474,33 +497,14 @@ where
     ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
         let credential = credential.clone();
         let request = request.clone();
-        let provider = Arc::clone(&self.provider);
-        let fee_payer_signer = self.fee_payer_signer.clone();
-        let store = self.store.clone();
-        let cached_chain_id = Arc::clone(&self.cached_chain_id);
-        let fee_payer_policy_override = self.fee_payer_policy_override.clone();
-        let validate_sender = self.validate_sender.clone();
-        let fee_payer_allowed_fee_tokens = self.fee_payer_allowed_fee_tokens.clone();
-        let relay = self.relay.clone();
-        let fee_payer_fee_token = self.fee_payer_fee_token;
+        let mut this = self.clone();
+        let relay = this.relay.take();
 
         async move {
             if let Some(relay) = relay {
                 relay.validate(&credential, &request).await?;
                 return relay.broadcast(&credential, METHOD_NAME).await;
             }
-
-            let this = ChargeMethod {
-                provider,
-                fee_payer_signer,
-                store,
-                cached_chain_id,
-                fee_payer_policy_override,
-                validate_sender,
-                fee_payer_allowed_fee_tokens,
-                relay: None,
-                fee_payer_fee_token,
-            };
 
             if credential.challenge.method.as_str() != METHOD_NAME {
                 return Err(VerificationError::credential_mismatch(format!(

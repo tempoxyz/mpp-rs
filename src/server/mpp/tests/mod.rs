@@ -22,6 +22,7 @@ use std::{
 
 #[cfg(feature = "tempo")]
 mod binding;
+mod body_digest;
 mod charge;
 #[cfg(feature = "tempo")]
 mod currencies;
