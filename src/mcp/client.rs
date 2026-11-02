@@ -162,16 +162,21 @@ where
         challenges: &[PaymentChallenge],
         management: Option<&dyn ManagementTransport>,
     ) -> Result<Option<PendingPayment<P>>, MppError> {
-        let ranking = if let Some(header) = self.context.headers.get("accept-payment") {
+        let mut preferences = self.context.headers.get_all("accept-payment").iter();
+        let first = preferences.next();
+        if preferences.next().is_some() {
+            return Ok(None);
+        }
+        let ranking = if let Some(header) = first {
             let value = header.to_str().map_err(|_| {
                 MppError::InvalidConfig("invalid caller Accept-Payment header".into())
             })?;
-            let entries = crate::protocol::core::accept_payment::parse(value).map_err(|_| {
-                MppError::InvalidConfig("invalid caller Accept-Payment header".into())
-            })?;
-            if entries.is_empty() {
+            if value.split(',').all(|part| part.trim().is_empty()) {
                 return Ok(None);
             }
+            crate::protocol::core::accept_payment::parse(value).map_err(|_| {
+                MppError::InvalidConfig("invalid caller Accept-Payment header".into())
+            })?;
             Some(value.to_owned())
         } else {
             self.provider.accept_payment_header()
@@ -678,6 +683,8 @@ mod tests {
     #[tokio::test]
     async fn caller_payment_preferences_control_credential_creation() {
         for (header, allowed, invalid) in [
+            ("", false, false),
+            (", ,", false, false),
             ("tempo/charge;q=0", false, false),
             ("stripe/charge", false, false),
             ("tempo/charge", true, false),
@@ -700,6 +707,20 @@ mod tests {
                 usize::from(allowed)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_caller_preferences_never_create_credentials() {
+        let provider = TestProvider::new();
+        let mut context = context();
+        for value in ["*/*", "tempo/charge;q=0"] {
+            context
+                .headers
+                .append("accept-payment", value.parse().unwrap());
+        }
+        let session = McpPayment::new(provider.clone(), context);
+        assert!(session.prepare(&[challenge()]).await.unwrap().is_none());
+        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
