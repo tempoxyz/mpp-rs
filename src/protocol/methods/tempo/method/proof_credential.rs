@@ -11,6 +11,8 @@ use crate::protocol::traits::VerificationError;
 use super::super::proof;
 use super::ChargeMethod;
 
+const AUTHENTICATED_PROOF_DOMAIN: &str = "mpp:charge:proof-domain:authenticated-expiry";
+
 impl<P> ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
@@ -78,17 +80,60 @@ where
         let Some(store) = &self.proof_store else {
             return Ok(());
         };
-        let reserved = store
-            .put_if_absent(
-                &Self::proof_replay_key(credential),
-                serde_json::Value::Bool(true),
+        self.ensure_proof_domain().await?;
+        let key = Self::proof_replay_key(credential);
+        let value = serde_json::Value::Bool(true);
+        let reservation = if let Some(expires) = credential
+            .challenge
+            .expires
+            .as_deref()
+            .filter(|_| self.authenticated_expiry)
+        {
+            let expires = time::OffsetDateTime::parse(
+                expires,
+                &time::format_description::well_known::Rfc3339,
             )
+            .map_err(|_| VerificationError::invalid_challenge("Invalid proof challenge expiry."))?;
+            // Retain beyond the challenge's acceptance window, including clock skew.
+            let remaining = expires - time::OffsetDateTime::now_utc() + time::Duration::seconds(30);
+            let ttl = std::time::Duration::try_from(remaining)
+                .map_err(|_| VerificationError::expired("Proof challenge has expired."))?;
+            store
+                .put_if_absent(AUTHENTICATED_PROOF_DOMAIN, serde_json::Value::Bool(true))
+                .await
+                .map_err(|e| {
+                    VerificationError::internal(format!("Failed to record proof domain: {e}"))
+                })?;
+            store.put_if_absent_with_ttl(&key, value, ttl)
+        } else {
+            // A challenge that never expires requires a permanent replay reservation.
+            store.put_if_absent(&key, value)
+        };
+        let reserved = reservation
             .await
             .map_err(|e| VerificationError::internal(format!("Failed to record proof: {e}")))?;
+        // A concurrent authenticated verifier may have enabled expiry while we awaited insertion.
+        self.ensure_proof_domain().await?;
         if !reserved {
             return Err(VerificationError::credential_replayed(
                 "Proof credential has already been used.",
             ));
+        }
+        Ok(())
+    }
+
+    async fn ensure_proof_domain(&self) -> Result<(), VerificationError> {
+        if !self.authenticated_expiry {
+            if let Some(store) = &self.proof_store {
+                let authenticated = store.get(AUTHENTICATED_PROOF_DOMAIN).await.map_err(|e| {
+                    VerificationError::internal(format!("Failed to read proof domain: {e}"))
+                })?;
+                if authenticated.is_some() {
+                    return Err(VerificationError::invalid_challenge(
+                        "This replay store requires HMAC-authenticated proof verification.",
+                    ));
+                }
+            }
         }
         Ok(())
     }

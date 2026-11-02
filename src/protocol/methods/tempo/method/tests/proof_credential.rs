@@ -352,6 +352,192 @@ async fn test_concurrent_proof_submissions_only_one_succeeds() {
     assert!(err.to_string().contains("already been used"));
 }
 
+#[tokio::test]
+async fn proof_expiring_during_reservation_is_rejected() {
+    use crate::store::{MemoryStore, Store, StoreError};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    // Hold the store response until the challenge has expired.
+    struct SlowStore {
+        inner: MemoryStore,
+        expires: time::OffsetDateTime,
+    }
+    impl Store for SlowStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
+        {
+            self.inner.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.inner.put(key, value)
+        }
+        fn delete(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.inner.delete(key)
+        }
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            let key = key.to_string();
+            let expires = self.expires;
+            Box::pin(async move {
+                while time::OffsetDateTime::now_utc() <= expires {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                self.inner.put_if_absent(&key, value).await
+            })
+        }
+    }
+
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let request = test_charge_request_with_amount("0");
+    let mut challenge = test_proof_challenge(&request);
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+    challenge.expires = Some(
+        expires
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    let signature = proof::sign_proof(
+        &signer,
+        signer.address(),
+        42431,
+        &challenge.id,
+        &challenge.realm,
+    )
+    .await
+    .unwrap();
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        proof::proof_source(signer.address(), 42431),
+        crate::protocol::core::PaymentPayload::proof(signature),
+    );
+
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let store = Arc::new(SlowStore {
+        inner: MemoryStore::new(),
+        expires,
+    });
+    let method = ChargeMethod::new(provider).with_store(store);
+    method.cached_chain_id.set(42431).unwrap();
+
+    let err = method.verify(&credential, &request).await.unwrap_err();
+    assert!(err.to_string().contains("expired"), "got: {err}");
+}
+
+#[tokio::test]
+async fn proof_reservation_lifetime_covers_challenge_expiry_and_skew() {
+    use crate::store::{MemoryStore, Store, StoreError};
+    use std::{future::Future, pin::Pin, sync::Mutex, time::Duration};
+
+    struct RecordingStore(MemoryStore, Mutex<Option<Duration>>);
+    impl Store for RecordingStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
+        {
+            self.0.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.0.put(key, value)
+        }
+        fn delete(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.0.delete(key)
+        }
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            self.0.put_if_absent(key, value)
+        }
+        fn put_if_absent_with_ttl(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+            ttl: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            *self.1.lock().unwrap() = Some(ttl);
+            self.0.put_if_absent_with_ttl(key, value, ttl)
+        }
+    }
+
+    let request = test_charge_request_with_amount("0");
+    let mut challenge = test_proof_challenge(&request);
+    challenge.expires = Some(
+        (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        "did:pkh:eip155:42431:0x0000000000000000000000000000000000000001",
+        crate::protocol::core::PaymentPayload::proof("unused"),
+    );
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let store = Arc::new(RecordingStore(MemoryStore::new(), Mutex::new(None)));
+    let mut method = ChargeMethod::new(provider).with_store(store.clone());
+    method.reserve_proof_credential(&credential).await.unwrap();
+    assert!(
+        store.1.lock().unwrap().is_none(),
+        "direct verification retains permanent markers"
+    );
+    store
+        .0
+        .delete(&format!("mpp:charge:proof:{}", credential.challenge.id))
+        .await
+        .unwrap();
+    method.authenticated_expiry = true;
+    method.reserve_proof_credential(&credential).await.unwrap();
+    let ttl = store.1.lock().unwrap().unwrap();
+    assert!(ttl > Duration::from_secs(329) && ttl <= Duration::from_secs(330));
+    assert!(method.reserve_proof_credential(&credential).await.is_err());
+    // Simulate ordinary TTL reclamation, then strip the unsigned expiry before direct reuse.
+    store
+        .0
+        .delete(&format!("mpp:charge:proof:{}", credential.challenge.id))
+        .await
+        .unwrap();
+    let mut direct = method.clone();
+    direct.authenticated_expiry = false;
+    let mut without_expiry = credential.clone();
+    without_expiry.challenge.expires = None;
+    let error = direct
+        .reserve_proof_credential(&without_expiry)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("HMAC-authenticated"));
+    for expires in ["invalid", "2000-01-01T00:00:00Z"] {
+        let mut invalid = credential.clone();
+        invalid.challenge.expires = Some(expires.into());
+        assert!(method.reserve_proof_credential(&invalid).await.is_err());
+    }
+}
+
 // mppx parity fixture: see `proof.rs` tests. Root key 0x11..11, access key
 // 0x22..22, Keychain V2 envelope signed by viem/tempo.
 const VIEM_KEYCHAIN_SIGNATURE: &str = "0x0419e7e376e7c213b7e7e7e46cc70a5dd086daff2aa64ad10a15b8ed2c208c147daf58f5ec3989b4de18173565f10d3acad84fc1cf3ccc20181099d57723b7b9f9ed3821442c44f641e0eb4e8a4f2965d15be9e8621c";

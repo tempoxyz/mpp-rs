@@ -535,7 +535,10 @@ where
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request)?;
         let validation = self.validate_before_broadcast(credential, request).await?;
-        let receipt = self.method.broadcast(credential, request).await?;
+        let receipt = self
+            .method
+            .broadcast_authenticated(credential, request)
+            .await?;
         self.events
             .emit_payment_success(PaymentSuccessContext {
                 credential: credential.clone(),

@@ -302,6 +302,17 @@ pub trait ChargeMethod: Clone + Send + Sync {
         self.verify(credential, request)
     }
 
+    /// Perform the terminal operation after the server has authenticated the
+    /// challenge HMAC and expiry. Direct callers must use `broadcast` unless
+    /// they have independently performed those checks.
+    fn broadcast_authenticated(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        self.broadcast(credential, request)
+    }
+
     /// Legacy combined verification hook.
     ///
     /// Existing methods may implement only this hook. Split-lifecycle methods
