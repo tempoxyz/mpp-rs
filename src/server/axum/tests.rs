@@ -44,6 +44,7 @@ impl ChargeChallenger for MockChallenger {
                     reference: "0xabc".into(),
                     external_id: None,
                     subscription_id: None,
+                    funding_currency: None,
                     extensions: serde_json::Map::new(),
                 })
             } else {
@@ -117,6 +118,7 @@ impl ChargeChallenger for BodyAwareChallenger {
             reference: "0xbody-aware".into(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         })))
     }
@@ -358,6 +360,7 @@ fn test_with_receipt_attaches_header() {
         reference: "0xabc".into(),
         external_id: None,
         subscription_id: None,
+        funding_currency: None,
         extensions: serde_json::Map::new(),
     };
 
@@ -392,6 +395,7 @@ fn test_with_receipt_does_not_attach_header_to_error_response() {
             reference: "0xabc".into(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         };
         let resp = WithReceipt {
@@ -417,6 +421,7 @@ fn test_with_receipt_preserves_existing_cache_control() {
         reference: "0xabc".into(),
         external_id: None,
         subscription_id: None,
+        funding_currency: None,
         extensions: serde_json::Map::new(),
     };
     let mut body = "ok".into_response();
@@ -618,6 +623,7 @@ async fn test_extractor_fails_closed_when_challenger_does_not_verify_scope() {
                 reference: "0xlegacy".into(),
                 external_id: None,
                 subscription_id: None,
+                funding_currency: None,
                 extensions: serde_json::Map::new(),
             })))
         }
@@ -696,6 +702,7 @@ impl ChargeChallenger for ScopedChallenger {
             reference: "0xscoped".into(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         })))
     }
@@ -1124,6 +1131,7 @@ async fn test_extractor_uses_route_aware_verification_path() {
                 reference: "0xroute-aware".into(),
                 external_id: None,
                 subscription_id: None,
+                funding_currency: None,
                 extensions: serde_json::Map::new(),
             })))
         }

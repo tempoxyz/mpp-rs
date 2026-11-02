@@ -31,6 +31,12 @@ pub struct Receipt {
     #[serde(rename = "subscriptionId", skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<String>,
 
+    /// Currency actually debited to fund the payment, when known. It can
+    /// differ from the challenge currency when the payment was funded through
+    /// a swap.
+    #[serde(rename = "fundingCurrency", skip_serializing_if = "Option::is_none")]
+    pub funding_currency: Option<String>,
+
     /// Method-specific receipt fields not defined by the core protocol.
     #[serde(flatten)]
     pub extensions: serde_json::Map<String, serde_json::Value>,
@@ -47,6 +53,7 @@ impl Receipt {
             reference: reference.into(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         }
     }
@@ -56,18 +63,13 @@ impl Receipt {
     /// payment was funded through a swap.
     #[must_use]
     pub fn with_funding_currency(mut self, currency: impl Into<String>) -> Self {
-        self.extensions.insert(
-            "fundingCurrency".to_string(),
-            serde_json::Value::String(currency.into()),
-        );
+        self.funding_currency = Some(currency.into());
         self
     }
 
     /// The token the payer spent to fund the payment, when the method reported it.
     pub fn funding_currency(&self) -> Option<&str> {
-        self.extensions
-            .get("fundingCurrency")
-            .and_then(serde_json::Value::as_str)
+        self.funding_currency.as_deref()
     }
 
     /// Set the merchant correlation reference.
@@ -141,6 +143,33 @@ pub fn extract_tx_hash(receipt_b64: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn encode_receipt(json: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        URL_SAFE_NO_PAD.encode(json)
+    }
+
+    #[test]
+    fn test_parse_receipt_rejects_non_string_funding_currency() {
+        let header = encode_receipt(
+            r#"{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc","fundingCurrency":123}"#,
+        );
+        assert!(Receipt::from_header(&header).is_err());
+    }
+
+    #[test]
+    fn test_parse_receipt_funding_currency_round_trips() {
+        let header = encode_receipt(
+            r#"{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc","fundingCurrency":"0x20c0"}"#,
+        );
+        let receipt = Receipt::from_header(&header).unwrap();
+        assert_eq!(receipt.funding_currency(), Some("0x20c0"));
+        assert!(!receipt.extensions.contains_key("fundingCurrency"));
+
+        let reparsed = Receipt::from_header(&receipt.to_header().unwrap()).unwrap();
+        assert_eq!(reparsed.funding_currency(), Some("0x20c0"));
+    }
+
     #[test]
     fn test_payment_receipt_status() {
         let success = Receipt {
@@ -150,6 +179,7 @@ mod tests {
             reference: "0xabc".to_string(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         };
         assert!(success.is_success());

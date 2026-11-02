@@ -781,6 +781,7 @@ mod tests {
             reference: "0xabc123".to_string(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         };
 
@@ -801,6 +802,7 @@ mod tests {
             reference: "0xabc123".to_string(),
             external_id: None,
             subscription_id: Some("sub_123".to_string()),
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         };
 
