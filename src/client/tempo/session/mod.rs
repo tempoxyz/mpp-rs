@@ -47,13 +47,13 @@ use crate::client::{
 use crate::error::{MppError, ResultExt};
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
-/// A client that never follows redirects, for requests that carry a
-/// `Payment-Session` channel hint: reqwest forwards custom headers across
+/// The default client for requests that carry a `Payment-Session` channel
+/// hint, which never follows redirects: reqwest forwards custom headers across
 /// redirects, so a caller's client could hand the hint to another origin.
 ///
 /// Built per use: hint requests are rare, and a pooled client would outlive
 /// the runtime its connections were opened on.
-pub(crate) fn hint_client() -> Result<reqwest::Client, MppError> {
+fn default_hint_client() -> Result<reqwest::Client, MppError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -176,6 +176,9 @@ pub struct TempoSessionProvider {
     /// another origin, and stored channels bound to one, are refused, as
     /// mppx's `SessionManager` does. Shared by clones.
     origin: Arc<Mutex<Option<String>>>,
+    /// Client for requests carrying a `Payment-Session` channel hint; a
+    /// no-redirect default client when unset.
+    hint_client: Option<reqwest::Client>,
 }
 
 /// How long a session management request may take before it fails with an
@@ -287,8 +290,24 @@ struct PendingOpen {
 }
 
 struct SessionPaymentLease {
+    /// Channel the leased credential pays from, so commit and rollback are
+    /// routed to the provider whose lease matches the credential's channel.
+    channel_id: Option<String>,
     _process: tokio::sync::OwnedMutexGuard<()>,
     _store: Box<dyn ChannelStoreLease>,
+}
+
+/// How strongly a session provider holds a payment, strongest first, so a
+/// commit or rollback reaches the provider holding its lease rather than one
+/// that only knows the channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PaymentHold {
+    /// A pending lease for the challenge, paying from the credential's channel.
+    LeaseOnChannel,
+    /// A pending lease for the challenge, recorded for another or no channel.
+    Lease,
+    /// No lease, but the provider knows the credential's channel.
+    Channel,
 }
 
 enum TopUpRoute<'a> {
@@ -350,6 +369,7 @@ impl TempoSessionProvider {
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
             uncertain_top_ups: Arc::new(Mutex::new(HashSet::new())),
             origin,
+            hint_client: None,
         })
     }
 
@@ -616,25 +636,123 @@ impl TempoSessionProvider {
         self.origin.lock().unwrap().as_deref() == Some(url.origin().ascii_serialization().as_str())
     }
 
-    /// Whether `challenge`'s payment, or the channel `credential` pays from,
-    /// belongs to this provider, so its commit or rollback is routed here.
-    pub(crate) fn holds_payment(
+    /// How this provider holds `challenge`'s payment with `credential`, if at
+    /// all: through its pending lease, on the credential's channel or not, or
+    /// only by knowing the channel. Commit and rollback go to the strongest
+    /// holder, so they release the lease that blocks later payments.
+    pub(crate) fn payment_hold(
         &self,
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
-    ) -> bool {
-        self.pending_payment_leases
+    ) -> Option<PaymentHold> {
+        let channel_id = Self::credential_channel_id(credential);
+        let knows_channel = channel_id
+            .as_deref()
+            .is_some_and(|id| self.knows_channel(id));
+        let leases = self.pending_payment_leases.lock().unwrap();
+        match leases.get(&challenge.id) {
+            Some(lease) => {
+                let on_channel = match (&lease.channel_id, &channel_id) {
+                    (Some(leased), Some(paid)) => leased.eq_ignore_ascii_case(paid),
+                    // A lease that recorded no channel matches through the
+                    // channel this provider knows.
+                    (None, Some(_)) => knows_channel,
+                    _ => false,
+                };
+                Some(if on_channel {
+                    PaymentHold::LeaseOnChannel
+                } else {
+                    PaymentHold::Lease
+                })
+            }
+            None => knows_channel.then_some(PaymentHold::Channel),
+        }
+    }
+
+    /// Whether this provider knows the channel `channel_id`.
+    fn knows_channel(&self, channel_id: &str) -> bool {
+        self.channel_id_to_key
             .lock()
             .unwrap()
-            .contains_key(&challenge.id)
-            || Self::credential_channel_id(credential)
-                .is_some_and(|id| self.channel_id_to_key.lock().unwrap().contains_key(&id))
+            .contains_key(channel_id)
+    }
+
+    /// Send requests that carry a `Payment-Session` channel hint (the
+    /// session-snapshot probe of WebSocket challenge recovery and
+    /// `TempoAccountsProvider::preconnect`'s hint probe) through `client`, for example one with the caller's CA
+    /// roots, client certificate, proxy or default headers.
+    ///
+    /// `client` must not follow redirects, for example one built with
+    /// `redirect(reqwest::redirect::Policy::none())`: reqwest forwards custom
+    /// headers across redirects, so the channel hint could reach another
+    /// origin. Hint requests still time out after the management request
+    /// timeout. Without it, a default client that follows no redirect is used.
+    pub fn with_hint_client(mut self, client: reqwest::Client) -> Self {
+        self.hint_client = Some(client);
+        self
+    }
+
+    /// The client for requests carrying a `Payment-Session` channel hint.
+    pub(crate) fn hint_client(&self) -> Result<reqwest::Client, MppError> {
+        match &self.hint_client {
+            Some(client) => Ok(client.clone()),
+            None => default_hint_client(),
+        }
+    }
+
+    /// Sends a request carrying a `Payment-Session` channel hint through
+    /// [`Self::hint_client`], within the management request timeout.
+    pub(crate) async fn send_hint(
+        &self,
+        request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<reqwest::Response, MppError> {
+        let client = self.hint_client()?;
+        with_management_timeout(self.management_timeout, context, async {
+            request(&client).send().await.mpp_http(context)
+        })
+        .await
     }
 
     /// Whether `self` and `other` share one session's channel state.
     #[cfg(test)]
     pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.channels, &other.channels)
+    }
+
+    /// Holds a pending payment lease for `challenge_id` on `channel_id`.
+    #[cfg(test)]
+    pub(crate) async fn hold_test_lease(&self, challenge_id: &str, channel_id: Option<&str>) {
+        let process = self.payment_lock.clone().lock_owned().await;
+        // Providers may share one store: lease a key of this provider's own.
+        let key = format!("{challenge_id}:{:p}", Arc::as_ptr(&self.channels));
+        let store = self.channel_store.acquire(&key).await.unwrap();
+        self.pending_payment_leases.lock().unwrap().insert(
+            challenge_id.to_owned(),
+            SessionPaymentLease {
+                channel_id: channel_id.map(str::to_owned),
+                _process: process,
+                _store: store,
+            },
+        );
+    }
+
+    /// Whether a payment lease for `challenge_id` is pending.
+    #[cfg(test)]
+    pub(crate) fn has_pending_lease(&self, challenge_id: &str) -> bool {
+        self.pending_payment_leases
+            .lock()
+            .unwrap()
+            .contains_key(challenge_id)
+    }
+
+    /// Records `channel_id` as known under `key`, without its state.
+    #[cfg(test)]
+    pub(crate) fn know_test_channel(&self, channel_id: &str, key: &str) {
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_owned(), key.to_owned());
     }
 
     /// Report `channel.deposit` events to `events` when the server accepts a
@@ -1332,8 +1450,13 @@ impl TempoSessionProvider {
             }
             // reqwest forwards custom headers across redirects, so the channel
             // hint goes through a client that never follows one.
-            let no_redirect = hint_client()?;
-            if let Ok(response) = no_redirect.get(url).headers(headers.clone()).send().await {
+            if let Ok(response) = self
+                .send_hint(
+                    |client| client.get(url).headers(headers.clone()),
+                    "session snapshot request failed",
+                )
+                .await
+            {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
                     let refreshed = crate::protocol::core::parse_www_authenticate_all_bytes(
                         response
@@ -3106,6 +3229,7 @@ impl TempoSessionProvider {
         self.pending_payment_leases.lock().unwrap().insert(
             challenge.id.clone(),
             SessionPaymentLease {
+                channel_id: Self::credential_channel_id(&credential),
                 _process: process_lease,
                 _store: store_lease,
             },
@@ -4856,6 +4980,56 @@ mod tests {
             && hint.as_deref() == Some(channel_id.to_string().as_str())));
         let leaked = elsewhere.lock().unwrap().clone();
         assert!(leaked.iter().all(|(_, hint)| hint.is_none()), "{leaked:?}");
+    }
+
+    #[tokio::test]
+    async fn channel_hint_uses_the_configured_hint_client_within_the_management_timeout() {
+        let seen = Arc::new(Mutex::new(Vec::<(Option<String>, Option<String>)>::new()));
+        let app = axum::Router::new().fallback({
+            let seen = seen.clone();
+            move |headers: axum::http::HeaderMap| {
+                let header = |name: &str| {
+                    headers
+                        .get(name)
+                        .map(|value| value.to_str().unwrap().to_owned())
+                };
+                seen.lock()
+                    .unwrap()
+                    .push((header("x-hint-client"), header("payment-session")));
+                async {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    "late"
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/pay", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-hint-client", "configured".parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut provider = make_test_provider().with_hint_client(client);
+        provider.management_timeout = std::time::Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let error = provider
+            .send_hint(
+                |client| client.get(&url).header("payment-session", "0xabc"),
+                "hint request failed",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(Some("configured".to_owned()), Some("0xabc".to_owned()))]
+        );
     }
 
     #[tokio::test]
