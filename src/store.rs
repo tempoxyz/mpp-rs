@@ -61,6 +61,19 @@ pub trait Store: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
         Box::pin(async { Err(StoreError::AtomicUnsupported) })
     }
+
+    /// Atomically reserve a key for at least `ttl`. Expiration must never evict a live reservation.
+    ///
+    /// Backends without TTL support retain the reservation permanently using their atomic insert.
+    /// Redis implementations should use SET NX with expiration in the same operation.
+    fn put_if_absent_with_ttl(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        _ttl: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        self.put_if_absent(key, value)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,13 +90,60 @@ pub enum StoreError {
 
 /// In-memory store backed by a HashMap. JSON-roundtrips values to match production behavior.
 pub struct MemoryStore {
-    data: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    data: std::sync::Mutex<MemoryData>,
+    expiring_capacity: usize,
+}
+
+#[derive(Default)]
+struct MemoryData {
+    values: std::collections::HashMap<String, (String, Option<std::time::Instant>)>,
+    expirations: std::collections::BTreeSet<(std::time::Instant, String)>,
+}
+
+impl MemoryData {
+    fn get(&self, key: &str) -> Option<&String> {
+        self.values.get(key).map(|(value, _)| value)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some((_, Some(deadline))) = self.values.remove(key) {
+            self.expirations.remove(&(deadline, key.to_owned()));
+        }
+    }
+
+    fn insert(&mut self, key: String, value: String) {
+        self.insert_until(key, value, None);
+    }
+
+    fn insert_until(&mut self, key: String, value: String, deadline: Option<std::time::Instant>) {
+        self.remove(&key);
+        if let Some(deadline) = deadline {
+            self.expirations.insert((deadline, key.clone()));
+        }
+        self.values.insert(key, (value, deadline));
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        while self
+            .expirations
+            .first()
+            .is_some_and(|(deadline, _)| *deadline <= now)
+        {
+            let (_, key) = self.expirations.pop_first().expect("expiry exists");
+            self.values.remove(&key);
+        }
+    }
 }
 
 impl Default for MemoryStore {
     fn default() -> Self {
         Self {
-            data: std::sync::Mutex::new(std::collections::HashMap::new()),
+            data: std::sync::Mutex::new(MemoryData::default()),
+            expiring_capacity: 100_000,
         }
     }
 }
@@ -91,6 +151,21 @@ impl Default for MemoryStore {
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Limits simultaneously live TTL reservations (100,000 by default).
+    /// A full store rejects new reservations; it never evicts live replay markers.
+    pub fn with_expiring_capacity(capacity: usize) -> Self {
+        Self {
+            expiring_capacity: capacity,
+            ..Self::default()
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryData> {
+        let mut data = self.data.lock().unwrap();
+        data.expire(std::time::Instant::now());
+        data
     }
 }
 
@@ -100,7 +175,7 @@ impl Store for MemoryStore {
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
     {
-        let result = self.data.lock().unwrap().get(key).cloned();
+        let result = self.lock().get(key).cloned();
         Box::pin(async move {
             match result {
                 Some(raw) => {
@@ -123,7 +198,7 @@ impl Store for MemoryStore {
             serde_json::to_string(&value).map_err(|e| StoreError::Serialization(e.to_string()));
         Box::pin(async move {
             let serialized = serialized?;
-            self.data.lock().unwrap().insert(key, serialized);
+            self.lock().insert(key, serialized);
             Ok(())
         })
     }
@@ -132,7 +207,7 @@ impl Store for MemoryStore {
         &self,
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        self.data.lock().unwrap().remove(key);
+        self.lock().remove(key);
         Box::pin(async { Ok(()) })
     }
 
@@ -144,7 +219,7 @@ impl Store for MemoryStore {
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
         let key = key.to_string();
         Box::pin(async move {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.lock();
             let current = data
                 .get(&key)
                 .map(|raw| serde_json::from_str(raw))
@@ -175,11 +250,38 @@ impl Store for MemoryStore {
         Box::pin(async move {
             let serialized = serialized?;
             // Check-and-insert under one mutex guard.
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.lock();
             if data.contains_key(&key) {
                 return Ok(false);
             }
             data.insert(key, serialized);
+            Ok(true)
+        })
+    }
+
+    fn put_if_absent_with_ttl(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        ttl: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+        let key = key.to_owned();
+        Box::pin(async move {
+            let serialized = serde_json::to_string(&value)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let deadline = std::time::Instant::now().checked_add(ttl).ok_or_else(|| {
+                StoreError::Internal("reservation lifetime exceeds clock range".into())
+            })?;
+            let mut data = self.lock();
+            if data.contains_key(&key) {
+                return Ok(false);
+            }
+            if data.expirations.len() >= self.expiring_capacity {
+                return Err(StoreError::Internal(
+                    "live replay reservation capacity reached".into(),
+                ));
+            }
+            data.insert_until(key, serialized, Some(deadline));
             Ok(true)
         })
     }
@@ -490,6 +592,107 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ttl_reservations_expire_without_evicting_live_or_permanent_entries() {
+        use std::time::{Duration, Instant};
+        let store = MemoryStore::with_expiring_capacity(2);
+        store.put("permanent", serde_json::json!(1)).await.unwrap();
+        assert!(store
+            .put_if_absent_with_ttl("soon", serde_json::json!(true), Duration::from_secs(10))
+            .await
+            .unwrap());
+        assert!(store
+            .put_if_absent_with_ttl("live", serde_json::json!(true), Duration::from_secs(100))
+            .await
+            .unwrap());
+        assert!(store
+            .put_if_absent_with_ttl("overflow", serde_json::json!(true), Duration::from_secs(10))
+            .await
+            .is_err());
+        assert!(!store
+            .put_if_absent_with_ttl("live", serde_json::json!(false), Duration::ZERO)
+            .await
+            .unwrap());
+        store
+            .data
+            .lock()
+            .unwrap()
+            .expire(Instant::now() + Duration::from_secs(20));
+        assert_eq!(store.get("soon").await.unwrap(), None);
+        assert_eq!(
+            store.get("live").await.unwrap(),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            store.get("permanent").await.unwrap(),
+            Some(serde_json::json!(1))
+        );
+        assert!(store
+            .put_if_absent_with_ttl("new", serde_json::json!(true), Duration::from_secs(10))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn ttl_replacement_and_delete_remove_expiry_index_entries() {
+        use std::time::{Duration, Instant};
+        let store = MemoryStore::new();
+        for key in ["replaced", "deleted"] {
+            store
+                .put_if_absent_with_ttl(key, serde_json::json!(true), Duration::from_secs(10))
+                .await
+                .unwrap();
+        }
+        store
+            .put("replaced", serde_json::json!("persistent"))
+            .await
+            .unwrap();
+        store.delete("deleted").await.unwrap();
+        let mut data = store.data.lock().unwrap();
+        assert!(data.expirations.is_empty());
+        data.expire(Instant::now() + Duration::from_secs(20));
+        assert_eq!(data.values.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ttl_reservation_is_atomic_and_reclaims_all_expired_keys() {
+        use std::time::{Duration, Instant};
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .put_if_absent_with_ttl(
+                        "same",
+                        serde_json::json!(true),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            successes += usize::from(task.await.unwrap());
+        }
+        assert_eq!(successes, 1);
+        for i in 0..1000 {
+            store
+                .put_if_absent_with_ttl(
+                    &format!("proof-{i}"),
+                    serde_json::json!(true),
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap();
+        }
+        let mut data = store.data.lock().unwrap();
+        data.expire(Instant::now() + Duration::from_secs(20));
+        assert!(data.values.is_empty());
+        assert!(data.expirations.is_empty());
+    }
 
     #[tokio::test]
     async fn memory_store_get_put_delete() {

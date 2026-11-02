@@ -351,3 +351,69 @@ async fn test_concurrent_proof_submissions_only_one_succeeds() {
     let err = res1.err().or(res2.err()).unwrap();
     assert!(err.to_string().contains("already been used"));
 }
+
+#[tokio::test]
+async fn proof_reservation_lifetime_covers_challenge_expiry_and_skew() {
+    use crate::store::{MemoryStore, Store, StoreError};
+    use std::{future::Future, pin::Pin, sync::Mutex, time::Duration};
+
+    struct RecordingStore(MemoryStore, Mutex<Option<Duration>>);
+    impl Store for RecordingStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
+        {
+            self.0.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.0.put(key, value)
+        }
+        fn delete(
+            &self,
+            key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
+            self.0.delete(key)
+        }
+        fn put_if_absent_with_ttl(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+            ttl: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            *self.1.lock().unwrap() = Some(ttl);
+            self.0.put_if_absent_with_ttl(key, value, ttl)
+        }
+    }
+
+    let request = test_charge_request_with_amount("0");
+    let mut challenge = test_proof_challenge(&request);
+    challenge.expires = Some(
+        (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        "did:pkh:eip155:42431:0x0000000000000000000000000000000000000001",
+        crate::protocol::core::PaymentPayload::proof("unused"),
+    );
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let store = Arc::new(RecordingStore(MemoryStore::new(), Mutex::new(None)));
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+    method.reserve_proof_credential(&credential).await.unwrap();
+    let ttl = store.1.lock().unwrap().unwrap();
+    assert!(ttl > Duration::from_secs(329) && ttl <= Duration::from_secs(330));
+    assert!(method.reserve_proof_credential(&credential).await.is_err());
+    for expires in ["invalid", "2000-01-01T00:00:00Z"] {
+        let mut invalid = credential.clone();
+        invalid.challenge.expires = Some(expires.into());
+        assert!(method.reserve_proof_credential(&invalid).await.is_err());
+    }
+}
