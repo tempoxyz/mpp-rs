@@ -80,16 +80,21 @@ where
         };
         let key = Self::proof_replay_key(credential);
         let value = serde_json::Value::Bool(true);
-        let reservation = if let Some(expires) = credential.challenge.expires.as_deref() {
+        let reservation = if let Some(expires) = credential
+            .challenge
+            .expires
+            .as_deref()
+            .filter(|_| self.authenticated_expiry)
+        {
             let expires = time::OffsetDateTime::parse(
                 expires,
                 &time::format_description::well_known::Rfc3339,
             )
-            .map_err(|_| VerificationError::new("Invalid proof challenge expiry."))?;
+            .map_err(|_| VerificationError::invalid_challenge("Invalid proof challenge expiry."))?;
             // Retain beyond the challenge's acceptance window, including clock skew.
             let remaining = expires - time::OffsetDateTime::now_utc() + time::Duration::seconds(30);
             let ttl = std::time::Duration::try_from(remaining)
-                .map_err(|_| VerificationError::new("Proof challenge has expired."))?;
+                .map_err(|_| VerificationError::expired("Proof challenge has expired."))?;
             store.put_if_absent_with_ttl(&key, value, ttl)
         } else {
             // A challenge that never expires requires a permanent replay reservation.

@@ -96,8 +96,8 @@ pub struct MemoryStore {
 
 #[derive(Default)]
 struct MemoryData {
-    values: std::collections::HashMap<String, (String, Option<std::time::Instant>)>,
-    expirations: std::collections::BTreeSet<(std::time::Instant, String)>,
+    values: std::collections::HashMap<String, (String, Option<std::time::SystemTime>)>,
+    expirations: std::collections::BTreeSet<(std::time::SystemTime, String)>,
 }
 
 impl MemoryData {
@@ -119,7 +119,12 @@ impl MemoryData {
         self.insert_until(key, value, None);
     }
 
-    fn insert_until(&mut self, key: String, value: String, deadline: Option<std::time::Instant>) {
+    fn insert_until(
+        &mut self,
+        key: String,
+        value: String,
+        deadline: Option<std::time::SystemTime>,
+    ) {
         self.remove(&key);
         if let Some(deadline) = deadline {
             self.expirations.insert((deadline, key.clone()));
@@ -127,7 +132,7 @@ impl MemoryData {
         self.values.insert(key, (value, deadline));
     }
 
-    fn expire(&mut self, now: std::time::Instant) {
+    fn expire(&mut self, now: std::time::SystemTime) {
         while self
             .expirations
             .first()
@@ -143,7 +148,7 @@ impl Default for MemoryStore {
     fn default() -> Self {
         Self {
             data: std::sync::Mutex::new(MemoryData::default()),
-            expiring_capacity: 100_000,
+            expiring_capacity: usize::MAX,
         }
     }
 }
@@ -153,7 +158,8 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// Limits simultaneously live TTL reservations (100,000 by default).
+    /// Opts into a limit on simultaneously live TTL reservations.
+    /// The default removes expired records without rejecting live traffic at a global cap.
     /// A full store rejects new reservations; it never evicts live replay markers.
     pub fn with_expiring_capacity(capacity: usize) -> Self {
         Self {
@@ -164,7 +170,7 @@ impl MemoryStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MemoryData> {
         let mut data = self.data.lock().unwrap();
-        data.expire(std::time::Instant::now());
+        data.expire(std::time::SystemTime::now());
         data
     }
 }
@@ -269,9 +275,11 @@ impl Store for MemoryStore {
         Box::pin(async move {
             let serialized = serde_json::to_string(&value)
                 .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let deadline = std::time::Instant::now().checked_add(ttl).ok_or_else(|| {
-                StoreError::Internal("reservation lifetime exceeds clock range".into())
-            })?;
+            let deadline = std::time::SystemTime::now()
+                .checked_add(ttl)
+                .ok_or_else(|| {
+                    StoreError::Internal("reservation lifetime exceeds clock range".into())
+                })?;
             let mut data = self.lock();
             if data.contains_key(&key) {
                 return Ok(false);
@@ -595,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_reservations_expire_without_evicting_live_or_permanent_entries() {
-        use std::time::{Duration, Instant};
+        use std::time::{Duration, SystemTime};
         let store = MemoryStore::with_expiring_capacity(2);
         store.put("permanent", serde_json::json!(1)).await.unwrap();
         assert!(store
@@ -618,7 +626,7 @@ mod tests {
             .data
             .lock()
             .unwrap()
-            .expire(Instant::now() + Duration::from_secs(20));
+            .expire(SystemTime::now() + Duration::from_secs(20));
         assert_eq!(store.get("soon").await.unwrap(), None);
         assert_eq!(
             store.get("live").await.unwrap(),
@@ -636,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_replacement_and_delete_remove_expiry_index_entries() {
-        use std::time::{Duration, Instant};
+        use std::time::{Duration, SystemTime};
         let store = MemoryStore::new();
         for key in ["replaced", "deleted"] {
             store
@@ -651,13 +659,13 @@ mod tests {
         store.delete("deleted").await.unwrap();
         let mut data = store.data.lock().unwrap();
         assert!(data.expirations.is_empty());
-        data.expire(Instant::now() + Duration::from_secs(20));
+        data.expire(SystemTime::now() + Duration::from_secs(20));
         assert_eq!(data.values.len(), 1);
     }
 
     #[tokio::test]
     async fn ttl_reservation_is_atomic_and_reclaims_all_expired_keys() {
-        use std::time::{Duration, Instant};
+        use std::time::{Duration, SystemTime};
         let store = std::sync::Arc::new(MemoryStore::new());
         let mut tasks = Vec::new();
         for _ in 0..32 {
@@ -689,7 +697,7 @@ mod tests {
                 .unwrap();
         }
         let mut data = store.data.lock().unwrap();
-        data.expire(Instant::now() + Duration::from_secs(20));
+        data.expire(SystemTime::now() + Duration::from_secs(20));
         assert!(data.values.is_empty());
         assert!(data.expirations.is_empty());
     }

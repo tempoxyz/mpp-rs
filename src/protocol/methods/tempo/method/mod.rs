@@ -140,6 +140,7 @@ pub struct ChargeMethod<P> {
     provider: Arc<P>,
     fee_payer_signer: Option<Arc<super::DynSigner>>,
     store: Option<Arc<dyn Store>>,
+    authenticated_expiry: bool,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
@@ -166,6 +167,7 @@ where
             provider: Arc::new(provider),
             fee_payer_signer: None,
             store: None,
+            authenticated_expiry: false,
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,
@@ -467,6 +469,18 @@ where
         }
     }
 
+    fn broadcast_authenticated(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+    ) -> impl Future<Output = Result<Receipt, VerificationError>> + Send {
+        let mut this = self.clone();
+        this.authenticated_expiry = true;
+        let credential = credential.clone();
+        let request = request.clone();
+        async move { ChargeMethodTrait::broadcast(&this, &credential, &request).await }
+    }
+
     fn verify(
         &self,
         credential: &PaymentCredential,
@@ -477,6 +491,7 @@ where
         let provider = Arc::clone(&self.provider);
         let fee_payer_signer = self.fee_payer_signer.clone();
         let store = self.store.clone();
+        let authenticated_expiry = self.authenticated_expiry;
         let cached_chain_id = Arc::clone(&self.cached_chain_id);
         let fee_payer_policy_override = self.fee_payer_policy_override.clone();
         let validate_sender = self.validate_sender.clone();
@@ -494,6 +509,7 @@ where
                 provider,
                 fee_payer_signer,
                 store,
+                authenticated_expiry,
                 cached_chain_id,
                 fee_payer_policy_override,
                 validate_sender,
@@ -573,8 +589,8 @@ where
                 let sig_hex = charge_payload.proof_signature().unwrap();
                 this.validate_proof_credential(&credential, sig_hex, expected_chain_id)
                     .await?;
-                this.reserve_proof_credential(&credential).await?;
                 ensure_challenge_not_expired(credential.challenge.expires.as_deref())?;
+                this.reserve_proof_credential(&credential).await?;
 
                 Ok(Receipt::success(METHOD_NAME, &credential.challenge.id))
             } else {

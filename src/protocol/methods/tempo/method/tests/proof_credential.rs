@@ -379,6 +379,13 @@ async fn proof_reservation_lifetime_covers_challenge_expiry_and_skew() {
         ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
             self.0.delete(key)
         }
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
+            self.0.put_if_absent(key, value)
+        }
         fn put_if_absent_with_ttl(
             &self,
             key: &str,
@@ -406,7 +413,18 @@ async fn proof_reservation_lifetime_covers_challenge_expiry_and_skew() {
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_http("http://127.0.0.1:1".parse().unwrap());
     let store = Arc::new(RecordingStore(MemoryStore::new(), Mutex::new(None)));
-    let method = ChargeMethod::new(provider).with_store(store.clone());
+    let mut method = ChargeMethod::new(provider).with_store(store.clone());
+    method.reserve_proof_credential(&credential).await.unwrap();
+    assert!(
+        store.1.lock().unwrap().is_none(),
+        "direct verification retains permanent markers"
+    );
+    store
+        .0
+        .delete(&format!("mpp:charge:proof:{}", credential.challenge.id))
+        .await
+        .unwrap();
+    method.authenticated_expiry = true;
     method.reserve_proof_credential(&credential).await.unwrap();
     let ttl = store.1.lock().unwrap().unwrap();
     assert!(ttl > Duration::from_secs(329) && ttl <= Duration::from_secs(330));
