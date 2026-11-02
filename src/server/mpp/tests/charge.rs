@@ -352,18 +352,18 @@ fn test_charge_supported_modes_advertisement() {
         })
     };
 
-    assert_eq!(modes(false, None).unwrap(), None);
+    assert_eq!(modes(None, None).unwrap(), None);
     assert_eq!(
-        modes(false, Some(&["push", "pull"])).unwrap(),
+        modes(None, Some(&["push", "pull"])).unwrap(),
         Some(serde_json::json!(["push", "pull"]))
     );
     assert_eq!(
-        modes(true, Some(&["pull"])).unwrap(),
+        modes(Some(true), Some(&["pull"])).unwrap(),
         Some(serde_json::json!(["pull"]))
     );
 
-    assert!(modes(false, Some(&[])).is_err());
-    assert!(modes(false, Some(&["Pull"])).is_err());
+    assert!(modes(None, Some(&[])).is_err());
+    assert!(modes(None, Some(&["Pull"])).is_err());
 }
 
 #[cfg(feature = "tempo")]
@@ -390,23 +390,125 @@ fn test_charge_with_options_binds_request_body_digest() {
 #[cfg(feature = "tempo")]
 #[test]
 fn test_sponsored_charge_refuses_expiry_under_floor() {
-    let mpp = create_test_mpp();
-    let charge = |fee_payer, expires: &str| {
+    let mpp = create_sponsored_test_mpp(None);
+    let charge = |amount: &str, fee_payer, supported_modes, expires: &str| {
         mpp.charge_with_options(
-            "1",
+            amount,
             ChargeOptions {
                 fee_payer,
+                supported_modes,
                 expires: Some(expires),
                 ..Default::default()
             },
         )
     };
+    let short = crate::expires::seconds(10);
 
-    let error = charge(true, &crate::expires::seconds(10)).unwrap_err();
+    let error = charge("1", None, None, &short).unwrap_err();
     assert!(
         matches!(error, crate::error::MppError::InvalidConfig(_)),
         "{error:?}"
     );
-    charge(true, &crate::expires::seconds(30)).unwrap();
-    charge(false, &crate::expires::seconds(10)).unwrap();
+    assert!(charge("1", None, Some(&["push", "pull"]), &short).is_err());
+    charge("1", None, None, &crate::expires::seconds(30)).unwrap();
+    charge("1", Some(false), None, &short).unwrap();
+    // Zero-amount proofs and push-only charges never reach the fee payer
+    // (mppx `Charge.request`).
+    charge("0", None, None, &short).unwrap();
+    charge("1", None, Some(&["push"]), &short).unwrap();
+}
+
+/// A handler with a fee-payer signer, optionally with `fee_payer(enabled)`.
+#[cfg(feature = "tempo")]
+fn create_sponsored_test_mpp(
+    fee_payer: Option<bool>,
+) -> Mpp<crate::server::TempoChargeMethod<crate::server::TempoProvider>> {
+    let mut builder = tempo(TempoConfig {
+        recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+    })
+    .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+    .secret_key(TEST_SECRET);
+    if let Some(enabled) = fee_payer {
+        builder = builder.fee_payer(enabled);
+    }
+    Mpp::create(builder).unwrap()
+}
+
+/// As in mppx, a configured fee payer sponsors every charge unless a route
+/// sets `feePayer: false`, and a handler without one never advertises
+/// sponsorship.
+#[cfg(feature = "tempo")]
+#[test]
+fn test_fee_payer_sponsors_routes_by_default() {
+    let sponsored = |mpp: &Mpp<_>, fee_payer| {
+        let challenge = mpp
+            .charge_with_options(
+                "1",
+                ChargeOptions {
+                    fee_payer,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .remove(0);
+        challenge
+            .request
+            .decode::<ChargeRequest>()
+            .unwrap()
+            .fee_payer()
+    };
+
+    let mpp = create_sponsored_test_mpp(None);
+    assert!(mpp.fee_payer());
+    assert!(sponsored(&mpp, None));
+    assert!(sponsored(&mpp, Some(true)));
+    assert!(!sponsored(&mpp, Some(false)));
+
+    let off = create_sponsored_test_mpp(Some(false));
+    assert!(!sponsored(&off, None));
+    assert!(sponsored(&off, Some(true)));
+
+    let unsponsored = create_test_mpp();
+    assert!(!sponsored(&unsponsored, None));
+    assert!(!sponsored(&unsponsored, Some(true)));
+}
+
+/// A hosted fee payer (mppx `feePayer: url`) sponsors routes by default and
+/// excludes a local fee token or signer.
+#[cfg(feature = "tempo")]
+#[test]
+fn test_hosted_fee_payer_configuration() {
+    let builder = || {
+        tempo(TempoConfig {
+            recipient: TEST_RECIPIENT,
+        })
+        .secret_key(TEST_SECRET)
+    };
+
+    let mpp = Mpp::create(builder().fee_payer_url("https://sponsor.example/rpc")).unwrap();
+    assert!(mpp.fee_payer());
+    let request: ChargeRequest = mpp.charge("1").unwrap().remove(0).request.decode().unwrap();
+    assert!(request.fee_payer());
+
+    let error = |builder| Mpp::create(builder).err().expect("invalid configuration");
+    assert!(matches!(
+        error(
+            builder()
+                .fee_payer_url("https://sponsor.example/rpc")
+                .fee_payer_fee_token(crate::protocol::methods::tempo::PATH_USD.parse().unwrap())
+        ),
+        crate::error::MppError::InvalidConfig(_)
+    ));
+    assert!(matches!(
+        error(
+            builder()
+                .fee_payer_url("https://sponsor.example/rpc")
+                .fee_payer_signer(alloy::signers::local::PrivateKeySigner::random())
+        ),
+        crate::error::MppError::InvalidConfig(_)
+    ));
+    assert!(matches!(
+        error(builder().fee_payer_url("not a url")),
+        crate::error::MppError::InvalidConfig(_)
+    ));
 }

@@ -134,6 +134,9 @@ struct Config {
     recipient: Option<String>,
     decimals: u32,
     fee_payer: bool,
+    /// Whether the charge method can sponsor fees at all. Unknown for a
+    /// custom method, so per-route sponsorship stays the caller's choice.
+    can_sponsor: bool,
     machine_token_enabled: bool,
     chain_id: Option<u64>,
     opaque: Option<Base64UrlJson>,
@@ -151,6 +154,7 @@ impl Config {
             recipient: None,
             decimals: DEFAULT_DECIMALS,
             fee_payer: false,
+            can_sponsor: true,
             machine_token_enabled: false,
             chain_id: None,
             opaque: None,
@@ -397,9 +401,18 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         }
         // Without a sponsor every challenge would advertise `feePayer: true`
         // and every credential built for it would then be rejected.
-        if builder.fee_payer && builder.fee_payer_signer.is_none() && builder.relay.is_none() {
+        if builder.fee_payer_signer.is_some() && builder.remote_fee_payer.is_some() {
             return Err(crate::error::MppError::InvalidConfig(
-                "fee_payer(true) requires fee_payer_signer(...) or relay(...)".into(),
+                "configure either fee_payer_signer(...) or a hosted fee payer, not both".into(),
+            ));
+        }
+        let has_fee_payer =
+            builder.fee_payer_signer.is_some() || builder.remote_fee_payer.is_some();
+        let can_sponsor = has_fee_payer || builder.relay.is_some();
+        if builder.fee_payer == Some(true) && !can_sponsor {
+            return Err(crate::error::MppError::InvalidConfig(
+                "fee_payer(true) requires fee_payer_signer(...), fee_payer_url(...) or relay(...)"
+                    .into(),
             ));
         }
         if builder
@@ -447,6 +460,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(fee_token) = builder.fee_payer_fee_token {
             method = method.with_fee_payer_fee_token(fee_token);
         }
+        if let Some(remote_fee_payer) = builder.remote_fee_payer {
+            method = method.with_remote_fee_payer(remote_fee_payer)?;
+        }
         if let Some(store) = builder.store {
             method = method.with_store(store);
         }
@@ -462,7 +478,10 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 currencies,
                 recipient: Some(builder.recipient),
                 decimals: builder.decimals,
-                fee_payer: builder.fee_payer,
+                // As in mppx, a configured fee payer sponsors charges unless
+                // sponsorship is turned off.
+                fee_payer: builder.fee_payer.unwrap_or(has_fee_payer),
+                can_sponsor,
                 machine_token_enabled: builder.machine_token_enabled,
                 chain_id: builder.chain_id,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),

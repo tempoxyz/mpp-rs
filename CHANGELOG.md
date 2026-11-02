@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.18.2 (2026-11-02)
+
+### Patch Changes
+
+- Rejected zero-amount proof credentials whose Keychain envelope names a different account than the proof's source, even when its access key is active for the source. (by @brendanjryan, [#672](https://github.com/tempoxyz/mpp-rs/pull/672))
+- Accept the RFC 9530 SHA-256 byte-sequence form when verifying body-bound
+- payment credentials, alongside the existing bare digest form. Digest generation
+- and the exact text bound into challenge IDs remain unchanged. (by @brendanjryan, [#672](https://github.com/tempoxyz/mpp-rs/pull/672))
+
 ## 0.18.1 (2026-10-29)
 
 ### Patch Changes
