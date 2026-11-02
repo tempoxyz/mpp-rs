@@ -1196,6 +1196,215 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn one_time_authorization_wallet() -> TempoAccountsWallet {
+        let root = PrivateKeySigner::random();
+        let signer = PrivateKeySigner::random();
+        let authorization =
+            KeyAuthorization::unrestricted(4217, SignatureType::Secp256k1, signer.address());
+        let signature =
+            alloy::signers::SignerSync::sign_hash_sync(&root, &authorization.signature_hash())
+                .unwrap();
+        let authorization = authorization.into_signed(PrimitiveSignature::Secp256k1(signature));
+        TempoAccountsWallet::from_secp256k1(root.address(), signer, Some(authorization))
+            .with_chain_id(4217)
+    }
+
+    fn push_only_challenge() -> PaymentChallenge {
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "100",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": {"chainId": 4217, "supportedModes": ["push"]},
+        }))
+        .unwrap();
+        PaymentChallenge::new(
+            "challenge-push",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        )
+    }
+
+    /// The keychain answers that the access key is not authorized yet, so
+    /// signing carries the one-time key authorization.
+    fn unauthorized_key_asserter() -> alloy::providers::mock::Asserter {
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::from(vec![0u8; 32 * 8]));
+        asserter
+    }
+
+    async fn push_with(
+        wallet: &TempoAccountsWallet,
+        asserter: alloy::providers::mock::Asserter,
+    ) -> Result<super::super::charge::SignedTempoCharge, MppError> {
+        let rpc = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter);
+        let charge =
+            super::super::charge::TempoCharge::from_challenge(&push_only_challenge()).unwrap();
+        let from = wallet.active_account().unwrap();
+        charge
+            .sign_with_accounts_provider_options(
+                wallet,
+                &rpc,
+                from,
+                SignOptions {
+                    gas_limit: Some(200_000),
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn push_rejected_by_the_node_releases_its_one_time_authorization() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: -32602,
+            message: "invalid params".into(),
+            data: None,
+        });
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert!(wallet
+            .in_flight_authorization_reservations()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A retrying transport may resend bytes the chain already accepted, so a
+    /// nonce error is no proof the payment was refused.
+    #[tokio::test]
+    async fn nonce_error_keeps_its_authorization_reserved() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure_msg("nonce too low");
+        let error = push_with(&wallet, asserter).await.unwrap_err();
+        assert!(error.to_string().contains("outcome unknown (tx 0x"));
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
+    }
+
+    /// A push the node plainly refused (no receipt, key still not installed)
+    /// releases its authorization so a later payment can carry it again.
+    #[tokio::test]
+    async fn refused_push_with_no_trace_on_chain_releases_its_authorization() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure_msg("insufficient funds for gas");
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&alloy::primitives::Bytes::from(vec![0u8; 32 * 8]));
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert!(wallet
+            .in_flight_authorization_reservations()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A push whose transaction has a receipt used its authorization.
+    #[tokio::test]
+    async fn push_with_a_receipt_keeps_its_authorization_spent() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure_msg("nonce too low");
+        asserter.push_success(&serde_json::json!({"status": "0x1"}));
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
+    }
+
+    /// A challenge that expires before the broadcast is never paid: nothing is broadcast, and the
+    /// authorization is released for the next payment.
+    #[tokio::test]
+    async fn expired_push_challenge_is_not_broadcast() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        let rpc = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+        let mut challenge = push_only_challenge();
+        let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        challenge.expires = Some(
+            expires
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+        let charge = super::super::charge::TempoCharge::from_challenge(&challenge).unwrap();
+        // The challenge expires while the payment is being prepared.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let from = wallet.active_account().unwrap();
+        let error = charge
+            .sign_with_accounts_provider_options(
+                &wallet,
+                &rpc,
+                from,
+                SignOptions {
+                    gas_limit: Some(200_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error}");
+        assert!(wallet
+            .in_flight_authorization_reservations()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pooled_push_keeps_its_authorization_reserved() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_failure(alloy_json_rpc::ErrorPayload {
+            code: 4,
+            message: "transaction pooled but not yet confirmed".into(),
+            data: None,
+        });
+        // The pooled transaction has no receipt yet but the node knows it.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::json!({"hash": format!("0x{}", "ab".repeat(32))}));
+        asserter.push_success(&alloy::primitives::Bytes::from(vec![0u8; 32 * 8]));
+        let error = push_with(&wallet, asserter).await.unwrap_err();
+        assert!(error.to_string().contains("outcome unknown (tx 0x"));
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn landed_push_keeps_its_one_time_authorization_spent() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": format!("0x{}", "ab".repeat(32)),
+            "status": "0x1",
+        }));
+        let signed = push_with(&wallet, asserter).await.unwrap();
+        // Nothing is left for a rollback to release.
+        assert!(signed.authorization_reservation().is_none());
+    }
+
+    #[tokio::test]
+    async fn push_with_an_unknown_outcome_keeps_its_authorization_reserved() {
+        let wallet = one_time_authorization_wallet();
+        let asserter = unauthorized_key_asserter();
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": format!("0x{}", "ab".repeat(32)),
+            "status": "0x0",
+        }));
+        assert!(push_with(&wallet, asserter).await.is_err());
+        assert_eq!(
+            wallet.in_flight_authorization_reservations().unwrap().len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn rejected_payment_releases_its_one_time_authorization() {
         let root = PrivateKeySigner::random();

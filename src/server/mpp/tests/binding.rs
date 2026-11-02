@@ -502,7 +502,7 @@ async fn test_hmac_charge_with_options_roundtrip() {
             "2.50",
             ChargeOptions {
                 description: Some("Premium access"),
-                fee_payer: true,
+                fee_payer: Some(true),
                 ..Default::default()
             },
         )
@@ -743,7 +743,7 @@ async fn test_expected_charge_request_matches_issued_request() {
     let mpp = create_hmac_test_mpp();
     let scope = serde_json::json!({ "route": "/api/fortune" });
     let options = || ChargeOptions {
-        fee_payer: true,
+        fee_payer: Some(true),
         mppx_scope: Some(&scope),
         ..Default::default()
     };

@@ -337,6 +337,9 @@ where
         let expected = self.expected_charge_request(amount, options).map_err(|e| {
             VerificationError::new(format!("Failed to build expected charge request: {e}"))
         })?;
+        // A route that does not sponsor (it opted out with fee_payer:
+        // Some(false), or has no fee payer) must not sponsor a credential
+        // issued for a sponsored route at the same price.
         self.broadcast_credential_with_expected_request(credential, &expected)
             .await
     }

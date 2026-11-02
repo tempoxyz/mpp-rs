@@ -76,7 +76,7 @@ impl TempoSigningMode {
 ///
 /// - `Direct` / `Keychain` V1: signs the raw `sig_hash`.
 /// - `Keychain` V2: signs `keccak256(0x04 || sig_hash || user_address)`.
-fn effective_signing_hash(
+pub(crate) fn effective_signing_hash(
     sig_hash: alloy::primitives::B256,
     mode: &TempoSigningMode,
 ) -> alloy::primitives::B256 {
@@ -92,14 +92,14 @@ fn effective_signing_hash(
 }
 
 /// Build the [`TempoSignature`] for a given inner signature and signing mode.
-fn build_tempo_signature(
+pub(crate) fn build_tempo_signature(
     inner_signature: alloy::signers::Signature,
     mode: &TempoSigningMode,
 ) -> TempoSignature {
     build_tempo_signature_primitive(PrimitiveSignature::Secp256k1(inner_signature), mode)
 }
 
-fn build_tempo_signature_primitive(
+pub(crate) fn build_tempo_signature_primitive(
     primitive: PrimitiveSignature,
     mode: &TempoSigningMode,
 ) -> TempoSignature {

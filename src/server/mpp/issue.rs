@@ -148,7 +148,12 @@ where
         };
         {
             let mut details = serde_json::Map::new();
-            if options.fee_payer || self.config.fee_payer {
+            let sponsored = match options.fee_payer {
+                Some(false) => false,
+                Some(true) => self.config.can_sponsor,
+                None => self.config.fee_payer,
+            };
+            if sponsored {
                 details.insert("feePayer".into(), serde_json::json!(true));
             }
             if self.config.machine_token_enabled {
