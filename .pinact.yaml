@@ -7,3 +7,10 @@ rules:
     conditions:
       - expr: |
           ActionName matches "^tempoxyz/changelogs(/check)?$" && ActionVersion == "35288d5b399317c9412f9dd4bfaf8cccf2d22215"
+  # tempoxyz/mpp-tools publishes its reusable workflows without tags, and the
+  # shared AGENTS.md sync is first-party, so skip version-comment and min-age
+  # checks for it. Its SHA pin is still enforced.
+  - ignore: true
+    conditions:
+      - expr: |
+          ActionName == "tempoxyz/mpp-tools/.github/workflows/agents-sync.yml"
