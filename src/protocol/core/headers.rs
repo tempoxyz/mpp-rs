@@ -573,15 +573,9 @@ pub fn format_authorization(credential: &PaymentCredential) -> Result<String> {
 ///
 /// Format: `<base64url-json>`
 pub fn parse_receipt(header: &str) -> Result<Receipt> {
+    // Like mppx, receipts have no size cap: method-specific extension fields
+    // may be large.
     let token = header.trim();
-
-    // Enforce size limit to prevent memory exhaustion DoS
-    if token.len() > MAX_TOKEN_LEN {
-        return Err(MppError::InvalidReceipt(format!(
-            "Receipt exceeds maximum length of {} bytes",
-            MAX_TOKEN_LEN
-        )));
-    }
 
     let decoded = base64url_decode(token)?;
     let receipt: Receipt = serde_json::from_slice(&decoded)
@@ -779,6 +773,7 @@ mod tests {
             reference: "0xabc123".to_string(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         };
 
@@ -799,6 +794,7 @@ mod tests {
             reference: "0xabc123".to_string(),
             external_id: None,
             subscription_id: Some("sub_123".to_string()),
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         };
 
@@ -1279,6 +1275,19 @@ mod tests {
             challenge.description = Some(text.to_string());
             assert!(format_www_authenticate(&challenge).is_err(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn test_parse_receipt_accepts_large_extension() {
+        let extension = "x".repeat(MAX_TOKEN_LEN);
+        let json = format!(
+            r#"{{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc","proof":"{extension}"}}"#
+        );
+        let header = base64url_encode(json.as_bytes());
+        assert!(header.len() > MAX_TOKEN_LEN);
+
+        let receipt = parse_receipt(&header).unwrap();
+        assert_eq!(receipt.extensions["proof"], extension.as_str());
     }
 
     #[test]

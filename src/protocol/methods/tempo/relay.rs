@@ -214,6 +214,7 @@ impl Relay {
             reference: response.receipt.reference,
             external_id: response.receipt.external_id,
             subscription_id: None,
+            funding_currency: None,
             extensions: serde_json::Map::new(),
         })
     }
