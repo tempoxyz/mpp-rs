@@ -146,6 +146,7 @@ impl SessionReceipt {
             reference: self.reference.clone(),
             external_id: None,
             subscription_id: None,
+            funding_currency: None,
             extensions,
         }
     }
