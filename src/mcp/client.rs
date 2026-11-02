@@ -162,7 +162,20 @@ where
         challenges: &[PaymentChallenge],
         management: Option<&dyn ManagementTransport>,
     ) -> Result<Option<PendingPayment<P>>, MppError> {
-        let ranking = self.provider.accept_payment_header();
+        let ranking = if let Some(header) = self.context.headers.get("accept-payment") {
+            let value = header.to_str().map_err(|_| {
+                MppError::InvalidConfig("invalid caller Accept-Payment header".into())
+            })?;
+            let entries = crate::protocol::core::accept_payment::parse(value).map_err(|_| {
+                MppError::InvalidConfig("invalid caller Accept-Payment header".into())
+            })?;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            Some(value.to_owned())
+        } else {
+            self.provider.accept_payment_header()
+        };
         let mut remaining = challenges.to_vec();
         let mut failure = None;
         loop {
@@ -660,6 +673,33 @@ mod tests {
 
     fn params() -> Value {
         json!({"name": "paid_tool", "arguments": {}})
+    }
+
+    #[tokio::test]
+    async fn caller_payment_preferences_control_credential_creation() {
+        for (header, allowed, invalid) in [
+            ("tempo/charge;q=0", false, false),
+            ("stripe/charge", false, false),
+            ("tempo/charge", true, false),
+            ("tempo/charge;q=invalid", false, true),
+        ] {
+            let provider = TestProvider::new();
+            let mut context = context();
+            context
+                .headers
+                .insert("accept-payment", header.parse().unwrap());
+            let session = McpPayment::new(provider.clone(), context);
+            let result = session.prepare(&[challenge()]).await;
+            if invalid {
+                assert!(result.is_err(), "{header}");
+            } else {
+                assert_eq!(result.unwrap().is_some(), allowed, "{header}");
+            }
+            assert_eq!(
+                provider.lifecycle.pays.load(Ordering::SeqCst),
+                usize::from(allowed)
+            );
+        }
     }
 
     #[tokio::test]
