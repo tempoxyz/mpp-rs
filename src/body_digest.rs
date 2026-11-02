@@ -45,11 +45,19 @@ pub fn verify(digest: &str, body: &[u8]) -> bool {
     let Some(hash) = digest.strip_prefix("sha-256=") else {
         return false;
     };
-    let hash = hash
+    let Some(inner) = hash
         .strip_prefix(':')
         .and_then(|hash| hash.strip_suffix(':'))
-        .unwrap_or(hash);
-    crate::protocol::core::challenge::constant_time_eq(&compute_hash(body), hash)
+    else {
+        return crate::protocol::core::challenge::constant_time_eq(&compute_hash(body), hash);
+    };
+    // A byte sequence may omit its padding (RFC 8941 section 4.2.7).
+    let unpadded = inner.trim_end_matches('=');
+    if unpadded.is_empty() || unpadded.contains(':') {
+        return false;
+    }
+    let padded = format!("{unpadded}{}", "=".repeat((4 - unpadded.len() % 4) % 4));
+    crate::protocol::core::challenge::constant_time_eq(&compute_hash(body), &padded)
 }
 
 #[cfg(test)]
@@ -84,6 +92,18 @@ mod tests {
             assert!(verify(digest, body));
             assert!(!verify(digest, b"changed body"));
         }
+    }
+
+    #[test]
+    fn test_verify_unpadded_byte_sequence() {
+        assert!(verify(
+            "sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ:",
+            b"hello"
+        ));
+        assert!(!verify(
+            "sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ:",
+            b"changed body"
+        ));
     }
 
     #[test]
