@@ -482,7 +482,7 @@ async fn probe_challenge<P: PaymentProvider>(
             status: response.status().as_u16(),
         });
     }
-    parse_www_authenticate_all_bytes(
+    let challenges = parse_www_authenticate_all_bytes(
         response
             .headers()
             .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -491,8 +491,15 @@ async fn probe_challenge<P: PaymentProvider>(
     )
     .into_iter()
     .filter_map(Result::ok)
-    .find(|challenge| provider.supports(challenge.method.as_str(), challenge.intent.as_str()))
-    .ok_or(MppWsError::UnsupportedChallenge)
+    .filter(|challenge| provider.supports(challenge.method.as_str(), challenge.intent.as_str()))
+    .collect::<Vec<_>>();
+    // Choose like the HTTP flow, so a provider policy (such as a Tempo
+    // session spending cap) can skip an offer for a later acceptable one.
+    let candidates = challenges.iter().collect::<Vec<_>>();
+    provider
+        .select_challenge(&candidates)
+        .cloned()
+        .ok_or(MppWsError::UnsupportedChallenge)
 }
 
 fn challenge_needs_refresh(challenge: &PaymentChallenge) -> bool {

@@ -665,6 +665,16 @@ impl TempoSessionProvider {
     /// violates the client policy. Runs during challenge selection and before
     /// any signing or top-up; closes skip it, since closing settles what the
     /// channel already spent.
+    /// Whether a per-request price a server charged, such as a prepaid
+    /// route's latest receipt delta, stays within `max_amount` and
+    /// `max_atomic_amount`. A reused Challenge keeps its quoted amount, so
+    /// the charged price is checked on its own.
+    fn price_within_caps(&self, price: u128) -> bool {
+        let price = alloy::primitives::U256::from(price);
+        !self.max_atomic_amount.is_some_and(|max| price > max)
+            && !self.max_amount.is_some_and(|max| price > max)
+    }
+
     fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
         if self.currencies.is_none()
             && self.expected_recipients.is_none()
@@ -1942,6 +1952,12 @@ impl TempoSessionProvider {
         let Some(price) = price else {
             return;
         };
+        // A route that now charges more than the cap gets no prepaid voucher
+        // or top-up; the next request pays through a fresh Challenge instead.
+        if !self.price_within_caps(price) || self.check_policy(challenge).is_err() {
+            prepaid.remove(&url);
+            return;
+        }
         prepaid.insert(
             url,
             PrepaidVoucher {
@@ -3366,6 +3382,7 @@ impl TempoSessionProvider {
         headers: reqwest::header::HeaderMap,
         challenge: &PaymentChallenge,
     ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         self.bind_origin(url)?;
         self.payment_credential(
             challenge,
@@ -3902,6 +3919,9 @@ impl PaymentProvider for TempoSessionProvider {
     ) -> Result<PaymentCredential, MppError> {
         // Without a client nothing is sent to the URL, which may be an MCP
         // resource rather than an HTTP one.
+        // Reject an out-of-policy offer before binding, so it cannot pin the
+        // provider to an origin it never paid.
+        self.check_policy(challenge)?;
         let Some(client) = context.http_client else {
             self.bind_http_origin(context.url.as_str())?;
             return self.pay(challenge).await;
@@ -3921,6 +3941,7 @@ impl PaymentProvider for TempoSessionProvider {
         context: PaymentContext,
         management: &dyn ManagementTransport,
     ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         // Management goes through the transport, not to this URL.
         self.bind_http_origin(context.url.as_str())?;
         let url = context.url.to_string();
@@ -4032,6 +4053,10 @@ impl PaymentProvider for TempoSessionProvider {
             .cloned()?;
         // Priming bound the provider; a request never binds it from here.
         if !self.is_bound_to(context.url.as_str()) {
+            return None;
+        }
+        // The server may charge more than the cached Challenge quoted.
+        if !self.price_within_caps(state.price) {
             return None;
         }
         if state
@@ -8609,7 +8634,62 @@ mod tests {
             }
             assert!(provider.last_challenge.lock().unwrap().is_none(), "{name}");
             assert!(provider.channels.lock().unwrap().is_empty(), "{name}");
+            // A rejected offer must not pin the provider to its origin.
+            assert!(provider.origin.lock().unwrap().is_none(), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn prepaid_vouchers_respect_caps_on_the_charged_price() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        // The cached Challenge quotes 1000, within the cap; the route now charges 2000.
+        let provider = make_test_provider()
+            .with_prepaid_requests(2)
+            .with_currencies([format!("{currency:#x}")])
+            .with_max_atomic_amount(alloy::primitives::U256::from(1_500u64));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+        provider.bind_origin(url.as_str()).unwrap();
+        provider.prepaid.lock().unwrap().insert(
+            url.to_string(),
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 2_000,
+            },
+        );
+        let context = || PaymentContext {
+            url: url.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        assert!(provider.prepaid_credential(context()).await.is_none());
+
+        // A receipt at an over-cap price drops the prepaid voucher for the URL.
+        provider.prepay(&context(), &challenge, channel_id.to_string(), 3_000, None);
+        assert!(provider.prepaid.lock().unwrap().get(url.as_str()).is_none());
+        // One within the cap keeps it.
+        provider.prepay(
+            &context(),
+            &challenge,
+            channel_id.to_string(),
+            1_000,
+            Some(1_000),
+        );
+        assert_eq!(
+            provider
+                .prepaid
+                .lock()
+                .unwrap()
+                .get(url.as_str())
+                .map(|v| v.price),
+            Some(1_000)
+        );
     }
 
     #[tokio::test]
