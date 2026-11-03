@@ -32,7 +32,7 @@ use self::channel_ops::{
 };
 use self::recovery::{
     can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
-    recover_stored_channel, RecoveryScope,
+    recover_stored_channel, validate_settlement_route, RecoveryScope,
 };
 use self::store::{
     ChannelStore, ChannelStoreLease, MemoryChannelStore, OriginBoundChannelStore,
@@ -1343,6 +1343,27 @@ impl TempoSessionProvider {
         }
     }
 
+    /// The merchant and target token a machine-token session settles to,
+    /// which a recovered snapshot's settlement route must match.
+    fn settlement_binding(
+        session_req: &SessionRequest,
+    ) -> Result<Option<(Address, Address)>, MppError> {
+        if !session_req.machine_token_enabled() {
+            return Ok(None);
+        }
+        let merchant = session_req
+            .recipient
+            .as_deref()
+            .ok_or_else(|| MppError::InvalidConfig("session challenge missing recipient".into()))?
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid recipient address".into()))?;
+        let target = session_req
+            .currency
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid currency address".into()))?;
+        Ok(Some((merchant, target)))
+    }
+
     fn payment_scope_key(
         session_req: &SessionRequest,
         payee: Address,
@@ -1429,6 +1450,7 @@ impl TempoSessionProvider {
         scope: RecoveryScope,
         snapshot: Option<&crate::protocol::methods::tempo::session::SessionSnapshot>,
         request_amount: u128,
+        settlement: Option<(Address, Address)>,
     ) -> Result<Option<(ChannelEntry, bool)>, MppError>
     where
         P: alloy::providers::Provider<tempo_alloy::TempoNetwork>,
@@ -1446,6 +1468,9 @@ impl TempoSessionProvider {
             None
         };
         if let Some(snapshot) = snapshot {
+            if let Some((merchant, target)) = settlement {
+                validate_settlement_route(snapshot, scope.payee, merchant, target)?;
+            }
             let snapshot_channel_id = snapshot.channel_id.parse().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot channelId: {error}"))
             })?;
@@ -2031,6 +2056,7 @@ impl TempoSessionProvider {
                 },
                 session_req.session_snapshot().as_ref(),
                 session_req.parse_amount()?,
+                Self::settlement_binding(&session_req)?,
             )
             .await?;
         let Some((entry, _)) = restored else {
@@ -3580,6 +3606,7 @@ impl TempoSessionProvider {
                     },
                     session_snapshot.as_ref(),
                     amount,
+                    Self::settlement_binding(&session_req)?,
                 )
                 .await?;
             if let Some((entry, _)) = &existing {

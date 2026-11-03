@@ -205,6 +205,41 @@ pub fn hydrate_session_snapshot(
     })
 }
 
+/// Check that a machine-token snapshot's settlement route pays the merchant and
+/// token the challenge names, and that its descriptor salt binds that route.
+///
+/// Machine-token channels share the swapper payee, so only the salt ties a
+/// channel to its merchant: without this check a snapshot for another
+/// merchant's channel would recover as this challenge's channel and its
+/// vouchers would bypass a recipient allowlist.
+pub fn validate_settlement_route(
+    snapshot: &SessionSnapshot,
+    swapper: Address,
+    merchant: Address,
+    target_token: Address,
+) -> Result<(), MppError> {
+    let mismatch = || invalid("snapshot settlement route does not match the session request");
+    let route = snapshot.settlement_route.as_ref().ok_or_else(mismatch)?;
+    let adapter = parse_address("snapshot settlement adapter", &route.adapter)?;
+    let recipient = parse_address("snapshot settlement recipient", &route.recipient)?;
+    let target = parse_address("snapshot settlement targetToken", &route.target_token)?;
+    let route_salt = parse_b256("snapshot settlement routeSalt", &route.route_salt)?;
+    let salt = parse_b256("snapshot descriptor salt", &snapshot.descriptor.salt)?;
+    if adapter != swapper
+        || recipient != merchant
+        || target != target_token
+        || salt
+            != crate::protocol::methods::tempo::machine_token::compute_session_salt(
+                merchant,
+                target_token,
+                route_salt,
+            )
+    {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
 fn validate_descriptor(
     descriptor: &ChannelDescriptor,
     channel_id: B256,
@@ -477,5 +512,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entry.cumulative_amount, 250);
+    }
+
+    #[tokio::test]
+    async fn settlement_route_must_bind_the_requested_merchant() {
+        use crate::protocol::methods::tempo::{
+            machine_token::compute_session_salt, session::SettlementRoute,
+        };
+        let swapper = Address::repeat_byte(0x51);
+        let merchant = Address::repeat_byte(0x61);
+        let other = Address::repeat_byte(0x62);
+        let target = Address::repeat_byte(0x71);
+        let route_salt = B256::repeat_byte(0x09);
+        let snapshot_for = |recipient: Address| {
+            let mut descriptor = descriptor(signer().address());
+            descriptor.salt = format!("{:#x}", compute_session_salt(recipient, target, route_salt));
+            SessionSnapshot {
+                accepted_cumulative: "0".into(),
+                chain_id: 4217,
+                channel_id: format!("{:#x}", B256::ZERO),
+                close_requested_at: None,
+                deposit: "1000".into(),
+                descriptor,
+                settlement_route: Some(SettlementRoute {
+                    adapter: format!("{swapper:#x}"),
+                    recipient: format!("{recipient:#x}"),
+                    target_token: format!("{target:#x}"),
+                    route_salt: format!("{route_salt:#x}"),
+                }),
+                escrow: format!("{TIP20_CHANNEL_RESERVE_ADDRESS:#x}"),
+                highest_voucher: None,
+                required_cumulative: "0".into(),
+                settled: "0".into(),
+                spent: "0".into(),
+                units: None,
+            }
+        };
+
+        validate_settlement_route(&snapshot_for(merchant), swapper, merchant, target).unwrap();
+        // Another merchant's channel on the shared swapper does not recover.
+        assert!(
+            validate_settlement_route(&snapshot_for(other), swapper, merchant, target).is_err()
+        );
+        // Nor does a route that names the merchant over a salt bound to someone else.
+        let mut forged = snapshot_for(other);
+        forged.settlement_route.as_mut().unwrap().recipient = format!("{merchant:#x}");
+        assert!(validate_settlement_route(&forged, swapper, merchant, target).is_err());
+        // Nor a snapshot with no route at all.
+        let mut missing = snapshot_for(merchant);
+        missing.settlement_route = None;
+        assert!(validate_settlement_route(&missing, swapper, merchant, target).is_err());
     }
 }
