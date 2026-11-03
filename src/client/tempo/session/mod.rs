@@ -1977,9 +1977,7 @@ impl TempoSessionProvider {
         let Some(price) = price else {
             return;
         };
-        // A route that now charges more than the cap gets no prepaid voucher
-        // or top-up; the next request pays through a fresh Challenge instead.
-        if !self.price_within_caps(price) || self.check_policy(challenge).is_err() {
+        if self.check_policy(challenge).is_err() {
             prepaid.remove(&url);
             return;
         }
@@ -1993,6 +1991,12 @@ impl TempoSessionProvider {
             },
         );
         drop(prepaid);
+        // A route that charges more than the cap keeps its entry, so the next
+        // receipt's price is measured against it rather than the quote, but
+        // gets no prepaid voucher (see prepaid_credential) or top-up.
+        if !self.price_within_caps(price) {
+            return;
+        }
         self.top_up_ahead(context, challenge, &channel_id, price);
     }
 
@@ -8697,26 +8701,44 @@ mod tests {
         };
         assert!(provider.prepaid_credential(context()).await.is_none());
 
-        // A receipt at an over-cap price drops the prepaid voucher for the URL.
-        provider.prepay(&context(), &challenge, channel_id.to_string(), 3_000, None);
-        assert!(provider.prepaid.lock().unwrap().get(url.as_str()).is_none());
-        // One within the cap keeps it.
+        // A receipt at an over-cap price keeps the measured price, so no
+        // prepaid voucher is signed for the URL.
         provider.prepay(
             &context(),
             &challenge,
             channel_id.to_string(),
-            1_000,
+            3_000,
             Some(1_000),
         );
-        assert_eq!(
+        let price = || {
             provider
                 .prepaid
                 .lock()
                 .unwrap()
                 .get(url.as_str())
-                .map(|v| v.price),
-            Some(1_000)
+                .map(|v| v.price)
+        };
+        assert_eq!(price(), Some(2_000));
+        assert!(provider.prepaid_credential(context()).await.is_none());
+        // The next receipt is measured against it, not re-armed at the quote.
+        provider.prepay(
+            &context(),
+            &challenge,
+            channel_id.to_string(),
+            5_000,
+            Some(1_000),
         );
+        assert_eq!(price(), Some(2_000));
+        assert!(provider.prepaid_credential(context()).await.is_none());
+        // A measured price back within the cap re-enables it.
+        provider.prepay(
+            &context(),
+            &challenge,
+            channel_id.to_string(),
+            6_000,
+            Some(1_000),
+        );
+        assert_eq!(price(), Some(1_000));
     }
 
     #[tokio::test]
