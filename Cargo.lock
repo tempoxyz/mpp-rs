@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "mpp"
-version = "0.19.0"
+version = "0.18.2"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
