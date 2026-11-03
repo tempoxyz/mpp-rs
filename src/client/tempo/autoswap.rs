@@ -140,6 +140,25 @@ impl AutoswapConfig {
     pub fn fee_token(&self) -> Option<Address> {
         Some(self.token_in).filter(|token| can_pay_fees(*token))
     }
+
+    /// The gas token for a transaction paying in `currency` after autoswap
+    /// resolved `route`, or `None` to let `currency` pay its own gas.
+    ///
+    /// `token_in` is only a candidate the payer may not hold, so without a
+    /// swap the charge currency pays gas when it can; `token_in` is used only
+    /// when the currency cannot pay fees (OUSD). With a swap, the swap's input
+    /// token pays gas, unless it is OUSD.
+    pub fn fee_token_for(
+        &self,
+        route: Option<&AutoswapRoute>,
+        currency: Address,
+    ) -> Option<Address> {
+        match route {
+            Some(route) => route.fee_token(self),
+            None if can_pay_fees(currency) => None,
+            None => self.fee_token(),
+        }
+    }
 }
 
 impl Default for AutoswapConfig {
@@ -671,6 +690,23 @@ mod tests {
         };
         assert_eq!(
             route.fee_token(&AutoswapConfig::default()),
+            Some(addr(USDC))
+        );
+    }
+
+    #[test]
+    fn test_fee_token_without_a_swap_is_the_currency() {
+        let config = AutoswapConfig::default();
+        // No swap: a fee-capable currency pays its own gas, never the unheld token_in.
+        assert_eq!(config.fee_token_for(None, addr(USDC)), None);
+        // OUSD cannot pay fees, so token_in does.
+        assert_eq!(config.fee_token_for(None, addr(OUSD)), Some(addr(PATH_USD)));
+        let route = AutoswapRoute {
+            token_in: addr(USDC),
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            config.fee_token_for(Some(&route), addr(OUSD)),
             Some(addr(USDC))
         );
     }

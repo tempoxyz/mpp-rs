@@ -67,7 +67,8 @@ pub(super) async fn apply_funding(
 
 /// Funds a charge like [`apply_funding`] and returns the token the payer spends (MACH through
 /// the machine-token swapper, the autoswap input token, or the charge currency) and the gas
-/// token autoswap implies: the swap's input token, else the configured `token_in`, never OUSD.
+/// token autoswap implies ([`AutoswapConfig::fee_token_for`]): the swap's input token, or
+/// `None` so the charge currency pays its own gas when no swap was needed. Never OUSD.
 pub(super) async fn fund(
     mut charge: TempoCharge,
     autoswap: Option<&AutoswapConfig>,
@@ -81,7 +82,6 @@ pub(super) async fn fund(
     ),
     MppError,
 > {
-    let default_fee_token = autoswap.and_then(AutoswapConfig::fee_token);
     if charge.machine_token_enabled() {
         let transfers = crate::protocol::methods::tempo::transfers::get_transfers(
             charge.amount(),
@@ -102,28 +102,25 @@ pub(super) async fn fund(
                 alloy::primitives::TxKind::Call(token) => token,
                 alloy::primitives::TxKind::Create => charge.currency(),
             };
-            return Ok((
-                charge.with_calls(route.calls.to_vec()),
-                funding,
-                default_fee_token,
-            ));
+            // The charge resolves a funded stablecoin for MACH-funded gas.
+            return Ok((charge.with_calls(route.calls.to_vec()), funding, None));
         }
     }
 
     let mut funding = charge.currency();
-    let mut fee_token = default_fee_token;
+    let mut fee_token = None;
     if let Some(config) = autoswap {
-        if let Some(route) = super::autoswap::resolve_autoswap_route(
+        let route = super::autoswap::resolve_autoswap_route(
             provider,
             from,
             charge.currency(),
             charge.amount(),
             config,
         )
-        .await?
-        {
+        .await?;
+        fee_token = config.fee_token_for(route.as_ref(), charge.currency());
+        if let Some(route) = route {
             funding = route.token_in;
-            fee_token = route.fee_token(config);
             for call in route.calls.into_iter().rev() {
                 charge = charge.with_prepended_call(call)?;
             }
@@ -1251,6 +1248,46 @@ mod tests {
             ))
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A payer holding enough USDC.e for a USDC.e charge needs no swap, so the
+    /// default autoswap config must not name unheld pathUSD as the gas token.
+    #[tokio::test]
+    async fn funded_charge_without_swap_pays_gas_in_its_currency() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+        use alloy::sol_types::SolCall;
+        use tempo_alloy::contracts::precompiles::ITIP20;
+
+        let usdc = crate::protocol::methods::tempo::USDC;
+        let request = crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1000000",
+            "currency": usdc,
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 4217 }
+        }))
+        .unwrap();
+        let challenge =
+            PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+        let charge = prepare_charge_request(&challenge, None, None).unwrap();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            ITIP20::balanceOfCall::abi_encode_returns(&alloy::primitives::U256::from(5_000_000u64)),
+        ));
+        let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+
+        let config = AutoswapConfig::default();
+        let (_, funding, fee_token) = fund(
+            charge,
+            Some(&config),
+            &provider,
+            alloy::primitives::Address::repeat_byte(0x11),
+        )
+        .await
+        .unwrap();
+        assert_eq!(funding, usdc.parse::<alloy::primitives::Address>().unwrap());
+        assert_eq!(fee_token, None);
     }
 
     #[test]
