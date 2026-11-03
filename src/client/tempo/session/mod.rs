@@ -32,7 +32,7 @@ use self::channel_ops::{
 };
 use self::recovery::{
     can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
-    recover_stored_channel, RecoveryScope,
+    recover_stored_channel, validate_settlement_route, RecoveryScope,
 };
 use self::store::{
     ChannelStore, ChannelStoreLease, MemoryChannelStore, OriginBoundChannelStore,
@@ -136,6 +136,14 @@ pub struct TempoSessionProvider {
     autoswap: Option<AutoswapConfig>,
     /// Token paying gas for unsponsored opens and top-ups.
     fee_token: Option<Address>,
+    /// Session currencies this client pays in; see [`Self::with_currencies`].
+    currencies: Option<Vec<String>>,
+    /// Session recipients this client pays; see [`Self::with_expected_recipients`].
+    expected_recipients: Option<Vec<String>>,
+    /// Per-unit cap from [`Self::with_max_amount`], in atomic units.
+    max_amount: Option<alloy::primitives::U256>,
+    /// Per-unit cap from [`Self::with_max_atomic_amount`].
+    max_atomic_amount: Option<alloy::primitives::U256>,
     /// Channel registry: key is `payee:currency:escrow` (lowercase).
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Durable channel view. Recovery policy remains owned by this provider.
@@ -348,6 +356,10 @@ impl TempoSessionProvider {
             top_up_amount: None,
             autoswap: None,
             fee_token: None,
+            currencies: None,
+            expected_recipients: None,
+            max_amount: None,
+            max_atomic_amount: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
             channel_store: Arc::new(OriginBoundChannelStore {
                 inner: Arc::new(MemoryChannelStore::default()),
@@ -586,6 +598,140 @@ impl TempoSessionProvider {
     pub fn with_fee_token(mut self, token: Address) -> Self {
         self.fee_token = Some(token);
         self
+    }
+
+    /// Only pay sessions in these TIP-20 currencies, compared
+    /// case-insensitively, as mppx's session `currencies`.
+    ///
+    /// Offers in other currencies are skipped during challenge selection and
+    /// rejected before signing a credential or topping up a channel; an empty
+    /// list rejects all. Explicit closes are exempt. Required with
+    /// [`with_max_amount`](Self::with_max_amount) and
+    /// [`with_max_atomic_amount`](Self::with_max_atomic_amount), which are
+    /// denominated in the challenge currency.
+    pub fn with_currencies<I, S>(mut self, currencies: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.currencies = Some(currencies.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Only pay sessions to these recipients (the channel payee), compared
+    /// case-insensitively, as mppx's session `expectedRecipients`.
+    ///
+    /// Offers to other recipients, or without one, are skipped during
+    /// challenge selection and rejected before signing a credential or
+    /// topping up a channel. Explicit closes are exempt.
+    pub fn with_expected_recipients<I, S>(mut self, recipients: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.expected_recipients = Some(recipients.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Cap the per-unit session amount (the challenge `amount`) at
+    /// `max_amount` in display units (e.g. `"1.5"`), parsed with the currency's
+    /// `decimals`.
+    ///
+    /// Larger offers are skipped during selection and rejected before signing
+    /// a credential or topping up a channel. Explicit closes are exempt.
+    /// Requires [`with_currencies`](Self::with_currencies).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `max_amount` is malformed or has more fractional
+    /// digits than `decimals` allow (it is never rounded).
+    pub fn with_max_amount(mut self, max_amount: &str, decimals: u8) -> Result<Self, MppError> {
+        self.max_amount = Some(super::provider::parse_max_amount(
+            "session", max_amount, decimals,
+        )?);
+        Ok(self)
+    }
+
+    /// Cap the per-unit session amount at `max_atomic_amount` raw base units of
+    /// the challenge currency. Checked like
+    /// [`with_max_amount`](Self::with_max_amount). Requires
+    /// [`with_currencies`](Self::with_currencies).
+    pub fn with_max_atomic_amount(mut self, max_atomic_amount: alloy::primitives::U256) -> Self {
+        self.max_atomic_amount = Some(max_atomic_amount);
+        self
+    }
+
+    /// Reject a session challenge whose currency, recipient or per-unit amount
+    /// violates the client policy. Runs during challenge selection and before
+    /// any signing or top-up; closes skip it, since closing settles what the
+    /// channel already spent.
+    /// Whether a per-request price a server charged, such as a prepaid
+    /// route's latest receipt delta, stays within `max_amount` and
+    /// `max_atomic_amount`. A reused Challenge keeps its quoted amount, so
+    /// the charged price is checked on its own.
+    fn price_within_caps(&self, price: u128) -> bool {
+        let price = alloy::primitives::U256::from(price);
+        !self.max_atomic_amount.is_some_and(|max| price > max)
+            && !self.max_amount.is_some_and(|max| price > max)
+    }
+
+    fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
+        if self.currencies.is_none()
+            && self.expected_recipients.is_none()
+            && self.max_amount.is_none()
+            && self.max_atomic_amount.is_none()
+        {
+            return Ok(());
+        }
+        if self.currencies.is_none()
+            && (self.max_amount.is_some() || self.max_atomic_amount.is_some())
+        {
+            return Err(MppError::InvalidConfig(
+                "Tempo session max_amount and max_atomic_amount require currencies".to_string(),
+            ));
+        }
+        let reject = |reason: String| MppError::InvalidChallenge {
+            id: Some(challenge.id.clone()),
+            reason: Some(reason),
+        };
+        let request: SessionRequest = challenge.request.decode()?;
+        if let Some(currencies) = &self.currencies {
+            if !currencies
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&request.currency))
+            {
+                return Err(reject(format!(
+                    "Tempo session currency is not allowed: {}",
+                    request.currency
+                )));
+            }
+        }
+        if let Some(recipients) = &self.expected_recipients {
+            let expected = request.recipient.as_deref().is_some_and(|recipient| {
+                recipients.iter().any(|r| r.eq_ignore_ascii_case(recipient))
+            });
+            if !expected {
+                return Err(reject(format!(
+                    "Unexpected session recipient: {}",
+                    request.recipient.as_deref().unwrap_or("none")
+                )));
+            }
+        }
+        if self.max_amount.is_none() && self.max_atomic_amount.is_none() {
+            return Ok(());
+        }
+        let amount = crate::evm::parse_amount(&request.amount)?;
+        if self.max_atomic_amount.is_some_and(|max| amount > max) {
+            return Err(reject(
+                "Tempo session amount exceeds max_atomic_amount".to_string(),
+            ));
+        }
+        if self.max_amount.is_some_and(|max| amount > max) {
+            return Err(reject(
+                "Tempo session amount exceeds max_amount".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Persist reusable native MPP channels in `store`.
@@ -1197,6 +1343,27 @@ impl TempoSessionProvider {
         }
     }
 
+    /// The merchant and target token a machine-token session settles to,
+    /// which a recovered snapshot's settlement route must match.
+    fn settlement_binding(
+        session_req: &SessionRequest,
+    ) -> Result<Option<(Address, Address)>, MppError> {
+        if !session_req.machine_token_enabled() {
+            return Ok(None);
+        }
+        let merchant = session_req
+            .recipient
+            .as_deref()
+            .ok_or_else(|| MppError::InvalidConfig("session challenge missing recipient".into()))?
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid recipient address".into()))?;
+        let target = session_req
+            .currency
+            .parse()
+            .map_err(|_| MppError::InvalidConfig("invalid currency address".into()))?;
+        Ok(Some((merchant, target)))
+    }
+
     fn payment_scope_key(
         session_req: &SessionRequest,
         payee: Address,
@@ -1283,6 +1450,7 @@ impl TempoSessionProvider {
         scope: RecoveryScope,
         snapshot: Option<&crate::protocol::methods::tempo::session::SessionSnapshot>,
         request_amount: u128,
+        settlement: Option<(Address, Address)>,
     ) -> Result<Option<(ChannelEntry, bool)>, MppError>
     where
         P: alloy::providers::Provider<tempo_alloy::TempoNetwork>,
@@ -1300,6 +1468,9 @@ impl TempoSessionProvider {
             None
         };
         if let Some(snapshot) = snapshot {
+            if let Some((merchant, target)) = settlement {
+                validate_settlement_route(snapshot, scope.payee, merchant, target)?;
+            }
             let snapshot_channel_id = snapshot.channel_id.parse().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot channelId: {error}"))
             })?;
@@ -1806,6 +1977,10 @@ impl TempoSessionProvider {
         let Some(price) = price else {
             return;
         };
+        if self.check_policy(challenge).is_err() {
+            prepaid.remove(&url);
+            return;
+        }
         prepaid.insert(
             url,
             PrepaidVoucher {
@@ -1816,6 +1991,12 @@ impl TempoSessionProvider {
             },
         );
         drop(prepaid);
+        // A route that charges more than the cap keeps its entry, so the next
+        // receipt's price is measured against it rather than the quote, but
+        // gets no prepaid voucher (see prepaid_credential) or top-up.
+        if !self.price_within_caps(price) {
+            return;
+        }
         self.top_up_ahead(context, challenge, &channel_id, price);
     }
 
@@ -1879,6 +2060,7 @@ impl TempoSessionProvider {
                 },
                 session_req.session_snapshot().as_ref(),
                 session_req.parse_amount()?,
+                Self::settlement_binding(&session_req)?,
             )
             .await?;
         let Some((entry, _)) = restored else {
@@ -1980,6 +2162,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         required_cumulative: u128,
     ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         self.assert_within_max_deposit(required_cumulative)?;
 
         // Find the channel entry by channel ID
@@ -2142,6 +2325,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<Option<Receipt>, MppError> {
+        self.check_policy(challenge)?;
         self.bind_origin(url)?;
         ensure_redirect_safe_credential_header(challenge)?;
         let _process_lease = self.acquire_payment_lock(challenge).await?;
@@ -2312,6 +2496,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         additional_deposit: u128,
     ) -> Result<PreparedTopUp, MppError> {
+        self.check_policy(challenge)?;
         ensure_redirect_safe_credential_header(challenge)?;
         if additional_deposit == 0 {
             return Err(MppError::InvalidConfig(
@@ -2615,6 +2800,7 @@ impl TempoSessionProvider {
         required_cumulative: u128,
         server_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         if self
             .pending_opens
             .lock()
@@ -3226,6 +3412,7 @@ impl TempoSessionProvider {
         headers: reqwest::header::HeaderMap,
         challenge: &PaymentChallenge,
     ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         self.bind_origin(url)?;
         self.payment_credential(
             challenge,
@@ -3244,6 +3431,7 @@ impl TempoSessionProvider {
         top_up: Option<TopUpRoute<'_>>,
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
+        self.check_policy(challenge)?;
         let process_lease = self.acquire_payment_lock(challenge).await?;
         let (key, _) = self.expected_channel_key(challenge)?;
         let store_lease = self
@@ -3422,6 +3610,7 @@ impl TempoSessionProvider {
                     },
                     session_snapshot.as_ref(),
                     amount,
+                    Self::settlement_binding(&session_req)?,
                 )
                 .await?;
             if let Some((entry, _)) = &existing {
@@ -3731,6 +3920,25 @@ impl PaymentProvider for TempoSessionProvider {
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
+    /// Skip offers that violate the currency, recipient or amount policy so
+    /// an acceptable offer can be chosen.
+    fn select_challenge<'a>(
+        &self,
+        challenges: &[&'a PaymentChallenge],
+    ) -> Option<&'a PaymentChallenge> {
+        // A cap without a currency pin is a configuration error, not a policy
+        // skip: hand the first offer to `pay`, which reports it.
+        if self.currencies.is_none()
+            && (self.max_amount.is_some() || self.max_atomic_amount.is_some())
+        {
+            return challenges.first().copied();
+        }
+        challenges
+            .iter()
+            .copied()
+            .find(|challenge| self.check_policy(challenge).is_ok())
+    }
+
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         self.payment_credential(challenge, None).await
     }
@@ -3742,6 +3950,9 @@ impl PaymentProvider for TempoSessionProvider {
     ) -> Result<PaymentCredential, MppError> {
         // Without a client nothing is sent to the URL, which may be an MCP
         // resource rather than an HTTP one.
+        // Reject an out-of-policy offer before binding, so it cannot pin the
+        // provider to an origin it never paid.
+        self.check_policy(challenge)?;
         let Some(client) = context.http_client else {
             self.bind_http_origin(context.url.as_str())?;
             return self.pay(challenge).await;
@@ -3761,6 +3972,7 @@ impl PaymentProvider for TempoSessionProvider {
         context: PaymentContext,
         management: &dyn ManagementTransport,
     ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
         // Management goes through the transport, not to this URL.
         self.bind_http_origin(context.url.as_str())?;
         let url = context.url.to_string();
@@ -3872,6 +4084,10 @@ impl PaymentProvider for TempoSessionProvider {
             .cloned()?;
         // Priming bound the provider; a request never binds it from here.
         if !self.is_bound_to(context.url.as_str()) {
+            return None;
+        }
+        // The server may charge more than the cached Challenge quoted.
+        if !self.price_within_caps(state.price) {
             return None;
         }
         if state
@@ -8291,5 +8507,316 @@ mod tests {
                 .await
                 .expect("pay must not wait forever for an unsettled payment");
         assert!(matches!(second, Err(MppError::PaymentExpired(_))));
+    }
+
+    fn policy_challenge(
+        id: &str,
+        amount: &str,
+        currency: Address,
+        recipient: Option<Address>,
+    ) -> PaymentChallenge {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let mut request = serde_json::json!({
+            "amount": amount,
+            "currency": format!("{:#x}", currency),
+            "methodDetails": {
+                "escrowContract": format!("{:#x}", TIP20_CHANNEL_RESERVE_ADDRESS),
+                "chainId": 42431
+            }
+        });
+        if let Some(recipient) = recipient {
+            request["recipient"] = format!("{:#x}", recipient).into();
+        }
+        PaymentChallenge::new(
+            id,
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    const POLICY_PAYEE: Address = Address::repeat_byte(0x11);
+    const POLICY_CURRENCY: Address = Address::repeat_byte(0x22);
+    const OTHER_ADDRESS: Address = Address::repeat_byte(0x99);
+
+    /// One provider per policy a 1000-unit offer from POLICY_PAYEE in
+    /// POLICY_CURRENCY violates: its currency, its amount, its recipient.
+    fn outside_policy_providers() -> Vec<(&'static str, TempoSessionProvider)> {
+        vec![
+            (
+                "currency",
+                make_test_provider().with_currencies([format!("{OTHER_ADDRESS:#x}")]),
+            ),
+            (
+                "amount",
+                make_test_provider()
+                    .with_currencies([format!("{POLICY_CURRENCY:#x}")])
+                    .with_max_atomic_amount(alloy::primitives::U256::from(999u64)),
+            ),
+            (
+                "recipient",
+                make_test_provider().with_expected_recipients([format!("{OTHER_ADDRESS:#x}")]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn session_max_amount_rejects_excess_fractional_digits() {
+        assert!(matches!(
+            make_test_provider().with_max_amount("1.0000001", 6),
+            Err(MppError::InvalidConfig(_))
+        ));
+        let provider = make_test_provider()
+            .with_max_amount("1.500000000", 6)
+            .unwrap();
+        assert_eq!(
+            provider.max_amount,
+            Some(alloy::primitives::U256::from(1_500_000u64))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_caps_without_currencies_are_config_errors() {
+        let challenge = policy_challenge("a", "1", POLICY_CURRENCY, Some(POLICY_PAYEE));
+        for provider in [
+            make_test_provider().with_max_amount("1", 6).unwrap(),
+            make_test_provider().with_max_atomic_amount(alloy::primitives::U256::from(1u64)),
+        ] {
+            // Selection keeps the offer so pay surfaces the configuration error.
+            assert_eq!(
+                provider.select_challenge(&[&challenge]).map(|c| &c.id),
+                Some(&challenge.id)
+            );
+            assert!(matches!(
+                provider.pay(&challenge).await,
+                Err(MppError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn select_challenge_skips_session_offers_outside_spending_policy() {
+        let provider = make_test_provider()
+            .with_currencies([format!("{POLICY_CURRENCY:#x}")
+                .to_uppercase()
+                .replace("0X", "0x")])
+            .with_expected_recipients([format!("{POLICY_PAYEE:#x}")
+                .to_uppercase()
+                .replace("0X", "0x")])
+            .with_max_amount("0.001", 6)
+            .unwrap();
+        let other_currency = policy_challenge("currency", "1", OTHER_ADDRESS, Some(POLICY_PAYEE));
+        let other_recipient =
+            policy_challenge("recipient", "1", POLICY_CURRENCY, Some(OTHER_ADDRESS));
+        let no_recipient = policy_challenge("none", "1", POLICY_CURRENCY, None);
+        let over = policy_challenge("over", "1001", POLICY_CURRENCY, Some(POLICY_PAYEE));
+        let exact = policy_challenge("exact", "1000", POLICY_CURRENCY, Some(POLICY_PAYEE));
+        let offers = [&other_currency, &other_recipient, &no_recipient, &over];
+        assert!(provider.select_challenge(&offers).is_none());
+        let offers = [
+            &other_currency,
+            &other_recipient,
+            &no_recipient,
+            &over,
+            &exact,
+        ];
+        assert_eq!(provider.select_challenge(&offers).unwrap().id, "exact");
+        // Without a policy, the first offer is chosen as before.
+        assert_eq!(
+            make_test_provider().select_challenge(&offers).unwrap().id,
+            "currency"
+        );
+    }
+
+    #[tokio::test]
+    async fn pay_rejects_session_offers_outside_spending_policy_before_signing() {
+        struct Unused;
+        impl ManagementTransport for Unused {
+            fn send<'a>(
+                &'a self,
+                _challenge: &'a PaymentChallenge,
+                _credential: &'a PaymentCredential,
+            ) -> crate::client::ManagementFuture<'a> {
+                Box::pin(async { Err(MppError::Http("unused".into())) })
+            }
+        }
+
+        let challenge = policy_challenge("offer", "1000", POLICY_CURRENCY, Some(POLICY_PAYEE));
+        let context = || PaymentContext {
+            url: "https://api.example.com/data".parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: Some(reqwest::Client::new()),
+        };
+        for (name, provider) in outside_policy_providers() {
+            for result in [
+                provider.pay(&challenge).await,
+                provider.pay_with_context(&challenge, context()).await,
+                provider
+                    .pay_with_management(&challenge, context(), &Unused)
+                    .await,
+            ] {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, MppError::InvalidChallenge { .. }),
+                    "{name}: {error:?}"
+                );
+            }
+            assert!(provider.last_challenge.lock().unwrap().is_none(), "{name}");
+            assert!(provider.channels.lock().unwrap().is_empty(), "{name}");
+            // A rejected offer must not pin the provider to its origin.
+            assert!(provider.origin.lock().unwrap().is_none(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prepaid_vouchers_respect_caps_on_the_charged_price() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        // The cached Challenge quotes 1000, within the cap; the route now charges 2000.
+        let provider = make_test_provider()
+            .with_prepaid_requests(2)
+            .with_currencies([format!("{currency:#x}")])
+            .with_max_atomic_amount(alloy::primitives::U256::from(1_500u64));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+        provider.bind_origin(url.as_str()).unwrap();
+        provider.prepaid.lock().unwrap().insert(
+            url.to_string(),
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 2_000,
+            },
+        );
+        let context = || PaymentContext {
+            url: url.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        assert!(provider.prepaid_credential(context()).await.is_none());
+
+        // A receipt at an over-cap price keeps the measured price, so no
+        // prepaid voucher is signed for the URL.
+        provider.prepay(
+            &context(),
+            &challenge,
+            channel_id.to_string(),
+            3_000,
+            Some(1_000),
+        );
+        let price = || {
+            provider
+                .prepaid
+                .lock()
+                .unwrap()
+                .get(url.as_str())
+                .map(|v| v.price)
+        };
+        assert_eq!(price(), Some(2_000));
+        assert!(provider.prepaid_credential(context()).await.is_none());
+        // The next receipt is measured against it, not re-armed at the quote.
+        provider.prepay(
+            &context(),
+            &challenge,
+            channel_id.to_string(),
+            5_000,
+            Some(1_000),
+        );
+        assert_eq!(price(), Some(2_000));
+        assert!(provider.prepaid_credential(context()).await.is_none());
+        // A measured price back within the cap re-enables it.
+        provider.prepay(
+            &context(),
+            &challenge,
+            channel_id.to_string(),
+            6_000,
+            Some(1_000),
+        );
+        assert_eq!(price(), Some(1_000));
+    }
+
+    #[tokio::test]
+    async fn top_ups_and_vouchers_reject_session_offers_outside_spending_policy() {
+        let challenge = policy_challenge("offer", "1000", POLICY_CURRENCY, Some(POLICY_PAYEE));
+        let client = reqwest::Client::new();
+        let url = "https://api.example.com/data";
+        for (name, provider) in outside_policy_providers() {
+            let provider = provider.with_max_deposit(100_000);
+            let channel_id =
+                seed_precompile_channel(&provider, POLICY_PAYEE, POLICY_CURRENCY, 1_000, 10_000)
+                    .to_string();
+            let headers = reqwest::header::HeaderMap::new;
+            for result in [
+                provider
+                    .top_up_with_headers_for_challenge(
+                        &client,
+                        url,
+                        headers(),
+                        &challenge,
+                        &channel_id,
+                        1_000,
+                    )
+                    .await
+                    .map(|_| ()),
+                // The background and automatic top-ups sign through prepare_top_up.
+                provider
+                    .prepare_top_up(headers(), &challenge, &channel_id, 1_000)
+                    .await
+                    .map(|_| ()),
+                provider
+                    .voucher_credential_with_top_up_for_challenge(
+                        &client,
+                        url,
+                        headers(),
+                        &challenge,
+                        &channel_id,
+                        20_000,
+                        10_000,
+                    )
+                    .await
+                    .map(|_| ()),
+                provider
+                    .voucher_credential_for_challenge(&challenge, &channel_id, 2_000)
+                    .await
+                    .map(|_| ()),
+            ] {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, MppError::InvalidChallenge { .. }),
+                    "{name}: {error:?}"
+                );
+            }
+            let entry = provider.channels().into_values().next().unwrap();
+            assert_eq!((entry.cumulative_amount, entry.deposit), (1_000, 10_000));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_closes_stay_allowed_outside_spending_policy() {
+        let challenge = policy_challenge("offer", "1000", POLICY_CURRENCY, Some(POLICY_PAYEE));
+        for (name, provider) in outside_policy_providers() {
+            let channel_id =
+                seed_precompile_channel(&provider, POLICY_PAYEE, POLICY_CURRENCY, 1_000, 10_000)
+                    .to_string();
+            let close = provider
+                .close_credential_at_for_challenge(&challenge, &channel_id, 1_000)
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert!(
+                matches!(
+                    close
+                        .payload_as::<crate::protocol::methods::tempo::session::SessionCredentialPayload>()
+                        .unwrap(),
+                    crate::protocol::methods::tempo::session::SessionCredentialPayload::Close { .. }
+                ),
+                "{name}"
+            );
+        }
     }
 }

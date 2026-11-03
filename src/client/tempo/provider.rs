@@ -392,24 +392,7 @@ impl TempoProvider {
     /// Returns an error if `max_amount` is malformed or has more fractional
     /// digits than `decimals` allow (it is never rounded).
     pub fn with_max_amount(mut self, max_amount: &str, decimals: u8) -> Result<Self, MppError> {
-        // Trailing fractional zeros are exact; anything beyond `decimals` is rejected.
-        let trimmed = match max_amount.split_once('.') {
-            Some((int, frac)) => {
-                let frac = frac.trim_end_matches('0');
-                if frac.is_empty() {
-                    int.to_string()
-                } else {
-                    format!("{int}.{frac}")
-                }
-            }
-            None => max_amount.to_string(),
-        };
-        let atomic = crate::protocol::intents::parse_units(&trimmed, decimals).map_err(|_| {
-            MppError::InvalidConfig(format!(
-                "Tempo charge max_amount {max_amount} is invalid or has more fractional digits than {decimals} decimals allow"
-            ))
-        })?;
-        self.max_amount = Some(crate::evm::parse_amount(&atomic)?);
+        self.max_amount = Some(parse_max_amount("charge", max_amount, decimals)?);
         Ok(self)
     }
 
@@ -505,6 +488,33 @@ impl TempoProvider {
             .await
             .copied()
     }
+}
+
+/// Parse a display-unit spending cap with `decimals`, rejecting values that
+/// would round. `intent` names the policy in the error.
+pub(super) fn parse_max_amount(
+    intent: &str,
+    max_amount: &str,
+    decimals: u8,
+) -> Result<alloy::primitives::U256, MppError> {
+    // Trailing fractional zeros are exact; anything beyond `decimals` is rejected.
+    let trimmed = match max_amount.split_once('.') {
+        Some((int, frac)) => {
+            let frac = frac.trim_end_matches('0');
+            if frac.is_empty() {
+                int.to_string()
+            } else {
+                format!("{int}.{frac}")
+            }
+        }
+        None => max_amount.to_string(),
+    };
+    let atomic = crate::protocol::intents::parse_units(&trimmed, decimals).map_err(|_| {
+        MppError::InvalidConfig(format!(
+            "Tempo {intent} max_amount {max_amount} is invalid or has more fractional digits than {decimals} decimals allow"
+        ))
+    })?;
+    crate::evm::parse_amount(&atomic)
 }
 
 impl PaymentProvider for TempoProvider {
