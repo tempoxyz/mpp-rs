@@ -358,16 +358,13 @@ pub fn tempo_provider(rpc_url: &str) -> crate::error::Result<TempoProvider> {
 }
 
 /// Type alias for the Tempo provider returned by [`tempo_provider`].
+///
+/// Uses `TempoNetwork`'s recommended fillers rather than naming them, so the
+/// alias follows tempo-alloy when it changes them (such as `TempoNonceFiller`).
 pub type TempoProvider = alloy::providers::fillers::FillProvider<
     alloy::providers::fillers::JoinFill<
         alloy::providers::Identity,
-        alloy::providers::fillers::JoinFill<
-            alloy::providers::fillers::NonceFiller,
-            alloy::providers::fillers::JoinFill<
-                tempo_alloy::fillers::TempoGasFiller,
-                alloy::providers::fillers::ChainIdFiller,
-            >,
-        >,
+        <tempo_alloy::TempoNetwork as alloy::providers::fillers::RecommendedFillers>::RecommendedFillers,
     >,
     alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
     tempo_alloy::TempoNetwork,
