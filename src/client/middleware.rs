@@ -11,7 +11,7 @@ use crate::client::events::{
     ChallengeReceivedContext, ClientEventSubscription, ClientEvents, CredentialCreatedContext,
     PaymentFailedContext, PaymentResponseContext,
 };
-use crate::client::flow::{Exchange, FlowError, PaymentFlow};
+use crate::client::flow::{same_resource, Exchange, FlowError, PaymentFlow};
 use crate::client::provider::PaymentProvider;
 use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 
@@ -50,6 +50,7 @@ pub struct PaymentMiddleware<P> {
     events: ClientEvents,
     max_payment_retries: usize,
     http_client: Option<reqwest::Client>,
+    redirects_disabled: bool,
 }
 
 impl<P> PaymentMiddleware<P> {
@@ -59,6 +60,7 @@ impl<P> PaymentMiddleware<P> {
         Self {
             provider,
             http_client: None,
+            redirects_disabled: false,
             accept_payment_policy: AcceptPaymentPolicy::default(),
             events: ClientEvents::default(),
             max_payment_retries: DEFAULT_MAX_PAYMENT_RETRIES,
@@ -80,6 +82,19 @@ impl<P> PaymentMiddleware<P> {
     /// ```
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
+        self
+    }
+
+    /// Declare that the client below this middleware never follows redirects,
+    /// for example one built with `reqwest::redirect::Policy::none()`.
+    ///
+    /// The middleware cannot see the client's redirects, so by default a
+    /// non-GET/HEAD request whose 402 arrives at a different URL is refused
+    /// with [`HttpError::RedirectedRequest`](crate::client::HttpError::RedirectedRequest).
+    /// With redirects disabled, a URL changed by inner middleware (an added
+    /// signature query, a path prefix) is a rewrite, and the request is paid.
+    pub fn with_redirects_disabled(mut self) -> Self {
+        self.redirects_disabled = true;
         self
     }
 
@@ -169,6 +184,7 @@ where
                 next,
                 extensions,
                 http_client: self.http_client.clone(),
+                redirects_disabled: self.redirects_disabled,
             },
             req,
             None,
@@ -188,6 +204,7 @@ struct NextExchange<'a, 'b> {
     next: Next<'a>,
     http_client: Option<reqwest::Client>,
     extensions: &'b mut http_types::Extensions,
+    redirects_disabled: bool,
 }
 
 impl Exchange for NextExchange<'_, '_> {
@@ -195,6 +212,10 @@ impl Exchange for NextExchange<'_, '_> {
 
     fn http_client(&self) -> Option<reqwest::Client> {
         self.http_client.clone()
+    }
+
+    fn redirected(&self, request_url: &reqwest::Url, response: &Response) -> bool {
+        !self.redirects_disabled && !same_resource(request_url, response.url())
     }
 
     async fn send(&mut self, request: Request) -> reqwest_middleware::Result<Response> {

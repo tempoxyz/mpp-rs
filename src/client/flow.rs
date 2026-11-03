@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::future::Future;
 
 use reqwest::header::{HeaderMap, HeaderValue, HOST, WWW_AUTHENTICATE};
-use reqwest::{Request, Response, StatusCode};
+use reqwest::{Method, Request, Response, StatusCode};
 
 use super::accept_payment_policy::AcceptPaymentPolicy;
 use super::challenge_selection::{
@@ -61,6 +61,21 @@ pub trait Exchange: Send {
     /// Caller-configured client available for session management requests.
     fn http_client(&self) -> Option<reqwest::Client> {
         None
+    }
+
+    /// Whether the request sent to `request_url` was redirected before
+    /// `response` arrived.
+    ///
+    /// A redirected non-GET/HEAD request may have become a GET (301/302/303),
+    /// so the flow refuses to pay it automatically. reqwest keeps no redirect
+    /// history, so the default treats any change of URL (ignoring the
+    /// fragment) as a redirect. It cannot see a redirect back to the same URL;
+    /// disable redirects on the client to rule those out. Override this when
+    /// the transport knows: return `false` when it never follows redirects
+    /// (so a URL rewritten below the flow is still paid), or `true` when its
+    /// recorded redirect history shows a hop, including a same-URL one.
+    fn redirected(&self, request_url: &reqwest::Url, response: &Response) -> bool {
+        !same_resource(request_url, response.url())
     }
 
     /// Sends `request` and returns its response.
@@ -237,6 +252,24 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             if payment_context.url.origin() != resp.url().origin() {
                 return Err(self.fail(None, HttpError::CrossOriginRedirect).await);
+            }
+
+            // A redirected non-GET/HEAD request may have become a GET
+            // (301/302/303) before reaching the challenge. Refuse to guess the
+            // method to pay with; the transport says whether it was redirected.
+            let method = retry.method();
+            if *method != Method::GET
+                && *method != Method::HEAD
+                && exchange.redirected(&payment_context.url, &resp)
+            {
+                // After a paid retry the request may already have run, so hand
+                // back the redirected 402 instead of an error that reads unpaid.
+                if payment_attempt > 0 {
+                    return Ok(resp);
+                }
+                return Err(self
+                    .fail(None, HttpError::RedirectedRequest(method.to_string()))
+                    .await);
             }
 
             let www_auth_values: Vec<&[u8]> = resp
@@ -719,6 +752,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             .await;
         FlowError::Payment(error)
     }
+}
+
+/// Whether two URLs name the same resource; fragments are never sent.
+pub(crate) fn same_resource(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.as_str().split('#').next() == b.as_str().split('#').next()
 }
 
 /// Whether a zero-amount Tempo challenge names a different host than the caller's request.

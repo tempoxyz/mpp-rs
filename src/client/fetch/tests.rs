@@ -485,6 +485,267 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn redirected_non_get_request_is_rejected_before_payment() {
+        for status in [
+            AxumStatusCode::MOVED_PERMANENTLY,
+            AxumStatusCode::FOUND,
+            AxumStatusCode::SEE_OTHER,
+            AxumStatusCode::TEMPORARY_REDIRECT,
+            AxumStatusCode::PERMANENT_REDIRECT,
+        ] {
+            let (_, www_auth) = test_challenge();
+            let paid = Arc::new(AtomicU32::new(0));
+            let observed = paid.clone();
+            let app = Router::new()
+                .route(
+                    "/start",
+                    axum::routing::any(move || async move {
+                        (
+                            status,
+                            [(axum::http::header::LOCATION, "/final")],
+                            "redirect",
+                        )
+                    }),
+                )
+                .route(
+                    "/final",
+                    axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                        let www_auth = www_auth.clone();
+                        let observed = observed.clone();
+                        async move {
+                            if req.headers().contains_key("authorization") {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                return AxumStatusCode::OK.into_response();
+                            }
+                            (
+                                AxumStatusCode::PAYMENT_REQUIRED,
+                                [(WWW_AUTH_NAME, www_auth)],
+                                "pay up",
+                            )
+                                .into_response()
+                        }
+                    }),
+                );
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+
+            let err = reqwest::Client::new()
+                .post(format!("{base_url}/start"))
+                .body("original")
+                .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(&err, HttpError::RedirectedRequest(method) if method == "POST"),
+                "{status}: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "Cannot automatically pay a redirected POST request"
+            );
+            assert_eq!(provider.call_count(), 0, "{status}");
+            assert_eq!(paid.load(Ordering::SeqCst), 0, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_402_after_paid_retry_is_returned() {
+        let (_, www_auth) = test_challenge();
+        let posts = Arc::new(AtomicU32::new(0));
+        let observed = posts.clone();
+        let app = Router::new()
+            .route(
+                "/jobs",
+                axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    let observed = observed.clone();
+                    async move {
+                        if req.headers().contains_key("authorization") {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            return (
+                                AxumStatusCode::SEE_OTHER,
+                                [(axum::http::header::LOCATION, "/result")],
+                                "",
+                            )
+                                .into_response();
+                        }
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/result",
+                get(|| async { (AxumStatusCode::PAYMENT_REQUIRED, "pay up").into_response() }),
+            );
+        let base_url = spawn_server(app).await;
+        let provider = MockProvider::new();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base_url}/jobs"))
+            .body("original")
+            .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(resp.url().path(), "/result");
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Exchange that knows its redirect history through a recording policy.
+    struct RecordingExchange {
+        client: reqwest::Client,
+        hops: Arc<AtomicU32>,
+        before: u32,
+    }
+
+    impl Exchange for RecordingExchange {
+        type Error = HttpError;
+
+        fn redirected(&self, _request_url: &reqwest::Url, _response: &reqwest::Response) -> bool {
+            self.hops.load(Ordering::SeqCst) > self.before
+        }
+
+        async fn send(&mut self, request: Request) -> Result<reqwest::Response, HttpError> {
+            self.before = self.hops.load(Ordering::SeqCst);
+            self.client
+                .execute(request)
+                .await
+                .map_err(HttpError::request)
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_reported_same_url_redirect_is_rejected_before_payment() {
+        let (_, www_auth) = test_challenge();
+        let paid = Arc::new(AtomicU32::new(0));
+        let observed = paid.clone();
+        let app = Router::new().route(
+            "/jobs",
+            axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                let www_auth = www_auth.clone();
+                let observed = observed.clone();
+                async move {
+                    if req.headers().contains_key("authorization") {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        return AxumStatusCode::OK.into_response();
+                    }
+                    if req.method() == axum::http::Method::POST {
+                        return (
+                            AxumStatusCode::SEE_OTHER,
+                            [(axum::http::header::LOCATION, "/jobs")],
+                            "",
+                        )
+                            .into_response();
+                    }
+                    (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTH_NAME, www_auth)],
+                        "pay up",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let provider = MockProvider::new();
+        let hops = Arc::new(AtomicU32::new(0));
+        let recorded = hops.clone();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                attempt.follow()
+            }))
+            .build()
+            .unwrap();
+        let mut exchange = RecordingExchange {
+            client: client.clone(),
+            hops,
+            before: 0,
+        };
+        let request = client
+            .post(format!("{base_url}/jobs"))
+            .body("original")
+            .build()
+            .unwrap();
+
+        let err = crate::client::send_with_exchange(
+            &mut exchange,
+            request,
+            &provider,
+            &AcceptPaymentPolicy::Always,
+            &ClientEvents::default(),
+            crate::client::DEFAULT_MAX_PAYMENT_RETRIES,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, FlowError::Payment(HttpError::RedirectedRequest(method)) if method == "POST"),
+            "unexpected error"
+        );
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(paid.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn paid_retry_preserves_method_and_body() {
+        for method in [reqwest::Method::POST, reqwest::Method::PUT] {
+            let (_, www_auth) = test_challenge();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let recorded = seen.clone();
+            let app = Router::new().route(
+                "/jobs",
+                axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                    let www_auth = www_auth.clone();
+                    let recorded = recorded.clone();
+                    async move {
+                        let paid = req.headers().contains_key("authorization");
+                        let method = req.method().to_string();
+                        let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push((method, String::from_utf8(body.to_vec()).unwrap()));
+                        if paid {
+                            return AxumStatusCode::OK.into_response();
+                        }
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [(WWW_AUTH_NAME, www_auth)],
+                            "pay up",
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+            let base_url = spawn_server(app).await;
+            let provider = MockProvider::new();
+
+            let resp = reqwest::Client::new()
+                .request(method.clone(), format!("{base_url}/jobs"))
+                .body(r#"{"job":"compute"}"#)
+                .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(provider.call_count(), 1);
+            let expected = (method.to_string(), r#"{"job":"compute"}"#.to_string());
+            assert_eq!(*seen.lock().unwrap(), vec![expected.clone(), expected]);
+        }
+    }
+
+    #[tokio::test]
     async fn dropped_paid_request_abandons_transient_provider_state() {
         let (_, www_auth) = test_challenge();
         let retry_started = Arc::new(Notify::new());

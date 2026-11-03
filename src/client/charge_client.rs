@@ -141,6 +141,11 @@ impl Exchange for ChargeExchange<'_> {
         }
     }
 
+    // The retained client never follows redirects, so a changed URL is not one.
+    fn redirected(&self, _request_url: &reqwest::Url, _response: &Response) -> bool {
+        false
+    }
+
     async fn send(&mut self, request: Request) -> Result<Response, Self::Error> {
         self.0.execute(request).await.map_err(HttpError::request)
     }
