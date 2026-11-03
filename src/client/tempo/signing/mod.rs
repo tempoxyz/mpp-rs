@@ -1046,9 +1046,13 @@ mod tests {
             panic!("expected keychain signature")
         };
         assert_eq!(signature.user_address, wallet);
+        // The approval's wire bytes follow the type byte and user address; decoding
+        // them works whether the field is a `PrimitiveSignature` or (from T14) an
+        // `AccountSignature`.
+        let approval = decoded.signature().to_bytes();
         assert!(matches!(
-            signature.signature,
-            PrimitiveSignature::P256(ref p256) if p256.pre_hash
+            PrimitiveSignature::from_bytes(&approval[21..]),
+            Ok(PrimitiveSignature::P256(ref p256)) if p256.pre_hash
         ));
     }
 

@@ -19,6 +19,22 @@ use crate::protocol::traits::VerificationError;
 
 use super::ChargeMethod;
 
+/// Bytes a keychain envelope puts before its approval: the type byte and the
+/// 20-byte user address.
+const KEYCHAIN_ENVELOPE_PREFIX_LEN: usize = 1 + 20;
+
+/// The primitive signature that approves a keychain envelope, or None when
+/// the approval is not primitive (a configurable account's owner quorum).
+///
+/// Decoded from the envelope's wire bytes (`type | user_address | approval`)
+/// rather than read from `KeychainSignature::signature`, whose Rust type is
+/// `PrimitiveSignature` before T14 and `AccountSignature` from T14, so this
+/// builds against both tempo-primitives versions.
+fn keychain_primitive_approval(signature: &TempoSignature) -> Option<PrimitiveSignature> {
+    let bytes = signature.to_bytes();
+    PrimitiveSignature::from_bytes(bytes.get(KEYCHAIN_ENVELOPE_PREFIX_LEN..)?).ok()
+}
+
 /// Move the last call of an AA batch into `to`/`value`/`input`.
 ///
 /// A request without `to` is read as a contract creation next to the batch.
@@ -84,20 +100,35 @@ where
             VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
         })?;
 
-        let (key_id, primitive_sig) = match signed.signature() {
+        let (key_id, key_type, approval) = match signed.signature() {
             TempoSignature::Keychain(keychain_sig) => {
                 let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
                     VerificationError::new(format!(
                         "Failed to recover keychain access key for simulation: {e}"
                     ))
                 })?;
-                (Some(key_id), &keychain_sig.signature)
+                (
+                    Some(key_id),
+                    keychain_sig.signature.signature_type(),
+                    keychain_primitive_approval(signed.signature()),
+                )
             }
-            TempoSignature::Primitive(primitive_sig) => (None, primitive_sig),
+            TempoSignature::Primitive(primitive_sig) => (
+                None,
+                primitive_sig.signature_type(),
+                Some(primitive_sig.clone()),
+            ),
+            // Signatures newer tempo-primitives versions add (a configurable
+            // account sender) carry no access-key hints to forward.
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(VerificationError::new(
+                    "Unsupported sender signature for simulation",
+                ))
+            }
         };
-        let key_type = primitive_sig.signature_type();
-        let key_data = match primitive_sig {
-            PrimitiveSignature::WebAuthn(webauthn) => Some(webauthn.webauthn_data.clone()),
+        let key_data = match approval {
+            Some(PrimitiveSignature::WebAuthn(webauthn)) => Some(webauthn.webauthn_data),
             _ => None,
         };
 
