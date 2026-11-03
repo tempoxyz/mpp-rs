@@ -62,6 +62,21 @@ pub trait Exchange: Send {
         None
     }
 
+    /// Whether the request sent to `request_url` was redirected before
+    /// `response` arrived.
+    ///
+    /// A redirected non-GET/HEAD request may have become a GET (301/302/303),
+    /// so the flow refuses to pay it automatically. reqwest keeps no redirect
+    /// history, so the default treats any change of URL (ignoring the
+    /// fragment) as a redirect. It cannot see a redirect back to the same URL;
+    /// disable redirects on the client to rule those out. Override this when
+    /// the transport knows: return `false` when it never follows redirects
+    /// (so a URL rewritten below the flow is still paid), or `true` when its
+    /// recorded redirect history shows a hop, including a same-URL one.
+    fn redirected(&self, request_url: &reqwest::Url, response: &Response) -> bool {
+        !same_resource(request_url, response.url())
+    }
+
     /// Sends `request` and returns its response.
     fn send(
         &mut self,
@@ -238,13 +253,13 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Err(self.fail(None, HttpError::CrossOriginRedirect).await);
             }
 
-            // reqwest does not expose the redirect chain, so a redirected
-            // non-GET/HEAD request may have become a GET (301/302/303) before
-            // reaching the challenge. Refuse to guess the method to pay with.
+            // A redirected non-GET/HEAD request may have become a GET
+            // (301/302/303) before reaching the challenge. Refuse to guess the
+            // method to pay with; the transport says whether it was redirected.
             let method = retry.method();
             if *method != Method::GET
                 && *method != Method::HEAD
-                && !same_resource(&payment_context.url, resp.url())
+                && exchange.redirected(&payment_context.url, &resp)
             {
                 // After a paid retry the request may already have run, so hand
                 // back the redirected 402 instead of an error that reads unpaid.
@@ -713,7 +728,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 }
 
 /// Whether two URLs name the same resource; fragments are never sent.
-fn same_resource(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+pub(crate) fn same_resource(a: &reqwest::Url, b: &reqwest::Url) -> bool {
     a.as_str().split('#').next() == b.as_str().split('#').next()
 }
 

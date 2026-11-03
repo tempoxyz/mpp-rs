@@ -398,6 +398,87 @@ mod integration {
         assert_eq!(provider.call_count(), 1);
     }
 
+    /// Inner middleware that signs requests by adding a query parameter.
+    struct SignQuery;
+
+    #[async_trait::async_trait]
+    impl reqwest_middleware::Middleware for SignQuery {
+        async fn handle(
+            &self,
+            mut req: reqwest::Request,
+            extensions: &mut http_types::Extensions,
+            next: reqwest_middleware::Next<'_>,
+        ) -> reqwest_middleware::Result<reqwest::Response> {
+            req.url_mut().query_pairs_mut().append_pair("sig", "1");
+            next.run(req, extensions).await
+        }
+    }
+
+    #[tokio::test]
+    async fn rewritten_non_get_request_pays_only_with_redirects_disabled() {
+        let (_, www_auth) = test_challenge();
+        let app = Router::new().route(
+            "/jobs",
+            axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                let www_auth = www_auth.clone();
+                async move {
+                    if req.headers().contains_key("authorization") {
+                        return AxumStatusCode::OK.into_response();
+                    }
+                    (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTH_NAME, www_auth)],
+                        "pay up",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let provider = TestProvider::new();
+        let client = ClientBuilder::new(http.clone())
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+            )
+            .with(SignQuery)
+            .build();
+        let err = client
+            .post(format!("{base_url}/jobs"))
+            .body("original")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            http_error(&err),
+            HttpError::RedirectedRequest(method) if method == "POST"
+        ));
+        assert_eq!(provider.call_count(), 0);
+
+        let provider = TestProvider::new();
+        let client = ClientBuilder::new(http)
+            .with(
+                PaymentMiddleware::new(provider.clone())
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Always)
+                    .with_redirects_disabled(),
+            )
+            .with(SignQuery)
+            .build();
+        let resp = client
+            .post(format!("{base_url}/jobs"))
+            .body("original")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(provider.call_count(), 1);
+    }
+
     #[tokio::test]
     async fn test_middleware_passes_request_context_to_concurrent_payments() {
         #[derive(Clone)]

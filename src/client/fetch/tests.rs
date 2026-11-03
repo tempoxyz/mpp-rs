@@ -599,6 +599,102 @@ mod integration {
         assert_eq!(posts.load(Ordering::SeqCst), 1);
     }
 
+    /// Exchange that knows its redirect history through a recording policy.
+    struct RecordingExchange {
+        client: reqwest::Client,
+        hops: Arc<AtomicU32>,
+        before: u32,
+    }
+
+    impl Exchange for RecordingExchange {
+        type Error = HttpError;
+
+        fn redirected(&self, _request_url: &reqwest::Url, _response: &reqwest::Response) -> bool {
+            self.hops.load(Ordering::SeqCst) > self.before
+        }
+
+        async fn send(&mut self, request: Request) -> Result<reqwest::Response, HttpError> {
+            self.before = self.hops.load(Ordering::SeqCst);
+            self.client
+                .execute(request)
+                .await
+                .map_err(HttpError::request)
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_reported_same_url_redirect_is_rejected_before_payment() {
+        let (_, www_auth) = test_challenge();
+        let paid = Arc::new(AtomicU32::new(0));
+        let observed = paid.clone();
+        let app = Router::new().route(
+            "/jobs",
+            axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                let www_auth = www_auth.clone();
+                let observed = observed.clone();
+                async move {
+                    if req.headers().contains_key("authorization") {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        return AxumStatusCode::OK.into_response();
+                    }
+                    if req.method() == axum::http::Method::POST {
+                        return (
+                            AxumStatusCode::SEE_OTHER,
+                            [(axum::http::header::LOCATION, "/jobs")],
+                            "",
+                        )
+                            .into_response();
+                    }
+                    (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTH_NAME, www_auth)],
+                        "pay up",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let provider = MockProvider::new();
+        let hops = Arc::new(AtomicU32::new(0));
+        let recorded = hops.clone();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                attempt.follow()
+            }))
+            .build()
+            .unwrap();
+        let mut exchange = RecordingExchange {
+            client: client.clone(),
+            hops,
+            before: 0,
+        };
+        let request = client
+            .post(format!("{base_url}/jobs"))
+            .body("original")
+            .build()
+            .unwrap();
+
+        let err = crate::client::send_with_exchange(
+            &mut exchange,
+            request,
+            &provider,
+            &AcceptPaymentPolicy::Always,
+            &ClientEvents::default(),
+            crate::client::DEFAULT_MAX_PAYMENT_RETRIES,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, FlowError::Payment(HttpError::RedirectedRequest(method)) if method == "POST"),
+            "unexpected error"
+        );
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(paid.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn paid_retry_preserves_method_and_body() {
         for method in [reqwest::Method::POST, reqwest::Method::PUT] {
