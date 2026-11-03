@@ -579,6 +579,9 @@ impl TempoSessionProvider {
     }
 
     /// Enable atomic stablecoin swaps before native session opens and top-ups.
+    ///
+    /// The swap comes from `config.token_in` or, unless `config.fallback` is
+    /// off, the first of pathUSD, USDC.e and OUSD the payer holds, as mppx does.
     pub fn with_autoswap(mut self, config: AutoswapConfig) -> Self {
         self.autoswap = Some(config);
         self
@@ -591,8 +594,8 @@ impl TempoSessionProvider {
 
     /// Pay gas for unsponsored channel opens and top-ups in `token`.
     ///
-    /// Without it, gas is paid in the autoswap input token, or else in the
-    /// session currency. A recipient-restricted currency such as MACH cannot
+    /// Without it, gas is paid in the autoswap `token_in` (unless it is
+    /// OUSD, which cannot pay fees), or else in the session currency. A recipient-restricted currency such as MACH cannot
     /// pay its own gas, so a MACH session without fee sponsorship needs a
     /// separate fee token.
     pub fn with_fee_token(mut self, token: Address) -> Self {
@@ -1032,7 +1035,7 @@ impl TempoSessionProvider {
 
     fn fee_token(&self, currency: Address) -> Address {
         self.fee_token
-            .or_else(|| self.autoswap.as_ref().map(|config| config.token_in))
+            .or_else(|| self.autoswap.as_ref().and_then(AutoswapConfig::fee_token))
             .unwrap_or(currency)
     }
 

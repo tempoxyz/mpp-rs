@@ -165,10 +165,6 @@ impl TempoAccountsProvider {
         self.preferred_currency
     }
 
-    fn fee_token(&self) -> Option<alloy::primitives::Address> {
-        self.autoswap.as_ref().map(|config| config.token_in)
-    }
-
     /// Pin the chain ID this provider will pay on.
     ///
     /// Without a pin the provider pays on the chain the challenge names, with
@@ -747,7 +743,7 @@ impl PaymentProvider for TempoAccountsProvider {
             self.client_id.as_deref(),
         )?;
         let rpc_provider = self.settlement_provider(charge.chain_id())?;
-        let (charge, funding) =
+        let (charge, funding, fee_token) =
             super::provider::fund(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
         self.funding
             .lock()
@@ -760,7 +756,7 @@ impl PaymentProvider for TempoAccountsProvider {
                 &rpc_provider,
                 from,
                 SignOptions {
-                    fee_token: self.fee_token(),
+                    fee_token,
                     ..Default::default()
                 },
             )
