@@ -43,17 +43,45 @@ pub(super) fn prepare_charge_request(
     Ok(charge)
 }
 
-pub(super) async fn prepare_charge(
+/// Builds the charge for a challenge, funded per autoswap, and returns the token
+/// that funds it (the charge currency, or an autoswap route's input token) and
+/// the fee token that funding implies.
+async fn prepare_funded_charge(
     challenge: &PaymentChallenge,
     expected_chain_id: Option<u64>,
     client_id: Option<&str>,
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
-) -> Result<(TempoCharge, Option<alloy::primitives::Address>), MppError> {
+) -> Result<
+    (
+        TempoCharge,
+        alloy::primitives::Address,
+        Option<alloy::primitives::Address>,
+    ),
+    MppError,
+> {
     let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
-    let (charge, _, fee_token) = fund(charge, autoswap, provider, from).await?;
-    Ok((charge, fee_token))
+    fund(charge, autoswap, provider, from).await
+}
+
+/// Picks the fee token for an unsponsored charge: the configured one, else the
+/// one funding implies.
+///
+/// An autoswap route buys exactly the charge's shortfall in its currency, so
+/// a configured fee token equal to that currency would leave nothing for the
+/// fee. The route's own fee token pays it instead.
+fn select_fee_token(
+    configured: Option<alloy::primitives::Address>,
+    implied: Option<alloy::primitives::Address>,
+    currency: alloy::primitives::Address,
+    funding: alloy::primitives::Address,
+) -> Option<alloy::primitives::Address> {
+    match configured {
+        Some(token) if token == currency && funding != currency => implied,
+        Some(token) => Some(token),
+        None => implied,
+    }
 }
 
 pub(super) async fn apply_funding(
@@ -612,7 +640,7 @@ impl PaymentProvider for TempoProvider {
         }
         let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
         self.ensure_allowed_chain(Some(chain_id))?;
-        let (charge, fee_token) = prepare_charge(
+        let (charge, funding, fee_token) = prepare_funded_charge(
             challenge,
             Some(chain_id),
             self.client_id.as_deref(),
@@ -624,7 +652,7 @@ impl PaymentProvider for TempoProvider {
 
         let options = SignOptions {
             signing_mode: Some(self.signing_mode.clone()),
-            fee_token: self.fee_token.or(fee_token),
+            fee_token: select_fee_token(self.fee_token, fee_token, charge.currency(), funding),
             ..Default::default()
         };
         let signed = charge
@@ -1711,6 +1739,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(envelope.fee_token, None);
+    }
+
+    /// A configured fee token equal to the charge currency yields to the
+    /// autoswap route's fee token when a swap funds the charge, since the swap
+    /// buys only the shortfall.
+    #[test]
+    fn test_select_fee_token_keeps_swap_fee_token() {
+        use alloy::primitives::Address;
+        let currency = Address::repeat_byte(0x11);
+        let token_in = Address::repeat_byte(0x22);
+        let other = Address::repeat_byte(0x33);
+
+        assert_eq!(
+            select_fee_token(Some(currency), Some(token_in), currency, token_in),
+            Some(token_in)
+        );
+        assert_eq!(
+            select_fee_token(Some(other), Some(token_in), currency, token_in),
+            Some(other)
+        );
+        assert_eq!(
+            select_fee_token(Some(currency), None, currency, currency),
+            Some(currency)
+        );
+        assert_eq!(
+            select_fee_token(None, Some(token_in), currency, token_in),
+            Some(token_in)
+        );
     }
 
     #[tokio::test]
