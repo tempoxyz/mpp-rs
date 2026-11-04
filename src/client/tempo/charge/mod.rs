@@ -1256,17 +1256,18 @@ impl SignedTempoCharge {
                 let rejected = push_refused(&error);
                 // The node may have accepted the transaction: name its hash
                 // so the payment can be reconciled rather than paid again.
-                let message = if rejected {
-                    format!("failed to broadcast push payment: {error}")
-                } else {
-                    format!(
-                        "push payment outcome unknown (tx {}): {error}",
-                        alloy::primitives::keccak256(tx_bytes)
-                    )
-                };
                 PushError {
                     rejected,
-                    error: MppError::Http(message),
+                    error: if rejected {
+                        MppError::Http(format!("failed to broadcast push payment: {error}"))
+                    } else {
+                        MppError::PaymentOutcomeUnknown {
+                            transaction_hash: format!(
+                                "{:#x}",
+                                alloy::primitives::keccak256(tx_bytes)
+                            ),
+                        }
+                    },
                 }
             })?;
         let hash = receipt
@@ -1274,12 +1275,20 @@ impl SignedTempoCharge {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| PushError {
                 rejected: false,
-                error: MppError::Http("No transaction receipt returned.".into()),
+                error: MppError::PaymentOutcomeUnknown {
+                    transaction_hash: format!("{:#x}", alloy::primitives::keccak256(tx_bytes)),
+                },
             })?;
         if receipt.get("status").and_then(serde_json::Value::as_str) != Some("0x1") {
             return Err(PushError {
                 rejected: false,
-                error: MppError::Http(format!("push payment transaction {hash} reverted")),
+                error: if receipt.get("status").and_then(serde_json::Value::as_str) == Some("0x0") {
+                    MppError::Http(format!("push payment transaction {hash} reverted"))
+                } else {
+                    MppError::PaymentOutcomeUnknown {
+                        transaction_hash: format!("{:#x}", alloy::primitives::keccak256(tx_bytes)),
+                    }
+                },
             });
         }
         self.credential = PaymentCredential::with_source(

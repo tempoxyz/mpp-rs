@@ -42,14 +42,27 @@ pub async fn read_on_chain_channel_state<P: Provider<TempoNetwork>>(
     provider: &P,
     channel_id: B256,
 ) -> Result<OnChainChannelState, MppError> {
+    read_on_chain_channel_state_at(provider, channel_id, None).await
+}
+
+pub(crate) async fn read_on_chain_channel_state_at<P: Provider<TempoNetwork>>(
+    provider: &P,
+    channel_id: B256,
+    block: Option<alloy::eips::BlockId>,
+) -> Result<OnChainChannelState, MppError> {
     let mut request = TempoTransactionRequest::default();
     request.inner = request.inner.to(TIP20_CHANNEL_RESERVE_ADDRESS).input(
         alloy::rpc::types::TransactionInput::new(encode_precompile_get_channel_state_call(
             channel_id,
         )),
     );
-    let result = provider
-        .call(request)
+    let call = provider.call(request);
+    let call = if let Some(block) = block {
+        call.block(block)
+    } else {
+        call
+    };
+    let result = call
         .await
         .mpp_http("failed to read TIP-1034 channel state")?;
     let decoded = ITIP20ChannelReserve::getChannelStateCall::abi_decode_returns(&result)

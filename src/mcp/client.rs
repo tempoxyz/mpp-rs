@@ -233,6 +233,10 @@ where
                         credential,
                     )));
                 }
+                Err(
+                    error @ (MppError::PaymentOutcomeUnknown { .. }
+                    | MppError::SessionPaymentOutcomeUnknown { .. }),
+                ) => return Err(error),
                 Err(error) => {
                     failure.get_or_insert(error);
                     remaining.retain(|candidate| {
@@ -904,6 +908,45 @@ mod tests {
 
         let error = payment.prepare(&[session]).await.err().unwrap();
         assert!(error.to_string().contains("insufficient balance"));
+    }
+
+    #[derive(Clone, Default)]
+    struct AmbiguousProvider(Arc<AtomicUsize>, bool);
+
+    impl PaymentProvider for AmbiguousProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && intent == "charge"
+        }
+        async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            if self.1 {
+                Err(MppError::SessionPaymentOutcomeUnknown {
+                    context: "top-up timed out".into(),
+                })
+            } else {
+                Err(MppError::PaymentOutcomeUnknown {
+                    transaction_hash: "0x1234".into(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_payment_does_not_try_another_offer() {
+        for session in [false, true] {
+            let provider = AmbiguousProvider(Arc::new(AtomicUsize::new(0)), session);
+            let payment = McpPayment::new(provider.clone(), context());
+            let first = challenge();
+            let mut second = challenge();
+            second.id = "second-offer".into();
+            let error = payment.prepare(&[first, second]).await.err().unwrap();
+            assert!(matches!(
+                error,
+                MppError::PaymentOutcomeUnknown { .. }
+                    | MppError::SessionPaymentOutcomeUnknown { .. }
+            ));
+            assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
