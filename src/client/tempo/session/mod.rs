@@ -1157,6 +1157,74 @@ impl TempoSessionProvider {
         Ok(())
     }
 
+    /// Discard an opening only after an expired chain block proves it unfunded.
+    async fn reconcile_expired_open(
+        &self,
+        key: &str,
+        entry: &ChannelEntry,
+        valid_before: u64,
+    ) -> Result<bool, MppError> {
+        use alloy::consensus::BlockHeader;
+        let block = self
+            .rpc_provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await
+            .mpp_http("failed to reconcile opening expiry")?
+            .ok_or_else(|| MppError::Http("opening expiry block unavailable".into()))?;
+        if block.header.timestamp() <= valid_before {
+            return Ok(false);
+        }
+        let block_id = Some(alloy::eips::BlockId::number(block.header.number()));
+        let funded = if is_precompile_escrow(entry.escrow_contract) {
+            let state = recovery::read_on_chain_channel_state_at(
+                &self.rpc_provider,
+                entry.channel_id,
+                block_id,
+            )
+            .await?;
+            state.deposit != 0 || state.settled != 0 || state.close_requested_at != 0
+        } else {
+            let state = channel_ops::get_on_chain_channel_at(
+                &self.rpc_provider,
+                entry.escrow_contract,
+                entry.channel_id,
+                block_id,
+            )
+            .await?;
+            state.deposit != 0
+                || state.settled != 0
+                || state.finalized
+                || state.close_requested_at != 0
+        };
+        if funded {
+            if let Some(pending) = self
+                .pending_opens
+                .lock()
+                .unwrap()
+                .get_mut(&entry.channel_id.to_string())
+            {
+                pending.payload = None;
+            }
+            return Ok(false);
+        }
+        if let Some(store_key) = Self::store_key(entry)? {
+            self.channel_store
+                .delete(&store_key)
+                .await
+                .map_err(Self::store_error)?;
+        }
+        self.pending_opens
+            .lock()
+            .unwrap()
+            .remove(&entry.channel_id.to_string());
+        self.channel_id_to_key
+            .lock()
+            .unwrap()
+            .remove(&entry.channel_id.to_string());
+        self.channels.lock().unwrap().remove(key);
+        Ok(true)
+    }
+
     async fn persist_channel(&self, entry: &ChannelEntry) -> Result<(), MppError> {
         if !is_precompile_escrow(entry.escrow_contract) {
             return Ok(());
@@ -3589,6 +3657,39 @@ impl TempoSessionProvider {
         if let Some((entry, _)) = existing.as_mut() {
             self.merge_stored_channel(&key, entry).await?;
         }
+        if let Some((entry, _)) = &existing {
+            let payload = self
+                .pending_opens
+                .lock()
+                .unwrap()
+                .get(&entry.channel_id.to_string())
+                .and_then(|pending| pending.payload.clone());
+            if let Some(SessionCredentialPayload::Open { transaction, .. }) = payload {
+                use alloy::eips::eip2718::Decodable2718;
+                use tempo_alloy::primitives::transaction::AASigned;
+                let bytes = alloy::hex::decode(&transaction)
+                    .mpp_http("invalid pending opening transaction")?;
+                let valid_before = match AASigned::decode_2718(&mut bytes.as_slice()) {
+                    Ok(tx) => tx.tx().valid_before.map(|value| value.get()),
+                    Err(_) => {
+                        crate::protocol::methods::tempo::FeePayerEnvelope78::decode_envelope(&bytes)
+                            .mpp_http("invalid pending opening envelope")?
+                            .valid_before
+                    }
+                };
+                if let Some(valid_before) = valid_before {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    if now > 0
+                        && now as u64 > valid_before
+                        && self
+                            .reconcile_expired_open(&key, entry, valid_before)
+                            .await?
+                    {
+                        existing = None;
+                    }
+                }
+            }
+        }
         let reconcile_pending = session_snapshot.is_some()
             && existing.as_ref().is_some_and(|(entry, _)| {
                 self.pending_opens
@@ -3668,6 +3769,16 @@ impl TempoSessionProvider {
                 if pending && precompile && !includes_request {
                     let state =
                         read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
+                    if state.deposit != 0 || state.settled != 0 || state.close_requested_at != 0 {
+                        if let Some(open) = self
+                            .pending_opens
+                            .lock()
+                            .unwrap()
+                            .get_mut(&entry.channel_id.to_string())
+                        {
+                            open.payload = None;
+                        }
+                    }
                     if state.settled != 0 && state.settled >= entry.cumulative_amount {
                         self.commit_referenced_open(&entry.channel_id.to_string());
                         self.persist_channel(&entry).await?;
@@ -3682,7 +3793,31 @@ impl TempoSessionProvider {
                         .get(&entry.channel_id.to_string())
                         .and_then(|pending| pending.payload.clone());
                     if let Some(payload) = payload {
-                        return Ok(build_credential(challenge, payload, chain_id, payer));
+                        let funded = if precompile {
+                            false
+                        } else {
+                            let state = channel_ops::get_on_chain_channel(
+                                &self.rpc_provider,
+                                entry.escrow_contract,
+                                entry.channel_id,
+                            )
+                            .await?;
+                            state.deposit != 0
+                                || state.settled != 0
+                                || state.finalized
+                                || state.close_requested_at != 0
+                        };
+                        if !funded {
+                            return Ok(build_credential(challenge, payload, chain_id, payer));
+                        }
+                        if let Some(open) = self
+                            .pending_opens
+                            .lock()
+                            .unwrap()
+                            .get_mut(&entry.channel_id.to_string())
+                        {
+                            open.payload = None;
+                        }
                     }
                 }
                 // Retry the authorized opening amount until a receipt reconciles it.
@@ -7636,6 +7771,24 @@ mod tests {
             .with_default_deposit(10_000);
         let asserter = Asserter::new();
         asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        use alloy::sol_types::SolValue;
+        let state = alloy::primitives::Bytes::from(
+            (
+                false,
+                0u64,
+                Address::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+                0u128,
+                0u128,
+            )
+                .abi_encode(),
+        )
+        .to_string();
+        for _ in 0..3 {
+            asserter.push_success(&state);
+        }
         provider.rpc_provider =
             ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
         let challenge = make_scoped_challenge(payee, currency, escrow);
@@ -7666,6 +7819,125 @@ mod tests {
             if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
         );
         provider.abandon_payment(&challenge, &next);
+    }
+
+    #[tokio::test]
+    async fn expired_open_is_replaced_only_after_chain_proves_it_unfunded() {
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            sol_types::SolValue,
+        };
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        for native in [false, true] {
+            for (timestamp, deposit, replace) in [(1, 0, false), (2, 10_000, false), (2, 0, true)] {
+                let escrow = if native {
+                    TIP20_CHANNEL_RESERVE_ADDRESS
+                } else {
+                    Address::repeat_byte(0x33)
+                };
+                let mut provider = make_test_provider()
+                    .with_allow_custom_escrow(true)
+                    .with_default_deposit(10_000);
+                let asserter = Asserter::new();
+                asserter.push_success(&"0x4a817c800");
+                if native {
+                    asserter.push_success(&"0x5208");
+                }
+                provider.rpc_provider = ProviderBuilder::<_, _, TempoNetwork>::default()
+                    .connect_mocked_client(asserter);
+                let challenge = make_scoped_challenge(
+                    Address::repeat_byte(0x11),
+                    Address::repeat_byte(0x22),
+                    escrow,
+                );
+                let credential = provider.pay(&challenge).await.unwrap();
+                provider.abandon_payment(&challenge, &credential);
+                let (key, entry) = provider.channels().into_iter().next().unwrap();
+
+                let header = tempo_alloy::rpc::TempoHeaderResponse {
+                    inner: alloy::rpc::types::Header {
+                        hash: B256::repeat_byte(0xee),
+                        inner: tempo_alloy::primitives::TempoHeader {
+                            inner: alloy::consensus::Header {
+                                number: 100,
+                                timestamp,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        total_difficulty: None,
+                        size: None,
+                    },
+                    timestamp_millis: timestamp * 1000,
+                };
+                let block: alloy::rpc::types::Block<serde_json::Value, _> =
+                    alloy::rpc::types::Block::empty(header);
+                let asserter = Asserter::new();
+                asserter.push_success(&block);
+                if timestamp > 1 {
+                    let state = if native {
+                        channel_state_response(deposit)
+                    } else {
+                        alloy::primitives::Bytes::from(
+                            (
+                                false,
+                                0u64,
+                                Address::ZERO,
+                                Address::ZERO,
+                                Address::ZERO,
+                                Address::ZERO,
+                                deposit,
+                                0u128,
+                            )
+                                .abi_encode(),
+                        )
+                        .to_string()
+                    };
+                    asserter.push_success(&state);
+                }
+                if replace {
+                    asserter.push_success(&"0x4a817c800");
+                    if native {
+                        asserter.push_success(&"0x5208");
+                    }
+                }
+                provider.rpc_provider = ProviderBuilder::<_, _, TempoNetwork>::default()
+                    .connect_mocked_client(asserter);
+                assert_eq!(
+                    provider
+                        .reconcile_expired_open(&key, &entry, 1)
+                        .await
+                        .unwrap(),
+                    replace
+                );
+                if replace {
+                    assert!(provider.channels().is_empty());
+                    assert!(provider.pending_opens.lock().unwrap().is_empty());
+                    let retry = provider.pay(&challenge).await.unwrap();
+                    assert_ne!(
+                        TempoSessionProvider::credential_channel_id(&retry),
+                        TempoSessionProvider::credential_channel_id(&credential)
+                    );
+                    assert!(matches!(
+                        retry.payload_as::<SessionCredentialPayload>().unwrap(),
+                        SessionCredentialPayload::Open { .. }
+                    ));
+                    provider.abandon_payment(&challenge, &retry);
+                } else {
+                    assert_eq!(provider.channels().len(), 1);
+                    let pending = provider.pending_opens.lock().unwrap();
+                    assert_eq!(
+                        pending
+                            .get(&entry.channel_id.to_string())
+                            .unwrap()
+                            .payload
+                            .is_some(),
+                        timestamp <= 1
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -7702,6 +7974,58 @@ mod tests {
         for _ in 0..2 {
             let retry = provider.pay(&challenge).await.unwrap();
             assert_eq!(retry.payload, credential.payload);
+            provider.abandon_payment(&challenge, &retry);
+        }
+        let retry = provider.pay(&challenge).await.unwrap();
+        provider.commit_payment(&challenge, &retry).await.unwrap();
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        let next = provider.pay(&challenge).await.unwrap();
+        assert!(
+            matches!(next.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Voucher { cumulative_amount, .. }
+            if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
+        );
+        provider.abandon_payment(&challenge, &next);
+    }
+
+    #[tokio::test]
+    async fn funded_native_open_retries_with_the_original_amount_voucher() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        asserter.push_success(&"0x5208"); // eth_estimateGas
+        for _ in 0..3 {
+            asserter.push_success(&channel_state_response(10_000));
+        }
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(payee, currency, escrow);
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        assert!(matches!(
+            credential.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Open { .. }
+        ));
+        assert_eq!(provider.channels().len(), 1);
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        let channel = provider.channels().values().next().unwrap().clone();
+        provider.abandon_payment(&challenge, &credential);
+        for _ in 0..2 {
+            let retry = provider.pay(&challenge).await.unwrap();
+            assert!(
+                matches!(retry.payload_as::<SessionCredentialPayload>().unwrap(),
+                SessionCredentialPayload::Voucher { cumulative_amount, .. }
+                if cumulative_amount == channel.cumulative_amount.to_string())
+            );
             provider.abandon_payment(&challenge, &retry);
         }
         let retry = provider.pay(&challenge).await.unwrap();
