@@ -189,6 +189,21 @@ pub(crate) struct OriginBoundChannelStore {
     pub(crate) origin: Arc<Mutex<Option<String>>>,
 }
 
+impl OriginBoundChannelStore {
+    /// Check a stored entry against the provider's origin, binding an unbound
+    /// provider to the entry's origin, and return the provider's origin.
+    fn adopt(&self, stored: &StoredChannelEntry) -> ChannelStoreResult<Option<String>> {
+        let mut bound = self.origin.lock().unwrap();
+        match (bound.as_ref(), stored.origin.as_ref()) {
+            (Some(bound), Some(stored)) if bound == stored => {}
+            (None, Some(stored)) => *bound = Some(stored.clone()),
+            (None, None) => {}
+            _ => return Err(origin_mismatch()),
+        }
+        Ok(bound.clone())
+    }
+}
+
 #[async_trait::async_trait]
 impl ChannelStore for OriginBoundChannelStore {
     async fn acquire(&self, key: &str) -> ChannelStoreResult<Box<dyn ChannelStoreLease>> {
@@ -198,19 +213,19 @@ impl ChannelStore for OriginBoundChannelStore {
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
         let entry = self.inner.get(key).await?;
         if let Some(entry) = &entry {
-            let mut bound = self.origin.lock().unwrap();
-            match (bound.as_ref(), entry.origin.as_ref()) {
-                (Some(bound), Some(stored)) if bound == stored => {}
-                (None, Some(stored)) => *bound = Some(stored.clone()),
-                (None, None) => {}
-                _ => return Err(origin_mismatch()),
-            }
+            self.adopt(entry)?;
         }
         Ok(entry)
     }
 
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
-        let bound = self.origin.lock().unwrap().clone();
+        let current = self.inner.get(&entry.key()).await?;
+        // Adopt the stored entry's origin as `get` does, so an unbound provider
+        // keeps writing an entry its store stamped with an origin.
+        let bound = match &current {
+            Some(current) => self.adopt(current)?,
+            None => self.origin.lock().unwrap().clone(),
+        };
         let mut entry = entry.clone();
         match (&entry.origin, bound) {
             (Some(origin), Some(bound)) if *origin != bound => return Err(origin_mismatch()),
@@ -218,7 +233,7 @@ impl ChannelStore for OriginBoundChannelStore {
             (_, None) => {}
         }
         // Never take over an entry bound elsewhere or left without an origin.
-        if let Some(current) = self.inner.get(&entry.key()).await? {
+        if let Some(current) = current {
             if current.origin != entry.origin {
                 return Err(origin_mismatch());
             }

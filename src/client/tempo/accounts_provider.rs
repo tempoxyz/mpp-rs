@@ -487,12 +487,10 @@ impl TempoAccountsProvider {
             let mut providers = cached
                 .iter()
                 .filter(|((chain, _), _)| *chain == chain_id)
-                .map(|(_, provider)| provider);
+                .map(|((_, origin), provider)| (origin, provider));
             match (providers.next(), providers.next()) {
-                (Some(provider), None) => {
-                    let mut provider = provider.clone();
-                    provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
-                    return Ok(provider);
+                (Some((origin, provider)), None) => {
+                    return Ok(self.session_for_caller(provider, origin.as_ref()));
                 }
                 (Some(_), Some(_)) => {
                     return Err(MppError::InvalidConfig(
@@ -560,9 +558,8 @@ impl TempoAccountsProvider {
                 .min_by(|(a, a_origin, _), (b, b_origin, _)| {
                     a.cmp(b).then_with(|| a_origin.cmp(b_origin))
                 })
-                .map(|(_, _, provider)| provider.clone());
-            if let Some(mut provider) = holder {
-                provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
+                .map(|(_, origin, provider)| self.session_for_caller(provider, origin.as_ref()));
+            if let Some(provider) = holder {
                 return Ok(provider);
             }
         }
@@ -597,9 +594,7 @@ impl TempoAccountsProvider {
             .expected_chain_id
             .and_then(|chain_id| cached.get(&(chain_id, origin.clone())))
         {
-            let mut provider = provider.clone();
-            provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
-            return Ok(provider);
+            return Ok(self.session_for_caller(provider, origin.as_ref()));
         }
         let settings = &self.session_settings;
         let mut provider = self.session_provider(session.store.clone())?;
@@ -635,11 +630,31 @@ impl TempoAccountsProvider {
             }
         }
         if let Some(chain_id) = self.expected_chain_id {
+            // The cache is shared by clones, which may pin other origins and
+            // realms: it keeps only channel state, and each caller adds its own.
             let mut shared = provider.clone();
             shared.replace_trusted_tempo_proof_realms(&[]);
+            shared.set_origin_configured(false);
             cached.insert((chain_id, origin), shared);
         }
         Ok(provider)
+    }
+
+    /// A clone of the cached session `provider` for `origin`, with this
+    /// caller's realm pins and its own authorization for server snapshot
+    /// recovery: only an origin pinned with [`Self::with_session_origin`] on
+    /// this `TempoAccountsProvider` may recover a channel from a snapshot.
+    fn session_for_caller(
+        &self,
+        provider: &TempoSessionProvider,
+        origin: Option<&String>,
+    ) -> TempoSessionProvider {
+        let mut provider = provider.clone();
+        provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
+        provider.set_origin_configured(
+            origin.is_some_and(|origin| self.session_settings.origins.contains(origin)),
+        );
+        provider
     }
 
     /// Return whether the Accounts store has a locally signable key covering
@@ -1261,6 +1276,57 @@ mod tests {
             .session_for("https://b.example/pay")
             .unwrap()
             .origin_configured());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_recovery_follows_each_clones_own_origin_pins() {
+        let (provider, path, _) = provider();
+        let pinned = reqwest::Url::parse("https://a.example").unwrap();
+        let unpinned = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ));
+        let pinned_clone = || unpinned.clone().with_session_origin(&pinned).unwrap();
+
+        // Clones share the session cache whichever initializes it first, but
+        // only a clone that pinned the origin may recover from a snapshot.
+        for pinned_first in [true, false] {
+            let (first, second) = if pinned_first {
+                let first = pinned_clone().session_for("https://a.example/pay").unwrap();
+                (
+                    first,
+                    unpinned.session_for("https://a.example/pay").unwrap(),
+                )
+            } else {
+                let first = unpinned.session_for("https://a.example/pay").unwrap();
+                (
+                    first,
+                    pinned_clone().session_for("https://a.example/pay").unwrap(),
+                )
+            };
+            let (pinned_session, unpinned_session) = if pinned_first {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            assert!(pinned_session.shares_state_with(&unpinned_session));
+            assert!(pinned_session.origin_configured());
+            assert!(!unpinned_session.origin_configured());
+            assert!(pinned_clone().session().unwrap().origin_configured());
+            assert!(!unpinned.session().unwrap().origin_configured());
+
+            // Start the other order from an empty cache.
+            unpinned
+                .session
+                .as_ref()
+                .unwrap()
+                .provider
+                .lock()
+                .unwrap()
+                .clear();
+        }
         std::fs::remove_file(path).unwrap();
     }
 

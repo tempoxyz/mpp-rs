@@ -927,6 +927,13 @@ impl TempoSessionProvider {
         .await
     }
 
+    /// Set whether a server snapshot may recover a channel this provider has
+    /// not stored, as [`Self::with_origin`] does, for a clone handed to a
+    /// caller whose own configuration pins (or does not pin) the origin.
+    pub(crate) fn set_origin_configured(&mut self, configured: bool) {
+        self.origin_configured = configured;
+    }
+
     /// Whether the caller pinned the origin with [`Self::with_origin`].
     #[cfg(test)]
     pub(crate) fn origin_configured(&self) -> bool {
@@ -8189,6 +8196,67 @@ mod tests {
             if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
         );
         provider.abandon_payment(&challenge, &next);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn unbound_provider_commits_a_native_open_to_an_origin_stamping_store() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-unbound-open-{}", uuid::Uuid::new_v4()));
+        // The SQLite store stamps its namespace origin on every entry it writes.
+        let store = Arc::new(
+            store::SqliteChannelStore::open(store::SqliteChannelStoreOptions {
+                namespace: "https://api.example.com".into(),
+                path: Some(directory.join("channels.db")),
+                request_url: None,
+            })
+            .unwrap(),
+        );
+        let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000)
+            .with_channel_store(store.clone());
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        asserter.push_success(&"0x5208"); // eth_estimateGas
+        for _ in 0..3 {
+            asserter.push_success(&channel_state_response(0));
+        }
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            escrow,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+        assert!(matches!(
+            credential.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Open { .. }
+        ));
+        provider
+            .commit_payment(&challenge, &credential)
+            .await
+            .unwrap();
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+
+        // The provider adopted the stored origin, so it pays no other origin.
+        let entry = provider.channels().into_values().next().unwrap();
+        let key = TempoSessionProvider::store_key(&entry).unwrap().unwrap();
+        let stored = store.get(&key).await.unwrap().unwrap();
+        assert!(stored.pending_open.is_none());
+        assert_eq!(stored.origin.as_deref(), Some("https://api.example.com"));
+        assert!(provider.bind_origin("https://evil.example/data").is_err());
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+        drop(provider);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
