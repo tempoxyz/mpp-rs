@@ -78,6 +78,8 @@ struct SessionSettings {
     prepaid_requests: Option<u32>,
     events: Option<ClientEvents>,
     hint_client: Option<reqwest::Client>,
+    /// HTTP origins pinned with [`TempoAccountsProvider::with_session_origin`].
+    origins: Vec<String>,
 }
 
 impl TempoAccountsProvider {
@@ -440,6 +442,24 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Pin the HTTP origin of `origin` for session payments before the first
+    /// request to it, as [`TempoSessionProvider::with_origin`] does, so that
+    /// service's server snapshot may recover a channel the session store does
+    /// not hold. Pin each service separately; other origins stay unpinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `origin` is not an HTTP(S) URL.
+    pub fn with_session_origin(mut self, origin: &reqwest::Url) -> Result<Self, MppError> {
+        let origin = http_origin(origin.as_str()).ok_or_else(|| {
+            MppError::InvalidConfig("session payments require an HTTP origin".into())
+        })?;
+        if !self.session_settings.origins.contains(&origin) {
+            self.session_settings.origins.push(origin);
+        }
+        Ok(self)
+    }
+
     /// Pay gas for unsponsored session opens and top-ups in `token`.
     pub fn with_session_fee_token(mut self, token: Address) -> Self {
         self.session_settings.fee_token = Some(token);
@@ -605,7 +625,14 @@ impl TempoAccountsProvider {
             provider = provider.with_hint_client(client.clone());
         }
         if let Some(origin) = &origin {
-            provider.bind_origin(origin)?;
+            if settings.origins.contains(origin) {
+                let url = reqwest::Url::parse(origin).map_err(|error| {
+                    MppError::InvalidConfig(format!("invalid session origin: {error}"))
+                })?;
+                provider = provider.with_origin(&url)?;
+            } else {
+                provider.bind_origin(origin)?;
+            }
         }
         if let Some(chain_id) = self.expected_chain_id {
             let mut shared = provider.clone();
@@ -741,13 +768,13 @@ impl PaymentProvider for TempoAccountsProvider {
     fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
         self.trusted_tempo_proof_realms
             .iter()
-            .find(|(origin, _)| origin.origin() == url.origin())
+            .find(|(origin, _)| crate::client::provider::same_pin_origin(origin, url))
             .map(|(_, realm)| realm.as_str())
     }
 
     fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
         self.trusted_tempo_proof_realms
-            .retain(|(existing, _)| existing.origin() != origin.origin());
+            .retain(|(existing, _)| !crate::client::provider::same_pin_origin(existing, &origin));
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
@@ -1202,6 +1229,83 @@ mod tests {
         assert!(first.shares_state_with(&again));
         let unbound = provider.session_for("mcp://tool").unwrap();
         assert!(!unbound.shares_state_with(&first));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_origin_pin_reaches_the_origins_session() {
+        let (provider, path, _) = provider();
+        let pinned = reqwest::Url::parse("https://a.example").unwrap();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(
+                super::super::session::store::MemoryChannelStore::default(),
+            ))
+            .with_session_origin(&pinned)
+            .unwrap();
+        assert!(provider
+            .clone()
+            .with_session_origin(&reqwest::Url::parse("mcp://a.example").unwrap())
+            .is_err());
+
+        // The pinned service's session may recover a channel from a server
+        // snapshot, as with `TempoSessionProvider::with_origin`; others may not.
+        let first = provider.session_for("https://a.example/pay").unwrap();
+        assert!(first.origin_configured());
+        assert!(first.bind_origin("https://b.example/pay").is_err());
+        assert!(provider
+            .session_for("https://a.example/other")
+            .unwrap()
+            .origin_configured());
+        assert!(!provider
+            .session_for("https://b.example/pay")
+            .unwrap()
+            .origin_configured());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn realm_pins_match_non_http_resources() {
+        let (accounts, path, _) = provider();
+        let signer = PrivateKeySigner::random();
+        let resource = reqwest::Url::parse("mcp://target.example/tool").unwrap();
+        let pin = reqwest::Url::parse("mcp://target.example").unwrap();
+        let challenge = PaymentChallenge::new(
+            "session-id",
+            "target.example",
+            "tempo",
+            "session",
+            Base64UrlJson::from_value(&serde_json::json!({ "amount": "100" })).unwrap(),
+        );
+        let headers = reqwest::header::HeaderMap::new();
+        let charge = crate::client::TempoProvider::new(signer.clone(), "https://rpc.example")
+            .unwrap()
+            .with_trusted_tempo_proof_realm(pin.clone(), "target.example");
+        let session =
+            crate::client::tempo::session::TempoSessionProvider::new(signer, "https://rpc.example")
+                .unwrap()
+                .with_trusted_tempo_proof_realm(pin.clone(), "target.example");
+        let accounts = accounts.with_trusted_tempo_proof_realm(pin, "target.example");
+        let realms = [
+            charge.trusted_tempo_proof_realm(&resource),
+            session.trusted_tempo_proof_realm(&resource),
+            accounts.trusted_tempo_proof_realm(&resource),
+        ];
+        for realm in realms {
+            assert_eq!(realm, Some("target.example"));
+            assert!(!crate::client::is_cross_realm_proof_with_trust(
+                &challenge, &resource, &headers, realm,
+            ));
+        }
+        // Another resource host, scheme or port does not reuse the pin.
+        for other in [
+            "mcp://other.example/tool",
+            "mcps://target.example/tool",
+            "mcp://target.example:9000/tool",
+        ] {
+            let other = reqwest::Url::parse(other).unwrap();
+            assert_eq!(session.trusted_tempo_proof_realm(&other), None, "{other}");
+        }
         std::fs::remove_file(path).unwrap();
     }
 

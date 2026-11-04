@@ -773,15 +773,16 @@ pub fn is_cross_realm_proof(
 ///
 /// A zero-amount Tempo proof authenticates the payer at its realm, and a
 /// session payment signs vouchers for it, so both are refused unless the realm
-/// is the request's hostname or `trusted_realm`, as mppx does. A URL without
-/// an HTTP origin, such as an MCP resource, trusts only `trusted_realm`.
+/// is the request's hostname or `trusted_realm`, as mppx does. A WebSocket
+/// URL counts as HTTP; any other URL, such as an MCP resource, trusts only
+/// `trusted_realm`.
 pub fn is_cross_realm_proof_with_trust(
     challenge: &PaymentChallenge,
     url: &reqwest::Url,
     headers: &HeaderMap,
     trusted_realm: Option<&str>,
 ) -> bool {
-    let requested_host = if matches!(url.scheme(), "http" | "https") {
+    let requested_host = if matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
         headers
             .get(HOST)
             .and_then(|value| value.to_str().ok())

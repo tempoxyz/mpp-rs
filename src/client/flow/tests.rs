@@ -71,6 +71,37 @@ fn caller_host_header_binds_proof_realm() {
 }
 
 #[test]
+fn websocket_urls_bind_their_host() {
+    let socket = reqwest::Url::parse("ws://target.example:8546/rpc").unwrap();
+    let secure = reqwest::Url::parse("wss://target.example/rpc").unwrap();
+    for (intent, amount) in [("session", "100"), ("charge", "0")] {
+        let challenge = PaymentChallenge::new(
+            "ws-id",
+            "target.example",
+            "tempo",
+            intent,
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": amount,
+                "currency": "0x3333333333333333333333333333333333333333"
+            }))
+            .unwrap(),
+        );
+        for url in [&socket, &secure] {
+            assert!(
+                !super::is_cross_realm_proof(&challenge, url, &HeaderMap::new()),
+                "{intent} {url}"
+            );
+        }
+        let other = reqwest::Url::parse("wss://relay.example/rpc").unwrap();
+        assert!(super::is_cross_realm_proof(
+            &challenge,
+            &other,
+            &HeaderMap::new()
+        ));
+    }
+}
+
+#[test]
 fn session_challenges_bind_their_realm() {
     let relay = reqwest::Url::parse("https://relay.example/data").unwrap();
     let target = reqwest::Url::parse("https://target.example/data").unwrap();

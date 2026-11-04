@@ -927,6 +927,12 @@ impl TempoSessionProvider {
         .await
     }
 
+    /// Whether the caller pinned the origin with [`Self::with_origin`].
+    #[cfg(test)]
+    pub(crate) fn origin_configured(&self) -> bool {
+        self.origin_configured
+    }
+
     /// Whether `self` and `other` share one session's channel state.
     #[cfg(test)]
     pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
@@ -4140,13 +4146,13 @@ impl PaymentProvider for TempoSessionProvider {
     fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
         self.trusted_tempo_proof_realms
             .iter()
-            .find(|(origin, _)| origin.origin() == url.origin())
+            .find(|(origin, _)| crate::client::provider::same_pin_origin(origin, url))
             .map(|(_, realm)| realm.as_str())
     }
 
     fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
         self.trusted_tempo_proof_realms
-            .retain(|(existing, _)| existing.origin() != origin.origin());
+            .retain(|(existing, _)| !crate::client::provider::same_pin_origin(existing, &origin));
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
