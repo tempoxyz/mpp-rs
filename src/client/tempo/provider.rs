@@ -43,9 +43,7 @@ pub(super) fn prepare_charge_request(
     Ok(charge)
 }
 
-/// Builds the charge for a challenge, funded per autoswap, and returns the token
-/// that funds it (the charge currency, or an autoswap route's input token) and
-/// the fee token that funding implies.
+/// Builds the charge for a challenge, funded like [`fund`].
 async fn prepare_funded_charge(
     challenge: &PaymentChallenge,
     expected_chain_id: Option<u64>,
@@ -53,32 +51,26 @@ async fn prepare_funded_charge(
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
-) -> Result<
-    (
-        TempoCharge,
-        alloy::primitives::Address,
-        Option<alloy::primitives::Address>,
-    ),
-    MppError,
-> {
+) -> Result<FundedCharge, MppError> {
     let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
-    fund(charge, autoswap, provider, from).await
+    fund_routed(charge, autoswap, provider, from).await
 }
 
 /// Picks the fee token for an unsponsored charge: the configured one, else the
 /// one funding implies.
 ///
-/// An autoswap route buys exactly the charge's shortfall in its currency, so
-/// a configured fee token equal to that currency would leave nothing for the
-/// fee. The route's own fee token pays it instead.
+/// An autoswap route (`swapped`) buys exactly the charge's shortfall in its
+/// currency, so a configured fee token equal to that currency would leave
+/// nothing for the fee. The route's own fee token pays it instead. A
+/// machine-token route spends none of the currency and keeps the configured one.
 fn select_fee_token(
     configured: Option<alloy::primitives::Address>,
     implied: Option<alloy::primitives::Address>,
     currency: alloy::primitives::Address,
-    funding: alloy::primitives::Address,
+    swapped: bool,
 ) -> Option<alloy::primitives::Address> {
     match configured {
-        Some(token) if token == currency && funding != currency => implied,
+        Some(token) if token == currency && swapped => implied,
         Some(token) => Some(token),
         None => implied,
     }
@@ -98,7 +90,7 @@ pub(super) async fn apply_funding(
 /// token autoswap implies ([`AutoswapConfig::fee_token_for`]): the swap's input token, or
 /// `None` so the charge currency pays its own gas when no swap was needed. Never OUSD.
 pub(super) async fn fund(
-    mut charge: TempoCharge,
+    charge: TempoCharge,
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
@@ -110,6 +102,28 @@ pub(super) async fn fund(
     ),
     MppError,
 > {
+    let funded = fund_routed(charge, autoswap, provider, from).await?;
+    Ok((funded.charge, funded.funding, funded.fee_token))
+}
+
+/// A charge funded by [`fund_routed`].
+struct FundedCharge {
+    charge: TempoCharge,
+    /// The token the payer spends.
+    funding: alloy::primitives::Address,
+    /// The gas token funding implies.
+    fee_token: Option<alloy::primitives::Address>,
+    /// Whether an autoswap route buys the charge's shortfall in its currency.
+    swapped: bool,
+}
+
+/// Funds a charge like [`fund`], and also reports whether an autoswap route funds it.
+async fn fund_routed(
+    mut charge: TempoCharge,
+    autoswap: Option<&AutoswapConfig>,
+    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+    from: alloy::primitives::Address,
+) -> Result<FundedCharge, MppError> {
     if charge.machine_token_enabled() {
         let transfers = crate::protocol::methods::tempo::transfers::get_transfers(
             charge.amount(),
@@ -131,11 +145,17 @@ pub(super) async fn fund(
                 alloy::primitives::TxKind::Create => charge.currency(),
             };
             // The charge resolves a funded stablecoin for MACH-funded gas.
-            return Ok((charge.with_calls(route.calls.to_vec()), funding, None));
+            return Ok(FundedCharge {
+                charge: charge.with_calls(route.calls.to_vec()),
+                funding,
+                fee_token: None,
+                swapped: false,
+            });
         }
     }
 
-    let mut funding = charge.currency();
+    let currency = charge.currency();
+    let mut funding = currency;
     let mut fee_token = None;
     if let Some(config) = autoswap {
         let route = super::autoswap::resolve_autoswap_route(
@@ -155,7 +175,12 @@ pub(super) async fn fund(
         }
     }
 
-    Ok((charge, funding, fee_token))
+    Ok(FundedCharge {
+        charge,
+        funding,
+        fee_token,
+        swapped: funding != currency,
+    })
 }
 
 /// Tempo payment provider using native primitive signing.
@@ -640,7 +665,7 @@ impl PaymentProvider for TempoProvider {
         }
         let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
         self.ensure_allowed_chain(Some(chain_id))?;
-        let (charge, funding, fee_token) = prepare_funded_charge(
+        let funded = prepare_funded_charge(
             challenge,
             Some(chain_id),
             self.client_id.as_deref(),
@@ -652,10 +677,16 @@ impl PaymentProvider for TempoProvider {
 
         let options = SignOptions {
             signing_mode: Some(self.signing_mode.clone()),
-            fee_token: select_fee_token(self.fee_token, fee_token, charge.currency(), funding),
+            fee_token: select_fee_token(
+                self.fee_token,
+                funded.fee_token,
+                funded.charge.currency(),
+                funded.swapped,
+            ),
             ..Default::default()
         };
-        let signed = charge
+        let signed = funded
+            .charge
             .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
             .await?;
         Ok(signed.into_credential())
@@ -1752,20 +1783,26 @@ mod tests {
         let other = Address::repeat_byte(0x33);
 
         assert_eq!(
-            select_fee_token(Some(currency), Some(token_in), currency, token_in),
+            select_fee_token(Some(currency), Some(token_in), currency, true),
             Some(token_in)
         );
         assert_eq!(
-            select_fee_token(Some(other), Some(token_in), currency, token_in),
+            select_fee_token(Some(other), Some(token_in), currency, true),
             Some(other)
         );
         assert_eq!(
-            select_fee_token(Some(currency), None, currency, currency),
+            select_fee_token(Some(currency), None, currency, false),
             Some(currency)
         );
         assert_eq!(
-            select_fee_token(None, Some(token_in), currency, token_in),
+            select_fee_token(None, Some(token_in), currency, true),
             Some(token_in)
+        );
+        // A machine-token route spends MACH, not the currency, and implies no
+        // fee token: the configured one still pays.
+        assert_eq!(
+            select_fee_token(Some(currency), None, currency, false),
+            Some(currency)
         );
     }
 
