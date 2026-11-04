@@ -226,10 +226,13 @@ where
         let payment =
             PendingPayment::new(self.payment_provider.clone(), challenge.clone(), credential);
 
+        let mut delivery_attempted = false;
         let result = async {
             let mut request = self.url.as_str().into_client_request()?;
             request.headers_mut().extend(self.headers.clone());
             let (mut socket, _) = connect_async_with_config(request, None, false).await?;
+            // Even a failed write may have delivered the signed opening transaction.
+            delivery_attempted = true;
             send_authorization(&mut socket, payment.credential()).await?;
             let _ = self.events_tx.send(MppApplicationEvent::CredentialSent);
 
@@ -257,7 +260,11 @@ where
                 Ok(client)
             }
             Err(error) => {
-                payment.rollback().await?;
+                if delivery_attempted {
+                    drop(payment);
+                } else {
+                    payment.rollback().await?;
+                }
                 Err(error)
             }
         }

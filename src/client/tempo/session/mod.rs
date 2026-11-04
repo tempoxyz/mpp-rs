@@ -674,8 +674,8 @@ impl TempoSessionProvider {
     /// the charged price is checked on its own.
     fn price_within_caps(&self, price: u128) -> bool {
         let price = alloy::primitives::U256::from(price);
-        !self.max_atomic_amount.is_some_and(|max| price > max)
-            && !self.max_amount.is_some_and(|max| price > max)
+        self.max_atomic_amount.is_none_or(|max| price <= max)
+            && self.max_amount.is_none_or(|max| price <= max)
     }
 
     fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {

@@ -233,6 +233,7 @@ where
                         credential,
                     )));
                 }
+                Err(error @ MppError::PaymentOutcomeUnknown { .. }) => return Err(error),
                 Err(error) => {
                     failure.get_or_insert(error);
                     remaining.retain(|candidate| {
@@ -904,6 +905,33 @@ mod tests {
 
         let error = payment.prepare(&[session]).await.err().unwrap();
         assert!(error.to_string().contains("insufficient balance"));
+    }
+
+    #[derive(Clone, Default)]
+    struct AmbiguousProvider(Arc<AtomicUsize>);
+
+    impl PaymentProvider for AmbiguousProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && intent == "charge"
+        }
+        async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(MppError::PaymentOutcomeUnknown {
+                transaction_hash: "0x1234".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_payment_does_not_try_another_offer() {
+        let provider = AmbiguousProvider::default();
+        let payment = McpPayment::new(provider.clone(), context());
+        let first = challenge();
+        let mut second = challenge();
+        second.id = "second-offer".into();
+        let error = payment.prepare(&[first, second]).await.err().unwrap();
+        assert!(matches!(error, MppError::PaymentOutcomeUnknown { .. }));
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

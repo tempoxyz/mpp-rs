@@ -542,6 +542,17 @@ mod sqlite {
                 }
                 entry.origin = Some(origin);
             }
+            let conflict: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT scope_key, origin FROM channels WHERE channel_id = ?1",
+                    [format!("{:#x}", entry.channel_id)],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(io_error)?;
+            if conflict.is_some_and(|(scope, origin)| scope != scope_key || origin != self.origin) {
+                return Err(origin_mismatch());
+            }
             let origin = merge_origin(current.as_ref(), &entry)?;
             let mut merged = match current {
                 Some(current) if current.channel_id == entry.channel_id => StoredChannelEntry {
@@ -571,7 +582,7 @@ mod sqlite {
                     params![scope_key, format!("{:#x}", merged.channel_id)],
                 )
                 .map_err(io_error)?;
-            transaction
+            let changed = transaction
                 .execute(
                     "INSERT INTO channels (
                         channel_id, version, scope_key, origin, request_url, chain_id,
@@ -590,7 +601,8 @@ mod sqlite {
                         session_protocol=excluded.session_protocol,
                         descriptor_json=excluded.descriptor_json, entry_json=excluded.entry_json,
                         deposit=excluded.deposit, cumulative_amount=excluded.cumulative_amount,
-                        state='active', close_requested_at=0, last_used_at=excluded.last_used_at",
+                        state='active', close_requested_at=0, last_used_at=excluded.last_used_at
+                     WHERE channels.scope_key = excluded.scope_key AND channels.origin = excluded.origin",
                     params![
                         format!("{:#x}", merged.channel_id),
                         i64::from(SCHEMA_VERSION),
@@ -612,6 +624,9 @@ mod sqlite {
                     ],
                 )
                 .map_err(io_error)?;
+            if changed != 1 {
+                return Err(origin_mismatch());
+            }
             transaction.commit().map_err(io_error)
         }
 
@@ -884,6 +899,36 @@ mod tests {
         );
         drop(connection);
         drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_rejects_cross_origin_channel_id_conflicts() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("channels.db");
+        let first = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: "https://first.example".into(),
+            path: Some(path.clone()),
+            request_url: None,
+        })
+        .unwrap();
+        let second = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: "https://second.example".into(),
+            path: Some(path),
+            request_url: None,
+        })
+        .unwrap();
+        let original = entry();
+        first.set(&original).await.unwrap();
+        let before = first.get(&original.key()).await.unwrap();
+        let error = second.set(&original).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert_eq!(first.get(&original.key()).await.unwrap(), before);
+        assert!(second.get(&original.key()).await.unwrap().is_none());
+        first.set(&original).await.unwrap();
+        drop(first);
+        drop(second);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
