@@ -278,6 +278,17 @@ fn apply_estimation_signer_hints(
 /// Contains all "what to pay" fields extracted from the challenge. The "how to sign"
 /// details (nonce, gas, signer) are provided later via [`sign`](TempoCharge::sign) or
 /// [`sign_with_options`](TempoCharge::sign_with_options).
+/// A reqwest client whose `Debug` output leaves out its default headers,
+/// which can hold an API key such as `tempo-api-key`.
+#[derive(Clone)]
+struct RedactedClient(reqwest::Client);
+
+impl std::fmt::Debug for RedactedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reqwest::Client { .. }")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TempoCharge {
     challenge: PaymentChallenge,
@@ -292,7 +303,7 @@ pub struct TempoCharge {
     calls: Option<Vec<Call>>,
     push: bool,
     /// HTTP client for RPC requests; see [`Self::with_http_client`].
-    http_client: Option<reqwest::Client>,
+    http_client: Option<RedactedClient>,
 }
 
 impl TempoCharge {
@@ -390,7 +401,10 @@ impl TempoCharge {
                     .mpp_config("invalid RPC URL")?
             }
         };
-        Ok(super::rpc_provider(rpc_url, self.http_client.as_ref()))
+        Ok(super::rpc_provider(
+            rpc_url,
+            self.http_client.as_ref().map(|c| &c.0),
+        ))
     }
 
     /// Send the RPC requests of [`sign`](Self::sign),
@@ -402,7 +416,7 @@ impl TempoCharge {
     /// API key in the `tempo-api-key` header for `https://api.tempo.xyz/rpc`
     /// (or `https://api.tempo.xyz/rpc/testnet`).
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = Some(client);
+        self.http_client = Some(RedactedClient(client));
         self
     }
 
@@ -1305,6 +1319,16 @@ impl SignedTempoCharge {
 mod tests {
     use super::*;
     use crate::protocol::core::Base64UrlJson;
+
+    #[test]
+    fn debug_output_omits_http_client_headers() {
+        let charge = TempoCharge::from_challenge(&test_challenge())
+            .unwrap()
+            .with_http_client(crate::client::tempo::test_rpc::api_key_client());
+        let debug = format!("{charge:?}");
+        assert!(!debug.contains("test-key"), "{debug}");
+        assert!(debug.contains("reqwest::Client { .. }"), "{debug}");
+    }
 
     #[tokio::test]
     async fn with_http_client_sends_rpc_requests_through_it() {
