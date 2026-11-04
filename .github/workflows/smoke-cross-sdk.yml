@@ -81,6 +81,7 @@ jobs:
         run: |
           response=$(npm exec --yes \
             --package mppx@0.8.14 \
+            --package @cfworker/json-schema@4.1.1 \
             --package yaml@2.9.0 \
             --package zod@4.6.1 \
             --package viem@2.56.3 \
