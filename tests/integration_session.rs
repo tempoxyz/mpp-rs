@@ -257,6 +257,8 @@ async fn start_server(
         })
         .rpc_url(rpc)
         .chain_id(chain_id)
+        // Clients refuse session Challenges whose realm is not the request host.
+        .realm("127.0.0.1")
         .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp")
