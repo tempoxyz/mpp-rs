@@ -305,6 +305,20 @@ impl TempoAccountsProvider {
         else {
             return Ok(());
         };
+        // Only a realm this origin owns may name or prime a channel for it.
+        let foreign_realm = |challenge: &PaymentChallenge| {
+            reqwest::Url::parse(url).map_or(true, |requested| {
+                crate::client::is_cross_realm_proof_with_trust(
+                    challenge,
+                    &requested,
+                    &reqwest::header::HeaderMap::new(),
+                    self.trusted_tempo_proof_realm(&requested),
+                )
+            })
+        };
+        if foreign_realm(challenge) {
+            return Ok(());
+        }
         let session = self.session_provider_for(challenge, Some(url))?;
         // The channel hint below names a stored channel: only to its origin.
         session.bind_origin(url)?;
@@ -319,7 +333,9 @@ impl TempoAccountsProvider {
             .probe(client, url, body, Some(&channel_id), Some(&session))
             .await?;
         for challenge in &described {
-            if self.check_expected_chain(challenge).is_ok() && session.prime_prepaid(url, challenge)
+            if self.check_expected_chain(challenge).is_ok()
+                && !foreign_realm(challenge)
+                && session.prime_prepaid(url, challenge)
             {
                 break;
             }

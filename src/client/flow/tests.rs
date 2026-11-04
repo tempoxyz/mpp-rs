@@ -70,6 +70,107 @@ fn caller_host_header_binds_proof_realm() {
     ));
 }
 
+#[test]
+fn session_challenges_bind_their_realm() {
+    let relay = reqwest::Url::parse("https://relay.example/data").unwrap();
+    let target = reqwest::Url::parse("https://target.example/data").unwrap();
+    // A transport without an HTTP origin, such as an MCP resource.
+    let opaque = reqwest::Url::parse("mcp://target.example/tool").unwrap();
+    for amount in ["0", "100"] {
+        let challenge = PaymentChallenge::new(
+            "session-id",
+            "target.example",
+            "tempo",
+            "session",
+            Base64UrlJson::from_value(&serde_json::json!({ "amount": amount })).unwrap(),
+        );
+        assert!(super::is_cross_realm_proof(
+            &challenge,
+            &relay,
+            &HeaderMap::new()
+        ));
+        assert!(!super::is_cross_realm_proof(
+            &challenge,
+            &target,
+            &HeaderMap::new()
+        ));
+        assert!(!super::is_cross_realm_proof_with_trust(
+            &challenge,
+            &relay,
+            &HeaderMap::new(),
+            Some("target.example")
+        ));
+        assert!(super::is_cross_realm_proof(
+            &challenge,
+            &opaque,
+            &HeaderMap::new()
+        ));
+        assert!(!super::is_cross_realm_proof_with_trust(
+            &challenge,
+            &opaque,
+            &HeaderMap::new(),
+            Some("target.example")
+        ));
+    }
+    let subscription = PaymentChallenge::new(
+        "subscription-id",
+        "target.example",
+        "tempo",
+        "subscription",
+        Base64UrlJson::from_value(&serde_json::json!({ "amount": "0" })).unwrap(),
+    );
+    assert!(!super::is_cross_realm_proof(
+        &subscription,
+        &relay,
+        &HeaderMap::new()
+    ));
+}
+
+#[tokio::test]
+async fn foreign_session_realm_is_refused_before_signing() {
+    for via in BOTH {
+        let requests = Arc::new(AtomicU32::new(0));
+        let app = Router::new().route(
+            "/paid",
+            get({
+                let requests = requests.clone();
+                move || async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let request =
+                        Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+                    let challenge = PaymentChallenge::new(
+                        "foreign",
+                        "target.example",
+                        "tempo",
+                        "session",
+                        request,
+                    );
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        [(
+                            WWW_AUTHENTICATE,
+                            format_www_authenticate(&challenge).unwrap(),
+                        )],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let url = spawn_server(app).await;
+        let provider = TestProvider::default();
+
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let err = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HttpError::CrossRealmProof), "{via:?}: {err}");
+        assert!(provider.paid().is_empty(), "{via:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "{via:?}");
+    }
+}
+
 impl Via {
     async fn send(
         self,
@@ -211,7 +312,7 @@ impl PaymentProvider for TestProvider {
         }
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
         let challenge =
-            PaymentChallenge::new("prepaid-1", "flow.example.com", "tempo", "session", request);
+            PaymentChallenge::new("prepaid-1", "127.0.0.1", "tempo", "session", request);
         let credential = PaymentCredential::new(
             challenge.to_echo(),
             serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
@@ -226,7 +327,7 @@ impl PaymentProvider for TestProvider {
 
 fn www_authenticate(id: &str, method: &str, intent: &str) -> String {
     let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-    let challenge = PaymentChallenge::new(id, "flow.example.com", method, intent, request);
+    let challenge = PaymentChallenge::new(id, "127.0.0.1", method, intent, request);
     format_www_authenticate(&challenge).unwrap()
 }
 

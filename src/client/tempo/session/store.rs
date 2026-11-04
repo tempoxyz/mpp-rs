@@ -36,8 +36,9 @@ pub struct StoredChannelEntry {
     /// Challenge whose opening payment has not yet received a verified receipt.
     pub pending_open: Option<String>,
     /// HTTP origin the channel pays, bound by the session provider that
-    /// persisted it. Absent on legacy entries, which stay usable and take an
-    /// origin on their next reuse.
+    /// persisted it. Absent on legacy entries and on channels paid over a
+    /// transport without an HTTP origin; a provider bound to an HTTP origin
+    /// neither reuses nor takes over such an entry.
     pub origin: Option<String>,
 }
 
@@ -178,9 +179,11 @@ impl ChannelStore for MemoryChannelStore {
 }
 
 /// A session provider's view of its channel store, bound to the provider's
-/// HTTP origin: entries it writes carry that origin, and an entry bound to
-/// another origin is refused. An unbound provider adopts the origin of the
-/// first bound entry it reads, so it cannot later pay another origin with it.
+/// HTTP origin: entries it writes carry that origin, and an entry whose origin
+/// is not exactly the provider's, including a legacy entry without one, is
+/// refused rather than reused or rebound, as mppx does. An unbound provider
+/// adopts the origin of the first bound entry it reads, so it cannot later pay
+/// another origin with it.
 pub(crate) struct OriginBoundChannelStore {
     pub(crate) inner: Arc<dyn ChannelStore>,
     pub(crate) origin: Arc<Mutex<Option<String>>>,
@@ -194,12 +197,13 @@ impl ChannelStore for OriginBoundChannelStore {
 
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
         let entry = self.inner.get(key).await?;
-        if let Some(stored) = entry.as_ref().and_then(|entry| entry.origin.as_ref()) {
+        if let Some(entry) = &entry {
             let mut bound = self.origin.lock().unwrap();
-            match bound.as_ref() {
-                Some(bound) if bound != stored => return Err(origin_mismatch()),
-                Some(_) => {}
-                None => *bound = Some(stored.clone()),
+            match (bound.as_ref(), entry.origin.as_ref()) {
+                (Some(bound), Some(stored)) if bound == stored => {}
+                (None, Some(stored)) => *bound = Some(stored.clone()),
+                (None, None) => {}
+                _ => return Err(origin_mismatch()),
             }
         }
         Ok(entry)
@@ -212,6 +216,12 @@ impl ChannelStore for OriginBoundChannelStore {
             (Some(origin), Some(bound)) if *origin != bound => return Err(origin_mismatch()),
             (_, Some(bound)) => entry.origin = Some(bound),
             (_, None) => {}
+        }
+        // Never take over an entry bound elsewhere or left without an origin.
+        if let Some(current) = self.inner.get(&entry.key()).await? {
+            if current.origin != entry.origin {
+                return Err(origin_mismatch());
+            }
         }
         self.inner.set(&entry).await
     }

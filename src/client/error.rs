@@ -28,7 +28,8 @@ pub enum HttpError {
     /// returned a payment challenge, so the paid retry cannot be resent safely.
     RedirectedRequest(String),
 
-    /// A zero-amount Tempo proof was requested for a different HTTP realm.
+    /// A zero-amount Tempo proof or a Tempo session payment was requested
+    /// for a different HTTP realm.
     CrossRealmProof,
 
     /// The caller-owned HTTP client may forward a custom credential header across redirects.

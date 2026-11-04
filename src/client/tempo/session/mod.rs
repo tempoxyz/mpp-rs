@@ -184,6 +184,9 @@ pub struct TempoSessionProvider {
     /// another origin, and stored channels bound to one, are refused, as
     /// mppx's `SessionManager` does. Shared by clones.
     origin: Arc<Mutex<Option<String>>>,
+    /// Whether the caller pinned `origin` with [`with_origin`](Self::with_origin), which
+    /// authorizes recovering an unknown channel from a server snapshot.
+    origin_configured: bool,
     /// Client for requests carrying a `Payment-Session` channel hint; a
     /// no-redirect default client when unset.
     hint_client: Option<reqwest::Client>,
@@ -383,6 +386,7 @@ impl TempoSessionProvider {
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
             uncertain_top_ups: Arc::new(Mutex::new(HashSet::new())),
             origin,
+            origin_configured: false,
             hint_client: None,
         })
     }
@@ -752,6 +756,24 @@ impl TempoSessionProvider {
             origin: self.origin.clone(),
         });
         self
+    }
+
+    /// Pin this provider to the HTTP origin of `origin` before its first
+    /// request, as mppx's session `origin` parameter does.
+    ///
+    /// Requests to any other origin are refused, and a challenge's server
+    /// snapshot may then recover a channel this provider has not stored.
+    /// Without the pin, a snapshot only recovers a channel already in the
+    /// channel store, so a server cannot make the provider adopt a channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `origin` is not an HTTP(S) URL, or the provider
+    /// is already bound to another origin.
+    pub fn with_origin(mut self, origin: &reqwest::Url) -> Result<Self, MppError> {
+        self.bind_origin(origin.as_str())?;
+        self.origin_configured = true;
+        Ok(self)
     }
 
     /// Binds this provider to `url`'s HTTP origin on first use and refuses
@@ -1572,6 +1594,17 @@ impl TempoSessionProvider {
         } else {
             None
         };
+        // A server snapshot alone may not introduce a channel for an HTTP
+        // origin the caller did not pin, as in mppx.
+        if snapshot.is_some()
+            && stored.is_none()
+            && !self.origin_configured
+            && self.origin.lock().unwrap().is_some()
+        {
+            return Err(MppError::InvalidConfig(
+                "session snapshot recovery requires an explicitly configured origin".into(),
+            ));
+        }
         if let Some(snapshot) = snapshot {
             if let Some((merchant, target)) = settlement {
                 validate_settlement_route(snapshot, scope.payee, merchant, target)?;
@@ -5028,7 +5061,10 @@ mod tests {
             let currency = Address::repeat_byte(0x22);
             let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
             let entry = provider.channels().into_values().next().unwrap();
-            let stored = TempoSessionProvider::stored_entry(&entry).unwrap();
+            let stored = StoredChannelEntry {
+                origin: Some("https://example.test".into()),
+                ..TempoSessionProvider::stored_entry(&entry).unwrap()
+            };
             store.set(&stored).await.unwrap();
             let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
             let url = reqwest::Url::parse("https://example.test/paid").unwrap();
@@ -5240,6 +5276,106 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("origin mismatch"));
         assert_eq!(inner.get(&stored.key()).await.unwrap(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn originless_stored_channel_is_neither_reused_nor_rebound() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let seeded = make_test_provider();
+        seed_precompile_channel(&seeded, payee, currency, 1_000, 10_000);
+        let entry = seeded.channels().into_values().next().unwrap();
+        seeded.channels.lock().unwrap().clear();
+        let stored = TempoSessionProvider::stored_entry(&entry).unwrap();
+        assert!(stored.origin.is_none());
+        let inner = Arc::new(MemoryChannelStore::default());
+        inner.set(&stored).await.unwrap();
+        let provider = seeded.with_channel_store(inner.clone());
+        provider
+            .bind_origin("https://api.example.com/data")
+            .unwrap();
+
+        // A legacy entry is refused before anything is signed for it.
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"), "{error}");
+        let error = provider.restore(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"), "{error}");
+        assert!(provider.restored_channel_id(&challenge).is_none());
+        // Nor does the provider take it over by writing its origin onto it.
+        let error = provider.channel_store.set(&stored).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
+        assert_eq!(inner.get(&stored.key()).await.unwrap(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn snapshot_recovery_requires_a_configured_origin() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let url = reqwest::Url::parse("https://api.example.com/data").unwrap();
+        for configured in [false, true] {
+            let signer = PrivateKeySigner::random();
+            let seeded =
+                TempoSessionProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
+            let channel_id = seed_precompile_channel(&seeded, payee, currency, 1_000, 10_000);
+            let entry = seeded.channels().into_values().next().unwrap();
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            let signature =
+                crate::protocol::methods::tempo::precompile_voucher::sign_precompile_voucher(
+                    &signer, channel_id, 400, 42431,
+                )
+                .await
+                .unwrap();
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["methodDetails"]["sessionSnapshot"] = serde_json::json!({
+                "acceptedCumulative": "400", "chainId": 42431, "channelId": channel_id.to_string(),
+                "deposit": "10000", "descriptor": entry.descriptor,
+                "escrow": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+                "highestVoucher": {
+                    "channelId": channel_id.to_string(), "cumulativeAmount": "400",
+                    "signature": alloy::hex::encode_prefixed(&signature)
+                },
+                "requiredCumulative": "400", "settled": "0", "spent": "300"
+            });
+            challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+
+            let store = Arc::new(MemoryChannelStore::default());
+            let provider = TempoSessionProvider::new(signer, "https://rpc.example.com")
+                .unwrap()
+                .with_channel_store(store.clone());
+            let key = TempoSessionProvider::store_key(&entry).unwrap().unwrap();
+            if !configured {
+                // A request binds the origin, which alone does not trust a snapshot.
+                provider.bind_origin(url.as_str()).unwrap();
+                let error = provider.pay(&challenge).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires an explicitly configured origin"),
+                    "{error}"
+                );
+                assert!(store.get(&key).await.unwrap().is_none());
+                assert!(provider.channels().is_empty());
+                continue;
+            }
+            let mut provider = provider.with_origin(&url).unwrap();
+            assert!(provider.bind_origin("https://evil.example/data").is_err());
+            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+            let credential = provider.pay(&challenge).await.unwrap();
+            assert!(matches!(
+                credential.payload_as::<SessionCredentialPayload>().unwrap(),
+                SessionCredentialPayload::Voucher { .. }
+            ));
+            assert_eq!(
+                store.get(&key).await.unwrap().unwrap().origin.as_deref(),
+                Some("https://api.example.com")
+            );
+        }
     }
 
     #[tokio::test]
@@ -6237,6 +6373,8 @@ mod tests {
         let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000);
         let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
         let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+        // The provider holds the channel from a payment to this origin.
+        provider.bind_origin(&url).unwrap();
 
         let credential = provider
             .voucher_credential_with_top_up_for_challenge(
@@ -6849,6 +6987,7 @@ mod tests {
                 .clone();
             let mut stored = TempoSessionProvider::stored_entry(&entry).unwrap();
             stored.deposit = stored_deposit;
+            provider.bind_origin("http://127.0.0.1:1/").unwrap();
             provider.channel_store.set(&stored).await.unwrap();
             mock_rpc(&mut provider, &[&channel_state_response(chain_deposit)]);
             let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
@@ -8723,8 +8862,13 @@ mod tests {
                 chain_id: 42431,
                 opened: true,
             };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
             store
-                .set(&TempoSessionProvider::stored_entry(&entry).unwrap())
+                .set(&StoredChannelEntry {
+                    origin: Some(format!("http://{address}")),
+                    ..TempoSessionProvider::stored_entry(&entry).unwrap()
+                })
                 .await
                 .unwrap();
             provider.channels.lock().unwrap().insert(key.clone(), entry);
@@ -8734,6 +8878,8 @@ mod tests {
                 .unwrap()
                 .insert(channel_id.to_string(), key.clone());
 
+            let mut challenge = challenge.clone();
+            challenge.realm = "127.0.0.1".into();
             let challenges = Arc::new(AtomicUsize::new(0));
             let app = Router::new().route(
                 "/paid",
@@ -8758,8 +8904,6 @@ mod tests {
                     }
                 }),
             );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
             tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
             let result = reqwest::Client::new()
