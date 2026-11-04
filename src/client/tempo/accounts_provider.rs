@@ -38,6 +38,8 @@ use crate::{
 pub struct TempoAccountsProvider {
     wallet: TempoAccountsWallet,
     rpc_url: Option<reqwest::Url>,
+    /// HTTP client for every RPC request; see [`Self::with_http_client`].
+    http_client: Option<reqwest::Client>,
     client_id: Option<String>,
     autoswap: Option<AutoswapConfig>,
     preferred_currency: Option<Address>,
@@ -87,6 +89,7 @@ impl TempoAccountsProvider {
         Self {
             wallet,
             rpc_url: None,
+            http_client: None,
             client_id: None,
             autoswap: None,
             preferred_currency: None,
@@ -117,6 +120,23 @@ impl TempoAccountsProvider {
     /// Override the settlement RPC for custom networks.
     pub fn with_rpc_url(mut self, rpc_url: reqwest::Url) -> Self {
         self.rpc_url = Some(rpc_url);
+        self
+    }
+
+    /// Send every settlement and session RPC request through `client`, as
+    /// mppx's `getClient`.
+    ///
+    /// Use it to set default headers the RPC needs, such as a Tempo Console
+    /// API key in the `tempo-api-key` header for `https://api.tempo.xyz/rpc`
+    /// (or `https://api.tempo.xyz/rpc/testnet`), or a proxy or TLS settings.
+    /// RPC calls are still retried on Tempo rate limits.
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        // RPC clients built without it must not be reused.
+        self.rpc_providers = Arc::new(Mutex::new(HashMap::new()));
+        if let Some(session) = &mut self.session {
+            session.provider = Arc::new(Mutex::new(HashMap::new()));
+        }
         self
     }
 
@@ -212,7 +232,11 @@ impl TempoAccountsProvider {
         let access_key = key.address();
         let key_authorization = key.key_authorization().cloned().map(Box::new);
         let rpc_url = self.settlement_rpc_url(chain_id)?;
-        let mut provider = TempoSessionProvider::new(key, rpc_url.as_str())?
+        let mut provider = TempoSessionProvider::new(key, rpc_url.as_str())?;
+        if let Some(client) = &self.http_client {
+            provider = provider.with_http_client(client.clone());
+        }
+        let mut provider = provider
             .with_signing_mode(TempoSigningMode::Keychain {
                 wallet: account,
                 key_authorization,
@@ -626,7 +650,7 @@ impl TempoAccountsProvider {
         })?;
         Ok(providers
             .entry(url)
-            .or_insert_with_key(|url| super::rpc_provider(url.clone()))
+            .or_insert_with_key(|url| super::rpc_provider(url.clone(), self.http_client.as_ref()))
             .clone())
     }
 
@@ -1773,6 +1797,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_http_client_sends_settlement_rpc_requests_through_it() {
+        use alloy::providers::Provider;
+
+        let (url, seen, server) = crate::client::tempo::test_rpc::spawn().await;
+        let wallet = TempoAccountsWallet::from_secp256k1(
+            Address::repeat_byte(0x11),
+            PrivateKeySigner::random(),
+            None,
+        );
+        let provider = TempoAccountsProvider::new(wallet)
+            .with_rpc_url(url)
+            .with_http_client(crate::client::tempo::test_rpc::api_key_client());
+
+        let rpc = provider.settlement_provider(4217).unwrap();
+        assert_eq!(rpc.get_chain_id().await.unwrap(), 4217);
+        crate::client::tempo::test_rpc::assert_api_key(&seen);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn rejected_payment_releases_its_one_time_authorization() {
         let root = PrivateKeySigner::random();
         let account = root.address();
@@ -1821,7 +1865,8 @@ mod tests {
         let key = provider.wallet().active_access_key().unwrap().address();
         let charge =
             super::super::charge::TempoCharge::from_challenge(&challenge("100", false)).unwrap();
-        let rpc_provider = super::super::rpc_provider("https://rpc.example.com".parse().unwrap());
+        let rpc_provider =
+            super::super::rpc_provider("https://rpc.example.com".parse().unwrap(), None);
         let signed = charge
             .sign_with_accounts_provider_options(
                 provider.wallet(),

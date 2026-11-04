@@ -169,6 +169,8 @@ pub struct TempoProvider {
     signer: TempoPrimitiveSigner,
     rpc_url: reqwest::Url,
     rpc_provider: alloy::providers::RootProvider<tempo_alloy::TempoNetwork>,
+    /// HTTP client for every RPC request; see [`Self::with_http_client`].
+    http_client: Option<reqwest::Client>,
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
     autoswap: Option<AutoswapConfig>,
@@ -215,11 +217,12 @@ impl TempoProvider {
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
         let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
-        let rpc_provider = super::rpc_provider(url.clone());
+        let rpc_provider = super::rpc_provider(url.clone(), None);
         Ok(Self {
             signer: signer.into(),
             rpc_url: url,
             rpc_provider,
+            http_client: None,
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
             autoswap: None,
@@ -233,6 +236,30 @@ impl TempoProvider {
             allowed_chain_ids: None,
             chain_providers: Arc::default(),
         })
+    }
+
+    /// Send every RPC request through `client`, as mppx's `getClient`.
+    ///
+    /// Use it to set default headers the RPC needs, such as a Tempo Console
+    /// API key in the `tempo-api-key` header for `https://api.tempo.xyz/rpc`
+    /// (or `https://api.tempo.xyz/rpc/testnet`), or a proxy or TLS settings.
+    /// It applies to the configured RPC and to the default RPCs a
+    /// [`from_signer`](Self::from_signer) provider picks per chain. RPC calls
+    /// are still retried on Tempo rate limits.
+    ///
+    /// ```ignore
+    /// let mut headers = reqwest::header::HeaderMap::new();
+    /// headers.insert("tempo-api-key", api_key.parse()?);
+    /// let client = reqwest::Client::builder().default_headers(headers).build()?;
+    /// let provider = TempoProvider::new(signer, "https://api.tempo.xyz/rpc")?
+    ///     .with_http_client(client);
+    /// ```
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.rpc_provider = super::rpc_provider(self.rpc_url.clone(), Some(&client));
+        self.http_client = Some(client);
+        // Per-chain RPC clients built without it must not be reused.
+        self.chain_providers = Arc::default();
+        self
     }
 
     /// Only pay on these chain IDs, as mppx's `allowedChainIds`.
@@ -307,7 +334,7 @@ impl TempoProvider {
             .default_rpc_url()
             .parse()
             .mpp_config("invalid RPC URL")?;
-        let provider = super::rpc_provider(url);
+        let provider = super::rpc_provider(url, self.http_client.as_ref());
         providers.insert(chain_id, provider.clone());
         Ok((chain_id, provider))
     }
@@ -630,6 +657,21 @@ impl PaymentProvider for TempoProvider {
 mod tests {
     use super::*;
     use alloy::providers::Provider;
+
+    #[tokio::test]
+    async fn with_http_client_sends_rpc_requests_through_it() {
+        let (url, seen, server) = crate::client::tempo::test_rpc::spawn().await;
+        let provider = TempoProvider::new(
+            alloy::signers::local::PrivateKeySigner::random(),
+            url.as_str(),
+        )
+        .unwrap()
+        .with_http_client(crate::client::tempo::test_rpc::api_key_client());
+
+        assert_eq!(provider.rpc_chain_id().await.unwrap(), 4217);
+        crate::client::tempo::test_rpc::assert_api_key(&seen);
+        server.abort();
+    }
     use alloy::signers::Signer;
     use axum::{extract::State, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
