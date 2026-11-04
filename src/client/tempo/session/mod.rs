@@ -343,7 +343,7 @@ impl TempoSessionProvider {
         rpc_url: impl AsRef<str>,
     ) -> Result<Self, MppError> {
         let url: reqwest::Url = rpc_url.as_ref().parse().mpp_config("invalid RPC URL")?;
-        let rpc_provider = super::rpc_provider(url.clone());
+        let rpc_provider = super::rpc_provider(url.clone(), None);
         let origin = Arc::new(Mutex::new(None));
         Ok(Self {
             signer: signer.into(),
@@ -866,6 +866,20 @@ impl TempoSessionProvider {
     /// timeout. Without it, a default client that follows no redirect is used.
     pub fn with_hint_client(mut self, client: reqwest::Client) -> Self {
         self.hint_client = Some(client);
+        self
+    }
+
+    /// Send every RPC request (channel reads, opens, top-ups and gas
+    /// estimates) through `client`, as mppx's `getClient`.
+    ///
+    /// Use it to set default headers the RPC needs, such as a Tempo Console
+    /// API key in the `tempo-api-key` header for `https://api.tempo.xyz/rpc`
+    /// (or `https://api.tempo.xyz/rpc/testnet`), or a proxy or TLS settings.
+    /// RPC calls are still retried on Tempo rate limits. It does not change
+    /// the client for paid HTTP requests or channel hints
+    /// ([`with_hint_client`](Self::with_hint_client)).
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.rpc_provider = super::rpc_provider(self.rpc_url.clone(), Some(&client));
         self
     }
 
@@ -4417,6 +4431,20 @@ fn management_headers(mut headers: reqwest::header::HeaderMap) -> reqwest::heade
 mod tests {
     use super::*;
     use alloy::signers::local::PrivateKeySigner;
+
+    #[tokio::test]
+    async fn with_http_client_sends_rpc_requests_through_it() {
+        use alloy::providers::Provider;
+
+        let (url, seen, server) = crate::client::tempo::test_rpc::spawn().await;
+        let provider = TempoSessionProvider::new(PrivateKeySigner::random(), url.as_str())
+            .unwrap()
+            .with_http_client(crate::client::tempo::test_rpc::api_key_client());
+
+        assert_eq!(provider.rpc_provider.get_chain_id().await.unwrap(), 4217);
+        crate::client::tempo::test_rpc::assert_api_key(&seen);
+        server.abort();
+    }
 
     #[test]
     fn test_session_provider_new() {

@@ -272,6 +272,17 @@ fn apply_estimation_signer_hints(
     }
 }
 
+/// A reqwest client whose `Debug` output leaves out its default headers,
+/// which can hold an API key such as `tempo-api-key`.
+#[derive(Clone)]
+struct RedactedClient(reqwest::Client);
+
+impl std::fmt::Debug for RedactedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reqwest::Client { .. }")
+    }
+}
+
 /// A parsed, validated Tempo charge ready to be signed.
 ///
 /// Created from a [`PaymentChallenge`] via [`TempoCharge::from_challenge`].
@@ -291,6 +302,8 @@ pub struct TempoCharge {
     splits: Option<Vec<Split>>,
     calls: Option<Vec<Call>>,
     push: bool,
+    /// HTTP client for RPC requests; see [`Self::with_http_client`].
+    http_client: Option<RedactedClient>,
 }
 
 impl TempoCharge {
@@ -357,6 +370,7 @@ impl TempoCharge {
             splits,
             calls: None,
             push,
+            http_client: None,
         })
     }
 
@@ -387,7 +401,23 @@ impl TempoCharge {
                     .mpp_config("invalid RPC URL")?
             }
         };
-        Ok(super::rpc_provider(rpc_url))
+        Ok(super::rpc_provider(
+            rpc_url,
+            self.http_client.as_ref().map(|c| &c.0),
+        ))
+    }
+
+    /// Send the RPC requests of [`sign`](Self::sign),
+    /// [`sign_with_options`](Self::sign_with_options) and
+    /// [`sign_with_primitive_options`](Self::sign_with_primitive_options)
+    /// through `client`, as mppx's `getClient`.
+    ///
+    /// Use it to set default headers the RPC needs, such as a Tempo Console
+    /// API key in the `tempo-api-key` header for `https://api.tempo.xyz/rpc`
+    /// (or `https://api.tempo.xyz/rpc/testnet`).
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(RedactedClient(client));
+        self
     }
 
     /// Get the chain ID extracted from the challenge.
@@ -1298,6 +1328,33 @@ impl SignedTempoCharge {
 mod tests {
     use super::*;
     use crate::protocol::core::Base64UrlJson;
+
+    #[test]
+    fn debug_output_omits_http_client_headers() {
+        let charge = TempoCharge::from_challenge(&test_challenge())
+            .unwrap()
+            .with_http_client(crate::client::tempo::test_rpc::api_key_client());
+        let debug = format!("{charge:?}");
+        assert!(!debug.contains("test-key"), "{debug}");
+        assert!(debug.contains("reqwest::Client { .. }"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn with_http_client_sends_rpc_requests_through_it() {
+        let (url, seen, server) = crate::client::tempo::test_rpc::spawn().await;
+        let charge = TempoCharge::from_challenge(&test_challenge())
+            .unwrap()
+            .with_http_client(crate::client::tempo::test_rpc::api_key_client());
+        let options = SignOptions {
+            rpc_url: Some(url.to_string()),
+            ..Default::default()
+        };
+
+        let rpc = charge.rpc_for(&options).unwrap();
+        assert_eq!(rpc.get_chain_id().await.unwrap(), 4217);
+        crate::client::tempo::test_rpc::assert_api_key(&seen);
+        server.abort();
+    }
 
     fn test_challenge() -> PaymentChallenge {
         let request_json = serde_json::json!({
