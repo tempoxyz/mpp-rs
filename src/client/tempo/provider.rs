@@ -50,9 +50,10 @@ pub(super) async fn prepare_charge(
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
-) -> Result<TempoCharge, MppError> {
+) -> Result<(TempoCharge, Option<alloy::primitives::Address>), MppError> {
     let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
-    apply_funding(charge, autoswap, provider, from).await
+    let (charge, _, fee_token) = fund(charge, autoswap, provider, from).await?;
+    Ok((charge, fee_token))
 }
 
 pub(super) async fn apply_funding(
@@ -64,14 +65,23 @@ pub(super) async fn apply_funding(
     Ok(fund(charge, autoswap, provider, from).await?.0)
 }
 
-/// Funds a charge like [`apply_funding`] and returns the token the payer spends: MACH through
-/// the machine-token swapper, the autoswap input token, or the charge currency.
+/// Funds a charge like [`apply_funding`] and returns the token the payer spends (MACH through
+/// the machine-token swapper, the autoswap input token, or the charge currency) and the gas
+/// token autoswap implies ([`AutoswapConfig::fee_token_for`]): the swap's input token, or
+/// `None` so the charge currency pays its own gas when no swap was needed. Never OUSD.
 pub(super) async fn fund(
     mut charge: TempoCharge,
     autoswap: Option<&AutoswapConfig>,
     provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
     from: alloy::primitives::Address,
-) -> Result<(TempoCharge, alloy::primitives::Address), MppError> {
+) -> Result<
+    (
+        TempoCharge,
+        alloy::primitives::Address,
+        Option<alloy::primitives::Address>,
+    ),
+    MppError,
+> {
     if charge.machine_token_enabled() {
         let transfers = crate::protocol::methods::tempo::transfers::get_transfers(
             charge.amount(),
@@ -92,29 +102,32 @@ pub(super) async fn fund(
                 alloy::primitives::TxKind::Call(token) => token,
                 alloy::primitives::TxKind::Create => charge.currency(),
             };
-            return Ok((charge.with_calls(route.calls.to_vec()), funding));
+            // The charge resolves a funded stablecoin for MACH-funded gas.
+            return Ok((charge.with_calls(route.calls.to_vec()), funding, None));
         }
     }
 
     let mut funding = charge.currency();
+    let mut fee_token = None;
     if let Some(config) = autoswap {
-        if let Some(calls) = super::autoswap::resolve_autoswap_calls(
+        let route = super::autoswap::resolve_autoswap_route(
             provider,
             from,
             charge.currency(),
             charge.amount(),
             config,
         )
-        .await?
-        {
-            funding = config.token_in;
-            for call in calls.into_iter().rev() {
+        .await?;
+        fee_token = config.fee_token_for(route.as_ref(), charge.currency());
+        if let Some(route) = route {
+            funding = route.token_in;
+            for call in route.calls.into_iter().rev() {
                 charge = charge.with_prepended_call(call)?;
             }
         }
     }
 
-    Ok((charge, funding))
+    Ok((charge, funding, fee_token))
 }
 
 /// Tempo payment provider using native primitive signing.
@@ -324,18 +337,26 @@ impl TempoProvider {
     }
 
     /// Enable autoswap: if the client doesn't hold enough of the challenge
-    /// currency, automatically swap from `config.token_in` via the Tempo
-    /// Stablecoin DEX before paying.
+    /// currency, automatically swap via the Tempo Stablecoin DEX before
+    /// paying, from `config.token_in` or, unless `config.fallback` is off,
+    /// the first of pathUSD, USDC.e and OUSD the client holds, as mppx does.
     ///
     /// The swap and payment execute atomically in a single AA transaction.
+    /// Gas is paid in the swap's input token, or `config.token_in` when that
+    /// is OUSD, which cannot pay fees.
     ///
     /// # Example
     ///
     /// ```ignore
     /// use mpp::client::tempo::autoswap::AutoswapConfig;
     ///
+    /// // pathUSD, USDC.e, then OUSD with 1% slippage (mppx's `autoSwap: true`).
     /// let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?
-    ///     .with_autoswap(AutoswapConfig::new(usdc_address, 100)); // 1% slippage
+    ///     .with_autoswap(AutoswapConfig::default());
+    ///
+    /// // Only USDC.e, with 1% slippage.
+    /// let provider = provider
+    ///     .with_autoswap(AutoswapConfig::new(usdc_address, 100).with_fallback(false));
     /// ```
     pub fn with_autoswap(mut self, config: AutoswapConfig) -> Self {
         self.autoswap = Some(config);
@@ -347,8 +368,9 @@ impl TempoProvider {
         self.autoswap.as_ref()
     }
 
+    #[cfg(test)]
     fn fee_token(&self) -> Option<alloy::primitives::Address> {
-        self.autoswap.as_ref().map(|config| config.token_in)
+        self.autoswap.as_ref().and_then(AutoswapConfig::fee_token)
     }
 
     /// Pin the chain ID this provider will pay on. When set, [`pay`] rejects any
@@ -575,7 +597,7 @@ impl PaymentProvider for TempoProvider {
         }
         let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
         self.ensure_allowed_chain(Some(chain_id))?;
-        let charge = prepare_charge(
+        let (charge, fee_token) = prepare_charge(
             challenge,
             Some(chain_id),
             self.client_id.as_deref(),
@@ -587,7 +609,7 @@ impl PaymentProvider for TempoProvider {
 
         let options = SignOptions {
             signing_mode: Some(self.signing_mode.clone()),
-            fee_token: self.fee_token(),
+            fee_token,
             ..Default::default()
         };
         let signed = charge
@@ -723,6 +745,14 @@ mod tests {
             .with_autoswap(AutoswapConfig::new(token_in, 100));
 
         assert_eq!(provider.fee_token(), Some(token_in));
+
+        // OUSD cannot pay fees, so it is never the gas token.
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let ousd = crate::protocol::methods::tempo::OUSD.parse().unwrap();
+        let provider = TempoProvider::new(signer, "https://rpc.example.com")
+            .unwrap()
+            .with_autoswap(AutoswapConfig::new(ousd, 100));
+        assert_eq!(provider.fee_token(), None);
     }
 
     #[test]
@@ -1218,6 +1248,46 @@ mod tests {
             ))
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A payer holding enough USDC.e for a USDC.e charge needs no swap, so the
+    /// default autoswap config must not name unheld pathUSD as the gas token.
+    #[tokio::test]
+    async fn funded_charge_without_swap_pays_gas_in_its_currency() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+        use alloy::sol_types::SolCall;
+        use tempo_alloy::contracts::precompiles::ITIP20;
+
+        let usdc = crate::protocol::methods::tempo::USDC;
+        let request = crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1000000",
+            "currency": usdc,
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 4217 }
+        }))
+        .unwrap();
+        let challenge =
+            PaymentChallenge::new("test-id", "api.example.com", "tempo", "charge", request);
+        let charge = prepare_charge_request(&challenge, None, None).unwrap();
+
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            ITIP20::balanceOfCall::abi_encode_returns(&alloy::primitives::U256::from(5_000_000u64)),
+        ));
+        let provider = ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+
+        let config = AutoswapConfig::default();
+        let (_, funding, fee_token) = fund(
+            charge,
+            Some(&config),
+            &provider,
+            alloy::primitives::Address::repeat_byte(0x11),
+        )
+        .await
+        .unwrap();
+        assert_eq!(funding, usdc.parse::<alloy::primitives::Address>().unwrap());
+        assert_eq!(fee_token, None);
     }
 
     #[test]

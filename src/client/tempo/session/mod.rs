@@ -38,7 +38,7 @@ use self::store::{
     ChannelStore, ChannelStoreLease, MemoryChannelStore, OriginBoundChannelStore,
     StoredChannelEntry,
 };
-use super::autoswap::AutoswapConfig;
+use super::autoswap::{AutoswapConfig, AutoswapRoute};
 use super::signing::TempoPrimitiveSigner;
 use crate::client::{
     ClientEvent, ClientEvents, DepositContext, ManagementTransport, PaymentContext,
@@ -579,6 +579,9 @@ impl TempoSessionProvider {
     }
 
     /// Enable atomic stablecoin swaps before native session opens and top-ups.
+    ///
+    /// The swap comes from `config.token_in` or, unless `config.fallback` is
+    /// off, the first of pathUSD, USDC.e and OUSD the payer holds, as mppx does.
     pub fn with_autoswap(mut self, config: AutoswapConfig) -> Self {
         self.autoswap = Some(config);
         self
@@ -591,8 +594,8 @@ impl TempoSessionProvider {
 
     /// Pay gas for unsponsored channel opens and top-ups in `token`.
     ///
-    /// Without it, gas is paid in the autoswap input token, or else in the
-    /// session currency. A recipient-restricted currency such as MACH cannot
+    /// Without it, gas is paid in the autoswap `token_in` (unless it is
+    /// OUSD, which cannot pay fees), or else in the session currency. A recipient-restricted currency such as MACH cannot
     /// pay its own gas, so a MACH session without fee sponsorship needs a
     /// separate fee token.
     pub fn with_fee_token(mut self, token: Address) -> Self {
@@ -1015,24 +1018,35 @@ impl TempoSessionProvider {
         payer: Address,
         currency: Address,
         amount: u128,
-    ) -> Result<Vec<Call>, MppError> {
+    ) -> Result<(Vec<Call>, Option<AutoswapRoute>), MppError> {
         let Some(config) = &self.autoswap else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
-        Ok(super::autoswap::resolve_autoswap_calls(
+        let route = super::autoswap::resolve_autoswap_route(
             provider,
             payer,
             currency,
             U256::from(amount),
             config,
         )
-        .await?
-        .unwrap_or_default())
+        .await?;
+        let calls = route
+            .as_ref()
+            .map(|route| route.calls.clone())
+            .unwrap_or_default();
+        Ok((calls, route))
     }
 
-    fn fee_token(&self, currency: Address) -> Address {
+    /// The gas token without an advertised one: the configured fee token, else
+    /// the token autoswap chose for `route` ([`AutoswapConfig::fee_token_for`]),
+    /// else the session currency.
+    fn fee_token(&self, currency: Address, route: Option<&AutoswapRoute>) -> Address {
         self.fee_token
-            .or_else(|| self.autoswap.as_ref().map(|config| config.token_in))
+            .or_else(|| {
+                self.autoswap
+                    .as_ref()
+                    .and_then(|config| config.fee_token_for(route, currency))
+            })
             .unwrap_or(currency)
     }
 
@@ -1046,6 +1060,7 @@ impl TempoSessionProvider {
         &self,
         session_req: &SessionRequest,
         currency: Address,
+        route: Option<&AutoswapRoute>,
     ) -> Result<Address, MppError> {
         let advertised = session_req
             .tempo_session_details()
@@ -1059,7 +1074,7 @@ impl TempoSessionProvider {
             advertised => self
                 .fee_token
                 .or(advertised)
-                .unwrap_or_else(|| self.fee_token(currency)),
+                .unwrap_or_else(|| self.fee_token(currency, route)),
         })
     }
 
@@ -2269,7 +2284,7 @@ impl TempoSessionProvider {
             .token
             .parse()
             .mpp_config("invalid TIP-1034 descriptor token")?;
-        let prefix_calls = self
+        let (prefix_calls, route) = self
             .autoswap_calls(&self.rpc_provider, payer, currency, additional_deposit)
             .await?;
         let payload = create_precompile_top_up_transaction_payload(
@@ -2280,7 +2295,7 @@ impl TempoSessionProvider {
             TopUpPrecompilePayloadOptions {
                 prefix_calls,
                 descriptor,
-                fee_token: self.session_fee_token(&session_req, currency)?,
+                fee_token: self.session_fee_token(&session_req, currency, route.as_ref())?,
                 additional_deposit,
                 chain_id: entry.chain_id,
                 fee_payer: session_req.fee_payer(),
@@ -3816,7 +3831,7 @@ impl TempoSessionProvider {
         }
 
         let (mut entry, mut payload) = if precompile {
-            let prefix_calls = self
+            let (prefix_calls, route) = self
                 .autoswap_calls(&self.rpc_provider, payer, currency, deposit)
                 .await?;
             create_precompile_open_payload(
@@ -3830,7 +3845,7 @@ impl TempoSessionProvider {
                     authorized_signer: Some(authorized_signer),
                     payee,
                     currency,
-                    fee_token: self.session_fee_token(&session_req, currency)?,
+                    fee_token: self.session_fee_token(&session_req, currency, route.as_ref())?,
                     deposit,
                     initial_amount: amount,
                     chain_id,
@@ -4347,12 +4362,29 @@ mod tests {
         assert_eq!(provider.max_deposit, Some(1_000_000));
         assert_eq!(provider.default_deposit, Some(500_000));
         assert_eq!(provider.autoswap().unwrap().token_in, swap_token);
-        assert_eq!(provider.fee_token(Address::repeat_byte(0x44)), swap_token);
+        let currency = Address::repeat_byte(0x44);
+        // Without a swap the session currency pays gas: token_in is only a
+        // candidate the payer may not hold.
+        assert_eq!(provider.fee_token(currency, None), currency);
+        // After a swap that fell back to another token, that token pays gas.
+        let usdc: Address = crate::protocol::methods::tempo::USDC.parse().unwrap();
+        let route = AutoswapRoute {
+            token_in: usdc,
+            calls: Vec::new(),
+        };
+        assert_eq!(provider.fee_token(currency, Some(&route)), usdc);
+        // An OUSD swap never pays gas in OUSD.
+        let ousd: Address = crate::protocol::methods::tempo::OUSD.parse().unwrap();
+        let ousd_route = AutoswapRoute {
+            token_in: ousd,
+            calls: Vec::new(),
+        };
+        assert_eq!(provider.fee_token(currency, Some(&ousd_route)), swap_token);
         let fee_token = Address::repeat_byte(0x55);
         assert_eq!(
             provider
                 .with_fee_token(fee_token)
-                .fee_token(Address::repeat_byte(0x44)),
+                .fee_token(currency, Some(&route)),
             fee_token
         );
     }
