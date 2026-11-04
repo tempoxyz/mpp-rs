@@ -1321,6 +1321,15 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
     escrow_contract: Address,
     channel_id: B256,
 ) -> Result<OnChainChannel, MppError> {
+    get_on_chain_channel_at(provider, escrow_contract, channel_id, None).await
+}
+
+pub(crate) async fn get_on_chain_channel_at<P: Provider<TempoNetwork>>(
+    provider: &P,
+    escrow_contract: Address,
+    channel_id: B256,
+    block: Option<alloy::eips::BlockId>,
+) -> Result<OnChainChannel, MppError> {
     use alloy::sol;
 
     sol! {
@@ -1351,10 +1360,13 @@ pub async fn get_on_chain_channel<P: Provider<TempoNetwork>>(
                 call_data,
             )));
 
-    let result = provider
-        .call(tx_req)
-        .await
-        .mpp_http("failed to read channel")?;
+    let call = provider.call(tx_req);
+    let call = if let Some(block) = block {
+        call.block(block)
+    } else {
+        call
+    };
+    let result = call.await.mpp_http("failed to read channel")?;
 
     let decoded =
         <(bool, u64, Address, Address, Address, Address, u128, u128)>::abi_decode(&result)

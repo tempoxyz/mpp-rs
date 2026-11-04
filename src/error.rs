@@ -191,6 +191,20 @@ pub enum MppError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// A signed payment may have been accepted. Reconcile its hash before paying again.
+    #[error("push payment outcome unknown (tx {transaction_hash}); reconcile before retrying")]
+    PaymentOutcomeUnknown {
+        /// Locally computed hash of the transaction whose broadcast was ambiguous.
+        transaction_hash: String,
+    },
+
+    /// A session operation may have been applied; reconcile it before paying again.
+    #[error("session payment outcome unknown: {context}; reconcile before retrying")]
+    SessionPaymentOutcomeUnknown {
+        /// Operation whose delivery or response was uncertain.
+        context: String,
+    },
+
     // ==================== HTTP Errors ====================
     /// HTTP request/response error
     #[error("HTTP error: {0}")]
