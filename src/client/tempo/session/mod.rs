@@ -1164,65 +1164,71 @@ impl TempoSessionProvider {
         entry: &ChannelEntry,
         valid_before: u64,
     ) -> Result<bool, MppError> {
-        use alloy::consensus::BlockHeader;
-        let block = self
-            .rpc_provider
-            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
-            .await
-            .mpp_http("failed to reconcile opening expiry")?
-            .ok_or_else(|| MppError::Http("opening expiry block unavailable".into()))?;
-        if block.header.timestamp() <= valid_before {
-            return Ok(false);
-        }
-        let block_id = Some(alloy::eips::BlockId::number(block.header.number()));
-        let funded = if is_precompile_escrow(entry.escrow_contract) {
-            let state = recovery::read_on_chain_channel_state_at(
-                &self.rpc_provider,
-                entry.channel_id,
-                block_id,
-            )
-            .await?;
-            state.deposit != 0 || state.settled != 0 || state.close_requested_at != 0
-        } else {
-            let state = channel_ops::get_on_chain_channel_at(
-                &self.rpc_provider,
-                entry.escrow_contract,
-                entry.channel_id,
-                block_id,
-            )
-            .await?;
-            state.deposit != 0
-                || state.settled != 0
-                || state.finalized
-                || state.close_requested_at != 0
-        };
-        if funded {
-            if let Some(pending) = self
-                .pending_opens
+        async {
+            use alloy::consensus::BlockHeader;
+            let block = self
+                .rpc_provider
+                .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+                .await
+                .mpp_http("failed to reconcile opening expiry")?
+                .ok_or_else(|| MppError::Http("opening expiry block unavailable".into()))?;
+            if block.header.timestamp() <= valid_before {
+                return Ok(false);
+            }
+            let block_id = Some(alloy::eips::BlockId::number(block.header.number()));
+            let funded = if is_precompile_escrow(entry.escrow_contract) {
+                let state = recovery::read_on_chain_channel_state_at(
+                    &self.rpc_provider,
+                    entry.channel_id,
+                    block_id,
+                )
+                .await?;
+                state.deposit != 0 || state.settled != 0 || state.close_requested_at != 0
+            } else {
+                let state = channel_ops::get_on_chain_channel_at(
+                    &self.rpc_provider,
+                    entry.escrow_contract,
+                    entry.channel_id,
+                    block_id,
+                )
+                .await?;
+                state.deposit != 0
+                    || state.settled != 0
+                    || state.finalized
+                    || state.close_requested_at != 0
+            };
+            if funded {
+                if let Some(pending) = self
+                    .pending_opens
+                    .lock()
+                    .unwrap()
+                    .get_mut(&entry.channel_id.to_string())
+                {
+                    pending.payload = None;
+                }
+                return Ok(false);
+            }
+            if let Some(store_key) = Self::store_key(entry)? {
+                self.channel_store
+                    .delete(&store_key)
+                    .await
+                    .map_err(Self::store_error)?;
+            }
+            self.pending_opens
                 .lock()
                 .unwrap()
-                .get_mut(&entry.channel_id.to_string())
-            {
-                pending.payload = None;
-            }
-            return Ok(false);
+                .remove(&entry.channel_id.to_string());
+            self.channel_id_to_key
+                .lock()
+                .unwrap()
+                .remove(&entry.channel_id.to_string());
+            self.channels.lock().unwrap().remove(key);
+            Ok(true)
         }
-        if let Some(store_key) = Self::store_key(entry)? {
-            self.channel_store
-                .delete(&store_key)
-                .await
-                .map_err(Self::store_error)?;
-        }
-        self.pending_opens
-            .lock()
-            .unwrap()
-            .remove(&entry.channel_id.to_string());
-        self.channel_id_to_key
-            .lock()
-            .unwrap()
-            .remove(&entry.channel_id.to_string());
-        self.channels.lock().unwrap().remove(key);
-        Ok(true)
+        .await
+        .map_err(|_: MppError| MppError::SessionPaymentOutcomeUnknown {
+            context: "pending opening expiry could not be reconciled".into(),
+        })
     }
 
     async fn persist_channel(&self, entry: &ChannelEntry) -> Result<(), MppError> {
@@ -3767,8 +3773,11 @@ impl TempoSessionProvider {
                 // server accepted the open, even without a receipt. A channel
                 // restored above has already been checked against chain state.
                 if pending && precompile && !includes_request {
-                    let state =
-                        read_on_chain_channel_state(&self.rpc_provider, entry.channel_id).await?;
+                    let state = read_on_chain_channel_state(&self.rpc_provider, entry.channel_id)
+                        .await
+                        .map_err(|_| MppError::SessionPaymentOutcomeUnknown {
+                            context: "pending opening funding could not be reconciled".into(),
+                        })?;
                     if state.deposit != 0 || state.settled != 0 || state.close_requested_at != 0 {
                         if let Some(open) = self
                             .pending_opens
@@ -3801,7 +3810,13 @@ impl TempoSessionProvider {
                                 entry.escrow_contract,
                                 entry.channel_id,
                             )
-                            .await?;
+                            .await
+                            .map_err(|_| {
+                                MppError::SessionPaymentOutcomeUnknown {
+                                    context: "pending opening funding could not be reconciled"
+                                        .into(),
+                                }
+                            })?;
                             state.deposit != 0
                                 || state.settled != 0
                                 || state.finalized
@@ -7854,6 +7869,21 @@ mod tests {
                 let credential = provider.pay(&challenge).await.unwrap();
                 provider.abandon_payment(&challenge, &credential);
                 let (key, entry) = provider.channels().into_iter().next().unwrap();
+
+                let unavailable = Asserter::new();
+                unavailable.push_success(&serde_json::Value::Null);
+                provider.rpc_provider = ProviderBuilder::<_, _, TempoNetwork>::default()
+                    .connect_mocked_client(unavailable);
+                assert!(matches!(
+                    provider.reconcile_expired_open(&key, &entry, 1).await,
+                    Err(MppError::SessionPaymentOutcomeUnknown { .. })
+                ));
+                assert!(provider
+                    .pending_opens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&entry.channel_id.to_string()));
+                assert_eq!(provider.channels().len(), 1);
 
                 let header = tempo_alloy::rpc::TempoHeaderResponse {
                     inner: alloy::rpc::types::Header {
