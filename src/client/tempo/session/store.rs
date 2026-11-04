@@ -542,7 +542,7 @@ mod sqlite {
                 }
                 entry.origin = Some(origin);
             }
-            let conflict: Option<(String, String)> = transaction
+            let conflict: Option<(Option<String>, String)> = transaction
                 .query_row(
                     "SELECT scope_key, origin FROM channels WHERE channel_id = ?1",
                     [format!("{:#x}", entry.channel_id)],
@@ -550,7 +550,9 @@ mod sqlite {
                 )
                 .optional()
                 .map_err(io_error)?;
-            if conflict.is_some_and(|(scope, origin)| scope != scope_key || origin != self.origin) {
+            if conflict.is_some_and(|(scope, origin)| {
+                scope.is_some_and(|scope| scope != scope_key) || origin != self.origin
+            }) {
                 return Err(origin_mismatch());
             }
             let origin = merge_origin(current.as_ref(), &entry)?;
@@ -602,7 +604,7 @@ mod sqlite {
                         descriptor_json=excluded.descriptor_json, entry_json=excluded.entry_json,
                         deposit=excluded.deposit, cumulative_amount=excluded.cumulative_amount,
                         state='active', close_requested_at=0, last_used_at=excluded.last_used_at
-                     WHERE channels.scope_key = excluded.scope_key AND channels.origin = excluded.origin",
+                     WHERE (channels.scope_key IS NULL OR channels.scope_key = excluded.scope_key) AND channels.origin = excluded.origin",
                     params![
                         format!("{:#x}", merged.channel_id),
                         i64::from(SCHEMA_VERSION),
@@ -1121,7 +1123,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM channels", [], |row| row.get(0))
             .unwrap();
         assert_eq!(total, 2);
+        let unscoped: String = connection
+            .query_row(
+                "SELECT channel_id FROM channels WHERE scope_key IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         drop(connection);
+        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: "https://api.example.com".into(),
+            path: Some(path.clone()),
+            request_url: None,
+        })
+        .unwrap();
+        let mut recovered = current;
+        recovered.channel_id = unscoped.parse().unwrap();
+        store.set(&recovered).await.unwrap();
+        assert_eq!(
+            store
+                .get(&recovered.key())
+                .await
+                .unwrap()
+                .unwrap()
+                .channel_id,
+            recovered.channel_id
+        );
+        drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

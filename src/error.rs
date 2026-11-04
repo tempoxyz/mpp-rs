@@ -198,6 +198,13 @@ pub enum MppError {
         transaction_hash: String,
     },
 
+    /// A session operation may have been applied; reconcile it before paying again.
+    #[error("session payment outcome unknown: {context}; reconcile before retrying")]
+    SessionPaymentOutcomeUnknown {
+        /// Operation whose delivery or response was uncertain.
+        context: String,
+    },
+
     // ==================== HTTP Errors ====================
     /// HTTP request/response error
     #[error("HTTP error: {0}")]

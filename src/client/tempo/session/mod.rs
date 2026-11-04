@@ -205,9 +205,9 @@ async fn with_management_timeout<T>(
     tokio::time::timeout(timeout, request)
         .await
         .unwrap_or_else(|_| {
-            Err(MppError::Http(format!(
-                "{context}: session management request timed out; payment outcome unknown"
-            )))
+            Err(MppError::SessionPaymentOutcomeUnknown {
+                context: format!("{context}: session management request timed out"),
+            })
         })
 }
 
@@ -292,6 +292,8 @@ struct PrepaidVoucher {
 
 #[derive(Clone, Debug)]
 struct PendingOpen {
+    /// Replay the original signed transaction after uncertain delivery.
+    payload: Option<SessionCredentialPayload>,
     challenge_id: String,
     /// Row persisted for the channel, if it is kept in the channel store.
     store_key: Option<String>,
@@ -1554,6 +1556,7 @@ impl TempoSessionProvider {
             self.pending_opens.lock().unwrap().insert(
                 recovered.channel_id.to_string(),
                 PendingOpen {
+                    payload: None,
                     challenge_id: challenge_id.clone(),
                     store_key: Some(store_key.to_owned()),
                 },
@@ -2412,20 +2415,23 @@ impl TempoSessionProvider {
                 .lock()
                 .unwrap()
                 .insert(prepared.channel_id);
-            return Err(MppError::Http(
-                "top-up request failed: session management request timed out; payment outcome unknown"
-                    .into(),
-            ));
+            return Err(MppError::SessionPaymentOutcomeUnknown {
+                context: "top-up request failed: session management request timed out".into(),
+            });
         };
         // A transport failure after the credential may have been delivered
         // leaves the outcome unknown, as on HTTP; a definite rejection does not.
-        let receipt = receipt.inspect_err(|error| {
+        let receipt = receipt.map_err(|error| {
             if matches!(error, MppError::Http(_)) {
                 self.uncertain_top_ups
                     .lock()
                     .unwrap()
                     .insert(prepared.channel_id);
+                return MppError::SessionPaymentOutcomeUnknown {
+                    context: "top-up management call failed".into(),
+                };
             }
+            error
         })?;
         self.record_top_up(url, &prepared, None).await?;
         Ok(receipt)
@@ -3014,7 +3020,7 @@ impl TempoSessionProvider {
             Err(_) => format!("{context}: session management request timed out"),
         };
         self.uncertain_top_ups.lock().unwrap().insert(channel_id);
-        Err(MppError::Http(format!("{error}; payment outcome unknown")))
+        Err(MppError::SessionPaymentOutcomeUnknown { context: error })
     }
 
     /// Reads a management error response's body within the management
@@ -3668,6 +3674,17 @@ impl TempoSessionProvider {
                         pending = false;
                     }
                 }
+                if pending {
+                    let payload = self
+                        .pending_opens
+                        .lock()
+                        .unwrap()
+                        .get(&entry.channel_id.to_string())
+                        .and_then(|pending| pending.payload.clone());
+                    if let Some(payload) = payload {
+                        return Ok(build_credential(challenge, payload, chain_id, payer));
+                    }
+                }
                 // Retry the authorized opening amount until a receipt reconciles it.
                 if !includes_request && !pending {
                     entry.cumulative_amount =
@@ -3891,6 +3908,7 @@ impl TempoSessionProvider {
 
         // Everything that can fail runs before the channel is tracked.
         let pending = PendingOpen {
+            payload: Some(payload.clone()),
             challenge_id: challenge.id.clone(),
             store_key: Self::store_key(&entry)?,
         };
@@ -5721,6 +5739,7 @@ mod tests {
         provider.pending_opens.lock().unwrap().insert(
             channel_id.to_string(),
             PendingOpen {
+                payload: None,
                 challenge_id: challenge.id.clone(),
                 store_key: Some(store_key.clone()),
             },
@@ -5771,6 +5790,7 @@ mod tests {
         provider.pending_opens.lock().unwrap().insert(
             channel_id.to_string(),
             PendingOpen {
+                payload: None,
                 challenge_id: challenge.id.clone(),
                 store_key: Some(store_key.clone()),
             },
@@ -5809,6 +5829,7 @@ mod tests {
         provider.pending_opens.lock().unwrap().insert(
             channel_id.to_string(),
             PendingOpen {
+                payload: None,
                 challenge_id: "open".into(),
                 store_key: None,
             },
@@ -5841,6 +5862,7 @@ mod tests {
         provider.pending_opens.lock().unwrap().insert(
             channel.clone(),
             PendingOpen {
+                payload: None,
                 challenge_id: "open".into(),
                 store_key: None,
             },
@@ -6157,7 +6179,10 @@ mod tests {
         .await
         .expect("top-up must fail within its deadline")
         .unwrap_err();
-        assert!(error.to_string().contains("payment outcome unknown"));
+        assert!(matches!(
+            error,
+            MppError::SessionPaymentOutcomeUnknown { .. }
+        ));
         assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
 
         // The server may still apply the stalled top-up, so the released
@@ -7279,6 +7304,7 @@ mod tests {
         provider.pending_opens.lock().unwrap().insert(
             channel_id.to_string(),
             PendingOpen {
+                payload: None,
                 challenge_id: challenge.id.clone(),
                 store_key: store_key.clone(),
             },
@@ -7627,11 +7653,55 @@ mod tests {
         provider.abandon_payment(&challenge, &credential);
         for _ in 0..2 {
             let retry = provider.pay(&challenge).await.unwrap();
-            assert!(
-                matches!(retry.payload_as::<SessionCredentialPayload>().unwrap(),
-                SessionCredentialPayload::Voucher { cumulative_amount, .. }
-                if cumulative_amount == channel.cumulative_amount.to_string())
-            );
+            assert_eq!(retry.payload, credential.payload);
+            provider.abandon_payment(&challenge, &retry);
+        }
+        let retry = provider.pay(&challenge).await.unwrap();
+        provider.commit_payment(&challenge, &retry).await.unwrap();
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        let next = provider.pay(&challenge).await.unwrap();
+        assert!(
+            matches!(next.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Voucher { cumulative_amount, .. }
+            if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
+        );
+        provider.abandon_payment(&challenge, &next);
+    }
+
+    #[tokio::test]
+    async fn abandoned_native_open_replays_the_signed_transaction() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        asserter.push_success(&"0x5208"); // eth_estimateGas
+        for _ in 0..3 {
+            asserter.push_success(&channel_state_response(0));
+        }
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(payee, currency, escrow);
+
+        let credential = provider.pay(&challenge).await.unwrap();
+
+        assert!(matches!(
+            credential.payload_as::<SessionCredentialPayload>().unwrap(),
+            SessionCredentialPayload::Open { .. }
+        ));
+        assert_eq!(provider.channels().len(), 1);
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        let channel = provider.channels().values().next().unwrap().clone();
+        provider.abandon_payment(&challenge, &credential);
+        for _ in 0..2 {
+            let retry = provider.pay(&challenge).await.unwrap();
+            assert_eq!(retry.payload, credential.payload);
             provider.abandon_payment(&challenge, &retry);
         }
         let retry = provider.pay(&challenge).await.unwrap();
