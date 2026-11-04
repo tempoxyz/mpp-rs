@@ -172,6 +172,7 @@ pub struct TempoProvider {
     client_id: Option<String>,
     signing_mode: TempoSigningMode,
     autoswap: Option<AutoswapConfig>,
+    fee_token: Option<alloy::primitives::Address>,
     expected_chain_id: Option<u64>,
     rpc_chain_id: Arc<OnceCell<u64>>,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
@@ -223,6 +224,7 @@ impl TempoProvider {
             client_id: None,
             signing_mode: TempoSigningMode::Direct,
             autoswap: None,
+            fee_token: None,
             expected_chain_id: None,
             rpc_chain_id: Arc::new(OnceCell::new()),
             trusted_tempo_proof_realms: Vec::new(),
@@ -366,6 +368,19 @@ impl TempoProvider {
     /// Get the autoswap configuration, if set.
     pub fn autoswap(&self) -> Option<&AutoswapConfig> {
         self.autoswap.as_ref()
+    }
+
+    /// Pay the transaction fee of charges the server does not sponsor in
+    /// `token`, as mppx's `feeToken` on the Tempo charge client.
+    ///
+    /// Set it for an access key whose spending limits do not cover the default
+    /// fee token, such as a key limited to OUSD paying a USDC.e charge. It
+    /// takes precedence over the fee token autoswap or a machine-token route
+    /// would choose. Fee-sponsored charges ignore it: the fee payer chooses
+    /// their fee token.
+    pub fn with_fee_token(mut self, token: alloy::primitives::Address) -> Self {
+        self.fee_token = Some(token);
+        self
     }
 
     #[cfg(test)]
@@ -609,7 +624,7 @@ impl PaymentProvider for TempoProvider {
 
         let options = SignOptions {
             signing_mode: Some(self.signing_mode.clone()),
-            fee_token,
+            fee_token: self.fee_token.or(fee_token),
             ..Default::default()
         };
         let signed = charge
@@ -1642,6 +1657,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(credential.payload["type"], "transaction");
+    }
+
+    /// As mppx's `feeToken`, a configured fee token pays an unsponsored
+    /// charge's fee, and a sponsored charge leaves it to the fee payer.
+    #[tokio::test]
+    async fn test_fee_token_pays_unsponsored_charges() {
+        use alloy::eips::Decodable2718;
+        use tempo_alloy::primitives::transaction::AASigned;
+
+        let fee_token = alloy::primitives::Address::repeat_byte(0x33);
+        let (rpc_url, _) = push_rpc("0x1").await;
+        let provider =
+            TempoProvider::new(alloy::signers::local::PrivateKeySigner::random(), &rpc_url)
+                .unwrap()
+                .with_expected_chain_id(42431)
+                .with_fee_token(fee_token);
+
+        let signed_fee_token = |credential: PaymentCredential| {
+            let payload = credential.charge_payload().unwrap();
+            let tx = alloy::hex::decode(payload.signed_tx().unwrap()).unwrap();
+            AASigned::decode_2718(&mut tx.as_slice())
+                .unwrap()
+                .tx()
+                .fee_token
+        };
+
+        let unsponsored = PaymentChallenge::new(
+            "fee-token",
+            "api.example.com",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": "0x20c0000000000000000000000000000000000000",
+                "recipient": "0x742d35Cc6634c0532925a3b844bC9e7595F8fE00",
+                "methodDetails": { "chainId": 42431, "supportedModes": ["pull"] },
+            }))
+            .unwrap(),
+        );
+        let credential = provider.pay(&unsponsored).await.unwrap();
+        assert_eq!(signed_fee_token(credential), Some(fee_token));
+
+        let credential = provider
+            .pay(&modes_challenge(serde_json::json!(["pull"])))
+            .await
+            .unwrap();
+        let payload = credential.charge_payload().unwrap();
+        let tx = alloy::hex::decode(payload.signed_tx().unwrap()).unwrap();
+        let envelope =
+            crate::protocol::methods::tempo::fee_payer_envelope::FeePayerEnvelope78::decode_envelope(
+                &tx,
+            )
+            .unwrap();
+        assert_eq!(envelope.fee_token, None);
     }
 
     #[tokio::test]
