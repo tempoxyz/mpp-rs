@@ -272,12 +272,6 @@ fn apply_estimation_signer_hints(
     }
 }
 
-/// A parsed, validated Tempo charge ready to be signed.
-///
-/// Created from a [`PaymentChallenge`] via [`TempoCharge::from_challenge`].
-/// Contains all "what to pay" fields extracted from the challenge. The "how to sign"
-/// details (nonce, gas, signer) are provided later via [`sign`](TempoCharge::sign) or
-/// [`sign_with_options`](TempoCharge::sign_with_options).
 /// A reqwest client whose `Debug` output leaves out its default headers,
 /// which can hold an API key such as `tempo-api-key`.
 #[derive(Clone)]
@@ -289,6 +283,12 @@ impl std::fmt::Debug for RedactedClient {
     }
 }
 
+/// A parsed, validated Tempo charge ready to be signed.
+///
+/// Created from a [`PaymentChallenge`] via [`TempoCharge::from_challenge`].
+/// Contains all "what to pay" fields extracted from the challenge. The "how to sign"
+/// details (nonce, gas, signer) are provided later via [`sign`](TempoCharge::sign) or
+/// [`sign_with_options`](TempoCharge::sign_with_options).
 #[derive(Debug, Clone)]
 pub struct TempoCharge {
     challenge: PaymentChallenge,
