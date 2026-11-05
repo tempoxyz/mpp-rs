@@ -60,7 +60,7 @@ impl fmt::Display for HttpError {
                 f,
                 "Cannot automatically pay a redirected {method} request"
             ),
-            Self::CrossRealmProof => write!(f, "Refusing to sign Tempo proof for a different HTTP realm"),
+            Self::CrossRealmProof => write!(f, "Refusing to sign a Tempo proof or session payment for a different HTTP realm"),
             Self::UnsafeCredentialHeader => write!(
                 f,
                 "Payment-Authorization requires a redirect-safe client; refusing to create a credential"

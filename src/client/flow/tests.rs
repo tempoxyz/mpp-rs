@@ -197,6 +197,10 @@ async fn foreign_session_realm_is_refused_before_signing() {
             .unwrap_err();
 
         assert!(matches!(err, HttpError::CrossRealmProof), "{via:?}: {err}");
+        assert!(
+            err.to_string().contains("session payment"),
+            "{via:?}: {err}"
+        );
         assert!(provider.paid().is_empty(), "{via:?}");
         assert_eq!(requests.load(Ordering::SeqCst), 1, "{via:?}");
     }

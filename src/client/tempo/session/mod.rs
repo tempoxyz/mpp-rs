@@ -1608,9 +1608,17 @@ impl TempoSessionProvider {
             None
         };
         // A server snapshot alone may not introduce a channel for an HTTP
-        // origin the caller did not pin, as in mppx.
+        // origin the caller did not pin, as in mppx. A stored entry for the
+        // scope vouches only for its own channel.
+        let stores_snapshot_channel = match (snapshot, stored.as_ref()) {
+            (Some(snapshot), Some(entry)) => snapshot
+                .channel_id
+                .parse::<B256>()
+                .is_ok_and(|channel_id| channel_id == entry.channel_id),
+            _ => false,
+        };
         if snapshot.is_some()
-            && stored.is_none()
+            && !stores_snapshot_channel
             && !self.origin_configured
             && self.origin.lock().unwrap().is_some()
         {
@@ -5374,6 +5382,33 @@ mod tests {
                 );
                 assert!(store.get(&key).await.unwrap().is_none());
                 assert!(provider.channels().is_empty());
+
+                // Nor does a stored entry for the scope that holds another channel.
+                let mut other = TempoSessionProvider::stored_entry(&entry).unwrap();
+                other.channel_id = B256::repeat_byte(0x77);
+                other.origin = Some("https://api.example.com".into());
+                store.set(&other).await.unwrap();
+                let error = provider.pay(&challenge).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires an explicitly configured origin"),
+                    "{error}"
+                );
+                assert_eq!(store.get(&key).await.unwrap(), Some(other));
+                assert!(provider.channels().is_empty());
+
+                // A stored entry for the snapshot's own channel still recovers.
+                let mut own = TempoSessionProvider::stored_entry(&entry).unwrap();
+                own.origin = Some("https://api.example.com".into());
+                store.set(&own).await.unwrap();
+                let mut provider = provider;
+                mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+                let credential = provider.pay(&challenge).await.unwrap();
+                assert!(matches!(
+                    credential.payload_as::<SessionCredentialPayload>().unwrap(),
+                    SessionCredentialPayload::Voucher { .. }
+                ));
                 continue;
             }
             let mut provider = provider.with_origin(&url).unwrap();

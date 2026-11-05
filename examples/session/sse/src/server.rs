@@ -80,7 +80,10 @@ async fn main() {
         tempo(TempoConfig {
             recipient: &recipient,
         })
-        .rpc_url(RPC_URL),
+        .rpc_url(RPC_URL)
+        // The host clients reach this server at: clients refuse session
+        // Challenges whose realm is not the request host.
+        .realm("localhost"),
     )
     .expect("failed to create payment handler");
 

@@ -911,7 +911,8 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                 payment_provider.trusted_tempo_proof_realm(&proof_origin),
             ) {
                 let _ = events_tx.send(MppEvent::Error(
-                    "refusing to sign Tempo proof for a different HTTP realm".into(),
+                    "refusing to sign a Tempo proof or session payment for a different HTTP realm"
+                        .into(),
                 ));
                 return Err(TerminationReason::Fatal);
             }
