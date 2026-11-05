@@ -449,8 +449,19 @@ where
         // it would revert. Fails closed: no simulation, no broadcast.
         // A reconciled transaction may already be on chain, where simulating
         // it again would fail: broadcast it and recover its receipt instead.
+        // The node bills the fee payer it recovers from `feePayerSignature`,
+        // so the simulation carries it: a hosted fee payer's as signed, and a
+        // local fee payer's over a simulation-only copy with gas headroom,
+        // signed only now that the sender's calls passed simulation.
         if let (Some(sponsor), false) = (sponsor, reconciling) {
-            self.simulate_sponsored_transaction(&final_tx_bytes, sponsor)
+            let simulation = match &self.fee_payer_signer {
+                Some(fee_payer_signer) => Some(
+                    self.sign_fee_payer_simulation(&final_tx_bytes, fee_payer_signer.as_ref())
+                        .await?,
+                ),
+                None => None,
+            };
+            self.simulate_sponsored_transaction(&final_tx_bytes, sponsor, simulation.as_ref())
                 .await?;
         }
 

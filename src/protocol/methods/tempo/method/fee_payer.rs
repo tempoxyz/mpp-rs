@@ -10,6 +10,7 @@ use tempo_alloy::TempoNetwork;
 use crate::protocol::traits::VerificationError;
 
 use super::super::{network::TempoNetwork as KnownTempoNetwork, CHAIN_ID, PATH_USD};
+use super::simulate::{FeePayerSimulation, SPONSORED_SIMULATION_GAS_BUFFER};
 use super::ChargeMethod;
 
 pub(super) const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
@@ -326,6 +327,46 @@ where
 
         let signed_tx = tx.into_signed(client_signature);
         Ok(signed_tx.encoded_2718())
+    }
+
+    /// Sign a simulation-only copy of a locally co-signed transaction for the
+    /// final sponsored simulation, as mppx's `signFeePayerSimulation`.
+    ///
+    /// Tempo's `eth_call` bills the fee payer it recovers from
+    /// `feePayerSignature`, and that signature binds the gas limit, while the
+    /// node's sponsored simulation needs more gas than the mined transaction
+    /// uses. So the fee payer signs the same payload as its broadcast
+    /// co-signature (the transaction with its fee token, for the sender) with
+    /// the gas limit raised by [`SPONSORED_SIMULATION_GAS_BUFFER`]; the
+    /// broadcast transaction keeps its gas limit. Call it only after the
+    /// sender's calls passed simulation.
+    pub(super) async fn sign_fee_payer_simulation(
+        &self,
+        final_tx_bytes: &[u8],
+        fee_payer_signer: &super::super::DynSigner,
+    ) -> Result<FeePayerSimulation, VerificationError> {
+        use alloy::eips::Decodable2718;
+
+        let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+            .map_err(|e| {
+                VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
+            })?;
+        let sender = signed.recover_signer().map_err(|e| {
+            VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
+        })?;
+        let mut tx = signed.tx().clone();
+        tx.gas_limit = tx.gas_limit.saturating_add(SPONSORED_SIMULATION_GAS_BUFFER);
+        tx.fee_payer_signature = None;
+        let fee_payer_signature = fee_payer_signer
+            .sign_hash(&tx.fee_payer_signature_hash(sender))
+            .await
+            .map_err(|e| {
+                VerificationError::internal(format!("Failed to sign fee payer simulation: {e}"))
+            })?;
+        Ok(FeePayerSimulation {
+            gas_limit: tx.gas_limit,
+            fee_payer_signature,
+        })
     }
 
     /// Sponsor fee-token allowlist: the configured list, else the chain default.
