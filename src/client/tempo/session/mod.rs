@@ -147,7 +147,7 @@ pub struct TempoSessionProvider {
     /// Channel registry: key is `payee:currency:escrow` (lowercase).
     channels: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Durable channel view. Recovery policy remains owned by this provider.
-    channel_store: Arc<dyn ChannelStore>,
+    channel_store: Arc<OriginBoundChannelStore>,
     /// Maps channel ID hex → channel key for reverse lookup.
     channel_id_to_key: Arc<Mutex<HashMap<String, String>>>,
     /// Newly prepared channels awaiting acceptance by the server.
@@ -366,10 +366,10 @@ impl TempoSessionProvider {
             max_amount: None,
             max_atomic_amount: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
-            channel_store: Arc::new(OriginBoundChannelStore {
-                inner: Arc::new(MemoryChannelStore::default()),
-                origin: origin.clone(),
-            }),
+            channel_store: Arc::new(OriginBoundChannelStore::new(
+                Arc::new(MemoryChannelStore::default()),
+                origin.clone(),
+            )),
             channel_id_to_key: Arc::new(Mutex::new(HashMap::new())),
             pending_opens: Arc::new(Mutex::new(HashMap::new())),
             on_channel_update: None,
@@ -749,16 +749,20 @@ impl TempoSessionProvider {
     /// its descriptor, the active challenge, and current on-chain state.
     ///
     /// Channels are persisted with this provider's HTTP origin, and a channel
-    /// bound to another origin is never reused.
-    /// Providers sharing one store never overwrite each other's channels:
-    /// when the payment scope's entry belongs to another provider, such as a
-    /// channel stored without an origin, this provider keeps its own under
-    /// [`store::origin_channel_key`] and leaves that entry in place.
+    /// bound to another origin is never reused. A store that keeps only one
+    /// origin's channels ([`ChannelStore::origin`]), such as a
+    /// [`store::SqliteChannelStore`] namespaced by an HTTP origin, binds the
+    /// provider to that origin.
+    ///
+    /// Providers sharing one store never reuse, overwrite or delete each
+    /// other's channels: a provider bound to an origin leaves a channel stored
+    /// without one in place, and an unbound provider leaves a channel bound to
+    /// an origin in place, each keeping its own channel under
+    /// [`store::origin_channel_key`]. A channel stays under the key it was
+    /// read from or written to while the provider holds it, even after the
+    /// provider is bound.
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
-        self.channel_store = Arc::new(OriginBoundChannelStore {
-            inner: store,
-            origin: self.origin.clone(),
-        });
+        self.channel_store = Arc::new(OriginBoundChannelStore::new(store, self.origin.clone()));
         self
     }
 
@@ -1267,7 +1271,7 @@ impl TempoSessionProvider {
             }
             if let Some(store_key) = Self::store_key(entry)? {
                 self.channel_store
-                    .delete(&store_key)
+                    .forget(&store_key, entry.channel_id)
                     .await
                     .map_err(Self::store_error)?;
             }
@@ -1412,9 +1416,12 @@ impl TempoSessionProvider {
         } else {
             None
         };
-        if let Some(store_key) = pending_store_key.or(runtime_store_key) {
+        if let (Some(store_key), Ok(channel_id)) = (
+            pending_store_key.or(runtime_store_key),
+            channel_id.parse::<B256>(),
+        ) {
             self.channel_store
-                .delete(&store_key)
+                .forget(&store_key, channel_id)
                 .await
                 .map_err(Self::store_error)?;
         }
@@ -1696,7 +1703,7 @@ impl TempoSessionProvider {
         }
         if state.deposit == 0 {
             self.channel_store
-                .delete(store_key)
+                .forget(store_key, stored.channel_id)
                 .await
                 .map_err(Self::store_error)?;
             return Ok(None);
@@ -3108,6 +3115,9 @@ impl TempoSessionProvider {
                 "channel does not match active session".into(),
             ));
         }
+        // Read the stored channel before signing, as top-ups and vouchers do:
+        // a channel stored for another origin than the provider's is refused.
+        self.merge_stored_channel(&key, &mut entry.clone()).await?;
         let cumulative_amount = requested_cumulative.unwrap_or(entry.cumulative_amount);
         if cumulative_amount > entry.cumulative_amount {
             return Err(MppError::InvalidConfig(format!(
@@ -3541,7 +3551,7 @@ impl TempoSessionProvider {
         }
         let store_key = Self::stored_entry(entry)?.key();
         self.channel_store
-            .delete(&store_key)
+            .forget(&store_key, entry.channel_id)
             .await
             .map_err(Self::store_error)?;
         self.channels.lock().unwrap().remove(key);
@@ -5470,10 +5480,11 @@ mod tests {
             Some("https://api.example.com")
         );
 
-        // Reading a bound channel never binds a provider that has not paid
-        // yet, and once bound to another origin it refuses that channel.
+        // A provider that has not paid yet neither reuses nor binds to a
+        // bound channel, and once bound to another origin it refuses it.
         let other = make_test_provider().with_channel_store(inner.clone());
-        other.channel_store.get(&key).await.unwrap().unwrap();
+        assert!(other.channel_store.get(&key).await.unwrap().is_none());
+        assert!(other.origin.lock().unwrap().is_none());
         other.bind_origin("https://evil.example/data").unwrap();
         let error = other.channel_store.get(&key).await.unwrap_err();
         assert!(error.to_string().contains("origin mismatch"));
@@ -5624,6 +5635,34 @@ mod tests {
         let entry = provider.channels().into_values().next().unwrap();
         assert_eq!((entry.cumulative_amount, entry.deposit), (1_000, 10_000));
         assert!(provider.channels().values().all(|entry| entry.opened));
+    }
+
+    #[tokio::test]
+    async fn close_refuses_a_channel_stored_for_another_origin_before_signing() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let inner = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider().with_channel_store(inner.clone());
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        // The store keeps this channel for https://api.example.com, while
+        // the provider holding it in memory is not bound to any origin.
+        let mut stored = TempoSessionProvider::stored_entry(&entry).unwrap();
+        stored.origin = Some("https://api.example.com".into());
+        inner.set(&stored).await.unwrap();
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        *provider.last_challenge.lock().unwrap() = Some(challenge);
+        let client = reqwest::Client::new();
+
+        // Nothing listens there: the close is refused before it is signed or sent.
+        let error = provider
+            .close(&client, "https://evil.example/manage")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"), "{error}");
+        assert_eq!(inner.get(&stored.key()).await.unwrap(), Some(stored));
     }
 
     #[tokio::test]
@@ -8425,6 +8464,10 @@ mod tests {
             }
 
             async fn set(&self, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                Err(ChannelStoreError::Io("read-only".into()))
+            }
+
+            async fn set_at(&self, _: &str, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
                 Err(ChannelStoreError::Io("read-only".into()))
             }
 
