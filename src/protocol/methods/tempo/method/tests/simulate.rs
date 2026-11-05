@@ -1,4 +1,9 @@
-use super::super::simulate::{rpc_signature, SPONSORED_SIMULATION_GAS_BUFFER};
+use super::super::fee_payer::{
+    sponsored_simulation_gas_limit, FeePayerPolicy, FeePayerPolicyOverride,
+};
+use super::super::simulate::{
+    is_gas_limit_error, rpc_signature, FeePayerSimulation, SPONSORED_SIMULATION_GAS_BUFFER,
+};
 use super::*;
 
 /// Build a co-signed `0x76` transaction the same way `broadcast_transaction`
@@ -103,16 +108,34 @@ fn revert(message: &str) -> alloy_json_rpc::ErrorPayload {
     }
 }
 
+fn out_of_gas() -> alloy_json_rpc::ErrorPayload {
+    alloy_json_rpc::ErrorPayload {
+        code: -32003,
+        message: "out of gas: gas exhausted during precompiled contract execution: 49152".into(),
+        data: None,
+    }
+}
+
+fn insufficient_fee_balance() -> alloy_json_rpc::ErrorPayload {
+    alloy_json_rpc::ErrorPayload {
+        code: -32003,
+        message: "insufficient fee token balance: required 6554, but only have 0".into(),
+        data: None,
+    }
+}
+
 fn is_absent(wire: &serde_json::Value, field: &str) -> bool {
     wire.get(field).is_none_or(serde_json::Value::is_null)
 }
 
-/// The first simulation runs the sender's calls alone: only `from` and the
-/// calls, without gas, fee fields or signatures, so it does not depend on the
-/// sender holding a fee token (mppx `simulationTransaction(tx, { feePayer:
+/// The first simulation is the sender's transaction at its exact broadcast
+/// gas limit, with its nonce key, validity window and key hints, but without
+/// fee fields, fee token, fee payer or signatures, so the node bills the
+/// sender nothing and needs no fee-token balance, while a gas limit too low
+/// for the calls still fails (mppx `simulationTransaction(tx, { feePayer:
 /// true })`).
 #[tokio::test]
-async fn test_sender_simulation_request_carries_only_sender_and_calls() {
+async fn test_sender_simulation_request_runs_at_broadcast_gas_without_fees() {
     let cosigned = make_cosigned_fee_payer_tx().await;
     let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
     let sender = signed.recover_signer().unwrap();
@@ -132,22 +155,46 @@ async fn test_sender_simulation_request_carries_only_sender_and_calls() {
         wire["to"].is_string() && wire["input"].is_string(),
         "{wire}"
     );
+    assert_eq!(wire["gas"], format!("{:#x}", signed.tx().gas_limit));
+    assert!(wire["nonceKey"].is_string() && wire["validBefore"].is_string());
+    assert!(wire["keyType"].is_string(), "{wire}");
     for field in [
-        "gas",
         "feeToken",
         "feePayer",
         "feePayerSignature",
-        "nonce",
-        "nonceKey",
-        "validBefore",
+        "gasPrice",
         "maxFeePerGas",
         "maxPriorityFeePerGas",
-        "keyType",
+        "signature",
         "keyId",
-        "keyAuthorization",
     ] {
         assert!(is_absent(&wire, field), "{field} must be omitted: {wire}");
     }
+}
+
+/// The sender simulation is the gas bound: a transaction whose gas limit is
+/// too low fails it before the fee payer signs anything.
+#[tokio::test]
+async fn test_under_gassed_transaction_never_reaches_the_fee_payer() {
+    let client_signer = alloy::signers::local::PrivateKeySigner::random();
+    let (envelope, request) = sponsored_charge_envelope(&client_signer);
+    let (method, asserter, remaining) = recording_method(vec![Err(out_of_gas())]);
+
+    let err = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(&envelope),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await
+        .expect_err("an out-of-gas sender simulation stops sponsorship");
+    assert!(err.to_string().contains("out of gas"), "{err}");
+    assert!(remaining.lock().unwrap().is_empty(), "nothing was signed");
+    assert!(asserter.read_q().is_empty());
 }
 
 /// The final simulation is the co-signed transaction with its concrete fee
@@ -575,4 +622,223 @@ async fn test_local_fee_payer_never_signs_when_sender_simulation_fails() {
         .await
         .expect_err("the sender simulation reverts");
     assert!(remaining.lock().unwrap().is_empty(), "nothing was signed");
+}
+
+/// The simulation copy's padding is clamped to the fee payer policy: to
+/// `max_gas`, to the most gas `max_total_fee` pays for, and never below the
+/// broadcast gas limit.
+#[test]
+fn test_sponsored_simulation_gas_limit_respects_policy_caps() {
+    let policy = |max_gas: u64, max_total_fee: u128| FeePayerPolicy {
+        max_gas,
+        max_total_fee,
+        ..FeePayerPolicy::default()
+    };
+    let fee = 1_000_000_000u128;
+    let unbounded = u128::MAX;
+
+    assert_eq!(
+        sponsored_simulation_gas_limit(&policy(2_000_000, unbounded), 100_000, fee),
+        100_000 + SPONSORED_SIMULATION_GAS_BUFFER
+    );
+    assert_eq!(
+        sponsored_simulation_gas_limit(&policy(104_000, unbounded), 100_000, fee),
+        104_000
+    );
+    assert_eq!(
+        sponsored_simulation_gas_limit(&policy(2_000_000, 103_000 * fee), 100_000, fee),
+        103_000
+    );
+    assert_eq!(
+        sponsored_simulation_gas_limit(&policy(100_000, unbounded), 100_000, fee),
+        100_000,
+        "no headroom at the policy edge"
+    );
+    assert_eq!(
+        sponsored_simulation_gas_limit(&policy(2_000_000, 0), 100_000, 0),
+        100_000 + SPONSORED_SIMULATION_GAS_BUFFER,
+        "a zero fee per gas leaves the total fee cap unbounding"
+    );
+}
+
+/// A local fee payer never signs a simulation copy its policy would refuse:
+/// at the policy edge it signs the copy with only the gas the caps allow.
+#[tokio::test]
+async fn test_local_fee_payer_simulation_copy_stays_within_policy() {
+    use super::super::super::FeePayerEnvelope78;
+    use alloy::signers::SignerSync;
+
+    let client_signer = alloy::signers::local::PrivateKeySigner::random();
+    let tx = make_fee_payer_tx(60);
+    let gas_limit = tx.gas_limit;
+    let max_fee_per_gas = tx.max_fee_per_gas;
+    let signature: tempo_alloy::primitives::transaction::TempoSignature = client_signer
+        .sign_hash_sync(&tx.signature_hash())
+        .unwrap()
+        .into();
+    let envelope = FeePayerEnvelope78::from_signing_tx(tx, client_signer.address(), signature)
+        .encoded_envelope();
+
+    for (overrides, expected_gas) in [
+        (
+            FeePayerPolicyOverride {
+                max_gas: Some(gas_limit + 4_000),
+                ..Default::default()
+            },
+            gas_limit + 4_000,
+        ),
+        (
+            FeePayerPolicyOverride {
+                max_total_fee: Some(u128::from(gas_limit + 2_500) * max_fee_per_gas),
+                ..Default::default()
+            },
+            gas_limit + 2_500,
+        ),
+        (
+            FeePayerPolicyOverride {
+                max_gas: Some(gas_limit),
+                max_total_fee: Some(u128::from(gas_limit) * max_fee_per_gas),
+                ..Default::default()
+            },
+            gas_limit,
+        ),
+    ] {
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_http("http://127.0.0.1:1".parse().unwrap());
+        let fee_payer_signer = alloy::signers::local::PrivateKeySigner::random();
+        let fee_payer = fee_payer_signer.address();
+        let method = ChargeMethod::new(provider)
+            .with_fee_payer(fee_payer_signer)
+            .with_fee_payer_policy_override(overrides.clone());
+        let signer = method.fee_payer_signer.as_deref().unwrap();
+        let cosigned = method
+            .cosign_fee_payer_transaction(&envelope, signer, PATH_USD.parse().unwrap())
+            .await
+            .unwrap();
+
+        let simulation = method
+            .sign_fee_payer_simulation(&cosigned, signer)
+            .await
+            .unwrap();
+        assert_eq!(simulation.gas_limit, expected_gas, "{overrides:?}");
+        assert_eq!(simulation.gas_buffer, expected_gas - gas_limit);
+
+        let policy = FeePayerPolicy::resolve(CHAIN_ID, Some(&overrides));
+        assert!(simulation.gas_limit <= policy.max_gas);
+        assert!(u128::from(simulation.gas_limit) * max_fee_per_gas <= policy.max_total_fee);
+
+        let broadcast =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let mut copy = broadcast.tx().clone();
+        copy.gas_limit = simulation.gas_limit;
+        copy.fee_payer_signature = Some(simulation.fee_payer_signature);
+        assert_eq!(
+            copy.recover_fee_payer(client_signer.address()).unwrap(),
+            fee_payer
+        );
+        assert_eq!(broadcast.tx().gas_limit, gas_limit, "broadcast untouched");
+    }
+}
+
+/// Gas-limit-only failures are told apart by the node's message, never by a
+/// revert reason or by the -32003 code the fee-balance error shares.
+#[test]
+fn test_is_gas_limit_error() {
+    assert!(is_gas_limit_error(-32003, &out_of_gas().message));
+    assert!(is_gas_limit_error(-32000, "intrinsic gas too low"));
+    assert!(is_gas_limit_error(-32003, "Out of gas"));
+    assert!(!is_gas_limit_error(
+        -32003,
+        &insufficient_fee_balance().message
+    ));
+    assert!(
+        !is_gas_limit_error(3, "out of gas"),
+        "a revert reason never counts"
+    );
+    assert!(!is_gas_limit_error(3, "execution reverted: out of gas"));
+    assert!(!is_gas_limit_error(
+        -32601,
+        "the method eth_call does not exist"
+    ));
+}
+
+/// A hosted fee payer's signature binds the broadcast gas limit, so its
+/// sponsored simulation may run out of gas only for the node's sponsored-call
+/// overhead after the sender simulation passed at that limit: that passes,
+/// while fee-balance errors and reverts still reject.
+#[tokio::test]
+async fn test_hosted_sponsored_simulation_tolerates_only_gas_limit_failures() {
+    let cosigned = make_cosigned_fee_payer_tx().await;
+    let sponsor = Address::repeat_byte(0x5e);
+
+    for error in [
+        out_of_gas(),
+        alloy_json_rpc::ErrorPayload {
+            code: -32000,
+            message: "intrinsic gas too low".into(),
+            data: None,
+        },
+    ] {
+        let (method, asserter) = sim_method_with(vec![Err(error)]);
+        method
+            .simulate_sponsored_transaction(&cosigned, sponsor, None)
+            .await
+            .expect("a gas-limit-only failure of a hosted simulation passes");
+        assert!(asserter.read_q().is_empty(), "eth_call must be issued");
+    }
+
+    let (method, _) = sim_method_with(vec![Err(insufficient_fee_balance())]);
+    let err = method
+        .simulate_sponsored_transaction(&cosigned, sponsor, None)
+        .await
+        .expect_err("a fee payer without balance is rejected");
+    assert!(
+        err.to_string().contains("insufficient fee token balance"),
+        "{err}"
+    );
+
+    let (method, _) = sim_method_with(vec![Err(revert("out of gas"))]);
+    method
+        .simulate_sponsored_transaction(&cosigned, sponsor, None)
+        .await
+        .expect_err("a revert is rejected whatever its reason");
+}
+
+/// A local simulation copy with the full buffer stays strict on out of gas;
+/// one the policy clamped tolerates it as the hosted path does.
+#[tokio::test]
+async fn test_local_sponsored_simulation_tolerates_out_of_gas_only_when_clamped() {
+    let cosigned = make_cosigned_fee_payer_tx().await;
+    let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+    let gas_limit = signed.tx().gas_limit;
+    let signature = signed.tx().fee_payer_signature.unwrap();
+    let sponsor = Address::repeat_byte(0x5e);
+
+    let full = FeePayerSimulation {
+        gas_limit: gas_limit + SPONSORED_SIMULATION_GAS_BUFFER,
+        gas_buffer: SPONSORED_SIMULATION_GAS_BUFFER,
+        fee_payer_signature: signature,
+    };
+    let (method, _) = sim_method_with(vec![Err(out_of_gas())]);
+    method
+        .simulate_sponsored_transaction(&cosigned, sponsor, Some(&full))
+        .await
+        .expect_err("out of gas with the full buffer is rejected");
+
+    let clamped = FeePayerSimulation {
+        gas_limit: gas_limit + 1_000,
+        gas_buffer: 1_000,
+        fee_payer_signature: signature,
+    };
+    let (method, _) = sim_method_with(vec![Err(out_of_gas())]);
+    method
+        .simulate_sponsored_transaction(&cosigned, sponsor, Some(&clamped))
+        .await
+        .expect("out of gas of a clamped copy passes");
+    let (method, _) = sim_method_with(vec![Err(insufficient_fee_balance())]);
+    method
+        .simulate_sponsored_transaction(&cosigned, sponsor, Some(&clamped))
+        .await
+        .expect_err("a fee-balance error of a clamped copy is rejected");
 }

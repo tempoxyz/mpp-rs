@@ -1,9 +1,10 @@
 //! Pre-broadcast simulation of fee-sponsored transactions.
 //!
 //! As mppx's `FeePayer.preflightSponsorship`, a sponsored transaction is
-//! simulated with two `eth_call`s: first the sender's calls alone, without fee
-//! fields or signatures, before any sponsor signs; then the co-signed
-//! transaction with its concrete fee payer, fee token and fee payer signature.
+//! simulated with two `eth_call`s: first the sender's transaction without fee
+//! fields, fee payer or signatures, before any sponsor signs; then the
+//! co-signed transaction with its concrete fee payer, fee token and fee payer
+//! signature.
 //!
 //! Tempo nodes (v1.18 and later) check the fee payer's fee-token balance in
 //! `eth_call` too, and recover the fee payer only from `feePayerSignature`: a
@@ -11,12 +12,20 @@
 //! final simulation therefore carries the sponsor's signature, so it passes
 //! when the sender holds none of the sponsor's fee token. The sender's own
 //! signature is never sent.
+//!
+//! The first simulation is the gas bound: it runs at the exact gas limit the
+//! sponsor broadcasts, with no fee fields, so the node charges the sender
+//! nothing and checks no fee-token balance, and an under-gassed transaction
+//! fails there (out of gas, or intrinsic gas too low) before any sponsor
+//! signs. It keeps the transaction's nonce key, validity window, key
+//! authorization and sender key hints, because the node prices intrinsic gas
+//! from them: without the expiring nonce key a request is charged about
+//! 250,000 more gas, as a fresh 2D nonce.
 
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, Bytes, Signature};
 use alloy::providers::Provider;
-use alloy::rpc::types::TransactionRequest;
 use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tempo_alloy::primitives::AASigned;
 use tempo_alloy::rpc::TempoTransactionRequest;
@@ -34,7 +43,15 @@ use super::ChargeMethod;
 /// (about 6,000 for a session top-up on v1.18.1: mined 63,645 of a 67,894
 /// limit, simulated 69,645), so simulating at the signed limit would reject
 /// transactions that succeed onchain. The broadcast transaction keeps its own
-/// gas limit; hosted fee payer signatures are simulated as signed.
+/// gas limit, which the sender simulation bounds. The padding is clamped to
+/// the fee payer policy (`max_gas` and `max_total_fee`), so the fee payer
+/// never signs a copy its policy would refuse.
+///
+/// A hosted fee payer's signature binds the broadcast gas limit and cannot be
+/// padded. That simulation, and a local copy whose padding the policy clamped,
+/// may fail only for this overhead: such a gas-limit-only failure is
+/// tolerated (see [`is_gas_limit_error`]), because the sender simulation
+/// already passed at the broadcast gas limit. Any other failure stays fatal.
 pub(super) const SPONSORED_SIMULATION_GAS_BUFFER: u64 = 10_000;
 
 /// A fee payer signature over a simulation-only copy of a sponsored
@@ -43,8 +60,11 @@ pub(super) const SPONSORED_SIMULATION_GAS_BUFFER: u64 = 10_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FeePayerSimulation {
     /// The simulation copy's gas limit: the broadcast gas limit plus
-    /// [`SPONSORED_SIMULATION_GAS_BUFFER`].
+    /// [`SPONSORED_SIMULATION_GAS_BUFFER`], clamped to the fee payer policy.
     pub(super) gas_limit: u64,
+    /// Gas the copy adds over the broadcast gas limit: less than
+    /// [`SPONSORED_SIMULATION_GAS_BUFFER`] when the policy clamped it.
+    pub(super) gas_buffer: u64,
     /// The fee payer's signature over the simulation copy.
     pub(super) fee_payer_signature: Signature,
 }
@@ -57,6 +77,21 @@ pub(super) fn rpc_signature(signature: &Signature) -> serde_json::Value {
         "s": format!("{:#x}", signature.s()),
         "yParity": format!("{:#x}", u8::from(signature.v())),
     })
+}
+
+/// JSON-RPC error code nodes return for a reverted call.
+const JSONRPC_EXECUTION_REVERTED: i64 = 3;
+
+/// Whether a failed `eth_call` failed only for its gas limit, as Tempo
+/// v1.18 reports it: "out of gas: ..." (code -32003, which the fee-token
+/// balance error shares, so the code alone cannot tell them apart) or
+/// "intrinsic gas too low" (code -32000). Matched by the start of the node's
+/// message. A revert (code 3) never counts, whatever its reason says, since
+/// the reverting contract chooses that text.
+pub(super) fn is_gas_limit_error(code: i64, message: &str) -> bool {
+    let message = message.trim_start().to_ascii_lowercase();
+    code != JSONRPC_EXECUTION_REVERTED
+        && (message.starts_with("out of gas") || message.starts_with("intrinsic gas too low"))
 }
 
 /// Bytes a keychain envelope puts before its approval: the type byte and the
@@ -102,52 +137,16 @@ impl<P> ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
-    /// The sender's calls as an `eth_call` request: only `from` and the calls,
-    /// so the sender need not hold a fee token (mppx
-    /// `simulationTransaction(tx, { feePayer: true })`).
-    pub(super) fn sender_simulation_request(
+    /// A signed `0x76` transaction as an `eth_call` request from its sender,
+    /// without the sender's signature or `feePayerSignature`: every other
+    /// field of the transaction, with the sender signature's key type, key
+    /// data and access key as `keyType`/`keyData`/`keyId` hints, so the node
+    /// charges the signature verification gas and access-key limits the
+    /// broadcast transaction pays. The tail call is not folded yet.
+    fn simulation_request_base(
         signed: &AASigned,
         sender: Address,
-    ) -> Result<serde_json::Value, VerificationError> {
-        let mut request = TempoTransactionRequest {
-            inner: TransactionRequest {
-                from: Some(sender),
-                ..Default::default()
-            },
-            calls: signed.tx().calls.clone(),
-            ..Default::default()
-        };
-        fold_tail_call(&mut request)?;
-        request_value(&request)
-    }
-
-    /// A co-signed `0x76` transaction as an `eth_call` request: every field of
-    /// the transaction with its concrete `feePayer`, `feeToken` and
-    /// `feePayerSignature`, and without the sender's signature (mppx
-    /// `sponsoredSimulationTransaction`). The node rejects `feePayer: true` in
-    /// `eth_call`, so the sponsor is named, and it bills the fee payer it
-    /// recovers from `feePayerSignature` (the sender when absent), so the
-    /// sponsor's signature is sent.
-    ///
-    /// With `simulation`, its gas limit and fee payer signature replace the
-    /// transaction's (a local fee payer's simulation-only copy); otherwise the
-    /// transaction's own fee payer signature is sent (a hosted fee payer's).
-    ///
-    /// The sender signature's key type, key data and access key are kept as
-    /// `keyType`/`keyData`/`keyId` hints, so the node charges the signature
-    /// verification gas and access-key limits the broadcast transaction pays.
-    pub(super) fn sponsored_simulation_request(
-        final_tx_bytes: &[u8],
-        fee_payer: Address,
-        simulation: Option<&FeePayerSimulation>,
-    ) -> Result<serde_json::Value, VerificationError> {
-        let signed = AASigned::decode_2718(&mut &final_tx_bytes[..]).map_err(|e| {
-            VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
-        })?;
-        let sender = signed.recover_signer().map_err(|e| {
-            VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
-        })?;
-
+    ) -> Result<TempoTransactionRequest, VerificationError> {
         let (key_id, key_type, approval) = match signed.signature() {
             TempoSignature::Keychain(keychain_sig) => {
                 let key_id = keychain_sig.key_id(&signed.signature_hash()).map_err(|e| {
@@ -180,6 +179,60 @@ where
             _ => None,
         };
 
+        let mut request: TempoTransactionRequest = signed.clone().into();
+        request.inner.from = Some(sender);
+        request.fee_payer_signature = None;
+        request.key_type = Some(key_type);
+        request.key_data = key_data;
+        request.key_id = key_id;
+        Ok(request)
+    }
+
+    /// The sender's transaction as an `eth_call` request, before any sponsor
+    /// signs: the transaction at its exact (broadcast) gas limit, with its
+    /// nonce key, validity window, key authorization and sender key hints,
+    /// but without `feeToken`, `feePayer`, `feePayerSignature` or any fee per
+    /// gas, so the node bills the sender nothing and needs no fee-token
+    /// balance (mppx `simulationTransaction(tx, { feePayer: true })`). It is
+    /// the sponsored transaction's gas bound: a gas limit too low for the
+    /// calls fails here.
+    pub(super) fn sender_simulation_request(
+        signed: &AASigned,
+        sender: Address,
+    ) -> Result<serde_json::Value, VerificationError> {
+        let mut request = Self::simulation_request_base(signed, sender)?;
+        request.fee_token = None;
+        request.inner.gas_price = None;
+        request.inner.max_fee_per_gas = None;
+        request.inner.max_priority_fee_per_gas = None;
+        fold_tail_call(&mut request)?;
+        request_value(&request)
+    }
+
+    /// A co-signed `0x76` transaction as an `eth_call` request: every field of
+    /// the transaction with its concrete `feePayer`, `feeToken` and
+    /// `feePayerSignature`, and without the sender's signature (mppx
+    /// `sponsoredSimulationTransaction`). The node rejects `feePayer: true` in
+    /// `eth_call`, so the sponsor is named, and it bills the fee payer it
+    /// recovers from `feePayerSignature` (the sender when absent), so the
+    /// sponsor's signature is sent.
+    ///
+    /// With `simulation`, its gas limit and fee payer signature replace the
+    /// transaction's (a local fee payer's simulation-only copy); otherwise the
+    /// transaction's own fee payer signature is sent (a hosted fee payer's).
+    /// Key hints are sent as in [`Self::simulation_request_base`].
+    pub(super) fn sponsored_simulation_request(
+        final_tx_bytes: &[u8],
+        fee_payer: Address,
+        simulation: Option<&FeePayerSimulation>,
+    ) -> Result<serde_json::Value, VerificationError> {
+        let signed = AASigned::decode_2718(&mut &final_tx_bytes[..]).map_err(|e| {
+            VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
+        })?;
+        let sender = signed.recover_signer().map_err(|e| {
+            VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
+        })?;
+
         let fee_payer_signature = match simulation {
             Some(simulation) => simulation.fee_payer_signature,
             None => signed.tx().fee_payer_signature.ok_or_else(|| {
@@ -189,16 +242,12 @@ where
             })?,
         };
 
-        let mut request: TempoTransactionRequest = signed.into();
-        request.inner.from = Some(sender);
+        // `feePayerSignature` is written below in RPC form rather than
+        // alloy's serde form.
+        let mut request = Self::simulation_request_base(&signed, sender)?;
         if let Some(simulation) = simulation {
             request.inner.gas = Some(simulation.gas_limit);
         }
-        // Written below in RPC form rather than alloy's serde form.
-        request.fee_payer_signature = None;
-        request.key_type = Some(key_type);
-        request.key_data = key_data;
-        request.key_id = key_id;
         fold_tail_call(&mut request)?;
 
         let mut value = request_value(&request)?;
@@ -216,35 +265,45 @@ where
     }
 
     /// `eth_call` one simulation request and fail closed: a revert is a failed
-    /// transaction, and an RPC error is a failed check, not a pass.
-    async fn simulate_call(&self, request: serde_json::Value) -> Result<(), VerificationError> {
-        // JSON-RPC error code nodes return for a reverted call.
-        const JSONRPC_EXECUTION_REVERTED: i64 = 3;
-
+    /// transaction, and an RPC error is a failed check, not a pass. With
+    /// `tolerate_gas_limit`, a gas-limit-only failure ([`is_gas_limit_error`])
+    /// passes.
+    async fn simulate_call(
+        &self,
+        request: serde_json::Value,
+        tolerate_gas_limit: bool,
+    ) -> Result<(), VerificationError> {
         let result: Result<Bytes, _> = self
             .provider
             .raw_request("eth_call".into(), (request, "latest"))
             .await;
-        result.map(|_| ()).map_err(|e| match e.as_error_resp() {
+        let Err(e) = result else {
+            return Ok(());
+        };
+        match e.as_error_resp() {
+            Some(err) if tolerate_gas_limit && is_gas_limit_error(err.code, &err.message) => Ok(()),
             Some(err) if err.code == JSONRPC_EXECUTION_REVERTED => {
-                VerificationError::transaction_failed(format!(
+                Err(VerificationError::transaction_failed(format!(
                     "Sponsored transaction would revert in pre-broadcast simulation: {} (code {})",
                     err.message, err.code
-                ))
+                )))
             }
-            _ => VerificationError::network_error(format!("Pre-broadcast simulation failed: {e}")),
-        })
+            _ => Err(VerificationError::network_error(format!(
+                "Pre-broadcast simulation failed: {e}"
+            ))),
+        }
     }
 
-    /// Simulate a sponsored transaction's calls from its sender, before any
-    /// sponsor signs it, so a reverting transaction never reaches a signer or
-    /// hosted fee payer.
+    /// Simulate a sponsored transaction from its sender at its broadcast gas
+    /// limit, before any sponsor signs it, so a reverting or under-gassed
+    /// transaction never reaches a signer or hosted fee payer. See
+    /// [`Self::sender_simulation_request`].
     pub(super) async fn simulate_sender_calls(
         &self,
         signed: &AASigned,
         sender: Address,
     ) -> Result<(), VerificationError> {
-        self.simulate_call(Self::sender_simulation_request(signed, sender)?)
+        self.simulate_call(Self::sender_simulation_request(signed, sender)?, false)
             .await
     }
 
@@ -252,17 +311,26 @@ where
     /// before broadcasting it, with the fee payer signature `simulation`
     /// carries (a local fee payer's) or else the transaction's own (a hosted
     /// fee payer's). See [`Self::sponsored_simulation_request`].
+    ///
+    /// Call it only after [`Self::simulate_sender_calls`] passed for the same
+    /// transaction: when the simulation has less than
+    /// [`SPONSORED_SIMULATION_GAS_BUFFER`] of headroom over the broadcast gas
+    /// limit (a hosted signature, or a local copy the policy clamped), a
+    /// gas-limit-only failure is the node's sponsored-call overhead, which the
+    /// mined transaction does not pay, and passes. Fee-balance errors, reverts
+    /// and every other failure stay fatal.
     pub(super) async fn simulate_sponsored_transaction(
         &self,
         final_tx_bytes: &[u8],
         fee_payer: Address,
         simulation: Option<&FeePayerSimulation>,
     ) -> Result<(), VerificationError> {
-        self.simulate_call(Self::sponsored_simulation_request(
-            final_tx_bytes,
-            fee_payer,
-            simulation,
-        )?)
+        let tolerate_gas_limit = simulation
+            .is_none_or(|simulation| simulation.gas_buffer < SPONSORED_SIMULATION_GAS_BUFFER);
+        self.simulate_call(
+            Self::sponsored_simulation_request(final_tx_bytes, fee_payer, simulation)?,
+            tolerate_gas_limit,
+        )
         .await
     }
 }
