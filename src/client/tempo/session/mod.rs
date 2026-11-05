@@ -769,12 +769,19 @@ impl TempoSessionProvider {
     /// [`with_origin`](Self::with_origin) does: the store was chosen for that
     /// origin, so a server snapshot may recover a channel it does not hold.
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
-        let store_origin = store.origin();
         self.channel_store = Arc::new(OriginBoundChannelStore::new(store, self.origin.clone()));
-        if store_origin.is_some() && *self.origin.lock().unwrap() == store_origin {
+        if self.store_pins_origin() {
             self.origin_configured = true;
         }
         self
+    }
+
+    /// Whether the channel store keeps only one HTTP origin's channels and
+    /// this provider is bound to that origin, which pins it as
+    /// [`with_origin`](Self::with_origin) does.
+    pub(crate) fn store_pins_origin(&self) -> bool {
+        let store_origin = self.channel_store.store_origin();
+        store_origin.is_some() && *self.origin.lock().unwrap() == store_origin
     }
 
     /// Pin this provider to the HTTP origin of `origin` before its first

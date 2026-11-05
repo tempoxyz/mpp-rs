@@ -275,6 +275,12 @@ impl OriginBoundChannelStore {
         }
     }
 
+    /// The origin of the underlying store, when it keeps only one HTTP
+    /// origin's channels ([`ChannelStore::origin`]).
+    pub(crate) fn store_origin(&self) -> Option<String> {
+        self.inner.origin()
+    }
+
     /// The provider's current namespace: its HTTP origin, if bound.
     fn namespace(&self) -> Option<String> {
         self.origin.lock().unwrap().clone()

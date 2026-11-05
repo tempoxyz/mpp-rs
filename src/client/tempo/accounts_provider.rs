@@ -643,7 +643,9 @@ impl TempoAccountsProvider {
     /// A clone of the cached session `provider` for `origin`, with this
     /// caller's realm pins and its own authorization for server snapshot
     /// recovery: only an origin pinned with [`Self::with_session_origin`] on
-    /// this `TempoAccountsProvider` may recover a channel from a snapshot.
+    /// this `TempoAccountsProvider`, or the origin of a session store that
+    /// keeps only that origin's channels, may recover a channel from a
+    /// snapshot.
     fn session_for_caller(
         &self,
         provider: &TempoSessionProvider,
@@ -651,9 +653,8 @@ impl TempoAccountsProvider {
     ) -> TempoSessionProvider {
         let mut provider = provider.clone();
         provider.replace_trusted_tempo_proof_realms(&self.trusted_tempo_proof_realms);
-        provider.set_origin_configured(
-            origin.is_some_and(|origin| self.session_settings.origins.contains(origin)),
-        );
+        let pinned = origin.is_some_and(|origin| self.session_settings.origins.contains(origin));
+        provider.set_origin_configured(pinned || provider.store_pins_origin());
         provider
     }
 
@@ -1277,6 +1278,37 @@ mod tests {
             .unwrap()
             .origin_configured());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_session_store_bound_to_an_origin_pins_every_cached_session() {
+        let (provider, path, _) = provider();
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let store = super::super::session::store::SqliteChannelStore::open(
+            super::super::session::store::SqliteChannelStoreOptions {
+                namespace: "https://a.example".into(),
+                path: Some(directory.join("channels.db")),
+                request_url: None,
+            },
+        )
+        .unwrap();
+        let provider = provider
+            .with_expected_chain_id(4217)
+            .with_session_store(Arc::new(store));
+
+        // The first session and the cached ones agree: the store's origin
+        // pins them, whether reached through its URL or a bare `pay`.
+        for _ in 0..2 {
+            assert!(provider
+                .session_for("https://a.example/pay")
+                .unwrap()
+                .origin_configured());
+            assert!(provider.session().unwrap().origin_configured());
+        }
+        assert!(provider.session_for("https://b.example/pay").is_err());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
