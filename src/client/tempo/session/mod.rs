@@ -763,8 +763,12 @@ impl TempoSessionProvider {
     ///
     /// Requests to any other origin are refused, and a challenge's server
     /// snapshot may then recover a channel this provider has not stored.
-    /// Without the pin, a snapshot only recovers a channel already in the
-    /// channel store, so a server cannot make the provider adopt a channel.
+    /// Without the pin, a provider bound to an HTTP origin by its requests
+    /// only recovers a channel already in the channel store, so that server
+    /// cannot make it adopt a channel. As in mppx, the check needs an HTTP
+    /// origin: a provider no request has bound, such as one used only through
+    /// a bare `pay` or a non-HTTP MCP resource, still recovers from a
+    /// snapshot.
     ///
     /// # Errors
     ///
@@ -1609,7 +1613,8 @@ impl TempoSessionProvider {
         };
         // A server snapshot alone may not introduce a channel for an HTTP
         // origin the caller did not pin, as in mppx. A stored entry for the
-        // scope vouches only for its own channel.
+        // scope vouches only for its own channel. Like mppx, this applies
+        // only once the provider is bound to an HTTP origin.
         let stores_snapshot_channel = match (snapshot, stored.as_ref()) {
             (Some(snapshot), Some(entry)) => snapshot
                 .channel_id
@@ -5300,7 +5305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn originless_stored_channel_is_neither_reused_nor_rebound() {
+    async fn originless_stored_channel_is_replaced_not_reused() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
         let payee = Address::repeat_byte(0x11);
@@ -5318,17 +5323,25 @@ mod tests {
             .bind_origin("https://api.example.com/data")
             .unwrap();
 
-        // A legacy entry is refused before anything is signed for it.
+        // A bound provider never reuses a legacy entry: it reads as absent,
+        // so nothing is restored or signed for it.
         let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
-        let error = provider.pay(&challenge).await.unwrap_err();
-        assert!(error.to_string().contains("origin mismatch"), "{error}");
-        let error = provider.restore(&challenge).await.unwrap_err();
-        assert!(error.to_string().contains("origin mismatch"), "{error}");
+        assert!(provider
+            .channel_store
+            .get(&stored.key())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!provider.restore(&challenge).await.unwrap());
         assert!(provider.restored_channel_id(&challenge).is_none());
-        // Nor does the provider take it over by writing its origin onto it.
-        let error = provider.channel_store.set(&stored).await.unwrap_err();
-        assert!(error.to_string().contains("origin mismatch"));
-        assert_eq!(inner.get(&stored.key()).await.unwrap(), Some(stored));
+        // Nor does it rebind it in place; a new channel replaces it instead
+        // of the scope staying locked.
+        let mut replacement = stored.clone();
+        replacement.channel_id = B256::repeat_byte(0x77);
+        provider.channel_store.set(&replacement).await.unwrap();
+        let written = inner.get(&stored.key()).await.unwrap().unwrap();
+        assert_eq!(written.channel_id, replacement.channel_id);
+        assert_eq!(written.origin.as_deref(), Some("https://api.example.com"));
     }
 
     #[tokio::test]

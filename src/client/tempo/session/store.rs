@@ -179,17 +179,25 @@ impl ChannelStore for MemoryChannelStore {
 }
 
 /// A session provider's view of its channel store, bound to the provider's
-/// HTTP origin: entries it writes carry that origin, and an entry whose origin
-/// is not exactly the provider's, including a legacy entry without one, is
-/// refused rather than reused or rebound, as mppx does. An unbound provider
-/// adopts the origin of the first bound entry it reads, so it cannot later pay
-/// another origin with it.
+/// HTTP origin: entries it writes carry that origin, and an entry bound to
+/// another origin is refused rather than reused or rebound, as mppx does. A
+/// legacy entry without an origin is never reused or rebound by a bound
+/// provider either: it reads as absent, so the provider opens a new channel
+/// and replaces it instead of being locked out of the payment scope. An
+/// unbound provider adopts the origin of the first bound entry it reads, so it
+/// cannot later pay another origin with it.
 pub(crate) struct OriginBoundChannelStore {
     pub(crate) inner: Arc<dyn ChannelStore>,
     pub(crate) origin: Arc<Mutex<Option<String>>>,
 }
 
 impl OriginBoundChannelStore {
+    /// Whether a bound provider may see `stored`: every entry, except a
+    /// legacy one without an origin once the provider is bound.
+    fn reusable(&self, stored: &StoredChannelEntry) -> bool {
+        stored.origin.is_some() || self.origin.lock().unwrap().is_none()
+    }
+
     /// Check a stored entry against the provider's origin, binding an unbound
     /// provider to the entry's origin, and return the provider's origin.
     fn adopt(&self, stored: &StoredChannelEntry) -> ChannelStoreResult<Option<String>> {
@@ -211,7 +219,11 @@ impl ChannelStore for OriginBoundChannelStore {
     }
 
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
-        let entry = self.inner.get(key).await?;
+        let entry = self
+            .inner
+            .get(key)
+            .await?
+            .filter(|entry| self.reusable(entry));
         if let Some(entry) = &entry {
             self.adopt(entry)?;
         }
@@ -219,7 +231,12 @@ impl ChannelStore for OriginBoundChannelStore {
     }
 
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
-        let current = self.inner.get(&entry.key()).await?;
+        // A bound provider replaces a legacy entry without an origin.
+        let current = self
+            .inner
+            .get(&entry.key())
+            .await?
+            .filter(|current| self.reusable(current));
         // Adopt the stored entry's origin as `get` does, so an unbound provider
         // keeps writing an entry its store stamped with an origin.
         let bound = match &current {
@@ -232,7 +249,7 @@ impl ChannelStore for OriginBoundChannelStore {
             (_, Some(bound)) => entry.origin = Some(bound),
             (_, None) => {}
         }
-        // Never take over an entry bound elsewhere or left without an origin.
+        // Never take over an entry bound elsewhere.
         if let Some(current) = current {
             if current.origin != entry.origin {
                 return Err(origin_mismatch());
