@@ -8790,6 +8790,10 @@ mod tests {
                 Err(ChannelStoreError::Io("read-only".into()))
             }
 
+            async fn find_channel(&self, _: B256) -> ChannelStoreResult<Option<String>> {
+                Ok(None)
+            }
+
             async fn delete(&self, _: &str) -> ChannelStoreResult<()> {
                 Ok(())
             }

@@ -140,17 +140,15 @@ pub trait ChannelStore: Send + Sync {
     /// keeps only that origin's channels ([`origin`](Self::origin)). `get` and
     /// `delete` must then find and remove the entry under `key`.
     async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()>;
-    /// Return the key channel `channel_id` is stored under, when the store
-    /// keeps it and can look channels up by ID.
+    /// Return the key channel `channel_id` is stored under, or `None` only
+    /// when the store keeps no entry for it under any key.
     ///
     /// Session providers use it to leave a channel in the namespace that
     /// keeps it, such as a channel another origin's provider opened that a
-    /// server snapshot names, instead of copying it into their own. Defaults
-    /// to `Ok(None)`: a provider then only checks the namespace without an
-    /// origin, under the payment-scope key.
-    async fn find_channel(&self, _channel_id: B256) -> ChannelStoreResult<Option<String>> {
-        Ok(None)
-    }
+    /// server snapshot names, instead of copying it into their own. It is
+    /// required, with no default, because `None` vouches that no other
+    /// namespace owns the channel.
+    async fn find_channel(&self, channel_id: B256) -> ChannelStoreResult<Option<String>>;
     /// The HTTP origin, such as `"https://api.example.com"`, that every
     /// channel this store keeps is bound to, when it keeps only one origin's
     /// channels. A session provider using the store is bound to it.
