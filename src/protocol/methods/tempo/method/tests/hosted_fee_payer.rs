@@ -226,6 +226,45 @@ async fn test_hosted_fee_payer_sponsors_and_server_broadcasts() {
     assert!(params.get("feeToken").is_none() && params.get("accessList").is_none());
 }
 
+/// The final simulation carries the hosted fee payer's signature as signed
+/// (and its gas limit), so the node bills the sponsor rather than the sender.
+/// Both `yParity` values decode and are sent back in RPC form.
+#[tokio::test]
+async fn test_hosted_final_simulation_carries_fee_payer_signature() {
+    let client = alloy::signers::local::PrivateKeySigner::random();
+    let fee_token = USDC.parse::<Address>().unwrap();
+    let (envelope, _) = sponsored_charge_envelope(&client);
+    let mut parities = std::collections::BTreeSet::new();
+    while parities.len() < 2 {
+        let sponsor = alloy::signers::local::PrivateKeySigner::random();
+        let answer = fill_answer(&envelope, &sponsor, fee_token, |_| {});
+        let (url, _) = mock_fee_payer(answer.clone()).await;
+        let (method, _) = node(vec![]);
+        let (cosigned, fee_payer) = method
+            .fill_hosted_fee_payer_transaction(&resolved(hosted(&url)), &envelope)
+            .await
+            .unwrap();
+        assert_eq!(fee_payer, sponsor.address());
+
+        let signed =
+            tempo_alloy::primitives::AASigned::decode_2718(&mut cosigned.as_slice()).unwrap();
+        let wire = ChargeMethod::<alloy::providers::RootProvider<TempoNetwork>>::sponsored_simulation_request(
+            &cosigned, fee_payer, None,
+        )
+        .unwrap();
+        let sent = &answer["result"]["tx"]["feePayerSignature"];
+        assert_eq!(wire["feePayerSignature"], *sent);
+        assert_eq!(wire["feePayer"], format!("{fee_payer:#x}"));
+        assert_eq!(wire["gas"], format!("{:#x}", signed.tx().gas_limit));
+        assert!(wire.get("signature").is_none_or(serde_json::Value::is_null));
+        parities.insert(sent["yParity"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(
+        parities.into_iter().collect::<Vec<_>>(),
+        vec!["0x0".to_owned(), "0x1".to_owned()]
+    );
+}
+
 /// Only the sponsor's signature and fee token are taken from its answer: a
 /// signature over changed sender fields recovers to another address, and the
 /// broadcast transaction keeps the client's fields.

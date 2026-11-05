@@ -364,8 +364,9 @@ where
         }
 
         // Sponsorship runs inside mppx's `preflightSponsorship`: the sender's
-        // calls are simulated first, so a reverting transaction never reaches
-        // a signer or hosted fee payer. Co-signing then replaces the
+        // transaction is simulated first, at its broadcast gas limit and with
+        // no fees, so a reverting or under-gassed transaction never reaches a
+        // signer or hosted fee payer. Co-signing then replaces the
         // placeholder fee_payer_signature and sets the fee_token.
         let mut sponsor = None;
         let mut hosted_record = None;
@@ -449,8 +450,23 @@ where
         // it would revert. Fails closed: no simulation, no broadcast.
         // A reconciled transaction may already be on chain, where simulating
         // it again would fail: broadcast it and recover its receipt instead.
+        // The node bills the fee payer it recovers from `feePayerSignature`,
+        // so the simulation carries it: a hosted fee payer's as signed, and a
+        // local fee payer's over a simulation-only copy with gas headroom
+        // within its policy, signed only now that the sender's transaction
+        // passed simulation at the broadcast gas limit. The node's sponsored
+        // call needs more gas than the mined transaction, so where that
+        // headroom is short (hosted, or clamped by the policy) a gas-limit-only
+        // failure passes here; the sender simulation is the gas bound.
         if let (Some(sponsor), false) = (sponsor, reconciling) {
-            self.simulate_sponsored_transaction(&final_tx_bytes, sponsor)
+            let simulation = match &self.fee_payer_signer {
+                Some(fee_payer_signer) => Some(
+                    self.sign_fee_payer_simulation(&final_tx_bytes, fee_payer_signer.as_ref())
+                        .await?,
+                ),
+                None => None,
+            };
+            self.simulate_sponsored_transaction(&final_tx_bytes, sponsor, simulation.as_ref())
                 .await?;
         }
 

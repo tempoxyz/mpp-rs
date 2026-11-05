@@ -10,6 +10,7 @@ use tempo_alloy::TempoNetwork;
 use crate::protocol::traits::VerificationError;
 
 use super::super::{network::TempoNetwork as KnownTempoNetwork, CHAIN_ID, PATH_USD};
+use super::simulate::{FeePayerSimulation, SPONSORED_SIMULATION_GAS_BUFFER};
 use super::ChargeMethod;
 
 pub(super) const MAX_FEE_PAYER_GAS_LIMIT: u64 = 2_000_000;
@@ -133,6 +134,49 @@ fn default_fee_payer_allowed_fee_tokens(chain_id: u64) -> Vec<Address> {
         }
     }
     tokens
+}
+
+/// Gas limit of a local fee payer's simulation-only copy: `gas_limit` plus
+/// [`SPONSORED_SIMULATION_GAS_BUFFER`], clamped to the policy's `max_gas` and
+/// to the most gas `max_total_fee` pays for at `max_fee_per_gas`, and never
+/// below `gas_limit`.
+pub(super) fn sponsored_simulation_gas_limit(
+    policy: &FeePayerPolicy,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+) -> u64 {
+    let max_gas_by_total_fee = policy
+        .max_total_fee
+        .checked_div(max_fee_per_gas)
+        .map_or(u64::MAX, |gas| u64::try_from(gas).unwrap_or(u64::MAX));
+    let cap = policy.max_gas.min(max_gas_by_total_fee);
+    gas_limit
+        .saturating_add(SPONSORED_SIMULATION_GAS_BUFFER)
+        .min(cap)
+        .max(gas_limit)
+}
+
+/// Reject a gas limit above the policy's `max_gas`, or whose total fee
+/// (`gas_limit * max_fee_per_gas`) exceeds its `max_total_fee`.
+fn ensure_within_gas_policy(
+    policy: &FeePayerPolicy,
+    gas_limit: u64,
+    max_fee_per_gas: u128,
+) -> Result<(), VerificationError> {
+    if gas_limit > policy.max_gas {
+        return Err(VerificationError::new(format!(
+            "Fee-sponsored transaction gas limit {gas_limit} exceeds maximum {}",
+            policy.max_gas
+        )));
+    }
+    let total_fee = (gas_limit as u128).saturating_mul(max_fee_per_gas);
+    if total_fee > policy.max_total_fee {
+        return Err(VerificationError::new(format!(
+            "Total fee {total_fee} (gas_limit * max_fee_per_gas) exceeds policy maximum {}",
+            policy.max_total_fee
+        )));
+    }
+    Ok(())
 }
 
 fn fee_token_allowed(allowed_fee_tokens: &[Address], fee_token: Address) -> bool {
@@ -326,6 +370,56 @@ where
 
         let signed_tx = tx.into_signed(client_signature);
         Ok(signed_tx.encoded_2718())
+    }
+
+    /// Sign a simulation-only copy of a locally co-signed transaction for the
+    /// final sponsored simulation, as mppx's `signFeePayerSimulation`.
+    ///
+    /// Tempo's `eth_call` bills the fee payer it recovers from
+    /// `feePayerSignature`, and that signature binds the gas limit, while the
+    /// node's sponsored simulation needs more gas than the mined transaction
+    /// uses. So the fee payer signs the same payload as its broadcast
+    /// co-signature (the transaction with its fee token, for the sender) with
+    /// the gas limit raised by up to [`SPONSORED_SIMULATION_GAS_BUFFER`]; the
+    /// broadcast transaction keeps its gas limit, and only the sender
+    /// simulation, at that limit, bounds it. The copy is held to the same fee
+    /// payer policy as the broadcast transaction: the padding is clamped so
+    /// its gas limit stays within `max_gas` and its gas limit times
+    /// `max_fee_per_gas` within `max_total_fee`, and the copy is checked
+    /// against both before it is signed. The copy is only ever simulated,
+    /// never broadcast. Call it only after the sender's calls passed
+    /// simulation.
+    pub(super) async fn sign_fee_payer_simulation(
+        &self,
+        final_tx_bytes: &[u8],
+        fee_payer_signer: &super::super::DynSigner,
+    ) -> Result<FeePayerSimulation, VerificationError> {
+        use alloy::eips::Decodable2718;
+
+        let signed = tempo_alloy::primitives::AASigned::decode_2718(&mut &final_tx_bytes[..])
+            .map_err(|e| {
+                VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
+            })?;
+        let sender = signed.recover_signer().map_err(|e| {
+            VerificationError::new(format!("Failed to recover sender for simulation: {e}"))
+        })?;
+        let mut tx = signed.tx().clone();
+        let broadcast_gas_limit = tx.gas_limit;
+        let policy = FeePayerPolicy::resolve(tx.chain_id, self.fee_payer_policy_override.as_ref());
+        tx.gas_limit = sponsored_simulation_gas_limit(&policy, tx.gas_limit, tx.max_fee_per_gas);
+        ensure_within_gas_policy(&policy, tx.gas_limit, tx.max_fee_per_gas)?;
+        tx.fee_payer_signature = None;
+        let fee_payer_signature = fee_payer_signer
+            .sign_hash(&tx.fee_payer_signature_hash(sender))
+            .await
+            .map_err(|e| {
+                VerificationError::internal(format!("Failed to sign fee payer simulation: {e}"))
+            })?;
+        Ok(FeePayerSimulation {
+            gas_limit: tx.gas_limit,
+            gas_buffer: tx.gas_limit - broadcast_gas_limit,
+            fee_payer_signature,
+        })
     }
 
     /// Sponsor fee-token allowlist: the configured list, else the chain default.
