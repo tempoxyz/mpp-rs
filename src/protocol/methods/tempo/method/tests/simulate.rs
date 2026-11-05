@@ -741,26 +741,84 @@ async fn test_local_fee_payer_simulation_copy_stays_within_policy() {
     }
 }
 
-/// Gas-limit-only failures are told apart by the node's message, never by a
-/// revert reason or by the -32003 code the fee-balance error shares.
+/// A node JSON-RPC error as the provider returns it.
+fn node_error(json: &str) -> alloy::transports::RpcError<alloy::transports::TransportErrorKind> {
+    alloy::transports::RpcError::ErrorResp(serde_json::from_str(json).unwrap())
+}
+
+/// Gas-limit-only failures are told apart by the start of the node's own
+/// message, as mppx's `isOutOfGasError`: never by a revert reason, revert
+/// data, a wrapper's text or the -32003 code the fee-balance error shares.
 #[test]
 fn test_is_gas_limit_error() {
-    assert!(is_gas_limit_error(-32003, &out_of_gas().message));
-    assert!(is_gas_limit_error(-32000, "intrinsic gas too low"));
-    assert!(is_gas_limit_error(-32003, "Out of gas"));
-    assert!(!is_gas_limit_error(
+    let from = |code: i64, message: &str| {
+        alloy::transports::RpcError::ErrorResp(alloy_json_rpc::ErrorPayload {
+            code,
+            message: message.to_owned().into(),
+            data: None,
+        })
+    };
+
+    // Tempo mainnet v1.18.1's errors, which carry no data.
+    let real = node_error(
+        r#"{"code":-32003,"message":"out of gas: gas exhausted during precompiled contract execution: 40960"}"#,
+    );
+    assert!(
+        real.to_string()
+            .starts_with("server returned an error response"),
+        "alloy wraps the node message: {real}"
+    );
+    assert!(is_gas_limit_error(&real), "wrapped real out of gas counts");
+    assert!(is_gas_limit_error(&node_error(
+        r#"{"code":-32000,"message":"intrinsic gas too low"}"#
+    )));
+    assert!(is_gas_limit_error(&node_error(
+        r#"{"code":-32000,"message":"intrinsic gas too low: have 21000, want 25000"}"#
+    )));
+    assert!(is_gas_limit_error(&from(-32003, &out_of_gas().message)));
+    assert!(is_gas_limit_error(&from(-32003, "  Out of gas ")));
+
+    // Reverts never count, whatever their reason says.
+    assert!(!is_gas_limit_error(&from(3, "out of gas")));
+    assert!(!is_gas_limit_error(&from(
+        3,
+        "execution reverted: out of gas"
+    )));
+    assert!(!is_gas_limit_error(&from(
+        -32000,
+        "execution reverted: out of gas"
+    )));
+
+    // Revert data rules it out even with a gas message; empty data does not.
+    assert!(!is_gas_limit_error(&node_error(
+        r#"{"code":-32003,"message":"out of gas","data":"0x08c379a0"}"#
+    )));
+    assert!(is_gas_limit_error(&node_error(
+        r#"{"code":-32003,"message":"out of gas","data":"0x"}"#
+    )));
+    assert!(is_gas_limit_error(&node_error(
+        r#"{"code":-32003,"message":"out of gas","data":null}"#
+    )));
+
+    // Text mentioning out of gas around another error is not gas exhaustion.
+    assert!(!is_gas_limit_error(&from(
         -32003,
         &insufficient_fee_balance().message
-    ));
-    assert!(
-        !is_gas_limit_error(3, "out of gas"),
-        "a revert reason never counts"
-    );
-    assert!(!is_gas_limit_error(3, "execution reverted: out of gas"));
+    )));
+    assert!(!is_gas_limit_error(&from(
+        -32003,
+        "simulation failed (out of gas?): insufficient fee token balance: required 6554, but only have 0"
+    )));
     assert!(!is_gas_limit_error(
+        &alloy::transports::RpcError::local_usage_str(
+            "out of gas: insufficient fee token balance: required 6554, but only have 0"
+        )
+    ));
+    assert!(!is_gas_limit_error(&from(-32003, "out of gasoline")));
+    assert!(!is_gas_limit_error(&from(
         -32601,
         "the method eth_call does not exist"
-    ));
+    )));
 }
 
 /// A hosted fee payer's signature binds the broadcast gas limit, so its

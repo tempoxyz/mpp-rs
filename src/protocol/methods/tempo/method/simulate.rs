@@ -26,6 +26,7 @@ use alloy::consensus::transaction::SignerRecoverable;
 use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, Bytes, Signature};
 use alloy::providers::Provider;
+use alloy::transports::{RpcError, TransportErrorKind};
 use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
 use tempo_alloy::primitives::AASigned;
 use tempo_alloy::rpc::TempoTransactionRequest;
@@ -82,16 +83,43 @@ pub(super) fn rpc_signature(signature: &Signature) -> serde_json::Value {
 /// JSON-RPC error code nodes return for a reverted call.
 const JSONRPC_EXECUTION_REVERTED: i64 = 3;
 
-/// Whether a failed `eth_call` failed only for its gas limit, as Tempo
-/// v1.18 reports it: "out of gas: ..." (code -32003, which the fee-token
-/// balance error shares, so the code alone cannot tell them apart) or
-/// "intrinsic gas too low" (code -32000). Matched by the start of the node's
-/// message. A revert (code 3) never counts, whatever its reason says, since
-/// the reverting contract chooses that text.
-pub(super) fn is_gas_limit_error(code: i64, message: &str) -> bool {
-    let message = message.trim_start().to_ascii_lowercase();
-    code != JSONRPC_EXECUTION_REVERTED
-        && (message.starts_with("out of gas") || message.starts_with("intrinsic gas too low"))
+/// Whether a failed `eth_call` failed only for its gas limit, as mppx's
+/// `isOutOfGasError`. Tempo v1.18.1 reports gas exhaustion as
+/// `{"code":-32003,"message":"out of gas: gas exhausted during precompiled
+/// contract execution: 40960"}` or `{"code":-32000,"message":"intrinsic gas
+/// too low"}`, with no `data`.
+///
+/// Only the node's own JSON-RPC error counts, never a wrapper's text, and only
+/// a message that starts with "out of gas" or "intrinsic gas too low" followed
+/// by `:` or its end: -32003 is shared with the fee-token balance error, so
+/// the code alone cannot tell them apart, and a substring match would let
+/// "execution reverted: out of gas" or a wrapper around a balance error pass
+/// to broadcast. A revert (code 3) or an error carrying revert data never
+/// counts, since the reverting contract chooses that text.
+pub(super) fn is_gas_limit_error(error: &RpcError<TransportErrorKind>) -> bool {
+    let Some(payload) = error.as_error_resp() else {
+        return false;
+    };
+    // Revert data: a `data` field other than null, `""` or `"0x"`.
+    let has_revert_data = payload.data.as_ref().is_some_and(|data| {
+        let data = data.get().trim();
+        data != "null"
+            && !matches!(
+                serde_json::from_str::<String>(data).as_deref(),
+                Ok("" | "0x")
+            )
+    });
+    if payload.code == JSONRPC_EXECUTION_REVERTED || has_revert_data {
+        return false;
+    }
+    let message = payload.message.trim().to_ascii_lowercase();
+    ["out of gas", "intrinsic gas too low"]
+        .iter()
+        .any(|prefix| {
+            message
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        })
 }
 
 /// Bytes a keychain envelope puts before its approval: the type byte and the
@@ -281,7 +309,7 @@ where
             return Ok(());
         };
         match e.as_error_resp() {
-            Some(err) if tolerate_gas_limit && is_gas_limit_error(err.code, &err.message) => Ok(()),
+            _ if tolerate_gas_limit && is_gas_limit_error(&e) => Ok(()),
             Some(err) if err.code == JSONRPC_EXECUTION_REVERTED => {
                 Err(VerificationError::transaction_failed(format!(
                     "Sponsored transaction would revert in pre-broadcast simulation: {} (code {})",
