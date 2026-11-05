@@ -487,7 +487,7 @@ async fn test_local_fee_payer_simulation_copy_has_gas_headroom() {
         simulation.gas_limit,
         gas_limit + SPONSORED_SIMULATION_GAS_BUFFER
     );
-    assert_eq!(SPONSORED_SIMULATION_GAS_BUFFER, 10_000);
+    assert_eq!(SPONSORED_SIMULATION_GAS_BUFFER, 6_000);
     assert_ne!(
         Some(simulation.fee_payer_signature),
         broadcast.tx().fee_payer_signature,

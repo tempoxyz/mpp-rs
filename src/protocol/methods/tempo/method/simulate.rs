@@ -39,12 +39,16 @@ use super::ChargeMethod;
 /// Extra gas a local fee payer signs into its simulation-only copy of a
 /// sponsored transaction, as mppx's `sponsoredSimulationGasBuffer`.
 ///
-/// The fee payer signature binds the gas limit, and Tempo's sponsored
-/// `eth_call` charges more gas than the same transaction uses when mined
-/// (about 6,000 for a session top-up on v1.18.1: mined 63,645 of a 67,894
-/// limit, simulated 69,645), so simulating at the signed limit would reject
-/// transactions that succeed onchain. The broadcast transaction keeps its own
-/// gas limit, which the sender simulation bounds. The padding is clamped to
+/// Tempo's `eth_call` skips fee collection, so the fee token's storage slots
+/// that block execution warms before the calls stay cold: a sponsored
+/// simulation needs exactly 6,000 more gas than the mined transaction when
+/// its calls touch the fee token (a session top-up on v1.18.1: mined 63,045
+/// of a 67,894 limit, simulated 69,045), and no more otherwise. The remaining
+/// risk is a gas limit up to 6,000 short on calls that don't touch the fee
+/// token, which passes simulation and reverts onchain; a node fix that warms
+/// those slots in `eth_call` would remove this buffer. The fee payer
+/// signature binds the gas limit, so the broadcast transaction keeps its own,
+/// which the sender simulation bounds. The padding is clamped to
 /// the fee payer policy (`max_gas` and `max_total_fee`), so the fee payer
 /// never signs a copy its policy would refuse.
 ///
@@ -53,7 +57,7 @@ use super::ChargeMethod;
 /// may fail only for this overhead: such a gas-limit-only failure is
 /// tolerated (see [`is_gas_limit_error`]), because the sender simulation
 /// already passed at the broadcast gas limit. Any other failure stays fatal.
-pub(super) const SPONSORED_SIMULATION_GAS_BUFFER: u64 = 10_000;
+pub(super) const SPONSORED_SIMULATION_GAS_BUFFER: u64 = 6_000;
 
 /// A fee payer signature over a simulation-only copy of a sponsored
 /// transaction whose gas limit is `gas_limit`, used in the final simulation
