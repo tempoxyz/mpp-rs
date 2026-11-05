@@ -138,7 +138,9 @@ pub trait ChannelStore: Send + Sync {
     /// A session provider bound to an HTTP origin keeps its channels in that
     /// origin's namespace, under [`origin_channel_key`], unless the store
     /// keeps only that origin's channels ([`origin`](Self::origin)). `get` and
-    /// `delete` must then find and remove the entry under `key`.
+    /// `delete` must then find and remove the entry under `key`. It must
+    /// refuse, atomically with the write, an entry whose channel is already
+    /// stored under another key, so a channel lives in one namespace only.
     async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()>;
     /// Return the key channel `channel_id` is stored under, or `None` only
     /// when the store keeps no entry for it under any key.
@@ -189,6 +191,15 @@ impl ChannelStore for MemoryChannelStore {
 
     async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
         let mut entries = self.entries.lock().unwrap();
+        // A channel lives under one key: checked under the same lock as the
+        // write, so providers racing to store it in two namespaces can't
+        // both succeed.
+        if entries
+            .iter()
+            .any(|(at, stored)| at != key && stored.channel_id == entry.channel_id)
+        {
+            return Err(origin_mismatch());
+        }
         let current = entries.get(key);
         let origin = merge_origin(current, entry)?;
         let mut merged = match current {
@@ -1534,6 +1545,31 @@ mod tests {
         );
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_store_keeps_a_channel_under_one_key() {
+        let store = MemoryChannelStore::default();
+        let key = entry().key();
+        store
+            .set_at(&origin_channel_key(&key, ORIGIN), &entry())
+            .await
+            .unwrap();
+        let error = store
+            .set_at(&origin_channel_key(&key, OTHER), &entry())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"), "{error}");
+        assert!(store
+            .get(&origin_channel_key(&key, OTHER))
+            .await
+            .unwrap()
+            .is_none());
+        // Updating it under its own key still works.
+        store
+            .set_at(&origin_channel_key(&key, ORIGIN), &entry())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
