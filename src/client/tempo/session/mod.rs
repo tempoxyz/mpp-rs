@@ -1547,8 +1547,10 @@ impl TempoSessionProvider {
     ) -> Result<String, MppError> {
         if session_req.machine_token_enabled() {
             let details = session_req.tempo_session_details()?;
+            // Lowercase like StoredChannelEntry::key, which keys the stored
+            // entry, so the provider finds and reuses its own channel.
             return Ok(format!(
-                "{}:{}:{}:{:#x}:{}",
+                "{:#x}:{}:{}:{:#x}:{}",
                 payee,
                 details
                     .settlement_recipient
@@ -4864,6 +4866,40 @@ mod tests {
                 .unwrap(),
             Some(25_000)
         );
+    }
+
+    #[test]
+    fn machine_token_scope_key_is_lowercase_like_the_stored_entry_key() {
+        let payee: Address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap();
+        let escrow: Address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+            .parse()
+            .unwrap();
+        let req = SessionRequest {
+            amount: "1".into(),
+            currency: "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+            method_details: Some(serde_json::json!({
+                "chainId": 4217,
+                "escrowContract": "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+                "machineTokenEnabled": true,
+                "settlementRecipient": "0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+                "settlementToken": "0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+            })),
+            ..Default::default()
+        };
+        let key = TempoSessionProvider::payment_scope_key(
+            &req,
+            payee,
+            Address::ZERO,
+            Address::ZERO,
+            escrow,
+            4217,
+        )
+        .unwrap();
+        // The stored entry's key lowercases the adapter, so a checksummed
+        // payee would put the provider's own channel in another namespace.
+        assert_eq!(key, key.to_lowercase());
     }
 
     #[test]
