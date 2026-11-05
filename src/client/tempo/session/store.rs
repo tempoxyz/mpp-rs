@@ -130,6 +130,23 @@ pub trait ChannelStore: Send + Sync {
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>>;
     /// Insert or replace a channel entry.
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()>;
+    /// Insert or replace `entry` under `key` instead of its payment-scope
+    /// key [`StoredChannelEntry::key`], merging it with a stored entry for the
+    /// same channel as [`set`](Self::set) does.
+    ///
+    /// Session providers sharing a store use it to keep a channel under
+    /// [`origin_channel_key`] when the payment-scope key holds another
+    /// provider's channel, so neither overwrites the other. The default only
+    /// accepts `entry.key()` and refuses any other key, so a store that does
+    /// not override it fails that write and keeps the other channel.
+    async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+        if key == entry.key() {
+            return self.set(entry).await;
+        }
+        Err(ChannelStoreError::InvalidEntry(format!(
+            "channel store cannot keep a channel under {key}"
+        )))
+    }
     /// Remove the channel cached for `key`.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()>;
 }
@@ -156,8 +173,12 @@ impl ChannelStore for MemoryChannelStore {
     }
 
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+        self.set_at(&entry.key(), entry).await
+    }
+
+    async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
         let mut entries = self.entries.lock().unwrap();
-        let current = entries.get(&entry.key());
+        let current = entries.get(key);
         let origin = merge_origin(current, entry)?;
         let mut merged = match current {
             Some(current) if current.channel_id == entry.channel_id => StoredChannelEntry {
@@ -168,7 +189,7 @@ impl ChannelStore for MemoryChannelStore {
             _ => entry.clone(),
         };
         merged.origin = origin;
-        entries.insert(merged.key(), merged);
+        entries.insert(key.to_owned(), merged);
         Ok(())
     }
 
@@ -178,37 +199,86 @@ impl ChannelStore for MemoryChannelStore {
     }
 }
 
+/// Key under which a session provider keeps its channel for payment scope
+/// `key` when the scope's own entry belongs to another provider sharing the
+/// store: `"{key}@{origin}"` for a provider bound to an HTTP origin, such as
+/// `"0xpayee:0xtoken:0xescrow:4217@https://api.example.com"`, and
+/// `"{key}@none"` for a provider without one.
+///
+/// The entry under `key` itself is never overwritten in that case. A
+/// channel stored without an origin, such as one written before origins
+/// existed, therefore stays under `key`, where [`ChannelStore::get`] finds
+/// it and a provider without an HTTP origin (one that pays through a bare
+/// `pay` or a non-HTTP MCP resource) still reuses and closes it.
+pub fn origin_channel_key(key: &str, origin: Option<&str>) -> String {
+    format!("{key}@{}", origin.unwrap_or("none"))
+}
+
 /// A session provider's view of its channel store, bound to the provider's
-/// HTTP origin: entries it writes carry that origin, and an entry bound to
-/// another origin is refused rather than reused or rebound, as mppx does. A
-/// legacy entry without an origin is never reused or rebound by a bound
-/// provider either: it reads as absent, so the provider opens a new channel
-/// and replaces it instead of being locked out of the payment scope. An
-/// unbound provider adopts the origin of the first bound entry it reads, so it
-/// cannot later pay another origin with it.
+/// HTTP origin once it has one: entries it writes carry that origin, and an
+/// entry bound to another origin is refused rather than reused or rebound, as
+/// mppx does.
+///
+/// Providers sharing one store never overwrite each other's channels. A
+/// bound provider neither reuses nor rebinds a channel stored without an
+/// origin (a legacy entry, or one an unbound provider paying the same payee
+/// keeps): it reads as absent, and the provider keeps the channel it opens
+/// under [`origin_channel_key`] instead, leaving the other entry where it is.
+/// Likewise, an unbound provider that opens a channel while the scope holds a
+/// bound provider's channel keeps its own under `origin_channel_key(key,
+/// None)`. An unbound provider may reuse a bound entry it reads, keeping that
+/// entry's origin as mppx's `persistChannel` does, but reading it never binds
+/// the provider.
 pub(crate) struct OriginBoundChannelStore {
     pub(crate) inner: Arc<dyn ChannelStore>,
     pub(crate) origin: Arc<Mutex<Option<String>>>,
 }
 
+/// Where a provider's channel for one payment scope lives.
+enum Slot {
+    /// The payment-scope key itself.
+    Scope,
+    /// The provider's own [`origin_channel_key`].
+    Own(String),
+}
+
 impl OriginBoundChannelStore {
-    /// Whether a bound provider may see `stored`: every entry, except a
-    /// legacy one without an origin once the provider is bound.
-    fn reusable(&self, stored: &StoredChannelEntry) -> bool {
-        stored.origin.is_some() || self.origin.lock().unwrap().is_none()
+    fn bound(&self) -> Option<String> {
+        self.origin.lock().unwrap().clone()
     }
 
-    /// Check a stored entry against the provider's origin, binding an unbound
-    /// provider to the entry's origin, and return the provider's origin.
-    fn adopt(&self, stored: &StoredChannelEntry) -> ChannelStoreResult<Option<String>> {
-        let mut bound = self.origin.lock().unwrap();
-        match (bound.as_ref(), stored.origin.as_ref()) {
-            (Some(bound), Some(stored)) if bound == stored => {}
-            (None, Some(stored)) => *bound = Some(stored.clone()),
-            (None, None) => {}
-            _ => return Err(origin_mismatch()),
+    /// Whether the entry stored under the payment-scope key belongs to a
+    /// provider bound to `bound`: one bound to the same origin, or, for an
+    /// unbound provider, one without an origin.
+    fn owns(bound: Option<&str>, stored: &StoredChannelEntry) -> bool {
+        stored.origin.as_deref() == bound
+    }
+
+    /// Find where this provider keeps its channel for `key`, with the entry
+    /// stored there. An entry under the scope key that belongs to another
+    /// provider reads as absent, except that a bound provider refuses an
+    /// entry bound to another origin.
+    async fn locate(
+        &self,
+        key: &str,
+        bound: Option<&str>,
+    ) -> ChannelStoreResult<(Option<Slot>, Option<StoredChannelEntry>)> {
+        let own = origin_channel_key(key, bound);
+        if let Some(entry) = self.inner.get(&own).await? {
+            return Ok((Some(Slot::Own(own)), Some(entry)));
         }
-        Ok(bound.clone())
+        match self.inner.get(key).await? {
+            None => Ok((Some(Slot::Scope), None)),
+            Some(entry) if Self::owns(bound, &entry) => Ok((Some(Slot::Scope), Some(entry))),
+            Some(entry) => match (bound, entry.origin.as_deref()) {
+                (Some(_), Some(_)) => Err(origin_mismatch()),
+                // An unbound provider reuses a bound entry without binding.
+                (None, Some(_)) => Ok((Some(Slot::Scope), Some(entry))),
+                // A bound provider never reuses an origin-less entry.
+                (Some(_), None) => Ok((None, None)),
+                (None, None) => unreachable!("an unbound provider owns origin-less entries"),
+            },
+        }
     }
 }
 
@@ -219,47 +289,77 @@ impl ChannelStore for OriginBoundChannelStore {
     }
 
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
-        let entry = self
-            .inner
-            .get(key)
-            .await?
-            .filter(|entry| self.reusable(entry));
-        if let Some(entry) = &entry {
-            self.adopt(entry)?;
-        }
-        Ok(entry)
+        let bound = self.bound();
+        Ok(self.locate(key, bound.as_deref()).await?.1)
     }
 
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
-        // A bound provider replaces a legacy entry without an origin.
-        let current = self
-            .inner
-            .get(&entry.key())
-            .await?
-            .filter(|current| self.reusable(current));
-        // Adopt the stored entry's origin as `get` does, so an unbound provider
-        // keeps writing an entry its store stamped with an origin.
-        let bound = match &current {
-            Some(current) => self.adopt(current)?,
-            None => self.origin.lock().unwrap().clone(),
-        };
+        let bound = self.bound();
         let mut entry = entry.clone();
-        match (&entry.origin, bound) {
-            (Some(origin), Some(bound)) if *origin != bound => return Err(origin_mismatch()),
-            (_, Some(bound)) => entry.origin = Some(bound),
-            (_, None) => {}
-        }
-        // Never take over an entry bound elsewhere.
-        if let Some(current) = current {
-            if current.origin != entry.origin {
+        if let Some(bound) = &bound {
+            if entry.origin.as_ref().is_some_and(|origin| origin != bound) {
                 return Err(origin_mismatch());
             }
+            entry.origin = Some(bound.clone());
         }
-        self.inner.set(&entry).await
+        let key = entry.key();
+        let (slot, current) = match self.locate(&key, bound.as_deref()).await? {
+            (Some(Slot::Own(own)), current) => (Slot::Own(own), current),
+            // Write over the scope entry only when it is this provider's own
+            // or the same channel; never replace another provider's channel.
+            (Some(Slot::Scope), current)
+                if current.as_ref().is_none_or(|current| {
+                    Self::owns(bound.as_deref(), current) || current.channel_id == entry.channel_id
+                }) =>
+            {
+                (Slot::Scope, current)
+            }
+            _ => (Slot::Own(origin_channel_key(&key, bound.as_deref())), None),
+        };
+        let slot_key = match &slot {
+            Slot::Scope => key.clone(),
+            Slot::Own(own) => own.clone(),
+        };
+        match &slot {
+            Slot::Scope => self.inner.set(&entry).await?,
+            Slot::Own(own) => self.inner.set_at(own, &entry).await?,
+        }
+        // A store that stamps its own origin on what it writes, such as a
+        // SQLite store namespaced by an HTTP origin, binds an unbound provider
+        // to that origin through the provider's own write. Reading or reusing
+        // a channel another provider bound never does.
+        if bound.is_none() && current.and_then(|current| current.origin).is_none() {
+            if let Some(origin) = self
+                .inner
+                .get(&slot_key)
+                .await?
+                .filter(|written| written.channel_id == entry.channel_id)
+                .and_then(|written| written.origin)
+            {
+                self.origin.lock().unwrap().get_or_insert(origin);
+            }
+        }
+        Ok(())
     }
 
+    /// Forget this provider's channel for `key`, once the session manager has
+    /// confirmed it unfunded: the one under its own key when it has one, else
+    /// the scope entry, unless that is bound to another origin.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
-        self.inner.delete(key).await
+        let bound = self.bound();
+        let own = origin_channel_key(key, bound.as_deref());
+        if self.inner.get(&own).await?.is_some() {
+            return self.inner.delete(&own).await;
+        }
+        match self.inner.get(key).await? {
+            Some(current)
+                if current.origin.is_none() || bound.is_none() || current.origin == bound =>
+            {
+                self.inner.delete(key).await
+            }
+            // Never delete another origin's channel.
+            _ => Ok(()),
+        }
     }
 }
 
@@ -558,8 +658,11 @@ mod sqlite {
         }
 
         async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
-            let key = entry.key();
-            let scope_key = self.scoped_key(&key);
+            self.set_at(&entry.key(), entry).await
+        }
+
+        async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+            let scope_key = self.scoped_key(key);
             let mut connection = self.connection.lock().unwrap();
             let transaction = connection.transaction().map_err(io_error)?;
             let current: Option<StoredChannelEntry> = transaction
@@ -896,6 +999,185 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("origin mismatch"));
         assert_eq!(store.get(&bound.key()).await.unwrap(), Some(bound));
+    }
+
+    const ORIGIN: &str = "https://api.example.test";
+
+    fn view(inner: &Arc<dyn ChannelStore>, origin: Option<&str>) -> OriginBoundChannelStore {
+        OriginBoundChannelStore {
+            inner: inner.clone(),
+            origin: Arc::new(Mutex::new(origin.map(str::to_owned))),
+        }
+    }
+
+    async fn bound_provider_keeps_legacy_channel_recoverable(inner: Arc<dyn ChannelStore>) {
+        let legacy = entry();
+        let key = legacy.key();
+        inner.set(&legacy).await.unwrap();
+        let bound = view(&inner, Some(ORIGIN));
+        // Never reused: the legacy entry reads as absent.
+        assert!(bound.get(&key).await.unwrap().is_none());
+
+        // The new channel goes under the provider's own key; the legacy one
+        // stays under the scope key.
+        let opened = StoredChannelEntry {
+            channel_id: B256::repeat_byte(0x77),
+            ..entry()
+        };
+        bound.set(&opened).await.unwrap();
+        let own = origin_channel_key(&key, Some(ORIGIN));
+        assert_eq!(own, format!("{key}@{ORIGIN}"));
+        let stored = inner.get(&key).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.channel_id, stored.origin),
+            (legacy.channel_id, None)
+        );
+        let kept = bound.get(&key).await.unwrap().unwrap();
+        assert_eq!(kept.channel_id, opened.channel_id);
+        assert_eq!(kept.origin.as_deref(), Some(ORIGIN));
+        assert_eq!(inner.get(&own).await.unwrap(), Some(kept));
+
+        // A provider without an origin still finds the legacy channel to
+        // close it, and the bound provider deleting its own leaves it.
+        let unbound = view(&inner, None);
+        assert_eq!(
+            unbound.get(&key).await.unwrap().unwrap().channel_id,
+            legacy.channel_id
+        );
+        bound.delete(&key).await.unwrap();
+        assert!(inner.get(&own).await.unwrap().is_none());
+        assert!(bound.get(&key).await.unwrap().is_none());
+        assert_eq!(
+            inner.get(&key).await.unwrap().unwrap().channel_id,
+            legacy.channel_id
+        );
+        // Nor does deleting for a provider bound to another origin remove a
+        // channel bound to this one.
+        let opened = StoredChannelEntry {
+            origin: Some(ORIGIN.into()),
+            ..opened
+        };
+        inner.delete(&key).await.unwrap();
+        inner.set(&opened).await.unwrap();
+        view(&inner, Some("https://other.example"))
+            .delete(&key)
+            .await
+            .unwrap();
+        assert_eq!(inner.get(&key).await.unwrap(), Some(opened));
+    }
+
+    #[tokio::test]
+    async fn bound_provider_never_overwrites_a_legacy_channel() {
+        bound_provider_keeps_legacy_channel_recoverable(Arc::new(MemoryChannelStore::default()))
+            .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn bound_provider_never_overwrites_a_legacy_sqlite_channel() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: "wallet".into(),
+            path: Some(directory.join("channels.db")),
+            request_url: None,
+        })
+        .unwrap();
+        bound_provider_keeps_legacy_channel_recoverable(Arc::new(store)).await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_and_unbound_providers_never_overwrite_each_other() {
+        let first = entry();
+        let second = StoredChannelEntry {
+            channel_id: B256::repeat_byte(0x77),
+            ..entry()
+        };
+        let key = first.key();
+        for unbound_first in [true, false] {
+            let inner: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::default());
+            let bound = view(&inner, Some(ORIGIN));
+            let unbound = view(&inner, None);
+            let (mine, theirs) = if unbound_first {
+                unbound.set(&first).await.unwrap();
+                bound.set(&second).await.unwrap();
+                (first.clone(), second.clone())
+            } else {
+                bound.set(&second).await.unwrap();
+                unbound.set(&first).await.unwrap();
+                (first.clone(), second.clone())
+            };
+            // Each provider keeps its own channel and both records survive
+            // later writes.
+            for _ in 0..2 {
+                unbound
+                    .set(&StoredChannelEntry {
+                        cumulative_amount: mine.cumulative_amount + 1,
+                        ..mine.clone()
+                    })
+                    .await
+                    .unwrap();
+                bound.set(&theirs).await.unwrap();
+            }
+            let unbound_entry = unbound.get(&key).await.unwrap().unwrap();
+            assert_eq!(unbound_entry.channel_id, mine.channel_id);
+            assert_eq!(unbound_entry.origin, None);
+            assert_eq!(unbound_entry.cumulative_amount, mine.cumulative_amount + 1);
+            let bound_entry = bound.get(&key).await.unwrap().unwrap();
+            assert_eq!(bound_entry.channel_id, theirs.channel_id);
+            assert_eq!(bound_entry.origin.as_deref(), Some(ORIGIN));
+            // Reading and writing never binds the unbound provider.
+            assert!(unbound.origin.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn unbound_provider_reuses_a_bound_channel_without_binding() {
+        let inner: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::default());
+        let bound = view(&inner, Some(ORIGIN));
+        bound.set(&entry()).await.unwrap();
+        let unbound = view(&inner, None);
+        let stored = unbound.get(&entry().key()).await.unwrap().unwrap();
+        assert_eq!(stored.origin.as_deref(), Some(ORIGIN));
+        // Writing the same channel keeps the stored origin, as mppx's
+        // persistChannel does, and never binds the provider.
+        unbound
+            .set(&StoredChannelEntry {
+                cumulative_amount: 3_000_000,
+                ..entry()
+            })
+            .await
+            .unwrap();
+        let stored = inner.get(&entry().key()).await.unwrap().unwrap();
+        assert_eq!(stored.origin.as_deref(), Some(ORIGIN));
+        assert_eq!(stored.cumulative_amount, 3_000_000);
+        assert!(unbound.origin.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn default_set_at_refuses_other_keys() {
+        struct Plain(MemoryChannelStore);
+        #[async_trait::async_trait]
+        impl ChannelStore for Plain {
+            async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
+                self.0.get(key).await
+            }
+            async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                self.0.set(entry).await
+            }
+            async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
+                self.0.delete(key).await
+            }
+        }
+        let inner: Arc<dyn ChannelStore> = Arc::new(Plain(MemoryChannelStore::default()));
+        inner.set(&entry()).await.unwrap();
+        let bound = view(&inner, Some(ORIGIN));
+        let opened = StoredChannelEntry {
+            channel_id: B256::repeat_byte(0x77),
+            ..entry()
+        };
+        assert!(bound.set(&opened).await.is_err());
+        assert_eq!(inner.get(&entry().key()).await.unwrap(), Some(entry()));
     }
 
     #[test]

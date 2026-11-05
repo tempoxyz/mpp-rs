@@ -750,6 +750,10 @@ impl TempoSessionProvider {
     ///
     /// Channels are persisted with this provider's HTTP origin, and a channel
     /// bound to another origin is never reused.
+    /// Providers sharing one store never overwrite each other's channels:
+    /// when the payment scope's entry belongs to another provider, such as a
+    /// channel stored without an origin, this provider keeps its own under
+    /// [`store::origin_channel_key`] and leaves that entry in place.
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
         self.channel_store = Arc::new(OriginBoundChannelStore {
             inner: store,
@@ -5305,7 +5309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn originless_stored_channel_is_replaced_not_reused() {
+    async fn originless_stored_channel_is_kept_not_reused() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
         let payee = Address::repeat_byte(0x11);
@@ -5334,14 +5338,23 @@ mod tests {
             .is_none());
         assert!(!provider.restore(&challenge).await.unwrap());
         assert!(provider.restored_channel_id(&challenge).is_none());
-        // Nor does it rebind it in place; a new channel replaces it instead
-        // of the scope staying locked.
+        // Nor does it rebind or overwrite it: the channel it opens is kept
+        // under its own key, and the legacy channel stays recoverable.
         let mut replacement = stored.clone();
         replacement.channel_id = B256::repeat_byte(0x77);
         provider.channel_store.set(&replacement).await.unwrap();
-        let written = inner.get(&stored.key()).await.unwrap().unwrap();
+        assert_eq!(
+            inner.get(&stored.key()).await.unwrap(),
+            Some(stored.clone())
+        );
+        let own = store::origin_channel_key(&stored.key(), Some("https://api.example.com"));
+        let written = inner.get(&own).await.unwrap().unwrap();
         assert_eq!(written.channel_id, replacement.channel_id);
         assert_eq!(written.origin.as_deref(), Some("https://api.example.com"));
+        assert_eq!(
+            provider.channel_store.get(&stored.key()).await.unwrap(),
+            Some(written)
+        );
     }
 
     #[tokio::test]
@@ -5457,11 +5470,13 @@ mod tests {
             Some("https://api.example.com")
         );
 
-        // A provider that has not paid yet adopts a stored channel's origin.
+        // Reading a bound channel never binds a provider that has not paid
+        // yet, and once bound to another origin it refuses that channel.
         let other = make_test_provider().with_channel_store(inner.clone());
         other.channel_store.get(&key).await.unwrap().unwrap();
-        assert!(other.bind_origin("https://evil.example/data").is_err());
-        other.bind_origin("https://api.example.com/other").unwrap();
+        other.bind_origin("https://evil.example/data").unwrap();
+        let error = other.channel_store.get(&key).await.unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"));
     }
 
     #[tokio::test]
