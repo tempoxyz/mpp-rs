@@ -41,6 +41,8 @@ jobs:
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           workspaces: fuzz
+          # Only main saves; other refs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Seed fuzz lockfile
         # The fuzz crate is its own workspace. Start it from the root lockfile
         # so it resolves the same versions as the other jobs.
