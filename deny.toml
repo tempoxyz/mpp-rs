@@ -12,6 +12,8 @@ ignore = [
     # via elliptic-curve/k256/p256). 0.5.x has no fix; the fixed 0.7.6+ is still inside the CI
     # supply-chain cooldown. Drop this once crypto-bigint 0.7 can be bumped.
     "RUSTSEC-2026-0387",
+    # https://rustsec.org/advisories/RUSTSEC-2026-0441 pin-utils is unmaintained (transitive dep)
+    "RUSTSEC-2026-0441",
 ]
 
 # This section is considered when running `cargo deny check bans`.
