@@ -4077,6 +4077,13 @@ impl TempoSessionProvider {
         }
 
         // No existing channel — open a new one
+        if precompile {
+            // Refuse before signing an opening the store could not keep.
+            self.channel_store
+                .ensure_room(&key)
+                .await
+                .map_err(Self::store_error)?;
+        }
         let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
         if deposit < amount {
             return Err(MppError::InvalidConfig(format!(
@@ -8372,6 +8379,53 @@ mod tests {
         drop(provider);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbound_provider_refuses_to_open_a_channel_it_could_not_store() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let origin = Some("https://api.example.com".to_owned());
+        let seeded = make_test_provider();
+        seed_precompile_channel(&seeded, payee, currency, 1_000, 10_000);
+        let stored =
+            TempoSessionProvider::stored_entry(&seeded.channels().into_values().next().unwrap())
+                .unwrap();
+        let key = stored.key();
+        // The scope key holds a bound channel, and the unbound key a channel
+        // another provider opened while unbound and has since bound.
+        let theirs = store::StoredChannelEntry {
+            origin: origin.clone(),
+            ..stored.clone()
+        };
+        let since_bound = store::StoredChannelEntry {
+            channel_id: B256::repeat_byte(0x99),
+            origin,
+            ..stored
+        };
+        let unbound_key = store::origin_channel_key(&key, None);
+        let inner = Arc::new(MemoryChannelStore::default());
+        inner.set(&theirs).await.unwrap();
+        inner.set_at(&unbound_key, &since_bound).await.unwrap();
+
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000)
+            .with_channel_store(inner.clone());
+        // No RPC responses: the refusal comes before any opening is built.
+        mock_rpc(&mut provider, &[]);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no free channel slot"),
+            "{error}"
+        );
+        assert!(provider.channels().is_empty());
+        assert!(provider.pending_opens.lock().unwrap().is_empty());
+        assert_eq!(inner.get(&key).await.unwrap(), Some(theirs));
+        assert_eq!(inner.get(&unbound_key).await.unwrap(), Some(since_bound));
     }
 
     #[tokio::test]

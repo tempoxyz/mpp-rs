@@ -95,6 +95,12 @@ fn origin_mismatch() -> ChannelStoreError {
     ChannelStoreError::InvalidEntry("stored channel origin mismatch".into())
 }
 
+fn no_free_slot(key: &str) -> ChannelStoreError {
+    ChannelStoreError::InvalidEntry(format!(
+        "no free channel slot for payment scope {key}: its keys hold channels other providers own"
+    ))
+}
+
 /// Store failures are deliberately separate from session recovery failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelStoreError {
@@ -390,19 +396,31 @@ impl OriginBoundChannelStore {
         Ok(())
     }
 
-    /// The key this provider writes `entry` under: the key it holds its
-    /// channel for `key` under, else the scope key or its own
-    /// [`origin_channel_key`] when already storing that same channel, else
-    /// the key of an entry it owns, else the scope key when free, else its own
-    /// [`origin_channel_key`]. Never a key holding another provider's
-    /// channel: a bound provider refuses to write a channel an unbound
-    /// provider keeps under `origin_channel_key(key, None)` rather than
-    /// rebind it there.
+    /// Check, before a new channel for payment scope `key` is opened and
+    /// signed, that this provider has a key to keep it under, so a channel it
+    /// could never store is never opened.
+    pub(crate) async fn ensure_room(&self, key: &str) -> ChannelStoreResult<()> {
+        let bound = self.bound();
+        self.slot_for(key, bound.as_deref(), None).await.map(|_| ())
+    }
+
+    /// The key this provider writes channel `channel_id` (`None` for a
+    /// channel not opened yet) under: the key it holds its channel for `key`
+    /// under, else the scope key or its own [`origin_channel_key`] when
+    /// already storing that same channel, else the key of an entry it owns,
+    /// else the scope key when free, else its own [`origin_channel_key`]
+    /// when free. Never a key holding another provider's channel: a bound
+    /// provider refuses to write a channel an unbound provider keeps under
+    /// `origin_channel_key(key, None)` rather than rebind it there, and a
+    /// provider whose keys all hold channels it neither holds nor owns, such
+    /// as an unbound provider's `origin_channel_key(key, None)` holding a
+    /// channel another provider has since bound to its origin, refuses the
+    /// write rather than overwrite one.
     async fn slot_for(
         &self,
         key: &str,
         bound: Option<&str>,
-        entry: &StoredChannelEntry,
+        channel_id: Option<B256>,
     ) -> ChannelStoreResult<String> {
         if let Some((slot, _)) = self.held(key, bound).await? {
             return Ok(slot);
@@ -412,7 +430,7 @@ impl OriginBoundChannelStore {
             let current = self.inner.get(&candidate).await?;
             if let Some(current) = current
                 .as_ref()
-                .filter(|current| current.channel_id == entry.channel_id)
+                .filter(|current| Some(current.channel_id) == channel_id)
             {
                 // The same channel, such as a legacy entry recovered from a
                 // server snapshot: update it in place rather than copy it,
@@ -438,14 +456,19 @@ impl OriginBoundChannelStore {
                 _ => {}
             }
         }
-        let scope_free = stored
-            .iter()
-            .any(|(candidate, current)| candidate == key && current.is_none());
-        Ok(if scope_free {
-            key.to_owned()
-        } else {
-            origin_channel_key(key, bound)
-        })
+        let own = origin_channel_key(key, bound);
+        let free = |slot: &str| {
+            stored
+                .iter()
+                .any(|(candidate, current)| candidate == slot && current.is_none())
+        };
+        if free(key) {
+            return Ok(key.to_owned());
+        }
+        if free(&own) {
+            return Ok(own);
+        }
+        Err(no_free_slot(key))
     }
 }
 
@@ -480,7 +503,9 @@ impl ChannelStore for OriginBoundChannelStore {
             None => {}
         }
         let key = entry.key();
-        let slot = self.slot_for(&key, bound.as_deref(), &entry).await?;
+        let slot = self
+            .slot_for(&key, bound.as_deref(), Some(entry.channel_id))
+            .await?;
         if slot == key {
             self.inner.set(&entry).await?;
         } else {
@@ -1452,6 +1477,91 @@ mod tests {
             inner.get(&key).await.unwrap().unwrap().channel_id,
             theirs.channel_id
         );
+    }
+
+    /// An unbound provider whose own key holds a channel another provider
+    /// wrote there while unbound and has since bound to its origin, while the
+    /// scope key holds a bound channel too, has nowhere to keep a channel: it
+    /// refuses to open or write one rather than overwrite either, and the
+    /// provider holding that channel still updates it in place.
+    async fn unbound_provider_never_overwrites_a_since_bound_channel(inner: Arc<dyn ChannelStore>) {
+        let theirs = entry();
+        let key = theirs.key();
+        let own = origin_channel_key(&key, None);
+        view(&inner, Some(ORIGIN)).set(&theirs).await.unwrap();
+        let provider = view(&inner, None);
+        let mine = other_channel(0x77);
+        provider.set(&mine).await.unwrap();
+        provider.origin.lock().unwrap().replace(ORIGIN.into());
+        provider
+            .set(&StoredChannelEntry {
+                cumulative_amount: 3_000_000,
+                ..mine.clone()
+            })
+            .await
+            .unwrap();
+
+        let unbound = view(&inner, None);
+        assert!(unbound.get(&key).await.unwrap().is_none());
+        let error = unbound.ensure_room(&key).await.unwrap_err();
+        assert!(error.to_string().contains("no free channel slot"));
+        let opened = other_channel(0x78);
+        let error = unbound.set(&opened).await.unwrap_err();
+        assert!(error.to_string().contains("no free channel slot"));
+        // Neither channel was overwritten, and the refused one is not held.
+        let kept = inner.get(&own).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                kept.channel_id,
+                kept.cumulative_amount,
+                kept.origin.as_deref()
+            ),
+            (mine.channel_id, 3_000_000, Some(ORIGIN))
+        );
+        let stored = inner.get(&key).await.unwrap().unwrap();
+        assert_eq!(
+            (stored.channel_id, stored.origin.as_deref()),
+            (theirs.channel_id, Some(ORIGIN))
+        );
+        assert!(unbound.get(&key).await.unwrap().is_none());
+        assert!(unbound.origin.lock().unwrap().is_none());
+
+        // The provider holding the channel still updates it in place.
+        provider
+            .set(&StoredChannelEntry {
+                cumulative_amount: 4_000_000,
+                ..mine.clone()
+            })
+            .await
+            .unwrap();
+        let kept = inner.get(&own).await.unwrap().unwrap();
+        assert_eq!(
+            (kept.channel_id, kept.cumulative_amount),
+            (mine.channel_id, 4_000_000)
+        );
+
+        // Once that channel is forgotten, the unbound provider has room again.
+        provider.forget(&key, mine.channel_id).await.unwrap();
+        unbound.ensure_room(&key).await.unwrap();
+        unbound.set(&opened).await.unwrap();
+        assert_eq!(inner.get(&own).await.unwrap(), Some(opened.clone()));
+        assert_eq!(unbound.get(&key).await.unwrap(), Some(opened));
+    }
+
+    #[tokio::test]
+    async fn unbound_provider_never_overwrites_a_since_bound_memory_channel() {
+        unbound_provider_never_overwrites_a_since_bound_channel(Arc::new(
+            MemoryChannelStore::default(),
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn unbound_provider_never_overwrites_a_since_bound_sqlite_channel() {
+        let (store, directory) = sqlite_store("wallet");
+        unbound_provider_never_overwrites_a_since_bound_channel(store).await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
