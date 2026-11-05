@@ -1008,7 +1008,11 @@ mod sqlite {
                                 THEN json_extract(entry_json, '$.origin') END AS entry_origin
                      FROM channels
                      WHERE entry_json IS NOT NULL AND scope_key IS NOT NULL
-                         AND instr(scope_key, '@') = 0
+                         -- The persisted key is namespace, newline, payment-scope
+                         -- key: only an '@' after the newline marks a key already
+                         -- in an origin's namespace, since namespaces such as
+                         -- alice@example.com may contain one.
+                         AND instr(substr(scope_key, instr(scope_key, char(10)) + 1), '@') = 0
                  )
                  UPDATE channels
                  SET scope_key = scope_key || '@' || (
@@ -1495,6 +1499,36 @@ mod tests {
             Some(service)
         );
         drop((wallet, origin_store));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_moves_bound_channels_of_a_namespace_containing_an_at_sign() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("channels.db");
+        let open = || {
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                namespace: "alice@example.com".into(),
+                path: Some(path.clone()),
+                request_url: None,
+            })
+            .unwrap()
+        };
+        let bound = StoredChannelEntry {
+            origin: Some(ORIGIN.into()),
+            ..entry()
+        };
+        open().set(&bound).await.unwrap();
+
+        let store: Arc<dyn ChannelStore> = Arc::new(open());
+        let key = bound.key();
+        assert!(store.get(&key).await.unwrap().is_none());
+        assert_eq!(
+            view(&store, Some(ORIGIN)).get(&key).await.unwrap(),
+            Some(bound)
+        );
+        drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

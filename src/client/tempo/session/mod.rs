@@ -764,8 +764,16 @@ impl TempoSessionProvider {
     /// stays in the namespace without an origin and is not used once the
     /// provider is bound; close it with a provider without an HTTP origin,
     /// for example through [`close_with`](Self::close_with).
+    ///
+    /// Binding to a store's origin counts as pinning it, as
+    /// [`with_origin`](Self::with_origin) does: the store was chosen for that
+    /// origin, so a server snapshot may recover a channel it does not hold.
     pub fn with_channel_store(mut self, store: Arc<dyn ChannelStore>) -> Self {
+        let store_origin = store.origin();
         self.channel_store = Arc::new(OriginBoundChannelStore::new(store, self.origin.clone()));
+        if store_origin.is_some() && *self.origin.lock().unwrap() == store_origin {
+            self.origin_configured = true;
+        }
         self
     }
 
@@ -5591,6 +5599,30 @@ mod tests {
                 Some("https://api.example.com")
             );
         }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_store_bound_to_an_origin_pins_the_provider_to_it() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let open = || -> Arc<dyn ChannelStore> {
+            Arc::new(
+                store::SqliteChannelStore::open(store::SqliteChannelStoreOptions {
+                    namespace: "https://api.example.com".into(),
+                    path: Some(directory.join("channels.db")),
+                    request_url: None,
+                })
+                .unwrap(),
+            )
+        };
+        let provider = |store: Arc<dyn ChannelStore>| {
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.example.com")
+                .unwrap()
+                .with_channel_store(store)
+        };
+        assert!(provider(open()).origin_configured());
+        assert!(!provider(Arc::new(MemoryChannelStore::default())).origin_configured());
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[tokio::test]
