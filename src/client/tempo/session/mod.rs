@@ -4360,6 +4360,17 @@ impl PaymentProvider for TempoSessionProvider {
         if !self.price_within_caps(state.price) {
             return None;
         }
+        // A clone sharing this cache may pin realms this caller does not:
+        // recheck the cached Challenge against this request and this caller's
+        // pins before signing or advancing durable authorization.
+        if crate::client::is_cross_realm_proof_with_trust(
+            &state.challenge,
+            &context.url,
+            &context.headers,
+            self.trusted_tempo_proof_realm(&context.url),
+        ) {
+            return None;
+        }
         if state
             .challenge
             .expires_at()
@@ -5106,7 +5117,9 @@ mod tests {
                 ..TempoSessionProvider::stored_entry(&entry).unwrap()
             };
             store.set(&stored).await.unwrap();
-            let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            challenge.realm = "example.test".into();
             let url = reqwest::Url::parse("https://example.test/paid").unwrap();
             // Priming binds the provider to the voucher's origin.
             provider.bind_origin(url.as_str()).unwrap();
@@ -9476,6 +9489,66 @@ mod tests {
             // A rejected offer must not pin the provider to its origin.
             assert!(provider.origin.lock().unwrap().is_none(), "{name}");
         }
+    }
+
+    /// Clones share the prepaid cache but not realm pins: a voucher a pinned
+    /// clone cached for a foreign realm is never signed for an unpinned one.
+    #[tokio::test]
+    async fn cached_prepaid_vouchers_honor_each_clones_realm_pins() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider()
+            .with_prepaid_requests(2)
+            .with_channel_store(store.clone());
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        store
+            .set(&StoredChannelEntry {
+                origin: Some("https://example.test".into()),
+                ..TempoSessionProvider::stored_entry(&entry).unwrap()
+            })
+            .await
+            .unwrap();
+        let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+        let origin = reqwest::Url::parse("https://example.test").unwrap();
+        provider.bind_origin(url.as_str()).unwrap();
+        let mut unpinned = provider.clone();
+        unpinned.replace_trusted_tempo_proof_realms(&[]);
+        let pinned = provider.with_trusted_tempo_proof_realm(origin, "realm.example");
+
+        // The pinned clone primes the shared cache with a foreign-realm Challenge.
+        let mut challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        challenge.realm = "realm.example".into();
+        pinned.prepaid.lock().unwrap().insert(
+            url.to_string(),
+            PrepaidVoucher {
+                challenge,
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 1_000,
+            },
+        );
+        let context = |headers: reqwest::header::HeaderMap| PaymentContext {
+            url: url.clone(),
+            headers,
+            http_client: None,
+        };
+
+        assert!(unpinned
+            .prepaid_credential(context(reqwest::header::HeaderMap::new()))
+            .await
+            .is_none());
+        assert_eq!(unpinned.cumulative(), 1_000);
+
+        let (_, credential) = pinned
+            .prepaid_credential(context(reqwest::header::HeaderMap::new()))
+            .await
+            .expect("the pinned clone trusts the realm");
+        assert_eq!(credential.challenge.realm, "realm.example");
+        assert_eq!(unpinned.cumulative(), 3_000);
     }
 
     #[tokio::test]

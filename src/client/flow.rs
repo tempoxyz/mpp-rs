@@ -203,10 +203,21 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             }
             _ => None,
         };
+        // A cached Challenge must still satisfy this caller's realm pins for
+        // this request, as a fresh one would before it is paid below.
         let prepaid = prepaid.filter(|(challenge, credential)| {
-            if self
-                .check_challenge(exchange, challenge, ranking_accept.as_deref())
-                .is_err()
+            let cross_realm = payment_context.as_ref().is_none_or(|context| {
+                is_cross_realm_proof_with_trust(
+                    challenge,
+                    &context.url,
+                    &context.headers,
+                    self.provider.trusted_tempo_proof_realm(&context.url),
+                )
+            });
+            if cross_realm
+                || self
+                    .check_challenge(exchange, challenge, ranking_accept.as_deref())
+                    .is_err()
             {
                 self.provider.abandon_payment(challenge, credential);
                 false

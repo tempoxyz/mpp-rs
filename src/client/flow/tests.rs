@@ -253,6 +253,10 @@ struct TestProvider {
     abandoned: Arc<AtomicU32>,
     /// Send a session voucher before the server asks for payment.
     prepaid: bool,
+    /// The realm of the prepaid voucher's cached Challenge, when not the request's host.
+    prepaid_realm: Option<&'static str>,
+    /// The realm this caller pins for every origin.
+    trusted_realm: Option<&'static str>,
 }
 
 impl TestProvider {
@@ -264,6 +268,10 @@ impl TestProvider {
 impl PaymentProvider for TestProvider {
     fn supports(&self, method: &str, _intent: &str) -> bool {
         method == "tempo"
+    }
+
+    fn trusted_tempo_proof_realm(&self, _url: &reqwest::Url) -> Option<&str> {
+        self.trusted_realm
     }
 
     async fn prepare_http_payment_challenge(
@@ -346,8 +354,8 @@ impl PaymentProvider for TestProvider {
             return None;
         }
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-        let challenge =
-            PaymentChallenge::new("prepaid-1", "127.0.0.1", "tempo", "session", request);
+        let realm = self.prepaid_realm.unwrap_or("127.0.0.1");
+        let challenge = PaymentChallenge::new("prepaid-1", realm, "tempo", "session", request);
         let credential = PaymentCredential::new(
             challenge.to_echo(),
             serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
@@ -1063,6 +1071,54 @@ async fn prepaid_credentials_respect_request_preferences() {
                     assert_eq!(provider.abandoned.load(Ordering::SeqCst), u32::from(warm));
                 }
             }
+        }
+    }
+}
+
+/// A cached Challenge for another realm is sent prepaid only to a caller
+/// that pins that realm; any other caller pays a fresh Challenge instead.
+#[tokio::test]
+async fn prepaid_credentials_respect_the_callers_realm_pins() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("session-1", "session")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        for trusted_realm in [None, Some("realm.example")] {
+            let provider = TestProvider {
+                prepaid: true,
+                prepaid_realm: Some("realm.example"),
+                trusted_realm,
+                ..TestProvider::default()
+            };
+            let response = via
+                .send(
+                    reqwest::Client::new().get(format!("{url}/paid")),
+                    &provider,
+                    ClientEvents::default(),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{via:?} {trusted_realm:?}: {err}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{via:?} {trusted_realm:?}"
+            );
+            // Had the unpinned caller sent the cached voucher, the server would
+            // have accepted it without asking for the fresh Challenge.
+            let fresh: &[&str] = if trusted_realm.is_some() {
+                &[]
+            } else {
+                &["session-1"]
+            };
+            assert_eq!(provider.paid(), fresh, "{via:?} {trusted_realm:?}");
         }
     }
 }
