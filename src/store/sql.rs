@@ -31,7 +31,7 @@ pub enum SqlParam {
 /// Runs one SQL statement for [`SqlStore`].
 ///
 /// Implemented for `tokio_postgres::Client` (feature `postgres-store`) and
-/// `std::sync::Mutex<rusqlite::Connection>` (feature `sqlite-store`); implement it
+/// `Arc<std::sync::Mutex<rusqlite::Connection>>` (feature `sqlite-store`); implement it
 /// to plug in another driver or a connection pool.
 pub trait SqlDriver: Send + Sync {
     /// The driver's placeholder style. Statements are written with `?` and
@@ -96,6 +96,22 @@ impl<D: SqlDriver> SqlStore<D> {
     pub fn with_create_table(mut self, create_table: bool) -> Self {
         self.create_table = create_table;
         self
+    }
+
+    /// Deletes rows whose `expires` has passed and returns how many it removed.
+    ///
+    /// Expired claims read as absent and are replaced by the next insert of the same
+    /// key, but replay keys rarely repeat, so call this periodically (for example from
+    /// a timer) to keep the table from growing. Live and permanent rows are never
+    /// touched. mppx's `Store.sql()` has no equivalent.
+    pub async fn purge_expired(&self) -> Result<u64, StoreError> {
+        let rows = self
+            .query(
+                "DELETE FROM {table} WHERE expires IS NOT NULL AND expires <= ? RETURNING key",
+                &[SqlParam::Float(Some(now_ms()))],
+            )
+            .await?;
+        Ok(rows.len() as u64)
     }
 
     async fn ensure_table(&self) -> Result<(), StoreError> {
@@ -364,9 +380,11 @@ impl SqlDriver for tokio_postgres::Client {
     }
 }
 
-/// Runs statements synchronously on the calling task, as SQLite is in-process.
+/// Runs each statement on Tokio's blocking pool, so a busy database file (rusqlite's
+/// 5 s busy timeout) or a contended connection never stalls an async worker thread.
+/// Needs a Tokio runtime.
 #[cfg(feature = "sqlite-store")]
-impl SqlDriver for std::sync::Mutex<rusqlite::Connection> {
+impl SqlDriver for std::sync::Arc<std::sync::Mutex<rusqlite::Connection>> {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }
@@ -376,27 +394,40 @@ impl SqlDriver for std::sync::Mutex<rusqlite::Connection> {
         sql: &'a str,
         params: &'a [SqlParam],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, StoreError>> + Send + 'a>> {
-        let result = (|| {
-            let connection = self
-                .lock()
-                .map_err(|_| StoreError::Internal("SQLite connection lock poisoned".into()))?;
-            let mut statement = connection.prepare_cached(sql).map_err(sqlite_error)?;
-            let params = params.iter().map(|param| match param {
-                SqlParam::Text(value) => rusqlite::types::Value::Text(value.clone()),
-                SqlParam::Float(Some(value)) => rusqlite::types::Value::Real(*value),
-                SqlParam::Float(None) => rusqlite::types::Value::Null,
-            });
-            let rows = statement
-                .query_map(rusqlite::params_from_iter(params), |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(sqlite_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(sqlite_error)?;
-            Ok(rows)
-        })();
-        Box::pin(std::future::ready(result))
+        let connection = std::sync::Arc::clone(self);
+        let sql = sql.to_owned();
+        let params = params.to_vec();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || sqlite_query(&connection, &sql, params))
+                .await
+                .map_err(|e| StoreError::Internal(format!("SQLite task failed: {e}")))?
+        })
     }
+}
+
+#[cfg(feature = "sqlite-store")]
+fn sqlite_query(
+    connection: &std::sync::Mutex<rusqlite::Connection>,
+    sql: &str,
+    params: Vec<SqlParam>,
+) -> Result<Vec<String>, StoreError> {
+    let connection = connection
+        .lock()
+        .map_err(|_| StoreError::Internal("SQLite connection lock poisoned".into()))?;
+    let mut statement = connection.prepare_cached(sql).map_err(sqlite_error)?;
+    let params = params.into_iter().map(|param| match param {
+        SqlParam::Text(value) => rusqlite::types::Value::Text(value),
+        SqlParam::Float(Some(value)) => rusqlite::types::Value::Real(value),
+        SqlParam::Float(None) => rusqlite::types::Value::Null,
+    });
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    Ok(rows)
 }
 
 #[cfg(feature = "sqlite-store")]
@@ -536,6 +567,26 @@ mod tests {
         put_if_absent(&make("put_if_absent").await).await;
         expiring_claims(&make("expiring_claims").await).await;
         concurrent_claims(&make("concurrent_claims").await).await;
+        purge_expired(&make("purge_expired").await).await;
+    }
+
+    #[cfg(any(feature = "sqlite-store", feature = "postgres-store"))]
+    async fn purge_expired<D: SqlDriver>(store: &SqlStore<D>) {
+        store.put("permanent", json!(1)).await.unwrap();
+        assert!(store
+            .put_if_absent_with_ttl("short", json!(2), Duration::from_millis(100))
+            .await
+            .unwrap());
+        assert!(store
+            .put_if_absent_with_ttl("live", json!(3), Duration::from_secs(60))
+            .await
+            .unwrap());
+        assert_eq!(store.purge_expired().await.unwrap(), 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(store.purge_expired().await.unwrap(), 1);
+        assert_eq!(store.get("permanent").await.unwrap(), Some(json!(1)));
+        assert_eq!(store.get("live").await.unwrap(), Some(json!(3)));
+        assert_eq!(store.purge_expired().await.unwrap(), 0);
     }
 
     #[cfg(any(feature = "sqlite-store", feature = "postgres-store"))]
@@ -689,8 +740,10 @@ mod tests {
     // ==================== SQLite ====================
 
     #[cfg(feature = "sqlite-store")]
-    fn sqlite_store() -> SqlStore<Mutex<rusqlite::Connection>> {
-        SqlStore::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()))
+    fn sqlite_store() -> SqlStore<Arc<Mutex<rusqlite::Connection>>> {
+        SqlStore::new(Arc::new(Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )))
     }
 
     #[cfg(feature = "sqlite-store")]

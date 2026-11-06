@@ -54,7 +54,7 @@ sqlite = ["client", "tempo", "dep:fs2", "dep:rusqlite"]
 # Server-side SQL store (SqlStore), with drivers for Postgres and SQLite
 sql-store = []
 postgres-store = ["sql-store", "dep:tokio-postgres"]
-sqlite-store = ["sql-store", "dep:rusqlite"]
+sqlite-store = ["sql-store", "dep:rusqlite", "tokio"]
 
 # Utilities
 utils = ["hex"]
