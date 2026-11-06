@@ -176,7 +176,7 @@ futures-util = { version = "0.3", features = ["sink"], optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.180", optional = true }
 
 [dev-dependencies]
 alloy-json-rpc = "2.0.5"

@@ -846,8 +846,8 @@ mod sqlite {
         }
         let path = CString::new(path.as_os_str().as_bytes())?;
         // Unlike a metadata check followed by chmod, this cannot follow a link
-        // swapped in between the two operations. Unsupported platforms fail
-        // closed. Do not open/close SQLite data-file descriptors to chmod them.
+        // swapped in between the two operations. Do not open/close SQLite
+        // data-file descriptors to chmod them.
         // SAFETY: path is a live NUL-terminated string; no pointers are retained.
         let result = unsafe {
             libc::fchmodat(
@@ -860,8 +860,68 @@ mod sqlite {
         if result == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::last_os_error())
+            let error = std::io::Error::last_os_error();
+            #[cfg(target_os = "linux")]
+            if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                return set_private_permissions_linux(&path);
+            }
+            Err(error)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_private_permissions_linux(path: &std::ffi::CStr) -> std::io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::PermissionsExt;
+
+        // O_PATH pins the inode without opening it for I/O. Closing this kind
+        // of descriptor does not release the process's SQLite POSIX locks.
+        // SAFETY: path is a live NUL-terminated string and open retains no pointer.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: open returned a new descriptor, owned exclusively here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite permission repair requires a regular file",
+            ));
+        }
+        // New kernels support descriptor-based chmod even when /proc is absent.
+        // SAFETY: fd is live, the empty path is NUL-terminated, and all arguments
+        // match fchmodat2's ABI. Older kernels return ENOSYS or EINVAL.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_fchmodat2,
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                0o600,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+        ) {
+            return Err(error);
+        }
+        // On older kernels, this procfs link names the pinned inode, never the
+        // mutable caller-supplied path. Keep the descriptor live through chmod.
+        fs::set_permissions(
+            format!("/proc/self/fd/{}", file.as_raw_fd()),
+            fs::Permissions::from_mode(0o600),
+        )
     }
 
     #[cfg(all(test, unix))]
@@ -879,6 +939,15 @@ mod sqlite {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
             symlink(&target, directory.join(format!("channels.db{suffix}"))).unwrap();
             assert!(secure_database_files(&path).is_err());
+            #[cfg(target_os = "linux")]
+            {
+                use std::{ffi::CString, os::unix::ffi::OsStrExt};
+                let link = directory.join(format!("channels.db{suffix}"));
+                assert!(set_private_permissions_linux(
+                    &CString::new(link.as_os_str().as_bytes()).unwrap()
+                )
+                .is_err());
+            }
             assert_eq!(
                 fs::metadata(&target).unwrap().permissions().mode() & 0o777,
                 0o755
@@ -908,6 +977,17 @@ mod sqlite {
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE test(value INTEGER); BEGIN IMMEDIATE; INSERT INTO test VALUES(1);").unwrap();
         secure_database_files(&path).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::{ffi::CString, os::unix::ffi::OsStrExt};
+            for suffix in ["", "-wal", "-shm"] {
+                let target = directory.join(format!("channels.db{suffix}"));
+                set_private_permissions_linux(
+                    &CString::new(target.as_os_str().as_bytes()).unwrap(),
+                )
+                .unwrap();
+            }
+        }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "client::tempo::session::store::sqlite::permission_repair_preserves_sqlite_writer_lock", "--nocapture"])
             .env(CHILD_PATH, &path).status().unwrap();
