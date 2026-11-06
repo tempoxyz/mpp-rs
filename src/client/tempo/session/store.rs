@@ -895,8 +895,7 @@ mod sqlite {
         }
         // SAFETY: open returned a new descriptor, owned exclusively here.
         let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
+        if !file.metadata()?.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "SQLite permission repair requires a regular file",
@@ -930,85 +929,6 @@ mod sqlite {
             format!("/proc/self/fd/{}", file.as_raw_fd()),
             fs::Permissions::from_mode(0o600),
         )
-        .or_else(|_| set_private_permissions_in_trusted_directory(path, &metadata))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn set_private_permissions_in_trusted_directory(
-        path: &std::ffi::CStr,
-        expected: &fs::Metadata,
-    ) -> std::io::Result<()> {
-        use std::{
-            ffi::{CString, OsStr},
-            os::{
-                fd::AsRawFd,
-                unix::{
-                    ffi::OsStrExt,
-                    fs::{MetadataExt, OpenOptionsExt},
-                },
-            },
-        };
-
-        let path = Path::new(OsStr::from_bytes(path.to_bytes()));
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        // Pin the directory, never an ordinary SQLite descriptor. Ancestor
-        // renames cannot redirect subsequent directory-relative operations.
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(parent)?;
-        let owner = directory.metadata()?;
-        // SAFETY: geteuid has no preconditions and retains no state.
-        if owner.uid() != unsafe { libc::geteuid() } || owner.mode() & 0o022 != 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                "SQLite permission repair without procfs requires a directory owned by the current user and not writable by group or others"));
-        }
-        let name = CString::new(
-            path.file_name()
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "database filename is required",
-                    )
-                })?
-                .as_bytes(),
-        )?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: directory and name are live; stat points to writable storage
-        // and is read only after a successful fstatat.
-        if unsafe {
-            libc::fstatat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatat initialized stat.
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-            || u128::from(stat.st_dev) != u128::from(expected.dev())
-            || u128::from(stat.st_ino) != u128::from(expected.ino())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SQLite permission repair target changed",
-            ));
-        }
-        // Only this user (or root) can replace the checked name in this pinned
-        // directory. Verify it still names the inode held by the O_PATH handle.
-        // SAFETY: directory and name remain live throughout this call.
-        if unsafe { libc::fchmodat(directory.as_raw_fd(), name.as_ptr(), 0o600, 0) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
     }
 
     #[cfg(all(test, unix))]
@@ -1034,11 +954,6 @@ mod sqlite {
                     &CString::new(link.as_os_str().as_bytes()).unwrap()
                 )
                 .is_err());
-                assert!(set_private_permissions_in_trusted_directory(
-                    &CString::new(link.as_os_str().as_bytes()).unwrap(),
-                    &fs::metadata(&target).unwrap(),
-                )
-                .is_err());
             }
             assert_eq!(
                 fs::metadata(&target).unwrap().permissions().mode() & 0o777,
@@ -1047,40 +962,6 @@ mod sqlite {
             assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
             fs::remove_dir_all(directory).unwrap();
         }
-    }
-
-    #[cfg(all(test, target_os = "linux"))]
-    #[test]
-    fn trusted_directory_repair_rejects_unsafe_targets() {
-        use std::{
-            ffi::CString,
-            os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-        };
-
-        let directory = std::env::temp_dir().join(format!("mpp-trusted-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&directory).unwrap();
-        let path = directory.join("channels.db");
-        let other = directory.join("other.db");
-        fs::write(&path, b"database").unwrap();
-        fs::write(&other, b"other").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert!(set_private_permissions_in_trusted_directory(
-            &name,
-            &fs::metadata(&other).unwrap()
-        )
-        .is_err());
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(
-            set_private_permissions_in_trusted_directory(&name, &fs::metadata(&path).unwrap())
-                .is_err()
-        );
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1132,11 +1013,6 @@ mod sqlite {
                 let target = directory.join(format!("channels.db{suffix}"));
                 set_private_permissions_linux(
                     &CString::new(target.as_os_str().as_bytes()).unwrap(),
-                )
-                .unwrap();
-                set_private_permissions_in_trusted_directory(
-                    &CString::new(target.as_os_str().as_bytes()).unwrap(),
-                    &fs::metadata(&target).unwrap(),
                 )
                 .unwrap();
             }
