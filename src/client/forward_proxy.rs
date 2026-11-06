@@ -74,10 +74,14 @@ const HOP_BY_HOP: [&str; 9] = [
 
 /// A local HTTP forward proxy that pays for `402 Payment Required` responses.
 ///
-/// [`bind`](Self::bind) takes a loopback port, generates a certificate authority
-/// that lives only in this process and writes it, with the system's trusted
-/// roots, to a PEM bundle. Give child processes [`environment`](Self::environment)
-/// and start the proxy with [`spawn`](Self::spawn).
+/// [`bind`](Self::bind) takes a loopback port and generates a certificate
+/// authority that lives only in this process. [`spawn`](Self::spawn) writes it,
+/// with the system's trusted roots, to a PEM bundle and starts the proxy. Give
+/// child processes [`environment`](Self::environment) once `spawn` returns.
+///
+/// Loading the system's roots is the slow step (about 150 ms on macOS), so
+/// `bind` leaves it to `spawn`: a caller learns the environment at once and
+/// can run `spawn` off its startup path.
 ///
 /// Clients authenticate with a random token carried in the proxy URL, so other
 /// local users cannot spend through the proxy.
@@ -86,6 +90,7 @@ pub struct ForwardProxy<P> {
     address: SocketAddr,
     token: String,
     certificates: PathBuf,
+    root: CertificateDer<'static>,
     authority: CertificateAuthority,
     providers: Providers<P>,
     events: ClientEvents,
@@ -104,25 +109,14 @@ impl<P: PaymentProvider + 'static> ForwardProxy<P> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let address = listener.local_addr()?;
         let (authority, root) = CertificateAuthority::generate()?;
-        let native = rustls_native_certs::load_native_certs();
-        if native.certs.is_empty() {
-            return Err(MppError::InvalidConfig(format!(
-                "no trusted root certificates to bundle with the proxy's: {:?}",
-                native.errors
-            )));
-        }
-        let bundle: String = std::iter::once(&root)
-            .chain(&native.certs)
-            .map(|certificate| pem(certificate))
-            .collect();
         let certificates =
             std::env::temp_dir().join(format!("mpp-forward-proxy-{}.pem", std::process::id()));
-        std::fs::write(&certificates, bundle)?;
         Ok(Self {
             listener,
             address,
             token: uuid::Uuid::new_v4().simple().to_string(),
             certificates,
+            root,
             authority,
             providers: Box::new(move |url| providers(url).map_err(|error| error.to_string())),
             events: ClientEvents::default(),
@@ -151,7 +145,7 @@ impl<P: PaymentProvider + 'static> ForwardProxy<P> {
     }
 
     /// The PEM bundle of the proxy's certificate authority and the system's
-    /// trusted roots.
+    /// trusted roots, which [`spawn`](Self::spawn) writes.
     pub fn certificates(&self) -> &Path {
         &self.certificates
     }
@@ -161,7 +155,8 @@ impl<P: PaymentProvider + 'static> ForwardProxy<P> {
     /// `HTTPS_PROXY` family, `NO_PROXY` extended with loopback and the bypassed
     /// hosts, `NODE_USE_ENV_PROXY` for Node.js's built-in clients, and
     /// `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE` and
-    /// `NODE_EXTRA_CA_CERTS` pointing at [`certificates`](Self::certificates).
+    /// `NODE_EXTRA_CA_CERTS` pointing at [`certificates`](Self::certificates),
+    /// which exists once [`spawn`](Self::spawn) returns.
     pub fn environment(&self) -> Vec<(&'static str, String)> {
         let proxy = format!("http://mpp:{}@{}", self.token, self.address);
         let mut bypass: Vec<String> = ["NO_PROXY", "no_proxy"]
@@ -196,7 +191,8 @@ impl<P: PaymentProvider + 'static> ForwardProxy<P> {
         ]
     }
 
-    /// Serve the proxy on a dedicated thread with its own Tokio runtime.
+    /// Write the [`certificates`](Self::certificates) bundle, then serve the
+    /// proxy on a dedicated thread with its own Tokio runtime.
     ///
     /// Connections queue until `policy` resolves; it decides which origins the
     /// proxy intercepts and pays, for example
@@ -206,6 +202,18 @@ impl<P: PaymentProvider + 'static> ForwardProxy<P> {
         self,
         policy: impl Future<Output = AcceptPaymentPolicy> + Send + 'static,
     ) -> Result<(), MppError> {
+        let native = rustls_native_certs::load_native_certs();
+        if native.certs.is_empty() {
+            return Err(MppError::InvalidConfig(format!(
+                "no trusted root certificates to bundle with the proxy's: {:?}",
+                native.errors
+            )));
+        }
+        let bundle: String = std::iter::once(&self.root)
+            .chain(&native.certs)
+            .map(|certificate| pem(certificate))
+            .collect();
+        std::fs::write(&self.certificates, bundle)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
