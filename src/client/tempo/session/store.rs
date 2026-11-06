@@ -842,15 +842,25 @@ mod sqlite {
     }
 
     #[cfg(unix)]
+    fn validate_private_file(metadata: &fs::Metadata) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no arguments and retains no pointers.
+        let owner = unsafe { libc::geteuid() };
+        if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != owner {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite permission repair requires a singly linked regular file owned by the current user",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     fn set_private_permissions_nofollow(path: &Path) -> std::io::Result<()> {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
-        if fs::symlink_metadata(path)?.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SQLite database and sidecars must not be symbolic links",
-            ));
-        }
+        let metadata = fs::symlink_metadata(path)?;
+        validate_private_file(&metadata)?;
         let path = CString::new(path.as_os_str().as_bytes())?;
         // Unlike a metadata check followed by chmod, this cannot follow a link
         // swapped in between the two operations. Do not open/close SQLite
@@ -895,12 +905,7 @@ mod sqlite {
         }
         // SAFETY: open returned a new descriptor, owned exclusively here.
         let file = unsafe { File::from_raw_fd(fd) };
-        if !file.metadata()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SQLite permission repair requires a regular file",
-            ));
-        }
+        validate_private_file(&file.metadata()?)?;
         // New kernels support descriptor-based chmod even when /proc is absent.
         // SAFETY: fd is live, the empty path is NUL-terminated, and all arguments
         // match fchmodat2's ABI. Older kernels return ENOSYS or EINVAL.
@@ -929,6 +934,37 @@ mod sqlite {
             format!("/proc/self/fd/{}", file.as_raw_fd()),
             fs::Permissions::from_mode(0o600),
         )
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_rejects_hard_links() {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let directory =
+                std::env::temp_dir().join(format!("mpp-hardlink-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&directory).unwrap();
+            let target = directory.join("unrelated-executable");
+            fs::write(&target, b"unrelated file").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            let link = directory.join(format!("channels.db{suffix}"));
+            fs::hard_link(&target, &link).unwrap();
+            assert!(secure_database_files(&directory.join("channels.db")).is_err());
+            #[cfg(target_os = "linux")]
+            {
+                use std::{ffi::CString, os::unix::ffi::OsStrExt};
+                assert!(set_private_permissions_linux(
+                    &CString::new(link.as_os_str().as_bytes()).unwrap()
+                )
+                .is_err());
+            }
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[cfg(all(test, unix))]
