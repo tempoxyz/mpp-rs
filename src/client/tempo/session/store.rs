@@ -132,8 +132,10 @@ pub trait ChannelStore: Send + Sync {
     /// Remove the channel cached for `key`.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()>;
     /// The `spent` a server receipt last reported for `channel_id`, the channel
-    /// cached for `key`. `None` when the store keeps no such record, so a
-    /// restored channel's first receipt is costed at its quoted price.
+    /// cached for `key`. `None` when the store keeps no such record, or when
+    /// the channel's vouchers moved after it was recorded: a client that keeps
+    /// no record, such as mppx, may have spent on the channel since. A restored
+    /// channel's first receipt is then costed at its quoted price.
     async fn server_spent(
         &self,
         _key: &str,
@@ -160,7 +162,7 @@ pub trait ChannelStore: Send + Sync {
 pub struct MemoryChannelStore {
     entries: Mutex<HashMap<String, StoredChannelEntry>>,
     leases: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    server_spent: Mutex<HashMap<String, (B256, u128)>>,
+    server_spent: Mutex<HashMap<String, (B256, u128, u128)>>,
 }
 
 #[async_trait::async_trait]
@@ -201,13 +203,20 @@ impl ChannelStore for MemoryChannelStore {
     }
 
     async fn server_spent(&self, key: &str, channel_id: B256) -> ChannelStoreResult<Option<u128>> {
+        let cumulative = self
+            .entries
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|entry| entry.channel_id == channel_id)
+            .map(|entry| entry.cumulative_amount);
         Ok(self
             .server_spent
             .lock()
             .unwrap()
             .get(key)
-            .filter(|(id, _)| *id == channel_id)
-            .map(|(_, spent)| *spent))
+            .filter(|(id, _, recorded)| *id == channel_id && Some(*recorded) == cumulative)
+            .map(|(_, spent, _)| *spent))
     }
 
     async fn set_server_spent(
@@ -216,10 +225,19 @@ impl ChannelStore for MemoryChannelStore {
         channel_id: B256,
         spent: u128,
     ) -> ChannelStoreResult<()> {
-        self.server_spent
+        let cumulative = self
+            .entries
             .lock()
             .unwrap()
-            .insert(key.to_owned(), (channel_id, spent));
+            .get(key)
+            .filter(|entry| entry.channel_id == channel_id)
+            .map(|entry| entry.cumulative_amount);
+        if let Some(cumulative) = cumulative {
+            self.server_spent
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), (channel_id, spent, cumulative));
+        }
         Ok(())
     }
 }
@@ -707,24 +725,34 @@ mod sqlite {
         /// Reads the `server_spent` column, which tempo-wallet also keeps. Its
         /// default `'0'`, written by mppx and by rows this store never
         /// recorded a receipt for, means unknown, as it does to tempo-wallet.
+        /// `server_spent_cumulative` holds the vouchers' cumulative amount when
+        /// this store recorded it; once the row's has moved, a client that does
+        /// not keep `server_spent` may have spent on the channel. A value
+        /// tempo-wallet recorded, with no cumulative beside it, is current.
         async fn server_spent(
             &self,
             key: &str,
             channel_id: B256,
         ) -> ChannelStoreResult<Option<u128>> {
-            let spent: Option<String> = self
+            let row: Option<(String, Option<String>, String)> = self
                 .connection
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT server_spent FROM channels WHERE scope_key = ?1 AND channel_id = ?2",
+                    "SELECT server_spent, server_spent_cumulative, cumulative_amount
+                     FROM channels WHERE scope_key = ?1 AND channel_id = ?2",
                     params![self.scoped_key(key), format!("{:#x}", channel_id)],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(io_error)?;
-            Ok(spent
-                .and_then(|spent| spent.parse::<u128>().ok())
+            Ok(row
+                .filter(|(_, recorded, cumulative)| {
+                    recorded
+                        .as_ref()
+                        .is_none_or(|recorded| recorded == cumulative)
+                })
+                .and_then(|(spent, _, _)| spent.parse::<u128>().ok())
                 .filter(|spent| *spent > 0))
         }
 
@@ -738,7 +766,8 @@ mod sqlite {
                 .lock()
                 .unwrap()
                 .execute(
-                    "UPDATE channels SET server_spent = ?3 WHERE scope_key = ?1 AND channel_id = ?2",
+                    "UPDATE channels SET server_spent = ?3, server_spent_cumulative = cumulative_amount
+                     WHERE scope_key = ?1 AND channel_id = ?2",
                     params![
                         self.scoped_key(key),
                         format!("{:#x}", channel_id),
@@ -805,6 +834,7 @@ mod sqlite {
             .map_err(io_error)?;
         add_column(connection, "scope_key", "TEXT")?;
         add_column(connection, "entry_json", "TEXT")?;
+        add_column(connection, "server_spent_cumulative", "TEXT")?;
         connection
             .execute_batch(
                 "WITH ranked AS (
@@ -962,6 +992,21 @@ mod tests {
                 .unwrap(),
             None
         );
+        store
+            .set(&StoredChannelEntry {
+                cumulative_amount: current.cumulative_amount + 1,
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.server_spent(&key, current.channel_id).await.unwrap(),
+            None
+        );
+        store
+            .set_server_spent(&key, current.channel_id, 1_600)
+            .await
+            .unwrap();
         store.delete(&key).await.unwrap();
         assert_eq!(
             store.server_spent(&key, current.channel_id).await.unwrap(),
@@ -1089,6 +1134,26 @@ mod tests {
             .query_row("SELECT server_spent FROM channels", [], |row| row.get(0))
             .unwrap();
         assert_eq!(column, "1500");
+
+        // Vouchers another client signed since make the recorded spent stale.
+        connection
+            .execute("UPDATE channels SET cumulative_amount = '2000001'", [])
+            .unwrap();
+        assert_eq!(
+            open().server_spent(&key, current.channel_id).await.unwrap(),
+            None
+        );
+        // tempo-wallet keeps server_spent current itself and records no cumulative.
+        connection
+            .execute(
+                "UPDATE channels SET server_spent = '1700', server_spent_cumulative = NULL",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            open().server_spent(&key, current.channel_id).await.unwrap(),
+            Some(1_700)
+        );
         connection
             .execute("UPDATE channels SET server_spent = '0'", [])
             .unwrap();

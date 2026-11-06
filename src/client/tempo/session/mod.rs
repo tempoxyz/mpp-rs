@@ -1631,6 +1631,16 @@ impl TempoSessionProvider {
         if !can_sign_descriptor(&stored.descriptor, scope.payer, scope.authorized_signer)? {
             return Ok(None);
         }
+        // A server without session snapshots leaves the stored `spent` as the
+        // only start for the next charge; one above the vouchers is not real.
+        // It is read before the row is rewritten below.
+        let stored_spent = self
+            .channel_store
+            .server_spent(store_key, stored.channel_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|spent| *spent <= stored.cumulative_amount);
 
         let state = read_on_chain_channel_state(provider, stored.channel_id).await?;
         if state.close_requested_at != 0 && state.deposit != 0 {
@@ -1661,21 +1671,13 @@ impl TempoSessionProvider {
             .set(&recovered)
             .await
             .map_err(Self::store_error)?;
-        // A server without session snapshots leaves the stored `spent` as the
-        // only start for the next charge; one above the vouchers is not real.
-        if let Ok(Some(spent)) = self
-            .channel_store
-            .server_spent(store_key, recovered.channel_id)
-            .await
-        {
-            if spent <= recovered.cumulative_amount {
-                self.spend
-                    .lock()
-                    .unwrap()
-                    .channels
-                    .entry(recovered.channel_id.to_string())
-                    .or_insert(spent);
-            }
+        if let Some(spent) = stored_spent {
+            self.spend
+                .lock()
+                .unwrap()
+                .channels
+                .entry(recovered.channel_id.to_string())
+                .or_insert(spent);
         }
         Self::channel_entry(recovered).map(|entry| Some((entry, pending.is_some())))
     }
@@ -2001,6 +2003,13 @@ impl TempoSessionProvider {
             .unwrap()
             .insert(entry.channel_id.to_string(), key.clone());
         self.channels.lock().unwrap().insert(key, entry.clone());
+        if let Ok(spent) = snapshot.spent.parse::<u128>() {
+            self.spend
+                .lock()
+                .unwrap()
+                .channels
+                .insert(entry.channel_id.to_string(), spent);
+        }
         self.commit_referenced_open(&entry.channel_id.to_string());
         self.notify_update(&entry);
         Ok(Some(recovered))
@@ -5356,6 +5365,85 @@ mod tests {
                 Some(700)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrapped_channel_costs_its_first_receipt_from_the_snapshot_spent() {
+        use axum::{http::StatusCode, routing::head, Router};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::protocol::methods::tempo::precompile_voucher::sign_precompile_voucher_primitive;
+        use crate::protocol::methods::tempo::session::{SessionSnapshot, SnapshotVoucher};
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut provider =
+            make_test_provider().with_channel_store(Arc::new(MemoryChannelStore::default()));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let descriptor = provider
+            .channels()
+            .into_values()
+            .next()
+            .unwrap()
+            .descriptor
+            .unwrap();
+        provider.channels.lock().unwrap().clear();
+        provider.channel_id_to_key.lock().unwrap().clear();
+        let signature =
+            sign_precompile_voucher_primitive(&provider.signer, channel_id, 1_000, 42431)
+                .await
+                .unwrap();
+        let snapshot = SessionSnapshot {
+            accepted_cumulative: "1000".into(),
+            chain_id: 42431,
+            channel_id: format!("{channel_id:#x}"),
+            close_requested_at: None,
+            deposit: "10000".into(),
+            descriptor,
+            settlement_route: None,
+            escrow: format!("{TIP20_CHANNEL_RESERVE_ADDRESS:#x}"),
+            highest_voucher: Some(SnapshotVoucher {
+                channel_id: format!("{channel_id:#x}"),
+                cumulative_amount: "1000".into(),
+                signature: alloy::hex::encode_prefixed(signature),
+            }),
+            required_cumulative: "1000".into(),
+            settled: "0".into(),
+            spent: "600".into(),
+            units: None,
+        };
+        let header = STANDARD.encode(serde_json::to_vec(&snapshot).unwrap());
+        let app = Router::new().route(
+            "/v1/responses",
+            head(move || {
+                let header = header.clone();
+                async move { (StatusCode::OK, [("payment-session-snapshot", header)]) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
+            .is_some());
+
+        let mut receipt = Receipt::success("tempo", channel_id.to_string());
+        receipt
+            .extensions
+            .insert("spent".into(), serde_json::json!("650"));
+        let context = PaymentContext {
+            url: url.parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        assert_eq!(
+            provider.record_receipt(&context, &challenge, &receipt),
+            Some(50)
+        );
     }
 
     #[tokio::test]
