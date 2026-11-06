@@ -384,7 +384,7 @@ mod sqlite {
     pub struct SqliteChannelStoreOptions {
         /// Service namespace, normally the protected API origin.
         pub namespace: String,
-        /// Filesystem path, not a `file:` URI. Defaults to `~/.tempo/wallet/channels.db`.
+        /// Filesystem path, not a `file:` URI or `:memory:`. Defaults to `~/.tempo/wallet/channels.db`.
         /// On Unix, repairing non-private files requires their parent directory
         /// to be owned by the effective user and not group/other-writable.
         /// Opening fails if repair is needed in an untrusted parent. Move legacy
@@ -434,6 +434,11 @@ mod sqlite {
                 Some(path) => path,
                 None => default_channel_database_path()?,
             };
+            if path.as_os_str() == ":memory:" {
+                return Err(ChannelStoreError::Io(
+                    "SQLite in-memory paths are not supported; provide a filesystem path".into(),
+                ));
+            }
             // Permission repair and SQLite must name the same filesystem entry.
             // SQLite otherwise interprets file: URIs, including query options.
             if path.as_os_str().as_encoded_bytes().starts_with(b"file:") {
@@ -857,6 +862,12 @@ mod sqlite {
             unix::fs::{MetadataExt, OpenOptionsExt},
         };
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        // Search permission is sufficient for already-private files. No chmod
+        // occurs on this path, so no directory read handle or data-file fd is needed.
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_file() && metadata.mode() & 0o077 == 0 {
+            return Ok(());
+        }
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -919,6 +930,55 @@ mod sqlite {
         } else {
             Err(std::io::Error::last_os_error())
         }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn sqlite_store_opens_in_search_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mpp-search-only-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o300)).unwrap();
+        let path = directory.join("channels.db");
+        let result = (|| {
+            drop(SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(path.clone()),
+                ..Default::default()
+            })?);
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(path),
+                ..Default::default()
+            })
+        })();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(result.unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sqlite_store_rejects_memory_sentinel_without_creating_files() {
+        const CHILD: &str = "MPP_SQLITE_MEMORY_SENTINEL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let error = SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(PathBuf::from(":memory:")),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("in-memory paths are not supported"));
+            assert_eq!(fs::read_dir(".").unwrap().count(), 0);
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mpp-memory-sentinel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "client::tempo::session::store::sqlite::sqlite_store_rejects_memory_sentinel_without_creating_files", "--nocapture"])
+            .current_dir(&directory).env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(test, unix))]
