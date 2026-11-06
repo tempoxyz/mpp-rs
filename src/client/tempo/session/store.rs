@@ -384,7 +384,7 @@ mod sqlite {
     pub struct SqliteChannelStoreOptions {
         /// Service namespace, normally the protected API origin.
         pub namespace: String,
-        /// SQLite path. Defaults to `~/.tempo/wallet/channels.db`.
+        /// Filesystem path, not a `file:` URI. Defaults to `~/.tempo/wallet/channels.db`.
         pub path: Option<PathBuf>,
         /// Full protected URL retained for CLI management requests.
         pub request_url: Option<String>,
@@ -429,6 +429,13 @@ mod sqlite {
                 Some(path) => path,
                 None => default_channel_database_path()?,
             };
+            // Permission repair and SQLite must name the same filesystem entry.
+            // SQLite otherwise interprets file: URIs, including query options.
+            if path.as_os_str().as_encoded_bytes().starts_with(b"file:") {
+                return Err(ChannelStoreError::Io(
+                    "SQLite URI paths are not supported; provide a filesystem path".into(),
+                ));
+            }
             if let Some(parent) = path.parent() {
                 let mut builder = fs::DirBuilder::new();
                 builder.recursive(true);
@@ -955,6 +962,28 @@ mod sqlite {
             assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn uri_paths_are_rejected_before_creating_files() {
+        let directory = std::env::temp_dir().join(format!("mpp-uri-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        for path in [
+            "file:channels.db".to_string(),
+            format!("file:{}?mode=rwc", directory.join("channels.db").display()),
+            "file::memory:?cache=shared".to_string(),
+        ] {
+            let result = SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(PathBuf::from(path)),
+                ..Default::default()
+            });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("URI paths are not supported"));
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(test, unix))]
