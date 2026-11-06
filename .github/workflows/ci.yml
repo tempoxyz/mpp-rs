@@ -130,7 +130,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: SQLite permission and lock regressions
-        run: cargo test --lib --no-default-features --features sqlite client::tempo::session::store::
+        run: cargo test --lib --no-default-features --features sqlite client::tempo::session::store
 
   doctest:
     name: Doc tests
