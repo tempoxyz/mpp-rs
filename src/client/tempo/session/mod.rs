@@ -4389,6 +4389,8 @@ impl PaymentProvider for TempoSessionProvider {
             .voucher_credential_for_challenge(&state.challenge, &state.channel_id, cumulative)
             .await
             .ok()?;
+        // A metered stream on this request asks for later vouchers against the same Challenge.
+        *self.last_challenge.lock().unwrap() = Some(state.challenge.clone());
         Some((state.challenge, credential))
     }
 
@@ -5064,6 +5066,51 @@ mod tests {
             .unwrap()
             .insert("key".to_string(), entry);
         assert_eq!(cloned.channels().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_prepaid_request_answers_payment_need_voucher() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let provider = make_test_provider().with_prepaid_requests(2);
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
+        provider.bind_origin(&url).unwrap();
+        provider.prepaid.lock().unwrap().insert(
+            url.clone(),
+            PrepaidVoucher {
+                challenge: make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS),
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 1_000,
+            },
+        );
+        assert!(provider
+            .prepaid_credential(PaymentContext {
+                url: url.parse().unwrap(),
+                headers: reqwest::header::HeaderMap::new(),
+                http_client: None,
+            })
+            .await
+            .is_some());
+
+        let data = serde_json::json!({
+            "channelId": channel_id.to_string(),
+            "requiredCumulative": "4000",
+            "acceptedCumulative": "3000",
+            "deposit": "10000",
+        })
+        .to_string();
+        provider
+            .stream_event(&reqwest::Client::new(), &url, "payment-need-voucher", &data)
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(posted.lock().unwrap().len(), 1);
+        assert_eq!(provider.cumulative(), 4_000);
     }
 
     #[tokio::test]
