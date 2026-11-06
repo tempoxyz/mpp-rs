@@ -51,6 +51,11 @@ tempo = [
 stripe = ["dep:reqwest", "reqwest?/form"]
 sqlite = ["client", "tempo", "dep:fs2", "dep:rusqlite"]
 
+# Server-side SQL store (SqlStore), with drivers for Postgres and SQLite
+sql-store = []
+postgres-store = ["sql-store", "dep:tokio-postgres"]
+sqlite-store = ["sql-store", "dep:rusqlite"]
+
 # Utilities
 utils = ["hex"]
 
@@ -144,6 +149,9 @@ tempo-alloy = { workspace = true, optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 fs2 = { version = "0.4", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
+
+# SQL store dependencies (optional)
+tokio-postgres = { version = "0.7", optional = true }
 
 # HTTP client dependencies (optional)
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }

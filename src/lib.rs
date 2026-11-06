@@ -84,6 +84,9 @@ pub use protocol::core::accept_payment;
 // Store types
 pub use store::{FileStore, MemoryStore, Store, StoreError};
 
+#[cfg(feature = "sql-store")]
+pub use store::{SqlDialect, SqlDriver, SqlParam, SqlStore};
+
 #[cfg(all(feature = "server", feature = "tempo"))]
 pub use store::ChannelStoreAdapter;
 
