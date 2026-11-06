@@ -49,7 +49,7 @@ tempo = [
   "dep:reqwest",
 ]
 stripe = ["dep:reqwest", "reqwest?/form"]
-sqlite = ["client", "tempo", "dep:fs2", "dep:rusqlite", "dep:libc"]
+sqlite = ["client", "tempo", "dep:fs2", "dep:rusqlite", "dep:libc", "dep:linux-raw-sys"]
 
 # Utilities
 utils = ["hex"]
@@ -177,6 +177,9 @@ uuid = { version = "1", features = ["v4"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.180", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["general", "std"], optional = true }
 
 [dev-dependencies]
 alloy-json-rpc = "2.0.5"

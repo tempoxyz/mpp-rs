@@ -110,6 +110,28 @@ jobs:
       - name: Check examples
         run: cargo check --workspace --exclude mpp
 
+  sqlite-arm64:
+    name: SQLite ARM64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          toolchain: stable
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: SQLite permission and lock regressions
+        run: cargo test --lib --no-default-features --features sqlite client::tempo::session::store::
+
   doctest:
     name: Doc tests
     runs-on: ubuntu-latest
@@ -240,7 +262,7 @@ jobs:
   ci-gate:
     name: CI Gate
     if: always()
-    needs: [lint, typos, test, doctest, features, integration, deny]
+    needs: [lint, typos, test, sqlite-arm64, doctest, features, integration, deny]
     runs-on: ubuntu-latest
     permissions:
       contents: read

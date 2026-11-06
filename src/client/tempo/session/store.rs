@@ -899,7 +899,7 @@ mod sqlite {
         // match fchmodat2's ABI. Older kernels return ENOSYS or EINVAL.
         let result = unsafe {
             libc::syscall(
-                libc::SYS_fchmodat2,
+                linux_raw_sys::general::__NR_fchmodat2 as libc::c_long,
                 file.as_raw_fd(),
                 c"".as_ptr(),
                 0o600,
