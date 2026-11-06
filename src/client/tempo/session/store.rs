@@ -809,29 +809,58 @@ mod sqlite {
     fn secure_database_files(path: &Path) -> ChannelStoreResult<()> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        let database = OpenOptions::new()
-            .read(true)
+        // Never open/close existing database or sidecar descriptors here: on
+        // Unix that releases this process's SQLite record locks on the inode.
+        match OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(false)
+            .create_new(true)
             .mode(0o600)
             .open(path)
-            .map_err(io_error)?;
-        database
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(io_error)?;
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error(error)),
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_error)?;
         for suffix in ["-wal", "-shm", "-journal"] {
             let mut sidecar = path.as_os_str().to_os_string();
             sidecar.push(suffix);
-            match OpenOptions::new().read(true).write(true).open(sidecar) {
-                Ok(file) => file
-                    .set_permissions(fs::Permissions::from_mode(0o600))
-                    .map_err(io_error)?,
+            match fs::set_permissions(sidecar, fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io_error(error)),
             }
         }
         Ok(())
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_preserves_sqlite_writer_lock() {
+        const CHILD_PATH: &str = "MPP_SQLITE_LOCK_CHILD_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let connection = Connection::open(path).unwrap();
+            connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let error = connection.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!("mpp-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("channels.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE test(value INTEGER); BEGIN IMMEDIATE; INSERT INTO test VALUES(1);").unwrap();
+        secure_database_files(&path).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "client::tempo::session::store::sqlite::permission_repair_preserves_sqlite_writer_lock", "--nocapture"])
+            .env(CHILD_PATH, &path).status().unwrap();
+        assert!(status.success());
+        connection.execute_batch("COMMIT").unwrap();
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn ensure_schema(connection: &Connection) -> ChannelStoreResult<()> {
