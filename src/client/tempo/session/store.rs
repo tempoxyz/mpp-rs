@@ -858,7 +858,7 @@ mod sqlite {
         // a data-file descriptor would release this process's record locks.
         let directory = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(parent)?;
         let name = CString::new(
             path.file_name()
@@ -912,6 +912,42 @@ mod sqlite {
         } else {
             Err(std::io::Error::last_os_error())
         }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn sqlite_store_allows_symlinked_parent_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let directory =
+            std::env::temp_dir().join(format!("mpp-parent-link-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let real = directory.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = directory.join("linked");
+        symlink(&real, &link).unwrap();
+        let path = real.join("channels.db");
+        drop(
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(path.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        for mode in [0o600, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            drop(
+                SqliteChannelStore::open(SqliteChannelStoreOptions {
+                    path: Some(link.join("channels.db")),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(test, unix))]
