@@ -819,7 +819,7 @@ mod sqlite {
 
     #[cfg(unix)]
     fn secure_database_files(path: &Path) -> ChannelStoreResult<()> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         // Never open/close existing database or sidecar descriptors here: on
         // Unix that releases this process's SQLite record locks on the inode.
@@ -829,7 +829,11 @@ mod sqlite {
             .mode(0o600)
             .open(path)
         {
-            Ok(_) => {}
+            // The umask can remove owner bits too. This descriptor belongs to
+            // a newly created inode, so closing it cannot release SQLite locks.
+            Ok(file) => file
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(io_error)?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(io_error(error)),
         }
@@ -915,6 +919,42 @@ mod sqlite {
         } else {
             Err(std::io::Error::last_os_error())
         }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn sqlite_store_restores_umask_stripped_owner_bits_on_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_PATH: &str = "MPP_SQLITE_OWNER_UMASK_CHILD_PATH";
+        if let Some(directory) = std::env::var_os(CHILD_PATH) {
+            for mask in [0o200, 0o400, 0o600] {
+                // SAFETY: this runs only in a dedicated single-test child process.
+                unsafe {
+                    libc::umask(mask);
+                }
+                let path = PathBuf::from(&directory).join(format!("channels-{mask}.db"));
+                drop(
+                    SqliteChannelStore::open(SqliteChannelStoreOptions {
+                        path: Some(path.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mpp-owner-umask-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "client::tempo::session::store::sqlite::sqlite_store_restores_umask_stripped_owner_bits_on_creation", "--nocapture"])
+            .env(CHILD_PATH, &directory).status().unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(test, unix))]
