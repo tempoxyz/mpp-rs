@@ -430,9 +430,20 @@ mod sqlite {
                 None => default_channel_database_path()?,
             };
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(io_error)?;
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(parent).map_err(io_error)?;
             }
             let _schema_lease = lock_file(&database_lock_path(&path))?;
+            // SQLite derives new sidecar modes from the database. Secure it before
+            // opening SQLite, and repair sidecars left by older store versions.
+            #[cfg(unix)]
+            secure_database_files(&path)?;
             let connection = Connection::open(&path).map_err(io_error)?;
             connection
                 .execute_batch(
@@ -441,12 +452,6 @@ mod sqlite {
                 )
                 .map_err(io_error)?;
             ensure_schema(&connection)?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(io_error)?;
-            }
 
             let request_url = options
                 .request_url
@@ -800,6 +805,35 @@ mod sqlite {
         Ok(file)
     }
 
+    #[cfg(unix)]
+    fn secure_database_files(path: &Path) -> ChannelStoreResult<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let database = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(io_error)?;
+        database
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(io_error)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            match OpenOptions::new().read(true).write(true).open(sidecar) {
+                Ok(file) => file
+                    .set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(io_error)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_schema(connection: &Connection) -> ChannelStoreResult<()> {
         connection
             .execute_batch(
@@ -1047,6 +1081,63 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(decoded, entry());
+    }
+
+    #[cfg(all(feature = "sqlite", unix))]
+    #[tokio::test]
+    async fn sqlite_secures_active_and_recreated_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("MPP_SQLITE_PERMISSIONS_CHILD").is_none() {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$1\" --exact client::tempo::session::store::tests::sqlite_secures_active_and_recreated_sidecars --nocapture", "sh"])
+                .arg(std::env::current_exe().unwrap())
+                .env("MPP_SQLITE_PERMISSIONS_CHILD", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-permissions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = directory.join("channels.db");
+        let options = SqliteChannelStoreOptions {
+            namespace: "https://api.example.com".into(),
+            path: Some(path.clone()),
+            request_url: Some("https://api.example.com/private?query=sensitive".into()),
+        };
+        let paths = [
+            path.clone(),
+            directory.join("channels.db-wal"),
+            directory.join("channels.db-shm"),
+        ];
+        let assert_private = || {
+            for file in &paths {
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    file.display()
+                );
+            }
+        };
+        let first = SqliteChannelStore::open(options.clone()).unwrap();
+        first.set(&entry()).await.unwrap();
+        assert_private();
+        // Emulate an older store while its WAL remains active.
+        for file in &paths {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let second = SqliteChannelStore::open(options.clone()).unwrap();
+        second.set(&entry()).await.unwrap();
+        assert_private();
+        drop(second);
+        drop(first);
+        let reopened = SqliteChannelStore::open(options).unwrap();
+        reopened.set(&entry()).await.unwrap();
+        assert_private();
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
