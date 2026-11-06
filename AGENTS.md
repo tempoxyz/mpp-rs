@@ -53,7 +53,7 @@ A bare `cargo test` builds only the default features and skips most of the suite
 
   Bump with `patch` for fixes and additive changes and `minor` for breaking ones while the crate is pre-1.0. Docs-only and CI-only changes need none.
 - Commits and pull request titles use Conventional Commits (`feat(tempo): ...`, `fix: ...`, `!` for breaking); the release workflow reads them.
-- Protocol changes under `src/`, `crates/`, `Cargo.toml` or `Cargo.lock` run the mpp-tools conformance suite with the `rust` adapter (`conformance.yml`).
+- mpp-tools' daily SDK Conformance Monitor runs the cross-SDK conformance suite against `main` with the `rust` adapter and opens a `conformance-failure` issue in tempoxyz/mpp-tools when it fails; this repository's CI does not run it. Protocol changes add or update vectors there.
 
 ## Releases
 
