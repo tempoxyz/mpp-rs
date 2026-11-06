@@ -385,6 +385,8 @@ mod sqlite {
         /// Service namespace, normally the protected API origin.
         pub namespace: String,
         /// Filesystem path, not a `file:` URI. Defaults to `~/.tempo/wallet/channels.db`.
+        /// On Unix, repairing non-private files requires their parent directory
+        /// to be owned by the effective user and not group/other-writable.
         pub path: Option<PathBuf>,
         /// Full protected URL retained for CLI management requests.
         pub request_url: Option<String>,
@@ -841,160 +843,78 @@ mod sqlite {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn needs_private_permissions(metadata: &fs::Metadata) -> std::io::Result<bool> {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid takes no arguments and retains no pointers.
-        let owner = unsafe { libc::geteuid() };
-        if metadata.is_file() && metadata.mode() & 0o077 == 0 {
-            return Ok(false);
-        }
-        if !metadata.is_file() || metadata.nlink() != 1 || (owner != 0 && metadata.uid() != owner) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SQLite permission repair requires a singly linked regular file owned by the current user (or root)",
-            ));
-        }
-        Ok(true)
-    }
-
     #[cfg(unix)]
     fn set_private_permissions_nofollow(path: &Path) -> std::io::Result<()> {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        #[cfg(target_os = "linux")]
-        {
-            set_private_permissions_linux(&CString::new(path.as_os_str().as_bytes())?)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            use std::os::{
-                fd::AsRawFd,
-                unix::fs::{MetadataExt, OpenOptionsExt},
-            };
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            // Pin a directory rather than opening a SQLite data file: closing
-            // a data-file descriptor would release this process's record locks.
-            let directory = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(parent)?;
-            let name = CString::new(
-                path.file_name()
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "SQLite path needs a file name",
-                        )
-                    })?
-                    .as_bytes(),
-            )?;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: directory is live, name is NUL-terminated, stat is writable.
-            if unsafe {
-                libc::fstatat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    stat.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: successful fstatat initialized stat; geteuid takes no pointers.
-            let (stat, owner) = unsafe { (stat.assume_init(), libc::geteuid()) };
-            if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "SQLite permission repair requires a regular file",
-                ));
-            }
-            if stat.st_mode & 0o077 == 0 {
-                return Ok(());
-            }
-            let parent_metadata = directory.metadata()?;
-            // Other principals must not be able to replace the checked name.
-            // The descriptor keeps this directory stable even if an ancestor moves.
-            if parent_metadata.uid() != owner || parent_metadata.mode() & 0o022 != 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "SQLite permission repair requires a directory owned by the current user and not writable by group or others"));
-            }
-            if stat.st_nlink != 1 || (owner != 0 && stat.st_uid != owner) {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SQLite permission repair requires a singly linked file owned by the current user (or root)"));
-            }
-            // SAFETY: the directory and name remain live; no pointers are retained.
-            if unsafe {
-                libc::fchmodat(
-                    directory.as_raw_fd(),
-                    name.as_ptr(),
-                    0o600,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            } == 0
-            {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn set_private_permissions_linux(path: &std::ffi::CStr) -> std::io::Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::fs::PermissionsExt;
-
-        // O_PATH pins the inode without opening it for I/O. Closing this kind
-        // of descriptor does not release the process's SQLite POSIX locks.
-        // SAFETY: path is a live NUL-terminated string and open retains no pointer.
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
         };
-        if fd < 0 {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // Pin a directory rather than opening a SQLite data file: closing
+        // a data-file descriptor would release this process's record locks.
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)?;
+        let name = CString::new(
+            path.file_name()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "SQLite path needs a file name",
+                    )
+                })?
+                .as_bytes(),
+        )?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: directory is live, name is NUL-terminated, stat is writable.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: open returned a new descriptor, owned exclusively here.
-        let file = unsafe { File::from_raw_fd(fd) };
-        if !needs_private_permissions(&file.metadata()?)? {
+        // SAFETY: successful fstatat initialized stat; geteuid takes no pointers.
+        let (stat, owner) = unsafe { (stat.assume_init(), libc::geteuid()) };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite permission repair requires a regular file",
+            ));
+        }
+        if stat.st_mode & 0o077 == 0 {
             return Ok(());
         }
-        // New kernels support descriptor-based chmod even when /proc is absent.
-        // SAFETY: fd is live, the empty path is NUL-terminated, and all arguments
-        // match fchmodat2's ABI. Older kernels return ENOSYS or EINVAL.
-        let result = unsafe {
-            libc::syscall(
-                linux_raw_sys::general::__NR_fchmodat2 as libc::c_long,
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                0o600,
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if result == 0 {
-            return Ok(());
+        let parent_metadata = directory.metadata()?;
+        // Other principals must not be able to replace the checked name.
+        // The descriptor keeps this directory stable even if an ancestor moves.
+        if parent_metadata.uid() != owner || parent_metadata.mode() & 0o022 != 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "SQLite permission repair requires a directory owned by the current user and not writable by group or others"));
         }
-        let error = std::io::Error::last_os_error();
-        if !matches!(
-            error.raw_os_error(),
-            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
-        ) {
-            return Err(error);
+        if stat.st_nlink != 1 || (owner != 0 && stat.st_uid != owner) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SQLite permission repair requires a singly linked file owned by the current user (or root)"));
         }
-        // On older kernels, this procfs link names the pinned inode, never the
-        // mutable caller-supplied path. Keep the descriptor live through chmod.
-        fs::set_permissions(
-            format!("/proc/self/fd/{}", file.as_raw_fd()),
-            fs::Permissions::from_mode(0o600),
-        )
+        // The checked directory cannot be modified by other principals, and
+        // fstatat rejected symlinks. Flags=0 avoids libc/kernel-dependent
+        // AT_SYMLINK_NOFOLLOW chmod support without following an attacker swap.
+        // SAFETY: the directory and name remain live; no pointers are retained.
+        if unsafe { libc::fchmodat(directory.as_raw_fd(), name.as_ptr(), 0o600, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     #[test]
     fn permission_repair_cannot_chmod_a_swapped_hard_link() {
         use std::os::unix::fs::PermissionsExt;
@@ -1004,6 +924,7 @@ mod sqlite {
         let target = directory.join("unrelated-executable");
         fs::write(&target, b"unrelated file").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
         let path = directory.join("channels.db-journal");
         let next = directory.join("next");
         std::thread::scope(|scope| {
@@ -1028,7 +949,7 @@ mod sqlite {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg(all(test, unix, not(target_os = "linux")))]
+    #[cfg(all(test, unix))]
     #[test]
     fn permission_repair_refuses_untrusted_directory() {
         use std::os::unix::fs::PermissionsExt;
@@ -1065,12 +986,6 @@ mod sqlite {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&target, directory.join("backup.db")).unwrap();
         secure_database_files(&target).unwrap();
-        #[cfg(target_os = "linux")]
-        {
-            use std::{ffi::CString, os::unix::ffi::OsStrExt};
-            set_private_permissions_linux(&CString::new(target.as_os_str().as_bytes()).unwrap())
-                .unwrap();
-        }
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1092,14 +1007,6 @@ mod sqlite {
             let link = directory.join(format!("channels.db{suffix}"));
             fs::hard_link(&target, &link).unwrap();
             assert!(secure_database_files(&directory.join("channels.db")).is_err());
-            #[cfg(target_os = "linux")]
-            {
-                use std::{ffi::CString, os::unix::ffi::OsStrExt};
-                assert!(set_private_permissions_linux(
-                    &CString::new(link.as_os_str().as_bytes()).unwrap()
-                )
-                .is_err());
-            }
             assert_eq!(
                 fs::metadata(&target).unwrap().permissions().mode() & 0o777,
                 0o755
@@ -1124,15 +1031,6 @@ mod sqlite {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
             symlink(&target, directory.join(format!("channels.db{suffix}"))).unwrap();
             assert!(secure_database_files(&path).is_err());
-            #[cfg(target_os = "linux")]
-            {
-                use std::{ffi::CString, os::unix::ffi::OsStrExt};
-                let link = directory.join(format!("channels.db{suffix}"));
-                assert!(set_private_permissions_linux(
-                    &CString::new(link.as_os_str().as_bytes()).unwrap()
-                )
-                .is_err());
-            }
             assert_eq!(
                 fs::metadata(&target).unwrap().permissions().mode() & 0o777,
                 0o755
@@ -1184,17 +1082,6 @@ mod sqlite {
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE test(value INTEGER); BEGIN IMMEDIATE; INSERT INTO test VALUES(1);").unwrap();
         secure_database_files(&path).unwrap();
-        #[cfg(target_os = "linux")]
-        {
-            use std::{ffi::CString, os::unix::ffi::OsStrExt};
-            for suffix in ["", "-wal", "-shm"] {
-                let target = directory.join(format!("channels.db{suffix}"));
-                set_private_permissions_linux(
-                    &CString::new(target.as_os_str().as_bytes()).unwrap(),
-                )
-                .unwrap();
-            }
-        }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "client::tempo::session::store::sqlite::permission_repair_preserves_sqlite_writer_lock", "--nocapture"])
             .env(CHILD_PATH, &path).status().unwrap();
