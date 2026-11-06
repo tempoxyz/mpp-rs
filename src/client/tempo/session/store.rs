@@ -387,6 +387,9 @@ mod sqlite {
         /// Filesystem path, not a `file:` URI. Defaults to `~/.tempo/wallet/channels.db`.
         /// On Unix, repairing non-private files requires their parent directory
         /// to be owned by the effective user and not group/other-writable.
+        /// Opening fails if repair is needed in an untrusted parent. Move legacy
+        /// files into a private wallet directory or secure that dedicated directory
+        /// explicitly; the store never changes permissions on a shared parent.
         pub path: Option<PathBuf>,
         /// Full protected URL retained for CLI management requests.
         pub request_url: Option<String>,
