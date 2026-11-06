@@ -131,6 +131,28 @@ pub trait ChannelStore: Send + Sync {
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()>;
     /// Remove the channel cached for `key`.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()>;
+    /// The `spent` a server receipt last reported for `channel_id`, the channel
+    /// cached for `key`. `None` when the store keeps no such record, so a
+    /// restored channel's first receipt is costed at its quoted price.
+    async fn server_spent(
+        &self,
+        _key: &str,
+        _channel_id: B256,
+    ) -> ChannelStoreResult<Option<u128>> {
+        Ok(None)
+    }
+    /// Record the `spent` a server receipt reported for `channel_id`, the
+    /// channel cached for `key`, so a later process can cost the channel's
+    /// next receipt as the change from it. Stores that keep no such record
+    /// ignore it.
+    async fn set_server_spent(
+        &self,
+        _key: &str,
+        _channel_id: B256,
+        _spent: u128,
+    ) -> ChannelStoreResult<()> {
+        Ok(())
+    }
 }
 
 /// In-memory channel store used when persistence is not configured.
@@ -138,6 +160,7 @@ pub trait ChannelStore: Send + Sync {
 pub struct MemoryChannelStore {
     entries: Mutex<HashMap<String, StoredChannelEntry>>,
     leases: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    server_spent: Mutex<HashMap<String, (B256, u128)>>,
 }
 
 #[async_trait::async_trait]
@@ -173,6 +196,30 @@ impl ChannelStore for MemoryChannelStore {
 
     async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
         self.entries.lock().unwrap().remove(key);
+        self.server_spent.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn server_spent(&self, key: &str, channel_id: B256) -> ChannelStoreResult<Option<u128>> {
+        Ok(self
+            .server_spent
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|(id, _)| *id == channel_id)
+            .map(|(_, spent)| *spent))
+    }
+
+    async fn set_server_spent(
+        &self,
+        key: &str,
+        channel_id: B256,
+        spent: u128,
+    ) -> ChannelStoreResult<()> {
+        self.server_spent
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), (channel_id, spent));
         Ok(())
     }
 }
@@ -218,6 +265,19 @@ impl ChannelStore for OriginBoundChannelStore {
 
     async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
         self.inner.delete(key).await
+    }
+
+    async fn server_spent(&self, key: &str, channel_id: B256) -> ChannelStoreResult<Option<u128>> {
+        self.inner.server_spent(key, channel_id).await
+    }
+
+    async fn set_server_spent(
+        &self,
+        key: &str,
+        channel_id: B256,
+        spent: u128,
+    ) -> ChannelStoreResult<()> {
+        self.inner.set_server_spent(key, channel_id, spent).await
     }
 }
 
@@ -643,6 +703,51 @@ mod sqlite {
                 .map_err(io_error)?;
             Ok(())
         }
+
+        /// Reads the `server_spent` column, which tempo-wallet also keeps. Its
+        /// default `'0'`, written by mppx and by rows this store never
+        /// recorded a receipt for, means unknown, as it does to tempo-wallet.
+        async fn server_spent(
+            &self,
+            key: &str,
+            channel_id: B256,
+        ) -> ChannelStoreResult<Option<u128>> {
+            let spent: Option<String> = self
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT server_spent FROM channels WHERE scope_key = ?1 AND channel_id = ?2",
+                    params![self.scoped_key(key), format!("{:#x}", channel_id)],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(io_error)?;
+            Ok(spent
+                .and_then(|spent| spent.parse::<u128>().ok())
+                .filter(|spent| *spent > 0))
+        }
+
+        async fn set_server_spent(
+            &self,
+            key: &str,
+            channel_id: B256,
+            spent: u128,
+        ) -> ChannelStoreResult<()> {
+            self.connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE channels SET server_spent = ?3 WHERE scope_key = ?1 AND channel_id = ?2",
+                    params![
+                        self.scoped_key(key),
+                        format!("{:#x}", channel_id),
+                        spent.to_string()
+                    ],
+                )
+                .map_err(io_error)?;
+            Ok(())
+        }
     }
 
     fn database_lock_path(path: &Path) -> PathBuf {
@@ -833,6 +938,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_store_keeps_server_spent_per_channel() {
+        let store = MemoryChannelStore::default();
+        let current = entry();
+        let key = current.key();
+        store.set(&current).await.unwrap();
+        assert_eq!(
+            store.server_spent(&key, current.channel_id).await.unwrap(),
+            None
+        );
+        store
+            .set_server_spent(&key, current.channel_id, 1_500)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.server_spent(&key, current.channel_id).await.unwrap(),
+            Some(1_500)
+        );
+        assert_eq!(
+            store
+                .server_spent(&key, B256::repeat_byte(0x99))
+                .await
+                .unwrap(),
+            None
+        );
+        store.delete(&key).await.unwrap();
+        assert_eq!(
+            store.server_spent(&key, current.channel_id).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn stored_channel_origin_is_retained_and_cannot_be_rebound() {
         let store = MemoryChannelStore::default();
         let bound = StoredChannelEntry {
@@ -901,6 +1038,65 @@ mod tests {
         );
         drop(connection);
         drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_keeps_server_spent_across_writes_and_processes() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("channels.db");
+        let open = || {
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                namespace: "https://api.example.com".into(),
+                path: Some(path.clone()),
+                request_url: None,
+            })
+            .unwrap()
+        };
+        let current = entry();
+        let key = current.key();
+        let store = open();
+        store.set(&current).await.unwrap();
+        assert_eq!(
+            store.server_spent(&key, current.channel_id).await.unwrap(),
+            None
+        );
+        store
+            .set_server_spent(&key, current.channel_id, 1_500)
+            .await
+            .unwrap();
+        store.set(&current).await.unwrap();
+        assert_eq!(
+            store.server_spent(&key, current.channel_id).await.unwrap(),
+            Some(1_500)
+        );
+        assert_eq!(
+            store
+                .server_spent(&key, B256::repeat_byte(0x99))
+                .await
+                .unwrap(),
+            None
+        );
+        drop(store);
+        assert_eq!(
+            open().server_spent(&key, current.channel_id).await.unwrap(),
+            Some(1_500)
+        );
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let column: String = connection
+            .query_row("SELECT server_spent FROM channels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(column, "1500");
+        connection
+            .execute("UPDATE channels SET server_spent = '0'", [])
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            open().server_spent(&key, current.channel_id).await.unwrap(),
+            None
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
