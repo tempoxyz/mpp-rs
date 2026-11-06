@@ -172,6 +172,9 @@ pub struct TempoSessionProvider {
     topping_up: Arc<Mutex<HashSet<String>>>,
     /// What the server charged for requests paid through this provider.
     spend: Arc<Mutex<SpendLedger>>,
+    /// Held across a save of receipted `spent`, so a save that read an older
+    /// receipt cannot land after a newer one's.
+    server_spent_saves: Arc<tokio::sync::Mutex<()>>,
     /// Receives `channel.deposit` events for accepted opens and top-ups.
     events: ClientEvents,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
@@ -380,6 +383,7 @@ impl TempoSessionProvider {
             prepaid: Arc::new(Mutex::new(HashMap::new())),
             topping_up: Arc::new(Mutex::new(HashSet::new())),
             spend: Arc::default(),
+            server_spent_saves: Arc::default(),
             events: ClientEvents::default(),
             trusted_tempo_proof_realms: Vec::new(),
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
@@ -3303,9 +3307,11 @@ impl TempoSessionProvider {
 
     /// Saves the channel's latest receipted `spent` to the store, so the next
     /// process that restores the channel costs its first receipt from there
-    /// rather than at the quoted price. It reads the ledger when it runs, so a
-    /// save spawned before later receipts writes their `spent`.
+    /// rather than at the quoted price. It reads the ledger under a lock held
+    /// through the write, so the last save to finish writes the newest
+    /// receipt's `spent`, also when it was spawned before later receipts.
     async fn save_server_spent(&self, channel_id: &str) {
+        let _save = self.server_spent_saves.lock().await;
         let (Ok(id), Some(key)) = (
             channel_id.parse::<B256>(),
             self.channel_id_to_key
