@@ -705,6 +705,74 @@ async fn test_retries_withdrawal_the_zone_refused() {
 }
 
 #[tokio::test]
+async fn test_unrecognized_send_error_with_an_unknown_transaction_is_outcome_unknown() {
+    // The node answered with an error that doesn't prove it refused the
+    // transaction, and doesn't know it yet: a load-balanced or still-indexing
+    // node may have accepted it, so nothing pays the challenge again.
+    for message in [
+        "internal error",
+        "nonce too low",
+        "already known",
+        "replacement transaction underpriced",
+    ] {
+        let handler = zone_handler(|| Ok(Value::Null));
+        let (zone_url, zone_calls) = spawn_rpc(Arc::new(move |method, params| match method {
+            "eth_sendRawTransactionSync" => Err((-32000, message.into())),
+            "eth_getTransactionByHash" => Ok(Value::Null),
+            "eth_getTransactionReceipt" => Ok(Value::Null),
+            _ => handler(method, params),
+        }))
+        .await;
+        let mut zone = TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap();
+        zone.receipt_recovery_timeout = Duration::ZERO;
+        let (provider, _) = provider_with_zone(zone).await;
+        let challenge = challenge_with(json!({}), None);
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(
+            matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+            "{message}: {error}"
+        );
+        // A retry doesn't send it again.
+        let retry = provider.pay(&challenge).await.unwrap_err();
+        assert!(
+            matches!(retry, MppError::PaymentOutcomeUnknown { .. }),
+            "{message}: {retry}"
+        );
+        let sends = zone_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "eth_sendRawTransactionSync")
+            .count();
+        assert_eq!(sends, 1, "{message}");
+    }
+}
+
+#[test]
+fn test_rejected_before_admission() {
+    for message in [
+        "insufficient funds for gas * price + value",
+        "Insufficient balance for transfer",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "invalid signature",
+        "max fee per gas less than block base fee",
+    ] {
+        assert!(super::rejected_before_admission(message), "{message}");
+    }
+    for message in [
+        "internal error",
+        "rejected",
+        "nonce too low",
+        "already known",
+        "replacement transaction underpriced",
+        "transaction underpriced: insufficient funds",
+    ] {
+        assert!(!super::rejected_before_admission(message), "{message}");
+    }
+}
+
+#[tokio::test]
 async fn test_withdrawal_known_to_the_zone_after_a_send_error_is_outcome_unknown() {
     // The node answered with an error but knows the transaction, or timed out
     // waiting for its receipt: it may run.

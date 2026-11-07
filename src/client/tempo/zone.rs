@@ -46,6 +46,33 @@ const RECEIPT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// admitted the transaction but no receipt arrived in time (EIP-7966).
 const SYNC_SEND_TIMEOUT_CODE: i64 = 4;
 
+/// Whether a send error's `message` names a rejection a node makes before it
+/// admits a transaction, so the transaction can never run.
+///
+/// Errors about a transaction that may already be pending (nonce too low,
+/// already known, replacement or underpriced) never count.
+fn rejected_before_admission(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    const MAYBE_PENDING: [&str; 5] = [
+        "nonce too low",
+        "already known",
+        "known transaction",
+        "replacement",
+        "underpriced",
+    ];
+    const REJECTED: [&str; 7] = [
+        "insufficient funds",
+        "insufficient balance",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "invalid signature",
+        "less than block base fee",
+        "fee cap less than base fee",
+    ];
+    !MAYBE_PENDING.iter().any(|text| message.contains(text))
+        && REJECTED.iter().any(|text| message.contains(text))
+}
+
 /// A Zone to pay Tempo charges from, set with
 /// [`TempoProvider::with_zone`](super::TempoProvider::with_zone).
 ///
@@ -545,28 +572,32 @@ impl TempoZone {
     /// Whether the Zone refused the withdrawal `hash` whose send failed with
     /// `error`, so it never ran.
     ///
-    /// Invalid parameters prove it. Any other error the node answered with,
-    /// except the sync send's timeout, does when the node doesn't know the
-    /// transaction, such as one refused for fees its balance can't pay. A
-    /// transaction the node knew would show up, and a retry signs with the
-    /// same protocol nonce, so at most one of them can ever run.
+    /// Invalid parameters prove it. Otherwise only an error that names a
+    /// rejection made before the node admits a transaction does (such as fees
+    /// its balance can't pay), and only once the node also doesn't know the
+    /// transaction. Any other error, or an empty lookup alone, proves nothing:
+    /// a load-balanced or still-indexing node may not report a transaction it
+    /// accepted yet, and paying the challenge again would pay twice.
     async fn refused(&self, error: &alloy::transports::TransportError, hash: B256) -> bool {
         let Some(response) = error.as_error_resp() else {
             return false;
         };
-        match response.code {
-            -32602 => true,
-            SYNC_SEND_TIMEOUT_CODE => false,
-            _ => matches!(
-                self.rpc_provider
-                    .raw_request::<_, Option<serde_json::Value>>(
-                        "eth_getTransactionByHash".into(),
-                        [hash],
-                    )
-                    .await,
-                Ok(None)
-            ),
+        if response.code == -32602 {
+            return true;
         }
+        if response.code == SYNC_SEND_TIMEOUT_CODE || !rejected_before_admission(&response.message)
+        {
+            return false;
+        }
+        matches!(
+            self.rpc_provider
+                .raw_request::<_, Option<serde_json::Value>>(
+                    "eth_getTransactionByHash".into(),
+                    [hash],
+                )
+                .await,
+            Ok(None)
+        )
     }
 
     /// The lock serializing `from`'s Zone withdrawals.
