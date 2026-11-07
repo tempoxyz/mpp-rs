@@ -218,6 +218,25 @@ pub enum MppError {
         zone_id: u32,
     },
 
+    /// A Zone withdrawal paying a challenge settled on Tempo, but its payout
+    /// bounced (the portal's `WithdrawalProcessed` reports `callbackSuccess`
+    /// false): the amount went back to the payer's Zone balance and the
+    /// challenge is unpaid, while the withdrawal's fees are spent.
+    ///
+    /// Paying `challenge_id` again with the same provider withdraws again.
+    /// Callers that choose among several offers should not fall back to
+    /// another one automatically, since each attempt spends another
+    /// withdrawal's fees.
+    #[error("Zone {zone_id} withdrawal {sender_tag} for challenge \"{challenge_id}\" bounced on Tempo: its amount was returned to the payer's Zone balance.")]
+    ZoneWithdrawalBounced {
+        /// ID of the challenge the withdrawal paid.
+        challenge_id: String,
+        /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed` event carries it.
+        sender_tag: String,
+        /// ID of the Zone the withdrawal left.
+        zone_id: u32,
+    },
+
     /// A session operation may have been applied; reconcile it before paying again.
     #[error("session payment outcome unknown: {context}; reconcile before retrying")]
     SessionPaymentOutcomeUnknown {

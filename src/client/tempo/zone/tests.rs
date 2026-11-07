@@ -844,13 +844,18 @@ async fn test_bounced_withdrawal_fails_without_a_credential_and_may_be_paid_agai
 
     let error = provider.pay(&challenge).await.unwrap_err();
     assert!(error.to_string().contains("bounced"), "{error}");
-    assert!(
-        !matches!(
-            error,
-            MppError::ZoneSettlementPending { .. } | MppError::PaymentOutcomeUnknown { .. }
-        ),
-        "{error}"
-    );
+    match &error {
+        MppError::ZoneWithdrawalBounced {
+            challenge_id,
+            sender_tag: tag,
+            zone_id,
+        } => {
+            assert_eq!(challenge_id, &challenge.id);
+            assert_eq!(tag, &format!("{sender_tag:#x}"));
+            assert_eq!(*zone_id, 3);
+        }
+        other => panic!("expected ZoneWithdrawalBounced, got {other}"),
+    }
 
     // The amount came back to the payer, so a retry withdraws again.
     *logs.lock().unwrap() = json!([settlement_log(sender_tag, true, B256::repeat_byte(0x55))]);

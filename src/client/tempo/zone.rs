@@ -409,12 +409,15 @@ impl TempoZone {
         self.forget(&key, &withdrawal);
         // A bounced payout returned the amount to the payer's Zone balance and
         // paid nothing, so the server would reject its Credential: fail
-        // without one, and let a retry withdraw again.
+        // without one, and let a retry withdraw again. The withdrawal's fees
+        // are spent, so it gets its own error, which callers such as MCP do
+        // not answer by paying another offer.
         if settlement.bounced {
-            return Err(MppError::Http(format!(
-                "Zone withdrawal {sender_tag:#x} bounced on Tempo in {:#x}: its amount was returned to the payer's Zone balance.",
-                settlement.hash
-            )));
+            return Err(MppError::ZoneWithdrawalBounced {
+                challenge_id: challenge.id.clone(),
+                sender_tag: format!("{sender_tag:#x}"),
+                zone_id,
+            });
         }
         let hash = settlement.hash;
 
