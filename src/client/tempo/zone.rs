@@ -279,7 +279,16 @@ impl TempoZone {
         // A withdrawal settles on the Zone's real parent: never start one for
         // a Challenge on a contradicting parent chain.
         self.check_parent_chain_id()?;
-        if request.amount_u256()?.is_zero() || self.parent_chain_id != Some(chain_id) {
+        // The Zone must settle on the chain the client signs on and on the one
+        // the Challenge names, when it names one.
+        let challenge_chain_id = {
+            use crate::protocol::methods::tempo::charge::TempoChargeExt;
+            request.chain_id()
+        };
+        if request.amount_u256()?.is_zero()
+            || self.parent_chain_id != Some(chain_id)
+            || challenge_chain_id.is_some_and(|id| self.parent_chain_id != Some(id))
+        {
             return Ok(false);
         }
         let details = request.tempo_method_details()?;

@@ -728,6 +728,17 @@ impl PaymentProvider for TempoProvider {
         }
         let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
         self.ensure_allowed_chain(Some(chain_id))?;
+        // A challenge names the chain it settles on: refuse another one before
+        // choosing the Zone path, as the ordinary path does, so an unpinned
+        // provider never withdraws from a Zone settling on its RPC chain.
+        if let Some(got) = challenge_chain_id {
+            if got != chain_id {
+                return Err(MppError::ChainIdMismatch {
+                    expected: chain_id,
+                    got,
+                });
+            }
+        }
         if let Some(zone) = &self.zone {
             let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
             if zone.pays(

@@ -278,6 +278,48 @@ async fn test_never_withdraws_on_a_parent_chain_that_does_not_match_zone_chain()
     assert!(tempo_calls.lock().unwrap().is_empty());
 }
 
+/// An unpinned provider with a Zone on its RPC chain refuses a Challenge
+/// naming another chain, as the ordinary path does, without touching the Zone.
+#[tokio::test]
+async fn test_never_withdraws_for_a_challenge_on_another_chain() {
+    let (zone_url, zone_calls) = unused_zone_rpc().await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    let challenge = challenge_with(json!({ "chainId": 4217 }), None);
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            MppError::ChainIdMismatch {
+                expected: 42431,
+                got: 4217
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(zone_calls.lock().unwrap().is_empty());
+}
+
+/// The Zone predicate checks the Challenge's chain, not only the signing chain.
+#[tokio::test]
+async fn test_does_not_pay_a_challenge_on_another_chain_from_the_zone() {
+    let (zone_url, zone_calls) = unused_zone_rpc().await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap();
+    let challenge = challenge_with(json!({ "chainId": 4217 }), None);
+    let request: ChargeRequest = challenge.request.decode().unwrap();
+    let signer = TempoPrimitiveSigner::from(payer());
+    assert!(!zone
+        .pays(
+            &challenge,
+            &request,
+            42431,
+            &signer,
+            &TempoSigningMode::Direct
+        )
+        .unwrap());
+    assert!(zone_calls.lock().unwrap().is_empty());
+}
+
 #[test]
 fn test_rejects_zone_without_zone_id() {
     let zone = TempoZone::new("http://127.0.0.1:1", 42_431).unwrap();
