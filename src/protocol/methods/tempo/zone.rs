@@ -164,9 +164,14 @@ impl<'de> Deserialize<'de> for Zones {
     }
 }
 
-/// Whether a value is a valid Zone ID: a positive 32-bit integer.
+/// Zone IDs from here up read as Zone chain IDs in viem's portal lookup, which
+/// would map them to another Zone's portal, as mppx's `maxIdExclusive`.
+const MAX_ID_EXCLUSIVE: u64 = 421_700_000;
+
+/// Whether a value is a valid Zone ID: a positive integer below the Zone chain
+/// ID ranges, as mppx's `isId`.
 pub fn is_id(zone_id: u64) -> bool {
-    zone_id > 0 && zone_id < (1 << 32)
+    zone_id > 0 && zone_id < MAX_ID_EXCLUSIVE
 }
 
 /// Whether a Challenge's `zones` accepts withdrawals from a Zone.
@@ -183,19 +188,11 @@ pub fn is_accepted(zones: Option<&Zones>, zone_id: u32) -> bool {
 
 /// The Tempo portal address of a Zone, as viem's `Addresses.zonePortal`.
 ///
-/// Like viem, an ID inside a Zone chain ID range is read as that Zone chain
-/// ID, and Zones 6 and 7 keep their legacy portal addresses.
+/// The ID is read literally: unlike viem, a Zone chain ID is not mapped to its
+/// Zone (use [`id_from_chain_id`] for that), and callers accept only IDs that
+/// pass [`is_id`]. Zones 6 and 7 keep their legacy portal addresses.
 pub fn portal_address(zone_id: u32) -> Address {
-    let id = u64::from(zone_id);
-    let zone_id = if (4_217_000_000..4_218_000_000).contains(&id) {
-        id - 4_217_000_000
-    } else if (TESTNET_ZONE_CHAIN_ID_BASE..(1 << 31)).contains(&id) {
-        id - TESTNET_ZONE_CHAIN_ID_BASE
-    } else if (MAINNET_ZONE_CHAIN_ID_BASE..TESTNET_ZONE_CHAIN_ID_BASE).contains(&id) {
-        id - MAINNET_ZONE_CHAIN_ID_BASE
-    } else {
-        id
-    };
+    let zone_id = u64::from(zone_id);
     match zone_id {
         6 => address!("7069DeC4E64Fd07334A0933eDe836C17259c9B23"),
         7 => address!("3F5296303400B56271b476F5A0B9cBF74350D6Ac"),
@@ -322,9 +319,14 @@ mod tests {
             portal_address(6),
             address!("7069DeC4E64Fd07334A0933eDe836C17259c9B23")
         );
+        // The ID is read literally: a Zone chain ID is not Zone 3's portal.
+        assert_eq!(
+            portal_address(421_700_003),
+            address!("5ad000000000000000000000000000001922a1a3")
+        );
         assert_eq!(
             portal_address(1_424_310_003),
-            address!("5ad0000000000000000000000000000000000003")
+            address!("5ad0000000000000000000000000000054e53ef3")
         );
         assert_eq!(
             portal_address(u32::MAX),
@@ -333,11 +335,23 @@ mod tests {
     }
 
     #[test]
+    fn test_is_id() {
+        assert!(is_id(1));
+        assert!(is_id(421_699_999));
+        assert!(!is_id(0));
+        assert!(!is_id(421_700_000));
+        assert!(!is_id(421_700_003));
+        assert!(!is_id(1_424_310_003));
+        assert!(!is_id(u64::from(u32::MAX)));
+    }
+
+    #[test]
     fn test_is_accepted() {
         assert!(is_accepted(Some(&Zones::Any), 9));
         assert!(is_accepted(Some(&Zones::Ids(vec![3, 7])), 7));
         assert!(!is_accepted(Some(&Zones::Ids(vec![3, 7])), 4));
         assert!(!is_accepted(Some(&Zones::Any), 0));
+        assert!(!is_accepted(Some(&Zones::Any), 421_700_003));
         assert!(!is_accepted(None, 3));
     }
 
@@ -364,6 +378,8 @@ mod tests {
             serde_json::json!([]),
             serde_json::json!([0]),
             serde_json::json!([4_294_967_296u64]),
+            serde_json::json!([421_700_000]),
+            serde_json::json!([3, 421_700_003]),
             serde_json::json!([-1]),
             serde_json::json!([1.5]),
         ] {
@@ -375,6 +391,7 @@ mod tests {
         assert_eq!(Zones::ids([3, 7]), Some(Zones::Ids(vec![3, 7])));
         assert_eq!(Zones::ids([]), None);
         assert_eq!(Zones::ids([0]), None);
+        assert_eq!(Zones::ids([421_700_003]), None);
     }
 
     #[test]

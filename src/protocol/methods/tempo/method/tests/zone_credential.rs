@@ -532,6 +532,9 @@ async fn test_zone_rejects_invalid_zone_ids() {
         serde_json::json!(-1),
         serde_json::json!(1.5),
         serde_json::json!(4_294_967_296u64),
+        // A Zone chain ID, not a Zone ID: it must not resolve to Zone 3.
+        serde_json::json!(421_700_000),
+        serde_json::json!(421_700_003),
     ] {
         let credential = PaymentCredential::new(
             challenge.to_echo(),

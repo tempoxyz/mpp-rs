@@ -192,6 +192,15 @@ async fn test_pays_on_tempo_when_the_zone_is_not_used() {
 }
 
 #[test]
+fn test_rejects_zone_id_in_zone_chain_id_range() {
+    let error = TempoZone::new("http://127.0.0.1:1", 1_000)
+        .unwrap()
+        .with_zone_id(421_700_003)
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid Zone ID"), "{error}");
+}
+
+#[test]
 fn test_rejects_zone_id_that_does_not_match_zone_chain() {
     let error = TempoZone::new("http://127.0.0.1:1", MODERATO_ZONE_3)
         .unwrap()

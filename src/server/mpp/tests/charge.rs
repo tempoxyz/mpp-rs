@@ -544,7 +544,11 @@ fn test_zones_advertised_in_charge_challenges() {
 fn test_zones_rejects_invalid_config() {
     use crate::protocol::methods::tempo::zone::Zones;
 
-    for zones in [Zones::Ids(vec![]), Zones::Ids(vec![0])] {
+    for zones in [
+        Zones::Ids(vec![]),
+        Zones::Ids(vec![0]),
+        Zones::Ids(vec![3, 421_700_003]),
+    ] {
         let error = Mpp::create(offers_builder().zones(zones)).err().unwrap();
         assert!(error.to_string().contains("zones must be"), "{error}");
     }
