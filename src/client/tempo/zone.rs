@@ -656,7 +656,7 @@ impl TempoZone {
 
     /// Looks for the receipt of a withdrawal whose send response failed.
     async fn recover_receipt(&self, hash: B256) -> Option<serde_json::Value> {
-        let deadline = tokio::time::Instant::now() + self.receipt_recovery_timeout;
+        let deadline = tokio::time::Instant::now().checked_add(self.receipt_recovery_timeout);
         loop {
             let receipt: Result<Option<serde_json::Value>, _> = self
                 .rpc_provider
@@ -665,7 +665,9 @@ impl TempoZone {
             if let Ok(Some(receipt)) = receipt {
                 return Some(receipt);
             }
-            if tokio::time::Instant::now() + POLLING_INTERVAL > deadline {
+            if deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() + POLLING_INTERVAL > deadline)
+            {
                 return None;
             }
             tokio::time::sleep(POLLING_INTERVAL).await;
@@ -691,8 +693,11 @@ fn settles_before_expiry(challenge: &PaymentChallenge, timeout: Duration) -> boo
         return true;
     }
     // An unparsable expiry is not one the withdrawal can beat.
+    // A timeout too long to add the margin to never beats an expiry.
     challenge.expires_at().is_some_and(|expires_at| {
-        expires_at - time::OffsetDateTime::now_utc() > timeout + SUBMISSION_MARGIN
+        timeout
+            .checked_add(SUBMISSION_MARGIN)
+            .is_some_and(|needed| expires_at - time::OffsetDateTime::now_utc() > needed)
     })
 }
 
@@ -742,7 +747,8 @@ async fn wait_for_settlement_from(
     timeout: Duration,
     cursor: &Mutex<Option<u64>>,
 ) -> Result<Settlement, MppError> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    // A timeout past what an Instant can hold waits without a deadline.
+    let deadline = tokio::time::Instant::now().checked_add(timeout);
     let block_number = || async {
         provider
             .get_block_number()
@@ -784,7 +790,9 @@ async fn wait_for_settlement_from(
             }
             from_block = latest + 1;
         }
-        if tokio::time::Instant::now() + POLLING_INTERVAL > deadline {
+        if deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() + POLLING_INTERVAL > deadline)
+        {
             return Err(MppError::Http(format!(
                 "Zone withdrawal {sender_tag:#x} did not settle on Tempo within {}ms.",
                 timeout.as_millis()

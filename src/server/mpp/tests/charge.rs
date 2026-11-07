@@ -703,6 +703,68 @@ async fn test_unbound_verification_rejects_withdrawals_from_other_zones() {
 
 #[cfg(feature = "tempo")]
 #[tokio::test]
+async fn test_route_zones_override_handler_zones() {
+    use crate::protocol::methods::tempo::zone::Zones;
+
+    let mpp = success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([3]).unwrap()),
+    );
+    let route = mpp
+        .expected_charge_request("0.10", ChargeOptions::default())
+        .unwrap();
+    // A route that issues its challenges for Zone 7 instead of the handler's.
+    let request = ChargeRequest {
+        amount: route.amount.clone(),
+        currency: route.currency.clone(),
+        recipient: route.recipient.clone(),
+        method_details: Some(serde_json::json!({ "chainId": CHAIN_ID, "zones": [7] })),
+        ..Default::default()
+    };
+    let challenge = mpp
+        .charge_challenge_with_options(&request, None, None)
+        .unwrap();
+    let credential = |zone_id| {
+        PaymentCredential::new(
+            challenge.to_echo(),
+            PaymentPayload::zone(
+                format!("0x{}", "ab".repeat(32)),
+                format!("0x{}", "a1".repeat(32)),
+                zone_id,
+            ),
+        )
+    };
+
+    mpp.verify_credential_with_expected_request(&credential(7), &request)
+        .await
+        .unwrap();
+
+    // A Zone the challenge does not accept is rejected on every path.
+    let zone_9 = credential(9);
+    let errors = [
+        mpp.verify_credential_with_expected_request(&zone_9, &request)
+            .await
+            .unwrap_err(),
+        mpp.validate_credential_with_expected_request(&zone_9, &request)
+            .await
+            .unwrap_err(),
+        mpp.broadcast_credential(&zone_9).await.unwrap_err(),
+        mpp.validate_credential(&zone_9).await.unwrap_err(),
+    ];
+    for err in errors {
+        assert_eq!(
+            err.code,
+            Some(ErrorCode::InvalidChallenge),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("Zone"), "{}", err.message);
+    }
+}
+
+#[cfg(feature = "tempo")]
+#[tokio::test]
 async fn test_explicit_charge_challenge_verifies_against_its_own_request() {
     use crate::protocol::methods::tempo::zone::Zones;
 

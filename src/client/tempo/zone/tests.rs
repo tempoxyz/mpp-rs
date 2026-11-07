@@ -949,3 +949,39 @@ async fn test_resumed_settlement_wait_searches_from_where_the_first_one_started(
     );
     assert_eq!(sent.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn test_settlement_timeout_of_duration_max_does_not_overflow() {
+    // With an expiry, no withdrawal can wait that long before it, and the
+    // wait is cut short at the expiry.
+    let expiring = challenge_with(json!({}), expires_in(3600));
+    assert!(!settles_before_expiry(&expiring, Duration::MAX));
+    assert!(settlement_timeout(&expiring, Duration::MAX) <= Duration::from_secs(3600));
+
+    // Without one, the withdrawal is sent and waited on with no deadline.
+    let challenge = challenge_with(json!({}), None);
+    assert!(settles_before_expiry(&challenge, Duration::MAX));
+    assert_eq!(settlement_timeout(&challenge, Duration::MAX), Duration::MAX);
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let sender_tag = zone::sender_tag(payer().address(), B256::repeat_byte(0x22), 7);
+    let (tempo_url, _) = tempo_rpc(Arc::new(Mutex::new(json!([settlement_log(
+        sender_tag,
+        true,
+        B256::repeat_byte(0x55)
+    )]))))
+    .await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::MAX);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(
+        credential.charge_payload().unwrap().data(),
+        format!("{:#x}", B256::repeat_byte(0x55))
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
