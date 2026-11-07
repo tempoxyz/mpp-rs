@@ -5291,10 +5291,12 @@ mod tests {
         let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
         let (url, posted) = management_server(|_, _| StatusCode::OK.into_response()).await;
         provider.bind_origin(&url).unwrap();
+        let mut challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        challenge.realm = "127.0.0.1".into();
         provider.prepaid.lock().unwrap().insert(
             url.clone(),
             PrepaidVoucher {
-                challenge: make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS),
+                challenge,
                 channel_id: channel_id.to_string(),
                 spent: 1_000,
                 price: 1_000,
