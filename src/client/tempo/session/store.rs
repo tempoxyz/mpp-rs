@@ -631,7 +631,12 @@ mod sqlite {
     pub struct SqliteChannelStoreOptions {
         /// Service namespace, normally the protected API origin.
         pub namespace: String,
-        /// SQLite path. Defaults to `~/.tempo/wallet/channels.db`.
+        /// Filesystem path, not a `file:` URI or `:memory:`. Defaults to `~/.tempo/wallet/channels.db`.
+        /// On Unix, repairing non-private files requires their parent directory
+        /// to be owned by the effective user and not group/other-writable.
+        /// Opening fails if repair is needed in an untrusted parent. Move legacy
+        /// files into a private wallet directory or secure that dedicated directory
+        /// explicitly; the store never changes permissions on a shared parent.
         pub path: Option<PathBuf>,
         /// Full protected URL retained for CLI management requests.
         pub request_url: Option<String>,
@@ -676,10 +681,33 @@ mod sqlite {
                 Some(path) => path,
                 None => default_channel_database_path()?,
             };
+            if path.as_os_str() == ":memory:" {
+                return Err(ChannelStoreError::Io(
+                    "SQLite in-memory paths are not supported; provide a filesystem path".into(),
+                ));
+            }
+            // Permission repair and SQLite must name the same filesystem entry.
+            // SQLite otherwise interprets file: URIs, including query options.
+            if path.as_os_str().as_encoded_bytes().starts_with(b"file:") {
+                return Err(ChannelStoreError::Io(
+                    "SQLite URI paths are not supported; provide a filesystem path".into(),
+                ));
+            }
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(io_error)?;
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(parent).map_err(io_error)?;
             }
             let _schema_lease = lock_file(&database_lock_path(&path))?;
+            // SQLite derives new sidecar modes from the database. Secure it before
+            // opening SQLite, and repair sidecars left by older store versions.
+            #[cfg(unix)]
+            secure_database_files(&path)?;
             let connection = Connection::open(&path).map_err(io_error)?;
             connection
                 .execute_batch(
@@ -688,12 +716,6 @@ mod sqlite {
                 )
                 .map_err(io_error)?;
             ensure_schema(&connection)?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(io_error)?;
-            }
 
             let request_url = options
                 .request_url
@@ -1076,6 +1098,414 @@ mod sqlite {
         let file = options.open(path).map_err(io_error)?;
         file.lock_exclusive().map_err(io_error)?;
         Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn secure_database_files(path: &Path) -> ChannelStoreResult<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        // Never open/close existing database or sidecar descriptors here: on
+        // Unix that releases this process's SQLite record locks on the inode.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            // The umask can remove owner bits too. This descriptor belongs to
+            // a newly created inode, so closing it cannot release SQLite locks.
+            Ok(file) => file
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(io_error)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error(error)),
+        }
+        set_private_permissions_nofollow(path).map_err(io_error)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            match set_private_permissions_nofollow(Path::new(&sidecar)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(error)),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn set_private_permissions_nofollow(path: &Path) -> std::io::Result<()> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        // Search permission is sufficient for already-private files. No chmod
+        // occurs on this path, so no directory read handle or data-file fd is needed.
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_file() && metadata.mode() & 0o077 == 0 {
+            return Ok(());
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // Pin a directory rather than opening a SQLite data file: closing
+        // a data-file descriptor would release this process's record locks.
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(parent)?;
+        let name = CString::new(
+            path.file_name()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "SQLite path needs a file name",
+                    )
+                })?
+                .as_bytes(),
+        )?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: directory is live, name is NUL-terminated, stat is writable.
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatat initialized stat; geteuid takes no pointers.
+        let (stat, owner) = unsafe { (stat.assume_init(), libc::geteuid()) };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite permission repair requires a regular file",
+            ));
+        }
+        if stat.st_mode & 0o077 == 0 {
+            return Ok(());
+        }
+        let parent_metadata = directory.metadata()?;
+        // Other principals must not be able to replace the checked name.
+        // The descriptor keeps this directory stable even if an ancestor moves.
+        if parent_metadata.uid() != owner || parent_metadata.mode() & 0o022 != 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "SQLite permission repair requires a directory owned by the current user and not writable by group or others"));
+        }
+        if stat.st_nlink != 1 || (owner != 0 && stat.st_uid != owner) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "SQLite permission repair requires a singly linked file owned by the current user (or root)"));
+        }
+        // The checked directory cannot be modified by other principals, and
+        // fstatat rejected symlinks. Flags=0 avoids libc/kernel-dependent
+        // AT_SYMLINK_NOFOLLOW chmod support without following an attacker swap.
+        // SAFETY: the directory and name remain live; no pointers are retained.
+        if unsafe { libc::fchmodat(directory.as_raw_fd(), name.as_ptr(), 0o600, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn sqlite_store_opens_in_search_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mpp-search-only-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o300)).unwrap();
+        let path = directory.join("channels.db");
+        let result = (|| {
+            drop(SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(path.clone()),
+                ..Default::default()
+            })?);
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(path),
+                ..Default::default()
+            })
+        })();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        drop(result.unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sqlite_store_rejects_memory_sentinel_without_creating_files() {
+        const CHILD: &str = "MPP_SQLITE_MEMORY_SENTINEL_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let error = SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(PathBuf::from(":memory:")),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("in-memory paths are not supported"));
+            assert_eq!(fs::read_dir(".").unwrap().count(), 0);
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mpp-memory-sentinel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "client::tempo::session::store::sqlite::sqlite_store_rejects_memory_sentinel_without_creating_files", "--nocapture"])
+            .current_dir(&directory).env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn sqlite_store_restores_umask_stripped_owner_bits_on_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_PATH: &str = "MPP_SQLITE_OWNER_UMASK_CHILD_PATH";
+        if let Some(directory) = std::env::var_os(CHILD_PATH) {
+            for mask in [0o200, 0o400, 0o600] {
+                // SAFETY: this runs only in a dedicated single-test child process.
+                unsafe {
+                    libc::umask(mask);
+                }
+                let path = PathBuf::from(&directory).join(format!("channels-{mask}.db"));
+                drop(
+                    SqliteChannelStore::open(SqliteChannelStoreOptions {
+                        path: Some(path.clone()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mpp-owner-umask-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "client::tempo::session::store::sqlite::sqlite_store_restores_umask_stripped_owner_bits_on_creation", "--nocapture"])
+            .env(CHILD_PATH, &directory).status().unwrap();
+        assert!(status.success());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn sqlite_store_allows_symlinked_parent_directories() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let directory =
+            std::env::temp_dir().join(format!("mpp-parent-link-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let real = directory.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = directory.join("linked");
+        symlink(&real, &link).unwrap();
+        let path = real.join("channels.db");
+        drop(
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(path.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        for mode in [0o600, 0o644] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            drop(
+                SqliteChannelStore::open(SqliteChannelStoreOptions {
+                    path: Some(link.join("channels.db")),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_cannot_chmod_a_swapped_hard_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mpp-link-race-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("unrelated-executable");
+        fs::write(&target, b"unrelated file").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = directory.join("channels.db-journal");
+        let next = directory.join("next");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1000 {
+                    fs::hard_link(&target, &next).unwrap();
+                    fs::rename(&next, &path).unwrap();
+                    fs::write(&next, b"legacy sidecar").unwrap();
+                    fs::set_permissions(&next, fs::Permissions::from_mode(0o644)).unwrap();
+                    fs::rename(&next, &path).unwrap();
+                }
+            });
+            for _ in 0..1000 {
+                let _ = set_private_permissions_nofollow(&path);
+            }
+        });
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_refuses_untrusted_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mpp-untrusted-dir-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("channels.db");
+        fs::write(&path, b"legacy database").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(set_private_permissions_nofollow(&path).is_err());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        set_private_permissions_nofollow(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn already_private_hard_links_need_no_permission_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mpp-private-link-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("channels.db");
+        fs::write(&target, b"private file").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&target, directory.join("backup.db")).unwrap();
+        secure_database_files(&target).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_rejects_hard_links() {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let directory =
+                std::env::temp_dir().join(format!("mpp-hardlink-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&directory).unwrap();
+            let target = directory.join("unrelated-executable");
+            fs::write(&target, b"unrelated file").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            let link = directory.join(format!("channels.db{suffix}"));
+            fs::hard_link(&target, &link).unwrap();
+            assert!(secure_database_files(&directory.join("channels.db")).is_err());
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_does_not_follow_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let directory =
+                std::env::temp_dir().join(format!("mpp-symlink-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("channels.db");
+            let target = directory.join("unrelated-executable");
+            fs::write(&target, b"unrelated file").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&target, directory.join(format!("channels.db{suffix}"))).unwrap();
+            assert!(secure_database_files(&path).is_err());
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"unrelated file");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn uri_paths_are_rejected_before_creating_files() {
+        let directory = std::env::temp_dir().join(format!("mpp-uri-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        for path in [
+            "file:channels.db".to_string(),
+            format!("file:{}?mode=rwc", directory.join("channels.db").display()),
+            "file::memory:?cache=shared".to_string(),
+        ] {
+            let result = SqliteChannelStore::open(SqliteChannelStoreOptions {
+                path: Some(PathBuf::from(path)),
+                ..Default::default()
+            });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("URI paths are not supported"));
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn permission_repair_preserves_sqlite_writer_lock() {
+        const CHILD_PATH: &str = "MPP_SQLITE_LOCK_CHILD_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let connection = Connection::open(path).unwrap();
+            connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let error = connection.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!("mpp-lock-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("channels.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE test(value INTEGER); BEGIN IMMEDIATE; INSERT INTO test VALUES(1);").unwrap();
+        secure_database_files(&path).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "client::tempo::session::store::sqlite::permission_repair_preserves_sqlite_writer_lock", "--nocapture"])
+            .env(CHILD_PATH, &path).status().unwrap();
+        assert!(status.success());
+        connection.execute_batch("COMMIT").unwrap();
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn ensure_schema(connection: &Connection) -> ChannelStoreResult<()> {
@@ -1785,6 +2215,63 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(decoded, entry());
+    }
+
+    #[cfg(all(feature = "sqlite", unix))]
+    #[tokio::test]
+    async fn sqlite_secures_active_and_recreated_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("MPP_SQLITE_PERMISSIONS_CHILD").is_none() {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$1\" --exact client::tempo::session::store::tests::sqlite_secures_active_and_recreated_sidecars --nocapture", "sh"])
+                .arg(std::env::current_exe().unwrap())
+                .env("MPP_SQLITE_PERMISSIONS_CHILD", "1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-permissions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = directory.join("channels.db");
+        let options = SqliteChannelStoreOptions {
+            namespace: "https://api.example.com".into(),
+            path: Some(path.clone()),
+            request_url: Some("https://api.example.com/private?query=sensitive".into()),
+        };
+        let paths = [
+            path.clone(),
+            directory.join("channels.db-wal"),
+            directory.join("channels.db-shm"),
+        ];
+        let assert_private = || {
+            for file in &paths {
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    file.display()
+                );
+            }
+        };
+        let first = SqliteChannelStore::open(options.clone()).unwrap();
+        first.set(&entry()).await.unwrap();
+        assert_private();
+        // Emulate an older store while its WAL remains active.
+        for file in &paths {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let second = SqliteChannelStore::open(options.clone()).unwrap();
+        second.set(&entry()).await.unwrap();
+        assert_private();
+        drop(second);
+        drop(first);
+        let reopened = SqliteChannelStore::open(options).unwrap();
+        reopened.set(&entry()).await.unwrap();
+        assert_private();
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(feature = "sqlite")]
