@@ -61,6 +61,10 @@ pub struct TempoZone {
     /// Withdrawals by Challenge, so a retry resumes waiting instead of paying
     /// again. Shared by clones.
     pending: Arc<Mutex<HashMap<String, Arc<PendingWithdrawal>>>>,
+    /// Per-account locks held from the protocol nonce lookup until the
+    /// withdrawal's outcome is known, so concurrent payments of different
+    /// Challenges never sign with the same nonce. Shared by clones.
+    nonce_locks: Arc<Mutex<HashMap<Address, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl std::fmt::Debug for TempoZone {
@@ -121,6 +125,7 @@ impl TempoZone {
             settlement_timeout: zone::DEFAULT_SETTLEMENT_TIMEOUT,
             receipt_recovery_timeout: RECEIPT_RECOVERY_TIMEOUT,
             pending: Arc::default(),
+            nonce_locks: Arc::default(),
         })
     }
 
@@ -261,6 +266,7 @@ impl TempoZone {
         client_id: Option<&str>,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
+        fee_token: Option<Address>,
         tempo: &impl Provider<TempoNetwork>,
     ) -> Result<PaymentCredential, MppError> {
         let zone_id = self.zone_id.ok_or_else(|| {
@@ -280,22 +286,46 @@ impl TempoZone {
             .entry(key.clone())
             .or_default()
             .clone();
-        let mut own_error = None;
-        let outcome = withdrawal
-            .get_or_init(|| async {
-                match self
-                    .request_withdrawal(challenge, client_id, signer, signing_mode)
+        // The request runs in its own task, so a caller that is cancelled or
+        // times out after the transaction is sent still leaves its outcome in
+        // the shared cell for the retry to reconcile, instead of sending
+        // another withdrawal.
+        let task = {
+            let zone = self.clone();
+            let withdrawal = withdrawal.clone();
+            let challenge = challenge.clone();
+            let client_id = client_id.map(str::to_owned);
+            let signer = signer.clone();
+            let signing_mode = signing_mode.clone();
+            tokio::spawn(async move {
+                let mut own_error = None;
+                let outcome = withdrawal
+                    .get_or_init(|| async {
+                        match zone
+                            .request_withdrawal(
+                                &challenge,
+                                client_id.as_deref(),
+                                &signer,
+                                &signing_mode,
+                                fee_token,
+                            )
+                            .await
+                        {
+                            Ok(sender_tag) => Ok(sender_tag),
+                            Err((failure, error)) => {
+                                own_error = Some(error);
+                                Err(failure)
+                            }
+                        }
+                    })
                     .await
-                {
-                    Ok(sender_tag) => Ok(sender_tag),
-                    Err((failure, error)) => {
-                        own_error = Some(error);
-                        Err(failure)
-                    }
-                }
+                    .clone();
+                (outcome, own_error)
             })
+        };
+        let (outcome, own_error) = task
             .await
-            .clone();
+            .map_err(|e| MppError::Http(format!("Zone withdrawal request failed: {e}")))?;
         let sender_tag = match outcome {
             Ok(sender_tag) => sender_tag,
             Err(failure) => {
@@ -339,6 +369,7 @@ impl TempoZone {
         client_id: Option<&str>,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
+        fee_token: Option<Address>,
     ) -> Result<B256, (WithdrawalFailure, MppError)> {
         let retryable = |error: MppError| (WithdrawalFailure::Retryable(error.to_string()), error);
         let request: ChargeRequest = challenge.request.decode().map_err(retryable)?;
@@ -384,6 +415,10 @@ impl TempoZone {
                 .into(),
             },
         ];
+        // Hold the account's nonce lock until the outcome is known, so another
+        // payment from this account reads the nonce after this one is spent.
+        let nonce_lock = self.nonce_lock(from);
+        let _nonce_guard = nonce_lock.lock().await;
         // Prepare and sign first: a failure there sent nothing, so the
         // challenge may be retried. The protocol nonce is the Zone's.
         let nonce = self
@@ -402,6 +437,9 @@ impl TempoZone {
                     signing_mode: Some(signing_mode.clone()),
                     nonce: Some(nonce),
                     nonce_key: Some(U256::ZERO),
+                    // The configured gas token, as for payments on Tempo; the
+                    // charge currency otherwise.
+                    fee_token,
                     ..Default::default()
                 },
             )
@@ -467,6 +505,16 @@ impl TempoZone {
             transaction_hash,
             requested.fallbackNonce,
         ))
+    }
+
+    /// The lock serializing `from`'s Zone withdrawals.
+    fn nonce_lock(&self, from: Address) -> Arc<tokio::sync::Mutex<()>> {
+        self.nonce_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(from)
+            .or_default()
+            .clone()
     }
 
     /// The Zone outbox's fee for a withdrawal without a callback.

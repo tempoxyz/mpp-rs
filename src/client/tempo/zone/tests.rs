@@ -464,3 +464,123 @@ fn test_zone_settlement_pending_message() {
         "Zone 3 withdrawal 0x01 for challenge \"abc\" has not settled on Tempo yet. Retry the challenge to resume waiting instead of paying again."
     );
 }
+
+/// A Zone handler recording the raw transactions it is sent.
+fn recording_zone_handler(sent: Arc<Mutex<Vec<String>>>) -> Handler {
+    let inner = zone_handler(|| {
+        Ok(zone_receipt(
+            "0x1",
+            json!([withdrawal_requested_log(payer().address())]),
+        ))
+    });
+    Arc::new(move |method, params| {
+        if method == "eth_sendRawTransactionSync" {
+            sent.lock()
+                .unwrap()
+                .push(params[0].as_str().unwrap_or_default().to_string());
+        }
+        inner(method, params)
+    })
+}
+
+#[tokio::test]
+async fn test_cancelled_payment_does_not_withdraw_again() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, zone_calls) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    let challenge = challenge_with(json!({}), None);
+
+    // Cancel the payment once the Zone has the transaction but before it answers.
+    let sending = async {
+        while !zone_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "eth_sendRawTransactionSync")
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::select! {
+        result = provider.pay(&challenge) => panic!("payment was not cancelled: {result:?}"),
+        () = sending => {}
+    }
+
+    // The retry reconciles the withdrawal the cancelled payment sent.
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_serializes_nonces_across_challenges() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, zone_calls) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    let first = challenge_with(json!({}), None);
+    let mut second = first.clone();
+    second.id = "other-challenge".into();
+    let other = provider.clone();
+    let (a, b) = tokio::join!(provider.pay(&first), other.pay(&second));
+    assert!(a.is_err() && b.is_err());
+
+    // The second nonce lookup waits for the first withdrawal's outcome.
+    let calls = zone_calls.lock().unwrap();
+    let order: Vec<&str> = calls
+        .iter()
+        .map(String::as_str)
+        .filter(|call| {
+            matches!(
+                *call,
+                "eth_getTransactionCount" | "eth_sendRawTransactionSync"
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "eth_getTransactionCount",
+            "eth_sendRawTransactionSync",
+            "eth_getTransactionCount",
+            "eth_sendRawTransactionSync",
+        ]
+    );
+    assert_eq!(sent.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_withdrawal_pays_fees_in_configured_fee_token() {
+    use alloy::eips::Decodable2718;
+    use tempo_alloy::primitives::AASigned;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (tempo_url, _) = tempo_rpc(Arc::new(Mutex::new(json!([])))).await;
+    let fee_token = address!("20c0000000000000000000000000000000000000");
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_fee_token(fee_token)
+        .with_zone(zone)
+        .unwrap();
+    provider
+        .pay(&challenge_with(json!({}), None))
+        .await
+        .unwrap_err();
+
+    let raw = sent.lock().unwrap()[0].clone();
+    let bytes = alloy::hex::decode(raw.trim_start_matches("0x")).unwrap();
+    let signed = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+    assert_eq!(signed.tx().fee_token, Some(fee_token));
+}

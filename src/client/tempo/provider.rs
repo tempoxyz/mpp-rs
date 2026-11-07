@@ -732,6 +732,7 @@ impl PaymentProvider for TempoProvider {
                         self.client_id.as_deref(),
                         &self.signer,
                         &self.signing_mode,
+                        self.fee_token,
                         &rpc_provider,
                     )
                     .await;
