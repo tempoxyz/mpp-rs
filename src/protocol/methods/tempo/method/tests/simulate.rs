@@ -2,7 +2,8 @@ use super::super::fee_payer::{
     sponsored_simulation_gas_limit, FeePayerPolicy, FeePayerPolicyOverride,
 };
 use super::super::simulate::{
-    is_gas_limit_error, rpc_signature, FeePayerSimulation, SPONSORED_SIMULATION_GAS_BUFFER,
+    is_gas_limit_error, rpc_signature, FeePayerSimulation, PaymentSimulationError,
+    PaymentSimulationPhase, SPONSORED_SIMULATION_GAS_BUFFER,
 };
 use super::*;
 
@@ -899,4 +900,135 @@ async fn test_local_sponsored_simulation_tolerates_out_of_gas_only_when_clamped(
         .simulate_sponsored_transaction(&cosigned, sponsor, Some(&clamped))
         .await
         .expect_err("a fee-balance error of a clamped copy is rejected");
+}
+
+/// The [`PaymentSimulationError`] a failed simulation is tagged with.
+fn simulation_error(err: &VerificationError) -> &PaymentSimulationError {
+    std::error::Error::source(err)
+        .and_then(|source| source.downcast_ref::<PaymentSimulationError>())
+        .unwrap_or_else(|| panic!("not tagged as a simulation failure: {err:?}"))
+}
+
+/// A failed sender simulation is tagged with its phase, sender and the
+/// single transfer's token, with the node's error as its cause, and keeps
+/// its code and message (mppx `PaymentSimulationError`, phase `sender`).
+#[tokio::test]
+async fn test_sender_simulation_failure_is_tagged() {
+    let client_signer = alloy::signers::local::PrivateKeySigner::random();
+    let (envelope, request) = sponsored_charge_envelope(&client_signer);
+    let (method, _) = sim_method_with(vec![Err(revert("execution reverted"))]);
+    let method = method.with_fee_payer(alloy::signers::local::PrivateKeySigner::random());
+
+    let err = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(&envelope),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await
+        .expect_err("a reverting sender simulation stops sponsorship");
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::TransactionFailed)
+    );
+    assert!(err.to_string().contains("would revert"), "{err}");
+
+    let simulation = simulation_error(&err);
+    assert_eq!(simulation.phase, PaymentSimulationPhase::Sender);
+    assert_eq!(simulation.sender, client_signer.address());
+    assert_eq!(simulation.fee_payer, None);
+    assert_eq!(
+        simulation.payment_token,
+        Some(PATH_USD.parse::<Address>().unwrap())
+    );
+    assert_eq!(simulation.cause.as_error_resp().unwrap().code, 3);
+}
+
+/// A failed sponsored simulation is tagged with the fee payer it billed too
+/// (mppx `PaymentSimulationError`, phase `sponsored`).
+#[tokio::test]
+async fn test_sponsored_simulation_failure_is_tagged() {
+    use alloy::consensus::transaction::SignerRecoverable;
+    use alloy::eips::Decodable2718;
+
+    let cosigned = make_cosigned_fee_payer_tx().await;
+    let sender = tempo_alloy::primitives::AASigned::decode_2718(&mut &cosigned[..])
+        .unwrap()
+        .recover_signer()
+        .unwrap();
+    let sponsor = Address::repeat_byte(0x5e);
+    let (method, _) = sim_method_with(vec![Err(insufficient_fee_balance())]);
+
+    let err = method
+        .simulate_sponsored_transaction(&cosigned, sponsor, None)
+        .await
+        .expect_err("a sponsor without fee balance fails the simulation");
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::NetworkError)
+    );
+    assert!(err.retryable);
+    assert!(
+        err.to_string().contains("Pre-broadcast simulation failed"),
+        "{err}"
+    );
+
+    let simulation = simulation_error(&err);
+    assert_eq!(simulation.phase, PaymentSimulationPhase::Sponsored);
+    assert_eq!(simulation.sender, sender);
+    assert_eq!(simulation.fee_payer, Some(sponsor));
+    assert_eq!(simulation.payment_token, Some(Address::repeat_byte(0x20)));
+    let cause = simulation.cause.as_error_resp().unwrap();
+    assert_eq!(cause.code, -32003);
+    assert!(cause.message.contains("insufficient fee token balance"));
+}
+
+/// A transaction that is not a single TIP-20 transfer has no payment token.
+#[tokio::test]
+async fn test_simulation_failure_without_single_transfer_has_no_payment_token() {
+    use alloy::signers::SignerSync;
+
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let mut tx = make_fee_payer_tx(60);
+    let transfer = tx.calls[0].clone();
+    tx.calls = vec![transfer.clone(), transfer];
+    let signature: tempo_alloy::primitives::transaction::TempoSignature =
+        signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
+    let signed = tx.into_signed(signature);
+    let (method, _) = sim_method_with(vec![Err(revert("execution reverted"))]);
+
+    let err = method
+        .simulate_sender_calls(&signed, signer.address())
+        .await
+        .expect_err("a reverting sender simulation fails");
+    let simulation = simulation_error(&err);
+    assert_eq!(simulation.phase, PaymentSimulationPhase::Sender);
+    assert_eq!(simulation.payment_token, None);
+}
+
+/// A transport failure, where no node answered, is not tagged as a failed
+/// simulation, as mppx rethrows it untagged.
+#[tokio::test]
+async fn test_simulation_transport_error_is_not_tagged() {
+    let cosigned = make_cosigned_fee_payer_tx().await;
+    // An empty mock queue fails the request in the transport.
+    let (method, _) = sim_method_with(vec![]);
+
+    let err = method
+        .simulate_sponsored_transaction(&cosigned, Address::repeat_byte(0x5e), None)
+        .await
+        .expect_err("a transport failure fails closed");
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::NetworkError)
+    );
+    assert!(
+        err.to_string().contains("Pre-broadcast simulation failed"),
+        "{err}"
+    );
+    assert!(std::error::Error::source(&err).is_none(), "{err:?}");
 }
