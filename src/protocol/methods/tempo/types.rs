@@ -57,6 +57,7 @@ pub struct Split {
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     splits: None,
+///     zones: None,
 /// };
 /// assert!(details.fee_payer());
 /// ```
@@ -87,6 +88,28 @@ pub struct TempoMethodDetails {
     /// Maximum 10 splits (11 total transfer calls including primary).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub splits: Option<Vec<Split>>,
+
+    /// Zones the payee accepts withdrawals from, as mppx's `zones`: any Zone
+    /// on the Challenge's chain, or a list of Zone IDs. A client with a
+    /// balance in an accepted Zone may pay with a `zone` Credential.
+    ///
+    /// A malformed value reads as `None`, so it accepts no Zone without
+    /// failing the rest of the method details.
+    #[serde(
+        default,
+        deserialize_with = "lenient_zones",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub zones: Option<super::zone::Zones>,
+}
+
+/// Reads `zones`, treating a malformed value as absent.
+fn lenient_zones<'de, D>(deserializer: D) -> Result<Option<super::zone::Zones>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl TempoMethodDetails {
@@ -117,18 +140,44 @@ mod tests {
             chain_id: Some(42431),
             fee_payer: Some(true),
             splits: None,
+            zones: Some(super::super::zone::Zones::Ids(vec![3, 7])),
         };
 
         let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("\"chainId\":42431"));
         assert!(json.contains("\"feePayer\":true"));
         assert!(json.contains("\"machineTokenEnabled\":true"));
+        assert!(json.contains("\"zones\":[3,7]"));
 
         let parsed: TempoMethodDetails = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.chain_id, Some(42431));
         assert!(parsed.fee_payer());
         assert!(parsed.machine_token_enabled());
         assert!(parsed.is_tempo_moderato());
+        assert_eq!(
+            parsed.zones,
+            Some(super::super::zone::Zones::Ids(vec![3, 7]))
+        );
+    }
+
+    #[test]
+    fn test_malformed_zones_do_not_fail_method_details() {
+        for zones in [
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!([0]),
+            serde_json::json!([4294967296u64]),
+            serde_json::json!("all"),
+        ] {
+            let parsed: TempoMethodDetails =
+                serde_json::from_value(serde_json::json!({ "chainId": 42431, "zones": zones }))
+                    .unwrap();
+            assert_eq!(parsed.chain_id, Some(42431));
+            assert!(parsed.zones.is_none(), "{zones}");
+        }
+        let parsed: TempoMethodDetails =
+            serde_json::from_value(serde_json::json!({ "zones": true })).unwrap();
+        assert_eq!(parsed.zones, Some(super::super::zone::Zones::Any));
     }
 
     #[test]
