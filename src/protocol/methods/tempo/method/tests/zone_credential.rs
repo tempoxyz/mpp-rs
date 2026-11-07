@@ -659,3 +659,61 @@ async fn test_zone_rejects_credential_in_relay_mode() {
         );
     }
 }
+
+/// Claims the settlement transaction's hash as a hash credential does.
+async fn claim_hash<P>(method: &ChargeMethod<P>) -> bool
+where
+    P: Provider<tempo_alloy::TempoNetwork> + Clone + Send + Sync + 'static,
+{
+    method
+        .store
+        .as_ref()
+        .unwrap()
+        .put_if_absent(
+            &crate::protocol::methods::tempo::method::hash_credential::tx_hash_replay_key(
+                settlement_hash(),
+            ),
+            serde_json::Value::Bool(true),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_zone_claims_its_settlement_against_hash_credentials() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, _) = zone_method(&fixture, true);
+    method
+        .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
+        .await
+        .unwrap();
+    // A hash credential naming the settlement transaction is now a replay.
+    assert!(!claim_hash(&method).await);
+}
+
+#[tokio::test]
+async fn test_zone_rejects_settlement_a_hash_credential_claimed() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = zone_method(&fixture, true);
+    assert!(claim_hash(&method).await);
+    let credential = zone_credential(&challenge, tag_a(), ZONE_ID);
+    let error = method.verify(&credential, &request).await.unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::CredentialReplayed));
+    assert!(
+        error
+            .message
+            .contains("Transaction hash has already been used"),
+        "{error}"
+    );
+    // Validation, which claims nothing, refuses it too.
+    push_settlement(&asserter, &fixture);
+    let error = method
+        .validate_local(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::CredentialReplayed));
+}

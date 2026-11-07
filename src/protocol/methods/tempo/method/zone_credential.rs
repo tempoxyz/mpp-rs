@@ -20,6 +20,10 @@ fn zone_replay_key(portal: alloy::primitives::Address, sender_tag: B256) -> Stri
     format!("mpp:charge:zone:{portal:#x}:{sender_tag:#x}")
 }
 
+/// The value a Zone credential stores under its settlement transaction's
+/// hash claim, which every withdrawal that transaction settles shares.
+const ZONE_SETTLEMENT_MARK: &str = "zone";
+
 fn parse_b256(value: Option<&str>, field: &str) -> Result<B256, VerificationError> {
     let value = value.unwrap_or_default();
     let hex = value.strip_prefix("0x").ok_or_else(|| {
@@ -168,24 +172,44 @@ where
             .map_err(|error| VerificationError::credential_replayed(error.message))?;
 
         if let Some(store) = &self.store {
+            // The settlement transaction's hash is also what a hash credential
+            // claims. Mark it as paid by Zone withdrawals, which every
+            // withdrawal it settles shares, so one settlement never pays both
+            // a Zone and a hash credential, in either order. The mark is never
+            // removed: a settlement stays one even when this claim fails.
+            let hash_key = super::hash_credential::tx_hash_replay_key(hash);
+            let zone_mark = serde_json::Value::String(ZONE_SETTLEMENT_MARK.into());
             let replay_key = zone_replay_key(portal, sender_tag);
+            let record_error =
+                |e| VerificationError::internal(format!("Failed to record Zone withdrawal: {e}"));
+            let check_error =
+                |e| VerificationError::internal(format!("Failed to check Zone withdrawal: {e}"));
+            let hash_used = if reserve
+                && store
+                    .put_if_absent(&hash_key, zone_mark.clone())
+                    .await
+                    .map_err(record_error)?
+            {
+                false
+            } else {
+                store
+                    .get(&hash_key)
+                    .await
+                    .map_err(check_error)?
+                    .is_some_and(|value| value != zone_mark)
+            };
+            if hash_used {
+                return Err(VerificationError::credential_replayed(
+                    "Transaction hash has already been used.",
+                ));
+            }
             let used = if reserve {
                 !store
                     .put_if_absent(&replay_key, serde_json::Value::Bool(true))
                     .await
-                    .map_err(|e| {
-                        VerificationError::internal(format!(
-                            "Failed to record Zone withdrawal: {e}"
-                        ))
-                    })?
+                    .map_err(record_error)?
             } else {
-                store
-                    .get(&replay_key)
-                    .await
-                    .map_err(|e| {
-                        VerificationError::internal(format!("Failed to check Zone withdrawal: {e}"))
-                    })?
-                    .is_some()
+                store.get(&replay_key).await.map_err(check_error)?.is_some()
             };
             if used {
                 return Err(VerificationError::credential_replayed(

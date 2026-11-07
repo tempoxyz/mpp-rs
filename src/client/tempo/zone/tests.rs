@@ -1,7 +1,7 @@
 //! Zone payments from the Tempo charge client, as mppx's
 //! `client/Charge.zone.test.ts`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use alloy::primitives::{address, Address, B256};
 use alloy::sol_types::SolEvent;
@@ -283,43 +283,73 @@ fn test_rejects_zone_without_zone_id() {
     );
 }
 
-/// The outbox's `WithdrawalRequested` for `sender` as a JSON-RPC log.
-fn withdrawal_requested_log(sender: Address) -> Value {
-    let data = IZoneOutbox::WithdrawalRequested {
+/// The hash of the raw transaction `raw`.
+fn tx_hash(raw: &str) -> B256 {
+    alloy::primitives::keccak256(alloy::hex::decode(raw.trim_start_matches("0x")).unwrap())
+}
+
+/// The outbox's `WithdrawalRequested` for the withdrawal the raw transaction
+/// `raw` requests, as a JSON-RPC log, after `edit`.
+fn withdrawal_requested_log_with(
+    raw: &str,
+    edit: impl FnOnce(&mut IZoneOutbox::WithdrawalRequested),
+) -> Value {
+    use alloy::consensus::transaction::SignerRecoverable;
+    use alloy::eips::Decodable2718;
+    use tempo_alloy::primitives::AASigned;
+
+    let bytes = alloy::hex::decode(raw.trim_start_matches("0x")).unwrap();
+    let signed = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
+    let request = signed
+        .tx()
+        .calls
+        .iter()
+        .find(|call| call.to == TxKind::Call(zone::ZONE_OUTBOX))
+        .map(|call| IZoneOutbox::requestWithdrawalCall::abi_decode(&call.input).unwrap())
+        .unwrap();
+    let mut event = IZoneOutbox::WithdrawalRequested {
         withdrawalIndex: 0,
-        sender,
-        token: CURRENCY,
-        to: MERCHANT,
-        amount: 1_000_000,
+        sender: signed.recover_signer().unwrap(),
+        token: request.token,
+        to: request.to,
+        amount: request.amount,
         fee: 1,
-        memo: B256::ZERO,
+        memo: request.memo,
         gasLimit: 0,
         fallbackNonce: 7,
         data: Bytes::new(),
         revealTo: Bytes::new(),
-    }
-    .encode_log_data();
+    };
+    edit(&mut event);
+    let data = event.encode_log_data();
     json!({
         "address": format!("{:#x}", zone::ZONE_OUTBOX),
         "topics": data.topics().iter().map(|topic| format!("{topic:#x}")).collect::<Vec<_>>(),
         "data": format!("{}", data.data),
         "blockHash": format!("{:#x}", B256::repeat_byte(0x11)),
         "blockNumber": "0x1",
-        "transactionHash": format!("{:#x}", B256::repeat_byte(0x22)),
+        "transactionHash": format!("{:#x}", tx_hash(raw)),
         "transactionIndex": "0x0",
         "logIndex": "0x0",
         "removed": false,
     })
 }
 
-fn zone_receipt(status: &str, logs: Value) -> Value {
+/// The outbox's `WithdrawalRequested` for the withdrawal the raw transaction
+/// `raw` requests, as a JSON-RPC log.
+fn withdrawal_requested_log(raw: &str) -> Value {
+    withdrawal_requested_log_with(raw, |_| {})
+}
+
+/// The receipt of the raw transaction `raw`.
+fn zone_receipt(raw: &str, status: &str, logs: Value) -> Value {
     json!({
         "type": "0x76",
         "status": status,
         "cumulativeGasUsed": "0x1",
         "logs": logs,
         "logsBloom": format!("0x{}", "00".repeat(256)),
-        "transactionHash": format!("{:#x}", B256::repeat_byte(0x22)),
+        "transactionHash": format!("{:#x}", tx_hash(raw)),
         "transactionIndex": "0x0",
         "blockHash": format!("{:#x}", B256::repeat_byte(0x11)),
         "blockNumber": "0x1",
@@ -331,13 +361,41 @@ fn zone_receipt(status: &str, logs: Value) -> Value {
     })
 }
 
+/// The sender tag of the last withdrawal sent to the Zone.
+fn sent_sender_tag(sent: &Mutex<Vec<String>>) -> B256 {
+    let raw = sent.lock().unwrap().last().unwrap().clone();
+    zone::sender_tag(payer().address(), tx_hash(&raw), 7)
+}
+
+/// A Moderato RPC that settles the last withdrawal sent to the Zone with the
+/// `(callback_success, transaction_hash)` in `settlement`.
+async fn settling_tempo_rpc(
+    sent: Arc<Mutex<Vec<String>>>,
+    settlement: Arc<Mutex<(bool, B256)>>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_rpc(Arc::new(move |method, _| match method {
+        "eth_chainId" => Ok(json!("0xa5bf")),
+        "eth_blockNumber" => Ok(json!("0x10")),
+        "eth_getLogs" => {
+            let (callback_success, hash) = *settlement.lock().unwrap();
+            Ok(json!([settlement_log(
+                sent_sender_tag(&sent),
+                callback_success,
+                hash
+            )]))
+        }
+        _ => Err((-32000, format!("l1: {method}"))),
+    }))
+    .await
+}
+
 /// A Zone RPC that prepares and signs withdrawals, then answers the send with
 /// `send`; once a send failed, every later call fails.
 fn zone_handler(
-    send: impl Fn() -> Result<Value, (i64, String)> + Send + Sync + 'static,
+    send: impl Fn(&str) -> Result<Value, (i64, String)> + Send + Sync + 'static,
 ) -> Handler {
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Arc::new(move |method, _| {
+    Arc::new(move |method, params| {
         if failed.load(Ordering::SeqCst) {
             return Err((-32000, "connection lost".into()));
         }
@@ -345,7 +403,7 @@ fn zone_handler(
             "eth_chainId" => Ok(json!(format!("{MODERATO_ZONE_3:#x}"))),
             "eth_call" => Ok(json!(format!("0x{}", "00".repeat(32)))),
             "eth_sendRawTransactionSync" => {
-                let result = send();
+                let result = send(params[0].as_str().unwrap_or_default());
                 if result.is_err() {
                     failed.store(true, Ordering::SeqCst);
                 }
@@ -359,7 +417,7 @@ fn zone_handler(
 #[tokio::test]
 async fn test_does_not_withdraw_again_after_unknown_outcome() {
     let (zone_url, zone_calls) =
-        spawn_rpc(zone_handler(|| Err((-32000, "connection lost".into())))).await;
+        spawn_rpc(zone_handler(|_| Err((-32000, "connection lost".into())))).await;
     let mut zone = TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap();
     zone.receipt_recovery_timeout = Duration::from_millis(600);
     let (provider, _) = provider_with_zone(zone).await;
@@ -390,7 +448,7 @@ async fn test_does_not_withdraw_again_after_unknown_outcome() {
 #[tokio::test]
 async fn test_retries_withdrawal_that_reverted() {
     let (zone_url, zone_calls) =
-        spawn_rpc(zone_handler(|| Ok(zone_receipt("0x0", json!([]))))).await;
+        spawn_rpc(zone_handler(|raw| Ok(zone_receipt(raw, "0x0", json!([]))))).await;
     let (provider, _) =
         provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
     let challenge = challenge_with(json!({}), None);
@@ -443,16 +501,8 @@ async fn test_shares_one_withdrawal_request_between_concurrent_payments() {
 
 #[tokio::test]
 async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
-    let sends = Arc::new(AtomicUsize::new(0));
-    let sends_in_zone = sends.clone();
-    let (zone_url, _) = spawn_rpc(zone_handler(move || {
-        sends_in_zone.fetch_add(1, Ordering::SeqCst);
-        Ok(zone_receipt(
-            "0x1",
-            json!([withdrawal_requested_log(payer().address())]),
-        ))
-    }))
-    .await;
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
     let logs = Arc::new(Mutex::new(json!([])));
     let (tempo_url, tempo_calls) = tempo_rpc(logs.clone()).await;
     let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
@@ -463,10 +513,10 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
         .with_zone(zone)
         .unwrap();
     let challenge = challenge_with(json!({}), None);
-    let sender_tag = zone::sender_tag(payer().address(), B256::repeat_byte(0x22), 7);
 
     // Give up on settlement at once, as a timeout would.
     let error = provider.pay(&challenge).await.unwrap_err();
+    let sender_tag = sent_sender_tag(&sent);
     // The error carries the challenge, so a caller that would otherwise
     // re-send the request (and get a fresh challenge) can pay this one again.
     let pending_challenge = match error {
@@ -515,7 +565,7 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
         Some(format!("{sender_tag:#x}").as_str())
     );
     assert_eq!(payload.zone_id(), Some(3));
-    assert_eq!(sends.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -536,7 +586,7 @@ fn test_zone_settlement_pending_message() {
 async fn test_withdrawal_without_its_event_is_outcome_unknown() {
     // The withdrawal succeeded, but its WithdrawalRequested event is missing.
     let (zone_url, zone_calls) =
-        spawn_rpc(zone_handler(|| Ok(zone_receipt("0x1", json!([]))))).await;
+        spawn_rpc(zone_handler(|raw| Ok(zone_receipt(raw, "0x1", json!([]))))).await;
     let (provider, _) =
         provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
     let challenge = challenge_with(json!({}), None);
@@ -558,10 +608,11 @@ async fn test_withdrawal_without_its_event_is_outcome_unknown() {
 
 /// A Zone handler recording the raw transactions it is sent.
 fn recording_zone_handler(sent: Arc<Mutex<Vec<String>>>) -> Handler {
-    let inner = zone_handler(|| {
+    let inner = zone_handler(|raw| {
         Ok(zone_receipt(
+            raw,
             "0x1",
-            json!([withdrawal_requested_log(payer().address())]),
+            json!([withdrawal_requested_log(raw)]),
         ))
     });
     Arc::new(move |method, params| {
@@ -763,7 +814,7 @@ async fn test_queued_withdrawal_rechecks_expiry_before_sending() {
 async fn test_retries_withdrawal_the_zone_refused() {
     // The node refuses the transaction, say for fees the payer can't pay, and
     // doesn't know it afterwards: nothing was withdrawn.
-    let handler = zone_handler(|| Ok(Value::Null));
+    let handler = zone_handler(|_| Ok(Value::Null));
     let (zone_url, zone_calls) = spawn_rpc(Arc::new(move |method, params| match method {
         "eth_sendRawTransactionSync" => {
             Err((-32003, "insufficient funds for gas * price + value".into()))
@@ -803,7 +854,7 @@ async fn test_unrecognized_send_error_with_an_unknown_transaction_is_outcome_unk
         "already known",
         "replacement transaction underpriced",
     ] {
-        let handler = zone_handler(|| Ok(Value::Null));
+        let handler = zone_handler(|_| Ok(Value::Null));
         let (zone_url, zone_calls) = spawn_rpc(Arc::new(move |method, params| match method {
             "eth_sendRawTransactionSync" => Err((-32000, message.into())),
             "eth_getTransactionByHash" => Ok(Value::Null),
@@ -865,7 +916,7 @@ async fn test_withdrawal_known_to_the_zone_after_a_send_error_is_outcome_unknown
     // The node answered with an error but knows the transaction, or timed out
     // waiting for its receipt: it may run.
     for (code, known) in [(-32003, json!({ "hash": "0x22" })), (4, Value::Null)] {
-        let handler = zone_handler(|| Ok(Value::Null));
+        let handler = zone_handler(|_| Ok(Value::Null));
         let (zone_url, _) = spawn_rpc(Arc::new(move |method, params| match method {
             "eth_sendRawTransactionSync" => Err((code, "rejected".into())),
             "eth_getTransactionByHash" => Ok(known.clone()),
@@ -914,13 +965,8 @@ fn settlement_log(sender_tag: B256, callback_success: bool, transaction_hash: B2
 async fn test_bounced_withdrawal_fails_without_a_credential_and_may_be_paid_again() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
-    let sender_tag = zone::sender_tag(payer().address(), B256::repeat_byte(0x22), 7);
-    let logs = Arc::new(Mutex::new(json!([settlement_log(
-        sender_tag,
-        false,
-        B256::repeat_byte(0x33)
-    )])));
-    let (tempo_url, _) = tempo_rpc(logs.clone()).await;
+    let settlement = Arc::new(Mutex::new((false, B256::repeat_byte(0x33))));
+    let (tempo_url, _) = settling_tempo_rpc(sent.clone(), settlement.clone()).await;
     let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
         .unwrap()
         .with_settlement_timeout(Duration::ZERO);
@@ -932,6 +978,7 @@ async fn test_bounced_withdrawal_fails_without_a_credential_and_may_be_paid_agai
 
     let error = provider.pay(&challenge).await.unwrap_err();
     assert!(error.to_string().contains("bounced"), "{error}");
+    let sender_tag = sent_sender_tag(&sent);
     match &error {
         MppError::ZoneWithdrawalBounced {
             challenge_id,
@@ -946,7 +993,7 @@ async fn test_bounced_withdrawal_fails_without_a_credential_and_may_be_paid_agai
     }
 
     // The amount came back to the payer, so a retry withdraws again.
-    *logs.lock().unwrap() = json!([settlement_log(sender_tag, true, B256::repeat_byte(0x55))]);
+    *settlement.lock().unwrap() = (true, B256::repeat_byte(0x55));
     let credential = provider.pay(&challenge).await.unwrap();
     assert_eq!(
         credential.charge_payload().unwrap().data(),
@@ -1026,12 +1073,10 @@ async fn test_settlement_timeout_of_duration_max_does_not_overflow() {
     assert_eq!(settlement_timeout(&challenge, Duration::MAX), Duration::MAX);
     let sent = Arc::new(Mutex::new(Vec::new()));
     let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
-    let sender_tag = zone::sender_tag(payer().address(), B256::repeat_byte(0x22), 7);
-    let (tempo_url, _) = tempo_rpc(Arc::new(Mutex::new(json!([settlement_log(
-        sender_tag,
-        true,
-        B256::repeat_byte(0x55)
-    )]))))
+    let (tempo_url, _) = settling_tempo_rpc(
+        sent.clone(),
+        Arc::new(Mutex::new((true, B256::repeat_byte(0x55)))),
+    )
     .await;
     let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
         .unwrap()
@@ -1046,4 +1091,115 @@ async fn test_settlement_timeout_of_duration_max_does_not_overflow() {
         format!("{:#x}", B256::repeat_byte(0x55))
     );
     assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_withdrawal_receipt_of_another_transaction_is_outcome_unknown() {
+    // The send answered with a successful receipt for a transaction other
+    // than the one signed here.
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let recording = recording_zone_handler(sent.clone());
+    let (zone_url, zone_calls) = spawn_rpc(Arc::new(move |method, params| {
+        let mut result = recording(method, params);
+        if method == "eth_sendRawTransactionSync" {
+            if let Ok(receipt) = &mut result {
+                receipt["transactionHash"] = json!(format!("{:#x}", B256::repeat_byte(0x22)));
+            }
+        }
+        result
+    }))
+    .await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    let challenge = challenge_with(json!({}), None);
+    for _ in 0..2 {
+        match provider.pay(&challenge).await.unwrap_err() {
+            MppError::PaymentOutcomeUnknown { transaction_hash } => {
+                let raw = sent.lock().unwrap()[0].clone();
+                assert_eq!(transaction_hash, format!("{:#x}", tx_hash(&raw)));
+            }
+            error => panic!("unexpected error: {error}"),
+        }
+    }
+    let sends = zone_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| *call == "eth_sendRawTransactionSync")
+        .count();
+    assert_eq!(sends, 1);
+}
+
+#[tokio::test]
+async fn test_withdrawal_event_that_does_not_match_the_withdrawal_is_outcome_unknown() {
+    let edits: [fn(&mut IZoneOutbox::WithdrawalRequested); 5] = [
+        |event| event.sender = Address::repeat_byte(0x99),
+        |event| event.token = Address::repeat_byte(0x99),
+        |event| event.to = Address::repeat_byte(0x99),
+        |event| event.amount += 1,
+        |event| event.memo = B256::repeat_byte(0x99),
+    ];
+    for edit in edits {
+        let (zone_url, zone_calls) = spawn_rpc(zone_handler(move |raw| {
+            Ok(zone_receipt(
+                raw,
+                "0x1",
+                json!([withdrawal_requested_log_with(raw, edit)]),
+            ))
+        }))
+        .await;
+        let (provider, _) =
+            provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+        let challenge = challenge_with(json!({}), None);
+        for _ in 0..2 {
+            let error = provider.pay(&challenge).await.unwrap_err();
+            assert!(
+                matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+                "{error}"
+            );
+        }
+        let sends = zone_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "eth_sendRawTransactionSync")
+            .count();
+        assert_eq!(sends, 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_withdrawal_rechecks_expiry_after_preparation() {
+    // The nonce lookup is slow enough that the challenge would expire before
+    // the withdrawal settles: nothing is sent.
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let recording = recording_zone_handler(sent.clone());
+    let (zone_url, zone_calls) = spawn_rpc(Arc::new(move |method, params| {
+        if method == "eth_getTransactionCount" {
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        recording(method, params)
+    }))
+    .await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    let challenge = challenge_with(
+        json!({}),
+        expires_in(SUBMISSION_MARGIN.as_secs() as i64 + 3),
+    );
+
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(error.to_string().contains("expires"), "{error}");
+    assert!(
+        !matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+        "{error}"
+    );
+    let calls = zone_calls.lock().unwrap();
+    assert!(calls.iter().any(|call| call == "eth_getTransactionCount"));
+    assert!(!calls
+        .iter()
+        .any(|call| call == "eth_sendRawTransactionSync"));
+    assert!(sent.lock().unwrap().is_empty());
 }

@@ -16,6 +16,12 @@ use super::receipt_logs::{match_receipt_transfers, ReceiptSenderPolicy};
 use super::transaction_credential::funding_currency;
 use super::ChargeMethod;
 
+/// Store key that makes a Tempo transaction pay for one hash credential.
+/// Zone credentials claim it too for the transaction that settled them.
+pub(super) fn tx_hash_replay_key(hash: B256) -> String {
+    format!("mpp:charge:{hash:#x}")
+}
+
 /// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
 /// for a `did:pkh:eip155` DID matching `expected_chain_id`, else `Err`.
 pub(super) fn parse_hash_credential_source(
@@ -66,7 +72,7 @@ where
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
-        let replay_key = format!("mpp:charge:{:#x}", hash);
+        let replay_key = tx_hash_replay_key(hash);
 
         let receipt = self
             .provider

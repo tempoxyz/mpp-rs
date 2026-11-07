@@ -531,12 +531,15 @@ impl TempoZone {
         // payment from this account reads the nonce after this one is spent.
         let nonce_lock = self.nonce_lock(from);
         let _nonce_guard = nonce_lock.lock().await;
+        let expiring = || {
+            retryable(MppError::Http(
+                "Zone withdrawal can no longer settle before the challenge expires.".into(),
+            ))
+        };
         // Another withdrawal may have held the lock past the time this one
         // needs to settle: send nothing once the challenge would expire first.
         if !settles_before_expiry(challenge, self.settlement_timeout) {
-            return Err(retryable(MppError::Http(
-                "Zone withdrawal can no longer settle before the challenge expires.".into(),
-            )));
+            return Err(expiring());
         }
         // Prepare and sign first: a failure there sent nothing, so the
         // challenge may be retried. The protocol nonce is the Zone's.
@@ -576,6 +579,12 @@ impl TempoZone {
                 },
             )
         };
+        // Preparing the transaction awaited Zone RPCs: check again that it can
+        // still settle before the challenge expires, since the send can't be
+        // undone.
+        if !settles_before_expiry(challenge, self.settlement_timeout) {
+            return Err(expiring());
+        }
         let receipt: serde_json::Value = match self
             .rpc_provider
             .raw_request(
@@ -594,6 +603,16 @@ impl TempoZone {
                 self.recover_receipt(hash).await.ok_or_else(unknown)?
             }
         };
+        // Only a receipt of the transaction signed here says what happened to
+        // it: one for another hash proves nothing, so the outcome stays
+        // unknown under the local hash.
+        let receipt_hash = receipt
+            .get("transactionHash")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|hash| hash.parse::<B256>().ok());
+        if receipt_hash != Some(hash) {
+            return Err(unknown());
+        }
         match receipt.get("status").and_then(serde_json::Value::as_str) {
             Some("0x1") => {}
             // A reverted withdrawal moved nothing, so the challenge may be retried.
@@ -604,17 +623,21 @@ impl TempoZone {
             }
             _ => return Err(unknown()),
         }
-        let transaction_hash = receipt
-            .get("transactionHash")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|hash| hash.parse::<B256>().ok())
-            .unwrap_or(hash);
-        // The withdrawal succeeded but can't be found: its outcome is unknown,
-        // so no flow pays the challenge another way.
-        let requested = withdrawal_requested(&receipt).ok_or_else(unknown)?;
+        // The withdrawal succeeded but its event can't be found, or doesn't
+        // describe the withdrawal signed here: its outcome is unknown, so no
+        // flow pays the challenge another way.
+        let requested = withdrawal_requested(&receipt)
+            .filter(|event| {
+                event.sender == from
+                    && event.token == currency
+                    && event.to == recipient
+                    && event.amount == amount_u128
+                    && event.memo == B256::from(memo)
+            })
+            .ok_or_else(unknown)?;
         Ok(zone::sender_tag(
             requested.sender,
-            transaction_hash,
+            hash,
             requested.fallbackNonce,
         ))
     }
