@@ -34,6 +34,10 @@ const LOOKBACK_BLOCKS: u64 = 7_200;
 /// Time between polls for a settled Zone withdrawal.
 const POLLING_INTERVAL: Duration = Duration::from_millis(500);
 
+/// The least time a settlement wait gives its RPC calls, so a zero or short
+/// timeout still completes the first search.
+const FIRST_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Time the client allows for sending a Zone withdrawal before it waits for
 /// settlement.
 const SUBMISSION_MARGIN: Duration = Duration::from_secs(15);
@@ -447,12 +451,15 @@ impl TempoZone {
         };
 
         let timeout = settlement_timeout(challenge, self.settlement_timeout);
+        // Even the first search ends at the challenge's expiry.
+        let limit = settlement_timeout(challenge, timeout.max(FIRST_SCAN_TIMEOUT));
         let settlement = wait_for_settlement_from(
             tempo,
             zone::portal_address(zone_id),
             sender_tag,
             Some(recipient),
             timeout,
+            limit,
             &withdrawal.settlement_cursor,
         )
         .await
@@ -781,9 +788,17 @@ pub async fn wait_for_settlement(
     to: Option<Address>,
     timeout: Duration,
 ) -> Result<B256, MppError> {
-    let settlement =
-        wait_for_settlement_from(provider, portal, sender_tag, to, timeout, &Mutex::new(None))
-            .await?;
+    let limit = timeout.max(FIRST_SCAN_TIMEOUT);
+    let settlement = wait_for_settlement_from(
+        provider,
+        portal,
+        sender_tag,
+        to,
+        timeout,
+        limit,
+        &Mutex::new(None),
+    )
+    .await?;
     Ok(settlement.hash)
 }
 
@@ -797,67 +812,80 @@ struct Settlement {
 
 /// [`wait_for_settlement`], searching from `cursor`'s block when set instead
 /// of the lookback window, and leaving in it the first block it searched.
+/// Polling stops at `timeout`; `limit` also bounds the RPC calls, so a stalled
+/// RPC can't hold the payment past it, nor a slow reply settle after it.
 async fn wait_for_settlement_from(
     provider: &impl Provider<TempoNetwork>,
     portal: Address,
     sender_tag: B256,
     to: Option<Address>,
     timeout: Duration,
+    limit: Duration,
     cursor: &Mutex<Option<u64>>,
 ) -> Result<Settlement, MppError> {
     // A timeout past what an Instant can hold waits without a deadline.
     let deadline = tokio::time::Instant::now().checked_add(timeout);
-    let block_number = || async {
-        provider
-            .get_block_number()
-            .await
-            .map_err(|e| MppError::Http(format!("failed to fetch the Tempo block number: {e}")))
+    let timed_out = || {
+        MppError::Http(format!(
+            "Zone withdrawal {sender_tag:#x} did not settle on Tempo within {}ms.",
+            timeout.as_millis()
+        ))
     };
-    let mut latest = block_number().await?;
-    // Scan the lookback window once, then only blocks added since the previous
-    // poll. A resumed wait searches again from where the first one started,
-    // which also covers blocks a lagging log index missed.
-    let mut from_block = *cursor
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get_or_insert_with(|| latest.saturating_sub(LOOKBACK_BLOCKS));
-    loop {
-        if from_block <= latest {
-            let mut filter = Filter::new()
-                .address(portal)
-                .event_signature(IZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
-                .topic2(sender_tag)
-                .from_block(from_block)
-                .to_block(latest);
-            if let Some(to) = to {
-                filter = filter.topic1(to.into_word());
-            }
-            let logs = provider
-                .get_logs(&filter)
+    let search = async {
+        let block_number = || async {
+            provider
+                .get_block_number()
                 .await
-                .map_err(|e| MppError::Http(format!("failed to fetch Zone settlements: {e}")))?;
-            if let Some((log, hash)) = logs
-                .iter()
-                .find_map(|log| Some((log, log.transaction_hash?)))
-            {
-                // Only an event that reports a bounce counts as one: the
-                // server verifies the Credential's settlement either way.
-                let bounced = IZonePortal::WithdrawalProcessed::decode_log_data(log.data())
-                    .is_ok_and(|event| !event.callbackSuccess);
-                return Ok(Settlement { hash, bounced });
+                .map_err(|e| MppError::Http(format!("failed to fetch the Tempo block number: {e}")))
+        };
+        let mut latest = block_number().await?;
+        // Scan the lookback window once, then only blocks added since the previous
+        // poll. A resumed wait searches again from where the first one started,
+        // which also covers blocks a lagging log index missed.
+        let mut from_block = *cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(|| latest.saturating_sub(LOOKBACK_BLOCKS));
+        loop {
+            if from_block <= latest {
+                let mut filter = Filter::new()
+                    .address(portal)
+                    .event_signature(IZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
+                    .topic2(sender_tag)
+                    .from_block(from_block)
+                    .to_block(latest);
+                if let Some(to) = to {
+                    filter = filter.topic1(to.into_word());
+                }
+                let logs = provider.get_logs(&filter).await.map_err(|e| {
+                    MppError::Http(format!("failed to fetch Zone settlements: {e}"))
+                })?;
+                if let Some((log, hash)) = logs
+                    .iter()
+                    .find_map(|log| Some((log, log.transaction_hash?)))
+                {
+                    // Only an event that reports a bounce counts as one: the
+                    // server verifies the Credential's settlement either way.
+                    let bounced = IZonePortal::WithdrawalProcessed::decode_log_data(log.data())
+                        .is_ok_and(|event| !event.callbackSuccess);
+                    return Ok(Settlement { hash, bounced });
+                }
+                from_block = latest + 1;
             }
-            from_block = latest + 1;
+            if deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() + POLLING_INTERVAL > deadline)
+            {
+                return Err(timed_out());
+            }
+            tokio::time::sleep(POLLING_INTERVAL).await;
+            latest = block_number().await?;
         }
-        if deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() + POLLING_INTERVAL > deadline)
-        {
-            return Err(MppError::Http(format!(
-                "Zone withdrawal {sender_tag:#x} did not settle on Tempo within {}ms.",
-                timeout.as_millis()
-            )));
-        }
-        tokio::time::sleep(POLLING_INTERVAL).await;
-        latest = block_number().await?;
+    };
+    match tokio::time::Instant::now().checked_add(limit) {
+        Some(limit) => tokio::time::timeout_at(limit, search)
+            .await
+            .unwrap_or_else(|_| Err(timed_out())),
+        None => search.await,
     }
 }
 

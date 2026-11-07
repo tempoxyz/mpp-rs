@@ -1254,3 +1254,31 @@ async fn test_withdrawal_rechecks_expiry_after_preparation() {
         .any(|call| call == "eth_sendRawTransactionSync"));
     assert!(sent.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn test_settlement_wait_bounds_a_stalled_rpc() {
+    // A Tempo RPC that accepts connections and never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let provider = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_http(url.parse().unwrap());
+    let started = std::time::Instant::now();
+    let result = wait_for_settlement_from(
+        &provider,
+        zone::portal_address(3),
+        B256::repeat_byte(0x01),
+        None,
+        Duration::ZERO,
+        Duration::from_millis(200),
+        &Mutex::new(None),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
