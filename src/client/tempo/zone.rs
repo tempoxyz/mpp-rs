@@ -92,8 +92,9 @@ pub struct TempoZone {
     fee_token: Option<Address>,
     /// How long to look for a withdrawal's receipt after its send fails.
     receipt_recovery_timeout: Duration,
-    /// Withdrawals by Challenge, so a retry resumes waiting instead of paying
-    /// again. Shared by clones.
+    /// Withdrawals by Zone, paying account, signing key and Challenge, so a
+    /// retry resumes waiting instead of paying again. Shared by clones, so
+    /// providers with different signers never share a withdrawal.
     pending: Arc<Mutex<HashMap<String, Arc<PendingWithdrawal>>>>,
     /// Per-account locks held from the protocol nonce lookup until the
     /// withdrawal's outcome is known, so concurrent payments of different
@@ -247,6 +248,8 @@ impl TempoZone {
         challenge: &PaymentChallenge,
         request: &ChargeRequest,
         chain_id: u64,
+        signer: &TempoPrimitiveSigner,
+        signing_mode: &TempoSigningMode,
     ) -> Result<bool, MppError> {
         let Some(zone_id) = self.zone_id else {
             return Ok(false);
@@ -274,21 +277,39 @@ impl TempoZone {
         // A withdrawal can't be undone, so start one only when it can settle
         // before the challenge expires; an expired challenge would invite
         // another payment.
-        Ok(self.pending_withdrawal(challenge).is_some()
+        Ok(self
+            .pending_withdrawal(&self.pending_key(challenge, signer, signing_mode))
+            .is_some()
             || settles_before_expiry(challenge, self.settlement_timeout))
     }
 
-    fn pending_key(challenge: &PaymentChallenge) -> String {
-        // The whole challenge, so one from another realm or request with the
-        // same ID never matches.
-        serde_json::to_string(challenge).unwrap_or_else(|_| format!("{challenge:?}"))
+    /// The key of a withdrawal paying `challenge` from this Zone with
+    /// `signer`.
+    fn pending_key(
+        &self,
+        challenge: &PaymentChallenge,
+        signer: &TempoPrimitiveSigner,
+        signing_mode: &TempoSigningMode,
+    ) -> String {
+        // The Zone, the paying account and its signing key, so a clone used by
+        // another signer never answers with this signer's withdrawal; and the
+        // whole challenge, so one from another realm or request with the same
+        // ID never matches.
+        let key = alloy::signers::Signer::address(signer);
+        let from = signing_mode.from_address(key);
+        let challenge =
+            serde_json::to_string(challenge).unwrap_or_else(|_| format!("{challenge:?}"));
+        format!(
+            "{}:{:?}:{from:#x}:{key:#x}:{challenge}",
+            self.chain_id, self.zone_id
+        )
     }
 
-    fn pending_withdrawal(&self, challenge: &PaymentChallenge) -> Option<Arc<PendingWithdrawal>> {
+    fn pending_withdrawal(&self, key: &str) -> Option<Arc<PendingWithdrawal>> {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&Self::pending_key(challenge))
+            .get(key)
             .cloned()
     }
 
@@ -329,7 +350,7 @@ impl TempoZone {
         // A withdrawal can't be undone, so a retry after a failed wait resumes
         // it instead of paying again. Concurrent payments of one challenge
         // share the request, which is stored before it is sent.
-        let key = Self::pending_key(challenge);
+        let key = self.pending_key(challenge, signer, signing_mode);
         let withdrawal = self
             .pending
             .lock()

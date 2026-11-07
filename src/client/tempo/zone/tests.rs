@@ -586,6 +586,32 @@ async fn test_serializes_nonces_across_challenges() {
     assert_eq!(sent.lock().unwrap().len(), 2);
 }
 
+#[tokio::test]
+async fn test_providers_with_different_signers_never_share_a_withdrawal() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone.clone()).await;
+    let (tempo_url, _) = tempo_rpc(Arc::new(Mutex::new(json!([])))).await;
+    let other_signer: alloy::signers::local::PrivateKeySigner =
+        "0x0000000000000000000000000000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+    let other = TempoProvider::new(other_signer, tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    // Each signer withdraws for itself; a retry by the same signer does not.
+    for provider in [&provider, &other, &provider] {
+        provider.pay(&challenge).await.unwrap_err();
+    }
+    assert_eq!(sent.lock().unwrap().len(), 2);
+}
+
 /// The fee token of the first withdrawal sent to the Zone.
 fn sent_fee_token(sent: &Mutex<Vec<String>>) -> Option<Address> {
     use alloy::eips::Decodable2718;

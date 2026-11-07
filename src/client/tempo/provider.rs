@@ -726,7 +726,13 @@ impl PaymentProvider for TempoProvider {
         self.ensure_allowed_chain(Some(chain_id))?;
         if let Some(zone) = &self.zone {
             let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
-            if zone.pays(challenge, &request, chain_id)? {
+            if zone.pays(
+                challenge,
+                &request,
+                chain_id,
+                &self.signer,
+                &self.signing_mode,
+            )? {
                 return zone
                     .pay(
                         challenge,

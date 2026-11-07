@@ -113,6 +113,35 @@ where
             }
         }
 
+        // Zone credentials: a handler that accepts only some Zones never takes
+        // a withdrawal from another, even for a challenge another handler
+        // sharing its secret and realm issued for that Zone.
+        #[cfg(feature = "tempo")]
+        if let Some(zones) = self
+            .config
+            .zones
+            .as_ref()
+            .and_then(|zones| {
+                serde_json::from_value::<crate::protocol::methods::tempo::zone::Zones>(
+                    zones.clone(),
+                )
+                .ok()
+            })
+            .filter(|zones| matches!(zones, crate::protocol::methods::tempo::zone::Zones::Ids(_)))
+        {
+            if let Ok(payload) = credential.charge_payload() {
+                if payload.is_zone() && !payload.zone_id().is_some_and(|id| zones.accepts(id)) {
+                    return Err(VerificationError::with_code(
+                        format!(
+                            "credential Zone {:?} does not match this route's requirements",
+                            payload.zone_id()
+                        ),
+                        crate::protocol::traits::ErrorCode::InvalidChallenge,
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 

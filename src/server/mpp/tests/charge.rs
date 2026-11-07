@@ -655,6 +655,54 @@ async fn test_zones_bind_credentials_to_the_route() {
 
 #[cfg(feature = "tempo")]
 #[tokio::test]
+async fn test_unbound_verification_rejects_withdrawals_from_other_zones() {
+    use crate::protocol::methods::tempo::zone::Zones;
+
+    // Two handlers share a secret and realm: one accepts Zone 3, the other Zone 5.
+    let zone_3 = success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([3]).unwrap()),
+    );
+    let zone_5 = success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([5]).unwrap()),
+    );
+    let zone_credential = |mpp: &Mpp<TempoSuccessMethod>, zone_id| {
+        PaymentCredential::new(
+            mpp.charge("0.10").unwrap()[0].to_echo(),
+            PaymentPayload::zone(
+                format!("0x{}", "ab".repeat(32)),
+                format!("0x{}", "a1".repeat(32)),
+                zone_id,
+            ),
+        )
+    };
+
+    // A Zone 5 withdrawal for the Zone 5 handler's challenge does not pay the
+    // Zone 3 handler.
+    let err = zone_3
+        .broadcast_credential(&zone_credential(&zone_5, 5))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
+    assert!(err.message.contains("Zone"), "{}", err.message);
+    zone_3
+        .broadcast_credential(&zone_credential(&zone_3, 3))
+        .await
+        .unwrap();
+
+    // A handler without Zones is unchanged.
+    let no_zones = success_mpp_from(offers_builder().chain_id(CHAIN_ID));
+    no_zones
+        .broadcast_credential(&zone_credential(&zone_5, 5))
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "tempo")]
+#[tokio::test]
 async fn test_explicit_charge_challenge_verifies_against_its_own_request() {
     use crate::protocol::methods::tempo::zone::Zones;
 
