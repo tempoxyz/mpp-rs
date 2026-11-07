@@ -142,6 +142,10 @@ struct Config {
     /// Zones charge challenges accept (`methodDetails.zones`), as JSON.
     #[cfg(feature = "tempo")]
     zones: Option<serde_json::Value>,
+    /// Whether a Tempo API relay verifies credentials. The relay does not
+    /// verify Zone credentials, so challenges must not advertise Zones.
+    #[cfg(feature = "tempo")]
+    relay: bool,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
 }
@@ -162,6 +166,8 @@ impl Config {
             chain_id: None,
             #[cfg(feature = "tempo")]
             zones: None,
+            #[cfg(feature = "tempo")]
+            relay: false,
             opaque: None,
             credential_header: None,
         }
@@ -495,6 +501,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(store) = builder.store {
             method = method.with_store(store);
         }
+        let relay = builder.relay.is_some();
         if let Some(relay) = builder.relay {
             method = method.with_relay(relay)?;
         }
@@ -514,6 +521,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 machine_token_enabled: builder.machine_token_enabled,
                 chain_id: builder.chain_id,
                 zones,
+                relay,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),
                 ..Config::new(builder.realm, secret_key)
             },

@@ -42,6 +42,21 @@ fn parse_b256(value: Option<&str>, field: &str) -> Result<B256, VerificationErro
     })
 }
 
+/// Reject a Zone credential that claims a source, as mpp-go does: nothing
+/// ties a Zone withdrawal's payer to a source DID on Tempo, so an unchecked
+/// one must not reach the receipt or [`ChargeValidation`](crate::protocol::traits::ChargeValidation).
+pub(super) fn ensure_zone_credential_has_no_source(
+    source: Option<&str>,
+) -> Result<(), VerificationError> {
+    if source.is_some() {
+        return Err(VerificationError::with_code(
+            "Zone credentials must not carry a source.",
+            ErrorCode::InvalidCredential,
+        ));
+    }
+    Ok(())
+}
+
 fn zone_withdrawal_not_found() -> VerificationError {
     VerificationError::new("Payment verification failed: Zone withdrawal not found.")
 }

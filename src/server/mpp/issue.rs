@@ -232,6 +232,19 @@ where
                 }
             }
         }
+        // A relay does not verify Zone credentials, and a payer's Zone
+        // withdrawal cannot be undone once the relay rejects its credential.
+        if self.config.relay
+            && request
+                .method_details
+                .as_ref()
+                .and_then(|details| details.get("zones"))
+                .is_some_and(|zones| !zones.is_null())
+        {
+            return Err(crate::error::MppError::InvalidConfig(
+                "methodDetails.zones cannot be issued with relay(...): the relay does not verify Zone credentials".into(),
+            ));
+        }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.config.secret_key,
             &self.config.realm,

@@ -567,6 +567,40 @@ fn test_zones_reject_relay() {
 }
 
 #[cfg(feature = "tempo")]
+#[test]
+fn test_relay_refuses_explicit_zone_challenges() {
+    let relay = crate::server::TempoRelayConfig::new("test-api-key");
+    let mpp = Mpp::create(offers_builder().relay(relay)).unwrap();
+    let request = |details: serde_json::Value| ChargeRequest {
+        amount: "1000".into(),
+        currency: crate::protocol::methods::tempo::OUSD.into(),
+        recipient: Some(TEST_RECIPIENT.into()),
+        method_details: Some(details),
+        ..Default::default()
+    };
+    // A relay does not verify Zone credentials, so a challenge that lets the
+    // payer withdraw from a Zone must not be issued.
+    for zones in [serde_json::json!(true), serde_json::json!([3])] {
+        let error = mpp
+            .charge_challenge_with_options(
+                &request(serde_json::json!({ "zones": zones })),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::error::MppError::InvalidConfig(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("relay"), "{error}");
+    }
+    mpp.charge_challenge_with_options(&request(serde_json::json!({ "zones": null })), None, None)
+        .unwrap();
+    mpp.charge_challenge_with_options(&request(serde_json::json!({})), None, None)
+        .unwrap();
+}
+
+#[cfg(feature = "tempo")]
 #[tokio::test]
 async fn test_explicit_charge_challenges_advertise_zones() {
     use crate::protocol::methods::tempo::zone::Zones;

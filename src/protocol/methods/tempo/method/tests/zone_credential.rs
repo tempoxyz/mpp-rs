@@ -611,3 +611,51 @@ async fn test_zone_rejects_split_payments() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn test_zone_rejects_credential_with_source() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let mut credential = zone_credential(&challenge, tag_a(), ZONE_ID);
+    credential.source = Some(format!(
+        "did:pkh:eip155:{MODERATO_CHAIN_ID}:{:#x}",
+        Address::repeat_byte(0x44)
+    ));
+    let (method, _) = zone_method(&[], true);
+    let error = method
+        .validate_local(&credential, &request)
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("must not carry a source"), "{error}");
+    assert_eq!(error.code, Some(ErrorCode::InvalidCredential));
+    assert_rejected_before_rpc(&request, credential, "must not carry a source").await;
+}
+
+#[tokio::test]
+async fn test_zone_rejects_credential_in_relay_mode() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let credential = zone_credential(&challenge, tag_a(), ZONE_ID);
+    let (method, _) = zone_method(&[], true);
+    let method = method
+        .with_relay(crate::protocol::methods::tempo::RelayConfig::new(
+            "test-api-key",
+        ))
+        .unwrap();
+    for error in [
+        ChargeMethodTrait::validate(&method, &credential, &request)
+            .await
+            .unwrap_err(),
+        ChargeMethodTrait::broadcast(&method, &credential, &request)
+            .await
+            .unwrap_err(),
+        ChargeMethodTrait::verify(&method, &credential, &request)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.message.contains("not supported with a relay"),
+            "{error}"
+        );
+    }
+}

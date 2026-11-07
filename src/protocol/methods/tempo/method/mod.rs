@@ -62,6 +62,22 @@ pub use hosted_fee_payer::RemoteFeePayer;
 pub use receipt_logs::{SenderValidation, ValidateSenderCallback};
 
 use transaction_credential::ensure_transaction_credential_source;
+use zone_credential::ensure_zone_credential_has_no_source;
+
+/// Reject a Zone credential in relay mode: the relay does not verify Zone
+/// credentials, so it must not be handed one.
+fn reject_relayed_zone_credential(credential: &PaymentCredential) -> Result<(), VerificationError> {
+    if credential
+        .charge_payload()
+        .is_ok_and(|payload| payload.is_zone())
+    {
+        return Err(VerificationError::with_code(
+            "Zone credentials are not supported with a relay.",
+            crate::protocol::traits::ErrorCode::InvalidCredential,
+        ));
+    }
+    Ok(())
+}
 
 /// Reject a credential whose submission mode the challenge does not allow.
 ///
@@ -372,6 +388,7 @@ where
             payer = hash_payer;
             serde_json::json!({ "mode": "push" })
         } else if payload.is_zone() {
+            ensure_zone_credential_has_no_source(credential.source.as_deref())?;
             self.verify_zone(&payload, request, &credential.challenge, false)
                 .await?;
             payer = None;
@@ -484,7 +501,10 @@ where
         let request = request.clone();
         async move {
             match relay {
-                Some(relay) => relay.validate(&credential, &request).await,
+                Some(relay) => {
+                    reject_relayed_zone_credential(&credential)?;
+                    relay.validate(&credential, &request).await
+                }
                 None => this.validate_local(&credential, &request).await,
             }
         }
@@ -500,6 +520,7 @@ where
         let request = request.clone();
         async move {
             if let Some(relay) = &this.relay {
+                reject_relayed_zone_credential(&credential)?;
                 relay.broadcast(&credential, METHOD_NAME).await
             } else {
                 ChargeMethodTrait::verify(&this, &credential, &request).await
@@ -531,6 +552,7 @@ where
 
         async move {
             if let Some(relay) = relay {
+                reject_relayed_zone_credential(&credential)?;
                 relay.validate(&credential, &request).await?;
                 return relay.broadcast(&credential, METHOD_NAME).await;
             }
@@ -597,6 +619,7 @@ where
                 .await
                 .map(|(receipt, _)| receipt)
             } else if charge_payload.is_zone() {
+                ensure_zone_credential_has_no_source(credential.source.as_deref())?;
                 this.verify_zone(&charge_payload, &request, &credential.challenge, true)
                     .await
             } else if charge_payload.is_proof() {
