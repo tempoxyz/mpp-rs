@@ -198,9 +198,31 @@ impl TempoZone {
 
     /// Set the Tempo chain the Zone settles on, as the Zone chain's
     /// `sourceId` in mppx. Derived from the chain ID by default.
+    ///
+    /// When the chain ID follows a known Zone scheme, it names the Tempo
+    /// chain the Zone settles on, and a different `chain_id` is rejected by
+    /// [`TempoProvider::with_zone`](super::TempoProvider::with_zone) and
+    /// before any withdrawal: the withdrawal would settle on the Zone's real
+    /// parent while the client waited on another chain.
     pub fn with_parent_chain_id(mut self, chain_id: u64) -> Self {
         self.parent_chain_id = Some(chain_id);
         self
+    }
+
+    /// Checks that the configured parent chain agrees with the one the Zone
+    /// chain ID names, when it follows a known Zone scheme.
+    pub(crate) fn check_parent_chain_id(&self) -> Result<(), MppError> {
+        match zone::parent_chain_id_from_chain_id(self.chain_id) {
+            Some(derived) if self.parent_chain_id != Some(derived) => {
+                Err(MppError::InvalidConfig(format!(
+                    "parent_chain_id {} does not match Tempo chain {derived} of the Zone chain {}",
+                    self.parent_chain_id
+                        .map_or_else(|| "unset".to_owned(), |id| id.to_string()),
+                    self.chain_id
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// How long to wait for a withdrawal to settle on Tempo (default: 60
@@ -254,6 +276,9 @@ impl TempoZone {
         let Some(zone_id) = self.zone_id else {
             return Ok(false);
         };
+        // A withdrawal settles on the Zone's real parent: never start one for
+        // a Challenge on a contradicting parent chain.
+        self.check_parent_chain_id()?;
         if request.amount_u256()?.is_zero() || self.parent_chain_id != Some(chain_id) {
             return Ok(false);
         }
@@ -344,6 +369,7 @@ impl TempoZone {
         let zone_id = self.zone_id.ok_or_else(|| {
             MppError::InvalidConfig("Zone ID is unknown: use TempoZone::with_zone_id".into())
         })?;
+        self.check_parent_chain_id()?;
         let request: ChargeRequest = challenge.request.decode()?;
         let recipient = request.recipient_address()?;
 

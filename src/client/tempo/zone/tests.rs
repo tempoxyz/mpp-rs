@@ -208,6 +208,68 @@ fn test_rejects_zone_id_that_does_not_match_zone_chain() {
 }
 
 #[test]
+fn test_rejects_parent_chain_id_that_does_not_match_zone_chain() {
+    // Zone 3 of Moderato settles on Moderato, not on mainnet.
+    let zone = TempoZone::new("http://127.0.0.1:1", MODERATO_ZONE_3)
+        .unwrap()
+        .with_parent_chain_id(4217);
+    let error = TempoProvider::new(payer(), "http://127.0.0.1:1")
+        .unwrap()
+        .with_zone(zone)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match Tempo chain 42431 of the Zone chain 1424310003"),
+        "{error}"
+    );
+    // The parent the chain ID names, and any parent of a Zone chain ID that
+    // follows no known scheme, are accepted.
+    for zone in [
+        TempoZone::new("http://127.0.0.1:1", MODERATO_ZONE_3)
+            .unwrap()
+            .with_parent_chain_id(42_431),
+        TempoZone::new("http://127.0.0.1:1", 7)
+            .unwrap()
+            .with_zone_id(3)
+            .unwrap()
+            .with_parent_chain_id(4217),
+    ] {
+        assert!(TempoProvider::new(payer(), "http://127.0.0.1:1")
+            .unwrap()
+            .with_zone(zone)
+            .is_ok());
+    }
+}
+
+#[tokio::test]
+async fn test_never_withdraws_on_a_parent_chain_that_does_not_match_zone_chain() {
+    let (zone_url, zone_calls) = unused_zone_rpc().await;
+    let (tempo_url, tempo_calls) = tempo_rpc(Arc::new(Mutex::new(json!([])))).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_parent_chain_id(4217);
+    // A Challenge on the overridden chain.
+    let challenge = challenge_with(json!({ "chainId": 4217 }), None);
+    let request: ChargeRequest = challenge.request.decode().unwrap();
+    let signer = TempoPrimitiveSigner::from(payer());
+    let signing_mode = TempoSigningMode::Direct;
+    let error = zone
+        .pays(&challenge, &request, 4217, &signer, &signing_mode)
+        .unwrap_err();
+    assert!(error.to_string().contains("does not match"), "{error}");
+    let tempo = super::super::rpc_provider(tempo_url.parse().unwrap(), None);
+    let error = zone
+        .pay(&challenge, None, &signer, &signing_mode, &tempo)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("does not match"), "{error}");
+    assert!(zone_calls.lock().unwrap().is_empty());
+    assert!(tempo_calls.lock().unwrap().is_empty());
+}
+
+#[test]
 fn test_rejects_zone_without_zone_id() {
     let zone = TempoZone::new("http://127.0.0.1:1", 42_431).unwrap();
     let error = TempoProvider::new(payer(), "http://127.0.0.1:1")

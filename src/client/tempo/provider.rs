@@ -414,6 +414,9 @@ impl TempoProvider {
     ///
     /// Rejects a Zone whose ID is unknown: set it with
     /// [`TempoZone::with_zone_id`](super::zone::TempoZone::with_zone_id).
+    /// Rejects a Zone whose
+    /// [`with_parent_chain_id`](super::zone::TempoZone::with_parent_chain_id)
+    /// contradicts the Tempo chain its chain ID names.
     pub fn with_zone(mut self, zone: super::zone::TempoZone) -> Result<Self, MppError> {
         if zone.zone_id().is_none() {
             return Err(MppError::InvalidConfig(format!(
@@ -421,6 +424,7 @@ impl TempoProvider {
                 zone.chain_id()
             )));
         }
+        zone.check_parent_chain_id()?;
         self.zone = Some(zone);
         Ok(self)
     }
