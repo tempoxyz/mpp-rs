@@ -35,9 +35,11 @@ pub struct StoredChannelEntry {
     pub opened: bool,
     /// Challenge whose opening payment has not yet received a verified receipt.
     pub pending_open: Option<String>,
-    /// HTTP origin the channel pays, bound by the session provider that
-    /// persisted it. Absent on legacy entries, which stay usable and take an
-    /// origin on their next reuse.
+    /// HTTP origin the channel pays, set by the session provider that
+    /// persisted it: the origin whose namespace keeps the channel (see
+    /// [`origin_channel_key`]). Absent on legacy entries and on channels
+    /// paid over a transport without an HTTP origin, which only providers
+    /// without an HTTP origin use.
     pub origin: Option<String>,
 }
 
@@ -129,6 +131,35 @@ pub trait ChannelStore: Send + Sync {
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>>;
     /// Insert or replace a channel entry.
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()>;
+    /// Insert or replace `entry` under `key` instead of its payment-scope
+    /// key [`StoredChannelEntry::key`], merging it with a stored entry for the
+    /// same channel as [`set`](Self::set) does.
+    ///
+    /// A session provider bound to an HTTP origin keeps its channels in that
+    /// origin's namespace, under [`origin_channel_key`], unless the store
+    /// keeps only that origin's channels ([`origin`](Self::origin)). `get` and
+    /// `delete` must then find and remove the entry under `key`. It must
+    /// refuse, atomically with the write, an entry whose channel is already
+    /// stored under another key, so a channel lives in one namespace only.
+    async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()>;
+    /// Return the key channel `channel_id` is stored under, or `None` only
+    /// when the store keeps no entry for it under any key.
+    ///
+    /// Session providers use it to leave a channel in the namespace that
+    /// keeps it, such as a channel another origin's provider opened that a
+    /// server snapshot names, instead of copying it into their own. It is
+    /// required, with no default, because `None` vouches that no other
+    /// namespace owns the channel.
+    async fn find_channel(&self, channel_id: B256) -> ChannelStoreResult<Option<String>>;
+    /// The HTTP origin, such as `"https://api.example.com"`, that every
+    /// channel this store keeps is bound to, when it keeps only one origin's
+    /// channels. A session provider using the store is bound to it.
+    ///
+    /// Defaults to `None`: the store keeps channels for any origin, with the
+    /// origin each entry names.
+    fn origin(&self) -> Option<String> {
+        None
+    }
     /// Remove the channel cached for `key`.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()>;
     /// The `spent` a server receipt last reported for `channel_id`, the channel
@@ -180,8 +211,21 @@ impl ChannelStore for MemoryChannelStore {
     }
 
     async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+        self.set_at(&entry.key(), entry).await
+    }
+
+    async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
         let mut entries = self.entries.lock().unwrap();
-        let current = entries.get(&entry.key());
+        // A channel lives under one key: checked under the same lock as the
+        // write, so providers racing to store it in two namespaces can't
+        // both succeed.
+        if entries
+            .iter()
+            .any(|(at, stored)| at != key && stored.channel_id == entry.channel_id)
+        {
+            return Err(origin_mismatch());
+        }
+        let current = entries.get(key);
         let origin = merge_origin(current, entry)?;
         let mut merged = match current {
             Some(current) if current.channel_id == entry.channel_id => StoredChannelEntry {
@@ -192,8 +236,18 @@ impl ChannelStore for MemoryChannelStore {
             _ => entry.clone(),
         };
         merged.origin = origin;
-        entries.insert(merged.key(), merged);
+        entries.insert(key.to_owned(), merged);
         Ok(())
+    }
+
+    async fn find_channel(&self, channel_id: B256) -> ChannelStoreResult<Option<String>> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry.channel_id == channel_id)
+            .map(|(key, _)| key.clone()))
     }
 
     async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
@@ -242,13 +296,151 @@ impl ChannelStore for MemoryChannelStore {
     }
 }
 
-/// A session provider's view of its channel store, bound to the provider's
-/// HTTP origin: entries it writes carry that origin, and an entry bound to
-/// another origin is refused. An unbound provider adopts the origin of the
-/// first bound entry it reads, so it cannot later pay another origin with it.
+/// Key under which a session provider bound to the HTTP origin `origin`
+/// keeps its channel for payment scope `key` in a store that keeps several
+/// origins' channels: `"{key}@{origin}"`, such as
+/// `"0xpayee:0xtoken:0xescrow:4217@https://api.example.com"`.
+///
+/// Each origin's channels live in their own namespace. The payment-scope key
+/// itself is the namespace of channels without an origin: those of providers
+/// with no HTTP origin (paying through a bare `pay` or a non-HTTP MCP
+/// resource) and legacy entries written before origins existed. A store that
+/// keeps only one origin's channels ([`ChannelStore::origin`]) keeps that
+/// origin's channels under their payment-scope key.
+pub fn origin_channel_key(key: &str, origin: &str) -> String {
+    format!("{key}@{origin}")
+}
+
+/// A session provider's view of its channel store, confined to one
+/// namespace: the provider's HTTP origin once it is bound to one, or the
+/// namespace of channels without an origin while it is not.
+///
+/// A provider reads and writes channels only in its current namespace (see
+/// [`origin_channel_key`]) and never reads, reuses, overwrites, rebinds or
+/// deletes an entry in another, so providers sharing a store never touch
+/// each other's channels. Reading never binds a provider.
+///
+/// The namespace is fixed when the provider is bound. Each channel belongs
+/// to the namespace the provider first read, wrote or opened it in, and stays
+/// stored there: a channel a provider used before it was bound stays in the
+/// namespace without an origin, and once bound the provider refuses to
+/// write, delete or sign for it, so it is never carried into the origin's
+/// namespace. A provider without an origin closes it.
 pub(crate) struct OriginBoundChannelStore {
-    pub(crate) inner: Arc<dyn ChannelStore>,
-    pub(crate) origin: Arc<Mutex<Option<String>>>,
+    inner: Arc<dyn ChannelStore>,
+    origin: Arc<Mutex<Option<String>>>,
+    /// The namespace each channel this provider read, wrote or opened
+    /// belongs to.
+    claims: Mutex<HashMap<B256, Option<String>>>,
+}
+
+impl OriginBoundChannelStore {
+    /// A view of `inner` for the provider bound through `origin`. A store
+    /// that keeps only one HTTP origin's channels ([`ChannelStore::origin`])
+    /// binds an unbound provider to that origin.
+    pub(crate) fn new(inner: Arc<dyn ChannelStore>, origin: Arc<Mutex<Option<String>>>) -> Self {
+        if let Some(store_origin) = inner.origin() {
+            origin.lock().unwrap().get_or_insert(store_origin);
+        }
+        Self {
+            inner,
+            origin,
+            claims: Mutex::default(),
+        }
+    }
+
+    /// The origin of the underlying store, when it keeps only one HTTP
+    /// origin's channels ([`ChannelStore::origin`]).
+    pub(crate) fn store_origin(&self) -> Option<String> {
+        self.inner.origin()
+    }
+
+    /// The provider's current namespace: its HTTP origin, if bound.
+    fn namespace(&self) -> Option<String> {
+        self.origin.lock().unwrap().clone()
+    }
+
+    /// Where namespace `namespace` keeps its channel for payment scope `key`.
+    fn location(&self, key: &str, namespace: Option<&str>) -> String {
+        match namespace {
+            Some(origin) if self.inner.origin().as_deref() != Some(origin) => {
+                origin_channel_key(key, origin)
+            }
+            _ => key.to_owned(),
+        }
+    }
+
+    /// Record that `channel_id` belongs to `namespace`, refusing a channel
+    /// that already belongs to another.
+    fn claim_in(&self, channel_id: B256, namespace: Option<&str>) -> ChannelStoreResult<()> {
+        let mut claims = self.claims.lock().unwrap();
+        let claimed = claims
+            .entry(channel_id)
+            .or_insert_with(|| namespace.map(str::to_owned));
+        if claimed.as_deref() == namespace {
+            Ok(())
+        } else {
+            Err(origin_mismatch())
+        }
+    }
+
+    /// Record that the provider opened `channel_id` in its current
+    /// namespace, before the channel is stored.
+    pub(crate) fn claim(&self, channel_id: B256) -> ChannelStoreResult<()> {
+        self.claim_in(channel_id, self.namespace().as_deref())
+    }
+
+    /// Refuse a channel that belongs to another namespace than the
+    /// provider's current one, such as a channel it used before it was bound.
+    /// A channel the provider never read, wrote or opened passes.
+    pub(crate) fn check(&self, channel_id: B256) -> ChannelStoreResult<()> {
+        let namespace = self.namespace();
+        match self.claims.lock().unwrap().get(&channel_id) {
+            Some(claimed) if *claimed != namespace => Err(origin_mismatch()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether channel `channel_id`, such as one a server snapshot names,
+    /// is stored or held in another namespace than the provider's current
+    /// one for payment scope `key`, and so must not be recovered into it.
+    pub(crate) async fn elsewhere(&self, key: &str, channel_id: B256) -> ChannelStoreResult<bool> {
+        if self.check(channel_id).is_err() {
+            return Ok(true);
+        }
+        let namespace = self.namespace();
+        let own = self.location(key, namespace.as_deref());
+        if let Some(stored) = self.inner.find_channel(channel_id).await? {
+            return Ok(stored != own);
+        }
+        // Without a lookup by channel ID, the namespace without an origin can
+        // still be read directly.
+        if own != key {
+            if let Some(stored) = self.inner.get(key).await? {
+                return Ok(stored.channel_id == channel_id);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Delete channel `channel_id` for payment scope `key`, once the
+    /// session manager has confirmed it unfunded: only from the provider's
+    /// current namespace, and only while that namespace still stores the
+    /// same channel. A channel of another namespace, such as one the
+    /// provider used before it was bound, is never deleted.
+    pub(crate) async fn forget(&self, key: &str, channel_id: B256) -> ChannelStoreResult<()> {
+        if self.check(channel_id).is_err() {
+            return Ok(());
+        }
+        let namespace = self.namespace();
+        let at = self.location(key, namespace.as_deref());
+        match self.inner.get(&at).await? {
+            Some(stored) if stored.channel_id == channel_id && stored.origin == namespace => {
+                self.inner.delete(&at).await
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -257,32 +449,87 @@ impl ChannelStore for OriginBoundChannelStore {
         self.inner.acquire(key).await
     }
 
+    fn origin(&self) -> Option<String> {
+        self.inner.origin()
+    }
+
+    /// The channel stored for `key` in the provider's current namespace. An
+    /// entry there bound to another origin, such as one an earlier release
+    /// bound under the payment-scope key of a store keeping several origins'
+    /// channels, is refused rather than reused or overwritten.
     async fn get(&self, key: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
-        let entry = self.inner.get(key).await?;
-        if let Some(stored) = entry.as_ref().and_then(|entry| entry.origin.as_ref()) {
-            let mut bound = self.origin.lock().unwrap();
-            match bound.as_ref() {
-                Some(bound) if bound != stored => return Err(origin_mismatch()),
-                Some(_) => {}
-                None => *bound = Some(stored.clone()),
+        let namespace = self.namespace();
+        let at = self.location(key, namespace.as_deref());
+        let Some(stored) = self.inner.get(&at).await? else {
+            return Ok(None);
+        };
+        if stored.origin != namespace {
+            return Err(origin_mismatch());
+        }
+        self.claim_in(stored.channel_id, namespace.as_deref())?;
+        Ok(Some(stored))
+    }
+
+    /// Write `entry` to the provider's current namespace, bound to its
+    /// origin. A channel of another namespace, or an entry there bound to
+    /// another origin, is refused.
+    async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+        let namespace = self.namespace();
+        if entry.origin.is_some() && entry.origin != namespace {
+            return Err(origin_mismatch());
+        }
+        let mut entry = entry.clone();
+        entry.origin = namespace.clone();
+        self.check(entry.channel_id)?;
+        let key = entry.key();
+        let at = self.location(&key, namespace.as_deref());
+        // A channel lives in exactly one namespace.
+        if self
+            .inner
+            .find_channel(entry.channel_id)
+            .await?
+            .is_some_and(|stored| stored != at)
+        {
+            return Err(origin_mismatch());
+        }
+        if let Some(current) = self.inner.get(&at).await? {
+            if current.origin != namespace {
+                return Err(origin_mismatch());
             }
         }
-        Ok(entry)
-    }
-
-    async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
-        let bound = self.origin.lock().unwrap().clone();
-        let mut entry = entry.clone();
-        match (&entry.origin, bound) {
-            (Some(origin), Some(bound)) if *origin != bound => return Err(origin_mismatch()),
-            (_, Some(bound)) => entry.origin = Some(bound),
-            (_, None) => {}
+        if at == key {
+            self.inner.set(&entry).await?;
+        } else {
+            self.inner.set_at(&at, &entry).await?;
         }
-        self.inner.set(&entry).await
+        self.claim_in(entry.channel_id, namespace.as_deref())
     }
 
+    /// Only [`set`](Self::set) chooses where a provider's channel goes.
+    async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+        if key != entry.key() {
+            return Err(ChannelStoreError::InvalidEntry(format!(
+                "session providers choose the key for {key}"
+            )));
+        }
+        self.set(entry).await
+    }
+
+    async fn find_channel(&self, channel_id: B256) -> ChannelStoreResult<Option<String>> {
+        self.inner.find_channel(channel_id).await
+    }
+
+    /// Delete the provider's channel for `key` from its current namespace.
+    /// An entry there bound to another origin is never deleted.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
-        self.inner.delete(key).await
+        let namespace = self.namespace();
+        let at = self.location(key, namespace.as_deref());
+        match self.inner.get(&at).await? {
+            Some(stored) if stored.origin == namespace && self.check(stored.channel_id).is_ok() => {
+                self.inner.delete(&at).await
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn server_spent(&self, key: &str, channel_id: B256) -> ChannelStoreResult<Option<u128>> {
@@ -593,9 +840,16 @@ mod sqlite {
             .map(Some)
         }
 
+        fn origin(&self) -> Option<String> {
+            self.http_origin()
+        }
+
         async fn set(&self, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
-            let key = entry.key();
-            let scope_key = self.scoped_key(&key);
+            self.set_at(&entry.key(), entry).await
+        }
+
+        async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
+            let scope_key = self.scoped_key(key);
             let mut connection = self.connection.lock().unwrap();
             let transaction = connection.transaction().map_err(io_error)?;
             let current: Option<StoredChannelEntry> = transaction
@@ -708,6 +962,30 @@ mod sqlite {
                 return Err(origin_mismatch());
             }
             transaction.commit().map_err(io_error)
+        }
+
+        async fn find_channel(&self, channel_id: B256) -> ChannelStoreResult<Option<String>> {
+            let scope = self
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT scope_key FROM channels WHERE lower(channel_id) = ?1",
+                    [format!("{channel_id:#x}")],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(io_error)?;
+            // A row of another namespace, or one no payment scope names, keeps
+            // its full scope key, which no key in this namespace equals.
+            let prefix = self.scoped_key("");
+            Ok(scope.map(|scope| {
+                let scope = scope.unwrap_or_default();
+                scope
+                    .strip_prefix(&prefix)
+                    .map(str::to_owned)
+                    .unwrap_or(scope)
+            }))
         }
 
         async fn delete(&self, key: &str) -> ChannelStoreResult<()> {
@@ -863,6 +1141,44 @@ mod sqlite {
                  CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_scope_key
                      ON channels(scope_key) WHERE scope_key IS NOT NULL;
                  CREATE INDEX IF NOT EXISTS idx_channels_origin ON channels(origin);",
+            )
+            .map_err(io_error)?;
+        // Releases before per-origin namespaces kept a channel a provider
+        // bound to an HTTP origin under its payment-scope key, even in a
+        // namespace (such as `wallet`) that keeps several origins' channels.
+        // Move each such row into its origin's namespace, under
+        // `origin_channel_key`, so the payment-scope key stays the namespace
+        // of channels without an origin. Rows without an origin, and rows of a
+        // namespace that keeps only their origin's channels, stay in place.
+        connection
+            .execute_batch(
+                "WITH bound AS (
+                     SELECT channel_id,
+                            CASE WHEN json_valid(entry_json)
+                                THEN json_extract(entry_json, '$.origin') END AS entry_origin
+                     FROM channels
+                     WHERE entry_json IS NOT NULL AND scope_key IS NOT NULL
+                         -- The persisted key is namespace, newline, payment-scope
+                         -- key: only an '@' after the newline marks a key already
+                         -- in an origin's namespace, since namespaces such as
+                         -- alice@example.com may contain one.
+                         AND instr(substr(scope_key, instr(scope_key, char(10)) + 1), '@') = 0
+                 )
+                 UPDATE channels
+                 SET scope_key = scope_key || '@' || (
+                     SELECT entry_origin FROM bound WHERE bound.channel_id = channels.channel_id
+                 )
+                 WHERE channel_id IN (
+                     SELECT bound.channel_id FROM bound
+                     JOIN channels AS row ON row.channel_id = bound.channel_id
+                     WHERE bound.entry_origin IS NOT NULL
+                         AND typeof(bound.entry_origin) = 'text'
+                         AND bound.entry_origin <> row.origin
+                         AND NOT EXISTS (
+                             SELECT 1 FROM channels AS taken
+                             WHERE taken.scope_key = row.scope_key || '@' || bound.entry_origin
+                         )
+                 );",
             )
             .map_err(io_error)
     }
@@ -1036,6 +1352,428 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("origin mismatch"));
         assert_eq!(store.get(&bound.key()).await.unwrap(), Some(bound));
+    }
+
+    const ORIGIN: &str = "https://api.example.test";
+    const OTHER: &str = "https://other.example";
+
+    fn view(inner: &Arc<dyn ChannelStore>, origin: Option<&str>) -> OriginBoundChannelStore {
+        OriginBoundChannelStore::new(
+            inner.clone(),
+            Arc::new(Mutex::new(origin.map(str::to_owned))),
+        )
+    }
+
+    fn other_channel(byte: u8) -> StoredChannelEntry {
+        StoredChannelEntry {
+            channel_id: B256::repeat_byte(byte),
+            ..entry()
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn sqlite_store(namespace: &str) -> (Arc<dyn ChannelStore>, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: namespace.into(),
+            path: Some(directory.join("channels.db")),
+            request_url: None,
+        })
+        .unwrap();
+        (Arc::new(store), directory)
+    }
+
+    /// Runs `check` against a memory store and, with `sqlite`, a SQLite
+    /// store whose namespace keeps several origins' channels.
+    async fn on_every_store<F, Fut>(check: F)
+    where
+        F: Fn(Arc<dyn ChannelStore>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        check(Arc::new(MemoryChannelStore::default())).await;
+        #[cfg(feature = "sqlite")]
+        {
+            let (store, directory) = sqlite_store("wallet");
+            check(store).await;
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_and_unbound_providers_keep_separate_namespaces() {
+        on_every_store(|inner| async move {
+            let key = entry().key();
+            let mine = entry();
+            let theirs = other_channel(0x77);
+            let unbound = view(&inner, None);
+            let bound = view(&inner, Some(ORIGIN));
+            unbound.set(&mine).await.unwrap();
+            bound.set(&theirs).await.unwrap();
+            for _ in 0..2 {
+                unbound
+                    .set(&StoredChannelEntry {
+                        cumulative_amount: mine.cumulative_amount + 1,
+                        ..mine.clone()
+                    })
+                    .await
+                    .unwrap();
+                bound.set(&theirs).await.unwrap();
+            }
+
+            // The unbound provider's channel stays under the scope key without
+            // an origin, the bound provider's under its origin's key.
+            let stored = unbound.get(&key).await.unwrap().unwrap();
+            assert_eq!(
+                (
+                    stored.channel_id,
+                    stored.origin.clone(),
+                    stored.cumulative_amount
+                ),
+                (mine.channel_id, None, mine.cumulative_amount + 1)
+            );
+            assert_eq!(inner.get(&key).await.unwrap(), Some(stored));
+            let stored = bound.get(&key).await.unwrap().unwrap();
+            assert_eq!(stored.channel_id, theirs.channel_id);
+            assert_eq!(stored.origin.as_deref(), Some(ORIGIN));
+            assert_eq!(
+                inner.get(&origin_channel_key(&key, ORIGIN)).await.unwrap(),
+                Some(stored)
+            );
+            // Neither deletes the other's channel, and reading never binds.
+            unbound.forget(&key, theirs.channel_id).await.unwrap();
+            bound.forget(&key, mine.channel_id).await.unwrap();
+            assert!(inner.get(&key).await.unwrap().is_some());
+            assert!(inner
+                .get(&origin_channel_key(&key, ORIGIN))
+                .await
+                .unwrap()
+                .is_some());
+            assert!(unbound.namespace().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_entry_is_left_to_unbound_providers() {
+        on_every_store(|inner| async move {
+            let legacy = entry();
+            let key = legacy.key();
+            inner.set(&legacy).await.unwrap();
+
+            // A bound provider never reads, deletes or overwrites it.
+            let bound = view(&inner, Some(ORIGIN));
+            assert!(bound.get(&key).await.unwrap().is_none());
+            assert!(bound.elsewhere(&key, legacy.channel_id).await.unwrap());
+            let opened = other_channel(0x77);
+            bound.set(&opened).await.unwrap();
+            bound.forget(&key, legacy.channel_id).await.unwrap();
+            bound.delete(&key).await.unwrap();
+            assert!(bound.get(&key).await.unwrap().is_none());
+            assert_eq!(inner.get(&key).await.unwrap(), Some(legacy.clone()));
+
+            // A provider without an origin reuses and closes it.
+            let unbound = view(&inner, None);
+            assert_eq!(unbound.get(&key).await.unwrap(), Some(legacy.clone()));
+            assert!(!unbound.elsewhere(&key, legacy.channel_id).await.unwrap());
+            unbound.forget(&key, legacy.channel_id).await.unwrap();
+            assert!(inner.get(&key).await.unwrap().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn providers_bound_to_different_origins_are_isolated() {
+        on_every_store(|inner| async move {
+            let key = entry().key();
+            let first = view(&inner, Some(ORIGIN));
+            let second = view(&inner, Some(OTHER));
+            first.set(&entry()).await.unwrap();
+            second.set(&other_channel(0x77)).await.unwrap();
+            assert_eq!(
+                first.get(&key).await.unwrap().unwrap().channel_id,
+                entry().channel_id
+            );
+            assert_eq!(
+                second.get(&key).await.unwrap().unwrap().channel_id,
+                B256::repeat_byte(0x77)
+            );
+            // A snapshot naming the other origin's channel is not recovered.
+            assert!(second.elsewhere(&key, entry().channel_id).await.unwrap());
+            assert!(!second
+                .elsewhere(&key, B256::repeat_byte(0x77))
+                .await
+                .unwrap());
+            second.forget(&key, entry().channel_id).await.unwrap();
+            assert!(first.get(&key).await.unwrap().is_some());
+            // Nothing reaches the namespace without an origin.
+            assert!(inner.get(&key).await.unwrap().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn binding_leaves_earlier_channels_in_the_originless_namespace() {
+        on_every_store(|inner| async move {
+            let key = entry().key();
+            let origin = Arc::new(Mutex::new(None));
+            let provider = OriginBoundChannelStore::new(inner.clone(), origin.clone());
+            provider.set(&entry()).await.unwrap();
+            let opened = other_channel(0x55);
+            provider.claim(opened.channel_id).unwrap();
+
+            *origin.lock().unwrap() = Some(ORIGIN.into());
+            // The bound namespace starts empty; the earlier channels are
+            // refused rather than carried into it, and never deleted.
+            assert!(provider.get(&key).await.unwrap().is_none());
+            assert!(provider.check(entry().channel_id).is_err());
+            assert!(provider.check(opened.channel_id).is_err());
+            assert!(provider.set(&entry()).await.is_err());
+            assert!(provider.set(&opened).await.is_err());
+            assert!(provider.elsewhere(&key, entry().channel_id).await.unwrap());
+            provider.forget(&key, entry().channel_id).await.unwrap();
+            assert!(inner
+                .get(&origin_channel_key(&key, ORIGIN))
+                .await
+                .unwrap()
+                .is_none());
+            let stored = inner.get(&key).await.unwrap().unwrap();
+            assert_eq!(
+                (stored.channel_id, stored.origin),
+                (entry().channel_id, None)
+            );
+
+            // A new channel goes to the origin's namespace, and a provider
+            // without an origin still finds the earlier one to close it.
+            let fresh = other_channel(0x77);
+            provider.set(&fresh).await.unwrap();
+            assert_eq!(
+                provider.get(&key).await.unwrap().unwrap().channel_id,
+                fresh.channel_id
+            );
+            assert_eq!(
+                view(&inner, None)
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .channel_id,
+                entry().channel_id
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unbound_provider_refuses_an_entry_bound_under_the_scope_key() {
+        // An earlier release kept a bound provider's channel under the scope
+        // key. A provider without an origin neither reuses nor overwrites it.
+        let inner: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::default());
+        let earlier = StoredChannelEntry {
+            origin: Some(ORIGIN.into()),
+            ..entry()
+        };
+        inner.set(&earlier).await.unwrap();
+        let unbound = view(&inner, None);
+        let key = earlier.key();
+        assert!(unbound
+            .get(&key)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("origin mismatch"));
+        assert!(unbound.set(&other_channel(0x77)).await.is_err());
+        unbound.forget(&key, earlier.channel_id).await.unwrap();
+        unbound.delete(&key).await.unwrap();
+        assert_eq!(inner.get(&key).await.unwrap(), Some(earlier));
+    }
+
+    #[tokio::test]
+    async fn unbound_provider_never_recovers_another_origins_channel() {
+        let inner: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::default());
+        let bound = view(&inner, Some(ORIGIN));
+        bound.set(&entry()).await.unwrap();
+        let unbound = view(&inner, None);
+        let key = entry().key();
+        assert!(unbound.get(&key).await.unwrap().is_none());
+        assert!(unbound.elsewhere(&key, entry().channel_id).await.unwrap());
+        assert!(!unbound
+            .elsewhere(&key, B256::repeat_byte(0x77))
+            .await
+            .unwrap());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn origin_namespaced_sqlite_store_binds_its_providers() {
+        let (store, directory) = sqlite_store("https://api.example.com");
+        assert_eq!(store.origin().as_deref(), Some("https://api.example.com"));
+        let first = view(&store, None);
+        assert_eq!(
+            first.namespace().as_deref(),
+            Some("https://api.example.com")
+        );
+        first.set(&entry()).await.unwrap();
+        // The store is the origin's namespace: its channels stay under their
+        // payment-scope key, and another provider of the service reuses them.
+        let key = entry().key();
+        assert_eq!(
+            store.get(&key).await.unwrap().unwrap().origin.as_deref(),
+            Some("https://api.example.com")
+        );
+        let second = view(&store, None);
+        assert_eq!(
+            second.get(&key).await.unwrap().unwrap().channel_id,
+            entry().channel_id
+        );
+        let replacement = other_channel(0x77);
+        second.set(&replacement).await.unwrap();
+        assert_eq!(
+            store.get(&key).await.unwrap().unwrap().channel_id,
+            replacement.channel_id
+        );
+        // A provider pinned to another origin sees none of them and cannot
+        // write there.
+        let foreign = view(&store, Some("https://evil.example"));
+        assert!(foreign.get(&key).await.unwrap().is_none());
+        assert!(foreign.set(&other_channel(0x78)).await.is_err());
+        drop((first, second, foreign, store));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_moves_channels_bound_under_the_scope_key_into_their_namespace() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("channels.db");
+        let open = |namespace: &str| {
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                namespace: namespace.into(),
+                path: Some(path.clone()),
+                request_url: None,
+            })
+            .unwrap()
+        };
+        // An earlier release kept a bound channel under its scope key, in a
+        // namespace that keeps several origins' channels, next to a legacy
+        // channel without an origin and a channel of an origin's own store.
+        let bound = StoredChannelEntry {
+            origin: Some(ORIGIN.into()),
+            ..entry()
+        };
+        let legacy = StoredChannelEntry {
+            descriptor: ChannelDescriptor {
+                payee: "0x0000000000000000000000000000000000000009".into(),
+                ..entry().descriptor
+            },
+            ..other_channel(0x77)
+        };
+        let service = StoredChannelEntry {
+            origin: Some(ORIGIN.into()),
+            ..other_channel(0x78)
+        };
+        open("wallet").set(&bound).await.unwrap();
+        open("wallet").set(&legacy).await.unwrap();
+        open(ORIGIN).set(&service).await.unwrap();
+
+        let wallet: Arc<dyn ChannelStore> = Arc::new(open("wallet"));
+        let key = bound.key();
+        assert!(wallet.get(&key).await.unwrap().is_none());
+        assert_eq!(
+            wallet.get(&origin_channel_key(&key, ORIGIN)).await.unwrap(),
+            Some(bound.clone())
+        );
+        assert_eq!(
+            view(&wallet, Some(ORIGIN)).get(&key).await.unwrap(),
+            Some(bound)
+        );
+        assert_eq!(
+            view(&wallet, None).get(&legacy.key()).await.unwrap(),
+            Some(legacy)
+        );
+        let origin_store: Arc<dyn ChannelStore> = Arc::new(open(ORIGIN));
+        assert_eq!(
+            view(&origin_store, None).get(&service.key()).await.unwrap(),
+            Some(service)
+        );
+        drop((wallet, origin_store));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_moves_bound_channels_of_a_namespace_containing_an_at_sign() {
+        let directory = std::env::temp_dir().join(format!("mpp-rs-store-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("channels.db");
+        let open = || {
+            SqliteChannelStore::open(SqliteChannelStoreOptions {
+                namespace: "alice@example.com".into(),
+                path: Some(path.clone()),
+                request_url: None,
+            })
+            .unwrap()
+        };
+        let bound = StoredChannelEntry {
+            origin: Some(ORIGIN.into()),
+            ..entry()
+        };
+        open().set(&bound).await.unwrap();
+
+        let store: Arc<dyn ChannelStore> = Arc::new(open());
+        let key = bound.key();
+        assert!(store.get(&key).await.unwrap().is_none());
+        assert_eq!(
+            view(&store, Some(ORIGIN)).get(&key).await.unwrap(),
+            Some(bound)
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_store_keeps_a_channel_under_one_key() {
+        let store = MemoryChannelStore::default();
+        let key = entry().key();
+        store
+            .set_at(&origin_channel_key(&key, ORIGIN), &entry())
+            .await
+            .unwrap();
+        let error = store
+            .set_at(&origin_channel_key(&key, OTHER), &entry())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("origin mismatch"), "{error}");
+        assert!(store
+            .get(&origin_channel_key(&key, OTHER))
+            .await
+            .unwrap()
+            .is_none());
+        // Updating it under its own key still works.
+        store
+            .set_at(&origin_channel_key(&key, ORIGIN), &entry())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn providers_choose_the_key_they_write_under() {
+        let inner: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::default());
+        let bound = view(&inner, Some(ORIGIN));
+        assert!(bound.set_at("elsewhere", &entry()).await.is_err());
+        assert!(bound
+            .set(&StoredChannelEntry {
+                origin: Some(OTHER.into()),
+                ..entry()
+            })
+            .await
+            .is_err());
+        assert!(view(&inner, None)
+            .set(&StoredChannelEntry {
+                origin: Some(ORIGIN.into()),
+                ..entry()
+            })
+            .await
+            .is_err());
+        assert!(inner.get(&entry().key()).await.unwrap().is_none());
     }
 
     #[test]

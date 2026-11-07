@@ -28,7 +28,8 @@ pub enum HttpError {
     /// returned a payment challenge, so the paid retry cannot be resent safely.
     RedirectedRequest(String),
 
-    /// A zero-amount Tempo proof was requested for a different HTTP realm.
+    /// A zero-amount Tempo proof or a Tempo session payment was requested
+    /// for a different HTTP realm.
     CrossRealmProof,
 
     /// The caller-owned HTTP client may forward a custom credential header across redirects.
@@ -59,7 +60,7 @@ impl fmt::Display for HttpError {
                 f,
                 "Cannot automatically pay a redirected {method} request"
             ),
-            Self::CrossRealmProof => write!(f, "Refusing to sign Tempo proof for a different HTTP realm"),
+            Self::CrossRealmProof => write!(f, "Refusing to sign a Tempo proof or session payment for a different HTTP realm"),
             Self::UnsafeCredentialHeader => write!(
                 f,
                 "Payment-Authorization requires a redirect-safe client; refusing to create a credential"

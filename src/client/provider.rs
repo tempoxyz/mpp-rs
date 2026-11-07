@@ -11,6 +11,20 @@ use reqwest::header::HeaderMap;
 use reqwest::Url;
 use std::future::Future;
 
+/// Whether a realm pin set for `pinned` applies to `url`: the same tuple
+/// origin, or for URLs with an opaque origin (such as `mcp://host/tool`) the
+/// same scheme, host and port. An opaque URL without a host never matches.
+pub(crate) fn same_pin_origin(pinned: &Url, url: &Url) -> bool {
+    let (pinned_origin, url_origin) = (pinned.origin(), url.origin());
+    if pinned_origin.is_tuple() || url_origin.is_tuple() {
+        return pinned_origin == url_origin;
+    }
+    pinned.host().is_some()
+        && pinned.scheme() == url.scheme()
+        && pinned.host() == url.host()
+        && pinned.port() == url.port()
+}
+
 /// Work a payment event in a response stream triggers, such as sending a voucher.
 pub type PaymentEventFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), MppError>> + Send>>;
 
@@ -481,7 +495,7 @@ impl PaymentProvider for MultiProvider {
     fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
         self.trusted_tempo_proof_realms
             .iter()
-            .find(|(origin, _)| origin.origin() == url.origin())
+            .find(|(origin, _)| same_pin_origin(origin, url))
             .map(|(_, realm)| realm.as_str())
             .or_else(|| {
                 self.providers
@@ -495,7 +509,7 @@ impl PaymentProvider for MultiProvider {
             provider.dyn_set_trusted_tempo_proof_realm(origin.clone(), realm.clone());
         }
         self.trusted_tempo_proof_realms
-            .retain(|(existing, _)| existing.origin() != origin.origin());
+            .retain(|(existing, _)| !same_pin_origin(existing, &origin));
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
@@ -1028,6 +1042,35 @@ impl Clone for Box<dyn DynPaymentProvider> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn realm_pins_match_opaque_origins_by_scheme_host_and_port() {
+        let url = |value: &str| reqwest::Url::parse(value).unwrap();
+        let pinned = url("mcp://target.example/tool");
+        assert!(super::same_pin_origin(
+            &pinned,
+            &url("mcp://target.example/other")
+        ));
+        assert!(!super::same_pin_origin(
+            &pinned,
+            &url("mcp://TARGET.example")
+        ));
+        for other in [
+            "mcp://other.example/tool",
+            "mcp://target.example:1/tool",
+            "mcps://target.example/tool",
+            "http://target.example/tool",
+        ] {
+            assert!(!super::same_pin_origin(&pinned, &url(other)), "{other}");
+        }
+        // Opaque URLs without a host share no identity, even with themselves.
+        let hostless = url("mcp:tool");
+        assert!(!super::same_pin_origin(&hostless, &hostless));
+        assert!(super::same_pin_origin(
+            &url("https://api.example"),
+            &url("https://api.example:443/pay")
+        ));
+    }
+
     use super::*;
 
     #[derive(Clone, Default)]
@@ -1041,7 +1084,7 @@ mod tests {
         fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
             self.0
                 .as_ref()
-                .filter(|(origin, _)| origin.origin() == url.origin())
+                .filter(|(origin, _)| same_pin_origin(origin, url))
                 .map(|(_, realm)| realm.as_str())
         }
 

@@ -210,7 +210,8 @@ where
                 .trusted_tempo_proof_realm(&payment_context.url),
         ) {
             return Err(mpp::MppError::InvalidConfig(
-                "refusing to sign Tempo proof for a different HTTP realm".into(),
+                "refusing to sign a Tempo proof or session payment for a different HTTP realm"
+                    .into(),
             )
             .into());
         }

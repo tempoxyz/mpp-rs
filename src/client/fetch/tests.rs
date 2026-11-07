@@ -1695,7 +1695,7 @@ mod integration {
         expires: Option<&str>,
     ) -> String {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-        let mut challenge = PaymentChallenge::new(id, "test.example.com", method, intent, request);
+        let mut challenge = PaymentChallenge::new(id, "127.0.0.1", method, intent, request);
         if let Some(expires) = expires {
             challenge = challenge.with_expires(expires);
         }

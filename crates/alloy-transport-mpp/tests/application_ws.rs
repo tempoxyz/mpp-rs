@@ -207,7 +207,9 @@ fn challenge() -> PaymentChallenge {
 fn challenge_with_id(id: &str) -> PaymentChallenge {
     PaymentChallenge::new(
         id,
-        "application-test",
+        // The fixtures serve from 127.0.0.1: clients refuse session Challenges
+        // whose realm is not the request host.
+        "127.0.0.1",
         "tempo",
         "session",
         Base64UrlJson::from_value(&json!({

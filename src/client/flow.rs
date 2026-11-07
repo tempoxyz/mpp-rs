@@ -203,10 +203,21 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             }
             _ => None,
         };
+        // A cached Challenge must still satisfy this caller's realm pins for
+        // this request, as a fresh one would before it is paid below.
         let prepaid = prepaid.filter(|(challenge, credential)| {
-            if self
-                .check_challenge(exchange, challenge, ranking_accept.as_deref())
-                .is_err()
+            let cross_realm = payment_context.as_ref().is_none_or(|context| {
+                is_cross_realm_proof_with_trust(
+                    challenge,
+                    &context.url,
+                    &context.headers,
+                    self.provider.trusted_tempo_proof_realm(&context.url),
+                )
+            });
+            if cross_realm
+                || self
+                    .check_challenge(exchange, challenge, ranking_accept.as_deref())
+                    .is_err()
             {
                 self.provider.abandon_payment(challenge, credential);
                 false
@@ -759,7 +770,8 @@ pub(crate) fn same_resource(a: &reqwest::Url, b: &reqwest::Url) -> bool {
     a.as_str().split('#').next() == b.as_str().split('#').next()
 }
 
-/// Whether a zero-amount Tempo challenge names a different host than the caller's request.
+/// Whether a zero-amount Tempo proof or a Tempo session challenge names a
+/// different host than the caller's request.
 pub fn is_cross_realm_proof(
     challenge: &PaymentChallenge,
     url: &reqwest::Url,
@@ -769,28 +781,43 @@ pub fn is_cross_realm_proof(
 }
 
 /// Apply an explicit caller-pinned proof realm for a known HTTP origin.
+///
+/// A zero-amount Tempo proof authenticates the payer at its realm, and a
+/// session payment signs vouchers for it, so both are refused unless the realm
+/// is the request's hostname or `trusted_realm`, as mppx does. A WebSocket
+/// URL counts as HTTP; any other URL, such as an MCP resource, trusts only
+/// `trusted_realm`.
 pub fn is_cross_realm_proof_with_trust(
     challenge: &PaymentChallenge,
     url: &reqwest::Url,
     headers: &HeaderMap,
     trusted_realm: Option<&str>,
 ) -> bool {
-    let requested_host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| reqwest::Url::parse(&format!("http://{value}")).ok())
-        .and_then(|host| host.host_str().map(str::to_owned))
-        .or_else(|| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
-    challenge.method.as_str() == "tempo"
-        && challenge.intent.as_str() == "charge"
-        && challenge
-            .request
-            .decode::<crate::protocol::intents::ChargeRequest>()
-            .ok()
-            .and_then(|request| request.parse_amount().ok())
-            == Some(0)
-        && !challenge.realm.eq_ignore_ascii_case(&requested_host)
+    let requested_host = if matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| reqwest::Url::parse(&format!("http://{value}")).ok())
+            .and_then(|host| host.host_str().map(str::to_owned))
+            .or_else(|| url.host_str().map(str::to_owned))
+    } else {
+        None
+    };
+    let binds_realm = challenge.method.as_str() == "tempo"
+        && match challenge.intent.as_str() {
+            "session" => true,
+            "charge" => {
+                challenge
+                    .request
+                    .decode::<crate::protocol::intents::ChargeRequest>()
+                    .ok()
+                    .and_then(|request| request.parse_amount().ok())
+                    == Some(0)
+            }
+            _ => false,
+        };
+    binds_realm
+        && !requested_host.is_some_and(|host| challenge.realm.eq_ignore_ascii_case(&host))
         && trusted_realm != Some(challenge.realm.as_str())
 }
 

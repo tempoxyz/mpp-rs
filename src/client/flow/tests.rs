@@ -70,6 +70,142 @@ fn caller_host_header_binds_proof_realm() {
     ));
 }
 
+#[test]
+fn websocket_urls_bind_their_host() {
+    let socket = reqwest::Url::parse("ws://target.example:8546/rpc").unwrap();
+    let secure = reqwest::Url::parse("wss://target.example/rpc").unwrap();
+    for (intent, amount) in [("session", "100"), ("charge", "0")] {
+        let challenge = PaymentChallenge::new(
+            "ws-id",
+            "target.example",
+            "tempo",
+            intent,
+            Base64UrlJson::from_value(&serde_json::json!({
+                "amount": amount,
+                "currency": "0x3333333333333333333333333333333333333333"
+            }))
+            .unwrap(),
+        );
+        for url in [&socket, &secure] {
+            assert!(
+                !super::is_cross_realm_proof(&challenge, url, &HeaderMap::new()),
+                "{intent} {url}"
+            );
+        }
+        let other = reqwest::Url::parse("wss://relay.example/rpc").unwrap();
+        assert!(super::is_cross_realm_proof(
+            &challenge,
+            &other,
+            &HeaderMap::new()
+        ));
+    }
+}
+
+#[test]
+fn session_challenges_bind_their_realm() {
+    let relay = reqwest::Url::parse("https://relay.example/data").unwrap();
+    let target = reqwest::Url::parse("https://target.example/data").unwrap();
+    // A transport without an HTTP origin, such as an MCP resource.
+    let opaque = reqwest::Url::parse("mcp://target.example/tool").unwrap();
+    for amount in ["0", "100"] {
+        let challenge = PaymentChallenge::new(
+            "session-id",
+            "target.example",
+            "tempo",
+            "session",
+            Base64UrlJson::from_value(&serde_json::json!({ "amount": amount })).unwrap(),
+        );
+        assert!(super::is_cross_realm_proof(
+            &challenge,
+            &relay,
+            &HeaderMap::new()
+        ));
+        assert!(!super::is_cross_realm_proof(
+            &challenge,
+            &target,
+            &HeaderMap::new()
+        ));
+        assert!(!super::is_cross_realm_proof_with_trust(
+            &challenge,
+            &relay,
+            &HeaderMap::new(),
+            Some("target.example")
+        ));
+        assert!(super::is_cross_realm_proof(
+            &challenge,
+            &opaque,
+            &HeaderMap::new()
+        ));
+        assert!(!super::is_cross_realm_proof_with_trust(
+            &challenge,
+            &opaque,
+            &HeaderMap::new(),
+            Some("target.example")
+        ));
+    }
+    let subscription = PaymentChallenge::new(
+        "subscription-id",
+        "target.example",
+        "tempo",
+        "subscription",
+        Base64UrlJson::from_value(&serde_json::json!({ "amount": "0" })).unwrap(),
+    );
+    assert!(!super::is_cross_realm_proof(
+        &subscription,
+        &relay,
+        &HeaderMap::new()
+    ));
+}
+
+#[tokio::test]
+async fn foreign_session_realm_is_refused_before_signing() {
+    for via in BOTH {
+        let requests = Arc::new(AtomicU32::new(0));
+        let app = Router::new().route(
+            "/paid",
+            get({
+                let requests = requests.clone();
+                move || async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let request =
+                        Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+                    let challenge = PaymentChallenge::new(
+                        "foreign",
+                        "target.example",
+                        "tempo",
+                        "session",
+                        request,
+                    );
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        [(
+                            WWW_AUTHENTICATE,
+                            format_www_authenticate(&challenge).unwrap(),
+                        )],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let url = spawn_server(app).await;
+        let provider = TestProvider::default();
+
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let err = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, HttpError::CrossRealmProof), "{via:?}: {err}");
+        assert!(
+            err.to_string().contains("session payment"),
+            "{via:?}: {err}"
+        );
+        assert!(provider.paid().is_empty(), "{via:?}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "{via:?}");
+    }
+}
+
 impl Via {
     async fn send(
         self,
@@ -117,6 +253,10 @@ struct TestProvider {
     abandoned: Arc<AtomicU32>,
     /// Send a session voucher before the server asks for payment.
     prepaid: bool,
+    /// The realm of the prepaid voucher's cached Challenge, when not the request's host.
+    prepaid_realm: Option<&'static str>,
+    /// The realm this caller pins for every origin.
+    trusted_realm: Option<&'static str>,
 }
 
 impl TestProvider {
@@ -128,6 +268,10 @@ impl TestProvider {
 impl PaymentProvider for TestProvider {
     fn supports(&self, method: &str, _intent: &str) -> bool {
         method == "tempo"
+    }
+
+    fn trusted_tempo_proof_realm(&self, _url: &reqwest::Url) -> Option<&str> {
+        self.trusted_realm
     }
 
     async fn prepare_http_payment_challenge(
@@ -210,8 +354,8 @@ impl PaymentProvider for TestProvider {
             return None;
         }
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-        let challenge =
-            PaymentChallenge::new("prepaid-1", "flow.example.com", "tempo", "session", request);
+        let realm = self.prepaid_realm.unwrap_or("127.0.0.1");
+        let challenge = PaymentChallenge::new("prepaid-1", realm, "tempo", "session", request);
         let credential = PaymentCredential::new(
             challenge.to_echo(),
             serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
@@ -226,7 +370,7 @@ impl PaymentProvider for TestProvider {
 
 fn www_authenticate(id: &str, method: &str, intent: &str) -> String {
     let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-    let challenge = PaymentChallenge::new(id, "flow.example.com", method, intent, request);
+    let challenge = PaymentChallenge::new(id, "127.0.0.1", method, intent, request);
     format_www_authenticate(&challenge).unwrap()
 }
 
@@ -927,6 +1071,54 @@ async fn prepaid_credentials_respect_request_preferences() {
                     assert_eq!(provider.abandoned.load(Ordering::SeqCst), u32::from(warm));
                 }
             }
+        }
+    }
+}
+
+/// A cached Challenge for another realm is sent prepaid only to a caller
+/// that pins that realm; any other caller pays a fresh Challenge instead.
+#[tokio::test]
+async fn prepaid_credentials_respect_the_callers_realm_pins() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("session-1", "session")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        for trusted_realm in [None, Some("realm.example")] {
+            let provider = TestProvider {
+                prepaid: true,
+                prepaid_realm: Some("realm.example"),
+                trusted_realm,
+                ..TestProvider::default()
+            };
+            let response = via
+                .send(
+                    reqwest::Client::new().get(format!("{url}/paid")),
+                    &provider,
+                    ClientEvents::default(),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{via:?} {trusted_realm:?}: {err}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{via:?} {trusted_realm:?}"
+            );
+            // Had the unpinned caller sent the cached voucher, the server would
+            // have accepted it without asking for the fresh Challenge.
+            let fresh: &[&str] = if trusted_realm.is_some() {
+                &[]
+            } else {
+                &["session-1"]
+            };
+            assert_eq!(provider.paid(), fresh, "{via:?} {trusted_realm:?}");
         }
     }
 }

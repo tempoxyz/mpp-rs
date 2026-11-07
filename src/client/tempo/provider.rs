@@ -643,13 +643,13 @@ impl PaymentProvider for TempoProvider {
     fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
         self.trusted_tempo_proof_realms
             .iter()
-            .find(|(origin, _)| origin.origin() == url.origin())
+            .find(|(origin, _)| crate::client::provider::same_pin_origin(origin, url))
             .map(|(_, realm)| realm.as_str())
     }
 
     fn set_trusted_tempo_proof_realm(&mut self, origin: reqwest::Url, realm: String) {
         self.trusted_tempo_proof_realms
-            .retain(|(existing, _)| existing.origin() != origin.origin());
+            .retain(|(existing, _)| !crate::client::provider::same_pin_origin(existing, &origin));
         self.trusted_tempo_proof_realms.push((origin, realm));
     }
 
