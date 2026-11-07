@@ -152,7 +152,10 @@ pub use types::{Split, TempoMethodDetails};
 pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
 #[cfg(feature = "server")]
-pub use method::{ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride, RemoteFeePayer};
+pub use method::{
+    ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride, PaymentSimulationError,
+    PaymentSimulationPhase, RemoteFeePayer,
+};
 #[cfg(feature = "server")]
 pub use relay::{RelayConfig, RelayErrorCode};
 #[cfg(feature = "server")]

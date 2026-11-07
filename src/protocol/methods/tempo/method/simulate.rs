@@ -28,13 +28,84 @@ use alloy::primitives::{Address, Bytes, Signature};
 use alloy::providers::Provider;
 use alloy::transports::{RpcError, TransportErrorKind};
 use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
-use tempo_alloy::primitives::AASigned;
+use tempo_alloy::primitives::{AASigned, TempoTransaction};
 use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_alloy::TempoNetwork;
 
 use crate::protocol::traits::VerificationError;
 
+use super::calls::{TRANSFER_SELECTOR, TRANSFER_WITH_MEMO_SELECTOR};
 use super::ChargeMethod;
+
+/// Which pre-broadcast simulation of a sponsored transaction failed, as
+/// mppx's `PaymentSimulationError.Phase`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentSimulationPhase {
+    /// The sender's calls, before any sponsor signs.
+    Sender,
+    /// The final co-signed transaction, billed to its fee payer.
+    Sponsored,
+}
+
+/// A pre-broadcast simulation of a fee-sponsored payment failed, so the
+/// payment was not broadcast, as mppx's `PaymentSimulationError`.
+///
+/// `phase` says which simulation failed. With `sender`, `fee_payer` and
+/// `payment_token` it tells a payer's insufficient balance from a sponsor's
+/// without matching node messages; the node's error is `cause`. It is the
+/// [`std::error::Error::source`] of the [`VerificationError`] the charge
+/// method returns, whose code and message are unchanged, so HTTP responses
+/// are too. Transport failures, where no node answered, are not tagged.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PaymentSimulationError {
+    /// The simulation that failed.
+    pub phase: PaymentSimulationPhase,
+    /// Sender of the simulated transaction.
+    pub sender: Address,
+    /// Fee payer the sponsored simulation billed. Set only in the
+    /// [`PaymentSimulationPhase::Sponsored`] phase.
+    pub fee_payer: Option<Address>,
+    /// TIP-20 token of the transaction's single `transfer` or
+    /// `transferWithMemo` call, when it is one.
+    pub payment_token: Option<Address>,
+    /// The node's error.
+    pub cause: RpcError<TransportErrorKind>,
+}
+
+impl std::fmt::Display for PaymentSimulationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Payment simulation failed")
+    }
+}
+
+impl std::error::Error for PaymentSimulationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// The fields of a [`PaymentSimulationError`] known before the simulation
+/// runs.
+struct SimulationTag {
+    phase: PaymentSimulationPhase,
+    sender: Address,
+    fee_payer: Option<Address>,
+    payment_token: Option<Address>,
+}
+
+/// The token of a transaction whose only call is a TIP-20 `transfer` or
+/// `transferWithMemo`, as mppx's `preflightSponsorship`.
+fn payment_token(tx: &TempoTransaction) -> Option<Address> {
+    let [call] = tx.calls.as_slice() else {
+        return None;
+    };
+    let selector = call.input.get(..4)?;
+    if selector != TRANSFER_SELECTOR && selector != TRANSFER_WITH_MEMO_SELECTOR {
+        return None;
+    }
+    call.to.to().copied()
+}
 
 /// Extra gas a local fee payer signs into its simulation-only copy of a
 /// sponsored transaction, as mppx's `sponsoredSimulationGasBuffer`.
@@ -253,11 +324,22 @@ where
     /// transaction's (a local fee payer's simulation-only copy); otherwise the
     /// transaction's own fee payer signature is sent (a hosted fee payer's).
     /// Key hints are sent as in [`Self::simulation_request_base`].
+    #[cfg(test)]
     pub(super) fn sponsored_simulation_request(
         final_tx_bytes: &[u8],
         fee_payer: Address,
         simulation: Option<&FeePayerSimulation>,
     ) -> Result<serde_json::Value, VerificationError> {
+        Self::sponsored_simulation(final_tx_bytes, fee_payer, simulation).map(|(value, _)| value)
+    }
+
+    /// [`Self::sponsored_simulation_request`] with the tag a failed
+    /// simulation of it is reported with.
+    fn sponsored_simulation(
+        final_tx_bytes: &[u8],
+        fee_payer: Address,
+        simulation: Option<&FeePayerSimulation>,
+    ) -> Result<(serde_json::Value, SimulationTag), VerificationError> {
         let signed = AASigned::decode_2718(&mut &final_tx_bytes[..]).map_err(|e| {
             VerificationError::new(format!("Failed to decode co-signed tx for simulation: {e}"))
         })?;
@@ -293,17 +375,25 @@ where
                 rpc_signature(&fee_payer_signature),
             );
         }
-        Ok(value)
+        let tag = SimulationTag {
+            phase: PaymentSimulationPhase::Sponsored,
+            sender,
+            fee_payer: Some(fee_payer),
+            payment_token: payment_token(signed.tx()),
+        };
+        Ok((value, tag))
     }
 
     /// `eth_call` one simulation request and fail closed: a revert is a failed
     /// transaction, and an RPC error is a failed check, not a pass. With
     /// `tolerate_gas_limit`, a gas-limit-only failure ([`is_gas_limit_error`])
-    /// passes.
+    /// passes. A failure the node answered is tagged with a
+    /// [`PaymentSimulationError`] from `tag`; a transport failure is not.
     async fn simulate_call(
         &self,
         request: serde_json::Value,
         tolerate_gas_limit: bool,
+        tag: SimulationTag,
     ) -> Result<(), VerificationError> {
         let result: Result<Bytes, _> = self
             .provider
@@ -312,18 +402,31 @@ where
         let Err(e) = result else {
             return Ok(());
         };
-        match e.as_error_resp() {
-            _ if tolerate_gas_limit && is_gas_limit_error(&e) => Ok(()),
+        let error = match e.as_error_resp() {
+            _ if tolerate_gas_limit && is_gas_limit_error(&e) => return Ok(()),
             Some(err) if err.code == JSONRPC_EXECUTION_REVERTED => {
-                Err(VerificationError::transaction_failed(format!(
+                VerificationError::transaction_failed(format!(
                     "Sponsored transaction would revert in pre-broadcast simulation: {} (code {})",
                     err.message, err.code
+                ))
+            }
+            Some(_) => {
+                VerificationError::network_error(format!("Pre-broadcast simulation failed: {e}"))
+            }
+            // No node answered: a transport failure, not a failed simulation.
+            None => {
+                return Err(VerificationError::network_error(format!(
+                    "Pre-broadcast simulation failed: {e}"
                 )))
             }
-            _ => Err(VerificationError::network_error(format!(
-                "Pre-broadcast simulation failed: {e}"
-            ))),
-        }
+        };
+        Err(error.with_source(PaymentSimulationError {
+            phase: tag.phase,
+            sender: tag.sender,
+            fee_payer: tag.fee_payer,
+            payment_token: tag.payment_token,
+            cause: e,
+        }))
     }
 
     /// Simulate a sponsored transaction from its sender at its broadcast gas
@@ -335,7 +438,13 @@ where
         signed: &AASigned,
         sender: Address,
     ) -> Result<(), VerificationError> {
-        self.simulate_call(Self::sender_simulation_request(signed, sender)?, false)
+        let tag = SimulationTag {
+            phase: PaymentSimulationPhase::Sender,
+            sender,
+            fee_payer: None,
+            payment_token: payment_token(signed.tx()),
+        };
+        self.simulate_call(Self::sender_simulation_request(signed, sender)?, false, tag)
             .await
     }
 
@@ -359,10 +468,7 @@ where
     ) -> Result<(), VerificationError> {
         let tolerate_gas_limit = simulation
             .is_none_or(|simulation| simulation.gas_buffer < SPONSORED_SIMULATION_GAS_BUFFER);
-        self.simulate_call(
-            Self::sponsored_simulation_request(final_tx_bytes, fee_payer, simulation)?,
-            tolerate_gas_limit,
-        )
-        .await
+        let (request, tag) = Self::sponsored_simulation(final_tx_bytes, fee_payer, simulation)?;
+        self.simulate_call(request, tolerate_gas_limit, tag).await
     }
 }

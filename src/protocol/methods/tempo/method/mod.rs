@@ -59,6 +59,7 @@ mod transaction_credential;
 pub use fee_payer::{FeePayerPolicy, FeePayerPolicyOverride};
 pub use hosted_fee_payer::RemoteFeePayer;
 pub use receipt_logs::{SenderValidation, ValidateSenderCallback};
+pub use simulate::{PaymentSimulationError, PaymentSimulationPhase};
 
 use transaction_credential::ensure_transaction_credential_source;
 

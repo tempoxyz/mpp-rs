@@ -128,6 +128,11 @@ pub struct VerificationError {
     /// Retryable errors are reported as `internal-payment-error` rather than
     /// as a payment problem with a fresh challenge.
     pub retryable: bool,
+    /// The typed error behind this one, when there is one, returned by
+    /// [`std::error::Error::source`] (for example a Tempo
+    /// `PaymentSimulationError`). It does not change how the error is
+    /// reported.
+    pub source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl VerificationError {
@@ -137,6 +142,7 @@ impl VerificationError {
             message: message.into(),
             code: None,
             retryable: false,
+            source: None,
         }
     }
 
@@ -146,7 +152,15 @@ impl VerificationError {
             message: message.into(),
             code: Some(code),
             retryable: false,
+            source: None,
         }
+    }
+
+    /// Attach the typed error behind this one, returned by
+    /// [`std::error::Error::source`].
+    pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        self.source = Some(std::sync::Arc::new(source));
+        self
     }
 
     /// Mark this error as retryable.
@@ -266,7 +280,13 @@ impl fmt::Display for VerificationError {
     }
 }
 
-impl std::error::Error for VerificationError {}
+impl std::error::Error for VerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl From<String> for VerificationError {
     fn from(message: String) -> Self {
