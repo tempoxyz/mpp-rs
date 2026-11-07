@@ -660,60 +660,72 @@ async fn test_zone_rejects_credential_in_relay_mode() {
     }
 }
 
-/// Claims the settlement transaction's hash as a hash credential does.
-async fn claim_hash<P>(method: &ChargeMethod<P>) -> bool
-where
-    P: Provider<tempo_alloy::TempoNetwork> + Clone + Send + Sync + 'static,
-{
-    method
-        .store
-        .as_ref()
-        .unwrap()
-        .put_if_absent(
-            &crate::protocol::methods::tempo::method::hash_credential::tx_hash_replay_key(
-                settlement_hash(),
-            ),
-            serde_json::Value::Bool(true),
-        )
-        .await
-        .unwrap()
+/// A hash credential naming the settlement transaction, answering `challenge`.
+fn settlement_hash_credential(challenge: &PaymentChallenge) -> PaymentCredential {
+    PaymentCredential::new(
+        challenge.to_echo(),
+        crate::protocol::core::PaymentPayload::hash(format!("{:#x}", settlement_hash())),
+    )
 }
 
-#[tokio::test]
-async fn test_zone_claims_its_settlement_against_hash_credentials() {
-    let request = zone_request(serde_json::json!({}));
-    let challenge = zone_challenge("challenge-a", &request);
-    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
-    let (method, _) = zone_method(&fixture, true);
-    method
-        .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
-        .await
-        .unwrap();
-    // A hash credential naming the settlement transaction is now a replay.
-    assert!(!claim_hash(&method).await);
-}
-
-#[tokio::test]
-async fn test_zone_rejects_settlement_a_hash_credential_claimed() {
-    let request = zone_request(serde_json::json!({}));
-    let challenge = zone_challenge("challenge-a", &request);
-    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
-    let (method, asserter) = zone_method(&fixture, true);
-    assert!(claim_hash(&method).await);
-    let credential = zone_credential(&challenge, tag_a(), ZONE_ID);
-    let error = method.verify(&credential, &request).await.unwrap_err();
-    assert_eq!(error.code, Some(ErrorCode::CredentialReplayed));
+fn assert_zone_settlement_hash_rejected(error: VerificationError) {
+    assert_eq!(error.code, Some(ErrorCode::InvalidCredential), "{error}");
     assert!(
         error
             .message
-            .contains("Transaction hash has already been used"),
+            .contains("Zone settlement transactions can't be redeemed as hash credentials"),
         "{error}"
     );
-    // Validation, which claims nothing, refuses it too.
+}
+
+#[tokio::test]
+async fn test_hash_credential_rejects_zone_settlement() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    // Emitted by an address that is no known portal: the event alone refuses it.
+    let mut withdrawal = WithdrawalFixture::new(tag_a(), challenge_memo(&challenge));
+    withdrawal.event_address = Address::repeat_byte(0x55);
+    let fixture = [withdrawal];
+    let (method, asserter) = zone_method(&fixture, true);
+    let credential = settlement_hash_credential(&challenge);
+    assert_zone_settlement_hash_rejected(method.verify(&credential, &request).await.unwrap_err());
+    asserter.write_q().clear();
     push_settlement(&asserter, &fixture);
-    let error = method
-        .validate_local(&credential, &request)
+    assert_zone_settlement_hash_rejected(
+        method
+            .validate_local(&credential, &request)
+            .await
+            .unwrap_err(),
+    );
+}
+
+#[tokio::test]
+async fn test_zone_batch_still_verifies_after_hash_credential_attempts() {
+    let request = zone_request(serde_json::json!({}));
+    let a = zone_challenge("challenge-a", &request);
+    let b = zone_challenge("challenge-b", &request);
+    let fixture = [
+        WithdrawalFixture::new(tag_a(), challenge_memo(&a)),
+        WithdrawalFixture::new(tag_b(), challenge_memo(&b)),
+    ];
+    let (method, asserter) = zone_method(&fixture, true);
+    method
+        .verify(&zone_credential(&a, tag_a(), ZONE_ID), &request)
         .await
-        .unwrap_err();
-    assert_eq!(error.code, Some(ErrorCode::CredentialReplayed));
+        .unwrap();
+    // Someone tries to redeem the batch's settlement as a hash credential.
+    push_settlement(&asserter, &fixture);
+    assert_zone_settlement_hash_rejected(
+        method
+            .verify(&settlement_hash_credential(&b), &request)
+            .await
+            .unwrap_err(),
+    );
+    // The other payer in the batch is still paid for.
+    asserter.write_q().clear();
+    push_settlement(&asserter, &fixture);
+    method
+        .verify(&zone_credential(&b, tag_b(), ZONE_ID), &request)
+        .await
+        .unwrap();
 }
