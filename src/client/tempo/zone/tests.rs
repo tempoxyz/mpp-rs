@@ -586,30 +586,267 @@ async fn test_serializes_nonces_across_challenges() {
     assert_eq!(sent.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
-async fn test_withdrawal_pays_fees_in_configured_fee_token() {
+/// The fee token of the first withdrawal sent to the Zone.
+fn sent_fee_token(sent: &Mutex<Vec<String>>) -> Option<Address> {
     use alloy::eips::Decodable2718;
     use tempo_alloy::primitives::AASigned;
 
+    let raw = sent.lock().unwrap()[0].clone();
+    let bytes = alloy::hex::decode(raw.trim_start_matches("0x")).unwrap();
+    AASigned::decode_2718(&mut bytes.as_slice())
+        .unwrap()
+        .tx()
+        .fee_token
+}
+
+#[tokio::test]
+async fn test_withdrawal_pays_fees_in_the_charge_currency_by_default() {
+    // The provider's fee token is a Tempo token the payer may not hold in the
+    // Zone, so the withdrawal pays its gas in the currency it withdraws.
     let sent = Arc::new(Mutex::new(Vec::new()));
     let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
     let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
         .unwrap()
         .with_settlement_timeout(Duration::ZERO);
     let (tempo_url, _) = tempo_rpc(Arc::new(Mutex::new(json!([])))).await;
-    let fee_token = address!("20c0000000000000000000000000000000000000");
     let provider = TempoProvider::new(payer(), tempo_url)
         .unwrap()
-        .with_fee_token(fee_token)
+        .with_fee_token(address!("20c0000000000000000000000000000000000000"))
         .with_zone(zone)
         .unwrap();
     provider
         .pay(&challenge_with(json!({}), None))
         .await
         .unwrap_err();
+    assert_eq!(sent_fee_token(&sent), Some(CURRENCY));
+}
 
-    let raw = sent.lock().unwrap()[0].clone();
-    let bytes = alloy::hex::decode(raw.trim_start_matches("0x")).unwrap();
-    let signed = AASigned::decode_2718(&mut bytes.as_slice()).unwrap();
-    assert_eq!(signed.tx().fee_token, Some(fee_token));
+#[tokio::test]
+async fn test_withdrawal_pays_fees_in_the_zone_fee_token() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let fee_token = address!("20c0000000000000000000000000000000000000");
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO)
+        .with_fee_token(fee_token);
+    let (provider, _) = provider_with_zone(zone).await;
+    provider
+        .pay(&challenge_with(json!({}), None))
+        .await
+        .unwrap_err();
+    assert_eq!(sent_fee_token(&sent), Some(fee_token));
+}
+
+#[tokio::test]
+async fn test_queued_withdrawal_rechecks_expiry_before_sending() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, zone_calls) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone.clone()).await;
+    // Leaves time to settle when the payment starts, but not after another
+    // withdrawal from the account holds the nonce lock for a few seconds.
+    let challenge = challenge_with(
+        json!({}),
+        expires_in(SUBMISSION_MARGIN.as_secs() as i64 + 3),
+    );
+    let lock = zone.nonce_lock(payer().address());
+    let guard = lock.lock().await;
+    let payment = tokio::spawn(async move { provider.pay(&challenge).await });
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    drop(guard);
+
+    let error = payment.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("expires"), "{error}");
+    assert!(
+        !matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+        "{error}"
+    );
+    assert!(!zone_calls.lock().unwrap().iter().any(|call| matches!(
+        call.as_str(),
+        "eth_getTransactionCount" | "eth_sendRawTransactionSync"
+    )));
+    assert!(sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_retries_withdrawal_the_zone_refused() {
+    // The node refuses the transaction, say for fees the payer can't pay, and
+    // doesn't know it afterwards: nothing was withdrawn.
+    let handler = zone_handler(|| Ok(Value::Null));
+    let (zone_url, zone_calls) = spawn_rpc(Arc::new(move |method, params| match method {
+        "eth_sendRawTransactionSync" => {
+            Err((-32003, "insufficient funds for gas * price + value".into()))
+        }
+        "eth_getTransactionByHash" => Ok(Value::Null),
+        _ => handler(method, params),
+    }))
+    .await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    let challenge = challenge_with(json!({}), None);
+    for _ in 0..2 {
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("insufficient funds"), "{error}");
+        assert!(
+            !matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+            "{error}"
+        );
+    }
+    let calls = zone_calls.lock().unwrap();
+    let sends = calls
+        .iter()
+        .filter(|call| *call == "eth_sendRawTransactionSync")
+        .count();
+    assert_eq!(sends, 2);
+    assert!(!calls.iter().any(|call| call == "eth_getTransactionReceipt"));
+}
+
+#[tokio::test]
+async fn test_withdrawal_known_to_the_zone_after_a_send_error_is_outcome_unknown() {
+    // The node answered with an error but knows the transaction, or timed out
+    // waiting for its receipt: it may run.
+    for (code, known) in [(-32003, json!({ "hash": "0x22" })), (4, Value::Null)] {
+        let handler = zone_handler(|| Ok(Value::Null));
+        let (zone_url, _) = spawn_rpc(Arc::new(move |method, params| match method {
+            "eth_sendRawTransactionSync" => Err((code, "rejected".into())),
+            "eth_getTransactionByHash" => Ok(known.clone()),
+            "eth_getTransactionReceipt" => Ok(Value::Null),
+            _ => handler(method, params),
+        }))
+        .await;
+        let mut zone = TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap();
+        zone.receipt_recovery_timeout = Duration::ZERO;
+        let (provider, _) = provider_with_zone(zone).await;
+        let error = provider
+            .pay(&challenge_with(json!({}), None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+            "{code}: {error}"
+        );
+    }
+}
+
+/// A WithdrawalProcessed log the portal of Zone 3 emits for sender_tag.
+fn settlement_log(sender_tag: B256, callback_success: bool, transaction_hash: B256) -> Value {
+    let data = IZonePortal::WithdrawalProcessed {
+        to: MERCHANT,
+        senderTag: sender_tag,
+        token: CURRENCY,
+        amount: 1_000_000,
+        callbackSuccess: callback_success,
+    }
+    .encode_log_data();
+    json!({
+        "address": format!("{:#x}", zone::portal_address(3)),
+        "topics": data.topics().iter().map(|topic| format!("{topic:#x}")).collect::<Vec<_>>(),
+        "data": format!("{}", data.data),
+        "blockHash": format!("{:#x}", B256::repeat_byte(0x44)),
+        "blockNumber": "0x10",
+        "transactionHash": format!("{transaction_hash:#x}"),
+        "transactionIndex": "0x0",
+        "logIndex": "0x0",
+        "removed": false,
+    })
+}
+
+#[tokio::test]
+async fn test_bounced_withdrawal_fails_without_a_credential_and_may_be_paid_again() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let sender_tag = zone::sender_tag(payer().address(), B256::repeat_byte(0x22), 7);
+    let logs = Arc::new(Mutex::new(json!([settlement_log(
+        sender_tag,
+        false,
+        B256::repeat_byte(0x33)
+    )])));
+    let (tempo_url, _) = tempo_rpc(logs.clone()).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(error.to_string().contains("bounced"), "{error}");
+    assert!(
+        !matches!(
+            error,
+            MppError::ZoneSettlementPending { .. } | MppError::PaymentOutcomeUnknown { .. }
+        ),
+        "{error}"
+    );
+
+    // The amount came back to the payer, so a retry withdraws again.
+    *logs.lock().unwrap() = json!([settlement_log(sender_tag, true, B256::repeat_byte(0x55))]);
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(
+        credential.charge_payload().unwrap().data(),
+        format!("{:#x}", B256::repeat_byte(0x55))
+    );
+    assert_eq!(sent.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_resumed_settlement_wait_searches_from_where_the_first_one_started() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let block = Arc::new(std::sync::atomic::AtomicU64::new(10_000));
+    let from_blocks = Arc::new(Mutex::new(Vec::new()));
+    let (tempo_url, _) = {
+        let block = block.clone();
+        let from_blocks = from_blocks.clone();
+        spawn_rpc(Arc::new(move |method, params| match method {
+            "eth_chainId" => Ok(json!("0xa5bf")),
+            "eth_blockNumber" => Ok(json!(format!("{:#x}", block.load(Ordering::SeqCst)))),
+            "eth_getLogs" => {
+                from_blocks.lock().unwrap().push(
+                    params[0]["fromBlock"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                Ok(json!([]))
+            }
+            _ => Err((-32000, format!("l1: {method}"))),
+        }))
+        .await
+    };
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+
+    // Far more than the lookback window later, the retry still searches
+    // every block since the first wait.
+    block.store(20_000, Ordering::SeqCst);
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        *from_blocks.lock().unwrap(),
+        [
+            format!("{:#x}", 10_000 - LOOKBACK_BLOCKS),
+            format!("{:#x}", 10_000 - LOOKBACK_BLOCKS)
+        ]
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
 }

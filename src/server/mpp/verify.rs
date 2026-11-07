@@ -489,7 +489,19 @@ where
                     .filter(|zones| !zones.is_null())
                     .cloned()
             };
-            if zones(request) != zones(expected) {
+            // An expected request that leaves Zones unset takes this handler's,
+            // as the challenges it issues from caller-built requests do; an
+            // explicit `"zones": null` expects none.
+            let sets_zones = expected
+                .method_details
+                .as_ref()
+                .is_some_and(|details| details.get("zones").is_some());
+            let expected_zones = if sets_zones {
+                zones(expected)
+            } else {
+                self.config.zones.clone()
+            };
+            if zones(request) != expected_zones {
                 return Err(VerificationError::with_code(
                     "Zone mismatch: credential was issued for different Zones",
                     crate::protocol::traits::ErrorCode::InvalidChallenge,

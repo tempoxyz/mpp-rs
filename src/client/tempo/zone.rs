@@ -42,6 +42,10 @@ const SUBMISSION_MARGIN: Duration = Duration::from_secs(15);
 /// response fails.
 const RECEIPT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The error code `eth_sendRawTransactionSync` answers with when the node
+/// admitted the transaction but no receipt arrived in time (EIP-7966).
+const SYNC_SEND_TIMEOUT_CODE: i64 = 4;
+
 /// A Zone to pay Tempo charges from, set with
 /// [`TempoProvider::with_zone`](super::TempoProvider::with_zone).
 ///
@@ -56,6 +60,9 @@ pub struct TempoZone {
     zone_id: Option<u32>,
     parent_chain_id: Option<u64>,
     settlement_timeout: Duration,
+    /// The token the withdrawal pays its Zone gas in; the charge currency
+    /// when unset.
+    fee_token: Option<Address>,
     /// How long to look for a withdrawal's receipt after its send fails.
     receipt_recovery_timeout: Duration,
     /// Withdrawals by Challenge, so a retry resumes waiting instead of paying
@@ -79,7 +86,14 @@ impl std::fmt::Debug for TempoZone {
 }
 
 /// A withdrawal request shared by every payment of one Challenge.
-type PendingWithdrawal = OnceCell<Result<B256, WithdrawalFailure>>;
+#[derive(Default)]
+struct PendingWithdrawal {
+    request: OnceCell<Result<B256, WithdrawalFailure>>,
+    /// The first Tempo block the first wait for its settlement searched: a
+    /// resumed wait searches from there again, so a settlement older than
+    /// the lookback window is still found.
+    settlement_cursor: Mutex<Option<u64>>,
+}
 
 /// Why a Zone withdrawal request failed, shared by every payment of its
 /// Challenge.
@@ -121,6 +135,7 @@ impl TempoZone {
             zone_id: zone::id_from_chain_id(chain_id),
             parent_chain_id: zone::parent_chain_id_from_chain_id(chain_id),
             settlement_timeout: zone::DEFAULT_SETTLEMENT_TIMEOUT,
+            fee_token: None,
             receipt_recovery_timeout: RECEIPT_RECOVERY_TIMEOUT,
             pending: Arc::default(),
             nonce_locks: Arc::default(),
@@ -164,6 +179,18 @@ impl TempoZone {
     /// seconds), as mppx's `zone.settlementTimeoutMs`.
     pub fn with_settlement_timeout(mut self, timeout: Duration) -> Self {
         self.settlement_timeout = timeout;
+        self
+    }
+
+    /// Pay the withdrawal's Zone gas in `fee_token` instead of the charge
+    /// currency.
+    ///
+    /// The payer's Zone balance must hold it. The provider's
+    /// [`with_fee_token`](super::TempoProvider::with_fee_token) names a token
+    /// on Tempo and does not apply here: by default a withdrawal pays its gas
+    /// in the currency it withdraws, which a payer of the charge holds.
+    pub fn with_fee_token(mut self, fee_token: Address) -> Self {
+        self.fee_token = Some(fee_token);
         self
     }
 
@@ -264,7 +291,6 @@ impl TempoZone {
         client_id: Option<&str>,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
-        fee_token: Option<Address>,
         tempo: &impl Provider<TempoNetwork>,
     ) -> Result<PaymentCredential, MppError> {
         let zone_id = self.zone_id.ok_or_else(|| {
@@ -298,6 +324,7 @@ impl TempoZone {
             tokio::spawn(async move {
                 let mut own_error = None;
                 let outcome = withdrawal
+                    .request
                     .get_or_init(|| async {
                         match zone
                             .request_withdrawal(
@@ -305,7 +332,6 @@ impl TempoZone {
                                 client_id.as_deref(),
                                 &signer,
                                 &signing_mode,
-                                fee_token,
                             )
                             .await
                         {
@@ -338,12 +364,13 @@ impl TempoZone {
         };
 
         let timeout = settlement_timeout(challenge, self.settlement_timeout);
-        let hash = wait_for_settlement(
+        let settlement = wait_for_settlement_from(
             tempo,
             zone::portal_address(zone_id),
             sender_tag,
             Some(recipient),
             timeout,
+            &withdrawal.settlement_cursor,
         )
         .await
         .map_err(|_| MppError::ZoneSettlementPending {
@@ -353,6 +380,16 @@ impl TempoZone {
             zone_id,
         })?;
         self.forget(&key, &withdrawal);
+        // A bounced payout returned the amount to the payer's Zone balance and
+        // paid nothing, so the server would reject its Credential: fail
+        // without one, and let a retry withdraw again.
+        if settlement.bounced {
+            return Err(MppError::Http(format!(
+                "Zone withdrawal {sender_tag:#x} bounced on Tempo in {:#x}: its amount was returned to the payer's Zone balance.",
+                settlement.hash
+            )));
+        }
+        let hash = settlement.hash;
 
         Ok(PaymentCredential::new(
             challenge.to_echo(),
@@ -368,7 +405,6 @@ impl TempoZone {
         client_id: Option<&str>,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
-        fee_token: Option<Address>,
     ) -> Result<B256, (WithdrawalFailure, MppError)> {
         let retryable = |error: MppError| (WithdrawalFailure::Retryable(error.to_string()), error);
         let request: ChargeRequest = challenge.request.decode().map_err(retryable)?;
@@ -418,6 +454,13 @@ impl TempoZone {
         // payment from this account reads the nonce after this one is spent.
         let nonce_lock = self.nonce_lock(from);
         let _nonce_guard = nonce_lock.lock().await;
+        // Another withdrawal may have held the lock past the time this one
+        // needs to settle: send nothing once the challenge would expire first.
+        if !settles_before_expiry(challenge, self.settlement_timeout) {
+            return Err(retryable(MppError::Http(
+                "Zone withdrawal can no longer settle before the challenge expires.".into(),
+            )));
+        }
         // Prepare and sign first: a failure there sent nothing, so the
         // challenge may be retried. The protocol nonce is the Zone's.
         let nonce = self
@@ -436,9 +479,9 @@ impl TempoZone {
                     signing_mode: Some(signing_mode.clone()),
                     nonce: Some(nonce),
                     nonce_key: Some(U256::ZERO),
-                    // The configured gas token, as for payments on Tempo; the
-                    // charge currency otherwise.
-                    fee_token,
+                    // The Zone's configured gas token; the charge currency
+                    // otherwise.
+                    fee_token: self.fee_token,
                     ..Default::default()
                 },
             )
@@ -465,17 +508,14 @@ impl TempoZone {
             .await
         {
             Ok(receipt) => receipt,
-            // Only invalid parameters prove the node never admitted it.
-            Err(error)
-                if error
-                    .as_error_resp()
-                    .is_some_and(|response| response.code == -32602) =>
-            {
-                return Err(retryable(MppError::Http(format!(
-                    "failed to send Zone withdrawal: {error}"
-                ))));
+            Err(error) => {
+                if self.refused(&error, hash).await {
+                    return Err(retryable(MppError::Http(format!(
+                        "failed to send Zone withdrawal: {error}"
+                    ))));
+                }
+                self.recover_receipt(hash).await.ok_or_else(unknown)?
             }
-            Err(_) => self.recover_receipt(hash).await.ok_or_else(unknown)?,
         };
         match receipt.get("status").and_then(serde_json::Value::as_str) {
             Some("0x1") => {}
@@ -500,6 +540,33 @@ impl TempoZone {
             transaction_hash,
             requested.fallbackNonce,
         ))
+    }
+
+    /// Whether the Zone refused the withdrawal `hash` whose send failed with
+    /// `error`, so it never ran.
+    ///
+    /// Invalid parameters prove it. Any other error the node answered with,
+    /// except the sync send's timeout, does when the node doesn't know the
+    /// transaction, such as one refused for fees its balance can't pay. A
+    /// transaction the node knew would show up, and a retry signs with the
+    /// same protocol nonce, so at most one of them can ever run.
+    async fn refused(&self, error: &alloy::transports::TransportError, hash: B256) -> bool {
+        let Some(response) = error.as_error_resp() else {
+            return false;
+        };
+        match response.code {
+            -32602 => true,
+            SYNC_SEND_TIMEOUT_CODE => false,
+            _ => matches!(
+                self.rpc_provider
+                    .raw_request::<_, Option<serde_json::Value>>(
+                        "eth_getTransactionByHash".into(),
+                        [hash],
+                    )
+                    .await,
+                Ok(None)
+            ),
+        }
     }
 
     /// The lock serializing `from`'s Zone withdrawals.
@@ -596,6 +663,30 @@ pub async fn wait_for_settlement(
     to: Option<Address>,
     timeout: Duration,
 ) -> Result<B256, MppError> {
+    let settlement =
+        wait_for_settlement_from(provider, portal, sender_tag, to, timeout, &Mutex::new(None))
+            .await?;
+    Ok(settlement.hash)
+}
+
+/// A `WithdrawalProcessed` event found on Tempo.
+struct Settlement {
+    /// The transaction that emitted it.
+    hash: B256,
+    /// Whether it reports the payout bounced (`callbackSuccess` false).
+    bounced: bool,
+}
+
+/// [`wait_for_settlement`], searching from `cursor`'s block when set instead
+/// of the lookback window, and leaving in it the first block it searched.
+async fn wait_for_settlement_from(
+    provider: &impl Provider<TempoNetwork>,
+    portal: Address,
+    sender_tag: B256,
+    to: Option<Address>,
+    timeout: Duration,
+    cursor: &Mutex<Option<u64>>,
+) -> Result<Settlement, MppError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let block_number = || async {
         provider
@@ -604,8 +695,13 @@ pub async fn wait_for_settlement(
             .map_err(|e| MppError::Http(format!("failed to fetch the Tempo block number: {e}")))
     };
     let mut latest = block_number().await?;
-    // Scan the lookback window once, then only blocks added since the previous poll.
-    let mut from_block = latest.saturating_sub(LOOKBACK_BLOCKS);
+    // Scan the lookback window once, then only blocks added since the previous
+    // poll. A resumed wait searches again from where the first one started,
+    // which also covers blocks a lagging log index missed.
+    let mut from_block = *cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(|| latest.saturating_sub(LOOKBACK_BLOCKS));
     loop {
         if from_block <= latest {
             let mut filter = Filter::new()
@@ -621,8 +717,15 @@ pub async fn wait_for_settlement(
                 .get_logs(&filter)
                 .await
                 .map_err(|e| MppError::Http(format!("failed to fetch Zone settlements: {e}")))?;
-            if let Some(hash) = logs.iter().find_map(|log| log.transaction_hash) {
-                return Ok(hash);
+            if let Some((log, hash)) = logs
+                .iter()
+                .find_map(|log| Some((log, log.transaction_hash?)))
+            {
+                // Only an event that reports a bounce counts as one: the
+                // server verifies the Credential's settlement either way.
+                let bounced = IZonePortal::WithdrawalProcessed::decode_log_data(log.data())
+                    .is_ok_and(|event| !event.callbackSuccess);
+                return Ok(Settlement { hash, bounced });
             }
             from_block = latest + 1;
         }

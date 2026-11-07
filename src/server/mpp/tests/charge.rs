@@ -632,8 +632,8 @@ async fn test_zones_bind_credentials_to_the_route() {
         .await
         .unwrap();
 
-    // A route that accepts other Zones, or none, does not take it.
-    for zones in [Some(serde_json::json!([4])), None] {
+    // A route that accepts other Zones, or explicitly none, does not take it.
+    for zones in [Some(serde_json::json!([4])), Some(serde_json::Value::Null)] {
         let mut other = expected.clone();
         let details = other
             .method_details
@@ -641,10 +641,9 @@ async fn test_zones_bind_credentials_to_the_route() {
             .unwrap()
             .as_object_mut()
             .unwrap();
-        match zones {
-            Some(zones) => details.insert("zones".into(), zones),
-            None => details.remove("zones"),
-        };
+        if let Some(zones) = zones {
+            details.insert("zones".into(), zones);
+        }
         let err = mpp
             .verify_credential_with_expected_request(&credential, &other)
             .await
@@ -652,4 +651,42 @@ async fn test_zones_bind_credentials_to_the_route() {
         assert_eq!(err.code, Some(ErrorCode::InvalidChallenge));
         assert!(err.message.contains("Zone mismatch"), "{}", err.message);
     }
+}
+
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_explicit_charge_challenge_verifies_against_its_own_request() {
+    use crate::protocol::methods::tempo::zone::Zones;
+
+    let mpp = success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([3]).unwrap()),
+    );
+    let route = mpp
+        .expected_charge_request("0.10", ChargeOptions::default())
+        .unwrap();
+    // A caller-built request without Zones, issued and verified as is: the
+    // handler's Zones apply to both sides.
+    let request = ChargeRequest {
+        amount: route.amount.clone(),
+        currency: route.currency.clone(),
+        recipient: route.recipient.clone(),
+        method_details: Some(serde_json::json!({ "chainId": CHAIN_ID })),
+        ..Default::default()
+    };
+    let challenge = mpp
+        .charge_challenge_with_options(&request, None, None)
+        .unwrap();
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        PaymentPayload::zone(
+            format!("0x{}", "ab".repeat(32)),
+            format!("0x{}", "a1".repeat(32)),
+            3,
+        ),
+    );
+    mpp.verify_credential_with_expected_request(&credential, &request)
+        .await
+        .unwrap();
 }

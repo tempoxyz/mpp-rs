@@ -488,7 +488,8 @@ impl TempoProvider {
     /// fee token, such as a key limited to OUSD paying a USDC.e charge. It
     /// takes precedence over the fee token autoswap or a machine-token route
     /// would choose. Fee-sponsored charges ignore it: the fee payer chooses
-    /// their fee token.
+    /// their fee token. Zone withdrawals take theirs from
+    /// [`TempoZone::with_fee_token`](super::zone::TempoZone::with_fee_token).
     pub fn with_fee_token(mut self, token: alloy::primitives::Address) -> Self {
         self.fee_token = Some(token);
         self
@@ -732,7 +733,6 @@ impl PaymentProvider for TempoProvider {
                         self.client_id.as_deref(),
                         &self.signer,
                         &self.signing_mode,
-                        self.fee_token,
                         &rpc_provider,
                     )
                     .await;
