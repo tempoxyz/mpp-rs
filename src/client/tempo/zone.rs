@@ -525,7 +525,7 @@ fn settles_before_expiry(challenge: &PaymentChallenge, timeout: Duration) -> boo
     if challenge.expires.is_none() {
         return true;
     }
-    // An unparseable expiry is not one the withdrawal can beat.
+    // An unparsable expiry is not one the withdrawal can beat.
     challenge.expires_at().is_some_and(|expires_at| {
         expires_at - time::OffsetDateTime::now_utc() > timeout + SUBMISSION_MARGIN
     })
