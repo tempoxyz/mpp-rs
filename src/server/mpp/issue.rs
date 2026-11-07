@@ -214,15 +214,22 @@ where
     ) -> Result<PaymentChallenge> {
         // Verification fails closed on a missing `chainId` when one is pinned,
         // so a caller-built request must carry it like `charge()` requests do.
+        // Configured Zones bind credentials to the route the same way, so
+        // they are advertised here as `charge()` advertises them.
         let mut request = request.clone();
-        if let Some(chain_id) = self.config.chain_id {
+        if self.config.chain_id.is_some() || self.config.zones.is_some() {
             let details = request
                 .method_details
                 .get_or_insert_with(|| serde_json::json!({}));
             if let Some(details) = details.as_object_mut() {
-                details
-                    .entry("chainId")
-                    .or_insert_with(|| serde_json::json!(chain_id));
+                if let Some(chain_id) = self.config.chain_id {
+                    details
+                        .entry("chainId")
+                        .or_insert_with(|| serde_json::json!(chain_id));
+                }
+                if let Some(zones) = &self.config.zones {
+                    details.entry("zones").or_insert_with(|| zones.clone());
+                }
             }
         }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(

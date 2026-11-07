@@ -405,8 +405,11 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
 
     // Give up on settlement at once, as a timeout would.
     let error = provider.pay(&challenge).await.unwrap_err();
-    match error {
+    // The error carries the challenge, so a caller that would otherwise
+    // re-send the request (and get a fresh challenge) can pay this one again.
+    let pending_challenge = match error {
         MppError::ZoneSettlementPending {
+            challenge: pending_challenge,
             challenge_id,
             sender_tag: pending_tag,
             zone_id,
@@ -414,9 +417,10 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
             assert_eq!(challenge_id, "zone-challenge");
             assert_eq!(pending_tag, format!("{sender_tag:#x}"));
             assert_eq!(zone_id, 3);
+            *pending_challenge
         }
         error => panic!("unexpected error: {error}"),
-    }
+    };
     assert!(tempo_calls
         .lock()
         .unwrap()
@@ -440,7 +444,7 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
         "logIndex": "0x0",
         "removed": false,
     }]);
-    let credential = provider.pay(&challenge).await.unwrap();
+    let credential = provider.pay(&pending_challenge).await.unwrap();
     let payload = credential.charge_payload().unwrap();
     assert!(payload.is_zone());
     assert_eq!(payload.data(), format!("{settlement:#x}"));
@@ -455,14 +459,39 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
 #[test]
 fn test_zone_settlement_pending_message() {
     let error = MppError::ZoneSettlementPending {
+        challenge: Box::new(challenge_with(json!({}), None)),
         challenge_id: "abc".into(),
         sender_tag: "0x01".into(),
         zone_id: 3,
     };
     assert_eq!(
         error.to_string(),
-        "Zone 3 withdrawal 0x01 for challenge \"abc\" has not settled on Tempo yet. Retry the challenge to resume waiting instead of paying again."
+        "Zone 3 withdrawal 0x01 for challenge \"abc\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again."
     );
+}
+
+#[tokio::test]
+async fn test_withdrawal_without_its_event_is_outcome_unknown() {
+    // The withdrawal succeeded, but its WithdrawalRequested event is missing.
+    let (zone_url, zone_calls) =
+        spawn_rpc(zone_handler(|| Ok(zone_receipt("0x1", json!([]))))).await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    let challenge = challenge_with(json!({}), None);
+    for _ in 0..2 {
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(
+            matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+            "{error}"
+        );
+    }
+    let sends = zone_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| *call == "eth_sendRawTransactionSync")
+        .count();
+    assert_eq!(sends, 1);
 }
 
 /// A Zone handler recording the raw transactions it is sent.

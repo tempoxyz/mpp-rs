@@ -87,8 +87,6 @@ type PendingWithdrawal = OnceCell<Result<B256, WithdrawalFailure>>;
 enum WithdrawalFailure {
     /// Nothing was withdrawn: the Challenge may be paid again.
     Retryable(String),
-    /// The withdrawal may have gone through: retries keep failing.
-    Final(String),
     /// The transaction may have been sent: reconcile its hash.
     OutcomeUnknown(String),
 }
@@ -96,7 +94,7 @@ enum WithdrawalFailure {
 impl WithdrawalFailure {
     fn to_error(&self) -> MppError {
         match self {
-            Self::Retryable(message) | Self::Final(message) => MppError::Http(message.clone()),
+            Self::Retryable(message) => MppError::Http(message.clone()),
             Self::OutcomeUnknown(transaction_hash) => MppError::PaymentOutcomeUnknown {
                 transaction_hash: transaction_hash.clone(),
             },
@@ -259,7 +257,7 @@ impl TempoZone {
     /// # Errors
     ///
     /// [`MppError::ZoneSettlementPending`] when the withdrawal did not settle
-    /// in time: paying the same challenge again resumes the wait.
+    /// in time: paying the challenge it carries again resumes the wait.
     pub(crate) async fn pay(
         &self,
         challenge: &PaymentChallenge,
@@ -349,6 +347,7 @@ impl TempoZone {
         )
         .await
         .map_err(|_| MppError::ZoneSettlementPending {
+            challenge: Box::new(challenge.clone()),
             challenge_id: challenge.id.clone(),
             sender_tag: format!("{sender_tag:#x}"),
             zone_id,
@@ -493,13 +492,9 @@ impl TempoZone {
             .and_then(serde_json::Value::as_str)
             .and_then(|hash| hash.parse::<B256>().ok())
             .unwrap_or(hash);
-        let requested = withdrawal_requested(&receipt).ok_or_else(|| {
-            let message = "Zone withdrawal request did not emit WithdrawalRequested.";
-            (
-                WithdrawalFailure::Final(message.into()),
-                MppError::Http(message.into()),
-            )
-        })?;
+        // The withdrawal succeeded but can't be found: its outcome is unknown,
+        // so no flow pays the challenge another way.
+        let requested = withdrawal_requested(&receipt).ok_or_else(unknown)?;
         Ok(zone::sender_tag(
             requested.sender,
             transaction_hash,

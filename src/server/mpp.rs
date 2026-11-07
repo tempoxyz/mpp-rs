@@ -455,6 +455,14 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             })?),
             None => None,
         };
+        // A relay verifies every credential itself, and one that does not
+        // know Zone credentials would reject them only after the payer's
+        // withdrawal settled to the recipient.
+        if zones.is_some() && builder.relay.is_some() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "zones(...) cannot be combined with relay(...): the relay does not verify Zone credentials".into(),
+            ));
+        }
         // Resolve accepted currencies (explicit list, legacy single currency,
         // or chain defaults) before moving fields out of the builder.
         let currencies = super::tempo::resolve_currencies(&builder)?;

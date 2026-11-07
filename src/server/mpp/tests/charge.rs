@@ -551,6 +551,62 @@ fn test_zones_rejects_invalid_config() {
 }
 
 #[cfg(feature = "tempo")]
+#[test]
+fn test_zones_reject_relay() {
+    use crate::protocol::methods::tempo::zone::Zones;
+
+    let relay = crate::server::TempoRelayConfig::new("test-api-key");
+    let error = Mpp::create(offers_builder().zones(Zones::Any).relay(relay))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, crate::error::MppError::InvalidConfig(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("relay"), "{error}");
+}
+
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_explicit_charge_challenges_advertise_zones() {
+    use crate::protocol::methods::tempo::zone::Zones;
+
+    let mpp = success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([3]).unwrap()),
+    );
+    let expected = mpp
+        .expected_charge_request("0.10", ChargeOptions::default())
+        .unwrap();
+    // Challenges built from explicit parameters bind the same Zones as
+    // `charge()`, so they verify against the route's expected request.
+    let challenge = mpp
+        .charge_challenge(
+            &expected.amount,
+            &expected.currency,
+            expected.recipient.as_deref().unwrap(),
+        )
+        .unwrap();
+    let request: ChargeRequest = challenge.request.decode().unwrap();
+    assert_eq!(
+        request.method_details.as_ref().unwrap()["zones"],
+        serde_json::json!([3])
+    );
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        PaymentPayload::zone(
+            format!("0x{}", "ab".repeat(32)),
+            format!("0x{}", "a1".repeat(32)),
+            3,
+        ),
+    );
+    mpp.verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "tempo")]
 #[tokio::test]
 async fn test_zones_bind_credentials_to_the_route() {
     use crate::protocol::methods::tempo::zone::Zones;

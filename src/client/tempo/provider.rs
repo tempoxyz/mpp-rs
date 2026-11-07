@@ -406,9 +406,9 @@ impl TempoProvider {
     /// The signer withdraws the amount from the Zone to the recipient with a
     /// challenge-bound memo, waits for the withdrawal to settle on Tempo and
     /// answers with a `zone` Credential. If the wait ends first, the payment
-    /// fails with [`MppError::ZoneSettlementPending`]: paying the same
-    /// challenge again with this provider resumes the wait without
-    /// withdrawing again.
+    /// fails with [`MppError::ZoneSettlementPending`]: paying the challenge
+    /// it carries again with this provider resumes the wait without
+    /// withdrawing again, while a fresh challenge would withdraw again.
     ///
     /// # Errors
     ///
