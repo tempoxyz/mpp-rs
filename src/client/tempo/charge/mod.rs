@@ -527,6 +527,19 @@ impl TempoCharge {
         self
     }
 
+    /// Turn the charge into a Zone withdrawal that pays it: `calls` on the
+    /// Zone chain `chain_id`, signed and paid for by the payer, without fee
+    /// sponsorship, and returned signed rather than broadcast.
+    pub(crate) fn into_zone_withdrawal(mut self, chain_id: u64, calls: Vec<Call>) -> Self {
+        self.chain_id = chain_id;
+        self.calls = Some(calls);
+        self.fee_payer = false;
+        self.machine_token_enabled = false;
+        self.splits = None;
+        self.push = false;
+        self
+    }
+
     /// Sign the charge with default options.
     ///
     /// This is the simple path — resolves the RPC provider from chain_id,

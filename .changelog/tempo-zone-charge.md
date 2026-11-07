@@ -1,0 +1,5 @@
+---
+mpp: minor
+---
+
+Added Zone payments to the Tempo charge method, as mppx does. A server accepts charges paid from Zones with `TempoBuilder::zones` (`Zones::ids([3, 7])` or `Zones::Any`), which advertises them in `methodDetails.zones` and binds them to the route. It verifies the new `zone` Credential (`PayloadType::Zone`, `PaymentPayload::zone`): the Zone portal's `WithdrawalProcessed` event for the sender tag in the settlement transaction, and the `processWithdrawals` calldata paying the amount and currency to the recipient with a challenge-bound memo, once per withdrawal. A client pays from a Zone balance with `TempoProvider::with_zone(TempoZone::new(zone_rpc_url, zone_chain_id)?)`: it withdraws to the recipient with a challenge-bound memo, waits for the withdrawal to settle on Tempo and sends a `zone` Credential. If the wait ends first, the payment fails with `MppError::ZoneSettlementPending`, and paying the same challenge again resumes it instead of withdrawing again. `TempoMethodDetails` gained a `zones` field and `PayloadType` a `Zone` variant, so exhaustive literals and matches need updating.

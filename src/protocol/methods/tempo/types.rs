@@ -57,6 +57,7 @@ pub struct Split {
 ///     chain_id: Some(42431),
 ///     fee_payer: Some(true),
 ///     splits: None,
+///     zones: None,
 /// };
 /// assert!(details.fee_payer());
 /// ```
@@ -87,6 +88,12 @@ pub struct TempoMethodDetails {
     /// Maximum 10 splits (11 total transfer calls including primary).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub splits: Option<Vec<Split>>,
+
+    /// Zones the payee accepts withdrawals from, as mppx's `zones`: any Zone
+    /// on the Challenge's chain, or a list of Zone IDs. A client with a
+    /// balance in an accepted Zone may pay with a `zone` Credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zones: Option<super::zone::Zones>,
 }
 
 impl TempoMethodDetails {
@@ -117,18 +124,24 @@ mod tests {
             chain_id: Some(42431),
             fee_payer: Some(true),
             splits: None,
+            zones: Some(super::super::zone::Zones::Ids(vec![3, 7])),
         };
 
         let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("\"chainId\":42431"));
         assert!(json.contains("\"feePayer\":true"));
         assert!(json.contains("\"machineTokenEnabled\":true"));
+        assert!(json.contains("\"zones\":[3,7]"));
 
         let parsed: TempoMethodDetails = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.chain_id, Some(42431));
         assert!(parsed.fee_payer());
         assert!(parsed.machine_token_enabled());
         assert!(parsed.is_tempo_moderato());
+        assert_eq!(
+            parsed.zones,
+            Some(super::super::zone::Zones::Ids(vec![3, 7]))
+        );
     }
 
     #[test]

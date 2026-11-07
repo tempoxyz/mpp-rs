@@ -198,6 +198,23 @@ pub enum MppError {
         transaction_hash: String,
     },
 
+    /// A Zone withdrawal paying a challenge did not settle on Tempo before the
+    /// client stopped waiting, as mppx's `ZoneSettlementPendingError`. The
+    /// withdrawal cannot be undone and may still settle.
+    ///
+    /// Retry the same challenge with the same provider to resume waiting
+    /// without withdrawing again, or find the settlement with `sender_tag` on
+    /// the Zone's portal.
+    #[error("Zone {zone_id} withdrawal {sender_tag} for challenge \"{challenge_id}\" has not settled on Tempo yet. Retry the challenge to resume waiting instead of paying again.")]
+    ZoneSettlementPending {
+        /// ID of the challenge the withdrawal pays.
+        challenge_id: String,
+        /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed` event carries it.
+        sender_tag: String,
+        /// ID of the Zone the withdrawal left.
+        zone_id: u32,
+    },
+
     /// A session operation may have been applied; reconcile it before paying again.
     #[error("session payment outcome unknown: {context}; reconcile before retrying")]
     SessionPaymentOutcomeUnknown {

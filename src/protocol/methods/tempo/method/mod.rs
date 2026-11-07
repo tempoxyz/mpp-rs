@@ -55,6 +55,7 @@ mod proof_credential;
 mod receipt_logs;
 mod simulate;
 mod transaction_credential;
+mod zone_credential;
 
 pub use fee_payer::{FeePayerPolicy, FeePayerPolicyOverride};
 pub use hosted_fee_payer::RemoteFeePayer;
@@ -64,7 +65,8 @@ use transaction_credential::ensure_transaction_credential_source;
 
 /// Reject a credential whose submission mode the challenge does not allow.
 ///
-/// `type="hash"` is `push` mode and `type="transaction"` is `pull` mode.
+/// `type="hash"` and `type="zone"` are `push` mode and `type="transaction"` is
+/// `pull` mode.
 /// `methodDetails.supportedModes`, when present, lists the allowed modes.
 /// Proof credentials are exempt: zero-amount charges have no submission mode.
 fn ensure_submission_mode_allowed(
@@ -73,6 +75,8 @@ fn ensure_submission_mode_allowed(
 ) -> Result<(), VerificationError> {
     let (mode, kind) = if payload.is_hash() {
         ("push", "Hash")
+    } else if payload.is_zone() {
+        ("push", "Zone")
     } else if payload.is_transaction() {
         ("pull", "Transaction")
     } else {
@@ -118,6 +122,8 @@ fn ensure_submission_mode_allowed(
 ///
 /// - `hash`: Client already broadcast the transaction, provides tx hash
 /// - `transaction`: Client provides signed transaction for server to broadcast
+/// - `zone`: A Zone withdrawal settled on Tempo paid the recipient; the client
+///   provides the settlement transaction hash and the withdrawal's sender tag
 ///
 /// # Example
 ///
@@ -241,8 +247,9 @@ where
     /// Configure a store for replay deduplication.
     ///
     /// When set, each verified transaction hash is recorded and subsequent
-    /// attempts to replay the same hash are rejected. Zero-amount proof
-    /// challenges are likewise made single-use per challenge id.
+    /// attempts to replay the same hash are rejected. Zone withdrawals are
+    /// likewise made single-use per portal and sender tag, and zero-amount
+    /// proof challenges per challenge id.
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
@@ -363,6 +370,11 @@ where
                 )
                 .await?;
             payer = hash_payer;
+            serde_json::json!({ "mode": "push" })
+        } else if payload.is_zone() {
+            self.verify_zone(&payload, request, &credential.challenge, false)
+                .await?;
+            payer = None;
             serde_json::json!({ "mode": "push" })
         } else if payload.is_proof() {
             if !is_zero_amount {
@@ -584,6 +596,9 @@ where
                 )
                 .await
                 .map(|(receipt, _)| receipt)
+            } else if charge_payload.is_zone() {
+                this.verify_zone(&charge_payload, &request, &credential.challenge, true)
+                    .await
             } else if charge_payload.is_proof() {
                 if !is_zero_amount {
                     return Err(VerificationError::new(

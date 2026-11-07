@@ -166,6 +166,9 @@ where
                 validate_charge_modes(supported_modes)?;
                 details.insert("supportedModes".into(), serde_json::json!(supported_modes));
             }
+            if let Some(zones) = &self.config.zones {
+                details.insert("zones".into(), zones.clone());
+            }
             if !details.is_empty() {
                 request.method_details = Some(serde_json::Value::Object(details));
             }

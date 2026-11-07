@@ -236,7 +236,8 @@ where
                 }
                 Err(
                     error @ (MppError::PaymentOutcomeUnknown { .. }
-                    | MppError::SessionPaymentOutcomeUnknown { .. }),
+                    | MppError::SessionPaymentOutcomeUnknown { .. }
+                    | MppError::ZoneSettlementPending { .. }),
                 ) => return Err(error),
                 Err(error) => {
                     failure.get_or_insert(error);

@@ -237,6 +237,7 @@ pub struct TempoProvider {
     /// No RPC was configured: pay on the challenge's chain via its default RPC.
     follow_challenge_chain: bool,
     allowed_chain_ids: Option<Vec<u64>>,
+    zone: Option<super::zone::TempoZone>,
     chain_providers: Arc<
         std::sync::Mutex<
             std::collections::HashMap<
@@ -289,6 +290,7 @@ impl TempoProvider {
             max_atomic_amount: None,
             follow_challenge_chain: false,
             allowed_chain_ids: None,
+            zone: None,
             chain_providers: Arc::default(),
         })
     }
@@ -392,6 +394,35 @@ impl TempoProvider {
         let provider = super::rpc_provider(url, self.http_client.as_ref());
         providers.insert(chain_id, provider.clone());
         Ok((chain_id, provider))
+    }
+
+    /// Pay from a Zone balance instead of the account's Tempo balance when a
+    /// challenge accepts this Zone (`methodDetails.zones`), as mppx's `zone`
+    /// option on the `tempo.charge` client. Other challenges, zero-amount and
+    /// split payments, and challenges that do not allow `push` are paid on
+    /// Tempo as usual, and so are challenges that expire before the
+    /// withdrawal could settle.
+    ///
+    /// The signer withdraws the amount from the Zone to the recipient with a
+    /// challenge-bound memo, waits for the withdrawal to settle on Tempo and
+    /// answers with a `zone` Credential. If the wait ends first, the payment
+    /// fails with [`MppError::ZoneSettlementPending`]: paying the same
+    /// challenge again with this provider resumes the wait without
+    /// withdrawing again.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a Zone whose ID is unknown: set it with
+    /// [`TempoZone::with_zone_id`](super::zone::TempoZone::with_zone_id).
+    pub fn with_zone(mut self, zone: super::zone::TempoZone) -> Result<Self, MppError> {
+        if zone.zone_id().is_none() {
+            return Err(MppError::InvalidConfig(format!(
+                "cannot derive a Zone ID from chain ID {}: use TempoZone::with_zone_id",
+                zone.chain_id()
+            )));
+        }
+        self.zone = Some(zone);
+        Ok(self)
     }
 
     /// Set an optional client identifier for attribution memos.
@@ -692,6 +723,20 @@ impl PaymentProvider for TempoProvider {
         }
         let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
         self.ensure_allowed_chain(Some(chain_id))?;
+        if let Some(zone) = &self.zone {
+            let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
+            if zone.pays(challenge, &request, chain_id)? {
+                return zone
+                    .pay(
+                        challenge,
+                        self.client_id.as_deref(),
+                        &self.signer,
+                        &self.signing_mode,
+                        &rpc_provider,
+                    )
+                    .await;
+            }
+        }
         let funded = prepare_funded_charge(
             challenge,
             Some(chain_id),

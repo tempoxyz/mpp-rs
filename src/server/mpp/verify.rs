@@ -477,6 +477,24 @@ where
                     crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ));
             }
+
+            // The Zones a challenge accepts decide which Zone withdrawals pay
+            // it, so they bind the credential to the route like mppx's
+            // `chargeBinding`.
+            let zones = |request: &ChargeRequest| {
+                request
+                    .method_details
+                    .as_ref()
+                    .and_then(|details| details.get("zones"))
+                    .filter(|zones| !zones.is_null())
+                    .cloned()
+            };
+            if zones(request) != zones(expected) {
+                return Err(VerificationError::with_code(
+                    "Zone mismatch: credential was issued for different Zones",
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
+                ));
+            }
         }
 
         self.method.validate_expected_request(request, expected)

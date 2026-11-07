@@ -13,9 +13,11 @@ use super::types::PayloadType;
 /// - `type="transaction"` uses field `signature` containing the signed transaction
 /// - `type="proof"` uses field `signature` containing the signed typed proof
 /// - `type="hash"` uses field `hash` containing the transaction hash
+/// - `type="zone"` uses fields `hash` (the Tempo transaction that settled a
+///   Zone withdrawal), `senderTag` and `zoneId`
 #[derive(Debug, Clone)]
 pub struct PaymentPayload {
-    /// Payload type: "transaction", "proof", or "hash"
+    /// Payload type: "transaction", "proof", "hash", or "zone"
     pub payload_type: PayloadType,
 
     /// Hex-encoded signed data.
@@ -23,7 +25,11 @@ pub struct PaymentPayload {
     /// For `type="transaction"`: the RLP-encoded signed transaction to broadcast.
     /// For `type="proof"`: the EIP-712 signature for the challenge proof.
     /// For `type="hash"`: the transaction hash (0x-prefixed) of an already-broadcast tx.
+    /// For `type="zone"`: the hash of the Tempo transaction that settled the withdrawal.
     data: String,
+
+    /// For `type="zone"`: the withdrawal's sender tag and Zone ID.
+    zone: Option<(String, u32)>,
 }
 
 impl serde::Serialize for PaymentPayload {
@@ -33,14 +39,32 @@ impl serde::Serialize for PaymentPayload {
     {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("PaymentPayload", 2)?;
-        state.serialize_field("type", &self.payload_type)?;
+        let fields = if self.payload_type == PayloadType::Zone {
+            4
+        } else {
+            2
+        };
+        let mut state = serializer.serialize_struct("PaymentPayload", fields)?;
 
         match self.payload_type {
             PayloadType::Transaction | PayloadType::Proof => {
+                state.serialize_field("type", &self.payload_type)?;
                 state.serialize_field("signature", &self.data)?
             }
-            PayloadType::Hash => state.serialize_field("hash", &self.data)?,
+            PayloadType::Hash => {
+                state.serialize_field("type", &self.payload_type)?;
+                state.serialize_field("hash", &self.data)?
+            }
+            PayloadType::Zone => {
+                let (sender_tag, zone_id) = self
+                    .zone
+                    .as_ref()
+                    .ok_or_else(|| serde::ser::Error::custom("zone payload without zone"))?;
+                state.serialize_field("hash", &self.data)?;
+                state.serialize_field("senderTag", sender_tag)?;
+                state.serialize_field("type", &self.payload_type)?;
+                state.serialize_field("zoneId", zone_id)?;
+            }
         }
 
         state.end()
@@ -58,9 +82,30 @@ impl<'de> serde::Deserialize<'de> for PaymentPayload {
             payload_type: PayloadType,
             signature: Option<String>,
             hash: Option<String>,
+            #[serde(rename = "senderTag")]
+            sender_tag: Option<String>,
+            #[serde(rename = "zoneId")]
+            zone_id: Option<u64>,
         }
 
         let raw = RawPayload::deserialize(deserializer)?;
+
+        if raw.payload_type == PayloadType::Zone {
+            let hash = raw
+                .hash
+                .ok_or_else(|| serde::de::Error::custom("zone payload requires 'hash' field"))?;
+            let sender_tag = raw.sender_tag.ok_or_else(|| {
+                serde::de::Error::custom("zone payload requires 'senderTag' field")
+            })?;
+            let zone_id = raw
+                .zone_id
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| {
+                    serde::de::Error::custom("zone payload requires a valid 'zoneId'")
+                })?;
+            return Ok(PaymentPayload::zone(hash, sender_tag, zone_id));
+        }
 
         let data = match raw.payload_type {
             PayloadType::Transaction | PayloadType::Proof => raw.signature.ok_or_else(|| {
@@ -72,11 +117,13 @@ impl<'de> serde::Deserialize<'de> for PaymentPayload {
             PayloadType::Hash => raw
                 .hash
                 .ok_or_else(|| serde::de::Error::custom("hash payload requires 'hash' field"))?,
+            PayloadType::Zone => unreachable!("zone payloads return above"),
         };
 
         Ok(PaymentPayload {
             payload_type: raw.payload_type,
             data,
+            zone: None,
         })
     }
 }
@@ -87,6 +134,7 @@ impl PaymentPayload {
         Self {
             payload_type: PayloadType::Transaction,
             data: signature.into(),
+            zone: None,
         }
     }
 
@@ -95,6 +143,7 @@ impl PaymentPayload {
         Self {
             payload_type: PayloadType::Hash,
             data: tx_hash.into(),
+            zone: None,
         }
     }
 
@@ -103,6 +152,17 @@ impl PaymentPayload {
         Self {
             payload_type: PayloadType::Proof,
             data: signature.into(),
+            zone: None,
+        }
+    }
+
+    /// Create a new Zone payload: `hash` is the Tempo transaction that settled
+    /// the Zone withdrawal identified by `sender_tag` and `zone_id`.
+    pub fn zone(hash: impl Into<String>, sender_tag: impl Into<String>, zone_id: u32) -> Self {
+        Self {
+            payload_type: PayloadType::Zone,
+            data: hash.into(),
+            zone: Some((sender_tag.into(), zone_id)),
         }
     }
 
@@ -116,6 +176,7 @@ impl PaymentPayload {
     /// For transaction payloads, this is the signed transaction bytes.
     /// For proof payloads, this is the proof signature.
     /// For hash payloads, this is the transaction hash.
+    /// For Zone payloads, this is the settlement transaction hash.
     ///
     /// Prefer using `tx_hash()`, `signed_tx()`, or `proof_signature()` for type-safe access.
     pub fn data(&self) -> &str {
@@ -168,6 +229,23 @@ impl PaymentPayload {
     /// Check if this is a proof payload.
     pub fn is_proof(&self) -> bool {
         self.payload_type == PayloadType::Proof
+    }
+
+    /// Check if this is a Zone payload.
+    pub fn is_zone(&self) -> bool {
+        self.payload_type == PayloadType::Zone
+    }
+
+    /// Get the withdrawal's sender tag (for Zone payloads).
+    pub fn zone_sender_tag(&self) -> Option<&str> {
+        self.zone
+            .as_ref()
+            .map(|(sender_tag, _)| sender_tag.as_str())
+    }
+
+    /// Get the Zone ID (for Zone payloads).
+    pub fn zone_id(&self) -> Option<u32> {
+        self.zone.as_ref().map(|(_, zone_id)| *zone_id)
     }
 
     /// Get the transaction reference (hash or signature data).
@@ -317,6 +395,42 @@ mod tests {
         assert!(json.contains("\"signature\":\"0x123\""));
         assert!(json.contains("\"type\":\"proof\""));
         assert!(!json.contains("\"hash\""));
+    }
+
+    #[test]
+    fn test_zone_payload_round_trip() {
+        let zone = PaymentPayload::zone("0xabc", "0xdef", 3);
+        assert_eq!(zone.payload_type(), PayloadType::Zone);
+        assert!(zone.is_zone());
+        assert!(!zone.is_hash());
+        assert_eq!(zone.tx_hash(), None);
+        assert_eq!(zone.data(), "0xabc");
+        assert_eq!(zone.zone_sender_tag(), Some("0xdef"));
+        assert_eq!(zone.zone_id(), Some(3));
+
+        let json = serde_json::to_value(&zone).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "zone", "hash": "0xabc", "senderTag": "0xdef", "zoneId": 3 })
+        );
+        let parsed: PaymentPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.zone_id(), Some(3));
+        assert_eq!(parsed.zone_sender_tag(), Some("0xdef"));
+        assert_eq!(parsed.data(), "0xabc");
+
+        for invalid in [
+            serde_json::json!({ "type": "zone", "senderTag": "0xdef", "zoneId": 3 }),
+            serde_json::json!({ "type": "zone", "hash": "0xabc", "zoneId": 3 }),
+            serde_json::json!({ "type": "zone", "hash": "0xabc", "senderTag": "0xdef" }),
+            serde_json::json!({ "type": "zone", "hash": "0xabc", "senderTag": "0xdef", "zoneId": 0 }),
+            serde_json::json!({ "type": "zone", "hash": "0xabc", "senderTag": "0xdef", "zoneId": 4_294_967_296u64 }),
+        ] {
+            assert!(
+                serde_json::from_value::<PaymentPayload>(invalid.clone()).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(PaymentPayload::hash("0x01").zone_id().is_none());
     }
 
     #[test]

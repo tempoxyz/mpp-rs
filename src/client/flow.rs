@@ -580,12 +580,12 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 pending.rollback().await.map_err(HttpError::Payment)?;
             }
 
-            // A hash credential's transfer is already on chain: paying a new
-            // challenge for the same request would pay twice, so its answer is
-            // final.
+            // A hash or Zone credential's payment is already on chain: paying
+            // a new challenge for the same request would pay twice, so its
+            // answer is final.
             if credential
                 .charge_payload()
-                .is_ok_and(|payload| payload.is_hash())
+                .is_ok_and(|payload| payload.is_hash() || payload.is_zone())
             {
                 return Ok(resp);
             }
