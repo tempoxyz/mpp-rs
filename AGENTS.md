@@ -10,8 +10,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # lint
 RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo doc --no-deps --all-features   # docs build without warnings
 sg scan -c sgconfig.yml src/ && sg test -c sgconfig.yml         # ast-grep rules (ast-grep 0.45)
 typos                                                           # spelling (_typos.toml)
-cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws   # unit and offline integration tests
-cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,integration-stripe,integration-ws   # doc tests
+cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,integration-stripe,integration-ws   # unit and offline integration tests
+cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,integration-stripe,integration-ws   # doc tests
 cargo check --workspace --exclude mpp                           # examples and alloy-transport-mpp
 cargo hack check --feature-powerset --depth 2 --no-dev-deps --skip integration,integration-stripe,integration-ws --exclude-features reqwest-default-tls,reqwest-native-tls,reqwest-rustls-tls,reqwest-rustls-tls-no-provider   # feature combinations
 cargo deny check                                                # licenses and advisories (deny.toml)

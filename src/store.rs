@@ -76,6 +76,11 @@ pub trait Store: Send + Sync {
     }
 }
 
+#[cfg(feature = "sql-store")]
+mod sql;
+#[cfg(feature = "sql-store")]
+pub use sql::{SqlDialect, SqlDriver, SqlParam, SqlStore};
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("Store error: {0}")]
