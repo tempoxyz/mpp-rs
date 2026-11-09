@@ -148,7 +148,7 @@ alloy = { version = "2.1.0", default-features = false, features = [
 tempo-alloy = { workspace = true, optional = true }
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 fs2 = { version = "0.4", optional = true }
-rusqlite = { version = "0.38", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 
 # SQL store dependencies (optional)
 tokio-postgres = { version = "0.7", optional = true }
