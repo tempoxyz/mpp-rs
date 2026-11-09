@@ -165,20 +165,24 @@ where
     /// The provider must be configured for `TempoNetwork`. Use
     /// [`tempo_provider`](crate::server::tempo_provider) to create one.
     ///
-    /// Replay protection is on by default: the method gets an in-memory
+    /// Hash replay protection is on by default: the method gets an in-memory
     /// [`MemoryStore`](crate::store::MemoryStore), as
-    /// [`Mpp::create`](crate::server::Mpp::create) does, so a hash or proof
+    /// [`Mpp::create`](crate::server::Mpp::create) does, so a hash
     /// credential is accepted once. That store is shared only by clones of this
     /// method instance: a deployment with several instances or processes must
     /// pass a shared store with [`with_store`](Self::with_store).
+    ///
+    /// Zero-amount proof credentials get a replay store only from
+    /// [`with_store`](Self::with_store): a direct proof reservation never
+    /// expires and its key is the client's Challenge ID, so a default store
+    /// would grow with every proof.
     pub fn new(provider: P) -> Self {
-        let store: Arc<dyn Store> = Arc::new(crate::store::MemoryStore::new());
         Self {
             provider: Arc::new(provider),
             fee_payer_signer: None,
-            store: Some(Arc::clone(&store)),
+            store: Some(Arc::new(crate::store::MemoryStore::new())),
             authenticated_expiry: false,
-            proof_store: Some(store),
+            proof_store: None,
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,

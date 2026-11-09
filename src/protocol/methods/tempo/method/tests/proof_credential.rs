@@ -673,10 +673,11 @@ async fn test_store_claims_proofs() {
     assert!(method.verify(&credential, &request).await.is_err());
 }
 
-/// \`ChargeMethod::new\` makes a proof credential single-use without
-/// \`with_store\`.
+/// `ChargeMethod::new` keeps no proof replay store: proofs become single-use
+/// only through `with_store`, so direct verification stores nothing per
+/// Challenge ID by default.
 #[tokio::test]
-async fn test_new_rejects_replayed_proof_by_default() {
+async fn test_new_keeps_no_proof_store_by_default() {
     let signer = alloy::signers::local::PrivateKeySigner::random();
     let request = test_charge_request_with_amount("0");
     let challenge = test_proof_challenge(&request);
@@ -700,16 +701,16 @@ async fn test_new_rejects_replayed_proof_by_default() {
             .connect_http("http://127.0.0.1:1".parse().unwrap());
     let method = ChargeMethod::new(provider);
     method.cached_chain_id.set(42431).unwrap();
+    assert!(method.proof_store.is_none());
+    method.verify(&credential, &request).await.unwrap();
+    method.verify(&credential, &request).await.unwrap();
 
+    // with_store makes the proof single-use.
+    let method = method.with_store(std::sync::Arc::new(crate::store::MemoryStore::new()));
     method.verify(&credential, &request).await.unwrap();
     let err = method.verify(&credential, &request).await.unwrap_err();
     assert_eq!(
         err.code,
         Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
     );
-
-    // Without a store, the same credential is accepted again.
-    let method = method.without_store();
-    method.verify(&credential, &request).await.unwrap();
-    method.verify(&credential, &request).await.unwrap();
 }

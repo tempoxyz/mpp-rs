@@ -432,7 +432,7 @@ async fn test_store_dedup_different_hashes_independent() {
     assert!(seen.is_some(), "original hash should still be recorded");
 }
 
-/// \`ChargeMethod::new\` protects against replays without \`with_store\`: the
+/// `ChargeMethod::new` protects against replays without `with_store`: the
 /// same transaction hash is accepted once.
 #[tokio::test]
 async fn test_new_rejects_replayed_hash_by_default() {
