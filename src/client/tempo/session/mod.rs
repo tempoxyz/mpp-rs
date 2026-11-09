@@ -1692,14 +1692,8 @@ impl TempoSessionProvider {
                 .is_ok_and(|channel_id| channel_id == entry.channel_id),
             _ => false,
         };
-        if snapshot.is_some()
-            && !stores_snapshot_channel
-            && !self.origin_configured
-            && self.origin.lock().unwrap().is_some()
-        {
-            return Err(MppError::InvalidConfig(
-                "session snapshot recovery requires an explicitly configured origin".into(),
-            ));
+        if snapshot.is_some() {
+            self.check_snapshot_origin(stores_snapshot_channel)?;
         }
         if let Some(snapshot) = snapshot {
             if let Some((merchant, target)) = settlement {
@@ -1809,6 +1803,15 @@ impl TempoSessionProvider {
         Self::channel_entry(recovered).map(|entry| Some((entry, pending.is_some())))
     }
 
+    fn check_snapshot_origin(&self, known_channel: bool) -> Result<(), MppError> {
+        if !known_channel && !self.origin_configured && self.origin.lock().unwrap().is_some() {
+            return Err(MppError::InvalidConfig(
+                "session snapshot recovery requires an explicitly configured origin".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Rehydrate a reusable native session through the server's authenticated
     /// `HEAD` bootstrap flow.
     ///
@@ -1817,6 +1820,8 @@ impl TempoSessionProvider {
     /// root/access-key identity used for the session. The authorized response
     /// carries `Payment-Session-Snapshot`; this provider reconciles it with
     /// TIP-1034 on-chain state, persists it, and activates it in memory.
+    /// Importing an unknown channel requires an explicitly configured origin;
+    /// an already stored channel in the current origin can be recovered without one.
     pub async fn bootstrap(
         &self,
         client: &reqwest::Client,
@@ -2114,12 +2119,17 @@ impl TempoSessionProvider {
         {
             return Ok(None);
         }
-        if let Some(stored) = self
+        let stored = self
             .channel_store
             .get(&recovered.key())
             .await
-            .map_err(Self::store_error)?
-        {
+            .map_err(Self::store_error)?;
+        self.check_snapshot_origin(
+            stored
+                .as_ref()
+                .is_some_and(|entry| entry.channel_id == recovered.channel_id),
+        )?;
+        if let Some(stored) = stored {
             if stored.pending_open.is_some() && stored.channel_id != recovered.channel_id {
                 return Err(MppError::InvalidConfig(
                     "snapshot does not match pending channel".into(),
@@ -5954,7 +5964,7 @@ mod tests {
                 cumulative_amount: "1000".into(),
                 signature: alloy::hex::encode_prefixed(signature),
             }),
-            required_cumulative: "1000".into(),
+            required_cumulative: "9000".into(),
             settled: "0".into(),
             spent: "600".into(),
             units: None,
@@ -5975,7 +5985,26 @@ mod tests {
             .bootstrap(&reqwest::Client::new(), &url)
             .await
             .unwrap()
+            .is_none());
+        assert!(provider.channels().is_empty());
+        provider = provider.with_origin(&url.parse().unwrap()).unwrap();
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
             .is_some());
+
+        assert_eq!(provider.cumulative(), 1_000);
+        // Once persisted in this origin, the same channel no longer needs a pin.
+        provider.origin_configured = false;
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(provider.cumulative(), 1_000);
 
         let mut receipt = Receipt::success("tempo", channel_id.to_string());
         receipt
