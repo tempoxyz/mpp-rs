@@ -670,6 +670,37 @@ async fn test_zones_bind_credentials_to_the_route() {
         .await
         .unwrap();
 
+    // A route listing the same Zones in another order, or with repeats, takes it.
+    let reordered_mpp = success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([5, 3]).unwrap()),
+    );
+    let challenges = reordered_mpp.charge("0.10").unwrap();
+    let reordered = PaymentCredential::new(
+        challenges[0].to_echo(),
+        PaymentPayload::zone(
+            format!("0x{}", "ab".repeat(32)),
+            format!("0x{}", "a1".repeat(32)),
+            3,
+        ),
+    );
+    for zones in [serde_json::json!([3, 5]), serde_json::json!([5, 3, 5])] {
+        let mut same = reordered_mpp
+            .expected_charge_request("0.10", ChargeOptions::default())
+            .unwrap();
+        same.method_details
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("zones".into(), zones);
+        reordered_mpp
+            .verify_credential_with_expected_request(&reordered, &same)
+            .await
+            .unwrap();
+    }
+
     // A route that accepts other Zones, or explicitly none, does not take it.
     for zones in [Some(serde_json::json!([4])), Some(serde_json::Value::Null)] {
         let mut other = expected.clone();

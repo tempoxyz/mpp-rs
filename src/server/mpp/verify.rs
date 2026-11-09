@@ -547,6 +547,20 @@ where
             // The Zones a challenge accepts decide which Zone withdrawals pay
             // it, so they bind the credential to the route like mppx's
             // `chargeBinding`.
+            // Compared as sets: the order and repeats of listed Zone IDs never
+            // change which withdrawals pay a challenge.
+            let normalize = |zones: serde_json::Value| {
+                use crate::protocol::methods::tempo::zone::Zones;
+                match serde_json::from_value::<Zones>(zones.clone()) {
+                    Ok(Zones::Ids(mut ids)) => {
+                        ids.sort_unstable();
+                        ids.dedup();
+                        serde_json::json!(ids)
+                    }
+                    Ok(Zones::Any) => serde_json::Value::Bool(true),
+                    Err(_) => zones,
+                }
+            };
             let zones = |request: &ChargeRequest| {
                 request
                     .method_details
@@ -554,6 +568,7 @@ where
                     .and_then(|details| details.get("zones"))
                     .filter(|zones| !zones.is_null())
                     .cloned()
+                    .map(normalize)
             };
             // An expected request that leaves Zones unset takes this handler's,
             // as the challenges it issues from caller-built requests do; an
@@ -565,7 +580,7 @@ where
             let expected_zones = if sets_zones {
                 zones(expected)
             } else {
-                self.config.zones.clone()
+                self.config.zones.clone().map(normalize)
             };
             if zones(request) != expected_zones {
                 return Err(VerificationError::with_code(
