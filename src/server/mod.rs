@@ -21,7 +21,8 @@
 //! use mpp::store::MemoryStore;
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
-//! // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+//! // The default in-memory store makes credentials single-use within this
+//! // instance and its clones; pass a shared store when several instances serve.
 //! let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 //! let payment = Mpp::new(method, "api.example.com", "my-server-secret-of-at-least-32-bytes");
 //!
