@@ -1,5 +1,7 @@
 //! Proof credentials: a signed proof of account control for zero-amount challenges.
 
+use std::sync::Arc;
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use tempo_alloy::contracts::precompiles::{IAccountKeychain, ACCOUNT_KEYCHAIN_ADDRESS};
@@ -7,6 +9,7 @@ use tempo_alloy::TempoNetwork;
 
 use crate::protocol::core::PaymentCredential;
 use crate::protocol::traits::VerificationError;
+use crate::store::Store;
 
 use super::super::proof;
 use super::ChargeMethod;
@@ -73,11 +76,20 @@ where
         Ok(parsed_source.address)
     }
 
+    /// The configured proof store, else the default one, which only
+    /// HMAC-authenticated verification uses.
+    pub(super) fn active_proof_store(&self) -> Option<&Arc<dyn Store>> {
+        self.proof_store.as_ref().or(self
+            .authenticated_proof_store
+            .as_ref()
+            .filter(|_| self.authenticated_expiry))
+    }
+
     pub(super) async fn reserve_proof_credential(
         &self,
         credential: &PaymentCredential,
     ) -> Result<(), VerificationError> {
-        let Some(store) = &self.proof_store else {
+        let Some(store) = self.active_proof_store() else {
             return Ok(());
         };
         self.ensure_proof_domain().await?;
@@ -124,7 +136,7 @@ where
 
     async fn ensure_proof_domain(&self) -> Result<(), VerificationError> {
         if !self.authenticated_expiry {
-            if let Some(store) = &self.proof_store {
+            if let Some(store) = self.active_proof_store() {
                 let authenticated = store.get(AUTHENTICATED_PROOF_DOMAIN).await.map_err(|e| {
                     VerificationError::internal(format!("Failed to read proof domain: {e}"))
                 })?;

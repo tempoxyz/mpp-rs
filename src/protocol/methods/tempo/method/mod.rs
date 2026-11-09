@@ -147,6 +147,9 @@ pub struct ChargeMethod<P> {
     store: Option<Arc<dyn Store>>,
     authenticated_expiry: bool,
     proof_store: Option<Arc<dyn Store>>,
+    /// Proof store for HMAC-authenticated verification when [`Self::proof_store`]
+    /// is unset. Its reservations expire with their Challenge, so it stays bounded.
+    authenticated_proof_store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
@@ -165,20 +168,28 @@ where
     /// The provider must be configured for `TempoNetwork`. Use
     /// [`tempo_provider`](crate::server::tempo_provider) to create one.
     ///
-    /// Replay protection is on by default: the method gets an in-memory
+    /// Hash replay protection is on by default: the method gets an in-memory
     /// [`MemoryStore`](crate::store::MemoryStore), as
-    /// [`Mpp::create`](crate::server::Mpp::create) does, so a hash or proof
+    /// [`Mpp::create`](crate::server::Mpp::create) does, so a hash
     /// credential is accepted once. That store is shared only by clones of this
     /// method instance: a deployment with several instances or processes must
     /// pass a shared store with [`with_store`](Self::with_store).
+    ///
+    /// Zero-amount proof credentials verified through [`Mpp`](crate::server::Mpp)
+    /// are single-use by default too, in a separate in-memory store whose
+    /// reservations expire with their Challenge. Proofs verified directly with
+    /// [`ChargeMethod::verify`](ChargeMethodTrait::verify) need
+    /// [`with_store`](Self::with_store) to be single-use: their reservations
+    /// never expire and are keyed by the client's Challenge ID, so a default store
+    /// would grow with every proof.
     pub fn new(provider: P) -> Self {
-        let store: Arc<dyn Store> = Arc::new(crate::store::MemoryStore::new());
         Self {
             provider: Arc::new(provider),
             fee_payer_signer: None,
-            store: Some(Arc::clone(&store)),
+            store: Some(Arc::new(crate::store::MemoryStore::new())),
             authenticated_expiry: false,
-            proof_store: Some(store),
+            proof_store: None,
+            authenticated_proof_store: Some(Arc::new(crate::store::MemoryStore::new())),
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,
@@ -270,6 +281,7 @@ where
     /// replays.
     pub fn without_store(mut self) -> Self {
         self.proof_store = None;
+        self.authenticated_proof_store = None;
         self.store = None;
         self
     }
@@ -396,7 +408,7 @@ where
                     expected_chain_id,
                 )
                 .await?;
-            if let Some(store) = &self.proof_store {
+            if let Some(store) = self.active_proof_store() {
                 if store
                     .get(&Self::proof_replay_key(credential))
                     .await
