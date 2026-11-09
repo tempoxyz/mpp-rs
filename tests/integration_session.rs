@@ -642,7 +642,6 @@ async fn test_e2e_session_top_up() {
             channel_id: channel_id.to_string(),
             transaction: alloy::hex::encode_prefixed(transaction),
             descriptor: None,
-            settlement_route: None,
             additional_deposit: TOP_UP.to_string(),
         },
     );

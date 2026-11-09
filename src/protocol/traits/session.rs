@@ -94,15 +94,6 @@ pub trait SessionMethod: Clone + Send + Sync {
         false
     }
 
-    /// Whether this method can open and settle sessions funded with machine
-    /// tokens.
-    ///
-    /// Session challenges only advertise a machine-token settlement route
-    /// when this returns `true`. Defaults to `false`.
-    fn supports_machine_tokens(&self) -> bool {
-        false
-    }
-
     /// Optional respond hook called after successful verification.
     ///
     /// If this returns `Some(response_body)`, the request is treated as a

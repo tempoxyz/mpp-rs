@@ -107,7 +107,6 @@ where
         let (
             channel_id_str,
             descriptor,
-            settlement_route,
             cumulative_amount_str,
             signature_str,
             _authorized_signer_str,
@@ -116,7 +115,6 @@ where
             SessionCredentialPayload::Open {
                 channel_id,
                 descriptor,
-                settlement_route,
                 cumulative_amount,
                 signature,
                 authorized_signer,
@@ -125,7 +123,6 @@ where
             } => (
                 channel_id,
                 descriptor.as_ref(),
-                settlement_route.as_ref(),
                 cumulative_amount,
                 signature,
                 authorized_signer,
@@ -138,41 +135,6 @@ where
         let channel_id_b256 = Self::parse_channel_id(channel_id_str)?;
         let escrow = self.resolve_escrow(details)?;
         let chain_id = self.resolve_chain_id(details);
-
-        if details.machine_token_enabled == Some(true) {
-            let descriptor = descriptor.ok_or_else(|| {
-                VerificationError::invalid_payload(
-                    "machine-token open credential is missing its channel descriptor",
-                )
-            })?;
-            let route = settlement_route.ok_or_else(|| {
-                VerificationError::invalid_payload(
-                    "machine-token open credential is missing its settlement route",
-                )
-            })?;
-            let recipient = Self::parse_address(&route.recipient)?;
-            let target_token = Self::parse_address(&route.target_token)?;
-            let route_salt = route
-                .route_salt
-                .parse()
-                .map_err(|_| VerificationError::invalid_payload("invalid settlement routeSalt"))?;
-            let expected_salt =
-                crate::protocol::methods::tempo::machine_token::compute_session_salt(
-                    recipient,
-                    target_token,
-                    route_salt,
-                );
-            if descriptor.salt != expected_salt.to_string()
-                || details.settlement_adapter.as_deref() != Some(&route.adapter)
-                || details.settlement_recipient.as_deref() != Some(&route.recipient)
-                || details.settlement_token.as_deref() != Some(&route.target_token)
-            {
-                return Err(VerificationError::credential_mismatch(
-                    "machine-token settlement route is not bound to the descriptor",
-                ));
-            }
-        }
-        let accepted_settlement_route = settlement_route.cloned();
 
         // Broadcast the client's signed open transaction (approve + escrow.open).
         let tx_bytes: Bytes = transaction_str.parse().map_err(|e| {
@@ -329,7 +291,6 @@ where
             chain_id,
             escrow_contract: escrow,
             authorized_signer,
-            settlement_route: accepted_settlement_route,
             cumulative_amount,
             signature: sig_bytes,
         };

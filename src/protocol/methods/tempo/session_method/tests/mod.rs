@@ -28,7 +28,6 @@ fn test_channel_state(channel_id: &str) -> ChannelState {
         token: "0x3333333333333333333333333333333333333333"
             .parse()
             .unwrap(),
-        settlement_route: None,
         authorized_signer: "0x4444444444444444444444444444444444444444"
             .parse()
             .unwrap(),
@@ -173,7 +172,6 @@ async fn test_verify_session_rejects_missing_recipient() {
         SessionCredentialPayload::Voucher {
             channel_id,
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
         },

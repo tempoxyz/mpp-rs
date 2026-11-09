@@ -86,12 +86,11 @@ where
     /// `chainId`, and `minVoucherDelta`. Additional options like `suggestedDeposit`,
     /// `feePayer`, `description`, and `expires` can be set via [`SessionChallengeOptions`](crate::server::SessionChallengeOptions).
     ///
-    /// `feePayer` and the machine-token settlement route are only advertised
-    /// when the session method reports that it supports them (see
-    /// [`SessionMethod::supports_fee_payer`](crate::protocol::traits::SessionMethod::supports_fee_payer)
-    /// and
-    /// [`SessionMethod::supports_machine_tokens`](crate::protocol::traits::SessionMethod::supports_machine_tokens)).
-    /// Tempo's `SessionMethod` supports neither.
+    /// `feePayer` is only advertised when the session method reports that it
+    /// supports it (see
+    /// [`SessionMethod::supports_fee_payer`](crate::protocol::traits::SessionMethod::supports_fee_payer));
+    /// Tempo's `SessionMethod` does not. Machine-token funding applies only to
+    /// charges, so session challenges never advertise it.
     ///
     /// # Example
     ///
@@ -122,39 +121,14 @@ where
 
         let mut method_details = session.and_then(|s| s.challenge_method_details());
 
-        // Fee sponsorship and machine tokens are configured on the handler for
-        // charges; only advertise them when the session method can honour them.
+        // Fee sponsorship is configured on the handler for charges; only
+        // advertise it when the session method can honour it.
         let sponsors_fees = session.is_some_and(|s| s.supports_fee_payer());
-        let settles_machine_tokens = session.is_some_and(|s| s.supports_machine_tokens());
 
         if (options.fee_payer || self.config.fee_payer) && sponsors_fees {
             let details = method_details.get_or_insert_with(|| serde_json::json!({}));
             if let Some(obj) = details.as_object_mut() {
                 obj.insert("feePayer".to_string(), serde_json::json!(true));
-            }
-        }
-
-        if self.config.machine_token_enabled && settles_machine_tokens {
-            let chain_id = self
-                .config
-                .chain_id
-                .unwrap_or(crate::protocol::methods::tempo::CHAIN_ID);
-            let (_, adapter) =
-                crate::protocol::methods::tempo::machine_token::session_addresses(chain_id)
-                    .ok_or_else(|| {
-                        crate::error::MppError::InvalidConfig(format!(
-                            "machine tokens are not supported on chain ID {chain_id}"
-                        ))
-                    })?;
-            let details = method_details.get_or_insert_with(|| serde_json::json!({}));
-            if let Some(obj) = details.as_object_mut() {
-                obj.insert("machineTokenEnabled".to_string(), serde_json::json!(true));
-                obj.insert("settlementAdapter".to_string(), serde_json::json!(adapter));
-                obj.insert(
-                    "settlementRecipient".to_string(),
-                    serde_json::json!(recipient),
-                );
-                obj.insert("settlementToken".to_string(), serde_json::json!(currency));
             }
         }
 

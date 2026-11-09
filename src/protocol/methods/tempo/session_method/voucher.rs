@@ -5,7 +5,6 @@ use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
 use super::chain::OnChainChannel;
-use super::payload::validate_settlement_route;
 use super::precompile;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, ChannelState, SessionMethod};
@@ -28,24 +27,21 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, descriptor, settlement_route, cumulative_amount_str, signature_str) =
-            match payload {
-                SessionCredentialPayload::Voucher {
-                    channel_id,
-                    descriptor,
-                    settlement_route,
-                    cumulative_amount,
-                    signature,
-                    ..
-                } => (
-                    channel_id,
-                    descriptor.as_ref(),
-                    settlement_route.as_ref(),
-                    cumulative_amount,
-                    signature,
-                ),
-                _ => unreachable!(),
-            };
+        let (channel_id_str, descriptor, cumulative_amount_str, signature_str) = match payload {
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                descriptor,
+                cumulative_amount,
+                signature,
+                ..
+            } => (
+                channel_id,
+                descriptor.as_ref(),
+                cumulative_amount,
+                signature,
+            ),
+            _ => unreachable!(),
+        };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
         // The on-chain read does not depend on the stored channel, so it
@@ -88,7 +84,6 @@ where
                     "channel token does not match session currency",
                 ));
             }
-            validate_settlement_route(&channel, details, settlement_route)?;
 
             if channel.finalized {
                 return Err(VerificationError::channel_closed("channel is finalized"));

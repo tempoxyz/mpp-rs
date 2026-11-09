@@ -295,7 +295,6 @@ mod tests {
             token: "0x3333333333333333333333333333333333333333"
                 .parse()
                 .unwrap(),
-            settlement_route: None,
             authorized_signer: "0x4444444444444444444444444444444444444444"
                 .parse()
                 .unwrap(),

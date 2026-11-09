@@ -35,9 +35,6 @@ pub struct ChannelState {
     pub payer: Address,
     pub payee: Address,
     pub token: Address,
-    /// Immutable machine-token settlement route accepted at open.
-    #[serde(default)]
-    pub settlement_route: Option<crate::protocol::methods::tempo::session::SettlementRoute>,
     pub authorized_signer: Address,
     pub deposit: u128,
     pub settled_on_chain: u128,

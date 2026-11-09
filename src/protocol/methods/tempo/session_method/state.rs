@@ -10,7 +10,6 @@ use alloy::primitives::Address;
 use super::chain::OnChainChannel;
 use super::receipt::now_iso8601;
 use super::ChannelState;
-use crate::protocol::methods::tempo::session::SettlementRoute;
 use crate::protocol::traits::VerificationError;
 
 /// What an accepted `open` credential records besides the on-chain channel.
@@ -19,7 +18,6 @@ pub(super) struct Opening {
     pub(super) chain_id: u64,
     pub(super) escrow_contract: Address,
     pub(super) authorized_signer: Address,
-    pub(super) settlement_route: Option<SettlementRoute>,
     pub(super) cumulative_amount: u128,
     pub(super) signature: Vec<u8>,
 }
@@ -37,7 +35,6 @@ impl ChannelState {
             chain_id,
             escrow_contract,
             authorized_signer,
-            settlement_route,
             cumulative_amount,
             signature,
         } = opening;
@@ -51,7 +48,6 @@ impl ChannelState {
             // Channel already exists — update if higher.
             if cumulative_amount > existing.highest_voucher_amount {
                 Self {
-                    settlement_route: existing.settlement_route.or(settlement_route),
                     deposit,
                     settled_on_chain,
                     spent,
@@ -82,7 +78,6 @@ impl ChannelState {
                 payer: on_chain.payer,
                 payee: on_chain.payee,
                 token: on_chain.token,
-                settlement_route,
                 authorized_signer,
                 deposit: on_chain.deposit,
                 settled_on_chain: on_chain.settled,

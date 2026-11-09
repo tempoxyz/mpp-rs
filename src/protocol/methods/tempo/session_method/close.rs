@@ -7,7 +7,6 @@ use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
 use super::chain::get_on_chain_channel_at;
-use super::payload::validate_settlement_route;
 use super::precompile;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, ChannelState, PendingClose, SessionMethod};
@@ -78,81 +77,6 @@ pub(super) fn validate_close_amount(
         ));
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn machine_session_close_calls(
-    chain_id: u64,
-    escrow: Address,
-    descriptor: &crate::protocol::methods::tempo::session::ChannelDescriptor,
-    route: &crate::protocol::methods::tempo::session::SettlementRoute,
-    cumulative_amount: u128,
-    deposit: u128,
-    settled: u128,
-    signature: &[u8],
-) -> Result<Vec<tempo_alloy::primitives::transaction::Call>, VerificationError> {
-    use alloy::{
-        primitives::{Bytes, TxKind, U256},
-        sol_types::SolCall,
-    };
-    if cumulative_amount != deposit {
-        return Err(VerificationError::invalid_payload(
-            "machine-token sessions cannot close with a nonzero refund",
-        ));
-    }
-    let cumulative_amount = alloy::primitives::Uint::<96, 2>::from(cumulative_amount);
-    let parse_address = |value: &str| {
-        value
-            .parse::<Address>()
-            .map_err(|_| VerificationError::invalid_payload("invalid channel descriptor address"))
-    };
-    let descriptor_wire =
-        tempo_alloy::contracts::precompiles::ITIP20ChannelReserve::ChannelDescriptor {
-            payer: parse_address(&descriptor.payer)?,
-            payee: parse_address(&descriptor.payee)?,
-            operator: parse_address(&descriptor.operator)?,
-            token: parse_address(&descriptor.token)?,
-            salt: descriptor
-                .salt
-                .parse()
-                .map_err(|_| VerificationError::invalid_payload("invalid descriptor salt"))?,
-            authorizedSigner: parse_address(&descriptor.authorized_signer)?,
-            expiringNonceHash: descriptor.expiring_nonce_hash.parse().map_err(|_| {
-                VerificationError::invalid_payload("invalid descriptor expiringNonceHash")
-            })?,
-        };
-    let settle = tempo_alloy::contracts::precompiles::ITIP20ChannelReserve::settleCall::new((
-        descriptor_wire.clone(),
-        cumulative_amount,
-        Bytes::copy_from_slice(signature),
-    ));
-    let close = tempo_alloy::contracts::precompiles::ITIP20ChannelReserve::closeCall::new((
-        descriptor_wire,
-        cumulative_amount,
-        cumulative_amount,
-        Bytes::copy_from_slice(signature),
-    ));
-    let swap = crate::protocol::methods::tempo::machine_token::settle_session_call(
-        chain_id, descriptor, route,
-    )
-    .map_err(|error| VerificationError::invalid_payload(error.to_string()))?;
-    let close_call = tempo_alloy::primitives::transaction::Call {
-        to: TxKind::Call(escrow),
-        value: U256::ZERO,
-        input: Bytes::from(close.abi_encode()),
-    };
-    if settled == deposit {
-        return Ok(vec![close_call]);
-    }
-    Ok(vec![
-        tempo_alloy::primitives::transaction::Call {
-            to: TxKind::Call(escrow),
-            value: U256::ZERO,
-            input: Bytes::from(settle.abi_encode()),
-        },
-        swap,
-        close_call,
-    ])
 }
 
 impl<P> SessionMethod<P>
@@ -322,31 +246,23 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (
-            channel_id_str,
-            descriptor,
-            settlement_route,
-            cumulative_amount_str,
-            signature_str,
-            close_signature,
-        ) = match payload {
-            SessionCredentialPayload::Close {
-                channel_id,
-                descriptor,
-                settlement_route,
-                cumulative_amount,
-                signature,
-                close_signature,
-            } => (
-                channel_id,
-                descriptor.as_ref(),
-                settlement_route.as_ref(),
-                cumulative_amount,
-                signature,
-                close_signature.as_deref(),
-            ),
-            _ => unreachable!(),
-        };
+        let (channel_id_str, descriptor, cumulative_amount_str, signature_str, close_signature) =
+            match payload {
+                SessionCredentialPayload::Close {
+                    channel_id,
+                    descriptor,
+                    cumulative_amount,
+                    signature,
+                    close_signature,
+                } => (
+                    channel_id,
+                    descriptor.as_ref(),
+                    cumulative_amount,
+                    signature,
+                    close_signature.as_deref(),
+                ),
+                _ => unreachable!(),
+            };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel = self
@@ -365,7 +281,6 @@ where
                 "channel token does not match session currency",
             ));
         }
-        validate_settlement_route(&channel, details, settlement_route)?;
 
         if channel.finalized {
             return Err(VerificationError::channel_closed(
@@ -518,28 +433,7 @@ where
                 value: alloy::primitives::U256::ZERO,
                 input: Bytes::from(close_data),
             }];
-            if details.machine_token_enabled == Some(true) {
-                let descriptor = descriptor.ok_or_else(|| {
-                    VerificationError::invalid_payload(
-                        "machine-token close credential is missing its channel descriptor",
-                    )
-                })?;
-                let route = settlement_route.ok_or_else(|| {
-                    VerificationError::invalid_payload(
-                        "machine-token close credential is missing its settlement route",
-                    )
-                })?;
-                calls = machine_session_close_calls(
-                    chain_id,
-                    escrow,
-                    descriptor,
-                    route,
-                    cumulative_amount,
-                    on_chain.deposit,
-                    on_chain.settled,
-                    &sig_bytes,
-                )?;
-            } else if let Some(d) = precompile_descriptor.clone() {
+            if let Some(d) = precompile_descriptor.clone() {
                 calls = vec![precompile::close_call(
                     escrow,
                     d,

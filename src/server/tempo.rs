@@ -150,8 +150,10 @@ impl TempoBuilder {
 
     /// Advertise canonical first-party machine-token funding for charges.
     ///
-    /// Clients that support this hint prefer machineUSD and atomically settle
-    /// the configured challenge currency through the canonical swapper.
+    /// Clients that support this hint may fund the charge with MACH through
+    /// the canonical MACH swapper (`swapTo`), which pays the merchant in the
+    /// configured challenge currency. It applies only to charges: session
+    /// challenges never advertise it.
     pub fn machine_token_enabled(mut self, enabled: bool) -> Self {
         self.machine_token_enabled = enabled;
         self

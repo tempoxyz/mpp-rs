@@ -1,18 +1,17 @@
-//! Canonical first-party machine-token settlement routes.
+//! Canonical first-party machine-token charge routes.
 //!
 //! A machine-token charge approves the canonical MACH swapper and calls
 //! `swapTo` atomically. The merchant continues to receive the challenge
 //! currency while the payer spends MACH, matching mppx's charge deployment.
 //!
-//! Sessions denominated in MACH are ordinary TIP-1034 channels whose token is
-//! MACH. TIP-1095 applies MACH's recipient policy to the logical payer to payee
-//! path and returns refunds to the payer, so they need no swapper route. The
-//! machineUSD session route below remains for channels that already use it.
+//! Machine-token funding applies only to charges. Sessions denominated in MACH
+//! are ordinary TIP-1034 channels whose token is MACH and whose payee is the
+//! merchant: TIP-1095 applies MACH's recipient policy to the logical payer to
+//! payee path and returns refunds to the payer, so they need no swapper route.
 
 use alloy::primitives::{address, Address, Bytes, TxKind, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolCall;
-use alloy::sol_types::SolValue;
 use tempo_alloy::contracts::precompiles::ITIP20;
 use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::rpc::TempoTransactionRequest;
@@ -28,104 +27,7 @@ alloy::sol! {
             address recipient,
             bytes32 memo
         ) external;
-
-        struct ChannelDescriptor {
-            address payer;
-            address payee;
-            address operator;
-            address token;
-            bytes32 salt;
-            address authorizedSigner;
-            bytes32 expiringNonceHash;
-        }
-
-        function settleSession(
-            ChannelDescriptor calldata descriptor,
-            address recipient,
-            address targetToken,
-            bytes32 routeSalt
-        ) external;
     }
-}
-
-/// Resolve the legacy machineUSD session token and swapper for a supported chain.
-pub fn session_addresses(chain_id: u64) -> Option<(Address, Address)> {
-    session_deployment(chain_id).map(|deployment| (deployment.token, deployment.swapper))
-}
-
-/// Bind a logical merchant settlement route into a TIP-1034 descriptor salt.
-pub fn compute_session_salt(
-    merchant: Address,
-    target_token: Address,
-    route_salt: alloy::primitives::B256,
-) -> alloy::primitives::B256 {
-    let typehash = alloy::primitives::keccak256(
-        b"MachineUsdSessionRoute(address merchant,address targetToken,bytes32 routeSalt)",
-    );
-    alloy::primitives::keccak256((typehash, merchant, target_token, route_salt).abi_encode())
-}
-
-/// Encode a canonical machine-token session settlement call.
-pub fn settle_session_call(
-    chain_id: u64,
-    descriptor: &super::session::ChannelDescriptor,
-    route: &super::session::SettlementRoute,
-) -> Result<Call, crate::error::MppError> {
-    let (_, swapper) = session_addresses(chain_id).ok_or_else(|| {
-        crate::error::MppError::InvalidConfig(format!(
-            "machine tokens are not supported on chain ID {chain_id}"
-        ))
-    })?;
-    let parse_address = |name: &str, value: &str| {
-        value.parse::<Address>().map_err(|error| {
-            crate::error::MppError::InvalidConfig(format!(
-                "invalid session descriptor {name}: {error}"
-            ))
-        })
-    };
-    let parse_b256 = |name: &str, value: &str| {
-        value.parse::<alloy::primitives::B256>().map_err(|error| {
-            crate::error::MppError::InvalidConfig(format!(
-                "invalid session descriptor {name}: {error}"
-            ))
-        })
-    };
-    if route.adapter.parse::<Address>().ok() != Some(swapper) {
-        return Err(crate::error::MppError::InvalidConfig(
-            "session settlement adapter is not canonical".into(),
-        ));
-    }
-    let merchant = parse_address("settlement recipient", &route.recipient)?;
-    let target_token = parse_address("settlement targetToken", &route.target_token)?;
-    let route_salt = parse_b256("settlement routeSalt", &route.route_salt)?;
-    let descriptor_salt = parse_b256("salt", &descriptor.salt)?;
-    if descriptor_salt != compute_session_salt(merchant, target_token, route_salt) {
-        return Err(crate::error::MppError::InvalidConfig(
-            "session descriptor salt does not bind the settlement route".into(),
-        ));
-    }
-    let descriptor = IMachineTokenSwapper::ChannelDescriptor {
-        payer: parse_address("payer", &descriptor.payer)?,
-        payee: parse_address("payee", &descriptor.payee)?,
-        operator: parse_address("operator", &descriptor.operator)?,
-        token: parse_address("token", &descriptor.token)?,
-        salt: parse_b256("salt", &descriptor.salt)?,
-        authorizedSigner: parse_address("authorizedSigner", &descriptor.authorized_signer)?,
-        expiringNonceHash: parse_b256("expiringNonceHash", &descriptor.expiring_nonce_hash)?,
-    };
-    Ok(Call {
-        to: TxKind::Call(swapper),
-        value: U256::ZERO,
-        input: Bytes::from(
-            IMachineTokenSwapper::settleSessionCall {
-                descriptor,
-                recipient: merchant,
-                targetToken: target_token,
-                routeSalt: route_salt,
-            }
-            .abi_encode(),
-        ),
-    })
 }
 
 /// MACH, the canonical machine token on Tempo mainnet and Moderato.
@@ -134,17 +36,6 @@ pub const MACH: Address = address!("20c000000000000000000000f37de3740ADec032");
 pub const MACH_SWAPPER_MAINNET: Address = address!("F72E5107c32C655ffA7539a3C8e97B7C3cE16A3F");
 /// Canonical MACH swapper on Tempo Moderato.
 pub const MACH_SWAPPER_TESTNET: Address = address!("d05f8EdFBB54Da0d765C9fE9b2B3f7d2E3a8C466");
-
-/// machineUSD on Tempo mainnet, used only by the legacy session route.
-pub const MACHINE_TOKEN_MAINNET: Address = address!("20C0000000000000000000003793c39601711f19");
-/// Canonical machineUSD swapper on Tempo mainnet.
-pub const MACHINE_TOKEN_SWAPPER_MAINNET: Address =
-    address!("C6D32f013E0fA3e83B63Dc680E99826761595732");
-/// machineUSD on Tempo Moderato.
-pub const MACHINE_TOKEN_TESTNET: Address = address!("20c000000000000000000000f85bbCa724044De0");
-/// Canonical machineUSD swapper on Tempo Moderato.
-pub const MACHINE_TOKEN_SWAPPER_TESTNET: Address =
-    address!("07f1FE0467Ae01DE340024aa4b7DD9729b1c169b");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Deployment {
@@ -172,20 +63,6 @@ fn deployment(chain_id: u64) -> Option<Deployment> {
         MODERATO_CHAIN_ID => Some(Deployment {
             token: MACH,
             swapper: MACH_SWAPPER_TESTNET,
-        }),
-        _ => None,
-    }
-}
-
-fn session_deployment(chain_id: u64) -> Option<Deployment> {
-    match chain_id {
-        CHAIN_ID => Some(Deployment {
-            token: MACHINE_TOKEN_MAINNET,
-            swapper: MACHINE_TOKEN_SWAPPER_MAINNET,
-        }),
-        MODERATO_CHAIN_ID => Some(Deployment {
-            token: MACHINE_TOKEN_TESTNET,
-            swapper: MACHINE_TOKEN_SWAPPER_TESTNET,
         }),
         _ => None,
     }
@@ -340,10 +217,6 @@ mod tests {
         assert_eq!(swap.inputToken, MACH);
         assert_eq!(token(CHAIN_ID), Some(MACH));
         assert_eq!(settlement_sender(CHAIN_ID), Some(MACH_SWAPPER_MAINNET));
-        assert_eq!(
-            session_addresses(CHAIN_ID),
-            Some((MACHINE_TOKEN_MAINNET, MACHINE_TOKEN_SWAPPER_MAINNET))
-        );
         assert_eq!(swap.targetToken, currency);
         assert_eq!(swap.recipient, Address::repeat_byte(0x22));
     }
@@ -362,63 +235,6 @@ mod tests {
         without_memo.memo = None;
         assert!(route(MODERATO_CHAIN_ID, currency, &[without_memo]).is_none());
         assert!(route(MODERATO_CHAIN_ID, currency, &[transfer(), transfer()]).is_none());
-    }
-
-    #[test]
-    fn encodes_session_settlement_with_the_full_bound_descriptor() {
-        let descriptor = super::super::session::ChannelDescriptor {
-            payer: Address::repeat_byte(0x11).to_string(),
-            payee: MACHINE_TOKEN_SWAPPER_TESTNET.to_string(),
-            operator: Address::repeat_byte(0x22).to_string(),
-            token: MACHINE_TOKEN_TESTNET.to_string(),
-            salt: alloy::primitives::B256::repeat_byte(0x33).to_string(),
-            authorized_signer: Address::repeat_byte(0x44).to_string(),
-            expiring_nonce_hash: alloy::primitives::B256::repeat_byte(0x55).to_string(),
-        };
-        let route = super::super::session::SettlementRoute {
-            adapter: MACHINE_TOKEN_SWAPPER_TESTNET.to_string(),
-            recipient: Address::repeat_byte(0x22).to_string(),
-            target_token: Address::repeat_byte(0x66).to_string(),
-            route_salt: alloy::primitives::B256::repeat_byte(0x77).to_string(),
-        };
-        let expected_salt = compute_session_salt(
-            Address::repeat_byte(0x22),
-            Address::repeat_byte(0x66),
-            alloy::primitives::B256::repeat_byte(0x77),
-        );
-        let descriptor = super::super::session::ChannelDescriptor {
-            salt: expected_salt.to_string(),
-            ..descriptor
-        };
-        let call = settle_session_call(MODERATO_CHAIN_ID, &descriptor, &route).unwrap();
-
-        assert_eq!(call.to, TxKind::Call(MACHINE_TOKEN_SWAPPER_TESTNET));
-        let decoded = IMachineTokenSwapper::settleSessionCall::abi_decode(&call.input).unwrap();
-        assert_eq!(decoded.descriptor.payee, MACHINE_TOKEN_SWAPPER_TESTNET);
-        assert_eq!(decoded.descriptor.operator, Address::repeat_byte(0x22));
-        assert_eq!(decoded.descriptor.token, MACHINE_TOKEN_TESTNET);
-        assert_eq!(decoded.recipient, Address::repeat_byte(0x22));
-        assert_eq!(decoded.targetToken, Address::repeat_byte(0x66));
-    }
-
-    #[test]
-    fn rejects_session_settlement_on_an_unsupported_chain() {
-        let descriptor = super::super::session::ChannelDescriptor {
-            payer: Address::ZERO.to_string(),
-            payee: Address::ZERO.to_string(),
-            operator: Address::ZERO.to_string(),
-            token: Address::ZERO.to_string(),
-            salt: alloy::primitives::B256::ZERO.to_string(),
-            authorized_signer: Address::ZERO.to_string(),
-            expiring_nonce_hash: alloy::primitives::B256::ZERO.to_string(),
-        };
-        let route = super::super::session::SettlementRoute {
-            adapter: Address::ZERO.to_string(),
-            recipient: Address::ZERO.to_string(),
-            target_token: Address::ZERO.to_string(),
-            route_salt: alloy::primitives::B256::ZERO.to_string(),
-        };
-        assert!(settle_session_call(1, &descriptor, &route).is_err());
     }
 
     #[tokio::test]

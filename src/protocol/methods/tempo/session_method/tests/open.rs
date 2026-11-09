@@ -9,7 +9,6 @@ fn opening(state: &ChannelState, cumulative_amount: u128) -> Opening {
         chain_id: state.chain_id,
         escrow_contract: state.escrow_contract,
         authorized_signer: state.authorized_signer,
-        settlement_route: None,
         cumulative_amount,
         signature: vec![0xAA; 65],
     }
@@ -397,7 +396,6 @@ async fn open_credential(
             channel_id: channel_id.to_string(),
             transaction,
             descriptor: None,
-            settlement_route: None,
             authorized_signer: None,
             cumulative_amount: cumulative_amount.to_string(),
             signature: alloy::hex::encode_prefixed(signature),
@@ -490,7 +488,6 @@ async fn unsupported_store_rejects_open_before_transaction_processing() {
             channel_id: B256::repeat_byte(0x11).to_string(),
             transaction: "0x".into(),
             descriptor: None,
-            settlement_route: None,
             authorized_signer: None,
             cumulative_amount: "1000".into(),
             signature: "0x".into(),

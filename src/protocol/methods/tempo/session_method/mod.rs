@@ -121,11 +121,7 @@ where
                 channel_id: None,
                 min_voucher_delta: None,
                 fee_payer: None,
-                machine_token_enabled: None,
                 fee_token: None,
-                settlement_adapter: None,
-                settlement_recipient: None,
-                settlement_token: None,
                 operator: None,
                 session_protocol: None,
                 session_snapshot: None,
@@ -171,11 +167,7 @@ where
             min_voucher_delta: Some(self.config.min_voucher_delta.to_string()),
             channel_id: None,
             fee_payer: None,
-            machine_token_enabled: None,
             fee_token: None,
-            settlement_adapter: None,
-            settlement_recipient: None,
-            settlement_token: None,
             operator: None,
             session_protocol: None,
             session_snapshot: None,
@@ -225,35 +217,7 @@ where
             })
             .and_then(Self::parse_address)?;
         let target_token = Self::parse_address(&request.currency)?;
-        let (expected_payee, expected_token) = if details.machine_token_enabled == Some(true) {
-            let (_, swapper) = crate::protocol::methods::tempo::machine_token::session_addresses(
-                self.resolve_chain_id(&details),
-            )
-            .ok_or_else(|| {
-                VerificationError::invalid_payload(
-                    "machine tokens are unsupported on the session chain",
-                )
-            })?;
-            if details.settlement_adapter.as_deref() != Some(&swapper.to_string())
-                || details.settlement_recipient.as_deref() != Some(&merchant.to_string())
-                || details.settlement_token.as_deref() != Some(&target_token.to_string())
-            {
-                return Err(VerificationError::credential_mismatch(
-                    "machine-token settlement route does not match the session request",
-                ));
-            }
-            crate::protocol::methods::tempo::machine_token::session_addresses(
-                self.resolve_chain_id(&details),
-            )
-            .map(|(token, swapper)| (swapper, token))
-            .ok_or_else(|| {
-                VerificationError::invalid_payload(
-                    "machine tokens are unsupported on the session chain",
-                )
-            })?
-        } else {
-            (merchant, target_token)
-        };
+        let (expected_payee, expected_token) = (merchant, target_token);
 
         let payload: SessionCredentialPayload = credential.payload_as().map_err(|e| {
             VerificationError::invalid_payload(format!("Expected session payload: {}", e))

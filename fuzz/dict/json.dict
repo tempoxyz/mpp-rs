@@ -82,8 +82,6 @@
 "\"additionalDeposit\""
 "\"authorizedSigner\""
 "\"descriptor\""
-"\"settlementRoute\""
-"\"settlement_route\""
 "\"acceptedCumulative\""
 "\"spent\""
 "\"units\""

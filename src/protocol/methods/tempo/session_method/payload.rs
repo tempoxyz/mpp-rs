@@ -4,33 +4,9 @@ use alloy::primitives::{Address, Bytes, B256};
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::{ChannelState, SessionMethod};
-use crate::protocol::methods::tempo::session::TempoSessionMethodDetails;
+use super::SessionMethod;
 use crate::protocol::methods::tempo::voucher::canonical_voucher_signature;
 use crate::protocol::traits::VerificationError;
-
-pub(super) fn validate_settlement_route(
-    channel: &ChannelState,
-    details: &TempoSessionMethodDetails,
-    route: Option<&crate::protocol::methods::tempo::session::SettlementRoute>,
-) -> Result<(), VerificationError> {
-    if details.machine_token_enabled != Some(true) {
-        return Ok(());
-    }
-    let route = route.ok_or_else(|| {
-        VerificationError::invalid_payload("machine-token credential is missing settlementRoute")
-    })?;
-    if channel.settlement_route.as_ref() != Some(route)
-        || details.settlement_adapter.as_deref() != Some(&route.adapter)
-        || details.settlement_recipient.as_deref() != Some(&route.recipient)
-        || details.settlement_token.as_deref() != Some(&route.target_token)
-    {
-        return Err(VerificationError::credential_mismatch(
-            "settlement route does not match the opened channel",
-        ));
-    }
-    Ok(())
-}
 
 impl<P> SessionMethod<P> {
     /// Parse a hex channel ID string to B256.

@@ -1,0 +1,5 @@
+---
+mpp: minor
+---
+
+Removed the legacy machineUSD session route. MACH sessions are ordinary TIP-1034 channels whose token is MACH and whose payee is the merchant (TIP-1095), which mpp already supports as plain sessions, so route-bound channels paid to the machineUSD swapper and settled with `settleSession` are no longer opened, verified or recovered. Removed `machine_token::{MACHINE_TOKEN_MAINNET, MACHINE_TOKEN_TESTNET, MACHINE_TOKEN_SWAPPER_MAINNET, MACHINE_TOKEN_SWAPPER_TESTNET, session_addresses, compute_session_salt, settle_session_call}`, `session::SettlementRoute`, the `settlement_route` fields of `SessionCredentialPayload`, `SessionSnapshot`, `ChannelState`, `ChannelEntry` and `StoredChannelEntry`, the `machine_token_enabled`, `settlement_adapter`, `settlement_recipient` and `settlement_token` fields of `TempoSessionMethodDetails`, `TempoSessionExt::machine_token_enabled`, `SessionMethod::supports_machine_tokens` and the session recovery helper `validate_settlement_route`. Session challenges no longer advertise `machineTokenEnabled`, which applies only to charges, as in mppx. MACH-funded charges through the canonical MACH swapper are unchanged.

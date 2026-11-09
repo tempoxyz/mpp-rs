@@ -1,7 +1,5 @@
 use super::*;
-use crate::protocol::methods::tempo::session_method::close::{
-    machine_session_close_calls, validate_close_amount,
-};
+use crate::protocol::methods::tempo::session_method::close::validate_close_amount;
 use crate::protocol::methods::tempo::voucher;
 
 struct AsyncOnlyCloseSigner(alloy::signers::local::PrivateKeySigner);
@@ -58,7 +56,6 @@ async fn test_close_rejects_channel_with_wrong_payee() {
         SessionCredentialPayload::Close {
             channel_id,
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
             close_signature: None,
@@ -143,7 +140,6 @@ async fn close_setup_with(
         SessionCredentialPayload::Close {
             channel_id: channel_id.clone(),
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: close_amount.to_string(),
             signature: alloy::hex::encode_prefixed(signature),
             close_signature: None,
@@ -325,7 +321,6 @@ async fn test_close_with_invalid_signature_does_not_disclose_spent() {
             SessionCredentialPayload::Close {
                 channel_id: channel_id.clone(),
                 descriptor: None,
-                settlement_route: None,
                 cumulative_amount: close_amount.to_string(),
                 signature,
                 close_signature: None,
@@ -630,89 +625,6 @@ fn test_close_at_zero_rejects_unfunded_channel() {
 fn test_close_at_exact_deposit() {
     // close at deposit boundary should succeed
     assert!(validate_close_amount(10_000_000, 0, 0, 10_000_000).is_ok());
-}
-
-#[test]
-fn machine_session_close_is_settle_swap_close_and_requires_full_consumption() {
-    use alloy::{
-        primitives::{Address, B256},
-        sol_types::SolCall,
-    };
-    use tempo_alloy::contracts::precompiles::ITIP20ChannelReserve;
-    let recipient = Address::repeat_byte(0x22);
-    let target = Address::repeat_byte(0x33);
-    let route_salt = B256::repeat_byte(0x44);
-    let salt = crate::protocol::methods::tempo::machine_token::compute_session_salt(
-        recipient, target, route_salt,
-    );
-    let (_, adapter) =
-        crate::protocol::methods::tempo::machine_token::session_addresses(42431).unwrap();
-    let (token, _) =
-        crate::protocol::methods::tempo::machine_token::session_addresses(42431).unwrap();
-    let descriptor = crate::protocol::methods::tempo::session::ChannelDescriptor {
-        payer: Address::repeat_byte(0x11).to_string(),
-        payee: adapter.to_string(),
-        operator: Address::repeat_byte(0x55).to_string(),
-        token: token.to_string(),
-        salt: salt.to_string(),
-        authorized_signer: Address::repeat_byte(0x66).to_string(),
-        expiring_nonce_hash: B256::repeat_byte(0x77).to_string(),
-    };
-    let route = crate::protocol::methods::tempo::session::SettlementRoute {
-        adapter: adapter.to_string(),
-        recipient: recipient.to_string(),
-        target_token: target.to_string(),
-        route_salt: route_salt.to_string(),
-    };
-    let calls = machine_session_close_calls(
-        42431,
-        Address::repeat_byte(0x88),
-        &descriptor,
-        &route,
-        100,
-        100,
-        0,
-        &[1; 64],
-    )
-    .unwrap();
-    assert_eq!(
-        &calls[0].input[..4],
-        &ITIP20ChannelReserve::settleCall::SELECTOR
-    );
-    assert_eq!(calls[1].to, alloy::primitives::TxKind::Call(adapter));
-    assert_eq!(
-        &calls[2].input[..4],
-        &ITIP20ChannelReserve::closeCall::SELECTOR
-    );
-    assert!(machine_session_close_calls(
-        42431,
-        Address::repeat_byte(0x88),
-        &descriptor,
-        &route,
-        99,
-        100,
-        0,
-        &[1; 64],
-    )
-    .unwrap_err()
-    .message
-    .contains("nonzero refund"));
-    let already_settled = machine_session_close_calls(
-        42431,
-        Address::repeat_byte(0x88),
-        &descriptor,
-        &route,
-        100,
-        100,
-        100,
-        &[1; 64],
-    )
-    .unwrap();
-    assert_eq!(already_settled.len(), 1);
-    assert_eq!(
-        &already_settled[0].input[..4],
-        &ITIP20ChannelReserve::closeCall::SELECTOR
-    );
 }
 
 #[tokio::test]

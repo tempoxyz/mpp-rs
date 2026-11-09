@@ -67,8 +67,6 @@ pub struct ChannelEntry {
     pub deposit: u128,
     /// Full TIP-1034 descriptor. Legacy contract channels do not have one.
     pub descriptor: Option<ChannelDescriptor>,
-    /// Immutable machine-token settlement route, when enabled.
-    pub settlement_route: Option<crate::protocol::methods::tempo::session::SettlementRoute>,
     /// Escrow contract address.
     pub escrow_contract: Address,
     /// Chain ID where the escrow contract is deployed.
@@ -203,7 +201,6 @@ pub async fn create_voucher_payload(
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
         descriptor: None,
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -223,7 +220,6 @@ pub async fn create_precompile_voucher_payload(
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
         descriptor: None,
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -242,7 +238,6 @@ pub async fn create_precompile_voucher_payload_primitive(
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
         descriptor: None,
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
     })
@@ -291,7 +286,6 @@ pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
         descriptor: Some(descriptor),
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
     })
@@ -323,7 +317,6 @@ pub async fn create_precompile_voucher_payload_with_descriptor_and_escrow(
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
         descriptor: Some(descriptor),
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
     })
@@ -349,7 +342,6 @@ pub async fn create_close_payload(
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
         descriptor: None,
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
         close_signature: None,
@@ -377,7 +369,6 @@ pub async fn create_precompile_close_payload(
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
         descriptor: None,
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
         close_signature: Some(alloy::hex::encode_prefixed(&close)),
@@ -405,7 +396,6 @@ pub async fn create_precompile_close_payload_primitive(
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
         descriptor: None,
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
         close_signature: Some(alloy::hex::encode_prefixed(&close)),
@@ -472,7 +462,6 @@ pub async fn create_precompile_close_payload_with_descriptor_primitive(
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
         descriptor: Some(descriptor),
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
         close_signature: Some(alloy::hex::encode_prefixed(&close)),
@@ -520,7 +509,6 @@ pub async fn create_precompile_close_payload_with_descriptor_and_escrow(
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),
         descriptor: Some(descriptor),
-        settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
         close_signature: Some(alloy::hex::encode_prefixed(&close)),
@@ -670,7 +658,6 @@ where
         cumulative_amount: options.initial_amount,
         deposit: options.deposit,
         descriptor: None,
-        settlement_route: None,
         escrow_contract: options.escrow_contract,
         chain_id: options.chain_id,
         opened: true,
@@ -681,7 +668,6 @@ where
         channel_id: channel_id.to_string(),
         transaction: signed_tx_hex,
         descriptor: None,
-        settlement_route: None,
         authorized_signer: Some(authorized_signer.to_string()),
         cumulative_amount: options.initial_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&voucher_sig),
@@ -980,7 +966,6 @@ pub fn create_precompile_top_up_payload(
         channel_id: channel_id.to_string(),
         transaction,
         descriptor: Some(descriptor),
-        settlement_route: None,
         additional_deposit: additional_deposit.to_string(),
     }
 }
@@ -1177,7 +1162,6 @@ where
         cumulative_amount: options.initial_amount,
         deposit: options.deposit,
         descriptor: Some(descriptor.clone()),
-        settlement_route: None,
         escrow_contract: TIP20_CHANNEL_RESERVE_ADDRESS,
         chain_id: options.chain_id,
         opened: true,
@@ -1188,7 +1172,6 @@ where
         channel_id: channel_id.to_string(),
         transaction: signed_tx_hex,
         descriptor: Some(descriptor),
-        settlement_route: None,
         authorized_signer: Some(authorized_signer.to_string()),
         cumulative_amount: options.initial_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&voucher_sig),
@@ -1429,7 +1412,6 @@ pub async fn try_recover_channel<P: Provider<TempoNetwork>>(
             cumulative_amount: on_chain.settled,
             deposit: on_chain.deposit,
             descriptor: None,
-            settlement_route: None,
             escrow_contract,
             chain_id,
             opened: true,
@@ -1644,7 +1626,6 @@ mod tests {
             cumulative_amount: 1000,
             deposit: 0,
             descriptor: None,
-            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: true,
@@ -2017,7 +1998,6 @@ mod tests {
         let payload = SessionCredentialPayload::Voucher {
             channel_id: "0xabc".to_string(),
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "5000".to_string(),
             signature: "0xdef".to_string(),
         };
@@ -2312,7 +2292,6 @@ mod tests {
         let payload = SessionCredentialPayload::Voucher {
             channel_id: "0xabc".to_string(),
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "5000".to_string(),
             signature: "0xdef".to_string(),
         };
@@ -2410,7 +2389,6 @@ mod tests {
             cumulative_amount: 0,
             deposit: 0,
             descriptor: None,
-            settlement_route: None,
             escrow_contract: Address::ZERO,
             chain_id: 42431,
             opened: false,

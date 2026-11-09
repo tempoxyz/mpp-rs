@@ -387,7 +387,6 @@ async fn test_voucher_rejects_channel_with_wrong_payee() {
         SessionCredentialPayload::Voucher {
             channel_id,
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
         },
@@ -427,7 +426,6 @@ async fn test_voucher_rejects_channel_with_wrong_token() {
         SessionCredentialPayload::Voucher {
             channel_id,
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
         },
@@ -533,7 +531,6 @@ async fn test_voucher_accepts_mixed_case_channel_id() {
         SessionCredentialPayload::Voucher {
             channel_id: upper,
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "2000".to_string(),
             signature: alloy::hex::encode_prefixed(signature),
         },
@@ -593,7 +590,6 @@ async fn test_voucher_returns_session_receipt() {
         SessionCredentialPayload::Voucher {
             channel_id: channel_id.clone(),
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "2000".to_string(),
             signature: alloy::hex::encode_prefixed(signature),
         },
@@ -653,7 +649,6 @@ async fn test_voucher_rejects_signed_amount() {
         SessionCredentialPayload::Voucher {
             channel_id: channel_id.clone(),
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: "+2000".to_string(),
             signature: alloy::hex::encode_prefixed(signature),
         },
@@ -699,7 +694,6 @@ async fn voucher_credential(
         SessionCredentialPayload::Voucher {
             channel_id: state.channel_id.clone(),
             descriptor: None,
-            settlement_route: None,
             cumulative_amount: amount.to_string(),
             signature: alloy::hex::encode_prefixed(signature),
         },

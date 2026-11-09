@@ -39,7 +39,6 @@ fn test_open_on_a_recorded_channel_keeps_the_higher_deposit() {
             chain_id: state.chain_id,
             escrow_contract: state.escrow_contract,
             authorized_signer: state.authorized_signer,
-            settlement_route: None,
             cumulative_amount,
             signature: vec![0xAA; 65],
         };
@@ -167,7 +166,6 @@ mod properties {
             chain_id: state.chain_id,
             escrow_contract: state.escrow_contract,
             authorized_signer: state.authorized_signer,
-            settlement_route: None,
             cumulative_amount,
             signature: vec![0xAA; 65],
         }

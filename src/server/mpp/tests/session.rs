@@ -373,15 +373,11 @@ fn sponsoring_machine_token_mpp<S>(
 }
 
 #[cfg(feature = "tempo")]
-fn session_challenge_details<M, S>(
-    mpp: &Mpp<M, S>,
-) -> crate::protocol::methods::tempo::session::TempoSessionMethodDetails
+fn session_challenge_request<M, S>(mpp: &Mpp<M, S>) -> crate::protocol::intents::SessionRequest
 where
     M: ChargeMethod,
     S: crate::protocol::traits::SessionMethod,
 {
-    use crate::protocol::methods::tempo::session::TempoSessionExt;
-
     let challenge = mpp
         .session_challenge_with_details(
             "1000",
@@ -393,13 +389,12 @@ where
             },
         )
         .unwrap();
-    let request: crate::protocol::intents::SessionRequest = challenge.request.decode().unwrap();
-    request.tempo_session_details().unwrap()
+    challenge.request.decode().unwrap()
 }
 
-/// The Tempo session method broadcasts client transactions as submitted and
-/// has no machine-token open path, so its challenges must not advertise
-/// either capability even when the handler enables them for charges.
+/// The Tempo session method broadcasts client transactions as submitted, so
+/// its challenges must not advertise fee sponsorship even when the handler
+/// enables it for charges. Machine-token funding applies only to charges.
 #[cfg(feature = "tempo")]
 #[test]
 fn test_session_challenge_omits_unsupported_capabilities() {
@@ -417,20 +412,26 @@ fn test_session_challenge_omits_unsupported_capabilities() {
         },
     ));
 
-    let details = session_challenge_details(&mpp);
+    use crate::protocol::methods::tempo::session::TempoSessionExt;
+
+    let request = session_challenge_request(&mpp);
+    let details = request.tempo_session_details().unwrap();
     assert_eq!(details.chain_id, Some(CHAIN_ID));
     assert_eq!(details.fee_payer, None);
-    assert_eq!(details.machine_token_enabled, None);
-    assert_eq!(details.settlement_adapter, None);
-    assert_eq!(details.settlement_recipient, None);
-    assert_eq!(details.settlement_token, None);
+    assert!(request
+        .method_details
+        .as_ref()
+        .unwrap()
+        .get("machineTokenEnabled")
+        .is_none());
 
     let charge: ChargeRequest = mpp.charge("1").unwrap().remove(0).request.decode().unwrap();
     assert!(charge.fee_payer());
     assert!(charge.machine_token_enabled());
 }
 
-/// Session methods that report support keep getting both advertised.
+/// Session methods that sponsor fees keep getting `feePayer` advertised, and
+/// session challenges never advertise machine-token funding.
 #[cfg(feature = "tempo")]
 #[test]
 fn test_session_challenge_advertises_supported_capabilities() {
@@ -457,18 +458,21 @@ fn test_session_challenge_advertises_supported_capabilities() {
         fn supports_fee_payer(&self) -> bool {
             true
         }
-
-        fn supports_machine_tokens(&self) -> bool {
-            true
-        }
     }
 
-    let details = session_challenge_details(&sponsoring_machine_token_mpp(CapableSessionMethod));
-    assert_eq!(details.fee_payer, Some(true));
-    assert_eq!(details.machine_token_enabled, Some(true));
-    assert!(details.settlement_adapter.is_some());
-    assert!(details.settlement_recipient.is_some());
-    assert!(details.settlement_token.is_some());
+    use crate::protocol::methods::tempo::session::TempoSessionExt;
+
+    let request = session_challenge_request(&sponsoring_machine_token_mpp(CapableSessionMethod));
+    assert_eq!(
+        request.tempo_session_details().unwrap().fee_payer,
+        Some(true)
+    );
+    assert!(request
+        .method_details
+        .as_ref()
+        .unwrap()
+        .get("machineTokenEnabled")
+        .is_none());
 }
 
 #[cfg(feature = "tempo")]

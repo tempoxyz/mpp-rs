@@ -5,7 +5,6 @@ use alloy::primitives::{Address, Bytes, B256};
 use alloy::providers::Provider;
 use tempo_alloy::TempoNetwork;
 
-use super::payload::validate_settlement_route;
 use super::precompile;
 use super::receipt::session_receipt;
 use super::{normalize_channel_id, SessionMethod};
@@ -71,24 +70,21 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, descriptor, settlement_route, additional_deposit_str, transaction_str) =
-            match payload {
-                SessionCredentialPayload::TopUp {
-                    channel_id,
-                    descriptor,
-                    settlement_route,
-                    additional_deposit,
-                    transaction,
-                    ..
-                } => (
-                    channel_id,
-                    descriptor.as_ref(),
-                    settlement_route.as_ref(),
-                    additional_deposit,
-                    transaction,
-                ),
-                _ => unreachable!(),
-            };
+        let (channel_id_str, descriptor, additional_deposit_str, transaction_str) = match payload {
+            SessionCredentialPayload::TopUp {
+                channel_id,
+                descriptor,
+                additional_deposit,
+                transaction,
+                ..
+            } => (
+                channel_id,
+                descriptor.as_ref(),
+                additional_deposit,
+                transaction,
+            ),
+            _ => unreachable!(),
+        };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
         let channel = self
@@ -107,7 +103,6 @@ where
                 "channel token does not match session currency",
             ));
         }
-        validate_settlement_route(&channel, details, settlement_route)?;
 
         if channel.finalized || channel.closing {
             return Err(VerificationError::channel_closed(
