@@ -604,7 +604,7 @@ async fn broadcast_with_failed_sync_reply_and_store(
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(asserter);
-    let mut method = ChargeMethod::new(provider);
+    let mut method = ChargeMethod::new(provider).without_store();
     if let Some(store) = store {
         method = method.with_store(store);
     }

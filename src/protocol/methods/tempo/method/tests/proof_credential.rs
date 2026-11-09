@@ -672,3 +672,44 @@ async fn test_store_claims_proofs() {
     method.verify(&credential, &request).await.unwrap();
     assert!(method.verify(&credential, &request).await.is_err());
 }
+
+/// \`ChargeMethod::new\` makes a proof credential single-use without
+/// \`with_store\`.
+#[tokio::test]
+async fn test_new_rejects_replayed_proof_by_default() {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let request = test_charge_request_with_amount("0");
+    let challenge = test_proof_challenge(&request);
+    let signature = proof::sign_proof(
+        &signer,
+        signer.address(),
+        42431,
+        &challenge.id,
+        &challenge.realm,
+    )
+    .await
+    .unwrap();
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        proof::proof_source(signer.address(), 42431),
+        crate::protocol::core::PaymentPayload::proof(signature),
+    );
+
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let method = ChargeMethod::new(provider);
+    method.cached_chain_id.set(42431).unwrap();
+
+    method.verify(&credential, &request).await.unwrap();
+    let err = method.verify(&credential, &request).await.unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
+
+    // Without a store, the same credential is accepted again.
+    let method = method.without_store();
+    method.verify(&credential, &request).await.unwrap();
+    method.verify(&credential, &request).await.unwrap();
+}
