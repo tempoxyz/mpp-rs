@@ -714,3 +714,49 @@ async fn test_new_keeps_no_proof_store_by_default() {
         Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
     );
 }
+
+/// Without `with_store`, HMAC-authenticated proofs are still single-use in a
+/// private default store whose reservations expire, while direct verification
+/// on a clone stores nothing and is not blocked by it.
+#[tokio::test]
+async fn test_new_rejects_replayed_authenticated_proof_by_default() {
+    let request = test_charge_request_with_amount("0");
+    let mut challenge = test_proof_challenge(&request);
+    challenge.expires = Some(
+        (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    let credential = PaymentCredential::with_source(
+        challenge.to_echo(),
+        "did:pkh:eip155:42431:0x0000000000000000000000000000000000000001",
+        crate::protocol::core::PaymentPayload::proof("unused"),
+    );
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let direct = ChargeMethod::new(provider);
+    let mut authenticated = direct.clone();
+    authenticated.authenticated_expiry = true;
+
+    authenticated
+        .reserve_proof_credential(&credential)
+        .await
+        .unwrap();
+    let err = authenticated
+        .reserve_proof_credential(&credential)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
+    );
+    // The clone that verifies directly keeps no proof store.
+    direct.reserve_proof_credential(&credential).await.unwrap();
+
+    // `without_store` removes the default proof store too.
+    let mut bare = authenticated.without_store();
+    bare.authenticated_expiry = true;
+    bare.reserve_proof_credential(&credential).await.unwrap();
+    bare.reserve_proof_credential(&credential).await.unwrap();
+}

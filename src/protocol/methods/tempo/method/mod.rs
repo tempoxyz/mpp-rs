@@ -147,6 +147,9 @@ pub struct ChargeMethod<P> {
     store: Option<Arc<dyn Store>>,
     authenticated_expiry: bool,
     proof_store: Option<Arc<dyn Store>>,
+    /// Proof store for HMAC-authenticated verification when [`Self::proof_store`]
+    /// is unset. Its reservations expire with their Challenge, so it stays bounded.
+    authenticated_proof_store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
@@ -172,9 +175,12 @@ where
     /// method instance: a deployment with several instances or processes must
     /// pass a shared store with [`with_store`](Self::with_store).
     ///
-    /// Zero-amount proof credentials get a replay store only from
-    /// [`with_store`](Self::with_store): a direct proof reservation never
-    /// expires and its key is the client's Challenge ID, so a default store
+    /// Zero-amount proof credentials verified through [`Mpp`](crate::server::Mpp)
+    /// are single-use by default too, in a separate in-memory store whose
+    /// reservations expire with their Challenge. Proofs verified directly with
+    /// [`ChargeMethod::verify`](ChargeMethodTrait::verify) need
+    /// [`with_store`](Self::with_store) to be single-use: their reservations
+    /// never expire and are keyed by the client's Challenge ID, so a default store
     /// would grow with every proof.
     pub fn new(provider: P) -> Self {
         Self {
@@ -183,6 +189,7 @@ where
             store: Some(Arc::new(crate::store::MemoryStore::new())),
             authenticated_expiry: false,
             proof_store: None,
+            authenticated_proof_store: Some(Arc::new(crate::store::MemoryStore::new())),
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,
@@ -274,6 +281,7 @@ where
     /// replays.
     pub fn without_store(mut self) -> Self {
         self.proof_store = None;
+        self.authenticated_proof_store = None;
         self.store = None;
         self
     }
@@ -400,7 +408,7 @@ where
                     expected_chain_id,
                 )
                 .await?;
-            if let Some(store) = &self.proof_store {
+            if let Some(store) = self.active_proof_store() {
                 if store
                     .get(&Self::proof_replay_key(credential))
                     .await
