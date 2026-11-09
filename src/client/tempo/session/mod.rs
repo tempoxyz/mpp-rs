@@ -2054,6 +2054,14 @@ impl TempoSessionProvider {
             challenge_response
         };
 
+        if reqwest::Url::parse(url)
+            .ok()
+            .is_none_or(|requested| requested.origin() != response.url().origin())
+        {
+            return Err(MppError::InvalidConfig(
+                "refusing a session bootstrap snapshot from a different HTTP origin".into(),
+            ));
+        }
         if !response.status().is_success() {
             return Ok(None);
         }
@@ -9553,6 +9561,102 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(proof_valid.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn bootstrap_checks_snapshot_response_origin_before_importing() {
+        use crate::protocol::core::Base64UrlJson;
+        use axum::{
+            http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::head,
+            Router,
+        };
+
+        for authenticated in [false, true] {
+            for cross_origin in [false, true] {
+                let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target_address = target.local_addr().unwrap();
+                let target_task = tokio::spawn(async move {
+                    axum::serve(
+                        target,
+                        Router::new().route("/snapshot", head(|| async { StatusCode::NO_CONTENT })),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = source.local_addr().unwrap();
+                let destination = if cross_origin {
+                    target_address
+                } else {
+                    address
+                };
+                let challenge = PaymentChallenge::new(
+                    "bootstrap-proof",
+                    "127.0.0.1",
+                    "tempo",
+                    "charge",
+                    Base64UrlJson::from_value(&serde_json::json!({
+                        "amount": "0",
+                        "currency": Address::repeat_byte(0x20).to_string(),
+                        "recipient": Address::repeat_byte(0x30).to_string(),
+                        "methodDetails": { "chainId": 4217 }
+                    }))
+                    .unwrap(),
+                )
+                .to_header()
+                .unwrap();
+                let app = Router::new()
+                    .route(
+                        "/bootstrap",
+                        head(move |headers: HeaderMap| {
+                            let challenge = challenge.clone();
+                            async move {
+                                if authenticated && !headers.contains_key(AUTHORIZATION) {
+                                    (
+                                        StatusCode::PAYMENT_REQUIRED,
+                                        [("www-authenticate", challenge)],
+                                    )
+                                        .into_response()
+                                } else {
+                                    (
+                                        StatusCode::TEMPORARY_REDIRECT,
+                                        [("location", format!("http://{destination}/snapshot"))],
+                                    )
+                                        .into_response()
+                                }
+                            }
+                        }),
+                    )
+                    .route("/snapshot", head(|| async { StatusCode::NO_CONTENT }));
+                let source_task =
+                    tokio::spawn(async move { axum::serve(source, app).await.unwrap() });
+                let url = format!("http://{address}/bootstrap");
+                let provider = make_test_provider()
+                    .with_origin(&url.parse().unwrap())
+                    .unwrap();
+                let result = provider
+                    .try_bootstrap_with_headers(
+                        &reqwest::Client::new(),
+                        &url,
+                        reqwest::header::HeaderMap::new(),
+                    )
+                    .await;
+                if cross_origin {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("different HTTP origin"));
+                } else {
+                    assert!(result.unwrap().is_none());
+                }
+                assert!(provider.channels.lock().unwrap().is_empty());
+                source_task.abort();
+                target_task.abort();
+            }
+        }
     }
 
     #[cfg(feature = "axum")]
