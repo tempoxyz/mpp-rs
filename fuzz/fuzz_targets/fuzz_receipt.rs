@@ -14,7 +14,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use mpp::{base64url_encode, format_receipt, parse_receipt, Receipt};
-use mpp_fuzz::{assert_same, is_rfc3339};
+use mpp_fuzz::{assert_same, is_mppx_datetime};
 
 fuzz_target!(|text: &str| {
     check(text);
@@ -38,7 +38,7 @@ fn check(header: &str) -> serde_json::Map<String, serde_json::Value> {
     };
     assert!(receipt.is_success());
     assert!(receipt.method.is_valid());
-    assert!(is_rfc3339(&receipt.timestamp));
+    assert!(is_mppx_datetime(&receipt.timestamp));
 
     let formatted = format_receipt(&receipt).expect("parsed receipt formats");
     let reparsed = parse_receipt(&formatted).expect("formatted receipt parses");
