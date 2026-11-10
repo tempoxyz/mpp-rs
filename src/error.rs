@@ -777,13 +777,18 @@ impl PaymentError for MppError {
             INTERNAL_PROBLEM_DETAIL.to_string()
         });
 
-        // A MACH shortfall carries Tempo Wallet's funding link in its detail;
-        // surface it as a member clients can render.
+        // The session server writes Tempo Wallet's MACH funding link into an
+        // insufficient-balance reason; surface it as a member clients can
+        // render. Other details can echo requester text, and a client error's
+        // typed link names the server's own wallet behind a masked 500, so
+        // neither is read.
         #[cfg(feature = "tempo")]
-        if let Some(url) =
-            crate::protocol::methods::tempo::machine_token::funding_url_in(&problem.detail)
-        {
-            problem.funding_url = Some(url.to_owned());
+        if let Self::InsufficientBalance(Some(reason)) = self {
+            if let Some(url) =
+                crate::protocol::methods::tempo::machine_token::funding_url_in(reason)
+            {
+                problem.funding_url = Some(url.to_owned());
+            }
         }
 
         // Use embedded challenge ID from InvalidChallenge, or the provided one
@@ -1146,6 +1151,21 @@ mod tests {
         );
         assert_eq!(problem.title, "PaymentInsufficientError");
         assert_eq!(problem.status, 402);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn funding_url_is_read_only_from_insufficient_balance() {
+        use crate::protocol::methods::tempo::machine_token::MACH_FUNDING_URL;
+        let link = format!("{MACH_FUNDING_URL}&amount=1.00");
+        let short = MppError::InsufficientBalance(Some(format!("top up from {link}")));
+        assert_eq!(
+            short.to_problem_details(None).funding_url.as_deref(),
+            Some(link.as_str())
+        );
+        // A detail that echoes requester text keeps no fundingUrl.
+        let echoed = MppError::VerificationFailed(Some(format!("bad memo {link}")));
+        assert_eq!(echoed.to_problem_details(None).funding_url, None);
     }
 
     #[test]
