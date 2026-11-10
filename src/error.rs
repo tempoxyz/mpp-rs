@@ -777,13 +777,21 @@ impl PaymentError for MppError {
             INTERNAL_PROBLEM_DETAIL.to_string()
         });
 
-        // A MACH shortfall carries Tempo Wallet's funding link in its detail;
-        // surface it as a member clients can render.
+        // A MACH shortfall carries Tempo Wallet's funding link: typed on a
+        // client error, or in the detail the session server writes for an
+        // insufficient balance. Other details can echo requester text, so only
+        // that error's detail is read.
         #[cfg(feature = "tempo")]
-        if let Some(url) =
-            crate::protocol::methods::tempo::machine_token::funding_url_in(&problem.detail)
         {
-            problem.funding_url = Some(url.to_owned());
+            let url = self.funding_url().or_else(|| match self {
+                Self::InsufficientBalance(Some(reason)) => {
+                    crate::protocol::methods::tempo::machine_token::funding_url_in(reason)
+                }
+                _ => None,
+            });
+            if let Some(url) = url {
+                problem.funding_url = Some(url.to_owned());
+            }
         }
 
         // Use embedded challenge ID from InvalidChallenge, or the provided one
@@ -1146,6 +1154,21 @@ mod tests {
         );
         assert_eq!(problem.title, "PaymentInsufficientError");
         assert_eq!(problem.status, 402);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn funding_url_is_read_only_from_insufficient_balance() {
+        use crate::protocol::methods::tempo::machine_token::MACH_FUNDING_URL;
+        let link = format!("{MACH_FUNDING_URL}&amount=1.00");
+        let short = MppError::InsufficientBalance(Some(format!("top up from {link}")));
+        assert_eq!(
+            short.to_problem_details(None).funding_url.as_deref(),
+            Some(link.as_str())
+        );
+        // A detail that echoes requester text keeps no fundingUrl.
+        let echoed = MppError::VerificationFailed(Some(format!("bad memo {link}")));
+        assert_eq!(echoed.to_problem_details(None).funding_url, None);
     }
 
     #[test]
