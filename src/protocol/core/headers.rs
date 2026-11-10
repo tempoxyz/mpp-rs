@@ -114,9 +114,56 @@ pub fn with_private_cache_control(value: Option<&str>) -> String {
     }
 }
 
-/// Validate ISO 8601 / RFC 3339 timestamp format.
+/// Validate an ISO 8601 datetime's shape, as mppx's \`datetime()\` schema does:
+/// \`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$\`.
+///
+/// Like mppx, this checks the form only, not the calendar, so a value such as
+/// \`2025-02-30T12:00:00Z\` parses. Expiry checks still parse the value and
+/// treat one they cannot read as expired.
 fn is_iso8601_timestamp(s: &str) -> bool {
-    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).is_ok()
+    fn digits(bytes: &[u8]) -> bool {
+        !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
+    }
+
+    let bytes = s.as_bytes();
+    if bytes.len() < 20
+        || !digits(&bytes[0..4])
+        || bytes[4] != b'-'
+        || !digits(&bytes[5..7])
+        || bytes[7] != b'-'
+        || !digits(&bytes[8..10])
+        || bytes[10] != b'T'
+        || !digits(&bytes[11..13])
+        || bytes[13] != b':'
+        || !digits(&bytes[14..16])
+        || bytes[16] != b':'
+        || !digits(&bytes[17..19])
+    {
+        return false;
+    }
+
+    let rest = &bytes[19..];
+    let offset = if rest.ends_with(b"Z") {
+        rest.len() - 1
+    } else if rest.len() >= 6 {
+        let tz = &rest[rest.len() - 6..];
+        if !matches!(tz[0], b'+' | b'-')
+            || !digits(&tz[1..3])
+            || tz[3] != b':'
+            || !digits(&tz[4..6])
+        {
+            return false;
+        }
+        rest.len() - 6
+    } else {
+        return false;
+    };
+
+    match &rest[..offset] {
+        [] => true,
+        [b'.', fraction @ ..] => digits(fraction),
+        _ => false,
+    }
 }
 
 /// Validate digest format: `sha-256=` followed by the base64 hash, either bare
@@ -655,6 +702,59 @@ mod tests {
         let err = parse_www_authenticate(header).unwrap_err();
 
         assert!(err.to_string().contains("Invalid expires timestamp"));
+    }
+
+    #[test]
+    fn test_is_iso8601_timestamp_matches_mppx_shape() {
+        for valid in [
+            "2025-01-06T12:00:00Z",
+            "2025-01-06T12:00:00.123Z",
+            "2025-01-06T12:00:00+05:30",
+            "2025-01-06T12:00:00.5-08:00",
+            "2025-02-30T12:00:00Z",
+            "2025-13-45T25:61:61Z",
+        ] {
+            assert!(is_iso8601_timestamp(valid), "{valid}");
+        }
+        for invalid in [
+            "not-a-date",
+            "2025-01-06",
+            "2025-01-06T12:00:00",
+            "2025-01-06t12:00:00Z",
+            "2025-01-06 12:00:00Z",
+            "2025-01-06T12:00:00z",
+            "2025-01-06T12:00:00.Z",
+            "2025-01-06T12:00Z",
+            "2025-01-06T12:00:00+0530",
+            "2025-01-06T12:00:00+05:30Z",
+            "20250-01-06T12:00:00Z",
+            "2025-01-06T12:00:00Z ",
+            "２025-01-06T12:00:00Z",
+        ] {
+            assert!(!is_iso8601_timestamp(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_accepts_calendar_invalid_expires_like_mppx() {
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", expires="2025-02-30T12:00:00Z""#;
+
+        let parsed = parse_www_authenticate(header).unwrap();
+
+        assert_eq!(parsed.expires.as_deref(), Some("2025-02-30T12:00:00Z"));
+        // An expiry that cannot be read as a date stays fail-closed.
+        assert!(parsed.is_expired());
+        assert!(parsed.expires_at().is_none());
+    }
+
+    #[test]
+    fn test_parse_receipt_accepts_calendar_invalid_timestamp_like_mppx() {
+        let json = r#"{"method":"tempo","reference":"0xabc","status":"success","timestamp":"2025-02-30T12:00:00Z"}"#;
+        let wire = base64url_encode(json.as_bytes());
+
+        let receipt = parse_receipt(&wire).unwrap();
+
+        assert_eq!(receipt.timestamp, "2025-02-30T12:00:00Z");
     }
 
     #[test]
