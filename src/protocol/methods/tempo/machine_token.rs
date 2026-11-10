@@ -193,13 +193,32 @@ pub fn format_amount(amount: u128) -> String {
 
 /// Returns the first MACH funding link (see [`funding_url`]) in `text`, such
 /// as a problem's `detail`.
+///
+/// Only the parameters [`funding_url`] writes are kept: an `address` of 40 hex
+/// digits, then an `amount` in dollars and cents. Anything else after the base
+/// link ends it, so text around the link can't reshape it.
 pub fn funding_url_in(text: &str) -> Option<&str> {
+    fn take(rest: &str, prefix: &str, valid: impl Fn(&str) -> Option<usize>) -> usize {
+        rest.strip_prefix(prefix)
+            .and_then(valid)
+            .map_or(0, |len| prefix.len() + len)
+    }
     let start = text.find(MACH_FUNDING_URL)?;
-    let rest = &text[start..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == ')' || c == ',' || c == ';')
-        .unwrap_or(rest.len());
-    Some(rest[..end].trim_end_matches('.'))
+    let mut end = start + MACH_FUNDING_URL.len();
+    end += take(&text[end..], "&address=0x", |value| {
+        let hex = value.bytes().take_while(u8::is_ascii_hexdigit).count();
+        (hex == 40).then_some(40)
+    });
+    end += take(&text[end..], "&amount=", |value| {
+        let whole = value.bytes().take_while(u8::is_ascii_digit).count();
+        let cents = value[whole..].strip_prefix('.')?;
+        (whole > 0
+            && cents.len() >= 2
+            && cents.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+            && !cents.as_bytes().get(2).is_some_and(u8::is_ascii_digit))
+        .then_some(whole + 3)
+    });
+    Some(&text[start..end])
 }
 
 /// machineUSD on Tempo mainnet, used only by the legacy session route.
@@ -430,6 +449,15 @@ mod tests {
             Some(url.as_str())
         );
         assert_eq!(funding_url_in("no link here"), None);
+        // Text that isn't a parameter the link builder writes ends the link.
+        assert_eq!(
+            funding_url_in(&format!("{MACH_FUNDING_URL}&address=evil&amount=1.00")),
+            Some(MACH_FUNDING_URL)
+        );
+        assert_eq!(
+            funding_url_in(&format!("{url}&redirect=https://example.com")),
+            Some(url.as_str())
+        );
     }
 
     #[test]
