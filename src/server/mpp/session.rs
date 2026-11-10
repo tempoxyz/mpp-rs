@@ -171,7 +171,10 @@ where
 
         let default_expires;
         let expires = match options.expires {
-            Some(e) => Some(e),
+            Some(e) => {
+                crate::expires::ensure_verifiable(e)?;
+                Some(e)
+            }
             None => {
                 let expiry_time = OffsetDateTime::now_utc()
                     + Duration::minutes(
