@@ -1116,7 +1116,20 @@ where
                 crate::client::tempo::signing::TempoSigningMode::Keychain { .. }
             ),
         );
-        transaction_options.gas_limit = estimate_gas(provider, request).await?;
+        transaction_options.gas_limit = match estimate_gas(provider, request).await {
+            Ok(gas) => gas,
+            Err(error) => {
+                return Err(explain_machine_token_deposit(
+                    error,
+                    provider,
+                    options.chain_id,
+                    payer,
+                    options.currency,
+                    options.deposit,
+                )
+                .await)
+            }
+        };
     }
     let unsigned_tx = build_tempo_tx(transaction_options);
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
@@ -1197,6 +1210,33 @@ where
     Ok((entry, payload))
 }
 
+/// Reports an insufficient-balance failure depositing `deposit` of `token`
+/// into a MACH channel as the payer's MACH shortfall with the link to buy it
+/// (see [`crate::protocol::methods::tempo::machine_token::funding_url`]).
+/// Deposits in other tokens keep the original error.
+#[cfg(feature = "tempo")]
+async fn explain_machine_token_deposit<P: Provider<TempoNetwork>>(
+    error: MppError,
+    provider: &P,
+    chain_id: u64,
+    payer: Address,
+    token: Address,
+    deposit: u128,
+) -> MppError {
+    if crate::protocol::methods::tempo::machine_token::token(chain_id) != Some(token) {
+        return error;
+    }
+    crate::client::tempo::error::with_machine_token_funding(
+        error,
+        provider,
+        chain_id,
+        payer,
+        token,
+        U256::from(deposit),
+    )
+    .await
+}
+
 /// Prepare and sign a descriptor-backed TIP-1034 top-up transaction.
 ///
 /// This mirrors MPPx's `createTopUpPayload`: the returned transaction is sent
@@ -1227,6 +1267,7 @@ where
     let primitive_signer = signer.clone().into();
     let signature_type = primitive_signer.signature_type();
     let descriptor = precompile_descriptor_from_wire(options.descriptor)?;
+    let token = descriptor.token;
     let mut calls = options.prefix_calls;
     calls.push(Call {
         to: TxKind::Call(TIP20_CHANNEL_RESERVE_ADDRESS),
@@ -1273,7 +1314,20 @@ where
                 crate::client::tempo::signing::TempoSigningMode::Keychain { .. }
             ),
         );
-        transaction_options.gas_limit = estimate_gas(provider, request).await?;
+        transaction_options.gas_limit = match estimate_gas(provider, request).await {
+            Ok(gas) => gas,
+            Err(error) => {
+                return Err(explain_machine_token_deposit(
+                    error,
+                    provider,
+                    options.chain_id,
+                    payer,
+                    token,
+                    options.additional_deposit,
+                )
+                .await)
+            }
+        };
     }
     let mut unsigned_tx = build_tempo_tx(transaction_options);
     unsigned_tx.valid_after = valid_after;
@@ -1634,6 +1688,62 @@ mod tests {
             error,
             MppError::Tempo(crate::client::tempo::TempoClientError::InsufficientBalance { .. })
         ));
+        assert!(error.funding_url().is_none());
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn mach_top_up_short_of_mach_links_the_funding_page() {
+        use crate::protocol::methods::tempo::machine_token::{MACH, MACH_FUNDING_URL};
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            signers::local::PrivateKeySigner,
+        };
+        use tempo_alloy::contracts::precompiles::ITIP20;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800");
+        asserter.push_failure_msg("execution reverted: insufficient balance");
+        asserter.push_success(&Bytes::from(ITIP20::balanceOfCall::abi_encode_returns(
+            &U256::from(1_000_000),
+        )));
+        let provider =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+        let signer = PrivateKeySigner::random();
+        let payer = signer.address();
+        let descriptor = ChannelDescriptor {
+            payer: payer.to_string(),
+            payee: Address::repeat_byte(0x11).to_string(),
+            operator: Address::ZERO.to_string(),
+            token: MACH.to_string(),
+            salt: B256::repeat_byte(0x33).to_string(),
+            authorized_signer: payer.to_string(),
+            expiring_nonce_hash: B256::repeat_byte(0x44).to_string(),
+        };
+
+        let error = create_precompile_top_up_transaction_payload(
+            &provider,
+            &signer,
+            None,
+            payer,
+            TopUpPrecompilePayloadOptions {
+                prefix_calls: vec![],
+                descriptor: &descriptor,
+                fee_token: Address::repeat_byte(0x22),
+                additional_deposit: 5_000_000,
+                chain_id: 4217,
+                fee_payer: false,
+            },
+        )
+        .await
+        .expect_err("a top-up short of MACH must fail before it is signed");
+
+        let url = format!("{MACH_FUNDING_URL}&address={payer}&amount=4.00");
+        assert_eq!(error.funding_url(), Some(url.as_str()));
+        assert_eq!(
+            error.to_string(),
+            format!("Insufficient MACH balance: have 1.00, need 5.00. Buy MACH at {url}")
+        );
     }
 
     #[test]

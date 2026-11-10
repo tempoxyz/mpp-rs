@@ -79,6 +79,16 @@ pub struct PaymentErrorDetails {
     /// This is an RFC 9457 extension member.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+
+    /// Where the payer can buy the balance it is missing, such as Tempo
+    /// Wallet's MACH funding page, when the problem is a shortfall the payer
+    /// can fund. This is an RFC 9457 extension member, `fundingUrl`.
+    #[serde(
+        rename = "fundingUrl",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub funding_url: Option<String>,
 }
 
 impl PaymentErrorDetails {
@@ -91,6 +101,7 @@ impl PaymentErrorDetails {
             detail: String::new(),
             challenge_id: None,
             hint: None,
+            funding_url: None,
         }
     }
 
@@ -141,6 +152,12 @@ impl PaymentErrorDetails {
     /// Set the hint message providing guidance on how to resolve this error.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Set the link where the payer can buy the balance it is missing.
+    pub fn with_funding_url(mut self, funding_url: impl Into<String>) -> Self {
+        self.funding_url = Some(funding_url.into());
         self
     }
 }
@@ -674,6 +691,16 @@ impl MppError {
     pub fn is_payment_problem(&self) -> bool {
         self.problem_type_suffix().is_some()
     }
+
+    /// Where the payer can buy the balance it is missing, such as the MACH
+    /// funding link a Tempo client reports when the payer is short of MACH.
+    pub fn funding_url(&self) -> Option<&str> {
+        match self {
+            #[cfg(all(feature = "client", feature = "tempo"))]
+            Self::Tempo(error) => error.funding_url(),
+            _ => None,
+        }
+    }
 }
 
 impl PaymentError for MppError {
@@ -749,6 +776,15 @@ impl PaymentError for MppError {
         } else {
             INTERNAL_PROBLEM_DETAIL.to_string()
         });
+
+        // A MACH shortfall carries Tempo Wallet's funding link in its detail;
+        // surface it as a member clients can render.
+        #[cfg(feature = "tempo")]
+        if let Some(url) =
+            crate::protocol::methods::tempo::machine_token::funding_url_in(&problem.detail)
+        {
+            problem.funding_url = Some(url.to_owned());
+        }
 
         // Use embedded challenge ID from InvalidChallenge, or the provided one
         let embedded_id = match self {

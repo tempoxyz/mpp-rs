@@ -135,6 +135,73 @@ pub const MACH_SWAPPER_MAINNET: Address = address!("F72E5107c32C655ffA7539a3C8e9
 /// Canonical MACH swapper on Tempo Moderato.
 pub const MACH_SWAPPER_TESTNET: Address = address!("d05f8EdFBB54Da0d765C9fE9b2B3f7d2E3a8C466");
 
+/// Tempo Wallet's MACH funding page, where a payer buys MACH on Tempo mainnet.
+///
+/// [`funding_url`] adds the payer's address and the amount to buy. MACH is
+/// sold only on mainnet, so the link names chain ID 4217.
+pub const MACH_FUNDING_URL: &str =
+    "https://wallet.tempo.xyz/agent?action=fund&intent=mach&chainId=4217";
+
+/// Decimals of MACH, which is worth 1 USD per whole token.
+pub const MACH_DECIMALS: u8 = 6;
+
+/// Builds the link where a payer buys MACH, or `None` on chains other than
+/// Tempo mainnet, where MACH is not sold.
+///
+/// `address` is the payer, which the wallet requires to be signed in; pass it
+/// only when known. `amount` is the MACH to buy in base units, rounded up to
+/// whole cents since MACH is worth 1 USD; zero is left out.
+///
+/// ```
+/// use mpp::protocol::methods::tempo::machine_token::{funding_url, MACH_FUNDING_URL};
+///
+/// assert_eq!(funding_url(4217, None, None).as_deref(), Some(MACH_FUNDING_URL));
+/// assert_eq!(
+///     funding_url(4217, None, Some(1_250_001)).unwrap(),
+///     format!("{MACH_FUNDING_URL}&amount=1.26"),
+/// );
+/// assert!(funding_url(42431, None, None).is_none());
+/// ```
+pub fn funding_url(
+    chain_id: u64,
+    address: Option<Address>,
+    amount: Option<u128>,
+) -> Option<String> {
+    if chain_id != CHAIN_ID {
+        return None;
+    }
+    let mut url = MACH_FUNDING_URL.to_owned();
+    if let Some(address) = address {
+        url.push_str(&format!("&address={address}"));
+    }
+    if let Some(amount) = amount.filter(|amount| *amount > 0) {
+        // 10^(6 - 2) base units per cent.
+        let cents = amount.div_ceil(10_000);
+        url.push_str(&format!("&amount={}.{:02}", cents / 100, cents % 100));
+    }
+    Some(url)
+}
+
+/// Formats MACH base units as a decimal amount with at least two places,
+/// such as `0.25` or `1.000001`.
+pub fn format_amount(amount: u128) -> String {
+    let scale = 10u128.pow(u32::from(MACH_DECIMALS));
+    let fraction = format!("{:06}", amount % scale);
+    let fraction = fraction.trim_end_matches('0');
+    format!("{}.{fraction:0<2}", amount / scale)
+}
+
+/// Returns the first MACH funding link (see [`funding_url`]) in `text`, such
+/// as a problem's `detail`.
+pub fn funding_url_in(text: &str) -> Option<&str> {
+    let start = text.find(MACH_FUNDING_URL)?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ')' || c == ',' || c == ';')
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim_end_matches('.'))
+}
+
 /// machineUSD on Tempo mainnet, used only by the legacy session route.
 pub const MACHINE_TOKEN_MAINNET: Address = address!("20C0000000000000000000003793c39601711f19");
 /// Canonical machineUSD swapper on Tempo mainnet.
@@ -318,6 +385,51 @@ mod tests {
             recipient: Address::repeat_byte(0x22),
             memo: Some([0xab; 32]),
         }
+    }
+
+    #[test]
+    fn funding_url_links_mainnet_only() {
+        let payer = Address::repeat_byte(0x11);
+        assert_eq!(
+            funding_url(CHAIN_ID, None, None).as_deref(),
+            Some(MACH_FUNDING_URL)
+        );
+        assert_eq!(
+            funding_url(CHAIN_ID, Some(payer), Some(750_000)).unwrap(),
+            format!("{MACH_FUNDING_URL}&address={payer}&amount=0.75")
+        );
+        assert_eq!(
+            funding_url(CHAIN_ID, None, Some(1)).unwrap(),
+            format!("{MACH_FUNDING_URL}&amount=0.01")
+        );
+        assert_eq!(
+            funding_url(CHAIN_ID, None, Some(12_000_000)).unwrap(),
+            format!("{MACH_FUNDING_URL}&amount=12.00")
+        );
+        assert_eq!(
+            funding_url(CHAIN_ID, None, Some(0)).as_deref(),
+            Some(MACH_FUNDING_URL)
+        );
+        assert!(funding_url(MODERATO_CHAIN_ID, Some(payer), Some(1)).is_none());
+    }
+
+    #[test]
+    fn formats_amounts_and_finds_links() {
+        assert_eq!(format_amount(0), "0.00");
+        assert_eq!(format_amount(250_000), "0.25");
+        assert_eq!(format_amount(1_000_001), "1.000001");
+        assert_eq!(format_amount(12_000_000), "12.00");
+
+        let url = funding_url(CHAIN_ID, Some(Address::repeat_byte(0x11)), Some(1)).unwrap();
+        assert_eq!(
+            funding_url_in(&format!("short; buy MACH at {url}.")),
+            Some(url.as_str())
+        );
+        assert_eq!(
+            funding_url_in(&format!("(buy MACH: {url}) more")),
+            Some(url.as_str())
+        );
+        assert_eq!(funding_url_in("no link here"), None);
     }
 
     #[test]

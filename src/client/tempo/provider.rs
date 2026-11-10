@@ -43,17 +43,45 @@ pub(super) fn prepare_charge_request(
     Ok(charge)
 }
 
-/// Builds the charge for a challenge, funded like [`fund`].
-async fn prepare_funded_charge(
-    challenge: &PaymentChallenge,
-    expected_chain_id: Option<u64>,
-    client_id: Option<&str>,
-    autoswap: Option<&AutoswapConfig>,
-    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
-    from: alloy::primitives::Address,
-) -> Result<FundedCharge, MppError> {
-    let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
-    fund_routed(charge, autoswap, provider, from).await
+/// A charge the payer can fund with MACH: one that names MACH as its
+/// currency, or a `machineTokenEnabled` charge the MACH swapper can fund.
+pub(super) struct MachineTokenPayment {
+    chain_id: u64,
+    currency: alloy::primitives::Address,
+    amount: alloy::primitives::U256,
+}
+
+impl MachineTokenPayment {
+    /// Reports an insufficient-balance failure paying this charge as the
+    /// payer's MACH shortfall with the link to buy MACH, when MACH is sold on
+    /// the charge's chain and the payer holds less than the charge amount.
+    pub(super) async fn explain(
+        &self,
+        error: MppError,
+        provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+        from: alloy::primitives::Address,
+    ) -> MppError {
+        super::error::with_machine_token_funding(
+            error,
+            provider,
+            self.chain_id,
+            from,
+            self.currency,
+            self.amount,
+        )
+        .await
+    }
+}
+
+/// The MACH funding a charge accepts, if any (see [`MachineTokenPayment`]).
+pub(super) fn machine_token_payment(charge: &TempoCharge) -> Option<MachineTokenPayment> {
+    let mach = crate::protocol::methods::tempo::machine_token::token(charge.chain_id())?;
+    (!charge.amount().is_zero() && (charge.machine_token_enabled() || charge.currency() == mach))
+        .then(|| MachineTokenPayment {
+            chain_id: charge.chain_id(),
+            currency: charge.currency(),
+            amount: charge.amount(),
+        })
 }
 
 /// Picks the fee token for an unsponsored charge: the configured one, else the
@@ -692,31 +720,31 @@ impl PaymentProvider for TempoProvider {
         }
         let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
         self.ensure_allowed_chain(Some(chain_id))?;
-        let funded = prepare_funded_charge(
-            challenge,
-            Some(chain_id),
-            self.client_id.as_deref(),
-            self.autoswap.as_ref(),
-            &rpc_provider,
-            from,
-        )
-        .await?;
-
-        let options = SignOptions {
-            signing_mode: Some(self.signing_mode.clone()),
-            fee_token: select_fee_token(
-                self.fee_token,
-                funded.fee_token,
-                funded.charge.currency(),
-                funded.swapped,
-            ),
-            ..Default::default()
-        };
-        let signed = funded
-            .charge
-            .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
-            .await?;
-        Ok(signed.into_credential())
+        let charge = prepare_charge_request(challenge, Some(chain_id), self.client_id.as_deref())?;
+        let machine_token = machine_token_payment(&charge);
+        let paid = async {
+            let funded = fund_routed(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
+            let options = SignOptions {
+                signing_mode: Some(self.signing_mode.clone()),
+                fee_token: select_fee_token(
+                    self.fee_token,
+                    funded.fee_token,
+                    funded.charge.currency(),
+                    funded.swapped,
+                ),
+                ..Default::default()
+            };
+            funded
+                .charge
+                .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
+                .await
+        }
+        .await;
+        match (paid, machine_token) {
+            (Ok(signed), _) => Ok(signed.into_credential()),
+            (Err(error), Some(payment)) => Err(payment.explain(error, &rpc_provider, from).await),
+            (Err(error), None) => Err(error),
+        }
     }
 
     fn accept_payment_header(&self) -> Option<String> {

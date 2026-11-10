@@ -391,6 +391,7 @@ async fn swap_from<P: alloy::providers::Provider<tempo_alloy::TempoNetwork>>(
                 token: token_in.to_string(),
                 available: balance.to_string(),
                 required: max_amount_in.to_string(),
+                funding_url: None,
             },
         ));
     }
