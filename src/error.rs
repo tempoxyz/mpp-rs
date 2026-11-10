@@ -777,19 +777,16 @@ impl PaymentError for MppError {
             INTERNAL_PROBLEM_DETAIL.to_string()
         });
 
-        // A MACH shortfall carries Tempo Wallet's funding link: typed on a
-        // client error, or in the detail the session server writes for an
-        // insufficient balance. Other details can echo requester text, so only
-        // that error's detail is read.
+        // The session server writes Tempo Wallet's MACH funding link into an
+        // insufficient-balance reason; surface it as a member clients can
+        // render. Other details can echo requester text, and a client error's
+        // typed link names the server's own wallet behind a masked 500, so
+        // neither is read.
         #[cfg(feature = "tempo")]
-        {
-            let url = self.funding_url().or_else(|| match self {
-                Self::InsufficientBalance(Some(reason)) => {
-                    crate::protocol::methods::tempo::machine_token::funding_url_in(reason)
-                }
-                _ => None,
-            });
-            if let Some(url) = url {
+        if let Self::InsufficientBalance(Some(reason)) = self {
+            if let Some(url) =
+                crate::protocol::methods::tempo::machine_token::funding_url_in(reason)
+            {
                 problem.funding_url = Some(url.to_owned());
             }
         }
