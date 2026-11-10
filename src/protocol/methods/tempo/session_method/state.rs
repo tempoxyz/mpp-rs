@@ -141,6 +141,21 @@ impl ChannelState {
         })
     }
 
+    /// The link where the payer buys the MACH that a deposit too small to
+    /// cover `amount` lacks, for a MACH channel on a chain that sells MACH.
+    /// The payer may already hold it, so the link names the deposit's
+    /// shortfall rather than a wallet balance.
+    fn machine_token_top_up_url(&self, amount: u128) -> Option<String> {
+        use crate::protocol::methods::tempo::machine_token;
+
+        if machine_token::token(self.chain_id) != Some(self.token) {
+            return None;
+        }
+        let unspent_deposit = self.deposit.saturating_sub(self.spent);
+        let shortfall = amount.checked_sub(unspent_deposit).filter(|s| *s > 0)?;
+        machine_token::funding_url(self.chain_id, Some(self.payer), Some(shortfall))
+    }
+
     /// Charge `amount` against the accepted balance.
     pub(super) fn deduct(self, amount: u128) -> Result<Self, VerificationError> {
         if self.finalized {
@@ -162,10 +177,11 @@ impl ChannelState {
                 ..self
             })
         } else {
-            Err(VerificationError::insufficient_balance(format!(
-                "requested {}, available {}",
-                amount, available
-            )))
+            let mut message = format!("requested {}, available {}", amount, available);
+            if let Some(url) = self.machine_token_top_up_url(amount) {
+                message.push_str(&format!("; top up the channel with MACH from {url}"));
+            }
+            Err(VerificationError::insufficient_balance(message))
         }
     }
 

@@ -1102,6 +1102,7 @@ impl TempoSessionProvider {
     async fn autoswap_calls<P: Provider<TempoNetwork>>(
         &self,
         provider: &P,
+        chain_id: u64,
         payer: Address,
         currency: Address,
         amount: u128,
@@ -1109,14 +1110,25 @@ impl TempoSessionProvider {
         let Some(config) = &self.autoswap else {
             return Ok((Vec::new(), None));
         };
-        let route = super::autoswap::resolve_autoswap_route(
+        // A MACH deposit autoswap can't cover reports the MACH shortfall and the
+        // link to buy it, as the gas-estimation path below does.
+        let route = match super::autoswap::resolve_autoswap_route(
             provider,
             payer,
             currency,
             U256::from(amount),
             config,
         )
-        .await?;
+        .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return Err(channel_ops::explain_machine_token_deposit(
+                    error, provider, chain_id, payer, currency, amount,
+                )
+                .await)
+            }
+        };
         let calls = route
             .as_ref()
             .map(|route| route.calls.clone())
@@ -2561,7 +2573,13 @@ impl TempoSessionProvider {
             .parse()
             .mpp_config("invalid TIP-1034 descriptor token")?;
         let (prefix_calls, route) = self
-            .autoswap_calls(&self.rpc_provider, payer, currency, additional_deposit)
+            .autoswap_calls(
+                &self.rpc_provider,
+                entry.chain_id,
+                payer,
+                currency,
+                additional_deposit,
+            )
             .await?;
         let payload = create_precompile_top_up_transaction_payload(
             &self.rpc_provider,
@@ -4254,7 +4272,7 @@ impl TempoSessionProvider {
 
         let (mut entry, mut payload) = if precompile {
             let (prefix_calls, route) = self
-                .autoswap_calls(&self.rpc_provider, payer, currency, deposit)
+                .autoswap_calls(&self.rpc_provider, chain_id, payer, currency, deposit)
                 .await?;
             create_precompile_open_payload(
                 &self.rpc_provider,
