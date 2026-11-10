@@ -352,7 +352,7 @@ pub fn is_well_formed_echo(echo: &ChallengeEcho) -> bool {
     !echo.id.is_empty()
         && !intent.is_empty()
         && !intent.contains('|')
-        && echo.expires.as_deref().is_none_or(is_rfc3339)
+        && echo.expires.as_deref().is_none_or(is_mppx_datetime)
         && echo.digest.as_deref().is_none_or(is_sha256_digest)
         && echo
             .opaque
@@ -375,8 +375,46 @@ fn is_sha256_digest(digest: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"+/-_=".contains(&b))
 }
 
-pub fn is_rfc3339(timestamp: &str) -> bool {
-    time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339).is_ok()
+/// Whether `timestamp` has the shape mppx's `datetime()` schema accepts:
+/// `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$`.
+///
+/// Like mppx (and the SDK's parser), this checks the form only, not the
+/// calendar. It is written independently of the SDK's matcher so the fuzz
+/// targets compare two implementations of the same rule.
+pub fn is_mppx_datetime(timestamp: &str) -> bool {
+    fn matches_template(value: &str, template: &str) -> bool {
+        value.len() == template.len()
+            && value.bytes().zip(template.bytes()).all(|(b, t)| match t {
+                b'd' => b.is_ascii_digit(),
+                _ => b == t,
+            })
+    }
+
+    let Some((date_time, rest)) = timestamp.split_at_checked(19) else {
+        return false;
+    };
+    if !matches_template(date_time, "dddd-dd-ddTdd:dd:dd") {
+        return false;
+    }
+    let fraction = if let Some(fraction) = rest.strip_suffix('Z') {
+        fraction
+    } else {
+        let Some((fraction, offset)) = rest
+            .len()
+            .checked_sub(6)
+            .and_then(|at| rest.split_at_checked(at))
+        else {
+            return false;
+        };
+        if !(matches_template(offset, "+dd:dd") || matches_template(offset, "-dd:dd")) {
+            return false;
+        }
+        fraction
+    };
+    fraction.is_empty()
+        || fraction
+            .strip_prefix('.')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `value` consists only of the bytes `HeaderValue::to_str` accepts:

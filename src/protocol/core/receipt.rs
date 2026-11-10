@@ -23,24 +23,12 @@ pub struct Receipt {
     pub reference: String,
 
     /// Merchant correlation reference, echoed from the credential payload.
-    /// An explicit `null` is rejected, as mppx's `z.optional(z.string())` does.
-    #[serde(
-        rename = "externalId",
-        default,
-        deserialize_with = "deserialize_present_string",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
 
     /// Server-issued subscription identifier, present on receipts for the
     /// subscription intent (activation and renewal).
-    /// An explicit `null` is rejected, as mppx's `z.optional(z.string())` does.
-    #[serde(
-        rename = "subscriptionId",
-        default,
-        deserialize_with = "deserialize_present_string",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "subscriptionId", skip_serializing_if = "Option::is_none")]
     pub subscription_id: Option<String>,
 
     /// Currency actually debited to fund the payment, when known. It can
@@ -220,35 +208,6 @@ mod tests {
             Receipt::from_header(&absent).unwrap().funding_currency(),
             None
         );
-    }
-
-    #[test]
-    fn test_parse_receipt_rejects_null_external_and_subscription_ids() {
-        for field in ["externalId", "subscriptionId"] {
-            let null = encode_receipt(&format!(
-                r#"{{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc","{field}":null}}"#
-            ));
-            assert!(Receipt::from_header(&null).is_err(), "{field}: null");
-            let number = encode_receipt(&format!(
-                r#"{{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc","{field}":1}}"#
-            ));
-            assert!(Receipt::from_header(&number).is_err(), "{field}: 1");
-            let present = encode_receipt(&format!(
-                r#"{{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc","{field}":"id_1"}}"#
-            ));
-            let receipt = Receipt::from_header(&present).unwrap();
-            let value = if field == "externalId" {
-                receipt.external_id
-            } else {
-                receipt.subscription_id
-            };
-            assert_eq!(value.as_deref(), Some("id_1"));
-        }
-        let absent = encode_receipt(
-            r#"{"status":"success","method":"tempo","timestamp":"2024-01-01T00:00:00Z","reference":"0xabc"}"#,
-        );
-        let receipt = Receipt::from_header(&absent).unwrap();
-        assert!(receipt.external_id.is_none() && receipt.subscription_id.is_none());
     }
 
     #[test]
