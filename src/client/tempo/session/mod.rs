@@ -4525,11 +4525,8 @@ impl PaymentProvider for TempoSessionProvider {
         ) {
             return None;
         }
-        if state
-            .challenge
-            .expires_at()
-            .is_some_and(|expires| expires <= time::OffsetDateTime::now_utc())
-        {
+        // Fail closed: an \`expires\` that does not read as a date counts as expired.
+        if state.challenge.is_expired() {
             self.prepaid.lock().unwrap().remove(context.url.as_str());
             return None;
         }
@@ -10136,6 +10133,63 @@ mod tests {
             .expect("the pinned clone trusts the realm");
         assert_eq!(credential.challenge.realm, "realm.example");
         assert_eq!(unpinned.cumulative(), 3_000);
+    }
+
+    #[tokio::test]
+    async fn prepaid_vouchers_skip_challenges_with_unreadable_expires() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider()
+            .with_prepaid_requests(2)
+            .with_channel_store(store.clone());
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        let stored = StoredChannelEntry {
+            origin: Some("https://example.test".into()),
+            ..TempoSessionProvider::stored_entry(&entry).unwrap()
+        };
+        store
+            .set_at(
+                &store::origin_channel_key(&stored.key(), "https://example.test"),
+                &stored,
+            )
+            .await
+            .unwrap();
+        let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+        provider.bind_origin(url.as_str()).unwrap();
+        let cache = |expires: &str| {
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            challenge.expires = Some(expires.into());
+            challenge.realm = "example.test".into();
+            provider.prepaid.lock().unwrap().insert(
+                url.to_string(),
+                PrepaidVoucher {
+                    challenge,
+                    channel_id: channel_id.to_string(),
+                    spent: 1_000,
+                    price: 1_000,
+                },
+            );
+        };
+        let context = || PaymentContext {
+            url: url.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+
+        // Matches mppx's shape, so it parses, but is not a calendar date.
+        cache("2099-02-30T12:00:00Z");
+        assert!(provider.prepaid_credential(context()).await.is_none());
+        assert!(provider.prepaid.lock().unwrap().get(url.as_str()).is_none());
+        assert_eq!(provider.cumulative(), 1_000);
+
+        cache("2099-02-28T12:00:00Z");
+        assert!(provider.prepaid_credential(context()).await.is_some());
+        assert_eq!(provider.cumulative(), 3_000);
     }
 
     #[tokio::test]
