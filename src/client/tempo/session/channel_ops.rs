@@ -1215,7 +1215,7 @@ where
 /// (see [`crate::protocol::methods::tempo::machine_token::funding_url`]).
 /// Deposits in other tokens keep the original error.
 #[cfg(feature = "tempo")]
-async fn explain_machine_token_deposit<P: Provider<TempoNetwork>>(
+pub(crate) async fn explain_machine_token_deposit<P: Provider<TempoNetwork>>(
     error: MppError,
     provider: &P,
     chain_id: u64,
