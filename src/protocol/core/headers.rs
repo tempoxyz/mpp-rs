@@ -114,11 +114,11 @@ pub fn with_private_cache_control(value: Option<&str>) -> String {
     }
 }
 
-/// Validate an ISO 8601 datetime's shape, as mppx's \`datetime()\` schema does:
-/// \`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$\`.
+/// Validate an ISO 8601 datetime's shape, as mppx's `datetime()` schema does:
+/// `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$`.
 ///
 /// Like mppx, this checks the form only, not the calendar, so a value such as
-/// \`2025-02-30T12:00:00Z\` parses. Expiry checks still parse the value and
+/// `2025-02-30T12:00:00Z` parses. Expiry checks still parse the value and
 /// treat one they cannot read as expired.
 fn is_iso8601_timestamp(s: &str) -> bool {
     fn digits(bytes: &[u8]) -> bool {
