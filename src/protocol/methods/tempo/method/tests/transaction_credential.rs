@@ -1067,3 +1067,101 @@ fn node_refusal(message: &'static str) -> alloy_json_rpc::ErrorPayload {
         data: None,
     }
 }
+
+/// A broadcast record names the challenge it was sent for: a credential for
+/// another challenge presenting the same unbound bytes cannot settle from
+/// it, while the original challenge's retry still does.
+#[tokio::test]
+async fn test_broadcast_record_settles_only_its_own_challenge() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![tempo_alloy::primitives::transaction::Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: make_transfer_input(recipient, amount),
+        }],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+    let mut log = make_transfer_log(currency, sender, recipient, amount);
+    log["blockHash"] = serde_json::json!(B256::repeat_byte(0xdd));
+    log["blockNumber"] = serde_json::json!("0x1");
+    log["transactionHash"] = serde_json::json!(tx_hash);
+    log["transactionIndex"] = serde_json::json!("0x0");
+    log["logIndex"] = serde_json::json!("0x0");
+    log["removed"] = serde_json::json!(false);
+    let receipt = serde_json::json!({
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "blockHash": B256::repeat_byte(0xdd),
+        "blockNumber": "0x1",
+        "from": sender,
+        "to": currency,
+        "cumulativeGasUsed": "0x5208",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "contractAddress": null,
+        "logs": [log],
+        "logsBloom": alloy::primitives::Bloom::ZERO,
+        "status": "0x1",
+        "type": "0x76",
+        "feePayer": sender,
+    });
+
+    let asserter = Asserter::new();
+    // Challenge A: the send times out and nothing is found yet.
+    asserter.push_success(&serde_json::Value::Null);
+    asserter.push_failure_msg("request timed out");
+    asserter.push_success(&serde_json::Value::Null);
+    // Challenge B, after the transaction landed: A's record does not count,
+    // so the pre-broadcast lookup rejects it.
+    asserter.push_success(&receipt);
+    // Challenge A's retry recovers its own transaction.
+    asserter.push_failure(node_refusal("already known"));
+    asserter.push_success(&receipt);
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(crate::store::MemoryStore::new());
+    let method = ChargeMethod::new(provider).with_store(store);
+    let signed_tx = alloy::hex::encode_prefixed(&tx_bytes);
+    let broadcast = |challenge_id: &'static str| {
+        method.broadcast_transaction(
+            &signed_tx,
+            &request,
+            None,
+            CHAIN_ID,
+            challenge_id,
+            "api.example.com",
+            None,
+        )
+    };
+
+    let error = broadcast("challenge-a").await.expect_err("outcome unknown");
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::NetworkError),
+        "{error}"
+    );
+    let error = broadcast("challenge-b")
+        .await
+        .expect_err("another challenge cannot settle from A's record");
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed),
+        "{error}"
+    );
+    assert_eq!(
+        broadcast("challenge-a")
+            .await
+            .expect("A's retry recovers its own transaction"),
+        tx_hash
+    );
+    assert!(asserter.read_q().is_empty());
+}

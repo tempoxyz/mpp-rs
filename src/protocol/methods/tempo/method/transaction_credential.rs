@@ -554,6 +554,9 @@ where
                 "mpp:charge:broadcast-pending:{:#x}",
                 keccak256(&final_tx_bytes)
             );
+            // The record names the challenge it was broadcast for: only a
+            // retry for that challenge may settle from it, never a
+            // credential for another challenge presenting the same bytes.
             let broadcast_before = match (&self.store, &submission_key) {
                 (Some(store), Some(_)) => store
                     .get(&broadcast_key)
@@ -561,7 +564,7 @@ where
                     .map_err(|e| {
                         VerificationError::internal(format!("Failed to read broadcast record: {e}"))
                     })?
-                    .is_some(),
+                    .is_some_and(|recorded| recorded.as_str() == Some(challenge_id)),
                 _ => false,
             };
             if !broadcast_before {
@@ -582,18 +585,24 @@ where
             // transaction's validity it can neither land nor be retried.
             if let (Some(store), Some(_)) = (&self.store, &submission_key) {
                 if !broadcast_before {
-                    store
+                    // A record another challenge holds stays: this attempt
+                    // then has no record of its own.
+                    let created = store
                         .put_if_absent_with_ttl(
                             &broadcast_key,
-                            serde_json::Value::Bool(true),
+                            serde_json::Value::String(challenge_id.to_owned()),
                             broadcast_record_ttl(expires, &final_tx_bytes)?,
                         )
                         .await
                         .map_err(|e| {
                             VerificationError::internal(format!("Failed to record broadcast: {e}"))
                         })?;
+                    if created {
+                        broadcast_record = Some(broadcast_key);
+                    }
+                } else {
+                    broadcast_record = Some(broadcast_key);
                 }
-                broadcast_record = Some(broadcast_key);
             }
 
             // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
