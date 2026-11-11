@@ -26,17 +26,15 @@ fn validate_charge_modes(modes: &[&str]) -> Result<()> {
 /// a route's `opaque`, keeping its other members.
 #[cfg(any(feature = "tempo", feature = "stripe"))]
 fn with_nonce(
-    opaque: Option<&crate::protocol::core::Base64UrlJson>,
-) -> Result<crate::protocol::core::Base64UrlJson> {
-    let mut members =
-        match opaque.map(|opaque| opaque.decode_value()).transpose()? {
-            Some(serde_json::Value::Object(members)) => members,
-            Some(_) => return Err(crate::error::MppError::InvalidConfig(
-                "opaque must be a JSON object to carry a nonce; disable it with with_nonce(false)"
-                    .into(),
-            )),
-            None => serde_json::Map::new(),
-        };
+    opaque: Option<crate::protocol::core::Base64UrlJson>,
+) -> Result<Option<crate::protocol::core::Base64UrlJson>> {
+    let mut members = match opaque.as_ref().map(|opaque| opaque.decode_value()) {
+        None => serde_json::Map::new(),
+        Some(Ok(serde_json::Value::Object(members))) => members,
+        // A route opaque that is not a JSON object has nowhere to carry a
+        // nonce; it is issued as configured and matched as raw text.
+        Some(_) => return Ok(opaque),
+    };
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|error| {
         crate::error::MppError::Internal(format!("failed to generate challenge nonce: {error}"))
@@ -45,7 +43,7 @@ fn with_nonce(
         super::NONCE_KEY.to_string(),
         serde_json::Value::String(crate::protocol::core::base64url_encode(&nonce)),
     );
-    crate::protocol::core::Base64UrlJson::from_value(&serde_json::Value::Object(members))
+    crate::protocol::core::Base64UrlJson::from_value(&serde_json::Value::Object(members)).map(Some)
 }
 
 impl<M, S> Mpp<M, S>
@@ -65,7 +63,7 @@ where
         self.check_secret_key()?;
         let opaque = self.config.opaque.clone().or(challenge.opaque.take());
         let opaque = if self.config.nonce {
-            Some(with_nonce(opaque.as_ref())?)
+            with_nonce(opaque)?
         } else {
             opaque
         };

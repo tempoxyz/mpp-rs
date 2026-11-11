@@ -39,16 +39,18 @@ pub trait Exchange: Send {
     /// Restricts server challenges before provider preparation and after preparation.
     /// Prepaid credentials are controlled separately by [`Self::allows_prepaid`].
     ///
-    /// The default accepts challenges that send the credential in
-    /// `Authorization` or, for servers that keep `Authorization` for their own
-    /// auth, `Payment-Authorization`, as mppx does. Unlike `Authorization`,
-    /// a client that follows redirects forwards `Payment-Authorization` to
-    /// another host; disable redirects on the client to keep the credential at
-    /// the server that asked for it. Override this to restrict challenges further.
+    /// The default accepts only challenges that send the credential in
+    /// `Authorization`, which HTTP clients drop on a redirect to another
+    /// host. A client that follows redirects forwards `Payment-Authorization`
+    /// to wherever the server redirects the paid request, so the default
+    /// refuses it with [`HttpError::UnsafeCredentialHeader`] before signing.
+    /// Override this to accept `Payment-Authorization` on a transport that
+    /// never follows redirects, as [`ChargeClient`](super::ChargeClient) does,
+    /// or to restrict challenges further.
     fn check_challenge(&self, challenge: &PaymentChallenge) -> Result<(), HttpError> {
-        let header = challenge.credential_header();
-        if header.eq_ignore_ascii_case("Authorization")
-            || header.eq_ignore_ascii_case("Payment-Authorization")
+        if challenge
+            .credential_header()
+            .eq_ignore_ascii_case("Authorization")
         {
             Ok(())
         } else {
@@ -205,7 +207,13 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             }
         });
         let prepaid = match (&initial_response, &payment_context) {
-            (None, Some(context)) if payment_allowed && exchange.allows_prepaid() => {
+            // A prepaid credential is sent before any 402, so it would bypass
+            // the approval hook; with a hook set, every payment waits for one.
+            (None, Some(context))
+                if payment_allowed
+                    && exchange.allows_prepaid()
+                    && !self.events.has_on_challenge() =>
+            {
                 self.provider.prepaid_credential(context.clone()).await
             }
             _ => None,
@@ -442,7 +450,9 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     .decide_on_challenge(OnChallengeContext {
                         challenge: challenge.clone(),
                         challenges,
-                        url: payment_context.url.clone(),
+                        // The credential goes to the final URL of any
+                        // same-origin redirect, so that is what is approved.
+                        url: resp.url().clone(),
                         method: retry.method().clone(),
                         headers: payment_context.headers.clone(),
                     })
@@ -621,11 +631,20 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             // A credential the server refused as an invalid challenge (which is
             // also how a replayed credential is answered) must not be paid
             // again: the earlier payment may have settled, and paying the fresh
-            // challenge could pay twice, so that 402 is final.
-            if status == StatusCode::PAYMENT_REQUIRED && is_problem_json(&resp) {
-                let (rebuilt, problem_type) = read_problem_type(resp).await;
-                resp = rebuilt;
-                if problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge")) {
+            // challenge could pay twice, so that 402 is final. So is an empty
+            // 402, which is how the default Tower layer answers a rejected
+            // credential, and a problem whose type cannot be read. A problem
+            // naming another failure, such as verification-failed, or a 402
+            // with another body is paid again, as in mppx (which has no
+            // empty-body rejections to tell apart).
+            if status == StatusCode::PAYMENT_REQUIRED {
+                if is_problem_json(&resp) {
+                    let (rebuilt, problem_type) = read_problem_type(resp).await;
+                    resp = rebuilt;
+                    if problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge")) {
+                        return Ok(resp);
+                    }
+                } else if has_empty_body(&resp) {
                     return Ok(resp);
                 }
             }
@@ -878,6 +897,38 @@ fn is_problem_json(resp: &Response) -> bool {
 /// Read the problem type of a problem-details response, and return an
 /// equivalent response with the same status, headers, URL and body. A body
 /// that cannot be read comes back empty, with no type.
+/// Whether `resp` declares an empty body (`Content-Length: 0`).
+fn has_empty_body(resp: &Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0")
+}
+
+/// The most of a paid request's `402` problem body the flow reads to learn
+/// its type. The server picks the body's size, so reading stops here.
+const MAX_PROBLEM_BODY_BYTES: usize = 64 * 1024;
+
+/// Read at most `limit` bytes of `resp`'s body, and whether that was all of
+/// it. A body that fails to arrive counts as incomplete.
+async fn read_limited(mut resp: Response, limit: usize) -> (Vec<u8>, bool) {
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = limit - body.len();
+                if chunk.len() > room {
+                    body.extend_from_slice(&chunk[..room]);
+                    return (body, false);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return (body, true),
+            Err(_) => return (body, false),
+        }
+    }
+}
+
 async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
     use reqwest::ResponseBuilderExt;
 
@@ -885,9 +936,11 @@ async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
     let version = resp.version();
     let url = resp.url().clone();
     let headers = resp.headers().clone();
-    let body = resp.bytes().await.unwrap_or_default();
-    let problem_type = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    let (body, complete) = read_limited(resp, MAX_PROBLEM_BODY_BYTES).await;
+    // A body cut at the limit is handed back as read and its type is unknown.
+    let problem_type = complete
+        .then(|| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .flatten()
         .and_then(|problem| problem.get("type")?.as_str().map(str::to_string));
     let mut builder = http_types::Response::builder()
         .status(status)

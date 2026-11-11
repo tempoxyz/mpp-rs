@@ -20,16 +20,14 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 /// When a request returns 402, the middleware:
 /// 1. Parses the challenge from the `WWW-Authenticate` header
 /// 2. Calls the provider to execute the payment
-/// 3. Retries the request with the credential in the header the challenge
-///    names: `Authorization`, or `Payment-Authorization` for servers that keep
-///    `Authorization` for their own auth
+/// 3. Retries the request with the credential in `Authorization`
 ///
 /// It pays without a request-level `Accept-Payment` header by default, as
 /// mppx does; select [`AcceptPaymentPolicy::Explicit`] to pay only requests
-/// that set one. A client that follows redirects forwards
-/// `Payment-Authorization` to another host, so build the inner client with
-/// `reqwest::redirect::Policy::none()` when servers use that header. Approve
-/// or decline each payment with [`with_on_challenge`](Self::with_on_challenge).
+/// that set one. A challenge that asks for `Payment-Authorization` is
+/// refused before anything is signed, since the inner client may follow a
+/// redirect and forward that header to another host. Approve or decline each
+/// payment with [`with_on_challenge`](Self::with_on_challenge).
 ///
 /// Payment failures are returned as [`HttpError`](crate::client::HttpError) inside
 /// [`reqwest_middleware::Error::Middleware`] and can be recovered with

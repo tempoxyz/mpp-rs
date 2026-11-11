@@ -516,12 +516,12 @@ async fn test_new_rejects_replayed_hash_by_default() {
     );
 }
 
-/// Hash credentials follow the optional attribution rule: a plain transfer or
-/// a non-attribution memo is accepted, and attribution for another challenge
-/// fails verification (402), not as a replayed credential. A request amount
-/// with leading zeros compares numerically.
+/// Hash (push) credentials require attribution bound to the challenge: a
+/// plain transfer, a non-attribution memo and attribution for another
+/// challenge all fail verification (402), not as a replayed credential. A
+/// request amount with leading zeros compares numerically.
 #[tokio::test]
-async fn test_verify_hash_attribution_is_optional() {
+async fn test_verify_hash_requires_bound_attribution() {
     use alloy::providers::mock::Asserter;
 
     let currency = Address::repeat_byte(0x20);
@@ -537,13 +537,24 @@ async fn test_verify_hash_attribution_is_optional() {
     };
     let challenge = test_proof_challenge(&request);
     let foreign = attribution::encode("another-challenge", &challenge.realm, None);
+    let bound = attribution::encode(&challenge.id, &challenge.realm, None);
     let tx_hash = B256::repeat_byte(0xab);
     let block_hash = B256::repeat_byte(0x22);
 
     for (name, memo, should_accept) in [
-        ("plain transfer", None, true),
-        ("non-attribution memo", Some([0x11; 32]), true),
+        ("bound attribution", Some(bound), true),
+        ("plain transfer", None, false),
+        ("non-attribution memo", Some([0x11; 32]), false),
         ("foreign attribution", Some(foreign), false),
+        (
+            "other realm attribution",
+            Some(attribution::encode(
+                &challenge.id,
+                "other.example.com",
+                None,
+            )),
+            false,
+        ),
     ] {
         let mut log = match memo {
             Some(memo) => make_transfer_with_memo_log(currency, payer, recipient, amount, memo),

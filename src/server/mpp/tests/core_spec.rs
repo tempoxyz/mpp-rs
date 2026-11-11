@@ -191,3 +191,48 @@ async fn test_binding_mismatch_is_reported_before_expiry() {
     let err = mpp.verify_charge(&credential, "0.10").await.unwrap_err();
     assert_eq!(err.code, Some(ErrorCode::Expired), "{err}");
 }
+
+/// A route opaque that is an empty object, another JSON value or not JSON at
+/// all is issued and matched with the nonce on and off, so a handler accepts
+/// its own Challenges.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_any_route_opaque_verifies_its_own_challenges() {
+    let opaques = [
+        Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+        Base64UrlJson::from_value(&serde_json::json!("route-a")).unwrap(),
+        Base64UrlJson::from_value(&serde_json::json!(["a", 1])).unwrap(),
+        Base64UrlJson::from_raw("bm90LWpzb24"),
+    ];
+    for opaque in opaques {
+        for nonce in [true, false] {
+            let mpp = spec_mpp().with_nonce(nonce).with_opaque(opaque.clone());
+            let challenge = mpp.charge("0.10").unwrap().remove(0);
+            let credential =
+                PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+            let result = mpp.verify_charge(&credential, "0.10").await;
+            assert!(result.is_ok(), "{} nonce={nonce}: {result:?}", opaque.raw());
+        }
+    }
+
+    // A different raw opaque still fails the route match.
+    let mpp = spec_mpp()
+        .with_nonce(false)
+        .with_opaque(Base64UrlJson::from_raw("bm90LWpzb24"));
+    let mut challenge = mpp.charge("0.10").unwrap().remove(0);
+    challenge.opaque = Some(Base64UrlJson::from_raw("b3RoZXI"));
+    challenge.id = crate::protocol::core::compute_challenge_id(
+        TEST_SECRET,
+        &challenge.realm,
+        challenge.method.as_str(),
+        challenge.intent.as_str(),
+        challenge.request.raw(),
+        challenge.expires.as_deref(),
+        None,
+        challenge.opaque.as_ref().map(|o| o.raw()),
+    );
+    let credential =
+        PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+    let err = mpp.verify_charge(&credential, "0.10").await.unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::InvalidChallenge), "{err}");
+}

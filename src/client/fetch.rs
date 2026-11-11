@@ -18,11 +18,12 @@ use super::DEFAULT_MAX_PAYMENT_RETRIES;
 /// By default it pays without a request-level `Accept-Payment` header, as
 /// mppx does ([`AcceptPaymentPolicy::Always`]); pass
 /// [`AcceptPaymentPolicy::Explicit`] to pay only requests that set one.
-/// The credential goes in the header the selected challenge names:
-/// `Authorization`, or `Payment-Authorization` for servers that keep
-/// `Authorization` for their own auth. A client that follows redirects
-/// forwards `Payment-Authorization` to another host, so build it with
-/// `reqwest::redirect::Policy::none()` when servers use that header.
+/// The credential goes in `Authorization`. A challenge that asks for
+/// `Payment-Authorization` is refused with
+/// [`HttpError::UnsafeCredentialHeader`](super::HttpError::UnsafeCredentialHeader)
+/// before anything is signed, since this client may follow a redirect and
+/// forward that header to another host; pay those with
+/// [`ChargeClient`](super::ChargeClient), which never follows redirects.
 /// To approve or decline each payment, set an
 /// [`on_challenge`](super::ClientEvents::set_on_challenge) hook on the events
 /// passed to [`send_with_payment_options`](Self::send_with_payment_options).

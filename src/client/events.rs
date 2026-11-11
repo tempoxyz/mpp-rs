@@ -505,7 +505,9 @@ impl ClientEvents {
     /// credential. Return `true` (or [`ChallengeDecision::Pay`]) to pay,
     /// `false` (or [`ChallengeDecision::Decline`]) to return the `402`
     /// response to the caller without paying, or a credential to send instead
-    /// of paying with the provider. A hook that panics declines.
+    /// of paying with the provider. A hook that panics declines. While a hook
+    /// is set, session providers do not send prepaid vouchers before a
+    /// `402`, so the hook sees every payment.
     ///
     /// Every clone of this registry shares the hook.
     pub fn set_on_challenge<F, Fut, R>(&self, handler: F)
@@ -525,6 +527,11 @@ impl ClientEvents {
     /// every challenge it selects again.
     pub fn clear_on_challenge(&self) {
         *self.inner.on_challenge.lock().unwrap() = None;
+    }
+
+    /// Whether an approval hook is set with [`Self::set_on_challenge`].
+    pub(crate) fn has_on_challenge(&self) -> bool {
+        self.inner.on_challenge.lock().unwrap().is_some()
     }
 
     /// Ask the approval hook about a challenge; [`ChallengeDecision::Pay`]

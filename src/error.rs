@@ -850,7 +850,7 @@ impl From<CredentialError> for MppError {
     fn from(error: CredentialError) -> Self {
         match error {
             CredentialError::MultipleCredentials => {
-                MppError::bad_request("more than one Payment credential in the request")
+                MppError::bad_request(MULTIPLE_CREDENTIALS_REASON)
             }
             CredentialError::Malformed(reason) => MppError::MalformedCredential(reason),
             CredentialError::InvalidChallenge(reason) => {
@@ -869,6 +869,11 @@ impl PaymentError for CredentialError {
         MppError::from(self.clone()).to_problem_details(challenge_id)
     }
 }
+
+/// The reason of the `bad-request` error for a request carrying more than one
+/// Payment credential.
+pub(crate) const MULTIPLE_CREDENTIALS_REASON: &str =
+    "more than one Payment credential in the request";
 
 /// A server or client was configured incorrectly, such as with a secret key
 /// shorter than 32 bytes. The narrower form of [`MppError::InvalidConfig`].
@@ -893,7 +898,9 @@ impl MppError {
     /// This error as a [`CredentialError`], when it is a credential failure.
     pub fn credential_error(&self) -> Option<CredentialError> {
         Some(match self {
-            Self::BadRequest(_) => CredentialError::MultipleCredentials,
+            Self::BadRequest(Some(reason)) if reason == MULTIPLE_CREDENTIALS_REASON => {
+                CredentialError::MultipleCredentials
+            }
             Self::MalformedCredential(reason) => CredentialError::Malformed(reason.clone()),
             Self::InvalidChallenge { reason, .. } => {
                 CredentialError::InvalidChallenge(reason.clone())
@@ -936,6 +943,17 @@ mod tests {
                 mpp.to_problem_details(None).problem_type
             );
         }
+        let multiple = MppError::from(CredentialError::MultipleCredentials);
+        assert_eq!(
+            multiple.credential_error(),
+            Some(CredentialError::MultipleCredentials)
+        );
+        // Other bad requests are not credential failures and keep their reason.
+        assert_eq!(
+            MppError::bad_request("invalid Accept-Payment entry: x").credential_error(),
+            None
+        );
+        assert_eq!(MppError::bad_request_default().credential_error(), None);
         let problem = CredentialError::MultipleCredentials.to_problem_details(None);
         assert!(problem.problem_type.ends_with("/bad-request"));
         assert_eq!(problem.status, 400);

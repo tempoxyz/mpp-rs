@@ -482,20 +482,18 @@ fn test_assert_challenge_bound_memo_accepts_non_mpp_memo() {
     .is_ok());
 }
 
+/// Another realm's attribution is that server's business: a pull payment
+/// carrying it is accepted, like a non-attribution memo.
 #[test]
-fn test_assert_challenge_bound_memo_rejects_wrong_realm() {
-    let memo = attribution::encode("challenge-123", "api.example.com", None);
+fn test_assert_challenge_bound_memo_accepts_other_realm() {
+    let memo = attribution::encode("challenge-456", "api.example.com", None);
 
-    let error = assert_challenge_bound_memo(
+    assert!(assert_challenge_bound_memo(
         &[MatchedTransferLog::Memo(memo)],
         "challenge-123",
         "other.example.com",
     )
-    .unwrap_err();
-
-    assert!(error
-        .to_string()
-        .contains("memo is not bound to this challenge"));
+    .is_ok());
 }
 
 #[test]
@@ -506,9 +504,8 @@ fn test_assert_challenge_bound_memo_rejects_conflicting_attribution() {
         None,
     ));
     let other_challenge = attribution::encode("challenge-456", "api.example.com", None);
-    let other_realm = attribution::encode("challenge-123", "other.example.com", None);
 
-    for conflicting in [other_challenge, other_realm].map(MatchedTransferLog::Memo) {
+    for conflicting in [other_challenge].map(MatchedTransferLog::Memo) {
         for matched in [[bound, conflicting], [conflicting, bound]] {
             let error = assert_challenge_bound_memo(&matched, "challenge-123", "api.example.com")
                 .unwrap_err();

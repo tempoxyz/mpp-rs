@@ -1769,8 +1769,10 @@ async fn test_e2e_fee_payer_premium_charge() {
 
 // ==================== Replay protection tests ====================
 
-/// Transaction credential replay protection: the same tx hash used for a second
-/// challenge should be rejected because the memo is bound to the first challenge ID.
+/// A transaction settled for one challenge cannot be presented again as a
+/// hash credential for another: the settled tx hash is recorded in the same
+/// replay record push credentials are checked against, and its memo is bound
+/// to the first challenge.
 #[tokio::test]
 async fn test_tx_hash_replay_rejected() {
     let rpc = rpc_url();
@@ -1782,6 +1784,8 @@ async fn test_tx_hash_replay_rejected() {
     fund_account(&rpc, server_signer.address()).await;
     fund_account(&rpc, client_signer.address()).await;
 
+    // Pull settlements and push credentials share one replay record.
+    let store = Arc::new(mpp::store::MemoryStore::new());
     let mpp = Mpp::create(
         tempo(TempoConfig {
             recipient: &format!("{}", server_signer.address()),
@@ -1790,6 +1794,7 @@ async fn test_tx_hash_replay_rejected() {
         .chain_id(chain_id)
         .fee_payer(true)
         .fee_payer_signer(server_signer)
+        .store(store.clone())
         .secret_key(TEST_SECRET),
     )
     .expect("failed to create Mpp");
@@ -1815,6 +1820,18 @@ async fn test_tx_hash_replay_rejected() {
         .unwrap();
     let receipt = mpp::parse_receipt(receipt_hdr).expect("failed to parse receipt");
     let tx_hash = &receipt.reference;
+    // The broadcast transaction is counted in the record a hash credential
+    // for it is checked against.
+    let tx_key = format!(
+        "mpp:charge:{:#x}",
+        tx_hash
+            .parse::<B256>()
+            .expect("receipt reference should be B256")
+    );
+    assert!(mpp::store::Store::get(store.as_ref(), &tx_key)
+        .await
+        .unwrap()
+        .is_some());
 
     // Get a fresh challenge.
     let resp2 = Client::new()
@@ -1846,14 +1863,14 @@ async fn test_tx_hash_replay_rejected() {
         .await
         .expect("replay request failed");
 
-    // The transaction already settled, so the replay is final: 403 with no
-    // fresh challenge, so the client does not pay again.
+    // A rejected credential gets 402 with a fresh challenge, as the core spec
+    // requires; clients that just sent a credential do not pay it again.
     assert_eq!(
         resp3.status(),
-        403,
+        402,
         "replayed tx hash with different challenge should be rejected"
     );
-    assert!(resp3.headers().get("www-authenticate").is_none());
+    assert!(resp3.headers().get("www-authenticate").is_some());
     assert_eq!(
         resp3
             .headers()
@@ -1866,8 +1883,9 @@ async fn test_tx_hash_replay_rejected() {
     let _ = handle.await;
 }
 
-/// Hash credential with extra transfer logs: a transaction that has additional
-/// transfers (plain transfer without challenge-bound memo) should be rejected.
+/// Hash (push) credential without attribution: a transaction whose transfer
+/// to the recipient is a plain transfer, with an extra transfer beside it,
+/// is rejected because push payments require a challenge-bound memo.
 #[tokio::test]
 async fn test_hash_credential_with_extra_transfer_rejected() {
     let rpc = rpc_url();
@@ -1950,14 +1968,14 @@ async fn test_hash_credential_with_extra_transfer_rejected() {
         .await
         .expect("request failed");
 
-    // A settled receipt whose memo is not bound to this challenge is answered
-    // as a replay: 403 with no fresh challenge.
+    // A push payment without attribution bound to this challenge fails
+    // verification: 402 with a fresh challenge.
     assert_eq!(
         resp.status(),
-        403,
+        402,
         "transaction with extra transfers (and no challenge-bound memo) should be rejected"
     );
-    assert!(resp.headers().get("www-authenticate").is_none());
+    assert!(resp.headers().get("www-authenticate").is_some());
 
     handle.abort();
     let _ = handle.await;
@@ -2233,17 +2251,21 @@ async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
 
 /// Reject invalid attribution before settlement, then accept a valid payment
 /// from the same payer to ensure rejection does not prevent legitimate payment.
+/// Transaction (pull) credentials follow the optional attribution rule: a
+/// plain transfer, a non-attribution memo, another realm's attribution and a
+/// bound attribution memo settle, while this realm's attribution for another
+/// challenge is refused before any funds move.
 #[tokio::test]
-async fn test_unbound_memo_rejected_without_moving_funds() {
-    assert_unbound_memo_rejected_without_moving_funds(false).await;
+async fn test_pull_attribution_optional_and_foreign_rejected() {
+    assert_pull_attribution_optional_and_foreign_rejected(false).await;
 }
 
 #[tokio::test]
-async fn test_sponsored_unbound_memo_rejected_without_moving_funds() {
-    assert_unbound_memo_rejected_without_moving_funds(true).await;
+async fn test_sponsored_pull_attribution_optional_and_foreign_rejected() {
+    assert_pull_attribution_optional_and_foreign_rejected(true).await;
 }
 
-async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
+async fn assert_pull_attribution_optional_and_foreign_rejected(sponsored: bool) {
     use mpp::tempo::attribution;
 
     let rpc = rpc_url();
@@ -2266,43 +2288,50 @@ async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
         .secret_key(TEST_SECRET),
     )
     .unwrap();
-    let challenge = mpp.charge("1").unwrap().remove(0);
-    let request: mpp::ChargeRequest = challenge.request.decode().unwrap();
-    let amount: U256 = request.amount.parse().unwrap();
-    let currency: Address = request.currency.parse().unwrap();
-    assert_eq!(currency, PATH_USD);
     let gas_price = provider.get_gas_price().await.unwrap();
-    let payer_before = tip20_balance(&provider, payer.address()).await;
-    let merchant_before = tip20_balance(&provider, merchant.address()).await;
-    let cases = [
+    type MemoFor = fn(&mpp::PaymentChallenge) -> Option<[u8; 32]>;
+    let cases: [(&str, MemoFor, bool); 5] = [
         (
             "wrong challenge",
-            Some(attribution::encode(
-                "wrong-challenge",
-                &challenge.realm,
-                None,
-            )),
+            |challenge| {
+                Some(attribution::encode(
+                    "wrong-challenge",
+                    &challenge.realm,
+                    None,
+                ))
+            },
             false,
         ),
+        // Another realm's attribution is that server's business.
         (
-            "wrong realm",
-            Some(attribution::encode(
-                &challenge.id,
-                "wrong.example.com",
-                None,
-            )),
-            false,
+            "other realm",
+            |challenge| {
+                Some(attribution::encode(
+                    &challenge.id,
+                    "other.example.com",
+                    None,
+                ))
+            },
+            true,
         ),
-        ("non-MPP memo", Some([0xab; 32]), false),
-        ("plain transfer", None, false),
+        ("non-MPP memo", |_| Some([0xab; 32]), true),
+        ("plain transfer", |_| None, true),
         (
-            "valid memo",
-            Some(attribution::encode(&challenge.id, &challenge.realm, None)),
+            "bound memo",
+            |challenge| Some(attribution::encode(&challenge.id, &challenge.realm, None)),
             true,
         ),
     ];
-    for (name, memo, valid) in cases {
-        let input = match memo {
+    for (name, memo_for, valid) in cases {
+        // Each settled payment answers its own challenge.
+        let challenge = mpp.charge("1").unwrap().remove(0);
+        let request: mpp::ChargeRequest = challenge.request.decode().unwrap();
+        let amount: U256 = request.amount.parse().unwrap();
+        let currency: Address = request.currency.parse().unwrap();
+        assert_eq!(currency, PATH_USD);
+        let payer_before = tip20_balance(&provider, payer.address()).await;
+        let merchant_before = tip20_balance(&provider, merchant.address()).await;
+        let input = match memo_for(&challenge) {
             Some(memo) => {
                 ITIP20::transferWithMemoCall::new((merchant.address(), amount, memo.into()))
                     .abi_encode()
@@ -2347,16 +2376,17 @@ async fn assert_unbound_memo_rejected_without_moving_funds(sponsored: bool) {
             assert!(result.is_ok(), "sponsored={sponsored}, {name}: {result:?}");
             let payer_after = tip20_balance(&provider, payer.address()).await;
             if sponsored {
-                assert_eq!(payer_before - payer_after, amount);
+                assert_eq!(payer_before - payer_after, amount, "{name}");
             } else {
-                assert!(payer_before - payer_after >= amount);
+                assert!(payer_before - payer_after >= amount, "{name}");
                 assert_eq!(
                     tip20_balance(&provider, merchant.address()).await - merchant_before,
-                    amount
+                    amount,
+                    "{name}"
                 );
             }
         } else {
-            let error = result.expect_err("invalid memo must be rejected");
+            let error = result.expect_err("foreign attribution must be rejected");
             assert!(
                 error
                     .to_string()

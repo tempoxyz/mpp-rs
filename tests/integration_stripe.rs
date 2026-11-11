@@ -837,12 +837,12 @@ async fn test_stripe_rejects_replayed_credential() {
         .send_with_payment(&provider)
         .await
         .expect("replay response");
-    // A replay is an invalid challenge: 402 with a fresh one. The client may
-    // pay the fresh challenge, within its bounded retries.
+    // A replay is an invalid challenge: 402 with a fresh one. The client
+    // just sent a credential, so it hands that 402 back without paying the
+    // fresh challenge.
     assert_eq!(response.status(), 402);
     assert!(response.headers().contains_key("www-authenticate"));
-    let paid = calls.load(Ordering::SeqCst);
-    assert!((1..=3).contains(&paid), "{paid}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     handle.abort();
     stripe_handle.abort();

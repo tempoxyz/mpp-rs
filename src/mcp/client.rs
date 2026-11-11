@@ -45,6 +45,21 @@ pub trait ToolCaller: Send + Sync {
     /// errors carry challenges; see [`is_payment_required`](super::is_payment_required).
     fn payment_challenges_from_error(&self, error: &Self::Error) -> Option<Vec<PaymentChallenge>>;
 
+    /// Extracts the RFC 9457 problem from a JSON-RPC payment error, such as
+    /// [`McpPaymentErrorData::problem`](super::McpPaymentErrorData::problem).
+    ///
+    /// [`McpClient`] does not pay an error whose problem is
+    /// `invalid-challenge`: the server sends it only in answer to a
+    /// credential, so the request already carried one (for example one the
+    /// caller attached), and that payment may have settled. Returns `None`
+    /// by default.
+    fn payment_problem_from_error(
+        &self,
+        _error: &Self::Error,
+    ) -> Option<crate::error::PaymentErrorDetails> {
+        None
+    }
+
     /// Extracts valid payment challenges from tool-result metadata.
     fn payment_challenges_from_output(
         &self,
@@ -360,7 +375,13 @@ where
     ///
     /// Free calls pass through unchanged. A supported, unexpired challenge is
     /// paid once and the exact request is retried with its credential in
-    /// `_meta`. A session channel whose deposit does not cover the call is
+    /// `_meta`. The answer to that retry is final: when it asks for payment
+    /// again, including with an `invalid-challenge` problem (how a server
+    /// answers a credential it already accepted), it is returned without
+    /// paying the fresh challenge, since the first payment may have settled
+    /// and paying again could pay twice. An `invalid-challenge` error
+    /// answering the first call (which then carried the caller's own
+    /// credential) is returned unpaid too. A session channel whose deposit does not cover the call is
     /// topped up first by the same call carrying the top-up credential.
     /// Successful retries record their receipt and commit provider state.
     /// Definitive rejection rolls it back; cancellation and transport
@@ -370,6 +391,15 @@ where
         params: C::Params,
     ) -> Result<C::Output, McpClientError<C::Error>> {
         let initial = self.caller.call_tool(params.clone()).await;
+        if let Err(error) = &initial {
+            if self
+                .caller
+                .payment_problem_from_error(error)
+                .is_some_and(|problem| is_invalid_challenge(&problem))
+            {
+                return initial.map_err(McpClientError::Transport);
+            }
+        }
         let challenges = match &initial {
             Ok(output) => self.caller.payment_challenges_from_output(output),
             Err(error) => self.caller.payment_challenges_from_error(error),
@@ -396,6 +426,8 @@ where
             return Err(error.into());
         }
 
+        // The paid call is sent once. Whatever it answers, including a fresh
+        // challenge, is returned without paying again.
         match self.caller.call_tool(paid).await {
             Ok(output) => {
                 if self
@@ -419,6 +451,14 @@ where
             Err(error) => Err(McpClientError::Transport(error)),
         }
     }
+}
+
+/// Whether `problem` is the core `invalid-challenge` problem.
+fn is_invalid_challenge(problem: &crate::error::PaymentErrorDetails) -> bool {
+    problem
+        .problem_type
+        .strip_prefix(crate::error::CORE_PROBLEM_TYPE_BASE)
+        .is_some_and(|suffix| suffix == "/invalid-challenge")
 }
 
 #[cfg(test)]
@@ -561,6 +601,7 @@ mod tests {
         challenges: Option<Vec<PaymentChallenge>>,
         definitive: bool,
         message: &'static str,
+        problem: Option<Box<crate::error::PaymentErrorDetails>>,
     }
 
     impl std::fmt::Display for TestError {
@@ -605,6 +646,13 @@ mod tests {
             error: &Self::Error,
         ) -> Option<Vec<PaymentChallenge>> {
             error.challenges.clone()
+        }
+
+        fn payment_problem_from_error(
+            &self,
+            error: &Self::Error,
+        ) -> Option<crate::error::PaymentErrorDetails> {
+            error.problem.as_deref().cloned()
         }
 
         fn payment_challenges_from_output(
@@ -662,6 +710,7 @@ mod tests {
             challenges: Some(vec![challenge()]),
             definitive,
             message: "payment required",
+            problem: None,
         }
     }
 
@@ -670,6 +719,7 @@ mod tests {
             challenges: None,
             definitive,
             message: "tool failed",
+            problem: None,
         }
     }
 
@@ -757,6 +807,90 @@ mod tests {
         assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 1);
         assert_eq!(provider.lifecycle.rollbacks.load(Ordering::SeqCst), 0);
         assert_eq!(provider.lifecycle.abandons.load(Ordering::SeqCst), 0);
+    }
+
+    /// The replay answer: a credential the server already accepted is
+    /// refused as an invalid challenge, with a fresh challenge attached.
+    fn invalid_challenge_error() -> TestError {
+        let fresh = PaymentChallenge::new(
+            "challenge-2",
+            "mcp.example.test",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&json!({"amount": "1"})).unwrap(),
+        );
+        TestError {
+            challenges: Some(vec![fresh]),
+            definitive: true,
+            message: "invalid challenge",
+            problem: Some(Box::new(crate::error::PaymentErrorDetails::core(
+                "invalid-challenge",
+            ))),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_challenge_after_payment_is_not_paid_again() {
+        // Enough answers for a client that would keep paying.
+        let caller = TestCaller::new([
+            Err(payment_error(true)),
+            Err(invalid_challenge_error()),
+            Err(invalid_challenge_error()),
+            Ok(json!({"content": "paid twice"})),
+        ]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller.clone(), provider.clone(), context());
+
+        let error = client.call_tool(params()).await.unwrap_err();
+
+        assert!(
+            matches!(&error, McpClientError::Transport(error) if error.message == "invalid challenge"),
+            "{error}"
+        );
+        assert_eq!(caller.calls.lock().unwrap().len(), 2);
+        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn payment_required_result_after_payment_is_not_paid_again() {
+        let asks_payment = || {
+            Ok(json!({
+                "_meta": {
+                    PAYMENT_REQUIRED_META_KEY: {"challenges": [challenge()]}
+                },
+                "isError": true
+            }))
+        };
+        let caller = TestCaller::new([
+            asks_payment(),
+            asks_payment(),
+            Ok(json!({"content": "paid twice"})),
+        ]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller.clone(), provider.clone(), context());
+
+        let result = client.call_tool(params()).await.unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(caller.calls.lock().unwrap().len(), 2);
+        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_challenge_answering_the_callers_credential_is_not_paid() {
+        let caller = TestCaller::new([
+            Err(invalid_challenge_error()),
+            Ok(json!({"content": "paid twice"})),
+        ]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller.clone(), provider.clone(), context());
+
+        let error = client.call_tool(params()).await.unwrap_err();
+
+        assert!(matches!(error, McpClientError::Transport(_)));
+        assert_eq!(caller.calls.lock().unwrap().len(), 1);
+        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

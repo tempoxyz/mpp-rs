@@ -18,16 +18,25 @@ fn same_amount(a: &str, b: &str) -> bool {
     }
 }
 
-/// Remove the per-challenge nonces from an echoed `opaque`, so it can be
-/// compared with the route's. An object left empty counts as absent.
-fn opaque_without_nonce(opaque: serde_json::Value) -> Option<serde_json::Value> {
-    match opaque {
-        serde_json::Value::Object(mut members) => {
+/// An `opaque` in the form it is matched in: a JSON object without the
+/// per-challenge nonces (an object left empty counts as absent), any other
+/// JSON value as is, and a value that is not JSON as its raw text.
+#[derive(Debug, PartialEq)]
+enum MatchedOpaque {
+    Json(serde_json::Value),
+    Raw(String),
+}
+
+fn matched_opaque(opaque: Option<&crate::protocol::core::Base64UrlJson>) -> Option<MatchedOpaque> {
+    let opaque = opaque?;
+    match opaque.decode_value() {
+        Ok(serde_json::Value::Object(mut members)) => {
             members.remove(super::NONCE_KEY);
             members.remove(super::LEGACY_NONCE_KEY);
-            (!members.is_empty()).then_some(serde_json::Value::Object(members))
+            (!members.is_empty()).then_some(MatchedOpaque::Json(serde_json::Value::Object(members)))
         }
-        other => Some(other),
+        Ok(other) => Some(MatchedOpaque::Json(other)),
+        Err(_) => Some(MatchedOpaque::Raw(opaque.raw().to_string())),
     }
 }
 
@@ -47,14 +56,8 @@ where
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
             )
         };
-        let configured = match &self.config.opaque {
-            Some(opaque) => Some(opaque.decode_value().map_err(|_| mismatch())?),
-            None => None,
-        };
-        let echoed = match &credential.challenge.opaque {
-            Some(opaque) => opaque_without_nonce(opaque.decode_value().map_err(|_| mismatch())?),
-            None => None,
-        };
+        let configured = matched_opaque(self.config.opaque.as_ref());
+        let echoed = matched_opaque(credential.challenge.opaque.as_ref());
         if echoed != configured {
             return Err(mismatch());
         }

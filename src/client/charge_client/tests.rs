@@ -90,7 +90,9 @@ fn offer(challenges: &[PaymentChallenge]) -> axum::response::Response {
             format_www_authenticate(challenge).unwrap(),
         )
     });
-    let mut response = StatusCode::PAYMENT_REQUIRED.into_response();
+    // A body, so a 402 answering a credential reads as a request for another
+    // payment rather than an empty rejection.
+    let mut response = (StatusCode::PAYMENT_REQUIRED, "pay up").into_response();
     for (name, value) in headers {
         response.headers_mut().append(name, value.parse().unwrap());
     }

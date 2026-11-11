@@ -112,9 +112,8 @@ where
             },
         )?;
 
-        // Attribution is optional, but attribution for another challenge
-        // fails verification. The check is isolated so hash credentials can be
-        // made to require attribution (HASH_CREDENTIAL_REQUIRES_ATTRIBUTION).
+        // A push payment must carry attribution bound to this challenge, and
+        // attribution for another challenge fails verification.
         assert_hash_credential_attribution(
             matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
             &challenge.id,

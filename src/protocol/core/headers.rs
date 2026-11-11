@@ -133,7 +133,7 @@ pub fn select_payment_credential<'a>(
     let in_payment_authorization = collect(&mut payment_authorization.into_iter());
     if in_authorization.len() + in_payment_authorization.len() > 1 {
         return Err(MppError::bad_request(
-            "more than one Payment credential in the request",
+            crate::error::MULTIPLE_CREDENTIALS_REASON,
         ));
     }
     let chosen = if selected.eq_ignore_ascii_case(PAYMENT_AUTHORIZATION_HEADER) {

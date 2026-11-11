@@ -218,14 +218,15 @@ fn test_validate_transaction_transfers_checks_challenge_bound_memo() {
             )),
             false,
         ),
+        // Another realm's attribution is that server's business.
         (
-            "wrong realm",
+            "other realm",
             Some(attribution::encode(
                 "challenge-123",
                 "other.example.com",
                 None,
             )),
-            false,
+            true,
         ),
         ("non-MPP memo", Some([0xab; 32]), true),
         ("plain transfer", None, true),
@@ -403,7 +404,7 @@ fn test_machine_token_route_checks_challenge_binding() {
         ),
         (
             attribution::encode("challenge-123", "other.example.com", None),
-            false,
+            true,
         ),
         ([0xab; 32], true),
     ] {
