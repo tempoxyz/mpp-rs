@@ -118,7 +118,8 @@ fn vouchers_older_than_the_window_are_stale() {
 fn after_must_be_below_the_cumulative_amount() {
     for after in [120, 121] {
         let err = accept(channel_at(100), 120, Some(after), NOW).unwrap_err();
-        assert_eq!(err.code, Some(ErrorCode::InvalidPayload));
+        assert_eq!(err.code, None);
+        assert_eq!(err.message, "voucher after must be below cumulativeAmount");
     }
 }
 

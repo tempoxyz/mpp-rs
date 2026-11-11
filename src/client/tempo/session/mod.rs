@@ -7244,6 +7244,59 @@ mod tests {
         assert_eq!(provider.cumulative(), 10_000);
     }
 
+    /// A refusal from a server whose problem details carry no amounts, such
+    /// as mppx's, comes with a fresh challenge whose session snapshot reports
+    /// what the server accepted: the retry allocates above it.
+    #[tokio::test]
+    async fn reorder_window_retry_resyncs_from_the_challenge_snapshot() {
+        use crate::protocol::methods::tempo::session::SessionSnapshot;
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+
+        let snapshot = SessionSnapshot {
+            accepted_cumulative: "6000".into(),
+            chain_id: 42431,
+            channel_id: channel_id.to_string(),
+            close_requested_at: None,
+            deposit: "10000".into(),
+            descriptor: entry.descriptor.clone().unwrap(),
+            settlement_route: None,
+            escrow: TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+            highest_voucher: None,
+            required_cumulative: "6001".into(),
+            settled: "0".into(),
+            spent: "5000".into(),
+            units: None,
+        };
+        let request: serde_json::Value = reorder_challenge("retry", payee, currency, Some(30))
+            .request
+            .decode()
+            .unwrap();
+        let mut request = request;
+        request["methodDetails"]["sessionSnapshot"] = serde_json::to_value(&snapshot).unwrap();
+        let retry = PaymentChallenge::new(
+            "retry",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&request).unwrap(),
+        );
+        let credential = provider.pay(&retry).await.unwrap();
+        assert_eq!(voucher_range(&credential), (Some(6_000), 7_000));
+        let stored = provider
+            .channel_store
+            .get(&entry_key(&provider, channel_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cumulative_amount, 7_000);
+    }
+
     /// Without a reorder window a payment waits for the channel's previous
     /// one to settle and signs no `after`, as before.
     #[tokio::test]

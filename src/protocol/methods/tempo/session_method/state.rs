@@ -185,7 +185,8 @@ impl ChannelState {
         window.prune(now_ms.saturating_sub(window_ms));
 
         if after.is_some_and(|after| after >= cumulative_amount) {
-            return Err(VerificationError::invalid_payload(
+            // Reported as verification-failed, as mppx does.
+            return Err(VerificationError::new(
                 "voucher after must be below cumulativeAmount",
             ));
         }
