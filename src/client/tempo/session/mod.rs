@@ -3933,6 +3933,9 @@ impl TempoSessionProvider {
         if reorder_window(&session_req).is_none() {
             return Ok(None);
         }
+        // Every path that pays this way (a payment, a prepaid voucher from a
+        // cache shared by clones) applies this provider's own policy.
+        self.check_policy(challenge)?;
         let amount = match amount {
             Some(amount) => amount,
             None => session_req.parse_amount()?,
@@ -3984,7 +3987,10 @@ impl TempoSessionProvider {
             return Ok(None);
         };
         let precompile = is_precompile_escrow(entry.escrow_contract);
+        // Native channels allocate in the channel store, which must do it in
+        // one atomic update: allocations run without the payment lease.
         if !entry.opened
+            || (precompile && !self.channel_store.allocates_atomically())
             || (precompile && entry.descriptor.is_none())
             || self
                 .pending_opens
@@ -7621,6 +7627,104 @@ mod tests {
             .insert(url.to_owned(), prepaid(2_500));
         let (_, credential) = provider.prepaid_credential(context()).await.unwrap();
         assert_eq!(voucher_range(&credential), (Some(5_500), 7_000));
+    }
+
+    /// A prepaid voucher for a server with a reorder window, cached by a
+    /// clone without this provider's policy, is still checked against it.
+    #[tokio::test]
+    async fn reorder_window_vouchers_apply_the_providers_policy() {
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let permissive = make_test_provider().with_prepaid_requests(1);
+        let channel_id = seed_precompile_channel(&permissive, payee, currency, 1_000, 10_000);
+        let url = "https://test-realm/data";
+        permissive.bind_origin(url).unwrap();
+        let entry = permissive.channels().into_values().next().unwrap();
+        permissive.persist_channel(&entry).await.unwrap();
+        let challenge = reorder_challenge("prepaid", payee, currency, Some(30));
+        permissive.prepaid.lock().unwrap().insert(
+            url.to_owned(),
+            PrepaidVoucher {
+                challenge: challenge.clone(),
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 1_000,
+            },
+        );
+        let restricted = permissive
+            .clone()
+            .with_currencies([format!("{:#x}", Address::repeat_byte(0x33))]);
+        let context = PaymentContext {
+            url: url.parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        assert!(restricted.prepaid_credential(context).await.is_none());
+        assert!(restricted.pay(&challenge).await.is_err());
+        assert_eq!(restricted.cumulative(), 1_000, "nothing was allocated");
+    }
+
+    /// A channel store that keeps the default `allocate`, which is not atomic,
+    /// is never allocated from concurrently: the payment takes the serialized
+    /// path under the store's lease.
+    #[tokio::test]
+    async fn reorder_window_needs_a_store_that_allocates_atomically() {
+        struct PlainStore(MemoryChannelStore);
+
+        #[async_trait::async_trait]
+        impl ChannelStore for PlainStore {
+            async fn acquire(
+                &self,
+                key: &str,
+            ) -> store::ChannelStoreResult<Box<dyn store::ChannelStoreLease>> {
+                self.0.acquire(key).await
+            }
+            async fn get(
+                &self,
+                key: &str,
+            ) -> store::ChannelStoreResult<Option<store::StoredChannelEntry>> {
+                self.0.get(key).await
+            }
+            async fn set(
+                &self,
+                entry: &store::StoredChannelEntry,
+            ) -> store::ChannelStoreResult<()> {
+                self.0.set(entry).await
+            }
+            async fn set_at(
+                &self,
+                key: &str,
+                entry: &store::StoredChannelEntry,
+            ) -> store::ChannelStoreResult<()> {
+                self.0.set_at(key, entry).await
+            }
+            async fn find_channel(
+                &self,
+                channel_id: B256,
+            ) -> store::ChannelStoreResult<Option<String>> {
+                self.0.find_channel(channel_id).await
+            }
+            async fn delete(&self, key: &str) -> store::ChannelStoreResult<()> {
+                self.0.delete(key).await
+            }
+        }
+
+        let provider = make_test_provider()
+            .with_channel_store(Arc::new(PlainStore(MemoryChannelStore::default())));
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+
+        let first = reorder_challenge("first", payee, currency, Some(30));
+        let credential = provider.pay(&first).await.unwrap();
+        assert_eq!(voucher_range(&credential), (None, 2_000));
+        let second = reorder_challenge("second", payee, currency, Some(30));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), provider.pay(&second))
+                .await
+                .is_err(),
+            "the second payment waits for the first to settle"
+        );
     }
 
     /// Without a reorder window a payment waits for the channel's previous

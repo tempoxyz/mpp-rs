@@ -170,36 +170,31 @@ pub trait ChannelStore: Send + Sync {
     /// Callers sharing the store, in this process or others, get disjoint
     /// ranges `(raised - amount, raised]`: session providers sign one voucher
     /// from each, with `after` set to the range's start, for servers that
-    /// accept vouchers out of order (`reorderWindow`). The default holds
-    /// [`acquire`](Self::acquire)'s lease around a read and a write; stores
-    /// shared by several processes should override it with one atomic update.
+    /// accept vouchers out of order (`reorderWindow`). Session providers call
+    /// it without holding [`acquire`](Self::acquire)'s lease, so it must be
+    /// one atomic update. A store that overrides it must also return `true`
+    /// from [`allocates_atomically`](Self::allocates_atomically).
+    ///
+    /// The default allocates nothing and returns `None`: payments over such a
+    /// store take the serialized path under [`acquire`](Self::acquire).
     async fn allocate(
         &self,
-        key: &str,
-        channel_id: B256,
-        floor: u128,
-        amount: u128,
-        cap: u128,
+        _key: &str,
+        _channel_id: B256,
+        _floor: u128,
+        _amount: u128,
+        _cap: u128,
     ) -> ChannelStoreResult<Option<u128>> {
-        let _lease = self.acquire(key).await?;
-        let Some(mut entry) = self
-            .get(key)
-            .await?
-            .filter(|entry| entry.channel_id == channel_id && entry.opened)
-        else {
-            return Ok(None);
-        };
-        let Some(raised) = entry
-            .cumulative_amount
-            .max(floor)
-            .checked_add(amount)
-            .filter(|raised| *raised <= cap)
-        else {
-            return Ok(None);
-        };
-        entry.cumulative_amount = raised;
-        self.set_at(key, &entry).await?;
-        Ok(Some(raised))
+        Ok(None)
+    }
+    /// Whether [`allocate`](Self::allocate) raises the counter in one atomic
+    /// update. Session providers allocate vouchers concurrently, for servers
+    /// that accept them out of order, only from stores that return `true`;
+    /// others pay serialized under [`acquire`](Self::acquire).
+    ///
+    /// Defaults to `false`.
+    fn allocates_atomically(&self) -> bool {
+        false
     }
     /// The `spent` a server receipt last reported for `channel_id`, the channel
     /// cached for `key`. `None` when the store keeps no such record, or when
@@ -293,6 +288,10 @@ impl ChannelStore for MemoryChannelStore {
         self.entries.lock().unwrap().remove(key);
         self.server_spent.lock().unwrap().remove(key);
         Ok(())
+    }
+
+    fn allocates_atomically(&self) -> bool {
+        true
     }
 
     async fn allocate(
@@ -608,6 +607,10 @@ impl ChannelStore for OriginBoundChannelStore {
         spent: u128,
     ) -> ChannelStoreResult<()> {
         self.inner.set_server_spent(key, channel_id, spent).await
+    }
+
+    fn allocates_atomically(&self) -> bool {
+        self.inner.allocates_atomically()
     }
 
     /// Allocates from the provider's channel for `key` in its current
@@ -1114,6 +1117,10 @@ mod sqlite {
                 )
                 .map_err(io_error)?;
             Ok(())
+        }
+
+        fn allocates_atomically(&self) -> bool {
+            true
         }
 
         /// One `UPDATE ... RETURNING`, so processes sharing the database get
