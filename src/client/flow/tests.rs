@@ -1847,3 +1847,27 @@ async fn caller_hash_credential_is_never_paid_again() {
         }
     }
 }
+
+/// A paid retry replaces the caller's credential in either field, so the
+/// server never sees two Payment credentials.
+#[test]
+fn remove_payment_credentials_clears_both_fields() {
+    let mut headers = HeaderMap::new();
+    headers.append("payment-authorization", HeaderValue::from_static("abc"));
+    headers.append(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static("Payment abc"),
+    );
+    headers.append(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer token"),
+    );
+    super::remove_payment_credentials(&mut headers);
+    assert!(!headers.contains_key("payment-authorization"));
+    let authorization: Vec<_> = headers
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .collect();
+    assert_eq!(authorization, [HeaderValue::from_static("Bearer token")]);
+    assert!(!super::carries_payment_credential(&headers));
+}

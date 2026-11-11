@@ -529,6 +529,10 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             // The challenge came from the final URL of any same-origin redirect,
             // so that is where the credential goes.
             *paid.url_mut() = resp.url().clone();
+            // The paid retry carries this credential alone: a caller's
+            // credential in the field the challenge does not select would
+            // make the server refuse a request that now carries two.
+            remove_payment_credentials(paid.headers_mut());
             paid.headers_mut().insert(
                 crate::client::payment_credential_header_name(&challenge),
                 auth_header,
@@ -912,6 +916,29 @@ fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
                     .next()
                     .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
             })
+}
+
+/// Remove every Payment credential from a request's headers:
+/// `Payment-Authorization` and any `Authorization: Payment` value. Other
+/// `Authorization` values stay.
+fn remove_payment_credentials(headers: &mut HeaderMap) {
+    headers.remove("payment-authorization");
+    let kept: Vec<HeaderValue> = headers
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .filter(|value| {
+            !value
+                .as_bytes()
+                .split(|byte| *byte == b' ')
+                .next()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
+        })
+        .cloned()
+        .collect();
+    headers.remove(reqwest::header::AUTHORIZATION);
+    for value in kept {
+        headers.append(reqwest::header::AUTHORIZATION, value);
+    }
 }
 
 /// Whether the caller's own credential on a request is a Tempo hash (push)
