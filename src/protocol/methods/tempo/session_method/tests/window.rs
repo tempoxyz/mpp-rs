@@ -541,3 +541,36 @@ async fn reorder_window_reapplies_a_voucher_after_a_lost_store_race() {
     assert_eq!(err.code, Some(ErrorCode::ConcurrentUpdate));
     assert_eq!(store.writes.load(Ordering::SeqCst), 1);
 }
+
+/// A configured window longer than the maximum is capped at it, and
+/// acceptance with it cannot overflow.
+#[tokio::test]
+async fn unbounded_reorder_window_is_capped() {
+    let signer = PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "aa".repeat(32));
+    let id = channel_id.parse::<B256>().unwrap();
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    state.highest_voucher_amount = 1_000;
+    state.deposit = 10_000;
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state);
+    let method = test_session_method(store).with_reorder_window(Duration::MAX);
+    assert_eq!(
+        method.challenge_method_details().unwrap()["reorderWindow"],
+        crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS
+    );
+    for (cumulative, after) in [(3_000, 2_000), (2_000, 1_000)] {
+        let voucher = signed(&signer, id, cumulative).await;
+        method
+            .verify_and_accept_voucher(&channel_id, None, cumulative, Some(after), &voucher, 0)
+            .await
+            .unwrap();
+    }
+    // Pruning with an extreme window and clock saturates.
+    let state = channel_at(100);
+    let state = state
+        .accept_voucher_in_window(120, Some(110), vec![1], 0, u64::MAX, u64::MAX)
+        .unwrap();
+    assert_eq!(state.highest_voucher_amount, 120);
+}

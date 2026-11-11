@@ -12,6 +12,12 @@ pub const SESSION_PROTOCOL_LEGACY: &str = "v1";
 /// TIP-1034 precompile-backed Tempo session protocol marker.
 pub const SESSION_PROTOCOL_TIP1034: &str = "v2";
 
+/// Longest `reorderWindow`, in seconds, that a session server advertises:
+/// one day. Clients treat a longer window as not advertised and pay
+/// serialized, and servers cap a longer configured window at it, so no
+/// window arithmetic can overflow.
+pub const MAX_REORDER_WINDOW_SECS: u64 = 86_400;
+
 /// Full TIP-1034 channel descriptor used to derive and verify a channel ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -201,14 +201,18 @@ pub struct TempoSessionProvider {
 }
 
 /// The reorder window, in seconds, a session challenge advertises: the
-/// server accepts this client's vouchers out of order within it.
+/// server accepts this client's vouchers out of order within it. A window
+/// above [`MAX_REORDER_WINDOW_SECS`](crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS)
+/// counts as not advertised, so payments take the serialized path.
 fn reorder_window(session_req: &SessionRequest) -> Option<u64> {
     session_req
         .method_details
         .as_ref()?
         .get("reorderWindow")?
         .as_u64()
-        .filter(|window| *window > 0)
+        .filter(|window| {
+            (1..=crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS).contains(window)
+        })
 }
 
 /// Most lost voucher ranges a session provider keeps per channel; the oldest
@@ -2626,11 +2630,9 @@ impl TempoSessionProvider {
                     .min_voucher_delta()
                     .and_then(|delta| delta.parse::<u128>().ok())
                     .unwrap_or_default();
-                let amount = required_cumulative
-                    .saturating_sub(entry.cumulative_amount)
-                    .max(min_delta)
-                    .max(1);
-                // A reused range must still reach what the server requires.
+                // The range reaches the required amount, applied as an
+                // absolute target in the same atomic step as the allocation.
+                let amount = min_delta.max(1);
                 if let Some(credential) = self
                     .sign_allocated_voucher(
                         challenge,
@@ -3935,7 +3937,7 @@ impl TempoSessionProvider {
     ) -> Result<PaymentCredential, MppError> {
         challenge.validate_for_session(crate::protocol::methods::tempo::METHOD_NAME)?;
         self.check_policy(challenge)?;
-        if let Some(credential) = self.concurrent_voucher(challenge, None).await? {
+        if let Some(credential) = self.concurrent_voucher(challenge, None, 0).await? {
             return Ok(credential);
         }
         let process_lease = self.acquire_payment_lock(challenge).await?;
@@ -3969,11 +3971,14 @@ impl TempoSessionProvider {
     /// then takes the serialized path.
     ///
     /// The range covers the challenge's quoted amount, or `amount` when
-    /// given (such as a prepaid voucher sized from measured prices).
+    /// given (such as a prepaid voucher's measured price), and reaches the
+    /// absolute cumulative `target` at least (`0` for none); see
+    /// [`allocate_voucher_range`](Self::allocate_voucher_range).
     async fn concurrent_voucher(
         &self,
         challenge: &PaymentChallenge,
         amount: Option<u128>,
+        target: u128,
     ) -> Result<Option<PaymentCredential>, MppError> {
         let session_req: SessionRequest = challenge
             .request
@@ -4007,7 +4012,7 @@ impl TempoSessionProvider {
             self.resync_counter(&key, entry.channel_id, accepted).await;
         }
         *self.last_challenge.lock().unwrap() = Some(challenge.clone());
-        self.sign_allocated_voucher(challenge, &key, chain_id, &entry, amount, 0)
+        self.sign_allocated_voucher(challenge, &key, chain_id, &entry, amount, target)
             .await
     }
 
@@ -4057,9 +4062,9 @@ impl TempoSessionProvider {
         Ok(Some(entry))
     }
 
-    /// Allocates `amount` from the channel's voucher counter and signs a
-    /// voucher for the range's end, with `after` set to its start. A range
-    /// reused from a lost voucher ends at `min_end` at least.
+    /// Allocates a range of at least `amount` reaching `target` from the
+    /// channel's voucher counter and signs a voucher for the range's end,
+    /// with `after` set to its start.
     async fn sign_allocated_voucher(
         &self,
         challenge: &PaymentChallenge,
@@ -4067,10 +4072,10 @@ impl TempoSessionProvider {
         chain_id: u64,
         entry: &ChannelEntry,
         amount: u128,
-        min_end: u128,
+        target: u128,
     ) -> Result<Option<PaymentCredential>, MppError> {
         let Some((after, cumulative_amount)) = self
-            .allocate_voucher_range(key, entry, amount, min_end)
+            .allocate_voucher_range(key, entry, amount, target)
             .await?
         else {
             return Ok(None);
@@ -4106,14 +4111,18 @@ impl TempoSessionProvider {
         Ok(Some(build_credential(challenge, payload, chain_id, payer)))
     }
 
-    /// Raises the channel's voucher counter by `amount` and returns the range
-    /// `(start, end]` it covers. Native channels allocate in the channel
-    /// store, which every provider and process sharing it allocates from;
-    /// legacy channels, which are not persisted, allocate in process memory.
+    /// Raises the channel's voucher counter from `start` to
+    /// `max(start + amount, target)` in one atomic step and returns the range
+    /// `(start, end]` it covers. `target` is an absolute cumulative amount
+    /// (`0` for none), such as a prepaid target or a stream's required
+    /// amount, so callers that overlap each add `amount` beyond it at most.
+    /// Native channels allocate in the channel store, which every provider
+    /// and process sharing it allocates from; legacy channels, which are not
+    /// persisted, allocate in process memory.
     ///
-    /// When the counter cannot rise by `amount` within the deposit (or the
+    /// When the counter cannot rise that far within the deposit (or the
     /// maximum deposit), the range is taken from a voucher range known to be
-    /// lost instead, ending at `min_end` at least; see
+    /// lost instead, reaching `target` too; see
     /// [`reuse_lost_range`](Self::reuse_lost_range). Vouchers merely in flight
     /// are never covered again. `None` when neither fits: the payment takes
     /// the serialized path, which tops up.
@@ -4122,7 +4131,7 @@ impl TempoSessionProvider {
         key: &str,
         entry: &ChannelEntry,
         amount: u128,
-        min_end: u128,
+        target: u128,
     ) -> Result<Option<(u128, u128)>, MppError> {
         let cap = self
             .max_deposit
@@ -4138,15 +4147,15 @@ impl TempoSessionProvider {
                 .get(key)
                 .filter(|current| current.channel_id == entry.channel_id)
                 .map_or(entry.cumulative_amount, |current| current.cumulative_amount);
-            let raised = self
+            let range = self
                 .channel_store
-                .allocate(key, entry.channel_id, floor, amount, cap)
+                .allocate(key, entry.channel_id, floor, amount, target, cap)
                 .await
                 .map_err(Self::store_error)?;
-            let Some(raised) = raised else {
-                return Ok(self.reuse_lost_range(key, entry, amount, min_end, cap));
+            let Some(range) = range else {
+                return Ok(self.reuse_lost_range(key, entry, amount, target, cap));
             };
-            Some(raised)
+            Some(range)
         } else {
             None
         };
@@ -4157,30 +4166,31 @@ impl TempoSessionProvider {
         else {
             return Ok(None);
         };
-        let raised = match stored {
-            Some(raised) => {
+        let range = match stored {
+            Some((start, raised)) => {
                 current.cumulative_amount = current.cumulative_amount.max(raised);
-                raised
+                (start, raised)
             }
             None => {
-                let Some(raised) = current
-                    .cumulative_amount
+                let start = current.cumulative_amount;
+                let Some(raised) = start
                     .checked_add(amount)
+                    .map(|raised| raised.max(target))
                     .filter(|raised| *raised <= cap)
                 else {
                     drop(channels);
-                    return Ok(self.reuse_lost_range(key, entry, amount, min_end, cap));
+                    return Ok(self.reuse_lost_range(key, entry, amount, target, cap));
                 };
                 current.cumulative_amount = raised;
-                raised
+                (start, raised)
             }
         };
-        Ok(Some((raised - amount, raised)))
+        Ok(Some(range))
     }
 
     /// Takes `(from, end]` from the start of a lost voucher range of the
     /// channel, for a counter that cannot rise within the deposit, with
-    /// `end = max(from + amount, min_end)`, and leaves the rest of that range
+    /// `end = max(from + amount, target)`, and leaves the rest of that range
     /// for later vouchers. The range must lie within the lost one, the cap
     /// and what the counter already authorized, so it signs for no new
     /// funds and never repeats a voucher still in flight, which a server
@@ -4190,7 +4200,7 @@ impl TempoSessionProvider {
         key: &str,
         entry: &ChannelEntry,
         amount: u128,
-        min_end: u128,
+        target: u128,
         cap: u128,
     ) -> Option<(u128, u128)> {
         let issued = self
@@ -4206,7 +4216,7 @@ impl TempoSessionProvider {
         ranges.retain(|range| range.expires > now);
         let limit = cap.min(issued);
         let (index, end) = ranges.iter().enumerate().find_map(|(index, range)| {
-            let end = range.from.checked_add(amount)?.max(min_end);
+            let end = range.from.checked_add(amount)?.max(target);
             (end <= range.to && end <= limit).then_some((index, end))
         })?;
         let from = ranges[index].from;
@@ -4253,14 +4263,14 @@ impl TempoSessionProvider {
         {
             return;
         }
+        let Some(expires) = std::time::Instant::now().checked_add(Duration::from_secs(window))
+        else {
+            return;
+        };
         if ranges.len() >= MAX_LOST_RANGES {
             ranges.remove(0);
         }
-        ranges.push(LostRange {
-            from,
-            to,
-            expires: std::time::Instant::now() + Duration::from_secs(window),
-        });
+        ranges.push(LostRange { from, to, expires });
     }
 
     /// Raises the channel's voucher counter to `signed`, the cumulative
@@ -4600,6 +4610,20 @@ impl TempoSessionProvider {
                         }
                     }
                 }
+                // On a server that accepts vouchers out of order, payments
+                // allocate from the channel store's counter without this
+                // lease. This voucher then takes its range from the same
+                // atomic allocation, after any top-up, sized from the
+                // store's counter, so it cannot overlap theirs.
+                let allocates = !includes_request
+                    && !pending
+                    && precompile
+                    && entry.descriptor.is_some()
+                    && reorder_window(&session_req).is_some()
+                    && self.channel_store.allocates_atomically();
+                if allocates {
+                    self.merge_stored_channel(&key, &mut entry).await?;
+                }
                 // Retry the authorized opening amount until a receipt reconciles it.
                 if !includes_request && !pending {
                     entry.cumulative_amount =
@@ -4669,6 +4693,17 @@ impl TempoSessionProvider {
                             })?
                             .deposit;
                     }
+                }
+
+                if allocates {
+                    return self
+                        .sign_allocated_voucher(challenge, &key, chain_id, &entry, amount, 0)
+                        .await?
+                        .ok_or_else(|| {
+                            MppError::InvalidConfig(
+                                "concurrent payments used the channel deposit; pay again".into(),
+                            )
+                        });
                 }
 
                 let payload = if precompile {
@@ -5081,31 +5116,20 @@ impl PaymentProvider for TempoSessionProvider {
         }
         // A server that accepts vouchers out of order gets this request's
         // own voucher, allocated without waiting for other payments. It is
-        // sized as the serialized path below sizes its voucher: up to
-        // `prepaid_requests` requests' worth at the measured price beyond what
-        // was spent, and at least the next request's price.
+        // sized as the serialized path below sizes its voucher: the counter
+        // rises to `prepaid_requests` requests' worth at the measured price
+        // beyond what was spent, and by at least the next request's price.
+        // The target is absolute and applied in the same atomic step as the
+        // allocation, so overlapping prepaid requests each add one price
+        // beyond it at most.
         if let Ok(request) = state.challenge.request.decode::<SessionRequest>() {
             if reorder_window(&request).is_some() {
-                let key = self
-                    .channel_id_to_key
-                    .lock()
-                    .unwrap()
-                    .get(&state.channel_id)
-                    .cloned()?;
-                let issued = self
-                    .channels
-                    .lock()
-                    .unwrap()
-                    .get(&key)
-                    .filter(|entry| entry.channel_id.to_string() == state.channel_id)
-                    .map(|entry| entry.cumulative_amount)?;
                 let target = state
                     .price
                     .checked_mul(u128::from(self.prepaid_requests))
                     .and_then(|headroom| state.spent.checked_add(headroom))?;
-                let amount = target.saturating_sub(issued).max(state.price);
                 let credential = self
-                    .concurrent_voucher(&state.challenge, Some(amount))
+                    .concurrent_voucher(&state.challenge, Some(state.price), target)
                     .await
                     .ok()??;
                 return Some((state.challenge, credential));
@@ -7764,6 +7788,200 @@ mod tests {
             .insert(url.to_owned(), prepaid(2_500));
         let (_, credential) = provider.prepaid_credential(context()).await.unwrap();
         assert_eq!(voucher_range(&credential), (Some(5_500), 7_000));
+    }
+
+    /// Overlapping prepaid requests from clones sharing one channel store
+    /// raise the counter to the prepaid target once, then by one price each,
+    /// instead of each adding the whole missing headroom.
+    #[tokio::test]
+    async fn overlapping_reorder_window_prepaid_vouchers_reach_the_target_once() {
+        let provider = make_test_provider().with_prepaid_requests(3);
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 100_000);
+        let url = "https://test-realm/data";
+        provider.bind_origin(url).unwrap();
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        // spent 1000 + 3 x 1500: the target is 5500.
+        provider.prepaid.lock().unwrap().insert(
+            url.to_owned(),
+            PrepaidVoucher {
+                challenge: reorder_challenge("prepaid", payee, currency, Some(30)),
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 1_500,
+            },
+        );
+        let context = || PaymentContext {
+            url: url.parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        const REQUESTS: u128 = 6;
+        let clones: Vec<_> = (0..REQUESTS).map(|_| provider.clone()).collect();
+        let credentials = futures_util::future::join_all(
+            clones
+                .iter()
+                .map(|clone| async move { clone.prepaid_credential(context()).await.unwrap().1 }),
+        )
+        .await;
+        let mut ranges: Vec<_> = credentials.iter().map(voucher_range).collect();
+        ranges.sort();
+        assert_eq!(ranges[0], (Some(1_000), 5_500));
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0.unwrap(), "disjoint ranges");
+        }
+        assert!(provider.cumulative() <= 5_500 + REQUESTS * 1_500);
+        assert_eq!(provider.cumulative(), 5_500 + (REQUESTS - 1) * 1_500);
+    }
+
+    /// A `reorderWindow` too large to represent safely, such as `u64::MAX`,
+    /// counts as not advertised: the payment takes the serialized path and
+    /// rolling it back cannot overflow.
+    #[tokio::test]
+    async fn unbounded_reorder_window_is_not_advertised() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = reorder_challenge("huge", payee, currency, Some(u64::MAX));
+        let credential = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_range(&credential), (None, 2_000));
+        provider
+            .rollback_payment(&challenge, &credential)
+            .await
+            .unwrap();
+
+        // A voucher sent with `after` under such a challenge records nothing.
+        let voucher = serde_json::json!({
+            "action": "voucher",
+            "channelId": provider.channels().into_values().next().unwrap().channel_id.to_string(),
+            "cumulativeAmount": "3000",
+            "after": "2000",
+            "signature": "0x00"
+        });
+        let sent = PaymentCredential::new(challenge.to_echo(), voucher);
+        provider.rollback_payment(&challenge, &sent).await.unwrap();
+        assert!(provider.lost_ranges.lock().unwrap().ranges.is_empty());
+    }
+
+    /// A payment that falls back to the serialized path, while other
+    /// processes keep allocating from the shared store without its lease,
+    /// takes its voucher's range from the same atomic allocation: all ranges
+    /// stay disjoint.
+    #[tokio::test]
+    async fn serialized_fallback_allocates_disjoint_from_concurrent_vouchers() {
+        /// Declines the first allocation, so the payment takes the serialized
+        /// path, and allocates `others` ranges for other processes while that
+        /// path takes the lease.
+        struct RacingStore {
+            inner: MemoryChannelStore,
+            declined: Mutex<Option<(String, B256)>>,
+            others: Mutex<Vec<(u128, u128)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ChannelStore for RacingStore {
+            async fn acquire(
+                &self,
+                key: &str,
+            ) -> store::ChannelStoreResult<Box<dyn store::ChannelStoreLease>> {
+                let declined = self.declined.lock().unwrap().clone();
+                if let Some((at, channel_id)) = declined {
+                    for _ in 0..3 {
+                        let range = self
+                            .inner
+                            .allocate(&at, channel_id, 0, 1_000, 0, 10_000)
+                            .await?
+                            .unwrap();
+                        self.others.lock().unwrap().push(range);
+                    }
+                }
+                self.inner.acquire(key).await
+            }
+            async fn get(
+                &self,
+                key: &str,
+            ) -> store::ChannelStoreResult<Option<store::StoredChannelEntry>> {
+                self.inner.get(key).await
+            }
+            async fn set(
+                &self,
+                entry: &store::StoredChannelEntry,
+            ) -> store::ChannelStoreResult<()> {
+                self.inner.set(entry).await
+            }
+            async fn set_at(
+                &self,
+                key: &str,
+                entry: &store::StoredChannelEntry,
+            ) -> store::ChannelStoreResult<()> {
+                self.inner.set_at(key, entry).await
+            }
+            async fn find_channel(
+                &self,
+                channel_id: B256,
+            ) -> store::ChannelStoreResult<Option<String>> {
+                self.inner.find_channel(channel_id).await
+            }
+            async fn delete(&self, key: &str) -> store::ChannelStoreResult<()> {
+                self.inner.delete(key).await
+            }
+            fn allocates_atomically(&self) -> bool {
+                true
+            }
+            async fn allocate(
+                &self,
+                key: &str,
+                channel_id: B256,
+                floor: u128,
+                amount: u128,
+                target: u128,
+                cap: u128,
+            ) -> store::ChannelStoreResult<Option<(u128, u128)>> {
+                let first = {
+                    let mut declined = self.declined.lock().unwrap();
+                    let first = declined.is_none();
+                    if first {
+                        *declined = Some((key.to_owned(), channel_id));
+                    }
+                    first
+                };
+                if first {
+                    return Ok(None);
+                }
+                self.inner
+                    .allocate(key, channel_id, floor, amount, target, cap)
+                    .await
+            }
+        }
+
+        let racing = Arc::new(RacingStore {
+            inner: MemoryChannelStore::default(),
+            declined: Mutex::new(None),
+            others: Mutex::new(Vec::new()),
+        });
+        let provider = make_test_provider().with_channel_store(racing.clone());
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+
+        let challenge = reorder_challenge("fallback", payee, currency, Some(30));
+        let serialized = provider.pay(&challenge).await.unwrap();
+        let mut ranges = racing.others.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 3, "others allocated while the lease was held");
+        let (after, end) = voucher_range(&serialized);
+        ranges.push((after.expect("the fallback voucher carries after"), end));
+        ranges.sort_unstable();
+        assert_eq!(
+            ranges,
+            vec![
+                (1_000, 2_000),
+                (2_000, 3_000),
+                (3_000, 4_000),
+                (4_000, 5_000)
+            ]
+        );
     }
 
     /// A prepaid voucher for a server with a reorder window, cached by a

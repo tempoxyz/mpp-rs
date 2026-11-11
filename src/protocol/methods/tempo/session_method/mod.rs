@@ -110,10 +110,14 @@ where
     /// accepted one, adds no funds: requests are still charged from the
     /// highest voucher, which remains what settles on chain. Without a window
     /// (the default) every voucher must raise the highest accepted amount.
-    /// A window shorter than a second disables it. See
-    /// [`DEFAULT_REORDER_WINDOW`].
+    /// A window shorter than a second disables it, and one longer than
+    /// [`MAX_REORDER_WINDOW_SECS`](crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS)
+    /// is capped at it. See [`DEFAULT_REORDER_WINDOW`].
     pub fn with_reorder_window(mut self, window: std::time::Duration) -> Self {
-        self.reorder_window = (window.as_secs() > 0).then_some(window);
+        let max = std::time::Duration::from_secs(
+            crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS,
+        );
+        self.reorder_window = (window.as_secs() > 0).then_some(window.min(max));
         self
     }
 
