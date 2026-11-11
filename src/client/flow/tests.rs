@@ -1439,6 +1439,41 @@ async fn refused_hash_credential_is_not_paid_again() {
     }
 }
 
+#[test]
+fn session_receipt_spending_is_bounded_by_the_sent_voucher() {
+    let challenge = PaymentChallenge::new(
+        "test",
+        "api.example.com",
+        "tempo",
+        "session",
+        Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+    );
+    let credential = PaymentCredential {
+        challenge: challenge.to_echo(),
+        payload: serde_json::json!({"channelId": "channel", "cumulativeAmount": "1000"}),
+        source: None,
+    };
+    for (spent, accepted, valid) in [
+        ("500", "1000", true),
+        ("1001", "1001", false),
+        ("500", "1001", false),
+        ("500", "499", false),
+        ("invalid", "1000", false),
+    ] {
+        let mut receipt = crate::protocol::core::Receipt::success("tempo", "channel");
+        receipt
+            .extensions
+            .insert("spent".into(), serde_json::json!(spent));
+        receipt
+            .extensions
+            .insert("acceptedCumulative".into(), serde_json::json!(accepted));
+        assert_eq!(
+            super::session_receipt_within_authorization(&receipt, &credential),
+            valid
+        );
+    }
+}
+
 /// A 402 answering a credential with `invalid-challenge` (also the replay
 /// answer) is final: paying its fresh challenge could pay twice.
 #[tokio::test]

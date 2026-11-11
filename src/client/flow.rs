@@ -1058,6 +1058,7 @@ fn session_receipt(
         .and_then(|v| parse_receipt(v).ok())
         .filter(|receipt| {
             receipt.is_success()
+                && session_receipt_within_authorization(receipt, credential)
                 && receipt.method == challenge.method
                 && receipt
                     .extensions
@@ -1069,6 +1070,29 @@ fn session_receipt(
                     .get("channelId")
                     .and_then(|v| v.as_str())
                     .is_some_and(|id| receipt.reference.eq_ignore_ascii_case(id))
+        })
+}
+
+/// Remote receipt accounting cannot exceed the voucher sent on this request.
+fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentCredential) -> bool {
+    let amount = |value: &serde_json::Value| value.as_str()?.parse::<u128>().ok();
+    let Some(spent) = receipt.extensions.get("spent") else {
+        return true;
+    };
+    let Some(spent) = amount(spent) else {
+        return false;
+    };
+    let Some(authorized) = credential.payload.get("cumulativeAmount").and_then(amount) else {
+        return false;
+    };
+    if spent > authorized {
+        return false;
+    }
+    receipt
+        .extensions
+        .get("acceptedCumulative")
+        .is_none_or(|value| {
+            amount(value).is_some_and(|accepted| spent <= accepted && accepted <= authorized)
         })
 }
 
