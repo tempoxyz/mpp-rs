@@ -43,17 +43,64 @@ pub(super) fn prepare_charge_request(
     Ok(charge)
 }
 
-/// Builds the charge for a challenge, funded like [`fund`].
-async fn prepare_funded_charge(
-    challenge: &PaymentChallenge,
-    expected_chain_id: Option<u64>,
-    client_id: Option<&str>,
-    autoswap: Option<&AutoswapConfig>,
-    provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
-    from: alloy::primitives::Address,
-) -> Result<FundedCharge, MppError> {
-    let charge = prepare_charge_request(challenge, expected_chain_id, client_id)?;
-    fund_routed(charge, autoswap, provider, from).await
+/// A charge the payer can fund with MACH: one that names MACH as its
+/// currency, or a `machineTokenEnabled` charge the MACH swapper can fund.
+pub(super) struct MachineTokenPayment {
+    chain_id: u64,
+    currency: alloy::primitives::Address,
+    amount: alloy::primitives::U256,
+}
+
+impl MachineTokenPayment {
+    /// Reports an insufficient-balance failure paying this charge as the
+    /// payer's MACH shortfall with the link to buy MACH, when MACH is sold on
+    /// the charge's chain and the payer holds less than the charge amount.
+    pub(super) async fn explain(
+        &self,
+        error: MppError,
+        provider: &impl alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+        from: alloy::primitives::Address,
+    ) -> MppError {
+        super::error::with_machine_token_funding(
+            error,
+            provider,
+            self.chain_id,
+            from,
+            self.currency,
+            self.amount,
+        )
+        .await
+    }
+}
+
+/// The MACH funding a charge accepts, if any (see [`MachineTokenPayment`]).
+///
+/// A `machineTokenEnabled` charge in another currency counts only when MACH can
+/// actually pay it: [`machine_token::route`](crate::protocol::methods::tempo::machine_token::route)
+/// takes exactly one memo-bearing transfer, so split or memo-less charges fall
+/// back to the charge currency and keep its insufficient-balance error.
+pub(super) fn machine_token_payment(charge: &TempoCharge) -> Option<MachineTokenPayment> {
+    use crate::protocol::methods::tempo::{machine_token, transfers};
+
+    let mach = machine_token::token(charge.chain_id())?;
+    let payable = charge.currency() == mach
+        || (charge.machine_token_enabled()
+            && transfers::get_transfers(
+                charge.amount(),
+                charge.recipient(),
+                charge.memo(),
+                charge.splits(),
+            )
+            .ok()
+            .and_then(|transfers| {
+                machine_token::route(charge.chain_id(), charge.currency(), &transfers)
+            })
+            .is_some());
+    (!charge.amount().is_zero() && payable).then(|| MachineTokenPayment {
+        chain_id: charge.chain_id(),
+        currency: charge.currency(),
+        amount: charge.amount(),
+    })
 }
 
 /// Picks the fee token for an unsponsored charge: the configured one, else the
@@ -759,31 +806,31 @@ impl PaymentProvider for TempoProvider {
                     .await;
             }
         }
-        let funded = prepare_funded_charge(
-            challenge,
-            Some(chain_id),
-            self.client_id.as_deref(),
-            self.autoswap.as_ref(),
-            &rpc_provider,
-            from,
-        )
-        .await?;
-
-        let options = SignOptions {
-            signing_mode: Some(self.signing_mode.clone()),
-            fee_token: select_fee_token(
-                self.fee_token,
-                funded.fee_token,
-                funded.charge.currency(),
-                funded.swapped,
-            ),
-            ..Default::default()
-        };
-        let signed = funded
-            .charge
-            .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
-            .await?;
-        Ok(signed.into_credential())
+        let charge = prepare_charge_request(challenge, Some(chain_id), self.client_id.as_deref())?;
+        let machine_token = machine_token_payment(&charge);
+        let paid = async {
+            let funded = fund_routed(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
+            let options = SignOptions {
+                signing_mode: Some(self.signing_mode.clone()),
+                fee_token: select_fee_token(
+                    self.fee_token,
+                    funded.fee_token,
+                    funded.charge.currency(),
+                    funded.swapped,
+                ),
+                ..Default::default()
+            };
+            funded
+                .charge
+                .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
+                .await
+        }
+        .await;
+        match (paid, machine_token) {
+            (Ok(signed), _) => Ok(signed.into_credential()),
+            (Err(error), Some(payment)) => Err(payment.explain(error, &rpc_provider, from).await),
+            (Err(error), None) => Err(error),
+        }
     }
 
     fn accept_payment_header(&self) -> Option<String> {
@@ -798,6 +845,39 @@ impl PaymentProvider for TempoProvider {
 mod tests {
     use super::*;
     use alloy::providers::Provider;
+
+    fn mainnet_mach_enabled_charge(splits: Option<serde_json::Value>) -> TempoCharge {
+        let mut details = serde_json::json!({ "chainId": 4217, "machineTokenEnabled": true });
+        if let Some(splits) = splits {
+            details["splits"] = splits;
+        }
+        let request = crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+            "amount": "1000000",
+            "currency": "0x20C000000000000000000000b9537d11c60E8b50", // USDC.e on Tempo
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": details,
+        }))
+        .unwrap();
+        let challenge = crate::protocol::core::PaymentChallenge::new(
+            "test-id",
+            "api.example.com",
+            "tempo",
+            "charge",
+            request,
+        );
+        TempoCharge::from_challenge(&challenge).unwrap()
+    }
+
+    #[test]
+    fn machine_token_payment_links_mach_only_when_mach_can_pay() {
+        assert!(machine_token_payment(&mainnet_mach_enabled_charge(None)).is_some());
+        // The swapper route takes one transfer, so a split charge falls back to
+        // its currency and keeps that currency's insufficient-balance error.
+        let splits = serde_json::json!([
+            { "amount": "300000", "recipient": "0x1111111111111111111111111111111111111111" }
+        ]);
+        assert!(machine_token_payment(&mainnet_mach_enabled_charge(Some(splits))).is_none());
+    }
 
     #[tokio::test]
     async fn with_http_client_sends_rpc_requests_through_it() {

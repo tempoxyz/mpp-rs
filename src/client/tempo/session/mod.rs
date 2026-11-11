@@ -1102,6 +1102,7 @@ impl TempoSessionProvider {
     async fn autoswap_calls<P: Provider<TempoNetwork>>(
         &self,
         provider: &P,
+        chain_id: u64,
         payer: Address,
         currency: Address,
         amount: u128,
@@ -1109,14 +1110,25 @@ impl TempoSessionProvider {
         let Some(config) = &self.autoswap else {
             return Ok((Vec::new(), None));
         };
-        let route = super::autoswap::resolve_autoswap_route(
+        // A MACH deposit autoswap can't cover reports the MACH shortfall and the
+        // link to buy it, as the gas-estimation path below does.
+        let route = match super::autoswap::resolve_autoswap_route(
             provider,
             payer,
             currency,
             U256::from(amount),
             config,
         )
-        .await?;
+        .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return Err(channel_ops::explain_machine_token_deposit(
+                    error, provider, chain_id, payer, currency, amount,
+                )
+                .await)
+            }
+        };
         let calls = route
             .as_ref()
             .map(|route| route.calls.clone())
@@ -1692,14 +1704,8 @@ impl TempoSessionProvider {
                 .is_ok_and(|channel_id| channel_id == entry.channel_id),
             _ => false,
         };
-        if snapshot.is_some()
-            && !stores_snapshot_channel
-            && !self.origin_configured
-            && self.origin.lock().unwrap().is_some()
-        {
-            return Err(MppError::InvalidConfig(
-                "session snapshot recovery requires an explicitly configured origin".into(),
-            ));
+        if snapshot.is_some() {
+            self.check_snapshot_origin(stores_snapshot_channel)?;
         }
         if let Some(snapshot) = snapshot {
             if let Some((merchant, target)) = settlement {
@@ -1809,6 +1815,15 @@ impl TempoSessionProvider {
         Self::channel_entry(recovered).map(|entry| Some((entry, pending.is_some())))
     }
 
+    fn check_snapshot_origin(&self, known_channel: bool) -> Result<(), MppError> {
+        if !known_channel && !self.origin_configured && self.origin.lock().unwrap().is_some() {
+            return Err(MppError::InvalidConfig(
+                "session snapshot recovery requires an explicitly configured origin".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Rehydrate a reusable native session through the server's authenticated
     /// `HEAD` bootstrap flow.
     ///
@@ -1817,6 +1832,8 @@ impl TempoSessionProvider {
     /// root/access-key identity used for the session. The authorized response
     /// carries `Payment-Session-Snapshot`; this provider reconciles it with
     /// TIP-1034 on-chain state, persists it, and activates it in memory.
+    /// Importing an unknown channel requires an explicitly configured origin;
+    /// an already stored channel in the current origin can be recovered without one.
     pub async fn bootstrap(
         &self,
         client: &reqwest::Client,
@@ -2049,6 +2066,14 @@ impl TempoSessionProvider {
             challenge_response
         };
 
+        if reqwest::Url::parse(url)
+            .ok()
+            .is_none_or(|requested| requested.origin() != response.url().origin())
+        {
+            return Err(MppError::InvalidConfig(
+                "refusing a session bootstrap snapshot from a different HTTP origin".into(),
+            ));
+        }
         if !response.status().is_success() {
             return Ok(None);
         }
@@ -2114,12 +2139,17 @@ impl TempoSessionProvider {
         {
             return Ok(None);
         }
-        if let Some(stored) = self
+        let stored = self
             .channel_store
             .get(&recovered.key())
             .await
-            .map_err(Self::store_error)?
-        {
+            .map_err(Self::store_error)?;
+        self.check_snapshot_origin(
+            stored
+                .as_ref()
+                .is_some_and(|entry| entry.channel_id == recovered.channel_id),
+        )?;
+        if let Some(stored) = stored {
             if stored.pending_open.is_some() && stored.channel_id != recovered.channel_id {
                 return Err(MppError::InvalidConfig(
                     "snapshot does not match pending channel".into(),
@@ -2543,7 +2573,13 @@ impl TempoSessionProvider {
             .parse()
             .mpp_config("invalid TIP-1034 descriptor token")?;
         let (prefix_calls, route) = self
-            .autoswap_calls(&self.rpc_provider, payer, currency, additional_deposit)
+            .autoswap_calls(
+                &self.rpc_provider,
+                entry.chain_id,
+                payer,
+                currency,
+                additional_deposit,
+            )
             .await?;
         let payload = create_precompile_top_up_transaction_payload(
             &self.rpc_provider,
@@ -4236,7 +4272,7 @@ impl TempoSessionProvider {
 
         let (mut entry, mut payload) = if precompile {
             let (prefix_calls, route) = self
-                .autoswap_calls(&self.rpc_provider, payer, currency, deposit)
+                .autoswap_calls(&self.rpc_provider, chain_id, payer, currency, deposit)
                 .await?;
             create_precompile_open_payload(
                 &self.rpc_provider,
@@ -4525,11 +4561,8 @@ impl PaymentProvider for TempoSessionProvider {
         ) {
             return None;
         }
-        if state
-            .challenge
-            .expires_at()
-            .is_some_and(|expires| expires <= time::OffsetDateTime::now_utc())
-        {
+        // Fail closed: an \`expires\` that does not read as a date counts as expired.
+        if state.challenge.is_expired() {
             self.prepaid.lock().unwrap().remove(context.url.as_str());
             return None;
         }
@@ -5954,7 +5987,7 @@ mod tests {
                 cumulative_amount: "1000".into(),
                 signature: alloy::hex::encode_prefixed(signature),
             }),
-            required_cumulative: "1000".into(),
+            required_cumulative: "9000".into(),
             settled: "0".into(),
             spent: "600".into(),
             units: None,
@@ -5975,7 +6008,26 @@ mod tests {
             .bootstrap(&reqwest::Client::new(), &url)
             .await
             .unwrap()
+            .is_none());
+        assert!(provider.channels().is_empty());
+        provider = provider.with_origin(&url.parse().unwrap()).unwrap();
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
             .is_some());
+
+        assert_eq!(provider.cumulative(), 1_000);
+        // Once persisted in this origin, the same channel no longer needs a pin.
+        provider.origin_configured = false;
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(provider.cumulative(), 1_000);
 
         let mut receipt = Receipt::success("tempo", channel_id.to_string());
         receipt
@@ -9528,6 +9580,102 @@ mod tests {
 
     #[cfg(feature = "axum")]
     #[tokio::test]
+    async fn bootstrap_checks_snapshot_response_origin_before_importing() {
+        use crate::protocol::core::Base64UrlJson;
+        use axum::{
+            http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::head,
+            Router,
+        };
+
+        for authenticated in [false, true] {
+            for cross_origin in [false, true] {
+                let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target_address = target.local_addr().unwrap();
+                let target_task = tokio::spawn(async move {
+                    axum::serve(
+                        target,
+                        Router::new().route("/snapshot", head(|| async { StatusCode::NO_CONTENT })),
+                    )
+                    .await
+                    .unwrap();
+                });
+                let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = source.local_addr().unwrap();
+                let destination = if cross_origin {
+                    target_address
+                } else {
+                    address
+                };
+                let challenge = PaymentChallenge::new(
+                    "bootstrap-proof",
+                    "127.0.0.1",
+                    "tempo",
+                    "charge",
+                    Base64UrlJson::from_value(&serde_json::json!({
+                        "amount": "0",
+                        "currency": Address::repeat_byte(0x20).to_string(),
+                        "recipient": Address::repeat_byte(0x30).to_string(),
+                        "methodDetails": { "chainId": 4217 }
+                    }))
+                    .unwrap(),
+                )
+                .to_header()
+                .unwrap();
+                let app = Router::new()
+                    .route(
+                        "/bootstrap",
+                        head(move |headers: HeaderMap| {
+                            let challenge = challenge.clone();
+                            async move {
+                                if authenticated && !headers.contains_key(AUTHORIZATION) {
+                                    (
+                                        StatusCode::PAYMENT_REQUIRED,
+                                        [("www-authenticate", challenge)],
+                                    )
+                                        .into_response()
+                                } else {
+                                    (
+                                        StatusCode::TEMPORARY_REDIRECT,
+                                        [("location", format!("http://{destination}/snapshot"))],
+                                    )
+                                        .into_response()
+                                }
+                            }
+                        }),
+                    )
+                    .route("/snapshot", head(|| async { StatusCode::NO_CONTENT }));
+                let source_task =
+                    tokio::spawn(async move { axum::serve(source, app).await.unwrap() });
+                let url = format!("http://{address}/bootstrap");
+                let provider = make_test_provider()
+                    .with_origin(&url.parse().unwrap())
+                    .unwrap();
+                let result = provider
+                    .try_bootstrap_with_headers(
+                        &reqwest::Client::new(),
+                        &url,
+                        reqwest::header::HeaderMap::new(),
+                    )
+                    .await;
+                if cross_origin {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("different HTTP origin"));
+                } else {
+                    assert!(result.unwrap().is_none());
+                }
+                assert!(provider.channels.lock().unwrap().is_empty());
+                source_task.abort();
+                target_task.abort();
+            }
+        }
+    }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
     async fn bootstrap_treats_an_invalid_snapshot_as_a_cache_miss() {
         use axum::{http::StatusCode, routing::head, Router};
 
@@ -10136,6 +10284,63 @@ mod tests {
             .expect("the pinned clone trusts the realm");
         assert_eq!(credential.challenge.realm, "realm.example");
         assert_eq!(unpinned.cumulative(), 3_000);
+    }
+
+    #[tokio::test]
+    async fn prepaid_vouchers_skip_challenges_with_unreadable_expires() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider()
+            .with_prepaid_requests(2)
+            .with_channel_store(store.clone());
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        let stored = StoredChannelEntry {
+            origin: Some("https://example.test".into()),
+            ..TempoSessionProvider::stored_entry(&entry).unwrap()
+        };
+        store
+            .set_at(
+                &store::origin_channel_key(&stored.key(), "https://example.test"),
+                &stored,
+            )
+            .await
+            .unwrap();
+        let url = reqwest::Url::parse("https://example.test/paid").unwrap();
+        provider.bind_origin(url.as_str()).unwrap();
+        let cache = |expires: &str| {
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            challenge.expires = Some(expires.into());
+            challenge.realm = "example.test".into();
+            provider.prepaid.lock().unwrap().insert(
+                url.to_string(),
+                PrepaidVoucher {
+                    challenge,
+                    channel_id: channel_id.to_string(),
+                    spent: 1_000,
+                    price: 1_000,
+                },
+            );
+        };
+        let context = || PaymentContext {
+            url: url.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+
+        // Matches mppx's shape, so it parses, but is not a calendar date.
+        cache("2099-02-30T12:00:00Z");
+        assert!(provider.prepaid_credential(context()).await.is_none());
+        assert!(provider.prepaid.lock().unwrap().get(url.as_str()).is_none());
+        assert_eq!(provider.cumulative(), 1_000);
+
+        cache("2099-02-28T12:00:00Z");
+        assert!(provider.prepaid_credential(context()).await.is_some());
+        assert_eq!(provider.cumulative(), 3_000);
     }
 
     #[tokio::test]

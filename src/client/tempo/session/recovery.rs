@@ -168,7 +168,7 @@ pub fn hydrate_session_snapshot(
         "snapshot voucher cumulativeAmount",
         &signed.cumulative_amount,
     )?;
-    let required = parse_amount("snapshot requiredCumulative", &snapshot.required_cumulative)?;
+    parse_amount("snapshot requiredCumulative", &snapshot.required_cumulative)?;
     let snapshot_deposit = parse_amount("snapshot deposit", &snapshot.deposit)?;
     let snapshot_settled = parse_amount("snapshot settled", &snapshot.settled)?;
     let spent = parse_amount("snapshot spent", &snapshot.spent)?;
@@ -198,7 +198,8 @@ pub fn hydrate_session_snapshot(
         return Err(invalid("snapshot highest voucher signature is invalid"));
     }
 
-    let cumulative_amount = accepted.max(required).max(state.settled);
+    // requiredCumulative is an unsigned server hint, not payer authorization.
+    let cumulative_amount = accepted.max(state.settled);
     if cumulative_amount > state.deposit {
         return Err(invalid(
             "recovered cumulative amount exceeds the on-chain channel deposit",
@@ -524,7 +525,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(entry.cumulative_amount, 250);
+        assert_eq!(entry.cumulative_amount, 200);
     }
 
     #[tokio::test]

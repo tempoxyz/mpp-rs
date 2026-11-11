@@ -24,6 +24,49 @@ fn test_refresh_on_chain_keeps_the_higher_values() {
     assert_eq!(newer.spent, 4_000);
 }
 
+/// A MACH channel whose deposit cannot cover a charge links the payer to
+/// where it can buy the MACH to top up with, and the problem details carry it.
+#[test]
+fn test_deduct_past_a_mach_deposit_links_the_funding_page() {
+    use crate::error::PaymentError;
+    use crate::protocol::methods::tempo::machine_token::{MACH, MACH_FUNDING_URL};
+    use crate::protocol::methods::tempo::CHAIN_ID;
+
+    let mut state = test_channel_state("0xchannel");
+    state.chain_id = CHAIN_ID;
+    state.token = MACH;
+    state.deposit = 1_000_000;
+    state.highest_voucher_amount = 1_000_000;
+    state.spent = 900_000;
+
+    let err = state.clone().deduct(300_000).unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::InsufficientBalance));
+    let url = format!("{MACH_FUNDING_URL}&address={}&amount=0.20", state.payer);
+    assert_eq!(
+        err.message,
+        format!("requested 300000, available 100000; top up the channel with MACH from {url}")
+    );
+    let problem = err.to_problem_details(None);
+    assert_eq!(problem.funding_url.as_deref(), Some(url.as_str()));
+    assert!(problem.detail.contains(&url), "{}", problem.detail);
+    let json = serde_json::to_value(&problem).unwrap();
+    assert_eq!(json["fundingUrl"], url.as_str());
+
+    // The deposit covers it: the payer only needs to sign a larger voucher.
+    state.deposit = 2_000_000;
+    let err = state.clone().deduct(300_000).unwrap_err();
+    assert_eq!(err.message, "requested 300000, available 100000");
+    assert!(err.to_problem_details(None).funding_url.is_none());
+
+    // Other tokens and chains get no link.
+    state.deposit = 1_000_000;
+    state.chain_id = crate::protocol::methods::tempo::MODERATO_CHAIN_ID;
+    assert_eq!(
+        state.deduct(300_000).unwrap_err().message,
+        "requested 300000, available 100000"
+    );
+}
+
 /// An `open` for a recorded channel merges the on-chain read like a refresh,
 /// whether or not its voucher replaces the recorded one.
 #[test]

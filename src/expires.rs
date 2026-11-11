@@ -74,6 +74,30 @@ pub fn assert(expires: Option<&str>, challenge_id: Option<&str>) -> Result<(), M
     assert_at(expires, challenge_id, OffsetDateTime::now_utc())
 }
 
+/// Reject a server-chosen `expires` that verification could not read.
+///
+/// Parsing accepts any ISO 8601-shaped value, as mppx does, but a server
+/// verifies `expires` as an RFC 3339 date. A Challenge issued with a value
+/// such as `2025-02-30T12:00:00Z` could never be paid, so issuing one fails.
+///
+/// # Errors
+///
+/// [`MppError::InvalidConfig`] if `expires` is not an RFC 3339 timestamp.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::expires;
+///
+/// assert!(expires::ensure_verifiable(&expires::hours(1)).is_ok());
+/// assert!(expires::ensure_verifiable("2025-02-30T12:00:00Z").is_err());
+/// ```
+pub fn ensure_verifiable(expires: &str) -> Result<(), MppError> {
+    OffsetDateTime::parse(expires, &Rfc3339)
+        .map(|_| ())
+        .map_err(|_| MppError::InvalidConfig(format!("invalid expires timestamp: {expires}")))
+}
+
 fn assert_at(
     expires: Option<&str>,
     challenge_id: Option<&str>,

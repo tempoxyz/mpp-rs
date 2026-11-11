@@ -492,6 +492,9 @@ impl TempoZone {
 
     /// Requests a Zone withdrawal of the challenge amount to its recipient,
     /// bound to the challenge by its memo, and returns its sender tag.
+    // The error pairs the cached failure with the caller's own error; it is
+    // returned once per withdrawal, so boxing it buys nothing.
+    #[allow(clippy::result_large_err)]
     async fn request_withdrawal(
         &self,
         challenge: &PaymentChallenge,

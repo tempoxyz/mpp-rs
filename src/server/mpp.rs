@@ -109,7 +109,8 @@ fn realm_from_env(lookup: impl Fn(&str) -> Option<String>) -> String {
 /// use mpp::store::MemoryStore;
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz")?;
-/// // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+/// // The default in-memory store makes credentials single-use within this
+/// // instance and its clones; pass a shared store when several instances serve.
 /// let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 /// let payment = Mpp::new(method, "api.example.com", "my-server-secret-of-at-least-32-bytes");
 ///
@@ -498,9 +499,10 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         if let Some(remote_fee_payer) = builder.remote_fee_payer {
             method = method.with_remote_fee_payer(remote_fee_payer)?;
         }
-        if let Some(store) = builder.store {
-            method = method.with_store(store);
-        }
+        method = match builder.store {
+            Some(store) => method.with_store(store),
+            None => method.without_store(),
+        };
         let relay = builder.relay.is_some();
         if let Some(relay) = builder.relay {
             method = method.with_relay(relay)?;

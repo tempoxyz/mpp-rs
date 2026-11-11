@@ -153,7 +153,10 @@ pub use types::{Split, TempoMethodDetails};
 pub use voucher::{compute_channel_id, sign_voucher, DOMAIN_NAME, DOMAIN_VERSION};
 
 #[cfg(feature = "server")]
-pub use method::{ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride, RemoteFeePayer};
+pub use method::{
+    ChargeMethod, FeePayerPolicy, FeePayerPolicyOverride, PaymentSimulationError,
+    PaymentSimulationPhase, RemoteFeePayer,
+};
 #[cfg(feature = "server")]
 pub use relay::{RelayConfig, RelayErrorCode};
 #[cfg(feature = "server")]
@@ -381,7 +384,10 @@ pub fn charge_challenge_with_options(
 
     let default_expires;
     let expires = match expires {
-        Some(e) => Some(e),
+        Some(e) => {
+            crate::expires::ensure_verifiable(e)?;
+            Some(e)
+        }
         None => {
             let expiry_time =
                 OffsetDateTime::now_utc() + Duration::minutes(DEFAULT_EXPIRES_MINUTES as i64);
@@ -676,6 +682,29 @@ mod tests {
             Some("2020-01-01T00:00:00Z"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_charge_challenge_with_options_rejects_unverifiable_expires() {
+        use crate::protocol::intents::ChargeRequest;
+
+        let request = ChargeRequest {
+            amount: "1000000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            ..Default::default()
+        };
+
+        // Shape-valid but not a calendar date: parsing accepts it, verification can't.
+        let error = charge_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &request,
+            Some("9999-13-01T00:00:00Z"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid expires timestamp"));
     }
 
     #[test]

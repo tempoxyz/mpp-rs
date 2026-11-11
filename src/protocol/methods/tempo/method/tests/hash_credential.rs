@@ -431,3 +431,87 @@ async fn test_store_dedup_different_hashes_independent() {
     let seen = store.get("mpp:charge:0xhash_a").await.unwrap();
     assert!(seen.is_some(), "original hash should still be recorded");
 }
+
+/// `ChargeMethod::new` protects against replays without `with_store`: the
+/// same transaction hash is accepted once.
+#[tokio::test]
+async fn test_new_rejects_replayed_hash_by_default() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let payer = Address::repeat_byte(0x11);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(1000u64);
+    let request = ChargeRequest {
+        amount: "1000".to_string(),
+        currency: format!("{currency:#x}"),
+        recipient: Some(format!("{recipient:#x}")),
+        method_details: Some(serde_json::json!({ "chainId": MODERATO_CHAIN_ID })),
+        ..Default::default()
+    };
+    let challenge = test_proof_challenge(&request);
+    let memo = attribution::encode(&challenge.id, &challenge.realm, None);
+    let tx_hash = B256::repeat_byte(0xab);
+    let block_hash = B256::repeat_byte(0x22);
+
+    let mut log = make_transfer_with_memo_log(currency, payer, recipient, amount, memo);
+    log.as_object_mut().unwrap().extend(
+        serde_json::json!({
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x1",
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+            "removed": false,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let receipt = serde_json::json!({
+        "type": "0x76",
+        "status": "0x1",
+        "cumulativeGasUsed": "0x5208",
+        "logs": [log],
+        "logsBloom": format!("0x{}", "00".repeat(256)),
+        "transactionHash": format!("{tx_hash:#x}"),
+        "transactionIndex": "0x0",
+        "blockHash": format!("{block_hash:#x}"),
+        "blockNumber": "0x1",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "from": format!("{payer:#x}"),
+        "to": format!("{currency:#x}"),
+        "contractAddress": null,
+        "feePayer": format!("{payer:#x}"),
+        "feeToken": format!("{currency:#x}"),
+    });
+    let asserter = Asserter::new();
+    // Answer every RPC lookup of both verifications, so only the replay check
+    // can reject the second.
+    for _ in 0..4 {
+        asserter.push_success(&receipt);
+    }
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter);
+    let method = ChargeMethod::new(provider);
+    method.cached_chain_id.set(MODERATO_CHAIN_ID).unwrap();
+
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:#x}")),
+    );
+    method.verify(&credential, &request).await.unwrap();
+    // A clone shares the default store.
+    let err = method
+        .clone()
+        .verify(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed),
+        "got: {err}"
+    );
+}
