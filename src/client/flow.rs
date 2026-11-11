@@ -15,8 +15,9 @@ use super::challenge_selection::{
 };
 use super::error::HttpError;
 use super::events::{
-    ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
-    PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
+    ChallengeDecision, ChallengeReceivedContext, ClientEvent, ClientEvents,
+    CredentialCreatedContext, OnChallengeContext, PaymentFailedContext, PaymentFailureReason,
+    PaymentResponseContext,
 };
 use super::provider::{PaymentContext, PaymentProvider, PendingPayment};
 use crate::error::MppError;
@@ -38,11 +39,17 @@ pub trait Exchange: Send {
     /// Restricts server challenges before provider preparation and after preparation.
     /// Prepaid credentials are controlled separately by [`Self::allows_prepaid`].
     ///
-    /// The default rejects custom credential headers because a caller-owned
-    /// client may forward them across redirects. Only override this restriction
-    /// when the transport enforces its own redirect-safe credential handling.
+    /// The default accepts challenges that send the credential in
+    /// `Authorization` or, for servers that keep `Authorization` for their own
+    /// auth, `Payment-Authorization`, as mppx does. Unlike `Authorization`,
+    /// a client that follows redirects forwards `Payment-Authorization` to
+    /// another host; disable redirects on the client to keep the credential at
+    /// the server that asked for it. Override this to restrict challenges further.
     fn check_challenge(&self, challenge: &PaymentChallenge) -> Result<(), HttpError> {
-        if challenge.credential_header() == "Authorization" {
+        let header = challenge.credential_header();
+        if header.eq_ignore_ascii_case("Authorization")
+            || header.eq_ignore_ascii_case("Payment-Authorization")
+        {
             Ok(())
         } else {
             Err(HttpError::UnsafeCredentialHeader)
@@ -421,13 +428,34 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Ok(resp);
             }
 
-            let override_credential = self
+            let mut override_credential = self
                 .events
                 .emit_challenge_received(ChallengeReceivedContext {
                     challenge: challenge.clone(),
-                    challenges,
+                    challenges: challenges.clone(),
                 })
                 .await;
+            // As in mppx, `challenge.received` credentials skip `onChallenge`.
+            if override_credential.is_none() {
+                match self
+                    .events
+                    .decide_on_challenge(OnChallengeContext {
+                        challenge: challenge.clone(),
+                        challenges,
+                        url: payment_context.url.clone(),
+                        method: retry.method().clone(),
+                        headers: payment_context.headers.clone(),
+                    })
+                    .await
+                {
+                    ChallengeDecision::Pay => {}
+                    // Declined before anything was signed: hand back the 402.
+                    ChallengeDecision::Decline => return Ok(resp),
+                    ChallengeDecision::Credential(credential) => {
+                        override_credential = Some(*credential);
+                    }
+                }
+            }
 
             let credential = match override_credential {
                 Some(credential) => credential,
@@ -588,6 +616,18 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 .is_ok_and(|payload| payload.is_hash())
             {
                 return Ok(resp);
+            }
+
+            // A credential the server refused as an invalid challenge (which is
+            // also how a replayed credential is answered) must not be paid
+            // again: the earlier payment may have settled, and paying the fresh
+            // challenge could pay twice, so that 402 is final.
+            if status == StatusCode::PAYMENT_REQUIRED && is_problem_json(&resp) {
+                let (rebuilt, problem_type) = read_problem_type(resp).await;
+                resp = rebuilt;
+                if problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge")) {
+                    return Ok(resp);
+                }
             }
 
             // Any other completed HTTP response is the application's answer,
@@ -819,6 +859,48 @@ pub fn is_cross_realm_proof_with_trust(
     binds_realm
         && !requested_host.is_some_and(|host| challenge.realm.eq_ignore_ascii_case(&host))
         && trusted_realm != Some(challenge.realm.as_str())
+}
+
+/// Whether a response's body is RFC 9457 problem details.
+fn is_problem_json(resp: &Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media| {
+                media
+                    .trim()
+                    .eq_ignore_ascii_case("application/problem+json")
+            })
+        })
+}
+
+/// Read the problem type of a problem-details response, and return an
+/// equivalent response with the same status, headers, URL and body. A body
+/// that cannot be read comes back empty, with no type.
+async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
+    use reqwest::ResponseBuilderExt;
+
+    let status = resp.status();
+    let version = resp.version();
+    let url = resp.url().clone();
+    let headers = resp.headers().clone();
+    let body = resp.bytes().await.unwrap_or_default();
+    let problem_type = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|problem| problem.get("type")?.as_str().map(str::to_string));
+    let mut builder = http_types::Response::builder()
+        .status(status)
+        .version(version)
+        .url(url);
+    if let Some(builder_headers) = builder.headers_mut() {
+        *builder_headers = headers;
+    }
+    let rebuilt = builder
+        .body(body)
+        .map(Response::from)
+        .unwrap_or_else(|_| Response::from(http_types::Response::new(Vec::<u8>::new())));
+    (rebuilt, problem_type)
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.

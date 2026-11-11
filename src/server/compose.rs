@@ -388,18 +388,30 @@ mod tests {
 
     #[tokio::test]
     async fn verify_dispatches_to_matching_method() {
-        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
-        let mpp_b = super::super::Mpp::new(MockMethod("beta"), "test.example.com", "secret");
+        let mpp_a = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
+        let mpp_b = super::super::Mpp::new(
+            MockMethod("beta"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let verifiers: Vec<&dyn ChargeVerifier> = vec![&mpp_a, &mpp_b];
 
-        let cred = test_credential("beta", "secret");
+        let cred = test_credential("beta", "test-secret-key-at-least-32-bytes");
         let receipt = compose_verify(&verifiers, &cred).await.unwrap();
         assert_eq!(receipt.method.as_str(), "beta");
     }
 
     #[tokio::test]
     async fn verify_falls_back_to_first_on_no_match() {
-        let mpp = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let verifiers: Vec<&dyn ChargeVerifier> = vec![&mpp];
 
         // Credential for "unknown" method — falls back to first verifier.
@@ -411,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_empty_verifiers_returns_error() {
-        let cred = test_credential("tempo", "secret");
+        let cred = test_credential("tempo", "test-secret-key-at-least-32-bytes");
         let result = compose_verify(&[], &cred).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("No verifiers"));
@@ -419,7 +431,11 @@ mod tests {
 
     #[tokio::test]
     async fn verify_rejects_non_charge_intent() {
-        let mpp = super::super::Mpp::new(MockMethod("tempo"), "test.example.com", "secret");
+        let mpp = super::super::Mpp::new(
+            MockMethod("tempo"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let verifiers: Vec<&dyn ChargeVerifier> = vec![&mpp];
 
         // Build a credential with intent="session"
@@ -432,7 +448,7 @@ mod tests {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
         let id = crate::protocol::core::compute_challenge_id(
-            "secret",
+            "test-secret-key-at-least-32-bytes",
             "test.example.com",
             "tempo",
             "session",
@@ -470,9 +486,13 @@ mod tests {
 
     #[tokio::test]
     async fn verify_with_expected_requests_rejects_other_routes_credential() {
-        let mpp = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         // Issued by this handler for a route that charges 1000.
-        let cred = test_credential("alpha", "secret");
+        let cred = test_credential("alpha", "test-secret-key-at-least-32-bytes");
 
         let expensive = expected("100000");
         let err = compose_verify_with_expected_requests(&[(&mpp, &expensive)], &cred)
@@ -493,10 +513,18 @@ mod tests {
 
     #[tokio::test]
     async fn verify_with_expected_requests_uses_matching_verifiers_expectation() {
-        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
-        let mpp_b = super::super::Mpp::new(MockMethod("beta"), "test.example.com", "secret");
+        let mpp_a = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
+        let mpp_b = super::super::Mpp::new(
+            MockMethod("beta"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let (alpha_expected, beta_expected) = (expected("5"), expected("1000"));
-        let cred = test_credential("beta", "secret");
+        let cred = test_credential("beta", "test-secret-key-at-least-32-bytes");
 
         let receipt = compose_verify_with_expected_requests(
             &[(&mpp_a, &alpha_expected), (&mpp_b, &beta_expected)],
@@ -516,8 +544,16 @@ mod tests {
 
     #[tokio::test]
     async fn verify_with_expected_requests_selects_route_by_issued_request() {
-        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
-        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp_a = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
+        let mpp_b = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let other_currency = ChargeRequest {
             amount: "1000".into(),
             currency: "EUR".into(),
@@ -525,7 +561,7 @@ mod tests {
         };
         let issued = expected("1000");
         // Issued by the second handler, which charges USD.
-        let cred = test_credential("alpha", "secret");
+        let cred = test_credential("alpha", "test-secret-key-at-least-32-bytes");
 
         let receipt = compose_verify_with_expected_requests(
             &[(&mpp_a, &other_currency), (&mpp_b, &issued)],
@@ -550,10 +586,18 @@ mod tests {
         // The first handler offers USD and EUR; its route's expected request
         // names only its first currency. The second handler charges EUR with
         // another secret.
-        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret-a")
-            .with_currencies(vec!["USD".into(), "EUR".into()]);
-        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret-b")
-            .with_currencies(vec!["EUR".into()]);
+        let mpp_a = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-a-at-least-32-bytes",
+        )
+        .with_currencies(vec!["USD".into(), "EUR".into()]);
+        let mpp_b = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-b-at-least-32-bytes",
+        )
+        .with_currencies(vec!["EUR".into()]);
         let usd = expected("1000");
         let eur = ChargeRequest {
             amount: "1000".into(),
@@ -563,7 +607,7 @@ mod tests {
         // Paid in EUR on a challenge the first handler issued.
         let cred = credential_for_request(
             "alpha",
-            "secret-a",
+            "test-secret-key-a-at-least-32-bytes",
             serde_json::json!({"amount": "1000", "currency": "EUR"}),
         );
 
@@ -577,8 +621,16 @@ mod tests {
     #[tokio::test]
     async fn verify_with_expected_requests_selects_route_by_scope() {
         // Same handler config and price; the routes differ only by scope.
-        let mpp_a = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
-        let mpp_b = super::super::Mpp::new(MockMethod("alpha"), "test.example.com", "secret");
+        let mpp_a = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
+        let mpp_b = super::super::Mpp::new(
+            MockMethod("alpha"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let scoped = |route: &str| ChargeRequest {
             mppx_scope: Some(serde_json::json!({"route": route})),
             ..expected("1000")
@@ -586,7 +638,7 @@ mod tests {
         let (first, second) = (scoped("/a"), scoped("/b"));
         let cred = credential_for_request(
             "alpha",
-            "secret",
+            "test-secret-key-at-least-32-bytes",
             serde_json::json!({"amount": "1000", "currency": "USD", "_mppx_scope": {"route": "/b"}}),
         );
 
@@ -613,7 +665,7 @@ mod tests {
             }
         }
 
-        let cred = test_credential("alpha", "secret");
+        let cred = test_credential("alpha", "test-secret-key-at-least-32-bytes");
         let route = expected("1000");
         let result = compose_verify_with_expected_requests(&[(&Unbound, &route)], &cred).await;
         assert!(result.is_err());
@@ -630,11 +682,19 @@ mod tests {
 
     #[tokio::test]
     async fn verify_same_method_picks_first() {
-        let mpp_a = super::super::Mpp::new(MockMethod("tempo"), "test.example.com", "secret");
-        let mpp_b = super::super::Mpp::new(MockMethod("tempo"), "test.example.com", "secret");
+        let mpp_a = super::super::Mpp::new(
+            MockMethod("tempo"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
+        let mpp_b = super::super::Mpp::new(
+            MockMethod("tempo"),
+            "test.example.com",
+            "test-secret-key-at-least-32-bytes",
+        );
         let verifiers: Vec<&dyn ChargeVerifier> = vec![&mpp_a, &mpp_b];
 
-        let cred = test_credential("tempo", "secret");
+        let cred = test_credential("tempo", "test-secret-key-at-least-32-bytes");
         let receipt = compose_verify(&verifiers, &cred).await.unwrap();
         // Both are "tempo" — first one wins, both return same receipt
         assert_eq!(receipt.method.as_str(), "tempo");

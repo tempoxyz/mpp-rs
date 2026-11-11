@@ -348,6 +348,26 @@ mod tests {
         assert_eq!(transfers[0].memo, None);
     }
 
+    /// Amounts with leading zeros are accepted and compare numerically.
+    #[test]
+    fn test_get_request_transfers_accepts_leading_zeros() {
+        let request = |amount: &str, split_amount: &str| ChargeRequest {
+            amount: amount.to_string(),
+            currency: format!("{:#x}", addr(0x20)),
+            recipient: Some(format!("{:#x}", addr(0x01))),
+            method_details: Some(serde_json::json!({
+                "splits": [{ "amount": split_amount, "recipient": format!("{:#x}", addr(0x02)) }],
+            })),
+            ..Default::default()
+        };
+
+        let padded = get_request_transfers(&request("0001000", "0000200")).unwrap();
+        let canonical = get_request_transfers(&request("1000", "200")).unwrap();
+        assert_eq!(padded, canonical);
+        assert_eq!(padded[0].amount, U256::from(800u64));
+        assert_eq!(padded[1].amount, U256::from(200u64));
+    }
+
     #[test]
     fn test_get_request_transfers_rejects_empty_splits() {
         let request = ChargeRequest {

@@ -257,7 +257,9 @@ impl TempoBuilder {
 /// - **rpc_url**: `https://rpc.tempo.xyz`
 /// - **realm**: auto-detected from `MPP_REALM`, `FLY_APP_NAME`, `HEROKU_APP_NAME`,
 ///   `RAILWAY_PUBLIC_DOMAIN`, `RENDER_EXTERNAL_HOSTNAME`, `VERCEL_URL`,
-///   `WEBSITE_HOSTNAME` — falling back to `"MPP Payment"`
+///   `WEBSITE_HOSTNAME` — falling back to `"localhost"`; Axum extractors
+///   use the request's hostname instead when it is listed in
+///   [`trusted_hosts`](TempoBuilder::trusted_hosts)
 /// - **secret_key**: reads `MPP_SECRET_KEY` env var; required if not explicitly set
 /// - **currencies**: one charge challenge per accepted currency, in order:
 ///   - Tempo mainnet (`.chain_id(4217)` or a non-Moderato `.rpc_url(...)`):

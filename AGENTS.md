@@ -40,7 +40,7 @@ A bare `cargo test` builds only the default features and skips most of the suite
 - Features gate everything beyond the core types: `client`, `server`, `tempo` (implies `evm`), `stripe`, `middleware`, `tower`, `axum`, `ws`, `sqlite`, `utils`, `forward-proxy` and the `reqwest-*-tls` backends. New code compiles under every pairing of features (`cargo hack` above); put it behind the narrowest feature that needs it.
 - Compare HMACs and Challenge IDs with `constant_time_eq`, never `==` or `!=`; the `no-hmac-equality-compare` ast-grep rule enforces it.
 - Match mppx's names, defaults and errors. Behavior ported from mppx says so in the changelog (for example "as mppx does").
-- Payment helpers pay only when a request authorizes it (`AcceptPaymentPolicy::Explicit` by default) and verification takes the route's amount; keep both when changing client or server flows.
+- Payment helpers pay a 402 without a request-level `Accept-Payment` header (`AcceptPaymentPolicy::Always` by default, as mppx does; `Explicit` stays selectable), callers approve or decline payments with the `on_challenge` hook, and verification takes the route's amount; keep these when changing client or server flows.
 - Every user-visible change needs a changelog fragment in `.changelog/<random-name>.md` (`changelogs add`, or the suggestion the Changelog workflow comments on the pull request):
 
   ```markdown

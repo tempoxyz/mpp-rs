@@ -34,7 +34,8 @@ tempo-alloy = { version = "1.11.0", default-features = false }
 default = ["reqwest-default-tls"]
 
 # Side selection
-client = ["dep:reqwest"]
+# http-types rebuilds a response whose problem body the payment flow read.
+client = ["dep:reqwest", "http-types"]
 server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
@@ -47,8 +48,9 @@ tempo = [
   "dep:p256",
   "dep:uuid",
   "dep:reqwest",
+  "dep:getrandom",
 ]
-stripe = ["dep:reqwest", "reqwest?/form"]
+stripe = ["dep:reqwest", "reqwest?/form", "dep:getrandom"]
 sqlite = ["client", "tempo", "dep:fs2", "dep:rusqlite", "dep:libc"]
 
 # Server-side SQL store (SqlStore), with drivers for Postgres and SQLite
@@ -182,6 +184,8 @@ rustls-native-certs = { version = "0.8", optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 
 uuid = { version = "1", features = ["v4"], optional = true }
+# OS randomness for the per-challenge `_mpp_nonce` servers add to `opaque`.
+getrandom = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.180", optional = true }

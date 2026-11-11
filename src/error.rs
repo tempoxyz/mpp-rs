@@ -49,7 +49,7 @@ pub const HINT_METHOD_UNSUPPORTED: &str = HINT_PAYMENT_REQUIRED;
 /// use mpp::error::PaymentErrorDetails;
 ///
 /// let problem = PaymentErrorDetails::core("verification-failed")
-///     .with_title("VerificationFailedError")
+///     .with_title("Payment Verification Failed")
 ///     .with_status(402)
 ///     .with_detail("Payment verification failed: insufficient amount.");
 ///
@@ -291,9 +291,10 @@ pub enum MppError {
     /// by a concurrent request, or its settled transfer is bound to another
     /// challenge.
     ///
-    /// Reported as `verification-failed` with status 403 and answered without
-    /// a challenge: the payment was valid, but paying again would not help.
-    #[error("{}", format_verification_failed(.0))]
+    /// Reported as `invalid-challenge` with status 402 and a fresh challenge,
+    /// as the core spec requires for a Credential whose Challenge was already
+    /// used.
+    #[error("{}", format_credential_replayed(.0))]
     CredentialReplayed(Option<String>),
 
     /// Payment has expired.
@@ -420,6 +421,13 @@ fn format_verification_failed(reason: &Option<String>) -> String {
     match reason {
         Some(r) => format!("Payment verification failed: {}.", r),
         None => "Payment verification failed.".to_string(),
+    }
+}
+
+fn format_credential_replayed(reason: &Option<String>) -> String {
+    match reason {
+        Some(r) => format!("Challenge was already used: {}.", r),
+        None => "Challenge was already used.".to_string(),
     }
 }
 
@@ -666,9 +674,8 @@ impl MppError {
         match self {
             Self::MalformedCredential(_) => Some("malformed-credential"),
             Self::InvalidChallenge { .. } => Some("invalid-challenge"),
-            Self::VerificationFailed(_) | Self::CredentialReplayed(_) => {
-                Some("verification-failed")
-            }
+            Self::VerificationFailed(_) => Some("verification-failed"),
+            Self::CredentialReplayed(_) => Some("invalid-challenge"),
             Self::PaymentExpired(_) => Some("payment-expired"),
             Self::PaymentRequired { .. } => Some("payment-required"),
             Self::InvalidPayload(_) => Some("invalid-payload"),
@@ -708,67 +715,67 @@ impl PaymentError for MppError {
         let mut problem = match self {
             // Core payment-auth errors
             Self::MalformedCredential(_) => PaymentErrorDetails::core("malformed-credential")
-                .with_title("MalformedCredentialError")
+                .with_title("Malformed Credential")
                 .with_status(402)
                 .with_hint(HINT_MALFORMED_CREDENTIAL),
             Self::InvalidChallenge { .. } => PaymentErrorDetails::core("invalid-challenge")
-                .with_title("InvalidChallengeError")
+                .with_title("Invalid Challenge")
                 .with_status(402),
             Self::VerificationFailed(_) => PaymentErrorDetails::core("verification-failed")
-                .with_title("VerificationFailedError")
+                .with_title("Payment Verification Failed")
                 .with_status(402),
-            Self::CredentialReplayed(_) => PaymentErrorDetails::core("verification-failed")
-                .with_title("VerificationFailedError")
-                .with_status(403),
+            Self::CredentialReplayed(_) => PaymentErrorDetails::core("invalid-challenge")
+                .with_title("Invalid Challenge")
+                .with_status(402),
             Self::PaymentExpired(_) => PaymentErrorDetails::core("payment-expired")
-                .with_title("PaymentExpiredError")
+                .with_title("Payment Expired")
                 .with_status(402),
             Self::PaymentRequired { .. } => PaymentErrorDetails::core("payment-required")
-                .with_title("PaymentRequiredError")
+                .with_title("Payment Required")
                 .with_status(402)
                 .with_hint(HINT_PAYMENT_REQUIRED),
             Self::InvalidPayload(_) => PaymentErrorDetails::core("invalid-payload")
-                .with_title("InvalidPayloadError")
+                .with_title("Invalid Payload")
                 .with_status(402),
             Self::BadRequest(_) => PaymentErrorDetails::core("bad-request")
-                .with_title("BadRequestError")
+                .with_title("Bad Request")
                 .with_status(400),
             Self::UnsupportedPaymentMethod(_) => PaymentErrorDetails::core("method-unsupported")
-                .with_title("PaymentMethodUnsupportedError")
+                .with_title("Method Unsupported")
                 .with_status(400)
                 .with_hint(HINT_METHOD_UNSUPPORTED),
             Self::PaymentActionRequired(_) => PaymentErrorDetails::core("payment-action-required")
-                .with_title("PaymentActionRequiredError")
+                .with_title("Payment Action Required")
                 .with_status(402),
             Self::PaymentInsufficient(_) => PaymentErrorDetails::core("payment-insufficient")
-                .with_title("PaymentInsufficientError")
+                .with_title("Payment Insufficient")
                 .with_status(402),
             // Session/channel errors
             Self::InsufficientBalance(_) => PaymentErrorDetails::session("insufficient-balance")
-                .with_title("InsufficientBalanceError")
+                .with_title("Insufficient Balance")
                 .with_status(402),
             Self::InvalidSignature(_) => PaymentErrorDetails::session("invalid-signature")
-                .with_title("InvalidSignatureError")
+                .with_title("Invalid Signature")
                 .with_status(402),
             Self::SignerMismatch(_) => PaymentErrorDetails::session("signer-mismatch")
-                .with_title("SignerMismatchError")
+                .with_title("Signer Mismatch")
                 .with_status(402),
             Self::AmountExceedsDeposit(_) => PaymentErrorDetails::session("amount-exceeds-deposit")
-                .with_title("AmountExceedsDepositError")
+                .with_title("Amount Exceeds Deposit")
                 .with_status(402),
             Self::DeltaTooSmall(_) => PaymentErrorDetails::session("delta-too-small")
-                .with_title("DeltaTooSmallError")
+                .with_title("Delta Too Small")
                 .with_status(402),
             Self::ChannelNotFound(_) => PaymentErrorDetails::session("channel-not-found")
-                .with_title("ChannelNotFoundError")
+                .with_title("Channel Not Found")
                 .with_status(410),
             Self::ChannelClosed(_) => PaymentErrorDetails::session("channel-finalized")
-                .with_title("ChannelClosedError")
+                .with_title("Channel Finalized")
                 .with_status(410),
             // Errors that are not payment problems are the server's own
             // failures, reported as the spec's internal-payment-error.
             _ => PaymentErrorDetails::core(INTERNAL_PROBLEM_TYPE_SUFFIX)
-                .with_title("InternalPaymentError")
+                .with_title("Internal Payment Error")
                 .with_status(500),
         }
         .with_detail(if self.is_payment_problem() {
@@ -803,9 +810,156 @@ impl PaymentError for MppError {
     }
 }
 
+// ==================== Narrower error types ====================
+
+/// Why a server rejected a request's Payment credential: one variant per
+/// problem type the core spec defines for credentials.
+///
+/// A narrower view of the credential variants of [`MppError`], for code that
+/// handles only credential failures. Convert with [`From`] and
+/// [`MppError::credential_error`]; both report the same problem details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CredentialError {
+    /// More than one Payment credential in the request (`bad-request`, 400).
+    MultipleCredentials,
+    /// The credential is not base64url-encoded JSON (`malformed-credential`).
+    Malformed(Option<String>),
+    /// The challenge id is unknown, or the challenge binding does not match
+    /// (`invalid-challenge`).
+    InvalidChallenge(Option<String>),
+    /// The challenge was already used (`invalid-challenge`).
+    Replayed(Option<String>),
+    /// The challenge expired (`payment-expired`).
+    Expired(Option<String>),
+    /// The payload does not match the method's schema (`invalid-payload`).
+    InvalidPayload(Option<String>),
+    /// The payment proof failed verification (`verification-failed`).
+    VerificationFailed(Option<String>),
+}
+
+impl std::fmt::Display for CredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        MppError::from(self.clone()).fmt(f)
+    }
+}
+
+impl std::error::Error for CredentialError {}
+
+impl From<CredentialError> for MppError {
+    fn from(error: CredentialError) -> Self {
+        match error {
+            CredentialError::MultipleCredentials => {
+                MppError::bad_request("more than one Payment credential in the request")
+            }
+            CredentialError::Malformed(reason) => MppError::MalformedCredential(reason),
+            CredentialError::InvalidChallenge(reason) => {
+                MppError::InvalidChallenge { id: None, reason }
+            }
+            CredentialError::Replayed(reason) => MppError::CredentialReplayed(reason),
+            CredentialError::Expired(expires) => MppError::PaymentExpired(expires),
+            CredentialError::InvalidPayload(reason) => MppError::InvalidPayload(reason),
+            CredentialError::VerificationFailed(reason) => MppError::VerificationFailed(reason),
+        }
+    }
+}
+
+impl PaymentError for CredentialError {
+    fn to_problem_details(&self, challenge_id: Option<&str>) -> PaymentErrorDetails {
+        MppError::from(self.clone()).to_problem_details(challenge_id)
+    }
+}
+
+/// A server or client was configured incorrectly, such as with a secret key
+/// shorter than 32 bytes. The narrower form of [`MppError::InvalidConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigError(pub String);
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid configuration: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl From<ConfigError> for MppError {
+    fn from(error: ConfigError) -> Self {
+        MppError::InvalidConfig(error.0)
+    }
+}
+
+impl MppError {
+    /// This error as a [`CredentialError`], when it is a credential failure.
+    pub fn credential_error(&self) -> Option<CredentialError> {
+        Some(match self {
+            Self::BadRequest(_) => CredentialError::MultipleCredentials,
+            Self::MalformedCredential(reason) => CredentialError::Malformed(reason.clone()),
+            Self::InvalidChallenge { reason, .. } => {
+                CredentialError::InvalidChallenge(reason.clone())
+            }
+            Self::CredentialReplayed(reason) => CredentialError::Replayed(reason.clone()),
+            Self::PaymentExpired(expires) => CredentialError::Expired(expires.clone()),
+            Self::InvalidPayload(reason) => CredentialError::InvalidPayload(reason.clone()),
+            Self::VerificationFailed(reason) => CredentialError::VerificationFailed(reason.clone()),
+            _ => return None,
+        })
+    }
+
+    /// This error as a [`ConfigError`], when it is a configuration error.
+    pub fn config_error(&self) -> Option<ConfigError> {
+        match self {
+            Self::InvalidConfig(message) => Some(ConfigError(message.clone())),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_credential_error_round_trips_through_mpp_error() {
+        for error in [
+            CredentialError::Malformed(Some("bad".into())),
+            CredentialError::InvalidChallenge(Some("bad".into())),
+            CredentialError::Replayed(None),
+            CredentialError::Expired(None),
+            CredentialError::InvalidPayload(None),
+            CredentialError::VerificationFailed(None),
+        ] {
+            let mpp = MppError::from(error.clone());
+            assert_eq!(mpp.credential_error(), Some(error.clone()));
+            assert_eq!(
+                error.to_problem_details(None).problem_type,
+                mpp.to_problem_details(None).problem_type
+            );
+        }
+        let problem = CredentialError::MultipleCredentials.to_problem_details(None);
+        assert!(problem.problem_type.ends_with("/bad-request"));
+        assert_eq!(problem.status, 400);
+        assert_eq!(
+            MppError::from(ConfigError("short key".into())).config_error(),
+            Some(ConfigError("short key".into()))
+        );
+    }
+
+    #[test]
+    fn test_problem_titles_are_human_readable() {
+        assert_eq!(
+            MppError::payment_required_default()
+                .to_problem_details(None)
+                .title,
+            "Payment Required"
+        );
+        assert_eq!(
+            MppError::malformed_credential_default()
+                .to_problem_details(None)
+                .title,
+            "Malformed Credential"
+        );
+    }
 
     #[test]
     fn test_amount_exceeds_max_display() {
@@ -898,7 +1052,7 @@ mod tests {
     #[test]
     fn test_problem_details_session() {
         let problem = PaymentErrorDetails::session("insufficient-balance")
-            .with_title("InsufficientBalanceError")
+            .with_title("Insufficient Balance")
             .with_status(402)
             .with_detail("Insufficient balance.");
 
@@ -906,7 +1060,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/insufficient-balance"
         );
-        assert_eq!(problem.title, "InsufficientBalanceError");
+        assert_eq!(problem.title, "Insufficient Balance");
         assert_eq!(problem.status, 402);
     }
 
@@ -922,7 +1076,7 @@ mod tests {
     #[test]
     fn test_problem_details_serialize() {
         let problem = PaymentErrorDetails::core("verification-failed")
-            .with_title("VerificationFailedError")
+            .with_title("Payment Verification Failed")
             .with_status(402)
             .with_detail("Payment verification failed.")
             .with_challenge_id("abc123");
@@ -938,7 +1092,7 @@ mod tests {
     #[test]
     fn test_problem_details_with_hint() {
         let problem = PaymentErrorDetails::core("payment-required")
-            .with_title("PaymentRequiredError")
+            .with_title("Payment Required")
             .with_status(402)
             .with_detail("Payment is required.")
             .with_hint("Use a wallet");
@@ -993,7 +1147,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/malformed-credential"
         );
-        assert_eq!(problem.title, "MalformedCredentialError");
+        assert_eq!(problem.title, "Malformed Credential");
         assert_eq!(problem.challenge_id, Some("test-id".to_string()));
     }
 
@@ -1038,7 +1192,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/verification-failed"
         );
-        assert_eq!(problem.title, "VerificationFailedError");
+        assert_eq!(problem.title, "Payment Verification Failed");
     }
 
     #[test]
@@ -1100,7 +1254,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/bad-request"
         );
-        assert_eq!(problem.title, "BadRequestError");
+        assert_eq!(problem.title, "Bad Request");
         assert_eq!(problem.status, 400);
     }
 
@@ -1112,7 +1266,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/method-unsupported"
         );
-        assert_eq!(problem.title, "PaymentMethodUnsupportedError");
+        assert_eq!(problem.title, "Method Unsupported");
         assert_eq!(problem.status, 400);
     }
 
@@ -1129,7 +1283,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/payment-action-required"
         );
-        assert_eq!(problem.title, "PaymentActionRequiredError");
+        assert_eq!(problem.title, "Payment Action Required");
         assert_eq!(problem.status, 402);
     }
 
@@ -1149,7 +1303,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/payment-insufficient"
         );
-        assert_eq!(problem.title, "PaymentInsufficientError");
+        assert_eq!(problem.title, "Payment Insufficient");
         assert_eq!(problem.status, 402);
     }
 
@@ -1180,7 +1334,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/insufficient-balance"
         );
-        assert_eq!(problem.title, "InsufficientBalanceError");
+        assert_eq!(problem.title, "Insufficient Balance");
         assert_eq!(problem.status, 402);
 
         let err = MppError::InsufficientBalance(None);
@@ -1196,7 +1350,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/invalid-signature"
         );
-        assert_eq!(problem.title, "InvalidSignatureError");
+        assert_eq!(problem.title, "Invalid Signature");
         assert_eq!(problem.status, 402);
 
         let err = MppError::InvalidSignature(None);
@@ -1215,7 +1369,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/signer-mismatch"
         );
-        assert_eq!(problem.title, "SignerMismatchError");
+        assert_eq!(problem.title, "Signer Mismatch");
         assert_eq!(problem.status, 402);
 
         let err = MppError::SignerMismatch(None);
@@ -1237,7 +1391,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/amount-exceeds-deposit"
         );
-        assert_eq!(problem.title, "AmountExceedsDepositError");
+        assert_eq!(problem.title, "Amount Exceeds Deposit");
         assert_eq!(problem.status, 402);
 
         let err = MppError::AmountExceedsDeposit(None);
@@ -1253,7 +1407,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/delta-too-small"
         );
-        assert_eq!(problem.title, "DeltaTooSmallError");
+        assert_eq!(problem.title, "Delta Too Small");
         assert_eq!(problem.status, 402);
 
         let err = MppError::DeltaTooSmall(None);
@@ -1272,7 +1426,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/internal-payment-error"
         );
-        assert_eq!(problem.title, "InternalPaymentError");
+        assert_eq!(problem.title, "Internal Payment Error");
         assert_eq!(problem.status, 500);
     }
 
@@ -1299,7 +1453,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/channel-not-found"
         );
-        assert_eq!(problem.title, "ChannelNotFoundError");
+        assert_eq!(problem.title, "Channel Not Found");
         assert_eq!(problem.status, 410);
 
         let err = MppError::ChannelNotFound(None);
@@ -1318,7 +1472,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/session/channel-finalized"
         );
-        assert_eq!(problem.title, "ChannelClosedError");
+        assert_eq!(problem.title, "Channel Finalized");
         assert_eq!(problem.status, 410);
 
         let err = MppError::ChannelClosed(None);
@@ -1341,7 +1495,7 @@ mod tests {
             problem.problem_type,
             "https://paymentauth.org/problems/invalid-payload"
         );
-        assert_eq!(problem.title, "InvalidPayloadError");
+        assert_eq!(problem.title, "Invalid Payload");
     }
 
     // --- Tempo error wrapping ---

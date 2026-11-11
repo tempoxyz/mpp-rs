@@ -40,8 +40,8 @@ use http_types::{header, HeaderValue, Request, Response, StatusCode};
 
 use crate::error::{MppError, PaymentError, PaymentErrorDetails};
 use crate::protocol::core::headers::{
-    extract_payment_scheme, format_receipt, format_www_authenticate_many, parse_authorization,
-    with_private_cache_control, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
+    format_receipt, format_www_authenticate_many, parse_authorization, with_private_cache_control,
+    PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
 };
 
 mod problem_details;
@@ -307,16 +307,14 @@ where
 
         Box::pin(async move {
             // Extract the Payment credential from the header selected by the challenge.
-            let auth_header = req
-                .headers()
-                .get(verifier.credential_header())
-                .and_then(|v| v.to_str().ok())
-                .and_then(extract_payment_scheme)
-                .map(|s| s.to_string());
+            let auth_header =
+                crate::server::credential_from_headers(req.headers(), verifier.credential_header());
 
             let credential = match auth_header {
-                Some(c) => c,
-                None => {
+                // More than one Payment credential: 400 without a challenge.
+                Err(error) => return Ok(rejection_response(&error, || Err(String::new()))),
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     // No credential — return a fresh, retryable 402 challenge.
                     return Ok(match verifier.challenge() {
                         Ok(challenge) => {
@@ -484,16 +482,16 @@ where
             };
 
             // Extract the Payment credential from the header selected by the challenge.
-            let auth_header = parts
-                .headers
-                .get(verifier.credential_header())
-                .and_then(|v| v.to_str().ok())
-                .and_then(extract_payment_scheme)
-                .map(|s| s.to_string());
+            let auth_header = crate::server::credential_from_headers(
+                &parts.headers,
+                verifier.credential_header(),
+            );
 
             let credential = match auth_header {
-                Some(c) => c,
-                None => {
+                // More than one Payment credential: 400 without a challenge.
+                Err(error) => return Ok(rejection_response(&error, || Err(String::new()))),
+                Ok(Some(c)) => c,
+                Ok(None) => {
                     let challenge = match verifier.challenge_with_body(&body) {
                         Ok(c) => c,
                         Err(e) => {
@@ -604,8 +602,8 @@ fn internal_error_response<B: Default>() -> Response<B> {
 ///
 /// A payment problem is answered with its status and the fresh challenge
 /// from `challenge` so the client can retry. A server-side failure is
-/// answered with `500` and a replayed credential with `403`, both without a
-/// challenge, so the client does not pay again.
+/// answered with `500`, and a `403` or a `bad-request` (more than one
+/// credential) with its status, all without a challenge.
 fn rejection_response<B: Default>(
     error: &MppError,
     challenge: impl FnOnce() -> Result<String, String>,
@@ -615,7 +613,8 @@ fn rejection_response<B: Default>(
     }
     let status = StatusCode::from_u16(error.to_problem_details(None).status)
         .unwrap_or(StatusCode::PAYMENT_REQUIRED);
-    if status == StatusCode::FORBIDDEN {
+    // More than one credential is a bad request, answered without a challenge.
+    if status == StatusCode::FORBIDDEN || matches!(error, MppError::BadRequest(_)) {
         let mut resp = error_response(status, "");
         resp.extensions_mut()
             .insert(ProblemDetails(error.to_problem_details(None)));
@@ -1113,24 +1112,33 @@ mod tests {
     }
 
     #[test]
-    fn test_replayed_credential_returns_403_without_challenge() {
+    fn test_replayed_credential_returns_402_invalid_challenge() {
         let error =
             MppError::CredentialReplayed(Some("Proof credential has already been used".into()));
         let resp: Response<()> = rejection_response(&error, || {
-            panic!("a replayed credential must not be answered with a challenge")
+            Ok(
+                r#"Payment id="x", realm="r", method="tempo", intent="charge", request="e30""#
+                    .to_string(),
+            )
         });
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
-        assert_eq!(
-            resp.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
-        // with_problem_details serializes the replay problem, as axum does.
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
         let ProblemDetails(problem) = resp.extensions().get::<ProblemDetails>().unwrap();
-        assert!(problem.problem_type.ends_with("verification-failed"));
-        assert_eq!(problem.status, 403);
+        assert!(problem.problem_type.ends_with("/invalid-challenge"));
+        assert_eq!(problem.status, 402);
         assert!(problem.detail.contains("already been used"));
-        assert!(problem.challenge_id.is_none());
+    }
+
+    #[test]
+    fn test_bad_request_returns_400_without_challenge() {
+        let error = MppError::bad_request("more than one Payment credential in the request");
+        let resp: Response<()> = rejection_response(&error, || {
+            panic!("a bad request must not be answered with a challenge")
+        });
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+        let ProblemDetails(problem) = resp.extensions().get::<ProblemDetails>().unwrap();
+        assert!(problem.problem_type.ends_with("/bad-request"));
     }
 
     /// Test: invalid auth → retryable 402 with a fresh challenge.

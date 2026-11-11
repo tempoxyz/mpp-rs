@@ -746,8 +746,11 @@ mod tests {
         let method = TempoChargeMethod::new(provider)
             .with_relay(RelayConfig::new("test-key").api_base_url(base_url))
             .unwrap();
-        let payment = Mpp::new(method, "relay.example", "test-secret");
-        let credential = bound_credential("test-secret", PaymentPayload::transaction("0x1234"));
+        let payment = Mpp::new(method, "relay.example", "test-secret-of-at-least-32-bytes!");
+        let credential = bound_credential(
+            "test-secret-of-at-least-32-bytes!",
+            PaymentPayload::transaction("0x1234"),
+        );
 
         let receipt = payment.broadcast_credential(&credential).await.unwrap();
 
@@ -774,8 +777,11 @@ mod tests {
         let method = TempoChargeMethod::new(provider)
             .with_relay(RelayConfig::new("test-key").api_base_url(base_url))
             .unwrap();
-        let payment = Mpp::new(method, "relay.example", "test-secret");
-        let credential = bound_credential("test-secret", PaymentPayload::transaction("0x1234"));
+        let payment = Mpp::new(method, "relay.example", "test-secret-of-at-least-32-bytes!");
+        let credential = bound_credential(
+            "test-secret-of-at-least-32-bytes!",
+            PaymentPayload::transaction("0x1234"),
+        );
 
         let error = payment.broadcast_credential(&credential).await.unwrap_err();
 

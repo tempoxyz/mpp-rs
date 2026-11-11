@@ -2,7 +2,11 @@ use super::*;
 
 #[test]
 fn test_mpp_creation() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
     assert_eq!(payment.realm(), "api.example.com");
     assert_eq!(payment.method_name(), "mock");
     assert!(payment.currency().is_none());
@@ -44,8 +48,12 @@ async fn test_verify_returns_error_for_failed_transaction() {
     use crate::error::{MppError, PaymentError};
     use crate::protocol::traits::ErrorCode;
 
-    let payment = Mpp::new(FailedTransactionMethod, "api.example.com", "secret");
-    let credential = test_credential("secret");
+    let payment = Mpp::new(
+        FailedTransactionMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let credential = test_credential("test-secret-key-at-least-32-bytes");
     let request = test_request();
 
     let result = payment.verify(&credential, &request).await;
@@ -62,8 +70,12 @@ async fn test_verify_returns_error_for_failed_transaction() {
 
 #[tokio::test]
 async fn test_verify_returns_receipt_for_success() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-    let credential = test_credential("secret");
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let credential = test_credential("test-secret-key-at-least-32-bytes");
     let request = test_request();
 
     let receipt = payment.verify(&credential, &request).await.unwrap();
@@ -74,8 +86,12 @@ async fn test_verify_returns_receipt_for_success() {
 
 #[tokio::test]
 async fn test_payment_success_event_fires_after_verify() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-    let credential = test_credential("secret");
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let credential = test_credential("test-secret-key-at-least-32-bytes");
     let request = test_request();
     let seen = Arc::new(Mutex::new(None));
     let _sub = payment.on_payment_success({
@@ -99,8 +115,12 @@ async fn test_payment_success_event_fires_after_verify() {
 
 #[tokio::test]
 async fn test_payment_success_event_panic_does_not_fail_verify() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-    let credential = test_credential("secret");
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let credential = test_credential("test-secret-key-at-least-32-bytes");
     let request = test_request();
     let _sub = payment.on_payment_success(|_| async move {
         panic!("hook panic should be isolated");
@@ -173,9 +193,13 @@ async fn test_verify_credential_decodes_request() {
 
 #[tokio::test]
 async fn test_verify_credential_with_body_digest_accepts_matching_body() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
     let body = br#"{"query":"paid"}"#;
-    let credential = test_credential_with_body_digest("secret", body);
+    let credential = test_credential_with_body_digest("test-secret-key-at-least-32-bytes", body);
 
     let receipt = payment
         .verify_credential_with_body(&credential, body)
@@ -187,8 +211,15 @@ async fn test_verify_credential_with_body_digest_accepts_matching_body() {
 
 #[tokio::test]
 async fn test_verify_credential_with_body_digest_rejects_mismatch() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-    let credential = test_credential_with_body_digest("secret", br#"{"query":"paid"}"#);
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let credential = test_credential_with_body_digest(
+        "test-secret-key-at-least-32-bytes",
+        br#"{"query":"paid"}"#,
+    );
 
     let err = payment
         .verify_credential_with_body(&credential, br#"{"query":"tampered"}"#)
@@ -200,8 +231,15 @@ async fn test_verify_credential_with_body_digest_rejects_mismatch() {
 
 #[tokio::test]
 async fn test_verify_credential_rejects_digest_without_body() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-    let credential = test_credential_with_body_digest("secret", br#"{"query":"paid"}"#);
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let credential = test_credential_with_body_digest(
+        "test-secret-key-at-least-32-bytes",
+        br#"{"query":"paid"}"#,
+    );
 
     let err = payment.verify_credential(&credential).await.unwrap_err();
 
@@ -210,11 +248,18 @@ async fn test_verify_credential_rejects_digest_without_body() {
 
 #[tokio::test]
 async fn test_verify_credential_with_body_rejects_missing_digest() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
-    let mut credential = test_credential_with_body_digest("secret", br#"{"query":"paid"}"#);
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
+    let mut credential = test_credential_with_body_digest(
+        "test-secret-key-at-least-32-bytes",
+        br#"{"query":"paid"}"#,
+    );
     credential.challenge.digest = None;
     credential.challenge.id = crate::protocol::core::compute_challenge_id(
-        "secret",
+        "test-secret-key-at-least-32-bytes",
         "api.example.com",
         "mock",
         "charge",

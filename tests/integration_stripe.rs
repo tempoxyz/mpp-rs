@@ -836,10 +836,13 @@ async fn test_stripe_rejects_replayed_credential() {
         .header("Accept-Payment", "stripe/charge")
         .send_with_payment(&provider)
         .await
-        .expect("terminal replay response");
-    assert_eq!(response.status(), 403);
-    assert!(!response.headers().contains_key("www-authenticate"));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+        .expect("replay response");
+    // A replay is an invalid challenge: 402 with a fresh one. The client may
+    // pay the fresh challenge, within its bounded retries.
+    assert_eq!(response.status(), 402);
+    assert!(response.headers().contains_key("www-authenticate"));
+    let paid = calls.load(Ordering::SeqCst);
+    assert!((1..=3).contains(&paid), "{paid}");
 
     handle.abort();
     stripe_handle.abort();
@@ -1065,9 +1068,9 @@ async fn test_stripe_external_id_binding_rejects_replayed_payment_intent() {
     let problem = err.to_problem_details(Some(&credential.challenge.id));
     assert_eq!(
         problem.problem_type,
-        "https://paymentauth.org/problems/verification-failed"
+        "https://paymentauth.org/problems/invalid-challenge"
     );
-    assert_eq!(problem.status, 403);
+    assert_eq!(problem.status, 402);
 
     stripe_handle.abort();
 }

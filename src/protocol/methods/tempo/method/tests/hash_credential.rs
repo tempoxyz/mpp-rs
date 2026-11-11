@@ -515,3 +515,100 @@ async fn test_new_rejects_replayed_hash_by_default() {
         "got: {err}"
     );
 }
+
+/// Hash credentials follow the optional attribution rule: a plain transfer or
+/// a non-attribution memo is accepted, and attribution for another challenge
+/// fails verification (402), not as a replayed credential. A request amount
+/// with leading zeros compares numerically.
+#[tokio::test]
+async fn test_verify_hash_attribution_is_optional() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let payer = Address::repeat_byte(0x11);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(1000u64);
+    let request = ChargeRequest {
+        amount: "0001000".to_string(),
+        currency: format!("{currency:#x}"),
+        recipient: Some(format!("{recipient:#x}")),
+        method_details: Some(serde_json::json!({ "chainId": MODERATO_CHAIN_ID })),
+        ..Default::default()
+    };
+    let challenge = test_proof_challenge(&request);
+    let foreign = attribution::encode("another-challenge", &challenge.realm, None);
+    let tx_hash = B256::repeat_byte(0xab);
+    let block_hash = B256::repeat_byte(0x22);
+
+    for (name, memo, should_accept) in [
+        ("plain transfer", None, true),
+        ("non-attribution memo", Some([0x11; 32]), true),
+        ("foreign attribution", Some(foreign), false),
+    ] {
+        let mut log = match memo {
+            Some(memo) => make_transfer_with_memo_log(currency, payer, recipient, amount, memo),
+            None => make_transfer_log(currency, payer, recipient, amount),
+        };
+        log.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "blockHash": format!("{block_hash:#x}"),
+                "blockNumber": "0x1",
+                "transactionHash": format!("{tx_hash:#x}"),
+                "transactionIndex": "0x0",
+                "logIndex": "0x0",
+                "removed": false,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "type": "0x76",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x5208",
+            "logs": [log],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x1",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "from": format!("{payer:#x}"),
+            "to": format!("{currency:#x}"),
+            "contractAddress": null,
+            "feePayer": format!("{payer:#x}"),
+            "feeToken": format!("{currency:#x}"),
+        }));
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter);
+        let method = ChargeMethod::new(provider);
+        method.cached_chain_id.set(MODERATO_CHAIN_ID).unwrap();
+
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:#x}")),
+        );
+        let result = method.verify(&credential, &request).await;
+        if should_accept {
+            assert!(result.is_ok(), "{name}: {result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("memo is not bound to this challenge"),
+                "{name}: {error}"
+            );
+            assert!(
+                matches!(
+                    crate::error::MppError::from(error),
+                    crate::error::MppError::VerificationFailed(_)
+                ),
+                "{name}"
+            );
+        }
+    }
+}

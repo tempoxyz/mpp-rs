@@ -65,7 +65,7 @@ where
             None,
         );
 
-        Ok(self.apply_pinned_opaque(PaymentChallenge {
+        self.apply_pinned_opaque(PaymentChallenge {
             id,
             realm: self.config.realm.clone(),
             method: "tempo".into(),
@@ -76,7 +76,7 @@ where
             digest: None,
             opaque: None,
             header: None,
-        }))
+        })
     }
 
     /// Generate a session challenge with method details populated from the session method.
@@ -202,7 +202,7 @@ where
             None,
         );
 
-        Ok(self.apply_pinned_opaque(PaymentChallenge {
+        self.apply_pinned_opaque(PaymentChallenge {
             id,
             realm: self.config.realm.clone(),
             method: "tempo".into(),
@@ -213,7 +213,7 @@ where
             digest: None,
             opaque: None,
             header: None,
-        }))
+        })
     }
 
     /// Verify a session credential.

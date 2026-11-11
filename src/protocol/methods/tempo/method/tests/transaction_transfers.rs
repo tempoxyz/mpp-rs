@@ -227,8 +227,8 @@ fn test_validate_transaction_transfers_checks_challenge_bound_memo() {
             )),
             false,
         ),
-        ("non-MPP memo", Some([0xab; 32]), false),
-        ("plain transfer", None, false),
+        ("non-MPP memo", Some([0xab; 32]), true),
+        ("plain transfer", None, true),
     ];
 
     for require_exact_calls in [false, true] {
@@ -405,7 +405,7 @@ fn test_machine_token_route_checks_challenge_binding() {
             attribution::encode("challenge-123", "other.example.com", None),
             false,
         ),
-        ([0xab; 32], false),
+        ([0xab; 32], true),
     ] {
         let mut actual = expected.clone();
         actual[0].memo = Some(memo);
@@ -446,7 +446,11 @@ fn test_legacy_primary_memo_does_not_disable_challenge_binding() {
             attribution::encode("challenge-123", "api.example.com", None),
             true,
         ),
-        ([0xab; 32], false),
+        ([0xab; 32], true),
+        (
+            attribution::encode("challenge-456", "api.example.com", None),
+            false,
+        ),
     ] {
         let tx_bytes = encode_signed_tx(
             vec![tempo_alloy::primitives::transaction::Call {

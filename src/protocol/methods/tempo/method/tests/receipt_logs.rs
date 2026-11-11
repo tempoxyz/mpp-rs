@@ -428,18 +428,15 @@ fn test_assert_challenge_bound_memo_accepts_bound_memo() {
     .is_ok());
 }
 
+/// Attribution is optional: a plain transfer is accepted.
 #[test]
-fn test_assert_challenge_bound_memo_rejects_plain_transfer() {
-    let error = assert_challenge_bound_memo(
+fn test_assert_challenge_bound_memo_accepts_plain_transfer() {
+    assert!(assert_challenge_bound_memo(
         &[MatchedTransferLog::Transfer],
         "challenge-123",
         "api.example.com",
     )
-    .unwrap_err();
-
-    assert!(error
-        .to_string()
-        .contains("memo is not bound to this challenge"));
+    .is_ok());
 }
 
 #[test]
@@ -456,25 +453,33 @@ fn test_assert_challenge_bound_memo_rejects_wrong_challenge() {
     assert!(error
         .to_string()
         .contains("memo is not bound to this challenge"));
-    // The transfer already settled, so paying again would not help.
-    assert_eq!(
-        error.code,
-        Some(crate::protocol::traits::ErrorCode::CredentialReplayed)
-    );
+    // The spec answers foreign attribution as a verification failure (402).
+    assert_eq!(error.code, None);
+    assert!(matches!(
+        crate::error::MppError::from(error),
+        crate::error::MppError::VerificationFailed(_)
+    ));
 }
 
+/// A memo that is not in attribution format is accepted.
 #[test]
-fn test_assert_challenge_bound_memo_rejects_non_mpp_memo() {
-    let error = assert_challenge_bound_memo(
+fn test_assert_challenge_bound_memo_accepts_non_mpp_memo() {
+    assert!(assert_challenge_bound_memo(
         &[MatchedTransferLog::Memo([0x11; 32])],
         "challenge-123",
         "api.example.com",
     )
-    .unwrap_err();
-
-    assert!(error
-        .to_string()
-        .contains("memo is not bound to this challenge"));
+    .is_ok());
+    // Only the tag and version mark attribution: a memo that shares the
+    // tag with another version byte is not attribution.
+    let mut other_version = attribution::encode("challenge-456", "api.example.com", None);
+    other_version[4] = 0x02;
+    assert!(assert_challenge_bound_memo(
+        &[MatchedTransferLog::Memo(other_version)],
+        "challenge-123",
+        "api.example.com",
+    )
+    .is_ok());
 }
 
 #[test]

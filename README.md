@@ -48,16 +48,71 @@ cargo add mpp
 
 ### Server (Tempo)
 
+Add the server features, Axum and Tokio:
+
+```bash
+cargo add mpp --features server,tempo,axum
+cargo add axum
+cargo add tokio --features full
+```
+
+This server charges $0.01 per request to `/paid` on the Moderato testnet:
+
 ```rust
-use mpp::server::{Mpp, tempo, TempoConfig};
+use std::sync::Arc;
 
-let mpp = Mpp::create(tempo(TempoConfig {
-    recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
-}))?;
+use axum::{routing::get, Router};
+use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
+use mpp::server::{tempo, Mpp, TempoConfig};
 
-let challenges = mpp.charge("1")?; // OUSD, then USDC.e on mainnet
+struct OneCent;
+
+impl ChargeConfig for OneCent {
+    fn amount() -> &'static str {
+        "0.01"
+    }
+}
+
+async fn paid(charge: MppCharge<OneCent>) -> String {
+    format!("paid: {}", charge.receipt.reference)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reads the challenge-binding secret from MPP_SECRET_KEY (at least 32 bytes).
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        })
+        .rpc_url("https://rpc.moderato.tempo.xyz"),
+    )?;
+
+    let app = Router::new()
+        .route("/paid", get(paid))
+        .with_state(Arc::new(mpp) as Arc<dyn ChargeChallenger>);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+```
+
+The server signs challenge ids with `MPP_SECRET_KEY`, which must be at least 32 bytes. Generate one and run the server:
+
+```bash
+export MPP_SECRET_KEY=$(openssl rand -base64 32)
+cargo run
+curl -i http://127.0.0.1:3000/paid   # 402 with a Payment challenge
+```
+
+To verify credentials yourself, issue challenges with `charge` and pass the route's amount to `verify_charge`:
+
+```rust
+let challenges = mpp.charge("1")?; // OUSD, then pathUSD on Moderato
 let receipt = mpp.verify_charge(&credential, "1").await?;
 ```
+
+For a price that depends on the request, use the `MppDynamicCharge` extractor with a `DynamicChargeConfig`.
 
 ### Server (Stripe)
 
@@ -80,7 +135,7 @@ let receipt = mpp.stripe_verify_charge(&credential, "1").await?;
 
 The Axum `MppCharge` extractors can use the incoming HTTP request hostname as the challenge realm, as in mppx, and verify credentials against that same hostname. Configure `.trusted_hosts(["api.example.com"])` with the public hostnames your server accepts before enabling this behavior: clients control the HTTP `Host` header, so unlisted hosts continue to use the configured or environment-detected realm. An explicit `.realm(...)` or `MPP_REALM` overrides the request hostname. Direct `Mpp::charge` calls have no HTTP request and continue to use the configured or environment-detected realm; set it to the public hostname when accepting zero-amount Tempo proofs from clients that check the request origin.
 
-If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`. The reqwest `send_with_payment` and `PaymentMiddleware` APIs reject those challenges before paying: they accept caller-owned clients and cannot enforce a safe redirect policy for the custom credential header. Use a transport that sends credential-bearing requests with redirects disabled until these APIs support a verified redirect-safe client.
+If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`, and the reqwest `send_with_payment` and `PaymentMiddleware` APIs send the credential in that header. reqwest forwards `Payment-Authorization` across redirects, so build the client with `redirect::Policy::none()`.
 
 ```rust
 let mpp = Mpp::create(tempo(config).requires_auth(true))?;
@@ -97,10 +152,10 @@ let client = ClientBuilder::new(reqwest::Client::new())
     .with(PaymentMiddleware::new(provider))
     .build();
 
-// Explicitly authorize payment for this request.
-let resp = client.get("https://mpp.dev/api/ping/paid")
-    .header("Accept-Payment", "tempo/charge")
-    .send().await?;
+// Pays the 402 automatically. Use `with_on_challenge` to approve or decline
+// each payment, or `AcceptPaymentPolicy::Explicit` to pay only requests that
+// send `Accept-Payment`.
+let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 ```
 
 ### Client (Stripe)
@@ -122,7 +177,6 @@ let provider = StripeProvider::new(|params| {
 
 let resp = reqwest::Client::new()
     .get("https://api.example.com/paid")
-    .header("Accept-Payment", "stripe/charge")
     .send_with_payment(&provider)
     .await?;
 ```
@@ -205,7 +259,7 @@ shall be dual licensed as above, without any additional terms or conditions.
 
 ### Payment policy and store migration
 
-HTTP payment helpers now default to `AcceptPaymentPolicy::Explicit`: set a request-level `Accept-Payment` header to authorize automatic payment. Reqwest client default headers cannot be inspected by middleware and do not authorize payments. A request-level `q=0` remains an opt-out. `Disabled` prevents all automatic payment, even with an explicit header. Applications that intentionally authorize provider-selected payment can pass `Always`; this explicitly overrides opaque client defaults. Origin policies authorize automatic payment only for matching origins unless a request supplies its own preference.
+HTTP payment helpers default to `AcceptPaymentPolicy::Always` and pay a 402 without a request-level `Accept-Payment` header, as mppx does. A request-level `Accept-Payment` narrows which methods they pay, and `q=0` opts out. `Explicit` pays only requests that send `Accept-Payment`, and `Disabled` prevents all automatic payment. Origin policies authorize automatic payment only for matching origins unless a request supplies its own preference. An `on_challenge` hook (`PaymentMiddleware::with_on_challenge`, `ChargeClient::with_on_challenge`) approves or declines each payment before it is made; a declined payment returns the 402.
 
 `ChannelStoreAdapter` requires a native atomic `Store::compare_exchange`. Implement it as a transaction or conditional write shared by every client using the backend; a read followed by a write is unsafe. `MemoryStore` supports it. `FileStore` and custom backends without this operation fail closed on channel updates. Concurrent conflicts fail before resource delivery and must be retried against fresh state.
 

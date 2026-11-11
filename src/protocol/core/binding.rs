@@ -6,14 +6,14 @@
 use subtle::ConstantTimeEq;
 
 /// Minimum HMAC secret key length in bytes, matching mppx.
-#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+#[cfg(any(feature = "tempo", feature = "server"))]
 const MIN_SECRET_KEY_BYTES: usize = 32;
 
-/// Reject HMAC secret keys shorter than 32 bytes.
+/// Reject HMAC secret keys shorter than 32 bytes, as the core spec requires.
 ///
-/// Whoever can guess the key can mint challenges for any amount, so the
-/// fallible entry points that take a secret call this before signing.
-#[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
+/// Whoever can guess the key can mint challenges for any amount, so servers
+/// call this before signing or verifying a challenge.
+#[cfg(any(feature = "tempo", feature = "server"))]
 pub(crate) fn validate_secret_key(secret_key: &str) -> crate::error::Result<()> {
     if secret_key.len() < MIN_SECRET_KEY_BYTES {
         return Err(crate::error::MppError::InvalidConfig(format!(
@@ -175,7 +175,7 @@ mod tests {
     fn test_compute_challenge_id_cross_sdk() {
         // This test vector matches the cross-SDK conformance tests
         let id = compute_challenge_id(
-            "test-secret-key-12345",
+            "mpp-hmac-test-vector-secret-32by",
             "api.example.com",
             "tempo",
             "charge",
@@ -186,13 +186,14 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(id, "XmJ98SdsAdzwP9Oa-8In322Uh6yweMO6rywdomWk_V4");
+        assert_eq!(id, "4sBeaeQBs-fmkZjor0fkeumZ-Gd-VDRdDIF3LEIU4Bo");
     }
 
     /// Cross-SDK golden vectors (shared with mppx and pympp).
     ///
     /// HMAC input: realm | method | intent | base64url(canonicalize(request)) | expires | digest | opaque
-    /// HMAC key:   UTF-8 bytes of secret_key ("test-vector-secret")
+    /// HMAC key:   UTF-8 bytes of secret_key ("mpp-hmac-test-vector-secret-32by",
+    ///             the core spec's 32-byte test vector secret)
     /// Output:     base64url(HMAC-SHA256(key, input), no padding)
     ///
     /// These vectors cover every combination of optional HMAC fields (expires, digest)
@@ -200,7 +201,7 @@ mod tests {
     #[test]
     fn test_golden_vectors() {
         use crate::protocol::core::base64url_encode as b64;
-        let secret = "test-vector-secret";
+        let secret = "mpp-hmac-test-vector-secret-32by";
 
         let req_amount = b64(br#"{"amount":"1000000"}"#);
         let req_multi = b64(br#"{"amount":"1000000","currency":"0x1234","recipient":"0xabcd"}"#);
@@ -227,7 +228,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "X6v1eo7fJ76gAxqY0xN9Jd__4lUyDDYmriryOM-5FO4",
+                "2S2NsFcCINq8QUKV8OZHdRm_JhhbJf5X8Cii4gZ_UyI",
             ),
             (
                 "with expires",
@@ -237,7 +238,7 @@ mod tests {
                 &req_amount,
                 Some("2025-01-06T12:00:00Z"),
                 None,
-                "ChPX33RkKSZoSUyZcu8ai4hhkvjZJFkZVnvWs5s0iXI",
+                "1si1-uE-QSDpwpnj7NxpFy7Gu6Z4YPWr_1FGsLYq0J4",
             ),
             (
                 "with digest",
@@ -247,7 +248,7 @@ mod tests {
                 &req_amount,
                 None,
                 Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE"),
-                "JHB7EFsPVb-xsYCo8LHcOzeX1gfXWVoUSzQsZhKAfKM",
+                "pgE6btlzFLJKudYJ4stj7HI4ocTeTJCFI6GA9tPxxyI",
             ),
             (
                 "with expires and digest",
@@ -257,7 +258,7 @@ mod tests {
                 &req_amount,
                 Some("2025-01-06T12:00:00Z"),
                 Some("sha-256=X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE"),
-                "m39jbWWCIfmfJZSwCfvKFFtBl0Qwf9X4nOmDb21peLA",
+                "HzjZEJWOhKwlDG8okZ2JBJQyI-h9XGvdE_HClrkM8NI",
             ),
             (
                 "multi-field request",
@@ -267,7 +268,7 @@ mod tests {
                 &req_multi,
                 None,
                 None,
-                "_H5TOnnlW0zduQ5OhQ3EyLVze_TqxLDPda2CGZPZxOc",
+                "F1RuEjUwsTn6bW6_RJPzi6DTOGCHrL1SJ4khSWkleHs",
             ),
             (
                 "nested methodDetails",
@@ -277,7 +278,7 @@ mod tests {
                 &req_nested,
                 None,
                 None,
-                "TqujwpuDDg_zsWGINAd5XObO2rRe6uYufpqvtDmr6N8",
+                "3Y4Qq7DfGEcsYA4X6Xp7T7SF5ndxdg1iT-UB_lSKQl8",
             ),
             (
                 "empty request",
@@ -287,7 +288,7 @@ mod tests {
                 &req_empty,
                 None,
                 None,
-                "yLN7yChAejW9WNmb54HpJIWpdb1WWXeA3_aCx4dxmkU",
+                "W8iN9dn5VBsfN18snJ7sfeQB1UW7lulIOy82KJenUmg",
             ),
             (
                 "different realm",
@@ -297,7 +298,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "3F5bOo2a9RUihdwKk4hGRvBvzQmVPBMDvW0YM-8GD00",
+                "DM5Lst2rlNZc5IZ82wbbX05B-oUYz4sT05hXlShlhgY",
             ),
             (
                 "different method",
@@ -307,7 +308,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "o0ra2sd7HcB4Ph0Vns69gRDUhSj5WNOnUopcDqKPLz4",
+                "LHQojyqF50s6xsRCuMVA1XUvXidusjxKN_SJLzHWEVg",
             ),
             (
                 "different intent",
@@ -317,7 +318,7 @@ mod tests {
                 &req_amount,
                 None,
                 None,
-                "aAY7_IEDzsznNYplhOSE8cERQxvjFcT4Lcn-7FHjLVE",
+                "NUFQUW9kSnrCVGMGHUdSfRUh6hEYBfZxasg7LtGeU4k",
             ),
         ];
 
@@ -420,7 +421,7 @@ mod tests {
     /// then base64url-encoded before entering the HMAC computation.
     #[test]
     fn test_opaque_golden_vectors() {
-        let secret = "test-vector-secret";
+        let secret = "mpp-hmac-test-vector-secret-32by";
         let req = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
 
         // Vector 1: with opaque {pi: "pi_3abc123XYZ"}
@@ -437,7 +438,7 @@ mod tests {
             Some(opaque1.raw()),
         );
         assert_eq!(
-            id1, "rxzKZ2qjXvinqCH96RORTZEPs1KXsA-0AUjrCAPFOWc",
+            id1, "qyYT7NIMs7VFQoJgAqnA5ixGY_Kj4_l9qL3kx15czlg",
             "opaque golden vector failed: with opaque"
         );
 
@@ -453,7 +454,7 @@ mod tests {
             Some(opaque1.raw()),
         );
         assert_eq!(
-            id2, "KAfoMrA4fnzS1DPWN_cUv_b3_yHxCizdp6OhH7gluMY",
+            id2, "R1aHgdUI4zwqREX1R18yKuWxOscZofeMv1XcjZfnj_k",
             "opaque golden vector failed: with opaque and expires"
         );
 
@@ -470,7 +471,7 @@ mod tests {
             Some(opaque_empty.raw()),
         );
         assert_eq!(
-            id3, "vb4IyH-0LdJ3s7L0QAw8jIzcZkyxksPhIvEfmHmzA9k",
+            id3, "Mvtq6plVTKirwcboOXIBbQI83yadbinNr1FPugdOXJk",
             "opaque golden vector failed: with empty opaque"
         );
 
@@ -490,7 +491,7 @@ mod tests {
             Some(opaque_multi.raw()),
         );
         assert_eq!(
-            id4, "aKskU8sadR5ZuFbUCsIwhO-ENxuVpTw17FdwHEXsJDk",
+            id4, "u38ignjZb8sbNC44ogWIqyNoWBbf4o0UiwGprmWXEpE",
             "opaque golden vector failed: with multi-key opaque"
         );
     }

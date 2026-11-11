@@ -50,7 +50,16 @@ const REALM_ENV_VARS: &[&str] = &[
     "WEBSITE_HOSTNAME",
 ];
 
-const DEFAULT_REALM: &str = "MPP Payment";
+/// Realm used when neither `.realm(...)` nor an environment variable sets
+/// one, as pympp does. Axum extractors use the request's hostname instead
+/// when it is one of the trusted hosts.
+const DEFAULT_REALM: &str = "localhost";
+
+/// Reserved `opaque` key for the per-challenge nonce.
+pub(crate) const NONCE_KEY: &str = "_mpp_nonce";
+
+/// Legacy nonce key mppx emits; ignored when matching `opaque`.
+pub(crate) const LEGACY_NONCE_KEY: &str = "_mppx_nonce";
 
 #[cfg(any(feature = "tempo", feature = "stripe"))]
 fn advertised_builder_credential_header(requires_auth: bool) -> Option<String> {
@@ -60,7 +69,7 @@ fn advertised_builder_credential_header(requires_auth: bool) -> Option<String> {
 /// Detect the server realm from environment variables.
 ///
 /// Checks platform-specific env vars in order (see [`REALM_ENV_VARS`]),
-/// falling back to `"MPP Payment"`.
+/// falling back to `"localhost"`.
 pub(crate) fn detect_realm() -> String {
     realm_from_env(|name| std::env::var(name).ok())
 }
@@ -142,6 +151,8 @@ struct Config {
     chain_id: Option<u64>,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
+    /// Whether issued challenges carry a random `_mpp_nonce` in `opaque`.
+    nonce: bool,
 }
 
 impl Config {
@@ -160,6 +171,7 @@ impl Config {
             chain_id: None,
             opaque: None,
             credential_header: None,
+            nonce: true,
         }
     }
 }
@@ -172,10 +184,23 @@ where
     ///
     /// For a simpler API, use [`Mpp::create()`] with [`tempo()`](super::tempo).
     ///
-    /// `secret_key` should be at least 32 bytes. This constructor cannot fail
-    /// and does not check the length; [`Mpp::create()`] does.
+    /// `secret_key` must be at least 32 bytes. This constructor cannot fail:
+    /// with a shorter key, issuing a challenge returns an error and every
+    /// credential is refused. Use [`Mpp::try_new()`] to check it up front.
     pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpp<M, ()> {
         Self::from_config(method, Config::new(realm.into(), secret_key.into()))
+    }
+
+    /// Create a new payment handler, refusing a `secret_key` shorter than
+    /// 32 bytes as the core spec requires.
+    pub fn try_new(
+        method: M,
+        realm: impl Into<String>,
+        secret_key: impl Into<String>,
+    ) -> crate::error::Result<Mpp<M, ()>> {
+        let secret_key = secret_key.into();
+        crate::protocol::core::validate_secret_key(&secret_key)?;
+        Ok(Self::new(method, realm, secret_key))
     }
 
     /// Create a new payment handler with pre-configured currency and recipient (advanced API).
@@ -233,6 +258,26 @@ where
     pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
         Arc::make_mut(&mut self.config).opaque = Some(opaque);
         self
+    }
+
+    /// Add a random `_mpp_nonce` (16 bytes, base64url) to the `opaque` of
+    /// every issued challenge, so no two challenges share an id. On by default;
+    /// verification ignores `_mpp_nonce` and mppx's `_mppx_nonce` when it
+    /// compares `opaque` with this route's.
+    pub fn with_nonce(mut self, enabled: bool) -> Self {
+        Arc::make_mut(&mut self.config).nonce = enabled;
+        self
+    }
+
+    /// Whether issued challenges carry a random `_mpp_nonce` in `opaque`.
+    pub fn nonce(&self) -> bool {
+        self.config.nonce
+    }
+
+    /// Refuse to sign or verify challenges with a secret key shorter than
+    /// 32 bytes.
+    pub(crate) fn check_secret_key(&self) -> crate::error::Result<()> {
+        crate::protocol::core::validate_secret_key(&self.config.secret_key)
     }
 
     /// Use `Payment-Authorization` for Payment credentials so `Authorization`

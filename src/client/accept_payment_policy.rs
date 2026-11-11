@@ -4,8 +4,9 @@
 //! payment methods on every cross-origin request, which can break CORS
 //! preflight and leak wallet capabilities.
 //!
-//! Defaults to explicit request-level preferences because reqwest client defaults
-//! cannot be inspected before the payment flow.
+//! Defaults to [`AcceptPaymentPolicy::Always`], as mppx does: payment helpers
+//! answer a 402 without a request-level `Accept-Payment` header. Select
+//! [`AcceptPaymentPolicy::Explicit`] to pay only requests that set one.
 
 use reqwest::Url;
 
@@ -14,12 +15,13 @@ use reqwest::Url;
 pub enum AcceptPaymentPolicy {
     /// Require a request-level `Accept-Payment` preference before automatic payment.
     /// Client default headers are opaque to reqwest middleware and cannot authorize payment.
-    #[default]
     Explicit,
     /// Never create payment credentials, even with a request-level preference.
     Disabled,
-    /// Explicitly permit automatic payment and inject provider preferences.
-    /// This overrides opaque client defaults; request-level preferences still win.
+    /// Permit automatic payment and inject provider preferences. The default,
+    /// as in mppx. This overrides opaque client defaults; request-level
+    /// preferences still win.
+    #[default]
     Always,
     /// Inject only when the request URL origin matches `same_origin`
     /// (`scheme://host[:port]`).
@@ -93,8 +95,15 @@ mod tests {
     }
 
     #[test]
-    fn default_requires_explicit_preference() {
+    fn default_pays_without_request_preference() {
         let p = AcceptPaymentPolicy::default();
+        assert!(matches!(p, AcceptPaymentPolicy::Always));
+        assert!(p.allows(&url("https://example.com/")));
+    }
+
+    #[test]
+    fn explicit_requires_request_preference() {
+        let p = AcceptPaymentPolicy::Explicit;
         assert!(!p.allows(&url("https://example.com/")));
     }
 

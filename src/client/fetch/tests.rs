@@ -152,8 +152,8 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn custom_credential_header_is_rejected_before_payment() {
-        for manual in [false, true] {
+    async fn payment_authorization_credential_is_not_sent_across_disabled_redirects() {
+        {
             let contacted = Arc::new(AtomicU32::new(0));
             let target_contacted = contacted.clone();
             let target = spawn_server(Router::new().route(
@@ -190,22 +190,20 @@ mod integration {
                 }),
             ))
             .await;
-            let builder = reqwest::Client::builder();
-            let client = if manual {
-                builder.redirect(reqwest::redirect::Policy::none())
-            } else {
-                builder
-            }
-            .build()
-            .unwrap();
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
             let provider = MockProvider::new();
-            let error = client
+            let response = client
                 .get(origin)
-                .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
+                .send_with_payment(&provider)
                 .await
-                .unwrap_err();
-            assert!(matches!(error, HttpError::UnsafeCredentialHeader));
-            assert_eq!(provider.call_count(), 0);
+                .unwrap();
+            // The credential went in Payment-Authorization, and the redirect
+            // the server answered with was handed back instead of followed.
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(provider.call_count(), 1);
             assert_eq!(contacted.load(Ordering::SeqCst), 0);
         }
     }
@@ -2028,11 +2026,22 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_send_with_payment_default_requires_explicit_preference() {
+    async fn test_send_with_payment_default_injects_preferences() {
         let (base_url, captured) = spawn_header_capture().await;
         reqwest::Client::new()
             .get(format!("{}/probe", base_url))
             .send_with_payment(&AdvertisingProvider)
+            .await
+            .unwrap();
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("tempo/charge"));
+    }
+
+    #[tokio::test]
+    async fn test_send_with_payment_explicit_policy_requires_preference() {
+        let (base_url, captured) = spawn_header_capture().await;
+        reqwest::Client::new()
+            .get(format!("{}/probe", base_url))
+            .send_with_payment_policy(&AdvertisingProvider, &AcceptPaymentPolicy::Explicit)
             .await
             .unwrap();
         assert_eq!(captured.lock().unwrap().as_deref(), None);

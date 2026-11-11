@@ -77,6 +77,73 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
     None
 }
 
+/// The Payment credentials in one field value, in order: each `Payment
+/// <token>` fragment, or `None` for a bare `Payment` with no token.
+fn payment_credentials(value: &str) -> Vec<Option<&str>> {
+    let mut found = Vec::new();
+    let mut tokens = Tokenizer::new(value);
+    while let Some(token) = tokens.next() {
+        match token {
+            Ok(token) if token.is_payment_scheme() => found.push(tokens.credentials()),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    found
+}
+
+/// Pick the Payment credential a request carries, following steps 1 and 2 of
+/// the core spec's credential processing.
+///
+/// Counts Payment credentials across every `Authorization` and
+/// `Payment-Authorization` field line and within comma-separated values:
+/// more than one is a `bad-request` error, answered with 400 and no
+/// challenge. Otherwise returns the credential (its `Payment <token>`
+/// fragment, to pass to [`parse_authorization`]) when it is in `selected`,
+/// the field the challenge selects. A credential in the other field, or a
+/// bare `Payment` with no token, counts as absent.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::protocol::core::select_payment_credential;
+///
+/// let found = select_payment_credential(["Payment abc"], [], "Authorization").unwrap();
+/// assert_eq!(found, Some("Payment abc"));
+///
+/// // A credential in a field the challenge didn't select is ignored.
+/// let found = select_payment_credential([], ["Payment abc"], "Authorization").unwrap();
+/// assert_eq!(found, None);
+///
+/// // Two credentials are refused.
+/// assert!(select_payment_credential(["Payment a, Payment b"], [], "Authorization").is_err());
+/// ```
+pub fn select_payment_credential<'a>(
+    authorization: impl IntoIterator<Item = &'a str>,
+    payment_authorization: impl IntoIterator<Item = &'a str>,
+    selected: &str,
+) -> Result<Option<&'a str>> {
+    let collect = |values: &mut dyn Iterator<Item = &'a str>| {
+        values
+            .flat_map(payment_credentials)
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    let in_authorization = collect(&mut authorization.into_iter());
+    let in_payment_authorization = collect(&mut payment_authorization.into_iter());
+    if in_authorization.len() + in_payment_authorization.len() > 1 {
+        return Err(MppError::bad_request(
+            "more than one Payment credential in the request",
+        ));
+    }
+    let chosen = if selected.eq_ignore_ascii_case(PAYMENT_AUTHORIZATION_HEADER) {
+        in_payment_authorization
+    } else {
+        in_authorization
+    };
+    Ok(chosen.into_iter().next())
+}
+
 /// Header name for payment challenges (from server)
 pub const WWW_AUTHENTICATE_HEADER: &str = "www-authenticate";
 
@@ -189,15 +256,9 @@ fn is_valid_intent_name(value: &str) -> bool {
     !value.is_empty() && !value.contains('|')
 }
 
-/// Validate the method identifier grammar used by mppx.
-fn is_valid_method_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-        && chars.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, ':' | '_' | '-')
-        })
+/// Validate the core spec's method identifier grammar, `1*LOWERALPHA`.
+pub(super) fn is_valid_method_name(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
 /// Validate that a `request` parameter is a base64url-encoded JSON object.
@@ -302,7 +363,7 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
     let method_raw = require_param!(params, "method").clone();
     if !is_valid_method_name(&method_raw) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be one or more lowercase letters (a-z).",
             method_raw
         )));
     }
@@ -467,7 +528,7 @@ fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     if !is_valid_method_name(challenge.method.as_str()) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be one or more lowercase letters (a-z).",
             challenge.method
         )));
     }
@@ -1269,12 +1330,22 @@ mod tests {
 
     #[test]
     fn test_parse_www_authenticate_accepts_canonical_method_names() {
-        for method in ["tempo", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+        for method in ["tempo", "stripe", "a"] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
             );
             let challenge = parse_www_authenticate(&header).unwrap();
             assert_eq!(challenge.method.as_str(), method);
+        }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_non_lowercase_alpha_methods() {
+        for method in ["x402", "tempo-v2", "a:b", "a_b"] {
+            let mut challenge = test_challenge();
+            challenge.method = MethodName::new(method);
+            let err = format_www_authenticate(&challenge).unwrap_err();
+            assert!(err.to_string().contains("Invalid method"), "{method}");
         }
     }
 
@@ -1289,7 +1360,8 @@ mod tests {
     #[test]
     fn test_parse_www_authenticate_rejects_invalid_method_names() {
         for method in [
-            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo",
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo", "x402", "tempo-v2",
+            "a:b", "a_b", "a1:b_2-c",
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#

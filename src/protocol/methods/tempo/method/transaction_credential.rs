@@ -18,8 +18,7 @@ use super::calls::{validate_fee_payer_calls, PaymentCalls};
 use super::fee_payer::FeePayerPolicy;
 use super::matching::{match_transfers, TransferSource};
 use super::memo::{
-    assert_challenge_bound_memo, assert_challenge_bound_memos, challenge_bound_memo_error,
-    is_challenge_bound_memo,
+    assert_challenge_bound_memo, assert_challenge_bound_memos, assert_memo_not_foreign,
 };
 use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
 use super::{ensure_challenge_not_expired, ChargeMethod};
@@ -210,11 +209,10 @@ where
             .flatten();
 
         if let Some(route) = machine_token_route {
-            if let Some((challenge_id, realm)) = challenge_binding {
-                let memo = route.transfer.memo.ok_or_else(challenge_bound_memo_error)?;
-                if !is_challenge_bound_memo(&memo, challenge_id, realm) {
-                    return Err(challenge_bound_memo_error());
-                }
+            if let (Some((challenge_id, realm)), Some(memo)) =
+                (challenge_binding, route.transfer.memo.as_ref())
+            {
+                assert_memo_not_foreign(memo, challenge_id, realm)?;
             }
             return Ok(Some(route.settlement_sender));
         }
