@@ -586,11 +586,13 @@ where
             if let (Some(store), Some(_)) = (&self.store, &submission_key) {
                 if !broadcast_before {
                     // A record another challenge holds stays: this attempt
-                    // then has no record of its own. So does a failed write,
-                    // such as a full MemoryStore expiring capacity: the record
-                    // only lets a retry skip the inclusion check, and without
-                    // it a retry after the transaction lands is answered as a
-                    // replay instead of failing every payment now.
+                    // then has no record of its own. A failed write, such as
+                    // a full MemoryStore expiring capacity, fails before the
+                    // send: without the record, a send whose outcome is lost
+                    // and that lands later could not be settled by a retry,
+                    // leaving the payer charged with no receipt. Size an
+                    // expiring capacity for in-flight broadcasts as well as
+                    // proof reservations.
                     let created = store
                         .put_if_absent_with_ttl(
                             &broadcast_key,
@@ -598,7 +600,9 @@ where
                             broadcast_record_ttl(expires, &final_tx_bytes)?,
                         )
                         .await
-                        .unwrap_or(false);
+                        .map_err(|e| {
+                            VerificationError::internal(format!("Failed to record broadcast: {e}"))
+                        })?;
                     if created {
                         broadcast_record = Some(broadcast_key);
                     }

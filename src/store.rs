@@ -166,6 +166,8 @@ impl MemoryStore {
     /// Opts into a limit on simultaneously live TTL reservations.
     /// The default removes expired records without rejecting live traffic at a global cap.
     /// A full store rejects new reservations; it never evicts live replay markers.
+    /// Tempo charge's in-flight pull broadcast records count against the cap too,
+    /// and a pull payment fails before its broadcast while the store is full.
     pub fn with_expiring_capacity(capacity: usize) -> Self {
         Self {
             expiring_capacity: capacity,
