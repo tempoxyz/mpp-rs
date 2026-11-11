@@ -327,6 +327,30 @@ where
         (receipt.transaction_hash() == tx_hash).then_some(receipt)
     }
 
+    /// Reject a transaction that is already on chain before this server
+    /// broadcasts it for this credential: another server, or an earlier
+    /// settlement whose replay record expired or lives elsewhere, may
+    /// already have accepted it. Only a transaction still pending here may
+    /// later be recovered from a failed broadcast. Fails closed when the
+    /// receipt cannot be looked up.
+    async fn ensure_not_yet_included(&self, tx_hash: B256) -> Result<(), VerificationError> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(|_| {
+                VerificationError::network_error(
+                    "Failed to look up the transaction before broadcasting it",
+                )
+            })?;
+        if receipt.is_some() {
+            return Err(VerificationError::new(format!(
+                "Transaction {tx_hash:#x} is already included on chain."
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn broadcast_transaction(
         &self,
@@ -446,8 +470,9 @@ where
         // The sponsor pays the gas here, so simulate the exact co-signed
         // transaction with its concrete fee payer and fee token, and bail if
         // it would revert. Fails closed: no simulation, no broadcast.
-        // A reconciled transaction may already be on chain, where simulating
-        // it again would fail: broadcast it and recover its receipt instead.
+        // A reconciled transaction is not simulated again: one already on
+        // chain is rejected before the broadcast below, and a pending one is
+        // broadcast and its receipt recovered.
         // The node bills the fee payer it recovers from `feePayerSignature`,
         // so the simulation carries it: a hosted fee payer's as signed, and a
         // local fee payer's over a simulation-only copy with gas headroom
@@ -513,6 +538,13 @@ where
             // while settlement completes.
             ensure_challenge_not_expired(expires)?;
 
+            // A transaction mined before this broadcast was settled by
+            // someone else, so its receipt proves nothing for this
+            // credential. Checked right before sending, so the recovery
+            // below only ever accepts a transaction that was still pending.
+            self.ensure_not_yet_included(keccak256(&final_tx_bytes))
+                .await?;
+
             if let (Some(store), Some(key), Some(fill)) =
                 (&self.store, &hosted_record, hosted_fill.take())
             {
@@ -534,13 +566,14 @@ where
                 Ok(receipt) => receipt,
                 Err(broadcast_error) => {
                     // The node may have included the transaction before its
-                    // reply failed. Recover only when the store reserved this
-                    // submission above: without a store, a receipt for these
-                    // bytes may belong to an earlier, already accepted
-                    // submission of the same credential. An unrecovered
-                    // broadcast releases the reservation below, so a retry of
-                    // the same bytes can reach recovery once the transaction
-                    // lands; the replay claim still prevents double acceptance.
+                    // reply failed, or already knew it as pending. It was not
+                    // on chain when checked above, so a receipt now comes from
+                    // this broadcast or one that raced it. Recover only when
+                    // the store reserved this submission above: without a
+                    // store, a concurrent submission of the same credential
+                    // could recover the same receipt. An unrecovered broadcast
+                    // releases the reservation below; a retry after the
+                    // transaction lands is rejected by the check above.
                     let recovered = match &submission_key {
                         Some(_) => {
                             self.recover_broadcast_receipt(keccak256(&final_tx_bytes))

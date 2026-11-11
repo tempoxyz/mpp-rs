@@ -2406,3 +2406,127 @@ async fn assert_pull_attribution_optional_and_foreign_rejected(sponsored: bool) 
         }
     }
 }
+
+/// A pull credential whose signed transaction is already on chain is
+/// rejected before broadcasting, even by a server with no replay record for
+/// it: another server, or an earlier settlement whose record expired, may
+/// already have counted it. A normal pull credential still settles.
+#[tokio::test]
+async fn test_pull_transaction_already_on_chain_rejected() {
+    let rpc = rpc_url();
+    let chain_id = get_chain_id(&rpc).await;
+    let provider =
+        ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc.parse().unwrap());
+
+    let merchant = PrivateKeySigner::random();
+    let payer = PrivateKeySigner::random();
+    fund_account(&rpc, merchant.address()).await;
+    fund_account(&rpc, payer.address()).await;
+    // Two servers for the same merchant, each with its own replay records.
+    let server = || {
+        Mpp::create(
+            tempo(TempoConfig {
+                recipient: &format!("{}", merchant.address()),
+            })
+            .rpc_url(&rpc)
+            .chain_id(chain_id)
+            .store(Arc::new(mpp::store::MemoryStore::new()))
+            .secret_key(TEST_SECRET),
+        )
+        .unwrap()
+    };
+    let (first, second) = (server(), server());
+    let gas_price = provider.get_gas_price().await.unwrap();
+
+    let signed_pull = |challenge: &mpp::PaymentChallenge| {
+        let request: mpp::ChargeRequest = challenge.request.decode().unwrap();
+        let amount: U256 = request.amount.parse().unwrap();
+        let currency: Address = request.currency.parse().unwrap();
+        let memo = mpp::tempo::attribution::encode(&challenge.id, &challenge.realm, None);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tx = TempoTransaction {
+            chain_id,
+            nonce: 0,
+            nonce_key: U256::MAX,
+            gas_limit: 1_000_000,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: gas_price,
+            fee_token: Some(currency),
+            valid_before: NonZeroU64::new(now + 25),
+            calls: vec![Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: ITIP20::transferWithMemoCall::new((merchant.address(), amount, memo.into()))
+                    .abi_encode()
+                    .into(),
+            }],
+            ..Default::default()
+        };
+        let signature = payer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let bytes = tx.into_signed(signature.into()).encoded_2718();
+        let credential = mpp::PaymentCredential::with_source(
+            challenge.to_echo(),
+            format!("did:pkh:eip155:{chain_id}:{}", payer.address()),
+            mpp::PaymentPayload::transaction(alloy::hex::encode_prefixed(&bytes)),
+        );
+        (bytes, credential)
+    };
+    let assert_rejected = |result: Result<mpp::Receipt, mpp::VerificationError>, case: &str| {
+        let error = result.expect_err(case);
+        assert!(
+            matches!(
+                mpp::MppError::from(error.clone()),
+                mpp::MppError::VerificationFailed(_)
+            ),
+            "{case}: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("already included"),
+            "{case}: {error}"
+        );
+    };
+
+    // A normal pull credential settles on the first server.
+    let challenge = first.charge("1").unwrap().remove(0);
+    let (_, credential) = signed_pull(&challenge);
+    let receipt = first
+        .verify_charge(&credential, "1")
+        .await
+        .expect("a normal pull credential settles");
+    assert!(receipt.is_success());
+
+    // The second server has no replay record for it, but it is on chain.
+    let merchant_before = tip20_balance(&provider, merchant.address()).await;
+    assert_rejected(
+        second.verify_charge(&credential, "1").await,
+        "a pull settled by another server must be rejected",
+    );
+
+    // A signed transaction the payer broadcast itself is on chain before
+    // this server's broadcast, so its receipt does not pay this challenge.
+    let challenge = second.charge("1").unwrap().remove(0);
+    let (bytes, credential) = signed_pull(&challenge);
+    let pending = provider
+        .send_raw_transaction(&bytes)
+        .await
+        .expect("payer broadcast");
+    let mined = pending
+        .get_receipt()
+        .await
+        .expect("payer transaction mined");
+    assert!(mined.status());
+    let merchant_after_payer = tip20_balance(&provider, merchant.address()).await;
+    assert_rejected(
+        second.verify_charge(&credential, "1").await,
+        "a pull mined before this server's broadcast must be rejected",
+    );
+    assert_eq!(
+        tip20_balance(&provider, merchant.address()).await,
+        merchant_after_payer,
+        "nothing moved after the rejection"
+    );
+    assert!(merchant_after_payer > merchant_before);
+}

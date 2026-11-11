@@ -418,6 +418,7 @@ async fn test_broadcast_returns_receipt_when_expiry_crosses_send() {
         .clone(),
     );
     let asserter = Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
     asserter.push_success(&serde_json::json!({
         "type": "0x76",
         "status": "0x1",
@@ -483,10 +484,11 @@ async fn test_failed_broadcast_releases_submission_claim() {
     );
     let request = challenge_bound_request(currency, recipient, amount);
 
-    // Both broadcasts fail before the transaction lands: the receipt lookup
-    // that follows each failed broadcast finds nothing.
+    // Both broadcasts fail before the transaction lands: the receipt lookups
+    // before and after each failed broadcast find nothing.
     let asserter = Asserter::new();
     for _ in 0..2 {
+        asserter.push_success(&serde_json::Value::Null);
         asserter.push_failure_msg("node unavailable");
         asserter.push_success(&serde_json::Value::Null);
     }
@@ -579,6 +581,8 @@ async fn broadcast_with_failed_sync_reply_and_store(
     log["removed"] = serde_json::json!(false);
 
     let asserter = Asserter::new();
+    // Not yet on chain when checked before the broadcast.
+    asserter.push_success(&serde_json::Value::Null);
     asserter.push_failure_msg("Broadcast reply unavailable");
     match lookup {
         RecoveryLookup::Missing => asserter.push_success(&serde_json::Value::Null),
@@ -686,4 +690,145 @@ async fn test_broadcast_releases_submission_reservation_when_unrecovered() {
         reservation.is_none(),
         "reservation was kept: {reservation:?}"
     );
+}
+
+/// A pull credential whose signed transaction is already on chain was
+/// settled before this server's broadcast, by another server or an earlier
+/// settlement whose replay record is gone: it is rejected before
+/// broadcasting, even with no replay record here.
+#[tokio::test]
+async fn test_broadcast_rejects_transaction_already_on_chain() {
+    use crate::store::Store;
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let memo = attribution::encode("challenge-123", "api.example.com", None);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+    let mut log = make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
+    log["blockHash"] = serde_json::json!(B256::repeat_byte(0xdd));
+    log["blockNumber"] = serde_json::json!("0x1");
+    log["transactionHash"] = serde_json::json!(tx_hash);
+    log["transactionIndex"] = serde_json::json!("0x0");
+    log["logIndex"] = serde_json::json!("0x0");
+    log["removed"] = serde_json::json!(false);
+
+    for with_store in [true, false] {
+        // Only the pre-broadcast receipt lookup is answered: a broadcast
+        // would find no response and fail with another error.
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0xdd),
+            "blockNumber": "0x1",
+            "from": sender,
+            "to": currency,
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "contractAddress": null,
+            "logs": [log.clone()],
+            "logsBloom": alloy::primitives::Bloom::ZERO,
+            "status": "0x1",
+            "type": "0x76",
+            "feePayer": sender,
+        }));
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter.clone());
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let mut method = ChargeMethod::new(provider).without_store();
+        if with_store {
+            method = method.with_store(store.clone());
+        }
+
+        let error = method
+            .broadcast_transaction(
+                &alloy::hex::encode_prefixed(&tx_bytes),
+                &request,
+                None,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+                None,
+            )
+            .await
+            .expect_err("a transaction already on chain must be rejected");
+        assert_eq!(error.code, None, "store {with_store}: {error}");
+        assert!(!error.retryable, "store {with_store}: {error}");
+        assert!(
+            matches!(
+                crate::error::MppError::from(error.clone()),
+                crate::error::MppError::VerificationFailed(_)
+            ),
+            "store {with_store}: {error}"
+        );
+        assert!(asserter.read_q().is_empty(), "store {with_store}");
+        assert!(
+            store
+                .get(&format!("mpp:charge:{tx_hash:#x}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "store {with_store}: a rejected transaction is not recorded"
+        );
+        assert!(
+            store
+                .get(&format!("mpp:charge:submission:{tx_hash:#x}"))
+                .await
+                .unwrap()
+                .is_none(),
+            "store {with_store}: the submission claim is released"
+        );
+    }
+}
+
+/// The pre-broadcast lookup fails closed: without it the transaction is not
+/// broadcast, and resending the credential retries.
+#[tokio::test]
+async fn test_broadcast_fails_closed_when_pre_broadcast_lookup_fails() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let request = challenge_bound_request(currency, recipient, amount);
+    let asserter = Asserter::new();
+    asserter.push_failure_msg("Lookup unavailable");
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let method = ChargeMethod::new(provider).with_store(Arc::new(crate::store::MemoryStore::new()));
+
+    let error = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(&tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await
+        .expect_err("an unchecked transaction must not be broadcast");
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::NetworkError),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("Lookup unavailable"), "{error}");
+    assert!(asserter.read_q().is_empty(), "nothing was broadcast");
 }
