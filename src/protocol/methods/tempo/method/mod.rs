@@ -56,6 +56,7 @@ mod proof_credential;
 mod receipt_logs;
 mod simulate;
 mod transaction_credential;
+mod zone_credential;
 
 pub use fee_payer::{FeePayerPolicy, FeePayerPolicyOverride};
 pub use hosted_fee_payer::RemoteFeePayer;
@@ -63,10 +64,27 @@ pub use receipt_logs::{SenderValidation, ValidateSenderCallback};
 pub use simulate::{PaymentSimulationError, PaymentSimulationPhase};
 
 use transaction_credential::ensure_transaction_credential_source;
+use zone_credential::ensure_zone_credential_has_no_source;
+
+/// Reject a Zone credential in relay mode: the relay does not verify Zone
+/// credentials, so it must not be handed one.
+fn reject_relayed_zone_credential(credential: &PaymentCredential) -> Result<(), VerificationError> {
+    if credential
+        .charge_payload()
+        .is_ok_and(|payload| payload.is_zone())
+    {
+        return Err(VerificationError::with_code(
+            "Zone credentials are not supported with a relay.",
+            crate::protocol::traits::ErrorCode::InvalidCredential,
+        ));
+    }
+    Ok(())
+}
 
 /// Reject a credential whose submission mode the challenge does not allow.
 ///
-/// `type="hash"` is `push` mode and `type="transaction"` is `pull` mode.
+/// `type="hash"` and `type="zone"` are `push` mode and `type="transaction"` is
+/// `pull` mode.
 /// `methodDetails.supportedModes`, when present, lists the allowed modes.
 /// Proof credentials are exempt: zero-amount charges have no submission mode.
 fn ensure_submission_mode_allowed(
@@ -75,6 +93,8 @@ fn ensure_submission_mode_allowed(
 ) -> Result<(), VerificationError> {
     let (mode, kind) = if payload.is_hash() {
         ("push", "Hash")
+    } else if payload.is_zone() {
+        ("push", "Zone")
     } else if payload.is_transaction() {
         ("pull", "Transaction")
     } else {
@@ -120,6 +140,8 @@ fn ensure_submission_mode_allowed(
 ///
 /// - `hash`: Client already broadcast the transaction, provides tx hash
 /// - `transaction`: Client provides signed transaction for server to broadcast
+/// - `zone`: A Zone withdrawal settled on Tempo paid the recipient; the client
+///   provides the settlement transaction hash and the withdrawal's sender tag
 ///
 /// # Example
 ///
@@ -259,9 +281,10 @@ where
     /// in-memory store.
     ///
     /// Each verified transaction hash is recorded and subsequent attempts to
-    /// replay the same hash are rejected. Zero-amount proof challenges are
-    /// likewise made single-use per challenge id. Pass a shared backend (Redis,
-    /// SQL, etc.) when several instances verify credentials for the same realm.
+    /// replay the same hash are rejected. Zone withdrawals are likewise made
+    /// single-use per portal and sender tag, and zero-amount proof challenges
+    /// per challenge id. Pass a shared backend (Redis, SQL, etc.) when several
+    /// instances verify credentials for the same realm.
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
@@ -395,6 +418,12 @@ where
                 .await?;
             payer = hash_payer;
             serde_json::json!({ "mode": "push" })
+        } else if payload.is_zone() {
+            ensure_zone_credential_has_no_source(credential.source.as_deref())?;
+            self.verify_zone(&payload, request, &credential.challenge, false)
+                .await?;
+            payer = None;
+            serde_json::json!({ "mode": "push" })
         } else if payload.is_proof() {
             if !is_zero_amount {
                 return Err(VerificationError::new(
@@ -503,7 +532,10 @@ where
         let request = request.clone();
         async move {
             match relay {
-                Some(relay) => relay.validate(&credential, &request).await,
+                Some(relay) => {
+                    reject_relayed_zone_credential(&credential)?;
+                    relay.validate(&credential, &request).await
+                }
                 None => this.validate_local(&credential, &request).await,
             }
         }
@@ -519,6 +551,7 @@ where
         let request = request.clone();
         async move {
             if let Some(relay) = &this.relay {
+                reject_relayed_zone_credential(&credential)?;
                 relay.broadcast(&credential, METHOD_NAME).await
             } else {
                 ChargeMethodTrait::verify(&this, &credential, &request).await
@@ -550,6 +583,7 @@ where
 
         async move {
             if let Some(relay) = relay {
+                reject_relayed_zone_credential(&credential)?;
                 relay.validate(&credential, &request).await?;
                 return relay.broadcast(&credential, METHOD_NAME).await;
             }
@@ -615,6 +649,10 @@ where
                 )
                 .await
                 .map(|(receipt, _)| receipt)
+            } else if charge_payload.is_zone() {
+                ensure_zone_credential_has_no_source(credential.source.as_deref())?;
+                this.verify_zone(&charge_payload, &request, &credential.challenge, true)
+                    .await
             } else if charge_payload.is_proof() {
                 if !is_zero_amount {
                     return Err(VerificationError::new(

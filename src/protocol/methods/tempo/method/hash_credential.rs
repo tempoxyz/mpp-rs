@@ -3,18 +3,25 @@
 use alloy::network::ReceiptResponse;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 use tempo_alloy::primitives::transaction::Call;
 use tempo_alloy::TempoNetwork;
 
 use crate::protocol::core::{ChallengeEcho, Receipt};
 use crate::protocol::intents::ChargeRequest;
-use crate::protocol::traits::VerificationError;
+use crate::protocol::traits::{ErrorCode, VerificationError};
 
+use super::super::zone::IZonePortal;
 use super::super::{proof, TempoChargeExt, METHOD_NAME};
 use super::memo::assert_challenge_bound_memos;
 use super::receipt_logs::{match_receipt_transfers, ReceiptSenderPolicy};
 use super::transaction_credential::funding_currency;
 use super::ChargeMethod;
+
+/// Store key that makes a Tempo transaction pay for one hash credential.
+pub(super) fn tx_hash_replay_key(hash: B256) -> String {
+    format!("mpp:charge:{hash:#x}")
+}
 
 /// Parse a hash credential `source`: `Ok(None)` if absent, `Ok(Some(address))`
 /// for a `did:pkh:eip155` DID matching `expected_chain_id`, else `Err`.
@@ -66,7 +73,7 @@ where
             .parse::<B256>()
             .map_err(|e| VerificationError::new(format!("Invalid transaction hash: {}", e)))?;
 
-        let replay_key = format!("mpp:charge:{:#x}", hash);
+        let replay_key = tx_hash_replay_key(hash);
 
         let receipt = self
             .provider
@@ -87,6 +94,21 @@ where
                 "Transaction {} reverted",
                 tx_hash
             )));
+        }
+
+        // One processWithdrawals transaction settles many Zone withdrawals,
+        // each paid for by its own zone credential. Redeeming it as a hash
+        // credential would let one payer claim the whole batch, so any
+        // receipt with a portal's WithdrawalProcessed event is refused,
+        // whichever address emitted it.
+        if receipt.logs().iter().any(|log| {
+            log.inner.data.topics().first()
+                == Some(&IZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
+        }) {
+            return Err(VerificationError::with_code(
+                "Zone settlement transactions can't be redeemed as hash credentials; use a zone credential.",
+                ErrorCode::InvalidCredential,
+            ));
         }
 
         let currency = charge.currency_address().map_err(|e| {

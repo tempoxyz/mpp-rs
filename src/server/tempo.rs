@@ -50,6 +50,7 @@ pub struct TempoBuilder {
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
+    pub(crate) zones: Option<crate::protocol::methods::tempo::zone::Zones>,
 }
 
 impl TempoBuilder {
@@ -245,6 +246,21 @@ impl TempoBuilder {
         self.requires_auth = enabled;
         self
     }
+
+    /// Accept charges paid from these Zones, as mppx's `zones` server option:
+    /// [`Zones::Any`](crate::protocol::methods::tempo::zone::Zones::Any) for any
+    /// Zone on the challenge's chain, or a list of Zone IDs
+    /// ([`Zones::ids`](crate::protocol::methods::tempo::zone::Zones::ids)).
+    ///
+    /// Charge challenges then advertise them in `methodDetails.zones`, and a
+    /// client may pay from a Zone balance with a `zone` Credential: a
+    /// withdrawal to the recipient, settled on Tempo, whose memo binds it to
+    /// the challenge. [`Mpp::create()`](super::Mpp::create) rejects an empty
+    /// list or an invalid Zone ID.
+    pub fn zones(mut self, zones: crate::protocol::methods::tempo::zone::Zones) -> Self {
+        self.zones = Some(zones);
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -328,6 +344,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         relay: None,
         requires_auth: false,
+        zones: None,
     }
 }
 
