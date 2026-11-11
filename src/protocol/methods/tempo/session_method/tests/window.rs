@@ -49,7 +49,8 @@ fn reordered_vouchers_are_both_accepted() {
     assert_eq!(state.highest_voucher_amount, 120, "a late voucher leaves H");
     assert_eq!(state.highest_voucher_signature, Some(vec![120]));
     assert_eq!(runs(&state), vec![(100, 120)]);
-    assert_eq!(state.window.as_ref().unwrap().runs[0].at, NOW + 5);
+    // The run keeps the age of the gap the late voucher filled.
+    assert_eq!(state.window.as_ref().unwrap().runs[0].at, NOW);
 }
 
 /// Serial vouchers without `after` grow one run, as today's advance does.
@@ -154,38 +155,70 @@ fn a_wide_after_only_marks_more_as_seen() {
     assert!(err.message.contains("(seen)"), "{}", err.message);
 }
 
-/// Runs that touch merge, keeping the latest acceptance time; disjoint
-/// runs stay sorted.
+/// A run's `at` is when the gap below it opened: a run above every other
+/// one opens it now, a run inside a gap keeps that gap's age, and runs that
+/// touch merge into one with the lower run's age.
 #[test]
-fn runs_merge_when_they_touch() {
+fn runs_keep_the_age_of_the_gap_below_them() {
     let mut window = VoucherWindow::default();
     window.insert(10, 20, 1);
     window.insert(30, 40, 2);
+    // Inside the gap below (10, 20], which opened at 1.
     window.insert(0, 5, 3);
     assert_eq!(
         window
             .runs
             .iter()
-            .map(|run| (run.from, run.to))
+            .map(|run| (run.from, run.to, run.at))
             .collect::<Vec<_>>(),
-        vec![(0, 5), (10, 20), (30, 40)]
+        vec![(0, 5, 1), (10, 20, 1), (30, 40, 2)]
     );
+    // Fills the gap below (30, 40] and merges all three into one run whose
+    // gap below is the oldest.
     window.insert(20, 30, 4);
+    // Extending the top run keeps its age.
+    window.insert(40, 50, 5);
     assert_eq!(
         window.runs,
         vec![
             VoucherRun {
                 from: 0,
                 to: 5,
-                at: 3
+                at: 1
             },
             VoucherRun {
                 from: 10,
-                to: 40,
-                at: 4
+                to: 50,
+                at: 1
             }
         ]
     );
+}
+
+/// A lost voucher leaves a hole that expires a window after it opened, also
+/// while in-order traffic keeps extending the run above it.
+#[test]
+fn a_hole_expires_under_continuous_traffic() {
+    // 110 (after 100) is lost; 120 (after 110) opens the hole (100, 110].
+    let mut state = accept(channel_at(100), 120, Some(110), NOW).unwrap();
+    let mut cumulative = 120;
+    let mut now = NOW;
+    while now < NOW + 2 * WINDOW_MS {
+        now += 1_000;
+        if now < NOW + WINDOW_MS {
+            assert!(
+                accept(state.clone(), 110, Some(100), now).is_ok(),
+                "the hole is open inside the window"
+            );
+        }
+        state = accept(state, cumulative + 10, Some(cumulative), now).unwrap();
+        cumulative += 10;
+    }
+    let err = accept(state.clone(), 110, Some(100), now).unwrap_err();
+    assert!(err.message.contains("(stale)"), "{}", err.message);
+    // Vouchers still in flight above the old run are accepted as usual.
+    let state = accept(state, cumulative + 20, Some(cumulative + 10), now).unwrap();
+    assert!(accept(state, cumulative + 10, Some(cumulative), now).is_ok());
 }
 
 /// The window is persisted with the channel, and channels stored before it

@@ -176,6 +176,11 @@ pub struct TempoSessionProvider {
     /// Held across a save of receipted `spent`, so a save that read an older
     /// receipt cannot land after a newer one's.
     server_spent_saves: Arc<tokio::sync::Mutex<()>>,
+    /// Per channel, the highest cumulative amount a server that accepts
+    /// vouchers out of order reported it accepted, advanced past the
+    /// vouchers signed again from it; see
+    /// [`allocate_voucher_range`](Self::allocate_voucher_range).
+    accepted_cursors: Arc<Mutex<HashMap<B256, u128>>>,
     /// Receives `channel.deposit` events for accepted opens and top-ups.
     events: ClientEvents,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
@@ -418,6 +423,7 @@ impl TempoSessionProvider {
             topping_up: Arc::new(Mutex::new(HashSet::new())),
             spend: Arc::default(),
             server_spent_saves: Arc::default(),
+            accepted_cursors: Arc::default(),
             events: ClientEvents::default(),
             trusted_tempo_proof_realms: Vec::new(),
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
@@ -4015,10 +4021,16 @@ impl TempoSessionProvider {
     }
 
     /// Raises the channel's voucher counter by `amount` and returns the range
-    /// `(start, end]` it covers, or `None` when that would exceed the deposit
-    /// or the maximum deposit. Native channels allocate in the channel store,
-    /// which every provider and process sharing it allocates from; legacy
-    /// channels, which are not persisted, allocate in process memory.
+    /// `(start, end]` it covers. Native channels allocate in the channel
+    /// store, which every provider and process sharing it allocates from;
+    /// legacy channels, which are not persisted, allocate in process memory.
+    ///
+    /// When the counter cannot rise by `amount` within the deposit (or the
+    /// maximum deposit), vouchers signed from it were lost or are still in
+    /// flight above what the server accepted. The range then starts at the
+    /// server's accepted amount instead, as long as it ends within what the
+    /// counter already authorized, so it signs for no new funds. `None` when
+    /// neither fits: the payment takes the serialized path, which tops up.
     async fn allocate_voucher_range(
         &self,
         key: &str,
@@ -4045,7 +4057,7 @@ impl TempoSessionProvider {
                 .await
                 .map_err(Self::store_error)?;
             let Some(raised) = raised else {
-                return Ok(None);
+                return Ok(self.reuse_accepted_range(key, entry, amount, cap));
             };
             Some(raised)
         } else {
@@ -4069,13 +4081,42 @@ impl TempoSessionProvider {
                     .checked_add(amount)
                     .filter(|raised| *raised <= cap)
                 else {
-                    return Ok(None);
+                    drop(channels);
+                    return Ok(self.reuse_accepted_range(key, entry, amount, cap));
                 };
                 current.cumulative_amount = raised;
                 raised
             }
         };
         Ok(Some((raised - amount, raised)))
+    }
+
+    /// Allocates `(accepted, accepted + amount]` from the server's reported
+    /// accepted amount, for a counter that cannot rise within the deposit,
+    /// and advances that cursor so concurrent payments take disjoint ranges.
+    /// The range must end within the cap and what the counter already
+    /// authorized.
+    fn reuse_accepted_range(
+        &self,
+        key: &str,
+        entry: &ChannelEntry,
+        amount: u128,
+        cap: u128,
+    ) -> Option<(u128, u128)> {
+        let issued = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|current| current.channel_id == entry.channel_id)
+            .map(|current| current.cumulative_amount)?;
+        let mut cursors = self.accepted_cursors.lock().unwrap();
+        let cursor = cursors.get_mut(&entry.channel_id)?;
+        let end = cursor
+            .checked_add(amount)
+            .filter(|end| *end <= cap.min(issued))?;
+        let start = std::mem::replace(cursor, end);
+        Some((start, end))
     }
 
     /// Raises the channel's voucher counter to `accepted`, the cumulative
@@ -4096,6 +4137,11 @@ impl TempoSessionProvider {
         let entry = channels
             .get_mut(key)
             .filter(|entry| entry.channel_id == channel_id && entry.opened)?;
+        {
+            let mut cursors = self.accepted_cursors.lock().unwrap();
+            let cursor = cursors.entry(channel_id).or_default();
+            *cursor = (*cursor).max(accepted);
+        }
         let cap = self
             .max_deposit
             .map_or(entry.deposit, |max| max.min(entry.deposit));
@@ -7295,6 +7341,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.cumulative_amount, 7_000);
+    }
+
+    /// A counter that ran ahead of the server, through vouchers lost or still
+    /// in flight, allocates from the server's accepted amount once it cannot
+    /// rise within the deposit, rather than topping up, and signs for no
+    /// more than it already authorized.
+    #[tokio::test]
+    async fn exhausted_counter_allocates_from_the_accepted_amount() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 9_500, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        let challenge = reorder_challenge("first", payee, currency, Some(30));
+
+        // Without a known accepted amount the payment takes the serialized
+        // path, which needs a top-up this test cannot do.
+        assert!(provider.pay(&challenge).await.is_err());
+
+        let voucher = serde_json::json!({
+            "action": "voucher",
+            "channelId": channel_id.to_string(),
+            "cumulativeAmount": "9500",
+            "after": "8500",
+            "signature": "0x00"
+        });
+        let refused = PaymentCredential::new(challenge.to_echo(), voucher);
+        provider.observe_refusal(
+            &challenge,
+            &refused,
+            &serde_json::json!({"acceptedCumulative": "5000"}),
+        );
+        let (first, second) = (
+            reorder_challenge("a", payee, currency, Some(30)),
+            reorder_challenge("b", payee, currency, Some(30)),
+        );
+        let (a, b) = tokio::join!(provider.pay(&first), provider.pay(&second));
+        let mut ranges = vec![voucher_range(&a.unwrap()), voucher_range(&b.unwrap())];
+        ranges.sort();
+        assert_eq!(ranges, vec![(Some(5_000), 6_000), (Some(6_000), 7_000)]);
+        assert_eq!(provider.cumulative(), 9_500, "the counter is not lowered");
     }
 
     /// Without a reorder window a payment waits for the channel's previous

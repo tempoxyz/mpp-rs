@@ -82,20 +82,24 @@ pub struct VoucherWindow {
     pub runs: Vec<VoucherRun>,
 }
 
-/// An interval of accepted voucher increments, `(from, to]`.
+/// An interval of accepted voucher increments, `(from, to]`, and the age of
+/// the gap of unaccepted increments directly below it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VoucherRun {
     /// Exclusive lower bound.
     pub from: u128,
     /// Inclusive upper bound.
     pub to: u128,
-    /// When the latest voucher in the run was accepted, in Unix milliseconds.
+    /// When the gap directly below the run opened, in Unix milliseconds:
+    /// once it is older than the window, the gap and the run move below the
+    /// floor.
     pub at: u64,
 }
 
 impl VoucherWindow {
-    /// Moves runs accepted at or before `cutoff` (Unix milliseconds) below
-    /// the floor, and drops runs the floor covers.
+    /// Expires the gaps that opened at or before `cutoff` (Unix
+    /// milliseconds): each such run, with the gap below it, moves below the
+    /// floor, and runs the floor covers are dropped.
     pub(super) fn prune(&mut self, cutoff: u64) {
         let floor = self
             .runs
@@ -112,20 +116,25 @@ impl VoucherWindow {
         self.runs.iter().any(|run| from < run.to && run.from < to)
     }
 
-    /// Records `(from, to]`, which overlaps no run, accepted at `at`, and
-    /// merges it with the runs it touches. Past [`MAX_VOUCHER_RUNS`] runs,
-    /// the lowest ones move below the floor: that refuses more vouchers as
-    /// stale, never accepts a replay.
-    pub(super) fn insert(&mut self, from: u128, to: u128, at: u64) {
+    /// Records `(from, to]`, which overlaps no run, accepted at `now`, and
+    /// merges it with the runs it touches.
+    ///
+    /// A run's `at` is when the gap directly below it opened, so a gap
+    /// expires a window after it opened, whatever is accepted around it
+    /// later. A run above every other one opens the gap below it now. A run
+    /// inside the gap below a run `U` splits that gap, which keeps `U`'s
+    /// age. Runs that touch merge into one that keeps the lower run's `at`.
+    ///
+    /// Past [`MAX_VOUCHER_RUNS`] runs, the lowest ones move below the floor:
+    /// that refuses more vouchers as stale, never accepts a replay.
+    pub(super) fn insert(&mut self, from: u128, to: u128, now: u64) {
         let index = self.runs.partition_point(|run| run.to <= from);
+        let at = self.runs.get(index).map_or(now, |above| above.at);
         self.runs.insert(index, VoucherRun { from, to, at });
         let mut merged: Vec<VoucherRun> = Vec::with_capacity(self.runs.len());
         for run in self.runs.drain(..) {
             match merged.last_mut() {
-                Some(last) if last.to == run.from => {
-                    last.to = run.to;
-                    last.at = last.at.max(run.at);
-                }
+                Some(last) if last.to == run.from => last.to = run.to,
                 _ => merged.push(run),
             }
         }
