@@ -1032,7 +1032,7 @@ async fn test_first_attempt_does_not_recover_unbound_transfer_submitted_elsewher
     let method = ChargeMethod::new(provider).with_store(store.clone());
     let signed_tx = alloy::hex::encode_prefixed(&tx_bytes);
     for expected in [
-        crate::protocol::traits::ErrorCode::NetworkError,
+        crate::protocol::traits::ErrorCode::CredentialReplayed,
         crate::protocol::traits::ErrorCode::CredentialReplayed,
     ] {
         let error = method
@@ -1055,6 +1055,87 @@ async fn test_first_attempt_does_not_recover_unbound_transfer_submitted_elsewher
         .await
         .unwrap()
         .is_none());
+}
+
+/// A first broadcast whose outcome is unknown (a timeout) keeps its
+/// broadcast record: the transaction is this server's own, so its receipt
+/// settles the same request instead of asking the client to resend.
+#[tokio::test]
+async fn test_first_attempt_settles_own_broadcast_after_timeout() {
+    use crate::store::Store;
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![tempo_alloy::primitives::transaction::Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: make_transfer_input(recipient, amount),
+        }],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+    let mut log = make_transfer_log(currency, sender, recipient, amount);
+    log["blockHash"] = serde_json::json!(B256::repeat_byte(0xdd));
+    log["blockNumber"] = serde_json::json!("0x1");
+    log["transactionHash"] = serde_json::json!(tx_hash);
+    log["transactionIndex"] = serde_json::json!("0x0");
+    log["logIndex"] = serde_json::json!("0x0");
+    log["removed"] = serde_json::json!(false);
+    let receipt = serde_json::json!({
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "blockHash": B256::repeat_byte(0xdd),
+        "blockNumber": "0x1",
+        "from": sender,
+        "to": currency,
+        "cumulativeGasUsed": "0x5208",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "contractAddress": null,
+        "logs": [log],
+        "logsBloom": alloy::primitives::Bloom::ZERO,
+        "status": "0x1",
+        "type": "0x76",
+        "feePayer": sender,
+    });
+
+    let asserter = Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
+    asserter.push_failure(alloy_json_rpc::ErrorPayload {
+        code: 4,
+        message: "timeout".into(),
+        data: None,
+    });
+    asserter.push_success(&receipt);
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(crate::store::MemoryStore::new());
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+    let signed_tx = alloy::hex::encode_prefixed(&tx_bytes);
+    method
+        .broadcast_transaction(
+            &signed_tx,
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await
+        .expect("the server's own broadcast settles after a timeout");
+    assert!(asserter.read_q().is_empty());
+    assert!(store
+        .get(&format!("mpp:charge:{tx_hash:#x}"))
+        .await
+        .unwrap()
+        .is_some());
 }
 
 /// A JSON-RPC error with which the node definitely refuses a transaction,

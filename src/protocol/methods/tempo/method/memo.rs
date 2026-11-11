@@ -12,9 +12,10 @@
 //!
 //! Hash (push) credentials name a transfer that is already on chain, so they
 //! must carry attribution bound to the challenge; otherwise anyone who saw
-//! an unattributed transfer to the recipient could present it. Attribution
-//! of this realm for another challenge on a push credential is rejected;
-//! attribution for another realm on one of its other transfers is accepted.
+//! an unattributed transfer to the recipient could present it. As for pull,
+//! any other attribution memo on a matched push transfer, including another
+//! realm's, is rejected: otherwise one transaction whose transfers carry two
+//! realms' attribution could pay a challenge at each.
 
 use crate::protocol::traits::VerificationError;
 use crate::tempo::attribution;
@@ -67,26 +68,8 @@ pub(super) fn assert_pull_attribution<'a>(
     Ok(())
 }
 
-/// Reject any attribution memo of this realm among `memos` that is bound to
-/// another challenge. Memos that are not in attribution format, attribution
-/// for another realm, and no attribution at all are accepted.
-fn assert_challenge_bound_memos<'a>(
-    memos: impl IntoIterator<Item = &'a [u8; 32]>,
-    challenge_id: &str,
-    realm: &str,
-) -> Result<(), VerificationError> {
-    for memo in memos {
-        if attribution::verify_server(memo, realm)
-            && !attribution::verify_challenge_binding(memo, challenge_id)
-        {
-            return Err(challenge_bound_memo_error());
-        }
-    }
-    Ok(())
-}
-
 /// The attribution check for the matched transfers of a hash (push)
-/// credential: [`assert_challenge_bound_memos`], plus at least one memo bound
+/// credential: [`assert_pull_attribution`], plus at least one memo bound
 /// to this challenge and realm.
 ///
 /// A hash credential names a transfer that is already on chain and that the
@@ -95,11 +78,12 @@ fn assert_challenge_bound_memos<'a>(
 /// route's amount to the recipient could claim it as their payment.
 pub(super) fn assert_hash_credential_attribution<'a>(
     memos: impl IntoIterator<Item = &'a [u8; 32]>,
+    expected: &[Transfer],
     challenge_id: &str,
     realm: &str,
 ) -> Result<(), VerificationError> {
     let memos: Vec<&[u8; 32]> = memos.into_iter().collect();
-    assert_challenge_bound_memos(memos.iter().copied(), challenge_id, realm)?;
+    assert_pull_attribution(memos.iter().copied(), expected, challenge_id, realm)?;
     if !memos
         .iter()
         .any(|memo| is_challenge_bound_memo(memo, challenge_id, realm))
@@ -116,4 +100,38 @@ pub(super) fn is_challenge_bound_memo(memo: &[u8; 32], challenge_id: &str, realm
 
 pub(super) fn challenge_bound_memo_error() -> VerificationError {
     VerificationError::new("Payment verification failed: memo is not bound to this challenge.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One transaction whose transfers carry two realms' attribution must
+    /// not pay a push challenge at either realm.
+    #[test]
+    fn hash_attribution_rejects_another_realms_memo() {
+        let own = attribution::encode("challenge-a", "a.example", None);
+        let other = attribution::encode("challenge-b", "b.example", None);
+        assert!(
+            assert_hash_credential_attribution([&own], &[], "challenge-a", "a.example").is_ok()
+        );
+        assert!(assert_hash_credential_attribution(
+            [&own, &other],
+            &[],
+            "challenge-a",
+            "a.example"
+        )
+        .is_err());
+        assert!(assert_hash_credential_attribution(
+            [&other, &own],
+            &[],
+            "challenge-b",
+            "b.example"
+        )
+        .is_err());
+        assert!(
+            assert_hash_credential_attribution([&[0u8; 32]], &[], "challenge-a", "a.example")
+                .is_err()
+        );
+    }
 }

@@ -283,6 +283,16 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             if rejected {
                 return Ok(resp);
             }
+        } else if is_problem_json(&resp) {
+            // A credential can reach the server without being on the request
+            // seen here, such as from the client's default headers. Servers
+            // answer invalid-challenge only to a credential, so it is final
+            // here too.
+            let (rebuilt, problem_type) = read_problem_type(resp).await;
+            resp = rebuilt;
+            if problem_type.is_some_and(|kind| kind.ends_with("/invalid-challenge")) {
+                return Ok(resp);
+            }
         }
 
         let (Some(retry), Some(payment_context)) = (retry, payment_context) else {
@@ -903,37 +913,106 @@ pub fn is_cross_realm_proof_with_trust(
 }
 
 /// Whether `headers` carry a Payment credential: a `Payment-Authorization`
-/// header, or an `Authorization` header with the `Payment` scheme.
+/// header, or a `Payment` scheme anywhere in an `Authorization` value,
+/// including one comma-joined after another scheme, as the server reads it.
 fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
     headers.contains_key("payment-authorization")
         || headers
             .get_all(reqwest::header::AUTHORIZATION)
             .iter()
-            .any(|value| {
-                value
-                    .as_bytes()
-                    .split(|byte| *byte == b' ')
-                    .next()
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
-            })
+            .any(authorization_has_payment)
+}
+
+/// Whether an `Authorization` value holds a `Payment` scheme in any of its
+/// comma-separated elements.
+fn authorization_has_payment(value: &HeaderValue) -> bool {
+    match value.to_str() {
+        Ok(text) => {
+            !crate::protocol::core::headers::payment_credentials(text).is_empty()
+                || authorization_elements(text)
+                    .iter()
+                    .any(|element| is_payment_element(element))
+        }
+        Err(_) => value.as_bytes().split(|byte| *byte == b',').any(|element| {
+            element
+                .trim_ascii_start()
+                .split(|byte| *byte == b' ')
+                .next()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
+        }),
+    }
+}
+
+/// The comma-separated elements of an `Authorization` value, with commas
+/// inside quoted strings kept.
+fn authorization_elements(value: &str) -> Vec<&str> {
+    let mut elements = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if byte == b',' && !quoted {
+            elements.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    elements.push(&value[start..]);
+    elements
+}
+
+/// Whether an element starts a `Payment` scheme: `Payment` alone or
+/// followed by a space.
+fn is_payment_element(element: &str) -> bool {
+    let scheme = element.trim_start().split(' ').next().unwrap_or("");
+    scheme.eq_ignore_ascii_case("payment")
+}
+
+/// Whether an element starts a new scheme rather than continuing the
+/// previous one's auth-params (`name=value`).
+fn starts_scheme(element: &str) -> bool {
+    let element = element.trim_start();
+    let token_end = element.find([' ', '=']).unwrap_or(element.len());
+    !element.is_empty() && !element[token_end..].starts_with('=')
+}
+
+/// An `Authorization` value without its `Payment` schemes and their
+/// parameters, or `None` when nothing else is left.
+fn without_payment_schemes(value: &str) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_payment = false;
+    for element in authorization_elements(value) {
+        if starts_scheme(element) {
+            in_payment = is_payment_element(element);
+        }
+        if !in_payment && !element.trim().is_empty() {
+            kept.push(element.trim());
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join(", "))
 }
 
 /// Remove every Payment credential from a request's headers:
-/// `Payment-Authorization` and any `Authorization: Payment` value. Other
-/// `Authorization` values stay.
+/// `Payment-Authorization` and any `Payment` scheme in an `Authorization`
+/// value, including one comma-joined with another scheme. The other schemes
+/// stay.
 fn remove_payment_credentials(headers: &mut HeaderMap) {
     headers.remove("payment-authorization");
     let kept: Vec<HeaderValue> = headers
         .get_all(reqwest::header::AUTHORIZATION)
         .iter()
-        .filter(|value| {
-            !value
-                .as_bytes()
-                .split(|byte| *byte == b' ')
-                .next()
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
+        .filter_map(|value| {
+            if !authorization_has_payment(value) {
+                return Some(value.clone());
+            }
+            let rest = without_payment_schemes(value.to_str().ok()?)?;
+            let mut rebuilt = HeaderValue::from_str(&rest).ok()?;
+            rebuilt.set_sensitive(value.is_sensitive());
+            Some(rebuilt)
         })
-        .cloned()
         .collect();
     headers.remove(reqwest::header::AUTHORIZATION);
     for value in kept {

@@ -1871,3 +1871,94 @@ fn remove_payment_credentials_clears_both_fields() {
     assert_eq!(authorization, [HeaderValue::from_static("Bearer token")]);
     assert!(!super::carries_payment_credential(&headers));
 }
+
+#[test]
+fn comma_joined_payment_credentials_are_found_and_removed() {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    let mut headers = HeaderMap::new();
+    headers.append(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer t, Payment abc"),
+    );
+    assert!(super::carries_payment_credential(&headers));
+    super::remove_payment_credentials(&mut headers);
+    let values: Vec<_> = headers.get_all(AUTHORIZATION).iter().collect();
+    assert_eq!(values, vec![HeaderValue::from_static("Bearer t")]);
+
+    let mut headers = HeaderMap::new();
+    headers.append(
+        AUTHORIZATION,
+        HeaderValue::from_static("Digest realm=\"a, b\", nonce=x, Payment abc, Basic dXM="),
+    );
+    assert!(super::carries_payment_credential(&headers));
+    super::remove_payment_credentials(&mut headers);
+    let values: Vec<_> = headers.get_all(AUTHORIZATION).iter().collect();
+    assert_eq!(
+        values,
+        vec![HeaderValue::from_static(
+            "Digest realm=\"a, b\", nonce=x, Basic dXM="
+        )]
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.append(AUTHORIZATION, HeaderValue::from_static("Payment abc"));
+    super::remove_payment_credentials(&mut headers);
+    assert!(headers.get(AUTHORIZATION).is_none());
+
+    let mut headers = HeaderMap::new();
+    headers.append(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer payment, Basic x"),
+    );
+    assert!(!super::carries_payment_credential(&headers));
+}
+
+/// A Payment credential the flow cannot see on the request, from the
+/// client's default headers or comma-joined after another scheme, is still
+/// not paid again when the server answers it with invalid-challenge.
+#[tokio::test]
+async fn hidden_caller_credential_is_not_paid_again() {
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/invalid-challenge"})
+        .to_string();
+    let url = spawn_server(caller_credential_route(
+        Some("application/problem+json"),
+        body,
+    ))
+    .await;
+    let mut defaults = reqwest::header::HeaderMap::new();
+    defaults.insert(
+        reqwest::header::AUTHORIZATION,
+        "Payment eyJjaGFsbGVuZ2UiOnt9fQ".parse().unwrap(),
+    );
+    let default_client = reqwest::Client::builder()
+        .default_headers(defaults)
+        .build()
+        .unwrap();
+    for via in BOTH {
+        for (name, builder) in [
+            ("default headers", default_client.get(format!("{url}/paid"))),
+            (
+                "comma-joined",
+                reqwest::Client::new()
+                    .get(format!("{url}/paid"))
+                    .header("authorization", "Bearer t, Payment eyJjaGFsbGVuZ2UiOnt9fQ"),
+            ),
+        ] {
+            let provider = TestProvider::default();
+            let response = via
+                .send(builder, &provider, ClientEvents::default())
+                .await
+                .unwrap_or_else(|err| panic!("{name}, {via:?}: {err}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "{name}, {via:?}"
+            );
+            assert!(
+                provider.paid().is_empty(),
+                "{name}, {via:?}: {:?}",
+                provider.paid()
+            );
+        }
+    }
+}

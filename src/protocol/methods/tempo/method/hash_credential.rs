@@ -113,9 +113,10 @@ where
         )?;
 
         // A push payment must carry attribution bound to this challenge, and
-        // attribution for another challenge fails verification.
+        // attribution for another challenge or realm fails verification.
         assert_hash_credential_attribution(
             matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+            &expected,
             &challenge.id,
             &challenge.realm,
         )?;

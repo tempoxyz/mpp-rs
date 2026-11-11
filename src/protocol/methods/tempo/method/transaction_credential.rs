@@ -586,7 +586,11 @@ where
             if let (Some(store), Some(_)) = (&self.store, &submission_key) {
                 if !broadcast_before {
                     // A record another challenge holds stays: this attempt
-                    // then has no record of its own.
+                    // then has no record of its own. So does a failed write,
+                    // such as a full MemoryStore expiring capacity: the record
+                    // only lets a retry skip the inclusion check, and without
+                    // it a retry after the transaction lands is answered as a
+                    // replay instead of failing every payment now.
                     let created = store
                         .put_if_absent_with_ttl(
                             &broadcast_key,
@@ -594,9 +598,7 @@ where
                             broadcast_record_ttl(expires, &final_tx_bytes)?,
                         )
                         .await
-                        .map_err(|e| {
-                            VerificationError::internal(format!("Failed to record broadcast: {e}"))
-                        })?;
+                        .unwrap_or(false);
                     if created {
                         broadcast_record = Some(broadcast_key);
                     }
@@ -614,9 +616,11 @@ where
                 self.provider
                     .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
                     .await;
-            // Set when the receipt was recovered after this attempt's own
-            // broadcast failed, with no earlier broadcast record here.
-            let mut recovered_first_attempt = false;
+            // Set when the receipt was recovered after the node definitely
+            // refused this attempt's own broadcast, such as a duplicate of a
+            // transaction someone else submitted, with no earlier broadcast
+            // record here.
+            let mut recovered_after_refusal = false;
             let receipt = match broadcast {
                 Ok(receipt) => receipt,
                 Err(broadcast_error) => {
@@ -626,7 +630,8 @@ where
                     // could accept a transaction another server settled.
                     // Only an earlier attempt's record, kept because its
                     // outcome was unknown, survives a rejected retry.
-                    if !broadcast_before && broadcast_refused(&broadcast_error) {
+                    let refused = broadcast_refused(&broadcast_error);
+                    if !broadcast_before && refused {
                         if let (Some(store), Some(key)) = (&self.store, broadcast_record.take()) {
                             let _ = store.delete(&key).await;
                         }
@@ -648,7 +653,7 @@ where
                         }
                         None => None,
                     };
-                    recovered_first_attempt = recovered.is_some() && !broadcast_before;
+                    recovered_after_refusal = recovered.is_some() && !broadcast_before && refused;
                     recovered.ok_or_else(|| {
                         VerificationError::network_error(format!(
                             "Failed to broadcast: {broadcast_error}"
@@ -679,20 +684,23 @@ where
                 },
             )?;
             assert_pull_attribution_logs(&matched_logs, &expected, challenge_id, realm)?;
-            // A first broadcast that failed may have failed because someone
-            // else (another server, or anyone who saw the transaction
-            // pending) submitted it first. Its receipt then proves nothing
-            // for this credential unless a transfer carries this challenge's
-            // attribution memo. An unbound transaction is settled only by a
-            // retry that holds this server's own broadcast record.
-            if recovered_first_attempt
+            // A first broadcast the node refused, such as a duplicate, may
+            // have been refused because someone else (another server, or
+            // anyone who saw the transaction pending) submitted it first.
+            // Its receipt then proves nothing for this credential unless a
+            // transfer carries this challenge's attribution memo, and the
+            // refusal removed this attempt's broadcast record, so a retry is
+            // answered as a replay. A broadcast whose outcome is unknown,
+            // such as a timeout, keeps its record: it is this server's own,
+            // and its receipt settles this request as a retry's would.
+            if recovered_after_refusal
                 && !matched_logs.iter().any(|log| {
                     matches!(log, super::receipt_logs::MatchedTransferLog::Memo(memo)
                         if super::memo::is_challenge_bound_memo(memo, challenge_id, realm))
                 })
             {
-                return Err(VerificationError::network_error(
-                    "Broadcast failed and its outcome is unknown; retry the same credential",
+                return Err(VerificationError::credential_replayed(
+                    "Transaction was already submitted elsewhere",
                 ));
             }
 

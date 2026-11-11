@@ -79,7 +79,7 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
 
 /// The Payment credentials in one field value, in order: each `Payment
 /// <token>` fragment, or `None` for a bare `Payment` with no token.
-fn payment_credentials(value: &str) -> Vec<Option<&str>> {
+pub(crate) fn payment_credentials(value: &str) -> Vec<Option<&str>> {
     let mut found = Vec::new();
     let mut tokens = Tokenizer::new(value);
     while let Some(token) = tokens.next() {
