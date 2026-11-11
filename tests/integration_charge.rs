@@ -2480,7 +2480,7 @@ async fn test_pull_transaction_already_on_chain_rejected() {
         assert!(
             matches!(
                 mpp::MppError::from(error.clone()),
-                mpp::MppError::VerificationFailed(_)
+                mpp::MppError::CredentialReplayed(_)
             ),
             "{case}: {error:?}"
         );

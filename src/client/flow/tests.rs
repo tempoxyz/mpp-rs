@@ -1762,3 +1762,53 @@ fn carries_payment_credential_reads_both_headers() {
     )])));
     assert!(!super::carries_payment_credential(&headers(&[])));
 }
+
+/// A caller's own hash (push) credential has its transfer on chain already,
+/// so any 402 answering it is final, even verification-failed, as for a hash
+/// credential the flow sent.
+#[tokio::test]
+async fn caller_hash_credential_is_never_paid_again() {
+    let challenge = crate::protocol::core::parse_www_authenticate(&www_authenticate(
+        "caller", "tempo", "charge",
+    ))
+    .unwrap();
+    let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xabc"));
+    let authorization = crate::protocol::core::format_authorization(&credential).unwrap();
+    let token = authorization.trim_start_matches("Payment ").to_string();
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/verification-failed"})
+        .to_string();
+    let url = spawn_server(caller_credential_route(
+        Some("application/problem+json"),
+        body,
+    ))
+    .await;
+    for (header, value) in [
+        ("authorization", authorization.clone()),
+        ("payment-authorization", token.clone()),
+        ("payment-authorization", authorization.clone()),
+    ] {
+        for via in BOTH {
+            let provider = TestProvider::default();
+            let response = via
+                .send(
+                    reqwest::Client::new()
+                        .get(format!("{url}/paid"))
+                        .header(header, value.as_str()),
+                    &provider,
+                    ClientEvents::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "{header}, {via:?}"
+            );
+            assert!(
+                provider.paid().is_empty(),
+                "{header}, {via:?}: {:?}",
+                provider.paid()
+            );
+        }
+    }
+}

@@ -464,8 +464,9 @@ async fn test_hosted_sponsorship_retry_reconciles_the_signed_transaction() {
             data: None,
         }),
         Ok(serde_json::Value::Null),
-        // The retry finds it still pending, then broadcasts it again.
-        Ok(serde_json::Value::Null),
+        // The retry broadcasts the transaction this server already sent
+        // again, without the pre-broadcast lookup: a receipt for it would be
+        // this server's own.
         Ok(receipt(
             client.address(),
             sponsor.address(),

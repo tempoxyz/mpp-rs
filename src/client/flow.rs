@@ -209,6 +209,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         // A credential the caller set on the request is sent as it is, like
         // mppx's `initialCredentialSent`; its rejection is answered below.
         let caller_credential = carries_payment_credential(request.headers());
+        let request_headers = caller_credential.then(|| request.headers().clone());
         let prepaid = match (&initial_response, &payment_context) {
             // A prepaid credential is sent before any 402, so it would bypass
             // the approval hook; with a hook set, every payment waits for one.
@@ -272,6 +273,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         // behind that credential may have settled, so paying the fresh
         // challenge could pay twice.
         if caller_credential {
+            // A hash credential's transfer is already on chain, so any 402
+            // answering it is final, as for a hash credential this flow sent.
+            if carries_hash_credential(request_headers.as_ref()) {
+                return Ok(resp);
+            }
             let (rebuilt, rejected) = credential_rejected(resp).await;
             resp = rebuilt;
             if rejected {
@@ -906,6 +912,28 @@ fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
                     .next()
                     .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
             })
+}
+
+/// Whether the caller's own credential on a request is a Tempo hash (push)
+/// credential, whose transfer is already on chain. Reads `Authorization:
+/// Payment` and `Payment-Authorization` (with or without the scheme).
+fn carries_hash_credential(headers: Option<&HeaderMap>) -> bool {
+    let Some(headers) = headers else {
+        return false;
+    };
+    let is_hash = |value: &str| {
+        crate::protocol::core::parse_authorization(value)
+            .or_else(|_| crate::protocol::core::parse_authorization(&format!("Payment {value}")))
+            .ok()
+            .and_then(|credential| credential.charge_payload().ok())
+            .is_some_and(|payload| payload.is_hash())
+    };
+    headers
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .chain(headers.get_all("payment-authorization").iter())
+        .filter_map(|value| value.to_str().ok())
+        .any(is_hash)
 }
 
 /// Whether a `402` answering a credential is final rather than a fresh

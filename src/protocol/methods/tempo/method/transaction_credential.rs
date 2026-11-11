@@ -343,7 +343,9 @@ where
                 )
             })?;
         if receipt.is_some() {
-            return Err(VerificationError::new(format!(
+            // Answered as a replay (invalid-challenge), which clients treat as
+            // final: paying a fresh Challenge for it could pay twice.
+            return Err(VerificationError::credential_replayed(format!(
                 "Transaction {tx_hash:#x} is already included on chain."
             )));
         }
@@ -515,6 +517,10 @@ where
             None => None,
         };
 
+        // Set once this server is about to broadcast these exact bytes, and
+        // kept until they settle, so a retry after a failed broadcast can
+        // still recover a transaction that landed later.
+        let mut broadcast_record: Option<String> = None;
         let result: Result<B256, VerificationError> = async {
             // Simulation and the dedup claim took round trips since co-signing:
             // right before broadcasting, make sure the sponsored transaction
@@ -541,8 +547,38 @@ where
             // someone else, so its receipt proves nothing for this
             // credential. Checked right before sending, so the recovery
             // below only ever accepts a transaction that was still pending.
-            self.ensure_not_yet_included(keccak256(&final_tx_bytes))
-                .await?;
+            // A transaction this server already broadcast for an earlier
+            // attempt of this credential may have landed after that attempt
+            // failed: its broadcast record lets the retry recover it below.
+            let broadcast_key = format!(
+                "mpp:charge:broadcast-pending:{:#x}",
+                keccak256(&final_tx_bytes)
+            );
+            let broadcast_before = match (&self.store, &submission_key) {
+                (Some(store), Some(_)) => store
+                    .get(&broadcast_key)
+                    .await
+                    .map_err(|e| {
+                        VerificationError::internal(format!("Failed to read broadcast record: {e}"))
+                    })?
+                    .is_some(),
+                _ => false,
+            };
+            if !broadcast_before {
+                self.ensure_not_yet_included(keccak256(&final_tx_bytes))
+                    .await?;
+            }
+            if let (Some(store), Some(_)) = (&self.store, &submission_key) {
+                if !broadcast_before {
+                    store
+                        .put(&broadcast_key, serde_json::Value::Bool(true))
+                        .await
+                        .map_err(|e| {
+                            VerificationError::internal(format!("Failed to record broadcast: {e}"))
+                        })?;
+                }
+                broadcast_record = Some(broadcast_key);
+            }
 
             if let (Some(store), Some(key), Some(fill)) =
                 (&self.store, &hosted_record, hosted_fill.take())
@@ -571,8 +607,9 @@ where
                     // the store reserved this submission above: without a
                     // store, a concurrent submission of the same credential
                     // could recover the same receipt. An unrecovered broadcast
-                    // releases the reservation below; a retry after the
-                    // transaction lands is rejected by the check above.
+                    // releases the reservation below but keeps its broadcast
+                    // record, so a retry after the transaction lands recovers
+                    // it here instead of being rejected as already included.
                     let recovered = match &submission_key {
                         Some(_) => {
                             self.recover_broadcast_receipt(keccak256(&final_tx_bytes))
@@ -642,9 +679,11 @@ where
             if let (Some(store), Some(key)) = (&self.store, &submission_key) {
                 let _ = store.delete(key).await;
             }
-        } else if let (Some(store), Some(key)) = (&self.store, &hosted_record) {
+        } else if let Some(store) = &self.store {
             // Settled: the transaction hash claim now guards it.
-            let _ = store.delete(key).await;
+            for key in [&hosted_record, &broadcast_record].into_iter().flatten() {
+                let _ = store.delete(key).await;
+            }
         }
         result
     }
