@@ -253,8 +253,11 @@ struct LostRange {
 struct LostRanges {
     ranges: HashMap<B256, Vec<LostRange>>,
     /// Ranges of vouchers that a server refused as already accepted or
-    /// stale, or with a problem the client could not read, until the
-    /// payment's rollback, which then does not record them as lost.
+    /// stale, or with a problem the client could not read. Each stays until
+    /// its own payment ends: its rollback takes it and then does not record
+    /// the range as lost, and its commit, invalidation or abandonment drops
+    /// it. Allocated ranges in flight are disjoint, so each marker belongs to
+    /// one pending payment, and none is ever dropped to make room.
     refused: HashSet<(B256, u128, u128)>,
 }
 
@@ -313,7 +316,8 @@ pub struct SessionSpend {
 
 /// Server charges from receipts: each request costs the change in its
 /// channel's `spent`, or its quoted price the first time a channel is seen
-/// with no `spent` to start from. A restored channel starts from its session
+/// with no `spent` to start from, or when it paid with an allocated voucher
+/// on a server that accepts vouchers out of order. A restored channel starts from its session
 /// snapshot's `spent`, else from the one its store recorded.
 #[derive(Debug, Default)]
 struct SpendLedger {
@@ -323,6 +327,20 @@ struct SpendLedger {
 }
 
 impl SpendLedger {
+    /// Records a request whose cost is known from its own payment, such as
+    /// one paid with an allocated voucher on a server that accepts vouchers
+    /// out of order: concurrent receipts arrive in any order, so the change
+    /// between two of them is not one request's cost. The channel's `spent`
+    /// only rises.
+    fn record_charge(&mut self, channel_id: &str, spent: u128, cost: u128) -> u128 {
+        let previous = self.channels.get(channel_id).copied().unwrap_or_default();
+        self.channels
+            .insert(channel_id.to_owned(), previous.max(spent));
+        self.spent += cost;
+        self.last = Some(cost);
+        cost
+    }
+
     fn record(&mut self, channel_id: &str, spent: u128, quoted: Option<u128>) -> u128 {
         let cost = match self.channels.get(channel_id) {
             Some(previous) => spent.saturating_sub(*previous),
@@ -776,10 +794,6 @@ impl TempoSessionProvider {
         self
     }
 
-    /// Reject a session challenge whose currency, recipient or per-unit amount
-    /// violates the client policy. Runs during challenge selection and before
-    /// any signing or top-up; closes skip it, since closing settles what the
-    /// channel already spent.
     /// Whether a per-request price a server charged, such as a prepaid
     /// route's latest receipt delta, stays within `max_amount` and
     /// `max_atomic_amount`. A reused Challenge keeps its quoted amount, so
@@ -790,6 +804,12 @@ impl TempoSessionProvider {
             && self.max_amount.is_none_or(|max| price <= max)
     }
 
+    /// Reject a session challenge whose currency, recipient or per-unit amount
+    /// violates the client policy. With a reorder window, its
+    /// `minVoucherDelta`, the least each voucher signs, is capped like the
+    /// amount. Runs during challenge selection and before any signing or
+    /// top-up; closes skip it, since closing settles what the channel already
+    /// spent.
     fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
         if self.currencies.is_none()
             && self.expected_recipients.is_none()
@@ -845,6 +865,18 @@ impl TempoSessionProvider {
             return Err(reject(
                 "Tempo session amount exceeds max_amount".to_string(),
             ));
+        }
+        // A server that accepts vouchers out of order gets ranges of at
+        // least its `minVoucherDelta`, so each voucher signs that much for
+        // one request: it stays within the same caps as the amount.
+        if reorder_window(&request).is_some() {
+            let delta = min_voucher_delta(&request);
+            if !self.price_within_caps(delta) {
+                return Err(reject(
+                    "Tempo session minVoucherDelta exceeds max_amount or max_atomic_amount"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1366,6 +1398,28 @@ impl TempoSessionProvider {
         {
             entry.cumulative_amount = entry.cumulative_amount.max(stored.cumulative_amount);
             entry.deposit = entry.deposit.max(stored.deposit);
+        }
+        Ok(())
+    }
+
+    /// Raises `entry`'s counter to the one vouchers are allocated from: the
+    /// channel store's and this process's, which concurrent allocations
+    /// raise without the payment lease.
+    async fn merge_allocation_counter(
+        &self,
+        key: &str,
+        entry: &mut ChannelEntry,
+    ) -> Result<(), MppError> {
+        self.merge_stored_channel(key, entry).await?;
+        if let Some(current) = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(key)
+            .filter(|current| current.channel_id == entry.channel_id)
+        {
+            entry.cumulative_amount = entry.cumulative_amount.max(current.cumulative_amount);
+            entry.deposit = entry.deposit.max(current.deposit);
         }
         Ok(())
     }
@@ -2368,18 +2422,33 @@ impl TempoSessionProvider {
         channel_id: String,
         spent: u128,
         quoted: Option<u128>,
+        charged: Option<u128>,
     ) {
         if self.prepaid_requests == 0 {
             return;
         }
         let url = context.url.to_string();
         let mut prepaid = self.prepaid.lock().unwrap();
-        let price = prepaid
+        let same_channel = prepaid
             .get(&url)
-            .filter(|previous| previous.channel_id == channel_id && spent > previous.spent)
-            .map(|previous| spent - previous.spent)
-            .or(quoted)
-            .filter(|price| *price > 0);
+            .filter(|previous| previous.channel_id == channel_id);
+        // A request whose own cost is known (`charged`, see record_receipt)
+        // prices the route at it, and the route's `spent` only rises, since
+        // concurrent receipts arrive in any order.
+        let (spent, price) = match charged {
+            Some(charged) => (
+                same_channel.map_or(spent, |previous| previous.spent.max(spent)),
+                Some(charged),
+            ),
+            None => (
+                spent,
+                same_channel
+                    .filter(|previous| spent > previous.spent)
+                    .map(|previous| spent - previous.spent)
+                    .or(quoted),
+            ),
+        };
+        let price = price.filter(|price| *price > 0);
         let Some(price) = price else {
             return;
         };
@@ -2658,6 +2727,12 @@ impl TempoSessionProvider {
                 {
                     return Ok(credential);
                 }
+                // A voucher without `after` would claim the whole gap above
+                // the server's highest voucher, so vouchers allocated from
+                // this channel and still in flight would be refused as seen.
+                return Err(MppError::InvalidConfig(
+                    "voucher cumulative amount exceeds channel deposit".into(),
+                ));
             }
         }
 
@@ -4299,6 +4374,14 @@ impl TempoSessionProvider {
         ranges.push(LostRange { from, to, expires });
     }
 
+    /// Drops the refusal marker of `credential`'s voucher range, when its
+    /// payment ends other than by a rollback, which takes the marker itself.
+    fn forget_refusal(&self, credential: &PaymentCredential) {
+        if let Some(range) = voucher_after_range(credential) {
+            self.lost_ranges.lock().unwrap().refused.remove(&range);
+        }
+    }
+
     /// Raises the channel's voucher counter to `signed`, the cumulative
     /// amount of a voucher this channel's signer signed that the server
     /// reports it accepted, capped at the channel's deposit: vouchers signed
@@ -4637,18 +4720,21 @@ impl TempoSessionProvider {
                     }
                 }
                 // On a server that accepts vouchers out of order, payments
-                // allocate from the channel store's counter without this
-                // lease. This voucher then takes its range from the same
-                // atomic allocation, after any top-up, sized from the
-                // store's counter, so it cannot overlap theirs.
+                // allocate from the channel's counter (the channel store's
+                // for native channels, process memory for legacy ones)
+                // without this lease. This voucher then takes its range from
+                // the same allocation, after any top-up, sized from that
+                // counter, and sends its start as `after`: a voucher without
+                // it would claim the whole gap above the server's highest
+                // voucher and get vouchers still in flight refused as seen.
                 let allocates = !includes_request
                     && !pending
-                    && precompile
-                    && entry.descriptor.is_some()
                     && reorder_window(&session_req).is_some()
-                    && self.channel_store.allocates_atomically();
+                    && (!precompile
+                        || (entry.descriptor.is_some()
+                            && self.channel_store.allocates_atomically()));
                 if allocates {
-                    self.merge_stored_channel(&key, &mut entry).await?;
+                    self.merge_allocation_counter(&key, &mut entry).await?;
                 }
                 // An allocated voucher's range covers the server's minimum
                 // voucher delta, as the allocation sizes it.
@@ -4754,7 +4840,7 @@ impl TempoSessionProvider {
                         ));
                     }
                     // Size this voucher from the counter the others raised.
-                    self.merge_stored_channel(&key, &mut entry).await?;
+                    self.merge_allocation_counter(&key, &mut entry).await?;
                     entry.cumulative_amount =
                         entry.cumulative_amount.checked_add(amount).ok_or_else(|| {
                             MppError::InvalidConfig("session cumulative amount overflowed".into())
@@ -5073,9 +5159,7 @@ impl PaymentProvider for TempoSessionProvider {
                 self.save_server_spent(&id).await;
             }
         }
-        if let Some(range) = voucher_after_range(credential) {
-            self.lost_ranges.lock().unwrap().refused.remove(&range);
-        }
+        self.forget_refusal(credential);
         self.commit_credential(credential);
         drop(lease);
         Ok(())
@@ -5107,16 +5191,18 @@ impl PaymentProvider for TempoSessionProvider {
             .lock()
             .unwrap()
             .remove(&challenge.id);
+        self.forget_refusal(credential);
         let result = self.invalidate_credential(challenge, credential).await;
         drop(lease);
         result
     }
 
-    fn abandon_payment(&self, challenge: &PaymentChallenge, _credential: &PaymentCredential) {
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         self.pending_payment_leases
             .lock()
             .unwrap()
             .remove(&challenge.id);
+        self.forget_refusal(credential);
     }
 
     async fn prepaid_credential(
@@ -5263,14 +5349,32 @@ impl PaymentProvider for TempoSessionProvider {
         if entry.channel_id.to_string() != channel_id || spent > entry.cumulative_amount {
             return None;
         }
+        // On a server that accepts vouchers out of order, payments on this
+        // channel allocate vouchers concurrently and their receipts arrive in
+        // any order, so a request costs the amount it paid for, never the
+        // change between two concurrent `spent` totals.
+        let charged = quoted.filter(|_| {
+            challenge
+                .request
+                .decode::<SessionRequest>()
+                .is_ok_and(|request| reorder_window(&request).is_some())
+                && is_precompile_escrow(entry.escrow_contract)
+                && entry.descriptor.is_some()
+                && self.channel_store.allocates_atomically()
+        });
         let mut ledger = self.spend.lock().unwrap();
         let previous = ledger
             .channels
             .get(&channel_id)
             .copied()
             .unwrap_or_default();
-        let delta = spent.checked_sub(previous)?;
-        let cost = ledger.record(&channel_id, spent, quoted);
+        let (delta, cost) = match charged {
+            Some(charged) => (charged, ledger.record_charge(&channel_id, spent, charged)),
+            None => (
+                spent.checked_sub(previous)?,
+                ledger.record(&channel_id, spent, quoted),
+            ),
+        };
         drop(ledger);
         // A prepaid request commits nothing afterwards, so its save runs in the background.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -5291,7 +5395,7 @@ impl PaymentProvider for TempoSessionProvider {
             }
         }
         if self.price_within_caps(delta) {
-            self.prepay(context, challenge, channel_id, spent, quoted);
+            self.prepay(context, challenge, channel_id, spent, quoted, charged);
         } else {
             self.prepaid.lock().unwrap().remove(context.url.as_str());
         }
@@ -5332,11 +5436,7 @@ impl PaymentProvider for TempoSessionProvider {
                 .and_then(|value| value.as_str())
                 .is_none_or(|kind| kind.ends_with("delta-too-small"));
         if window_refusal {
-            let mut lost = self.lost_ranges.lock().unwrap();
-            if lost.refused.len() >= MAX_LOST_RANGES {
-                lost.refused.clear();
-            }
-            lost.refused.insert(range);
+            self.lost_ranges.lock().unwrap().refused.insert(range);
         }
     }
 
@@ -7773,9 +7873,110 @@ mod tests {
         assert_eq!(provider.cumulative(), 10_000, "the counter is not lowered");
     }
 
+    /// Every refusal marker lasts until its own payment commits, rolls back
+    /// or is abandoned, however many refusals overlap: none is dropped to
+    /// make room, so no range refused as already accepted or stale becomes
+    /// reusable as lost.
+    #[tokio::test]
+    async fn many_overlapping_refusals_are_never_reused() {
+        const PAYMENTS: u128 = 100;
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        seed_precompile_channel(&provider, payee, currency, 0, PAYMENTS * 1_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        let challenge = reorder_challenge("pay", payee, currency, Some(30));
+
+        let mut credentials = Vec::new();
+        for _ in 0..PAYMENTS {
+            credentials.push(provider.pay(&challenge).await.unwrap());
+        }
+        // All are refused as stale before any of them is rolled back.
+        let stale = serde_json::json!({
+            "type": "https://paymentauth.org/problems/session/delta-too-small"
+        });
+        for credential in &credentials {
+            provider.observe_refusal(&challenge, credential, &stale);
+        }
+        assert_eq!(
+            provider.lost_ranges.lock().unwrap().refused.len(),
+            PAYMENTS as usize
+        );
+        for credential in &credentials {
+            provider
+                .rollback_payment(&challenge, credential)
+                .await
+                .unwrap();
+        }
+        {
+            let lost = provider.lost_ranges.lock().unwrap();
+            assert!(lost.ranges.values().all(Vec::is_empty), "nothing is lost");
+            assert!(lost.refused.is_empty(), "each rollback took its marker");
+        }
+        // The counter is exhausted and no range is reusable.
+        assert!(provider.pay(&challenge).await.is_err());
+
+        // A marker whose payment is abandoned instead goes with it.
+        provider.observe_refusal(&challenge, &credentials[0], &stale);
+        provider.abandon_payment(&challenge, &credentials[0]);
+        assert!(provider.lost_ranges.lock().unwrap().refused.is_empty());
+    }
+
+    /// Concurrent payments on a server that accepts vouchers out of order
+    /// get their receipts in any order: each request costs the amount it
+    /// paid for, never the change between two concurrent `spent` totals,
+    /// and the channel's `spent` only rises.
+    #[tokio::test]
+    async fn reorder_window_receipts_out_of_order_cost_each_request_once() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 0, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        let challenge = reorder_challenge("pay", payee, currency, Some(30));
+        for _ in 0..3 {
+            provider.pay(&challenge).await.unwrap();
+        }
+        let context = PaymentContext {
+            url: "https://test-realm/data".parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        let receipt = |spent: u128| {
+            let mut receipt = Receipt::success("tempo", channel_id.to_string());
+            receipt
+                .extensions
+                .insert("spent".into(), serde_json::json!(spent.to_string()));
+            receipt
+        };
+
+        // The first and third requests' receipts arrive before the second's.
+        for spent in [1_000, 3_000, 2_000] {
+            assert_eq!(
+                provider.record_receipt(&context, &challenge, &receipt(spent)),
+                Some(1_000)
+            );
+        }
+        let spend = provider.spend();
+        assert_eq!(spend.spent, 3_000);
+        assert_eq!(spend.last, Some(1_000));
+        assert_eq!(
+            provider
+                .spend
+                .lock()
+                .unwrap()
+                .channels
+                .get(&channel_id.to_string())
+                .copied(),
+            Some(3_000),
+            "the channel's spent never moves back"
+        );
+    }
+
     /// A `payment-need-voucher` voucher from an exhausted counter reuses a
-    /// lost range only when it reaches the required amount; otherwise the
-    /// serialized path signs at least the required amount.
+    /// lost range only when it reaches the required amount; otherwise it is
+    /// refused rather than signed without `after`, which would claim the
+    /// ranges still in flight.
     #[tokio::test]
     async fn need_voucher_reuses_a_lost_range_only_up_to_the_required_amount() {
         let provider = make_test_provider();
@@ -7793,14 +7994,11 @@ mod tests {
         assert_eq!(provider.cumulative(), 10_000);
         provider.rollback_payment(&challenge, &lost).await.unwrap();
 
-        // (5000, 6000] cannot reach 9600: the serialized path signs it.
-        let credential = provider
+        // (5000, 6000] cannot reach 9600, and the counter cannot rise.
+        assert!(provider
             .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 9_600)
             .await
-            .unwrap();
-        let (after, cumulative) = voucher_range(&credential);
-        assert_eq!(after, None);
-        assert!(cumulative >= 9_600, "{cumulative}");
+            .is_err());
 
         // 5800 fits within it.
         let credential = provider
@@ -7808,6 +8006,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(voucher_range(&credential), (Some(5_000), 5_800));
+    }
+
+    /// On a server that accepts vouchers out of order, a voucher the
+    /// serialized path signs (here for a payment that waited on the payment
+    /// lock, on a legacy channel, which allocates in process memory) takes
+    /// its own range from the counter and sends its start as `after`, so it
+    /// claims no range a concurrent voucher still in flight covers and the
+    /// server accepts both.
+    #[tokio::test]
+    async fn reorder_window_serialized_voucher_sends_after_beside_concurrent_ones() {
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let escrow = Address::repeat_byte(0x33);
+        let provider = make_test_provider().with_allow_custom_escrow(true);
+        let key = TempoSessionProvider::channel_key(&payee, &currency, &escrow, 42431);
+        let channel_id = B256::repeat_byte(0x44);
+        provider.channels.lock().unwrap().insert(
+            key.clone(),
+            ChannelEntry {
+                channel_id,
+                salt: B256::repeat_byte(0x45),
+                cumulative_amount: 1_000,
+                deposit: 10_000,
+                descriptor: None,
+                settlement_route: None,
+                escrow_contract: escrow,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
+        provider
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), key);
+        let challenge = PaymentChallenge::new(
+            "pay",
+            "test-realm",
+            "tempo",
+            "session",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": format!("{currency:#x}"),
+                "recipient": format!("{payee:#x}"),
+                "methodDetails": {
+                    "escrowContract": format!("{escrow:#x}"),
+                    "chainId": 42431,
+                    "reorderWindow": 30
+                }
+            }))
+            .unwrap(),
+        );
+
+        // A concurrent voucher is in flight when a payment takes the
+        // serialized path.
+        let in_flight = provider.pay(&challenge).await.unwrap();
+        let serialized = provider
+            .payment_credential_inner(&challenge, None)
+            .await
+            .unwrap();
+        assert_eq!(voucher_range(&in_flight), (Some(1_000), 2_000));
+        assert_eq!(voucher_range(&serialized), (Some(2_000), 3_000));
+
+        // The server accepts each increment `(after, cumulativeAmount]` once,
+        // in any order: the serialized voucher first, then the one in flight.
+        let mut accepted: Vec<(u128, u128)> = Vec::new();
+        for credential in [&serialized, &in_flight] {
+            let (after, cumulative) = voucher_range(credential);
+            let from = after.expect("every voucher sends after");
+            assert!(
+                accepted
+                    .iter()
+                    .all(|(start, end)| cumulative <= *start || *end <= from),
+                "({from}, {cumulative}] was already accepted"
+            );
+            accepted.push((from, cumulative));
+        }
+        assert_eq!(provider.cumulative(), 3_000);
     }
 
     /// A prepaid voucher for a server with a reorder window keeps
@@ -8275,6 +8550,72 @@ mod tests {
         };
         let (_, credential) = provider.prepaid_credential(context).await.unwrap();
         assert_eq!(voucher_range(&credential), (Some(3_500), 6_000));
+    }
+
+    /// A `minVoucherDelta` above `max_amount` would make every reorder-window
+    /// voucher sign more than the cap for one request, so the challenge is
+    /// refused before anything is allocated, signed or topped up.
+    #[tokio::test]
+    async fn reorder_window_min_voucher_delta_respects_max_amount() {
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let provider = make_test_provider()
+            .with_prepaid_requests(1)
+            .with_currencies([format!("{:#x}", currency)])
+            .with_max_amount("0.01", 6)
+            .unwrap();
+        let url = "https://test-realm/data";
+        provider.bind_origin(url).unwrap();
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 1_000_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        let with_min_delta = |id: &str, window: Option<u64>, delta: &str| {
+            let mut challenge = reorder_challenge(id, payee, currency, window);
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["methodDetails"]["minVoucherDelta"] = delta.into();
+            challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+            challenge
+        };
+
+        // The quoted 1000 is within max_amount (10000), the delta is not.
+        let inflated = with_min_delta("pay", Some(30), "500000");
+        let err = provider.pay(&inflated).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("minVoucherDelta exceeds max_amount"),
+            "{err}"
+        );
+        assert!(provider.check_policy(&inflated).is_err());
+
+        // A prepaid voucher on the same challenge is refused too.
+        provider.prepaid.lock().unwrap().insert(
+            url.to_owned(),
+            PrepaidVoucher {
+                challenge: with_min_delta("prepaid", Some(30), "500000"),
+                channel_id: channel_id.to_string(),
+                spent: 1_000,
+                price: 1_000,
+            },
+        );
+        let context = PaymentContext {
+            url: url.parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        assert!(provider.prepaid_credential(context).await.is_none());
+        assert_eq!(provider.cumulative(), 1_000, "nothing was allocated");
+
+        // Without a reorder window the client never raises a voucher to the
+        // delta, so the delta is not capped.
+        assert!(provider
+            .check_policy(&with_min_delta("serialized", None, "500000"))
+            .is_ok());
+
+        // A delta within max_amount still sizes the range.
+        let credential = provider
+            .pay(&with_min_delta("within", Some(30), "2500"))
+            .await
+            .unwrap();
+        assert_eq!(voucher_range(&credential), (Some(1_000), 3_500));
     }
 
     /// A prepaid voucher for a server with a reorder window, cached by a
@@ -12206,6 +12547,7 @@ mod tests {
             channel_id.to_string(),
             3_000,
             Some(1_000),
+            None,
         );
         let price = || {
             provider
@@ -12224,6 +12566,7 @@ mod tests {
             channel_id.to_string(),
             5_000,
             Some(1_000),
+            None,
         );
         assert_eq!(price(), Some(2_000));
         assert!(provider.prepaid_credential(context()).await.is_none());
@@ -12234,6 +12577,7 @@ mod tests {
             channel_id.to_string(),
             6_000,
             Some(1_000),
+            None,
         );
         assert_eq!(price(), Some(1_000));
     }
