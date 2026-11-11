@@ -835,45 +835,50 @@ async fn wait_for_settlement_from(
         ))
     };
     let search = async {
-        let block_number = || async {
-            provider
-                .get_block_number()
-                .await
-                .map_err(|e| MppError::Http(format!("failed to fetch the Tempo block number: {e}")))
-        };
-        let mut latest = block_number().await?;
-        // Scan the lookback window once, then only blocks added since the previous
-        // poll. A resumed wait searches again from where the first one started,
-        // which also covers blocks a lagging log index missed.
-        let mut from_block = *cursor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_or_insert_with(|| latest.saturating_sub(LOOKBACK_BLOCKS));
+        // A failed Tempo RPC call is retried at the next poll rather than ending
+        // the wait: the withdrawal is already sent, so giving up early would
+        // report a settlement as pending that the next poll could find.
+        let mut latest: Option<u64> = None;
+        let mut from_block: Option<u64> = None;
         loop {
-            if from_block <= latest {
-                let mut filter = Filter::new()
-                    .address(portal)
-                    .event_signature(IZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
-                    .topic2(sender_tag)
-                    .from_block(from_block)
-                    .to_block(latest);
-                if let Some(to) = to {
-                    filter = filter.topic1(to.into_word());
+            if let Ok(block) = provider.get_block_number().await {
+                latest = Some(latest.map_or(block, |latest| latest.max(block)));
+            }
+            if let Some(latest) = latest {
+                // Scan the lookback window once, then only blocks added since the
+                // previous poll. A resumed wait searches again from where the first
+                // one started, which also covers blocks a lagging log index missed.
+                let from = *from_block.get_or_insert_with(|| {
+                    *cursor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get_or_insert_with(|| latest.saturating_sub(LOOKBACK_BLOCKS))
+                });
+                if from <= latest {
+                    let mut filter = Filter::new()
+                        .address(portal)
+                        .event_signature(IZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
+                        .topic2(sender_tag)
+                        .from_block(from)
+                        .to_block(latest);
+                    if let Some(to) = to {
+                        filter = filter.topic1(to.into_word());
+                    }
+                    if let Ok(logs) = provider.get_logs(&filter).await {
+                        if let Some((log, hash)) = logs
+                            .iter()
+                            .find_map(|log| Some((log, log.transaction_hash?)))
+                        {
+                            // Only an event that reports a bounce counts as one: the
+                            // server verifies the Credential's settlement either way.
+                            let bounced =
+                                IZonePortal::WithdrawalProcessed::decode_log_data(log.data())
+                                    .is_ok_and(|event| !event.callbackSuccess);
+                            return Ok(Settlement { hash, bounced });
+                        }
+                        from_block = Some(latest + 1);
+                    }
                 }
-                let logs = provider.get_logs(&filter).await.map_err(|e| {
-                    MppError::Http(format!("failed to fetch Zone settlements: {e}"))
-                })?;
-                if let Some((log, hash)) = logs
-                    .iter()
-                    .find_map(|log| Some((log, log.transaction_hash?)))
-                {
-                    // Only an event that reports a bounce counts as one: the
-                    // server verifies the Credential's settlement either way.
-                    let bounced = IZonePortal::WithdrawalProcessed::decode_log_data(log.data())
-                        .is_ok_and(|event| !event.callbackSuccess);
-                    return Ok(Settlement { hash, bounced });
-                }
-                from_block = latest + 1;
             }
             if deadline
                 .is_some_and(|deadline| tokio::time::Instant::now() + POLLING_INTERVAL > deadline)
@@ -881,7 +886,6 @@ async fn wait_for_settlement_from(
                 return Err(timed_out());
             }
             tokio::time::sleep(POLLING_INTERVAL).await;
-            latest = block_number().await?;
         }
     };
     match tokio::time::Instant::now().checked_add(limit) {

@@ -1282,3 +1282,44 @@ async fn test_settlement_wait_bounds_a_stalled_rpc() {
     assert!(result.is_err());
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[tokio::test]
+async fn test_settlement_wait_retries_a_failed_tempo_rpc_call() {
+    // The first block-number and log lookups fail; the wait keeps polling and
+    // finds the settlement instead of giving up at once.
+    let sender_tag = B256::repeat_byte(0x01);
+    let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (tempo_url, _) = {
+        let calls = calls.clone();
+        spawn_rpc(Arc::new(move |method, _params| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            match method {
+                "eth_blockNumber" if n == 0 => Err((-32000, "temporarily unavailable".into())),
+                "eth_blockNumber" => Ok(json!("0x2710")),
+                "eth_getLogs" if n < 3 => Err((-32000, "temporarily unavailable".into())),
+                "eth_getLogs" => Ok(json!([settlement_log(
+                    sender_tag,
+                    true,
+                    B256::repeat_byte(0x55)
+                )])),
+                _ => Err((-32000, format!("l1: {method}"))),
+            }
+        }))
+        .await
+    };
+    let provider = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+        .connect_http(tempo_url.parse().unwrap());
+    let settlement = wait_for_settlement_from(
+        &provider,
+        zone::portal_address(3),
+        sender_tag,
+        None,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        &Mutex::new(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(settlement.hash, B256::repeat_byte(0x55));
+    assert!(!settlement.bounced);
+}
