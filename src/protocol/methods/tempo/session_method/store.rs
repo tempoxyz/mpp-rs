@@ -59,7 +59,88 @@ pub struct ChannelState {
     #[serde(default)]
     pub close_requested_at: u64,
     pub created_at: String,
+    /// Vouchers accepted within the reorder window, when the session method
+    /// accepts vouchers out of order (see
+    /// [`SessionMethod::with_reorder_window`](super::SessionMethod::with_reorder_window)).
+    /// `None` until the first such voucher, which reads as a window whose
+    /// floor is `highest_voucher_amount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<VoucherWindow>,
 }
+
+/// The vouchers a channel accepted within its reorder window: its replay
+/// protection when vouchers may arrive out of order.
+///
+/// Every voucher at or below `floor` is refused as stale. Above it, a
+/// voucher is accepted once: its increment `(after, cumulativeAmount]` must
+/// not overlap an accepted run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VoucherWindow {
+    /// Cumulative amount at or below which every voucher is refused.
+    pub floor: u128,
+    /// Accepted intervals, sorted and disjoint. Intervals that touch are merged.
+    pub runs: Vec<VoucherRun>,
+}
+
+/// An interval of accepted voucher increments, `(from, to]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VoucherRun {
+    /// Exclusive lower bound.
+    pub from: u128,
+    /// Inclusive upper bound.
+    pub to: u128,
+    /// When the latest voucher in the run was accepted, in Unix milliseconds.
+    pub at: u64,
+}
+
+impl VoucherWindow {
+    /// Moves runs accepted at or before `cutoff` (Unix milliseconds) below
+    /// the floor, and drops runs the floor covers.
+    pub(super) fn prune(&mut self, cutoff: u64) {
+        let floor = self
+            .runs
+            .iter()
+            .filter(|run| run.at <= cutoff)
+            .map(|run| run.to)
+            .fold(self.floor, u128::max);
+        self.floor = floor;
+        self.runs.retain(|run| run.at > cutoff && run.to > floor);
+    }
+
+    /// Whether `(from, to]` overlaps an accepted run.
+    pub(super) fn overlaps(&self, from: u128, to: u128) -> bool {
+        self.runs.iter().any(|run| from < run.to && run.from < to)
+    }
+
+    /// Records `(from, to]`, which overlaps no run, accepted at `at`, and
+    /// merges it with the runs it touches. Past [`MAX_VOUCHER_RUNS`] runs,
+    /// the lowest ones move below the floor: that refuses more vouchers as
+    /// stale, never accepts a replay.
+    pub(super) fn insert(&mut self, from: u128, to: u128, at: u64) {
+        let index = self.runs.partition_point(|run| run.to <= from);
+        self.runs.insert(index, VoucherRun { from, to, at });
+        let mut merged: Vec<VoucherRun> = Vec::with_capacity(self.runs.len());
+        for run in self.runs.drain(..) {
+            match merged.last_mut() {
+                Some(last) if last.to == run.from => {
+                    last.to = run.to;
+                    last.at = last.at.max(run.at);
+                }
+                _ => merged.push(run),
+            }
+        }
+        self.runs = merged;
+        let excess = self.runs.len().saturating_sub(MAX_VOUCHER_RUNS);
+        if excess > 0 {
+            self.floor = self.floor.max(self.runs[excess - 1].to);
+            self.runs.drain(..excess);
+        }
+    }
+}
+
+/// Most disjoint runs a [`VoucherWindow`] keeps, which bounds the stored
+/// channel state. Runs are holes left by vouchers in flight or lost.
+pub const MAX_VOUCHER_RUNS: usize = 256;
 
 /// Trait for channel state persistence.
 ///

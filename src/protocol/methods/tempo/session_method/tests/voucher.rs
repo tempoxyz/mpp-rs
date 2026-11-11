@@ -26,7 +26,8 @@ async fn test_stale_voucher_with_garbage_signature_rejected() {
         .verify_and_accept_voucher(
             &channel_id,
             None,
-            0,            // cumulative_amount <= highest_voucher_amount
+            0,
+            None,         // cumulative_amount <= highest_voucher_amount
             &garbage_sig, // garbage signature
             0,            // min_delta
         )
@@ -70,7 +71,8 @@ async fn test_stale_voucher_same_amount_different_signature_rejected() {
         .verify_and_accept_voucher(
             &channel_id_hex,
             None,
-            1000,        // same amount as highest
+            1000,
+            None,        // same amount as highest
             &forged_sig, // different signature
             0,
         )
@@ -109,7 +111,7 @@ async fn test_exact_replay_of_highest_voucher_rejected() {
 
     // Exact replay: same amount and same signature does not add new funds.
     let result = method
-        .verify_and_accept_voucher(&channel_id_hex, None, 1000, &sig_hex, 0)
+        .verify_and_accept_voucher(&channel_id_hex, None, 1000, None, &sig_hex, 0)
         .await;
 
     assert!(result.is_err());
@@ -132,7 +134,7 @@ async fn test_unsigned_voucher_does_not_disclose_accepted_amount() {
     let method = test_session_method(store);
     let garbage_sig = format!("0x{}", "ff".repeat(65));
     let err = method
-        .verify_and_accept_voucher(&channel_id, None, 123_457, &garbage_sig, 1_000)
+        .verify_and_accept_voucher(&channel_id, None, 123_457, None, &garbage_sig, 1_000)
         .await
         .unwrap_err();
 
@@ -165,7 +167,7 @@ async fn test_concurrent_voucher_acceptance_has_one_winner() {
     store.insert(&channel_id, state.clone());
 
     let method = test_session_method(store.clone());
-    let verify = || method.verify_and_accept_voucher(&channel_id, None, 2_000, &signature, 0);
+    let verify = || method.verify_and_accept_voucher(&channel_id, None, 2_000, None, &signature, 0);
     let (first, second) = tokio::join!(verify(), verify());
 
     assert_eq!(
@@ -211,9 +213,10 @@ async fn test_concurrent_vouchers_recheck_minimum_delta_atomically() {
     store.insert(&channel_id, state.clone());
 
     let method = test_session_method(store.clone());
-    let lower = method.verify_and_accept_voucher(&channel_id, None, 2_000, &lower_signature, 1_000);
+    let lower =
+        method.verify_and_accept_voucher(&channel_id, None, 2_000, None, &lower_signature, 1_000);
     let higher =
-        method.verify_and_accept_voucher(&channel_id, None, 2_500, &higher_signature, 1_000);
+        method.verify_and_accept_voucher(&channel_id, None, 2_500, None, &higher_signature, 1_000);
     let (lower, higher) = tokio::join!(lower, higher);
 
     assert!(lower.is_ok());
@@ -256,7 +259,7 @@ async fn test_accept_voucher_preserves_concurrent_deposit_update() {
 
     let method = test_session_method(store.clone());
     method
-        .verify_and_accept_voucher(&channel_id_hex, None, 2_000, &sig_hex, 0)
+        .verify_and_accept_voucher(&channel_id_hex, None, 2_000, None, &sig_hex, 0)
         .await
         .unwrap();
 
@@ -294,7 +297,8 @@ async fn test_stale_voucher_with_forged_keychain_envelope_rejected() {
         .verify_and_accept_voucher(
             &channel_id,
             None,
-            500, // stale: below highest_voucher_amount of 1000
+            500,
+            None, // stale: below highest_voucher_amount of 1000
             &forged_sig,
             0,
         )
@@ -339,7 +343,7 @@ async fn test_voucher_signature_must_be_canonical() {
         let (method, channel_id) = (&method, &channel_id);
         async move {
             method
-                .verify_and_accept_voucher(channel_id, None, 2_000, &signature, 0)
+                .verify_and_accept_voucher(channel_id, None, 2_000, None, &signature, 0)
                 .await
         }
     };
@@ -390,6 +394,7 @@ async fn test_voucher_rejects_channel_with_wrong_payee() {
             settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
+            after: None,
         },
     );
 
@@ -430,6 +435,7 @@ async fn test_voucher_rejects_channel_with_wrong_token() {
             settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
+            after: None,
         },
     );
 
@@ -536,6 +542,7 @@ async fn test_voucher_accepts_mixed_case_channel_id() {
             settlement_route: None,
             cumulative_amount: "2000".to_string(),
             signature: alloy::hex::encode_prefixed(signature),
+            after: None,
         },
     );
 
@@ -596,6 +603,7 @@ async fn test_voucher_returns_session_receipt() {
             settlement_route: None,
             cumulative_amount: "2000".to_string(),
             signature: alloy::hex::encode_prefixed(signature),
+            after: None,
         },
     );
 
@@ -656,6 +664,7 @@ async fn test_voucher_rejects_signed_amount() {
             settlement_route: None,
             cumulative_amount: "+2000".to_string(),
             signature: alloy::hex::encode_prefixed(signature),
+            after: None,
         },
     );
 
@@ -702,6 +711,7 @@ async fn voucher_credential(
             settlement_route: None,
             cumulative_amount: amount.to_string(),
             signature: alloy::hex::encode_prefixed(signature),
+            after: None,
         },
     )
 }

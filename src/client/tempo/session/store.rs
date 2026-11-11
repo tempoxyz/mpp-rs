@@ -162,6 +162,45 @@ pub trait ChannelStore: Send + Sync {
     }
     /// Remove the channel cached for `key`.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()>;
+    /// Atomically raise the cumulative amount of channel `channel_id`, cached
+    /// for `key`, to `amount` above the higher of it and `floor`, and return
+    /// the raised amount. `None` when the store keeps no open entry for that
+    /// channel under `key`, or the raised amount would exceed `cap`.
+    ///
+    /// Callers sharing the store, in this process or others, get disjoint
+    /// ranges `(raised - amount, raised]`: session providers sign one voucher
+    /// from each, with `after` set to the range's start, for servers that
+    /// accept vouchers out of order (`reorderWindow`). The default holds
+    /// [`acquire`](Self::acquire)'s lease around a read and a write; stores
+    /// shared by several processes should override it with one atomic update.
+    async fn allocate(
+        &self,
+        key: &str,
+        channel_id: B256,
+        floor: u128,
+        amount: u128,
+        cap: u128,
+    ) -> ChannelStoreResult<Option<u128>> {
+        let _lease = self.acquire(key).await?;
+        let Some(mut entry) = self
+            .get(key)
+            .await?
+            .filter(|entry| entry.channel_id == channel_id && entry.opened)
+        else {
+            return Ok(None);
+        };
+        let Some(raised) = entry
+            .cumulative_amount
+            .max(floor)
+            .checked_add(amount)
+            .filter(|raised| *raised <= cap)
+        else {
+            return Ok(None);
+        };
+        entry.cumulative_amount = raised;
+        self.set_at(key, &entry).await?;
+        Ok(Some(raised))
+    }
     /// The `spent` a server receipt last reported for `channel_id`, the channel
     /// cached for `key`. `None` when the store keeps no such record, or when
     /// the channel's vouchers moved after it was recorded: a client that keeps
@@ -254,6 +293,32 @@ impl ChannelStore for MemoryChannelStore {
         self.entries.lock().unwrap().remove(key);
         self.server_spent.lock().unwrap().remove(key);
         Ok(())
+    }
+
+    async fn allocate(
+        &self,
+        key: &str,
+        channel_id: B256,
+        floor: u128,
+        amount: u128,
+        cap: u128,
+    ) -> ChannelStoreResult<Option<u128>> {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries
+            .get_mut(key)
+            .filter(|entry| entry.channel_id == channel_id && entry.opened)
+        else {
+            return Ok(None);
+        };
+        let raised = entry
+            .cumulative_amount
+            .max(floor)
+            .checked_add(amount)
+            .filter(|raised| *raised <= cap);
+        if let Some(raised) = raised {
+            entry.cumulative_amount = raised;
+        }
+        Ok(raised)
     }
 
     async fn server_spent(&self, key: &str, channel_id: B256) -> ChannelStoreResult<Option<u128>> {
@@ -543,6 +608,31 @@ impl ChannelStore for OriginBoundChannelStore {
         spent: u128,
     ) -> ChannelStoreResult<()> {
         self.inner.set_server_spent(key, channel_id, spent).await
+    }
+
+    /// Allocates from the provider's channel for `key` in its current
+    /// namespace only, where [`get`](Self::get) reads it.
+    async fn allocate(
+        &self,
+        key: &str,
+        channel_id: B256,
+        floor: u128,
+        amount: u128,
+        cap: u128,
+    ) -> ChannelStoreResult<Option<u128>> {
+        if self.check(channel_id).is_err() {
+            return Ok(None);
+        }
+        let namespace = self.namespace();
+        let at = self.location(key, namespace.as_deref());
+        match self.inner.get(&at).await? {
+            Some(stored) if stored.origin == namespace && stored.channel_id == channel_id => {
+                self.inner
+                    .allocate(&at, channel_id, floor, amount, cap)
+                    .await
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -873,7 +963,11 @@ mod sqlite {
         async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
             let scope_key = self.scoped_key(key);
             let mut connection = self.connection.lock().unwrap();
-            let transaction = connection.transaction().map_err(io_error)?;
+            // Take the write lock before reading what is merged, so a
+            // concurrent `allocate` in another process cannot land in between.
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(io_error)?;
             let current: Option<StoredChannelEntry> = transaction
                 .query_row(
                     "SELECT entry_json FROM channels WHERE scope_key = ?1",
@@ -1020,6 +1114,76 @@ mod sqlite {
                 )
                 .map_err(io_error)?;
             Ok(())
+        }
+
+        /// One `UPDATE ... RETURNING`, so processes sharing the database get
+        /// disjoint ranges without holding the payment lease. Amounts are
+        /// added as SQLite integers: an amount, cap or stored cumulative
+        /// amount beyond what fits returns `None`, which falls back to a
+        /// serialized payment.
+        async fn allocate(
+            &self,
+            key: &str,
+            channel_id: B256,
+            floor: u128,
+            amount: u128,
+            cap: u128,
+        ) -> ChannelStoreResult<Option<u128>> {
+            // Stored amounts and floors of up to 18 digits plus such an
+            // amount stay below i64::MAX.
+            const MAX_SQL_AMOUNT: u128 = 8_000_000_000_000_000_000;
+            const MAX_SQL_FLOOR: u128 = 999_999_999_999_999_999;
+            if amount > MAX_SQL_AMOUNT || floor > MAX_SQL_FLOOR {
+                return Ok(None);
+            }
+            let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+            let amount = i64::try_from(amount).map_err(io_error)?;
+            let floor = i64::try_from(floor).map_err(io_error)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(io_error)?
+                .as_secs();
+            let now = i64::try_from(now)
+                .map_err(|_| ChannelStoreError::Io("system time exceeds SQLite range".into()))?;
+            let raised: Option<String> = self
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "UPDATE channels SET
+                        cumulative_amount =
+                            CAST(MAX(CAST(cumulative_amount AS INTEGER), ?6) + ?3 AS TEXT),
+                        entry_json = CASE WHEN entry_json IS NULL THEN NULL ELSE json_set(
+                            entry_json, '$.cumulativeAmount',
+                            CAST(MAX(CAST(cumulative_amount AS INTEGER), ?6) + ?3 AS TEXT)
+                        ) END,
+                        last_used_at = ?5
+                     WHERE scope_key = ?1 AND lower(channel_id) = ?2 AND state = 'active'
+                        AND length(cumulative_amount) BETWEEN 1 AND 18
+                        AND cumulative_amount NOT GLOB '*[^0-9]*'
+                        AND MAX(CAST(cumulative_amount AS INTEGER), ?6) + ?3 <= ?4
+                     RETURNING cumulative_amount",
+                    params![
+                        self.scoped_key(key),
+                        format!("{channel_id:#x}"),
+                        amount,
+                        cap,
+                        now,
+                        floor
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(io_error)?;
+            raised
+                .map(|raised| {
+                    raised.parse().map_err(|error| {
+                        ChannelStoreError::InvalidEntry(format!(
+                            "invalid cumulative_amount: {error}"
+                        ))
+                    })
+                })
+                .transpose()
         }
 
         /// Reads the `server_spent` column, which tempo-wallet also keeps. Its
@@ -1695,6 +1859,122 @@ mod tests {
             pending_open: None,
             origin: None,
         }
+    }
+
+    /// Allocations from a channel get disjoint ranges above the floor, never
+    /// exceed the cap, and are what the store reads back.
+    #[tokio::test]
+    async fn allocations_are_disjoint_capped_and_monotonic() {
+        on_every_store(|store| async move {
+            let entry = entry();
+            let key = entry.key();
+            store.set(&entry).await.unwrap();
+            let id = entry.channel_id;
+            assert_eq!(
+                store
+                    .allocate(&key, id, 0, 1_000, 10_000_000)
+                    .await
+                    .unwrap(),
+                Some(2_001_000)
+            );
+            // A floor above the stored amount, such as one resynchronized
+            // from the server, raises it first.
+            assert_eq!(
+                store
+                    .allocate(&key, id, 3_000_000, 1_000, 10_000_000)
+                    .await
+                    .unwrap(),
+                Some(3_001_000)
+            );
+            assert_eq!(
+                store
+                    .allocate(&key, id, 0, 7_000_000, 10_000_000)
+                    .await
+                    .unwrap(),
+                None,
+                "the cap is never exceeded"
+            );
+            assert_eq!(
+                store
+                    .allocate(&key, B256::repeat_byte(0x99), 0, 1, u128::MAX)
+                    .await
+                    .unwrap(),
+                None,
+                "only the stored channel allocates"
+            );
+            assert_eq!(
+                store.get(&key).await.unwrap().unwrap().cumulative_amount,
+                3_001_000
+            );
+            store.set(&entry).await.unwrap();
+            assert_eq!(
+                store.get(&key).await.unwrap().unwrap().cumulative_amount,
+                3_001_000,
+                "a write of an older amount does not lower it"
+            );
+        })
+        .await;
+    }
+
+    /// Processes sharing a SQLite store allocate disjoint voucher ranges
+    /// without holding the payment lease.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_allocations_are_disjoint_across_store_instances() {
+        let directory =
+            std::env::temp_dir().join(format!("mpp-rs-store-alloc-{}", uuid::Uuid::new_v4()));
+        let options = SqliteChannelStoreOptions {
+            namespace: "https://api.example.com".into(),
+            path: Some(directory.join("channels.db")),
+            request_url: None,
+        };
+        let stores: Vec<Arc<SqliteChannelStore>> = (0..4)
+            .map(|_| Arc::new(SqliteChannelStore::open(options.clone()).unwrap()))
+            .collect();
+        let entry = entry();
+        let (key, id) = (entry.key(), entry.channel_id);
+        stores[0].set(&entry).await.unwrap();
+        // Another process holding the payment lease does not block allocation.
+        let _lease = stores[1].acquire(&key).await.unwrap();
+
+        let tasks: Vec<_> = stores
+            .iter()
+            .cloned()
+            .map(|store| {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let mut raised = Vec::new();
+                    for _ in 0..25 {
+                        raised.push(
+                            store
+                                .allocate(&key, id, 0, 10, u128::MAX)
+                                .await
+                                .unwrap()
+                                .unwrap(),
+                        );
+                    }
+                    raised
+                })
+            })
+            .collect();
+        let mut raised = Vec::new();
+        for task in tasks {
+            raised.extend(task.await.unwrap());
+        }
+        raised.sort_unstable();
+        let expected: Vec<u128> = (1..=100).map(|i| 2_000_000 + 10 * i).collect();
+        assert_eq!(raised, expected);
+        assert_eq!(
+            stores[3]
+                .get(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .cumulative_amount,
+            2_001_000
+        );
+        drop(stores);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

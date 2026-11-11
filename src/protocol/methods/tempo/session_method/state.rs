@@ -9,7 +9,7 @@ use alloy::primitives::Address;
 
 use super::chain::OnChainChannel;
 use super::receipt::now_iso8601;
-use super::ChannelState;
+use super::{ChannelState, VoucherWindow};
 use crate::protocol::methods::tempo::session::SettlementRoute;
 use crate::protocol::traits::VerificationError;
 
@@ -95,6 +95,7 @@ impl ChannelState {
                 pending_close: None,
                 close_requested_at: on_chain.close_requested_at,
                 created_at: now_iso8601(),
+                window: None,
             }
         }
     }
@@ -137,6 +138,95 @@ impl ChannelState {
         Ok(Self {
             highest_voucher_amount: cumulative_amount,
             highest_voucher_signature: Some(signature),
+            ..self
+        })
+    }
+
+    /// Record a voucher accepted within a reorder window of `window_ms`, at
+    /// `now_ms` (Unix milliseconds): out of order, but each increment once.
+    ///
+    /// `after` is the cumulative amount the client counted before this
+    /// voucher, so `(after, cumulative_amount]` is its own increment. Without
+    /// it, a voucher above the accepted amount covers the gap from it, and a
+    /// late one covers one base unit. A voucher at or below the window's
+    /// floor is refused as stale and one overlapping an accepted increment as
+    /// seen. Only a voucher above the accepted amount raises it: a late one
+    /// adds no funds, since requests are charged from the accepted amount.
+    pub(super) fn accept_voucher_in_window(
+        self,
+        cumulative_amount: u128,
+        after: Option<u128>,
+        signature: Vec<u8>,
+        min_delta: u128,
+        now_ms: u64,
+        window_ms: u64,
+    ) -> Result<Self, VerificationError> {
+        let highest = self.highest_voucher_amount;
+        // The window tracks vouchers up to the highest one. A channel that
+        // has none yet, or whose highest voucher was raised outside it (an
+        // open, or vouchers accepted while no window was configured), starts
+        // one with every voucher up to the highest below its floor, so none
+        // of them can be replayed.
+        let mut window = match self.window.clone() {
+            Some(window)
+                if window
+                    .runs
+                    .last()
+                    .map_or(window.floor, |run| run.to.max(window.floor))
+                    == highest =>
+            {
+                window
+            }
+            _ => VoucherWindow {
+                floor: highest,
+                runs: Vec::new(),
+            },
+        };
+        window.prune(now_ms.saturating_sub(window_ms));
+
+        if after.is_some_and(|after| after >= cumulative_amount) {
+            return Err(VerificationError::invalid_payload(
+                "voucher after must be below cumulativeAmount",
+            ));
+        }
+        let resync = |reason: &str| {
+            VerificationError::delta_too_small(format!(
+                "{reason}; acceptedCumulative {highest}, requiredCumulative {}",
+                highest.saturating_add(min_delta.max(1)),
+            ))
+        };
+        if cumulative_amount <= window.floor {
+            return Err(resync("voucher is older than the reorder window (stale)"));
+        }
+        // A voucher above the highest one adds funds and cannot be a replay:
+        // it covers what lies above the highest voucher (and above `after`,
+        // leaving a hole below it for a voucher still in flight). A late one
+        // covers its own increment, and only once.
+        let lo = if cumulative_amount > highest {
+            after.unwrap_or(highest).max(highest)
+        } else {
+            after.unwrap_or(cumulative_amount - 1).max(window.floor)
+        };
+        if cumulative_amount <= highest && window.overlaps(lo, cumulative_amount) {
+            return Err(resync("voucher was already accepted (seen)"));
+        }
+        let delta = cumulative_amount - lo;
+        if delta < min_delta {
+            return Err(resync(&format!(
+                "voucher delta {delta} below minimum {min_delta}"
+            )));
+        }
+        window.insert(lo, cumulative_amount, now_ms);
+
+        let raises = cumulative_amount > highest;
+        Ok(Self {
+            highest_voucher_amount: if raises { cumulative_amount } else { highest },
+            highest_voucher_signature: if raises {
+                Some(signature)
+            } else {
+                self.highest_voucher_signature
+            },
+            window: Some(window),
             ..self
         })
     }

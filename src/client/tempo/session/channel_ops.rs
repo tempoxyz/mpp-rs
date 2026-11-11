@@ -206,6 +206,7 @@ pub async fn create_voucher_payload(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
+        after: None,
     })
 }
 
@@ -226,6 +227,7 @@ pub async fn create_precompile_voucher_payload(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
+        after: None,
     })
 }
 
@@ -245,6 +247,7 @@ pub async fn create_precompile_voucher_payload_primitive(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
+        after: None,
     })
 }
 
@@ -294,6 +297,7 @@ pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&signature),
+        after: None,
     })
 }
 
@@ -326,6 +330,7 @@ pub async fn create_precompile_voucher_payload_with_descriptor_and_escrow(
         settlement_route: None,
         cumulative_amount: cumulative_amount.to_string(),
         signature: alloy::hex::encode_prefixed(&sig),
+        after: None,
     })
 }
 
@@ -2130,6 +2135,7 @@ mod tests {
             settlement_route: None,
             cumulative_amount: "5000".to_string(),
             signature: "0xdef".to_string(),
+            after: None,
         };
 
         let addr: Address = "0x1111111111111111111111111111111111111111"
@@ -2425,6 +2431,7 @@ mod tests {
             settlement_route: None,
             cumulative_amount: "5000".to_string(),
             signature: "0xdef".to_string(),
+            after: None,
         };
 
         let addr: Address = "0x1111111111111111111111111111111111111111"

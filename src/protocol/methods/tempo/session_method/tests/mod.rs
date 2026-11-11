@@ -11,6 +11,7 @@ mod store;
 mod stream;
 mod top_up;
 mod voucher;
+mod window;
 
 fn test_channel_state(channel_id: &str) -> ChannelState {
     ChannelState {
@@ -43,6 +44,7 @@ fn test_channel_state(channel_id: &str) -> ChannelState {
         pending_close: None,
         close_requested_at: 0,
         created_at: "2025-01-01T00:00:00Z".to_string(),
+        window: None,
     }
 }
 
@@ -176,6 +178,7 @@ async fn test_verify_session_rejects_missing_recipient() {
             settlement_route: None,
             cumulative_amount: "1000".to_string(),
             signature: format!("0x{}", "aa".repeat(65)),
+            after: None,
         },
     );
 
