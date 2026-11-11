@@ -176,13 +176,10 @@ pub struct TempoSessionProvider {
     /// Held across a save of receipted `spent`, so a save that read an older
     /// receipt cannot land after a newer one's.
     server_spent_saves: Arc<tokio::sync::Mutex<()>>,
-    /// Per channel, the highest cumulative amount a server that accepts
-    /// vouchers out of order reported it accepted, advanced past the
-    /// vouchers signed again from it; see
-    /// [`allocate_voucher_range`](Self::allocate_voucher_range). Vouchers
-    /// signed from it never exceed the channel's counter, so an amount the
-    /// server reports without a signed voucher behind it authorizes nothing.
-    accepted_cursors: Arc<Mutex<HashMap<B256, u128>>>,
+    /// Voucher ranges known not to have been accepted, which vouchers may
+    /// cover again once the counter cannot rise; see
+    /// [`reuse_lost_range`](Self::reuse_lost_range).
+    lost_ranges: Arc<Mutex<LostRanges>>,
     /// Receives `channel.deposit` events for accepted opens and top-ups.
     events: ClientEvents,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
@@ -212,6 +209,50 @@ fn reorder_window(session_req: &SessionRequest) -> Option<u64> {
         .get("reorderWindow")?
         .as_u64()
         .filter(|window| *window > 0)
+}
+
+/// Most lost voucher ranges a session provider keeps per channel; the oldest
+/// is dropped first. Each is a hole in the server's reorder window, which
+/// expires on its own.
+const MAX_LOST_RANGES: usize = 64;
+
+/// A voucher range `(from, to]` that the server is known not to have
+/// accepted: its voucher was never sent, or the server refused it for a
+/// reason other than the reorder window. A later voucher may cover it again
+/// until `expires`, one reorder window after it was recorded, when the hole it
+/// left in the server's window may have closed.
+#[derive(Clone, Copy, Debug)]
+struct LostRange {
+    from: u128,
+    to: u128,
+    expires: std::time::Instant,
+}
+
+/// Voucher ranges known not to have been accepted, by channel.
+#[derive(Debug, Default)]
+struct LostRanges {
+    ranges: HashMap<B256, Vec<LostRange>>,
+    /// Ranges of vouchers that a server refused as already accepted or
+    /// stale, or with a problem the client could not read, until the
+    /// payment's rollback, which then does not record them as lost.
+    refused: HashSet<(B256, u128, u128)>,
+}
+
+/// The channel and `(after, cumulativeAmount]` range of a voucher credential
+/// sent with `after`.
+fn voucher_after_range(credential: &PaymentCredential) -> Option<(B256, u128, u128)> {
+    match serde_json::from_value(credential.payload.clone()).ok()? {
+        SessionCredentialPayload::Voucher {
+            channel_id,
+            cumulative_amount,
+            after: Some(after),
+            ..
+        } => {
+            let (from, to) = (after.parse().ok()?, cumulative_amount.parse().ok()?);
+            (from < to).then_some((channel_id.parse().ok()?, from, to))
+        }
+        _ => None,
+    }
 }
 
 /// How long a session management request may take before it fails with an
@@ -425,7 +466,7 @@ impl TempoSessionProvider {
             topping_up: Arc::new(Mutex::new(HashSet::new())),
             spend: Arc::default(),
             server_spent_saves: Arc::default(),
-            accepted_cursors: Arc::default(),
+            lost_ranges: Arc::default(),
             events: ClientEvents::default(),
             trusted_tempo_proof_realms: Vec::new(),
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
@@ -2589,8 +2630,16 @@ impl TempoSessionProvider {
                     .saturating_sub(entry.cumulative_amount)
                     .max(min_delta)
                     .max(1);
+                // A reused range must still reach what the server requires.
                 if let Some(credential) = self
-                    .sign_allocated_voucher(challenge, &key, entry.chain_id, &entry, amount)
+                    .sign_allocated_voucher(
+                        challenge,
+                        &key,
+                        entry.chain_id,
+                        &entry,
+                        amount,
+                        required_cumulative,
+                    )
                     .await?
                 {
                     return Ok(credential);
@@ -3958,7 +4007,7 @@ impl TempoSessionProvider {
             self.resync_counter(&key, entry.channel_id, accepted).await;
         }
         *self.last_challenge.lock().unwrap() = Some(challenge.clone());
-        self.sign_allocated_voucher(challenge, &key, chain_id, &entry, amount)
+        self.sign_allocated_voucher(challenge, &key, chain_id, &entry, amount, 0)
             .await
     }
 
@@ -4009,7 +4058,8 @@ impl TempoSessionProvider {
     }
 
     /// Allocates `amount` from the channel's voucher counter and signs a
-    /// voucher for the range's end, with `after` set to its start.
+    /// voucher for the range's end, with `after` set to its start. A range
+    /// reused from a lost voucher ends at `min_end` at least.
     async fn sign_allocated_voucher(
         &self,
         challenge: &PaymentChallenge,
@@ -4017,9 +4067,11 @@ impl TempoSessionProvider {
         chain_id: u64,
         entry: &ChannelEntry,
         amount: u128,
+        min_end: u128,
     ) -> Result<Option<PaymentCredential>, MppError> {
-        let Some((after, cumulative_amount)) =
-            self.allocate_voucher_range(key, entry, amount).await?
+        let Some((after, cumulative_amount)) = self
+            .allocate_voucher_range(key, entry, amount, min_end)
+            .await?
         else {
             return Ok(None);
         };
@@ -4060,16 +4112,17 @@ impl TempoSessionProvider {
     /// legacy channels, which are not persisted, allocate in process memory.
     ///
     /// When the counter cannot rise by `amount` within the deposit (or the
-    /// maximum deposit), vouchers signed from it were lost or are still in
-    /// flight above what the server accepted. The range then starts at the
-    /// server's accepted amount instead, as long as it ends within what the
-    /// counter already authorized, so it signs for no new funds. `None` when
-    /// neither fits: the payment takes the serialized path, which tops up.
+    /// maximum deposit), the range is taken from a voucher range known to be
+    /// lost instead, ending at `min_end` at least; see
+    /// [`reuse_lost_range`](Self::reuse_lost_range). Vouchers merely in flight
+    /// are never covered again. `None` when neither fits: the payment takes
+    /// the serialized path, which tops up.
     async fn allocate_voucher_range(
         &self,
         key: &str,
         entry: &ChannelEntry,
         amount: u128,
+        min_end: u128,
     ) -> Result<Option<(u128, u128)>, MppError> {
         let cap = self
             .max_deposit
@@ -4091,7 +4144,7 @@ impl TempoSessionProvider {
                 .await
                 .map_err(Self::store_error)?;
             let Some(raised) = raised else {
-                return Ok(self.reuse_accepted_range(key, entry, amount, cap));
+                return Ok(self.reuse_lost_range(key, entry, amount, min_end, cap));
             };
             Some(raised)
         } else {
@@ -4116,7 +4169,7 @@ impl TempoSessionProvider {
                     .filter(|raised| *raised <= cap)
                 else {
                     drop(channels);
-                    return Ok(self.reuse_accepted_range(key, entry, amount, cap));
+                    return Ok(self.reuse_lost_range(key, entry, amount, min_end, cap));
                 };
                 current.cumulative_amount = raised;
                 raised
@@ -4125,16 +4178,19 @@ impl TempoSessionProvider {
         Ok(Some((raised - amount, raised)))
     }
 
-    /// Allocates `(accepted, accepted + amount]` from the server's reported
-    /// accepted amount, for a counter that cannot rise within the deposit,
-    /// and advances that cursor so concurrent payments take disjoint ranges.
-    /// The range must end within the cap and what the counter already
-    /// authorized.
-    fn reuse_accepted_range(
+    /// Takes `(from, end]` from the start of a lost voucher range of the
+    /// channel, for a counter that cannot rise within the deposit, with
+    /// `end = max(from + amount, min_end)`, and leaves the rest of that range
+    /// for later vouchers. The range must lie within the lost one, the cap
+    /// and what the counter already authorized, so it signs for no new
+    /// funds and never repeats a voucher still in flight, which a server
+    /// would refuse as already seen.
+    fn reuse_lost_range(
         &self,
         key: &str,
         entry: &ChannelEntry,
         amount: u128,
+        min_end: u128,
         cap: u128,
     ) -> Option<(u128, u128)> {
         let issued = self
@@ -4144,13 +4200,67 @@ impl TempoSessionProvider {
             .get(key)
             .filter(|current| current.channel_id == entry.channel_id)
             .map(|current| current.cumulative_amount)?;
-        let mut cursors = self.accepted_cursors.lock().unwrap();
-        let cursor = cursors.get_mut(&entry.channel_id)?;
-        let end = cursor
-            .checked_add(amount)
-            .filter(|end| *end <= cap.min(issued))?;
-        let start = std::mem::replace(cursor, end);
-        Some((start, end))
+        let now = std::time::Instant::now();
+        let mut lost = self.lost_ranges.lock().unwrap();
+        let ranges = lost.ranges.get_mut(&entry.channel_id)?;
+        ranges.retain(|range| range.expires > now);
+        let limit = cap.min(issued);
+        let (index, end) = ranges.iter().enumerate().find_map(|(index, range)| {
+            let end = range.from.checked_add(amount)?.max(min_end);
+            (end <= range.to && end <= limit).then_some((index, end))
+        })?;
+        let from = ranges[index].from;
+        if end == ranges[index].to {
+            ranges.remove(index);
+        } else {
+            ranges[index].from = end;
+        }
+        Some((from, end))
+    }
+
+    /// Records the range of a voucher sent with `after` as lost, when its
+    /// payment was rolled back (the voucher was never sent, or the server
+    /// rejected it) and the server did not refuse it as already accepted or
+    /// stale; see [`reuse_lost_range`](Self::reuse_lost_range).
+    fn record_lost_range(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        let Some((channel_id, from, to)) = voucher_after_range(credential) else {
+            return;
+        };
+        let mut lost = self.lost_ranges.lock().unwrap();
+        if lost.refused.remove(&(channel_id, from, to)) {
+            return;
+        }
+        let Some(window) = challenge
+            .request
+            .decode::<SessionRequest>()
+            .ok()
+            .and_then(|request| reorder_window(&request))
+        else {
+            return;
+        };
+        if !self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .contains_key(&channel_id.to_string())
+        {
+            return;
+        }
+        let ranges = lost.ranges.entry(channel_id).or_default();
+        if ranges
+            .iter()
+            .any(|range| range.from < to && from < range.to)
+        {
+            return;
+        }
+        if ranges.len() >= MAX_LOST_RANGES {
+            ranges.remove(0);
+        }
+        ranges.push(LostRange {
+            from,
+            to,
+            expires: std::time::Instant::now() + Duration::from_secs(window),
+        });
     }
 
     /// Raises the channel's voucher counter to `signed`, the cumulative
@@ -4177,11 +4287,6 @@ impl TempoSessionProvider {
         let entry = channels
             .get_mut(key)
             .filter(|entry| entry.channel_id == channel_id && entry.opened)?;
-        {
-            let mut cursors = self.accepted_cursors.lock().unwrap();
-            let cursor = cursors.entry(channel_id).or_default();
-            *cursor = (*cursor).max(signed);
-        }
         let cap = self
             .max_deposit
             .map_or(entry.deposit, |max| max.min(entry.deposit));
@@ -4191,25 +4296,6 @@ impl TempoSessionProvider {
         }
         entry.cumulative_amount = target;
         Some(entry.clone())
-    }
-
-    /// Records `accepted`, a cumulative amount a server that accepts
-    /// vouchers out of order reports without a signed voucher (in a receipt
-    /// or a refusal), as where vouchers signed again below the counter start;
-    /// see [`reuse_accepted_range`](Self::reuse_accepted_range). Such vouchers
-    /// end within what the counter already authorized, so the amount cannot
-    /// make the client sign for more. The counter itself does not move.
-    fn observe_accepted(&self, key: &str, channel_id: B256, accepted: u128) {
-        let channels = self.channels.lock().unwrap();
-        if !channels
-            .get(key)
-            .is_some_and(|entry| entry.channel_id == channel_id && entry.opened)
-        {
-            return;
-        }
-        let mut cursors = self.accepted_cursors.lock().unwrap();
-        let cursor = cursors.entry(channel_id).or_default();
-        *cursor = (*cursor).max(accepted);
     }
 
     /// Waits for the payment lock, but not past the challenge's expiry: an
@@ -4897,6 +4983,9 @@ impl PaymentProvider for TempoSessionProvider {
                 self.save_server_spent(&id).await;
             }
         }
+        if let Some(range) = voucher_after_range(credential) {
+            self.lost_ranges.lock().unwrap().refused.remove(&range);
+        }
         self.commit_credential(credential);
         drop(lease);
         Ok(())
@@ -4912,6 +5001,7 @@ impl PaymentProvider for TempoSessionProvider {
             .lock()
             .unwrap()
             .remove(&challenge.id);
+        self.record_lost_range(challenge, credential);
         let result = self.rollback_credential(challenge, credential).await;
         drop(lease);
         result
@@ -5074,25 +5164,8 @@ impl PaymentProvider for TempoSessionProvider {
             .and_then(|value| value.as_str())
             .and_then(|value| value.parse::<u128>().ok())?;
         let channel_id = receipt.reference.parse::<B256>().ok()?.to_string();
-        // A server that accepts vouchers out of order reports the highest
-        // voucher it accepted, which may come from another client. The
-        // amount carries no signature, so it only marks where vouchers signed
-        // again below the counter start; it never raises the counter.
-        let session_request = challenge.request.decode::<SessionRequest>().ok();
-        if session_request.as_ref().and_then(reorder_window).is_some() {
-            let accepted = receipt
-                .extensions
-                .get("acceptedCumulative")
-                .and_then(|value| value.as_str())
-                .and_then(|value| value.parse::<u128>().ok());
-            if let (Some(accepted), Ok((key, _)), Ok(id)) = (
-                accepted,
-                self.expected_channel_key(challenge),
-                channel_id.parse::<B256>(),
-            ) {
-                self.observe_accepted(&key, id, accepted);
-            }
-        }
+        // A receipt's `acceptedCumulative` carries no signature, so it never
+        // moves the voucher counter.
         let quoted = challenge
             .request
             .decode::<SessionRequest>()
@@ -5149,36 +5222,34 @@ impl PaymentProvider for TempoSessionProvider {
     }
 
     /// A server that accepts vouchers out of order refuses a stale or
-    /// already accepted one with the amount it accepted. The amount carries
-    /// no signature, so it only marks where vouchers signed again below the
-    /// counter start; the retry's challenge snapshot, whose highest voucher
-    /// is signed, is what moves the counter.
+    /// already accepted voucher as `delta-too-small`, with the amounts it
+    /// accepted. Such a voucher's range is not lost, so it is never covered
+    /// again; nor is one refused with a problem the client could not read
+    /// (`problem` is `null`). The amounts carry no signature, so they never
+    /// move the counter: the retry's challenge snapshot, whose highest
+    /// voucher is signed, does.
     fn observe_refusal(
         &self,
-        challenge: &PaymentChallenge,
+        _challenge: &PaymentChallenge,
         credential: &PaymentCredential,
         problem: &serde_json::Value,
     ) {
-        let Some(accepted) = problem
-            .get("acceptedCumulative")
-            .and_then(|value| value.as_str())
-            .and_then(|value| value.parse::<u128>().ok())
-        else {
+        let Some(range) = voucher_after_range(credential) else {
             return;
         };
-        let advertised = challenge
-            .request
-            .decode::<SessionRequest>()
-            .ok()
-            .and_then(|request| reorder_window(&request));
-        let channel_id = Self::credential_channel_id(credential)
-            .and_then(|channel_id| channel_id.parse::<B256>().ok());
-        let (Some(_), Some(channel_id), Ok((key, _))) =
-            (advertised, channel_id, self.expected_channel_key(challenge))
-        else {
-            return;
-        };
-        self.observe_accepted(&key, channel_id, accepted);
+        let window_refusal = problem.get("acceptedCumulative").is_some()
+            || problem.get("requiredCumulative").is_some()
+            || problem
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_none_or(|kind| kind.ends_with("delta-too-small"));
+        if window_refusal {
+            let mut lost = self.lost_ranges.lock().unwrap();
+            if lost.refused.len() >= MAX_LOST_RANGES {
+                lost.refused.clear();
+            }
+            lost.refused.insert(range);
+        }
     }
 
     fn accept_payment_header(&self) -> Option<String> {
@@ -7544,45 +7615,111 @@ mod tests {
         assert_eq!(stored.cumulative_amount, 7_000);
     }
 
-    /// A counter that ran ahead of the server, through vouchers lost or still
-    /// in flight, allocates from the server's accepted amount once it cannot
-    /// rise within the deposit, rather than topping up, and signs for no
-    /// more than it already authorized.
+    /// A counter that cannot rise within the deposit covers again only
+    /// ranges known to be lost: a voucher never sent, or one refused for a
+    /// reason other than the reorder window. Vouchers still in flight, and
+    /// ones refused as already accepted or stale, are never repeated; with
+    /// nothing lost the payment takes the serialized path.
     #[tokio::test]
-    async fn exhausted_counter_allocates_from_the_accepted_amount() {
+    async fn exhausted_counter_reuses_only_lost_ranges() {
         let provider = make_test_provider();
         let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
-        let channel_id = seed_precompile_channel(&provider, payee, currency, 9_500, 10_000);
+        seed_precompile_channel(&provider, payee, currency, 7_000, 10_000);
         let entry = provider.channels().into_values().next().unwrap();
         provider.persist_channel(&entry).await.unwrap();
-        let challenge = reorder_challenge("first", payee, currency, Some(30));
+        let challenge = reorder_challenge("pay", payee, currency, Some(30));
 
-        // Without a known accepted amount the payment takes the serialized
-        // path, which needs a top-up this test cannot do.
+        let a = provider.pay(&challenge).await.unwrap();
+        let b = provider.pay(&challenge).await.unwrap();
+        let c = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_range(&c), (Some(9_000), 10_000));
+        // The server reports it accepted only 7000 so far, but all three are
+        // in flight: none is repeated, and the serialized path needs a
+        // top-up this test cannot do.
+        let mut receipt = Receipt::success("tempo", entry.channel_id.to_string());
+        receipt
+            .extensions
+            .insert("spent".into(), serde_json::json!("7000"));
+        receipt
+            .extensions
+            .insert("acceptedCumulative".into(), serde_json::json!("7000"));
+        let context = PaymentContext {
+            url: "https://test-realm/data".parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        provider.record_receipt(&context, &challenge, &receipt);
         assert!(provider.pay(&challenge).await.is_err());
 
-        let voucher = serde_json::json!({
-            "action": "voucher",
-            "channelId": channel_id.to_string(),
-            "cumulativeAmount": "9500",
-            "after": "8500",
-            "signature": "0x00"
-        });
-        let refused = PaymentCredential::new(challenge.to_echo(), voucher);
+        // b was never sent; c was refused as already accepted.
+        provider.rollback_payment(&challenge, &b).await.unwrap();
         provider.observe_refusal(
             &challenge,
-            &refused,
-            &serde_json::json!({"acceptedCumulative": "5000"}),
+            &c,
+            &serde_json::json!({
+                "type": "https://paymentauth.org/problems/session/delta-too-small",
+                "acceptedCumulative": "10000"
+            }),
         );
-        let (first, second) = (
-            reorder_challenge("a", payee, currency, Some(30)),
-            reorder_challenge("b", payee, currency, Some(30)),
+        provider.rollback_payment(&challenge, &c).await.unwrap();
+        let reused = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_range(&reused), (Some(8_000), 9_000));
+        assert!(provider.pay(&challenge).await.is_err());
+
+        // A refusal for another reason, such as an expired challenge, or
+        // with no readable problem, leaves the range lost or not.
+        provider.observe_refusal(
+            &challenge,
+            &a,
+            &serde_json::json!({"type": "https://paymentauth.org/problems/payment-expired"}),
         );
-        let (a, b) = tokio::join!(provider.pay(&first), provider.pay(&second));
-        let mut ranges = vec![voucher_range(&a.unwrap()), voucher_range(&b.unwrap())];
-        ranges.sort();
-        assert_eq!(ranges, vec![(Some(5_000), 6_000), (Some(6_000), 7_000)]);
-        assert_eq!(provider.cumulative(), 9_500, "the counter is not lowered");
+        provider.rollback_payment(&challenge, &a).await.unwrap();
+        provider.observe_refusal(&challenge, &reused, &serde_json::Value::Null);
+        provider
+            .rollback_payment(&challenge, &reused)
+            .await
+            .unwrap();
+        let again = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_range(&again), (Some(7_000), 8_000));
+        assert!(provider.pay(&challenge).await.is_err());
+        assert_eq!(provider.cumulative(), 10_000, "the counter is not lowered");
+    }
+
+    /// A `payment-need-voucher` voucher from an exhausted counter reuses a
+    /// lost range only when it reaches the required amount; otherwise the
+    /// serialized path signs at least the required amount.
+    #[tokio::test]
+    async fn need_voucher_reuses_a_lost_range_only_up_to_the_required_amount() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 5_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        provider.persist_channel(&entry).await.unwrap();
+        let challenge = reorder_challenge("stream", payee, currency, Some(30));
+
+        let lost = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_range(&lost), (Some(5_000), 6_000));
+        for _ in 0..4 {
+            provider.pay(&challenge).await.unwrap();
+        }
+        assert_eq!(provider.cumulative(), 10_000);
+        provider.rollback_payment(&challenge, &lost).await.unwrap();
+
+        // (5000, 6000] cannot reach 9600: the serialized path signs it.
+        let credential = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 9_600)
+            .await
+            .unwrap();
+        let (after, cumulative) = voucher_range(&credential);
+        assert_eq!(after, None);
+        assert!(cumulative >= 9_600, "{cumulative}");
+
+        // 5800 fits within it.
+        let credential = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 5_800)
+            .await
+            .unwrap();
+        assert_eq!(voucher_range(&credential), (Some(5_000), 5_800));
     }
 
     /// A prepaid voucher for a server with a reorder window keeps

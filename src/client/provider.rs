@@ -292,11 +292,13 @@ pub trait PaymentProvider: Clone + Send + Sync {
     }
 
     /// Observe the problem details of a `402` response that refused this
-    /// provider's credential, before the payment flow pays again.
+    /// provider's credential, before the payment flow pays again. `problem`
+    /// is `null` when the response carried no problem details the flow could
+    /// read.
     ///
-    /// Session providers resynchronize their voucher counter from the
-    /// `acceptedCumulative` a server that accepts vouchers out of order
-    /// reports.
+    /// Session providers learn from it whether a server that accepts vouchers
+    /// out of order refused a voucher as already accepted or stale, so they
+    /// never cover its range again.
     fn observe_refusal(
         &self,
         challenge: &PaymentChallenge,

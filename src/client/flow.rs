@@ -547,19 +547,21 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             let has_receipt = resp.headers().contains_key("payment-receipt");
 
-            // A server that accepts vouchers out of order reports, in the
-            // problem refusing one, the amount it accepted, so the provider
-            // resynchronizes its voucher counter before paying again.
+            // A server that accepts vouchers out of order says, in the
+            // problem refusing one, whether it was already accepted or stale,
+            // so the provider knows whether the voucher's range was lost.
             if session
                 && status == StatusCode::PAYMENT_REQUIRED
                 && credential.payload.get("after").is_some()
             {
                 let (refused, problem) = read_small_problem(resp).await;
                 resp = refused;
-                if let Some(problem) = problem {
-                    self.provider
-                        .observe_refusal(&challenge, &credential, &problem);
-                }
+                // A problem that could not be read is reported as null.
+                self.provider.observe_refusal(
+                    &challenge,
+                    &credential,
+                    &problem.unwrap_or(serde_json::Value::Null),
+                );
             }
 
             // The credential was spent but the server failed, so the payment
