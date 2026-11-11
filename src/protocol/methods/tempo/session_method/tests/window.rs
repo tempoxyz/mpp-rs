@@ -405,3 +405,139 @@ fn runs_are_bounded() {
     assert!(err.message.contains("(stale)"), "{}", err.message);
     assert!(accept(state, 5, Some(4), NOW).is_ok());
 }
+
+/// A channel store shared with other server instances: its first `losses`
+/// writes find that another instance accepted a voucher (3000 after 2000)
+/// since they read, and fail as a lost compare-exchange does.
+struct LosesRaces {
+    inner: InMemoryChannelStore,
+    losses: std::sync::atomic::AtomicUsize,
+    writes: std::sync::atomic::AtomicUsize,
+}
+
+impl LosesRaces {
+    fn new(losses: usize) -> Self {
+        Self {
+            inner: InMemoryChannelStore::new(),
+            losses: losses.into(),
+            writes: 0.into(),
+        }
+    }
+}
+
+impl ChannelStore for LosesRaces {
+    fn get_channel(
+        &self,
+        channel_id: &str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    > {
+        self.inner.get_channel(channel_id)
+    }
+
+    fn update_channel(
+        &self,
+        channel_id: &str,
+        updater: Box<
+            dyn FnOnce(Option<ChannelState>) -> Result<Option<ChannelState>, VerificationError>
+                + Send,
+        >,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
+    > {
+        use std::sync::atomic::Ordering;
+
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        let left = self.losses.load(Ordering::SeqCst);
+        if left == 0 {
+            return self.inner.update_channel(channel_id, updater);
+        }
+        self.losses.store(left - 1, Ordering::SeqCst);
+        let current = self.inner.get_channel_sync(channel_id).unwrap();
+        if current.highest_voucher_amount < 3_000 {
+            let other = current
+                .accept_voucher_in_window(
+                    3_000,
+                    Some(2_000),
+                    vec![3],
+                    0,
+                    now_ms_for_tests(),
+                    WINDOW_MS,
+                )
+                .unwrap();
+            self.inner.insert(channel_id, other);
+        }
+        Box::pin(async {
+            Err(VerificationError::concurrent_update(
+                "channel changed concurrently; retry against fresh state",
+            ))
+        })
+    }
+}
+
+/// With a reorder window, a voucher whose store write lost a race against
+/// another instance is applied again to the fresh state, a bounded number of
+/// times; without one the conflict is returned with its own code.
+#[tokio::test]
+async fn reorder_window_reapplies_a_voucher_after_a_lost_store_race() {
+    use crate::protocol::methods::tempo::session_method::voucher::MAX_VOUCHER_UPDATE_ATTEMPTS;
+    use std::sync::atomic::Ordering;
+
+    let signer = PrivateKeySigner::random();
+    let channel_id = format!("0x{}", "ef".repeat(32));
+    let id = channel_id.parse::<B256>().unwrap();
+    let mut state = test_channel_state(&channel_id);
+    state.authorized_signer = signer.address();
+    state.highest_voucher_amount = 1_000;
+    state.deposit = 10_000;
+    let voucher = signed(&signer, id, 2_000).await;
+    let method = |store: Arc<LosesRaces>| {
+        SessionMethod::new(
+            crate::server::tempo_provider("https://rpc.test.invalid").unwrap(),
+            store,
+            SessionMethodConfig {
+                escrow_contract: "0x5555555555555555555555555555555555555555"
+                    .parse()
+                    .unwrap(),
+                chain_id: 42431,
+                min_voucher_delta: 0,
+            },
+        )
+    };
+
+    // Two lost races: both vouchers end up accepted.
+    let store = Arc::new(LosesRaces::new(2));
+    store.inner.insert(&channel_id, state.clone());
+    let accepted = method(store.clone())
+        .with_reorder_window(Duration::from_secs(30))
+        .verify_and_accept_voucher(&channel_id, None, 2_000, Some(1_000), &voucher, 0)
+        .await
+        .unwrap();
+    assert_eq!(accepted.highest_voucher_amount, 3_000);
+    assert_eq!(runs(&accepted), vec![(1_000, 3_000)]);
+    assert_eq!(store.writes.load(Ordering::SeqCst), 3);
+
+    // Losing every attempt gives up after the bound with the conflict's code.
+    let store = Arc::new(LosesRaces::new(usize::MAX));
+    store.inner.insert(&channel_id, state.clone());
+    let err = method(store.clone())
+        .with_reorder_window(Duration::from_secs(30))
+        .verify_and_accept_voucher(&channel_id, None, 2_000, Some(1_000), &voucher, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::ConcurrentUpdate));
+    assert_eq!(
+        store.writes.load(Ordering::SeqCst),
+        MAX_VOUCHER_UPDATE_ATTEMPTS
+    );
+
+    // Without a window the voucher is not applied again.
+    let store = Arc::new(LosesRaces::new(1));
+    store.inner.insert(&channel_id, state);
+    let err = method(store.clone())
+        .verify_and_accept_voucher(&channel_id, None, 2_000, None, &voucher, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::ConcurrentUpdate));
+    assert_eq!(store.writes.load(Ordering::SeqCst), 1);
+}

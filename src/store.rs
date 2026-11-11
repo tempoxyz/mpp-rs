@@ -439,8 +439,10 @@ impl Store for FileStore {
 ///
 /// Local locks reduce contention; correctness requires backend-native
 /// [`Store::compare_exchange`]. Unsupported stores (including `FileStore`) fail
-/// closed on updates. A conflict returns an error before authorizing delivery;
-/// the caller may retry its operation against fresh state.
+/// closed on updates. A conflict returns an
+/// [`ErrorCode::ConcurrentUpdate`](crate::protocol::traits::ErrorCode::ConcurrentUpdate)
+/// error before authorizing delivery; the caller may retry its operation
+/// against fresh state.
 #[cfg(all(feature = "server", feature = "tempo"))]
 pub struct ChannelStoreAdapter {
     store: std::sync::Arc<dyn Store>,
@@ -585,9 +587,11 @@ impl crate::protocol::methods::tempo::session_method::ChannelStore for ChannelSt
                 .await
                 .map_err(|e| crate::protocol::traits::VerificationError::internal(e.to_string()))?;
             if !committed {
-                return Err(crate::protocol::traits::VerificationError::internal(
-                    "channel changed concurrently; retry against fresh state",
-                ));
+                return Err(
+                    crate::protocol::traits::VerificationError::concurrent_update(
+                        "channel changed concurrently; retry against fresh state",
+                    ),
+                );
             }
             if result.is_none() {
                 if let Ok(mut locks) = self.channel_locks.lock() {
@@ -1117,6 +1121,11 @@ mod adapter_tests {
             deduct_from_channel(&second, "ch1", 7_000)
         );
         assert_ne!(a.is_ok(), b.is_ok());
+        let lost = a.err().or(b.err()).unwrap();
+        assert_eq!(
+            lost.code,
+            Some(crate::protocol::traits::ErrorCode::ConcurrentUpdate)
+        );
         let saved: ChannelState =
             serde_json::from_value(store.inner.get("channels:ch1").await.unwrap().unwrap())
                 .unwrap();
