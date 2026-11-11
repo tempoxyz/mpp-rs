@@ -417,11 +417,12 @@ fn test_match_transfer_logs_validate_sender_not_called_for_memo_incompatible_log
 }
 
 #[test]
-fn test_assert_challenge_bound_memo_accepts_bound_memo() {
+fn test_assert_pull_attribution_logs_accepts_bound_memo() {
     let memo = attribution::encode("challenge-123", "api.example.com", None);
 
-    assert!(assert_challenge_bound_memo(
+    assert!(assert_pull_attribution_logs(
         &[MatchedTransferLog::Memo(memo)],
+        &[],
         "challenge-123",
         "api.example.com",
     )
@@ -430,9 +431,10 @@ fn test_assert_challenge_bound_memo_accepts_bound_memo() {
 
 /// Attribution is optional: a plain transfer is accepted.
 #[test]
-fn test_assert_challenge_bound_memo_accepts_plain_transfer() {
-    assert!(assert_challenge_bound_memo(
+fn test_assert_pull_attribution_logs_accepts_plain_transfer() {
+    assert!(assert_pull_attribution_logs(
         &[MatchedTransferLog::Transfer],
+        &[],
         "challenge-123",
         "api.example.com",
     )
@@ -440,11 +442,12 @@ fn test_assert_challenge_bound_memo_accepts_plain_transfer() {
 }
 
 #[test]
-fn test_assert_challenge_bound_memo_rejects_wrong_challenge() {
+fn test_assert_pull_attribution_logs_rejects_wrong_challenge() {
     let memo = attribution::encode("challenge-123", "api.example.com", None);
 
-    let error = assert_challenge_bound_memo(
+    let error = assert_pull_attribution_logs(
         &[MatchedTransferLog::Memo(memo)],
+        &[],
         "challenge-456",
         "api.example.com",
     )
@@ -463,9 +466,10 @@ fn test_assert_challenge_bound_memo_rejects_wrong_challenge() {
 
 /// A memo that is not in attribution format is accepted.
 #[test]
-fn test_assert_challenge_bound_memo_accepts_non_mpp_memo() {
-    assert!(assert_challenge_bound_memo(
+fn test_assert_pull_attribution_logs_accepts_non_mpp_memo() {
+    assert!(assert_pull_attribution_logs(
         &[MatchedTransferLog::Memo([0x11; 32])],
+        &[],
         "challenge-123",
         "api.example.com",
     )
@@ -474,30 +478,62 @@ fn test_assert_challenge_bound_memo_accepts_non_mpp_memo() {
     // tag with another version byte is not attribution.
     let mut other_version = attribution::encode("challenge-456", "api.example.com", None);
     other_version[4] = 0x02;
-    assert!(assert_challenge_bound_memo(
+    assert!(assert_pull_attribution_logs(
         &[MatchedTransferLog::Memo(other_version)],
+        &[],
         "challenge-123",
         "api.example.com",
     )
     .is_ok());
 }
 
-/// Another realm's attribution is that server's business: a pull payment
-/// carrying it is accepted, like a non-attribution memo.
+/// Another realm's attribution is rejected on a pull payment, even for the
+/// same challenge id: that realm could later accept the settled transfer as
+/// a hash credential it has no record of.
 #[test]
-fn test_assert_challenge_bound_memo_accepts_other_realm() {
-    let memo = attribution::encode("challenge-456", "api.example.com", None);
+fn test_assert_pull_attribution_logs_rejects_other_realm() {
+    for challenge_id in ["challenge-123", "challenge-456"] {
+        let memo = attribution::encode(challenge_id, "api.example.com", None);
 
-    assert!(assert_challenge_bound_memo(
+        let error = assert_pull_attribution_logs(
+            &[MatchedTransferLog::Memo(memo)],
+            &[],
+            "challenge-123",
+            "other.example.com",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("memo is not bound to this challenge"));
+        assert!(matches!(
+            crate::error::MppError::from(error),
+            crate::error::MppError::VerificationFailed(_)
+        ));
+    }
+}
+
+/// A memo the server configured is matched exactly and is not subject to
+/// the attribution rule.
+#[test]
+fn test_assert_pull_attribution_logs_accepts_configured_memo() {
+    let memo = attribution::encode("challenge-456", "other.example.com", None);
+    let configured = Transfer {
+        amount: U256::from(1u64),
+        recipient: Address::repeat_byte(0x33),
+        memo: Some(memo),
+    };
+
+    assert!(assert_pull_attribution_logs(
         &[MatchedTransferLog::Memo(memo)],
+        std::slice::from_ref(&configured),
         "challenge-123",
-        "other.example.com",
+        "api.example.com",
     )
     .is_ok());
 }
 
 #[test]
-fn test_assert_challenge_bound_memo_rejects_conflicting_attribution() {
+fn test_assert_pull_attribution_logs_rejects_conflicting_attribution() {
     let bound = MatchedTransferLog::Memo(attribution::encode(
         "challenge-123",
         "api.example.com",
@@ -507,8 +543,9 @@ fn test_assert_challenge_bound_memo_rejects_conflicting_attribution() {
 
     for conflicting in [other_challenge].map(MatchedTransferLog::Memo) {
         for matched in [[bound, conflicting], [conflicting, bound]] {
-            let error = assert_challenge_bound_memo(&matched, "challenge-123", "api.example.com")
-                .unwrap_err();
+            let error =
+                assert_pull_attribution_logs(&matched, &[], "challenge-123", "api.example.com")
+                    .unwrap_err();
             assert!(error
                 .to_string()
                 .contains("memo is not bound to this challenge"));
@@ -516,12 +553,13 @@ fn test_assert_challenge_bound_memo_rejects_conflicting_attribution() {
     }
 
     // Plain transfers and non-MPP memos carry no attribution to conflict.
-    assert!(assert_challenge_bound_memo(
+    assert!(assert_pull_attribution_logs(
         &[
             MatchedTransferLog::Memo([0x11; 32]),
             MatchedTransferLog::Transfer,
             bound,
         ],
+        &[],
         "challenge-123",
         "api.example.com",
     )

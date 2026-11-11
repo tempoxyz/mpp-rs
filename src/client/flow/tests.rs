@@ -1620,3 +1620,145 @@ async fn verification_failed_after_payment_pays_fresh_challenge() {
         assert!(provider.paid().len() > 1, "{via:?}: {:?}", provider.paid());
     }
 }
+
+/// A server that answers any request carrying a Payment credential with a
+/// 402 of `content_type` and `body` and a fresh challenge, and asks for
+/// payment otherwise.
+fn caller_credential_route(content_type: Option<&'static str>, body: String) -> Router {
+    let issued = Arc::new(AtomicU32::new(0));
+    Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let issued = issued.clone();
+            let body = body.clone();
+            async move {
+                let n = issued.fetch_add(1, Ordering::SeqCst);
+                if !super::carries_payment_credential(request.headers()) {
+                    return payment_required(&format!("fresh-{n}"), "charge");
+                }
+                let challenge = www_authenticate(&format!("fresh-{n}"), "tempo", "charge");
+                let mut response = (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(WWW_AUTHENTICATE, challenge)],
+                    body,
+                )
+                    .into_response();
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(reqwest::header::CONTENT_TYPE, content_type.parse().unwrap());
+                }
+                response
+            }
+        }),
+    )
+}
+
+/// A credential the caller set on the request is answered under the same
+/// final rules as one the flow sent: `invalid-challenge` (the replay answer)
+/// or an empty 402 is returned without paying the fresh challenge, as mppx
+/// does after `initialCredentialSent`.
+#[tokio::test]
+async fn refused_caller_credential_is_not_paid_again() {
+    let invalid_challenge =
+        serde_json::json!({"type": "https://paymentauth.org/problems/invalid-challenge"})
+            .to_string();
+    for (name, content_type, body) in [
+        (
+            "invalid-challenge",
+            Some("application/problem+json"),
+            invalid_challenge,
+        ),
+        ("empty body", None, String::new()),
+    ] {
+        let url = spawn_server(caller_credential_route(content_type, body)).await;
+        for (header, value) in [
+            ("authorization", "Payment eyJjaGFsbGVuZ2UiOnt9fQ"),
+            ("payment-authorization", "eyJjaGFsbGVuZ2UiOnt9fQ"),
+        ] {
+            for via in BOTH {
+                let provider = TestProvider::default();
+                let response = via
+                    .send(
+                        reqwest::Client::new()
+                            .get(format!("{url}/paid"))
+                            .header(header, value),
+                        &provider,
+                        ClientEvents::default(),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("{name}, {header}, {via:?}: {err}"));
+                assert_eq!(
+                    response.status(),
+                    StatusCode::PAYMENT_REQUIRED,
+                    "{name}, {header}, {via:?}"
+                );
+                assert!(
+                    provider.paid().is_empty(),
+                    "{name}, {header}, {via:?}: {:?}",
+                    provider.paid()
+                );
+            }
+        }
+    }
+}
+
+/// A caller credential refused for another reason, such as
+/// verification-failed, still lets the client pay the fresh challenge.
+#[tokio::test]
+async fn caller_credential_verification_failed_pays_fresh_challenge() {
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/verification-failed"})
+        .to_string();
+    let url = spawn_server(caller_credential_route(
+        Some("application/problem+json"),
+        body,
+    ))
+    .await;
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let response = via
+            .send(
+                reqwest::Client::new()
+                    .get(format!("{url}/paid"))
+                    .header("authorization", "Payment eyJjaGFsbGVuZ2UiOnt9fQ"),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert!(!provider.paid().is_empty(), "{via:?}");
+    }
+}
+
+#[test]
+fn carries_payment_credential_reads_both_headers() {
+    let headers = |pairs: &[(&'static str, &'static str)]| {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert!(super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "Payment abc"
+    )])));
+    assert!(super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "payment abc"
+    )])));
+    assert!(super::carries_payment_credential(&headers(&[(
+        "Payment-Authorization",
+        "abc"
+    )])));
+    assert!(!super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "Bearer abc"
+    )])));
+    assert!(!super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "Paymentabc"
+    )])));
+    assert!(!super::carries_payment_credential(&headers(&[])));
+}

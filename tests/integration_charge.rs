@@ -2252,9 +2252,9 @@ async fn test_keychain_sponsored_charge_passes_simulation_and_settles() {
 /// Reject invalid attribution before settlement, then accept a valid payment
 /// from the same payer to ensure rejection does not prevent legitimate payment.
 /// Transaction (pull) credentials follow the optional attribution rule: a
-/// plain transfer, a non-attribution memo, another realm's attribution and a
-/// bound attribution memo settle, while this realm's attribution for another
-/// challenge is refused before any funds move.
+/// plain transfer, a non-attribution memo and a bound attribution memo
+/// settle, while attribution for another challenge or another realm is
+/// refused before any funds move.
 #[tokio::test]
 async fn test_pull_attribution_optional_and_foreign_rejected() {
     assert_pull_attribution_optional_and_foreign_rejected(false).await;
@@ -2302,7 +2302,8 @@ async fn assert_pull_attribution_optional_and_foreign_rejected(sponsored: bool) 
             },
             false,
         ),
-        // Another realm's attribution is that server's business.
+        // Another realm could later accept this settled transfer as a hash
+        // credential it has no record of.
         (
             "other realm",
             |challenge| {
@@ -2312,7 +2313,7 @@ async fn assert_pull_attribution_optional_and_foreign_rejected(sponsored: bool) 
                     None,
                 ))
             },
-            true,
+            false,
         ),
         ("non-MPP memo", |_| Some([0xab; 32]), true),
         ("plain transfer", |_| None, true),

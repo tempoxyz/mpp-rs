@@ -206,11 +206,15 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 headers,
             }
         });
+        // A credential the caller set on the request is sent as it is, like
+        // mppx's `initialCredentialSent`; its rejection is answered below.
+        let caller_credential = carries_payment_credential(request.headers());
         let prepaid = match (&initial_response, &payment_context) {
             // A prepaid credential is sent before any 402, so it would bypass
             // the approval hook; with a hook set, every payment waits for one.
             (None, Some(context))
                 if payment_allowed
+                    && !caller_credential
                     && exchange.allows_prepaid()
                     && !self.events.has_on_challenge() =>
             {
@@ -261,6 +265,18 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
         if resp.status() != StatusCode::PAYMENT_REQUIRED || !payment_allowed {
             return Ok(resp);
+        }
+
+        // The caller's own credential was refused. Under the same rules as a
+        // credential this flow sent, the 402 is final: the earlier payment
+        // behind that credential may have settled, so paying the fresh
+        // challenge could pay twice.
+        if caller_credential {
+            let (rebuilt, rejected) = credential_rejected(resp).await;
+            resp = rebuilt;
+            if rejected {
+                return Ok(resp);
+            }
         }
 
         let (Some(retry), Some(payment_context)) = (retry, payment_context) else {
@@ -638,13 +654,9 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             // with another body is paid again, as in mppx (which has no
             // empty-body rejections to tell apart).
             if status == StatusCode::PAYMENT_REQUIRED {
-                if is_problem_json(&resp) {
-                    let (rebuilt, problem_type) = read_problem_type(resp).await;
-                    resp = rebuilt;
-                    if problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge")) {
-                        return Ok(resp);
-                    }
-                } else if has_empty_body(&resp) {
+                let (rebuilt, rejected) = credential_rejected(resp).await;
+                resp = rebuilt;
+                if rejected {
                     return Ok(resp);
                 }
             }
@@ -878,6 +890,40 @@ pub fn is_cross_realm_proof_with_trust(
     binds_realm
         && !requested_host.is_some_and(|host| challenge.realm.eq_ignore_ascii_case(&host))
         && trusted_realm != Some(challenge.realm.as_str())
+}
+
+/// Whether `headers` carry a Payment credential: a `Payment-Authorization`
+/// header, or an `Authorization` header with the `Payment` scheme.
+fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key("payment-authorization")
+        || headers
+            .get_all(reqwest::header::AUTHORIZATION)
+            .iter()
+            .any(|value| {
+                value
+                    .as_bytes()
+                    .split(|byte| *byte == b' ')
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
+            })
+}
+
+/// Whether a `402` answering a credential is final rather than a fresh
+/// Challenge to pay: an `invalid-challenge` problem (how a replayed
+/// credential is answered), a problem whose type cannot be read, or an empty
+/// body (how the default Tower layer answers a rejected credential). A
+/// problem naming another failure, such as `verification-failed`, or a 402
+/// with another body is paid again, as in mppx. Returns an equivalent
+/// response, since reading the problem type consumes the body.
+async fn credential_rejected(resp: Response) -> (Response, bool) {
+    if is_problem_json(&resp) {
+        let (rebuilt, problem_type) = read_problem_type(resp).await;
+        let rejected = problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge"));
+        (rebuilt, rejected)
+    } else {
+        let rejected = has_empty_body(&resp);
+        (resp, rejected)
+    }
 }
 
 /// Whether a response's body is RFC 9457 problem details.

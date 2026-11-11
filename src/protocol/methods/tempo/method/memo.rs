@@ -3,24 +3,30 @@
 //! Attribution is optional for transaction (pull) credentials and
 //! zero-amount proofs: the server broadcasts the client's own signed
 //! transaction, so a transfer with no memo, or with a memo that is not in
-//! attribution format, is accepted. Hash (push) credentials name a transfer
-//! that is already on chain, so they must carry attribution bound to the
-//! challenge; otherwise anyone who saw an unattributed transfer to the
-//! recipient could present it. An attribution memo of this realm for another
-//! challenge is always rejected, so one transaction cannot settle here and
-//! later be claimed for that other challenge. Attribution for another realm
-//! is accepted on pull credentials; a push credential still needs a memo
-//! bound to this challenge and realm.
+//! attribution format, is accepted. Any attribution memo on a pull
+//! credential must be bound to this challenge and realm, though: a pull
+//! settled here carrying another realm's or another challenge's attribution
+//! could later be presented to that server as a hash credential, and its
+//! replay store has no record of the settlement. Memos the server configures
+//! (`methodDetails.memo`, split memos) are matched exactly and exempt.
+//!
+//! Hash (push) credentials name a transfer that is already on chain, so they
+//! must carry attribution bound to the challenge; otherwise anyone who saw
+//! an unattributed transfer to the recipient could present it. Attribution
+//! of this realm for another challenge on a push credential is rejected;
+//! attribution for another realm on one of its other transfers is accepted.
 
 use crate::protocol::traits::VerificationError;
 use crate::tempo::attribution;
 
+use super::super::transfers::Transfer;
 use super::receipt_logs::MatchedTransferLog;
 
-/// Reject attribution for another challenge among the matched transfers of a
-/// settled receipt; plain transfers and non-attribution memos are accepted.
-pub(super) fn assert_challenge_bound_memo(
+/// The attribution check for the matched transfers of a settled pull
+/// receipt: [`assert_pull_attribution`] over the memos of `matched_logs`.
+pub(super) fn assert_pull_attribution_logs(
     matched_logs: &[MatchedTransferLog],
+    expected: &[Transfer],
     challenge_id: &str,
     realm: &str,
 ) -> Result<(), VerificationError> {
@@ -28,44 +34,53 @@ pub(super) fn assert_challenge_bound_memo(
         MatchedTransferLog::Transfer => None,
         MatchedTransferLog::Memo(memo) => Some(memo),
     });
-    assert_challenge_bound_memos(memos, challenge_id, realm)
+    assert_pull_attribution(memos, expected, challenge_id, realm)
 }
 
-/// Reject any attribution memo of this realm among `memos` that is bound to
-/// another challenge. Memos that are not in attribution format (their first
-/// five bytes are not the MPP tag and version), attribution for another
-/// realm, and no attribution at all are accepted.
+/// The attribution check for the matched transfers of a transaction (pull)
+/// credential: reject any attribution memo that is not bound to this
+/// challenge and realm, including another realm's attribution.
+///
+/// Plain transfers, memos that are not in attribution format (their first
+/// five bytes are not the MPP tag and version) and memos equal to one the
+/// server configured in `expected` are accepted.
 ///
 /// A failure is a verification failure (402 with a fresh challenge), as the
 /// spec requires, not a replayed credential.
-pub(super) fn assert_challenge_bound_memos<'a>(
+pub(super) fn assert_pull_attribution<'a>(
+    memos: impl IntoIterator<Item = &'a [u8; 32]>,
+    expected: &[Transfer],
+    challenge_id: &str,
+    realm: &str,
+) -> Result<(), VerificationError> {
+    for memo in memos {
+        let configured = expected
+            .iter()
+            .any(|transfer| transfer.memo.as_ref() == Some(memo));
+        if !configured
+            && attribution::is_mpp_memo(memo)
+            && !is_challenge_bound_memo(memo, challenge_id, realm)
+        {
+            return Err(challenge_bound_memo_error());
+        }
+    }
+    Ok(())
+}
+
+/// Reject any attribution memo of this realm among `memos` that is bound to
+/// another challenge. Memos that are not in attribution format, attribution
+/// for another realm, and no attribution at all are accepted.
+fn assert_challenge_bound_memos<'a>(
     memos: impl IntoIterator<Item = &'a [u8; 32]>,
     challenge_id: &str,
     realm: &str,
 ) -> Result<(), VerificationError> {
     for memo in memos {
-        assert_memo_not_foreign(memo, challenge_id, realm)?;
-    }
-    Ok(())
-}
-
-/// Reject `memo` when it is an attribution memo of this realm bound to
-/// another challenge.
-///
-/// Such a transaction could otherwise settle here and later be presented as
-/// a hash credential for that other challenge. Attribution for another realm
-/// is another server's business and is accepted, like any non-attribution
-/// memo.
-pub(super) fn assert_memo_not_foreign(
-    memo: &[u8; 32],
-    challenge_id: &str,
-    realm: &str,
-) -> Result<(), VerificationError> {
-    if attribution::is_mpp_memo(memo)
-        && attribution::verify_server(memo, realm)
-        && !attribution::verify_challenge_binding(memo, challenge_id)
-    {
-        return Err(challenge_bound_memo_error());
+        if attribution::verify_server(memo, realm)
+            && !attribution::verify_challenge_binding(memo, challenge_id)
+        {
+            return Err(challenge_bound_memo_error());
+        }
     }
     Ok(())
 }

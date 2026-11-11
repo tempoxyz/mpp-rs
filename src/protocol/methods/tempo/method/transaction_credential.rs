@@ -17,9 +17,7 @@ use super::super::{proof, TempoChargeExt};
 use super::calls::{validate_fee_payer_calls, PaymentCalls};
 use super::fee_payer::FeePayerPolicy;
 use super::matching::{match_transfers, TransferSource};
-use super::memo::{
-    assert_challenge_bound_memo, assert_challenge_bound_memos, assert_memo_not_foreign,
-};
+use super::memo::{assert_pull_attribution, assert_pull_attribution_logs};
 use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
 use super::{ensure_challenge_not_expired, ChargeMethod};
 
@@ -212,7 +210,7 @@ where
             if let (Some((challenge_id, realm)), Some(memo)) =
                 (challenge_binding, route.transfer.memo.as_ref())
             {
-                assert_memo_not_foreign(memo, challenge_id, realm)?;
+                assert_pull_attribution([memo], expected, challenge_id, realm)?;
             }
             return Ok(Some(route.settlement_sender));
         }
@@ -241,8 +239,9 @@ where
         )?;
 
         if let Some((challenge_id, realm)) = challenge_binding {
-            assert_challenge_bound_memos(
+            assert_pull_attribution(
                 matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+                expected,
                 challenge_id,
                 realm,
             )?;
@@ -610,7 +609,7 @@ where
                     settlement_senders: &settlement_senders,
                 },
             )?;
-            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
+            assert_pull_attribution_logs(&matched_logs, &expected, challenge_id, realm)?;
 
             // Record the on-chain tx hash for hash-based replay protection. Use the
             // atomic claim so a concurrent hash credential for the same tx cannot

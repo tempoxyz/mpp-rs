@@ -15,7 +15,7 @@ use super::{
     calls::{TRANSFER_SELECTOR, TRANSFER_WITH_MEMO_SELECTOR},
     fee_payer::MAX_FEE_PAYER_GAS_LIMIT,
     hash_credential::parse_hash_credential_source,
-    memo::assert_challenge_bound_memo,
+    memo::assert_pull_attribution_logs,
     receipt_logs::{MatchedTransferLog, ReceiptSenderPolicy},
     transaction_credential::TransactionValidationOptions,
     *,
