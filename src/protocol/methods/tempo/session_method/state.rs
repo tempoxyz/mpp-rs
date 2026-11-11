@@ -190,12 +190,10 @@ impl ChannelState {
                 "voucher after must be below cumulativeAmount",
             ));
         }
-        let resync = |reason: &str| {
-            VerificationError::delta_too_small(format!(
-                "{reason}; acceptedCumulative {highest}, requiredCumulative {}",
-                highest.saturating_add(min_delta.max(1)),
-            ))
-        };
+        // A window refusal names no amounts, so a replayed voucher reveals
+        // nothing about the channel. Clients resynchronize from the signed
+        // snapshot voucher in the next Challenge instead.
+        let resync = |reason: &str| VerificationError::delta_too_small(reason);
         if cumulative_amount <= window.floor {
             return Err(resync("voucher is older than the reorder window (stale)"));
         }

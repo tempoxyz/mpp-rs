@@ -65,8 +65,8 @@ fn serial_vouchers_without_after_grow_one_run() {
 }
 
 /// Replaying any accepted voucher inside the window is refused as seen,
-/// including an exact replay of the highest one, and carries the amounts
-/// a client resynchronizes from.
+/// including an exact replay of the highest one, without naming the
+/// channel's accepted or required amounts to whoever replayed it.
 #[test]
 fn replays_are_seen() {
     let state = accept(channel_at(100), 120, Some(110), NOW).unwrap();
@@ -76,12 +76,10 @@ fn replays_are_seen() {
         let err = accept(state.clone(), cumulative, after, NOW).unwrap_err();
         assert_eq!(err.code, Some(ErrorCode::DeltaTooSmall));
         assert!(err.message.contains("(seen)"), "{}", err.message);
-        let problem = err.to_problem_details(None);
-        assert_eq!(problem.accepted_cumulative.as_deref(), Some("120"));
-        assert_eq!(problem.required_cumulative.as_deref(), Some("121"));
-        let json = serde_json::to_value(&problem).unwrap();
-        assert_eq!(json["acceptedCumulative"], "120");
-        assert_eq!(json["requiredCumulative"], "121");
+        assert!(!err.message.contains("120"), "{}", err.message);
+        let json = serde_json::to_value(err.to_problem_details(None)).unwrap();
+        assert!(json.get("acceptedCumulative").is_none(), "{json}");
+        assert!(json.get("requiredCumulative").is_none(), "{json}");
     }
 }
 

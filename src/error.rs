@@ -89,27 +89,6 @@ pub struct PaymentErrorDetails {
         skip_serializing_if = "Option::is_none"
     )]
     pub funding_url: Option<String>,
-
-    /// The cumulative amount the server has accepted on the channel, as a
-    /// decimal string, when it refused a session voucher that did not add to
-    /// it. Clients resynchronize their voucher counter from it. This is an
-    /// RFC 9457 extension member, `acceptedCumulative`.
-    #[serde(
-        rename = "acceptedCumulative",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub accepted_cumulative: Option<String>,
-
-    /// The lowest cumulative amount a new voucher must reach, as a decimal
-    /// string, alongside [`accepted_cumulative`](Self::accepted_cumulative).
-    /// This is an RFC 9457 extension member, `requiredCumulative`.
-    #[serde(
-        rename = "requiredCumulative",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub required_cumulative: Option<String>,
 }
 
 impl PaymentErrorDetails {
@@ -123,8 +102,6 @@ impl PaymentErrorDetails {
             challenge_id: None,
             hint: None,
             funding_url: None,
-            accepted_cumulative: None,
-            required_cumulative: None,
         }
     }
 
@@ -814,14 +791,6 @@ impl PaymentError for MppError {
             }
         }
 
-        // A session server refusing a voucher that adds nothing writes the
-        // channel's accepted and required amounts into the reason, so the
-        // client can resynchronize its voucher counter.
-        if let Self::DeltaTooSmall(Some(reason)) = self {
-            problem.accepted_cumulative = amount_after(reason, "acceptedCumulative ");
-            problem.required_cumulative = amount_after(reason, "requiredCumulative ");
-        }
-
         // Use embedded challenge ID from InvalidChallenge, or the provided one
         let embedded_id = match self {
             Self::InvalidChallenge { id, .. } => id.as_deref(),
@@ -832,16 +801,6 @@ impl PaymentError for MppError {
         }
         problem
     }
-}
-
-/// The decimal amount that follows `label` in `reason`, if any.
-fn amount_after(reason: &str, label: &str) -> Option<String> {
-    let start = reason.find(label)? + label.len();
-    let digits: String = reason[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    (!digits.is_empty()).then_some(digits)
 }
 
 #[cfg(test)]

@@ -363,8 +363,9 @@ where
     /// `_meta`. A session channel whose deposit does not cover the call is
     /// topped up first by the same call carrying the top-up credential.
     /// Successful retries record their receipt and commit provider state.
-    /// Definitive rejection rolls it back; cancellation and transport
-    /// ambiguity invoke only the provider's synchronous abandonment hook.
+    /// Definitive rejection is reported to the provider as a refusal it could
+    /// not read, then rolls it back; cancellation and transport ambiguity
+    /// invoke only the provider's synchronous abandonment hook.
     pub async fn call_tool(
         &self,
         params: C::Params,
@@ -403,6 +404,7 @@ where
                     .payment_challenges_from_output(&output)
                     .is_some()
                 {
+                    self.report_refusal(&pending);
                     pending.rollback().await?;
                 } else {
                     if let Some(receipt) = self.caller.receipt_from_output(&output) {
@@ -413,11 +415,25 @@ where
                 Ok(output)
             }
             Err(error) if self.caller.is_definitive_error(&error) => {
+                self.report_refusal(&pending);
                 pending.rollback().await?;
                 Err(McpClientError::Transport(error))
             }
             Err(error) => Err(McpClientError::Transport(error)),
         }
+    }
+
+    /// Reports a server's refusal of a sent credential, whose problem details
+    /// MCP does not carry (`null`), before it is rolled back, as the HTTP flow
+    /// does. A session provider then treats a voucher range the server may
+    /// have refused as already accepted or stale as not lost, and never signs
+    /// it again.
+    fn report_refusal(&self, pending: &PendingPayment<P>) {
+        self.payment.provider.observe_refusal(
+            pending.challenge(),
+            pending.credential(),
+            &serde_json::Value::Null,
+        );
     }
 }
 
@@ -451,6 +467,8 @@ mod tests {
         management_receipts: Mutex<Vec<Option<Receipt>>>,
         pays: AtomicUsize,
         receipts: AtomicUsize,
+        refusals: AtomicUsize,
+        refused_before_rollback: AtomicBool,
         rollbacks: AtomicUsize,
     }
 
@@ -547,12 +565,26 @@ mod tests {
             _challenge: &PaymentChallenge,
             _credential: &PaymentCredential,
         ) -> Result<(), MppError> {
+            self.lifecycle.refused_before_rollback.store(
+                self.lifecycle.refusals.load(Ordering::SeqCst) > 0,
+                Ordering::SeqCst,
+            );
             self.lifecycle.rollbacks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
         fn abandon_payment(&self, _challenge: &PaymentChallenge, _credential: &PaymentCredential) {
             self.lifecycle.abandons.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn observe_refusal(
+            &self,
+            _challenge: &PaymentChallenge,
+            _credential: &PaymentCredential,
+            problem: &Value,
+        ) {
+            assert!(problem.is_null(), "MCP carries no problem details");
+            self.lifecycle.refusals.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -973,6 +1005,49 @@ mod tests {
         assert!(matches!(error, McpClientError::Transport(_)));
         assert_eq!(provider.lifecycle.rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(provider.lifecycle.abandons.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.lifecycle.refusals.load(Ordering::SeqCst), 1);
+        assert!(provider
+            .lifecycle
+            .refused_before_rollback
+            .load(Ordering::SeqCst));
+    }
+
+    /// A paid call answered with a new payment challenge refused the
+    /// credential: the provider hears of the refusal before rolling back.
+    #[tokio::test]
+    async fn challenged_retry_reports_the_refusal_before_rolling_back() {
+        let caller = TestCaller::new([
+            Err(payment_error(true)),
+            Ok(json!({
+                "_meta": {
+                    PAYMENT_REQUIRED_META_KEY: {"challenges": [challenge()]}
+                },
+                "isError": true
+            })),
+        ]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller, provider.clone(), context());
+
+        client.call_tool(params()).await.unwrap();
+
+        assert_eq!(provider.lifecycle.rollbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.lifecycle.refusals.load(Ordering::SeqCst), 1);
+        assert!(provider
+            .lifecycle
+            .refused_before_rollback
+            .load(Ordering::SeqCst));
+    }
+
+    /// Ambiguous delivery reports no refusal: the server may have accepted it.
+    #[tokio::test]
+    async fn ambiguous_delivery_reports_no_refusal() {
+        let caller = TestCaller::new([Err(payment_error(true)), Err(transport_error(false))]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller, provider.clone(), context());
+
+        let _ = client.call_tool(params()).await;
+
+        assert_eq!(provider.lifecycle.refusals.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
