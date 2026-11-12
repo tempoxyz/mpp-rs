@@ -24,6 +24,10 @@ const PAYMENT_HEADERS: &[&str] = &[
     "www-authenticate",
 ];
 
+/// Identity proofs a client sends the proxy, such as Tempo ID's DPoP proof
+/// and ID token, which name the user to the proxy and never go upstream.
+const IDENTITY_HEADERS: &[&str] = &["dpop", "tempo-id-token"];
+
 fn eq_ascii_lower(name: &str, lower: &str) -> bool {
     name.len() == lower.len()
         && name
@@ -39,6 +43,9 @@ pub fn is_request_header_stripped(name: &str) -> bool {
         return true;
     }
     if PAYMENT_HEADERS.iter().any(|h| eq_ascii_lower(name, h)) {
+        return true;
+    }
+    if IDENTITY_HEADERS.iter().any(|h| eq_ascii_lower(name, h)) {
         return true;
     }
     if eq_ascii_lower(name, "host")
@@ -226,6 +233,13 @@ fn remove_payment_challenges(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_identity_proofs_stay_with_the_proxy() {
+        for name in ["DPoP", "Tempo-Id-Token"] {
+            assert!(is_request_header_stripped(name), "{name}");
+        }
+    }
 
     #[test]
     fn test_scrub_response_drops_payment_hidden_by_parser_mismatch() {

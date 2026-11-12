@@ -98,9 +98,9 @@ impl Config {
     /// DPoP proof's `htu` names.
     ///
     /// mppx reads the full request URL; a Rust server often sees only the
-    /// path, so without this the origin is the request URI's, else
-    /// `https://` and the `Host` header. The client sends `Host`, so set
-    /// this whenever DPoP-bound tokens should be bound to this API's origin.
+    /// path. Without this the origin is the request URI's, and a request
+    /// whose URI names none rejects DPoP-bound tokens: the `Host` header is
+    /// the client's to choose, so it never stands in.
     pub fn origin(mut self, origin: impl Into<String>) -> Self {
         self.origin = Some(origin.into());
         self
@@ -545,6 +545,9 @@ impl Core {
         }
 
         let claims = &proof.claims;
+        if self.htu(request).is_none() {
+            return Err("This API needs a configured origin to accept DPoP-bound tokens.");
+        }
         if str_claim(claims, "htm") != Some(request.method().as_str())
             || str_claim(claims, "htu") != self.htu(request).as_deref()
         {
@@ -589,13 +592,18 @@ impl Core {
 }
 
 /// The URL of `request` without its query, on `origin` when given, else on
-/// the request's own scheme and host, as mppx's `Jwt.htu(request.url)`.
+/// the request URI's own scheme and host, as mppx's `Jwt.htu(request.url)`.
+///
+/// `None` when neither names an origin. mppx's request URL is absolute; a
+/// Rust server often sees only the path, and the `Host` header is the
+/// client's to choose, so it never stands in: a proof made for another origin
+/// would then match.
 fn htu(origin: Option<&str>, request: &IdentityRequest) -> Option<String> {
     let uri = request.uri();
     let origin = match (origin, uri.scheme_str(), uri.authority()) {
         (Some(origin), _, _) => origin.to_owned(),
         (None, Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
-        (None, _, _) => format!("https://{}", request.header(http_types::header::HOST)?),
+        (None, _, _) => return None,
     };
     let mut url = Url::parse(&origin).ok()?;
     // Set the path literally: resolved as a reference, a path such as

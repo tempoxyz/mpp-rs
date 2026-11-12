@@ -673,11 +673,50 @@ mod dpop {
             "Payment eyJjaGFsbGVuZ2UiOnt9fQ".parse().unwrap(),
         );
         assert!(dpop.prove(&mut request, &context).await.is_err());
+
+        // A Challenge whose Credential goes in Authorization is refused before paying.
+        use crate::identity::client::{PrepareContext, ResponseParts};
+        let challenge = |header: Option<&str>| {
+            let mut challenge = crate::protocol::core::PaymentChallenge::new(
+                "id",
+                "realm",
+                "tempo",
+                "charge",
+                crate::protocol::core::Base64UrlJson::from_value(&json!({})).unwrap(),
+            );
+            challenge.header = header.map(str::to_owned);
+            PrepareContext {
+                challenge,
+                requirements: Vec::new(),
+            }
+        };
+        let parts = ResponseParts {
+            status: http_types::StatusCode::PAYMENT_REQUIRED,
+            headers: http_types::HeaderMap::new(),
+            url: URL.parse().unwrap(),
+        };
+        assert!(dpop.prepare(&parts, &challenge(None)).await.is_err());
+        assert!(dpop
+            .prepare(&parts, &challenge(Some("Payment-Authorization")))
+            .await
+            .is_ok());
         assert!(request.headers()["authorization"]
             .to_str()
             .unwrap()
             .starts_with("Payment "));
     }
+}
+
+#[test]
+fn htu_never_trusts_the_host_header() {
+    let mut headers = http_types::HeaderMap::new();
+    headers.insert("host", "other.example".parse().unwrap());
+    let request = IdentityRequest::new(http_types::Method::GET, "/haiku".parse().unwrap(), headers);
+    assert_eq!(htu(None, &request), None);
+    assert_eq!(
+        htu(Some("https://api.example"), &request).as_deref(),
+        Some("https://api.example/haiku")
+    );
 }
 
 #[test]

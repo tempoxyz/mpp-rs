@@ -12,7 +12,9 @@ use reqwest::Request;
 use super::constants::ID_TOKEN_HEADER;
 use super::jwt;
 use super::DpopKey;
-use crate::identity::client::{ProveContext, Prover, ProverError, Scope};
+use crate::identity::client::{
+    PrepareContext, ProveContext, Prover, ProverError, ResponseParts, Scope,
+};
 use crate::identity::BoxFuture;
 use crate::protocol::core::headers::extract_payment_scheme;
 
@@ -84,6 +86,8 @@ pub struct TempoIdProver {
 
 const HEADERS: &[&str] = &["dpop", "tempo-id-token"];
 
+const REQUIRES_AUTH: &str = "the Tempo ID access token needs Authorization, which holds the Payment Credential: the server must set requires_auth";
+
 impl Prover for TempoIdProver {
     fn scope(&self) -> &Scope {
         &self.config.scope
@@ -91,6 +95,25 @@ impl Prover for TempoIdProver {
 
     fn headers(&self) -> &[&'static str] {
         HEADERS
+    }
+
+    // Refuses before the client pays: the access token needs Authorization,
+    // and a Challenge naming it would put the Payment Credential there too.
+    fn prepare<'a>(
+        &'a self,
+        _response: &'a ResponseParts,
+        context: &'a PrepareContext,
+    ) -> BoxFuture<'a, Result<(), ProverError>> {
+        let result = if context
+            .challenge
+            .credential_header()
+            .eq_ignore_ascii_case(AUTHORIZATION.as_str())
+        {
+            Err(ProverError::new(REQUIRES_AUTH))
+        } else {
+            Ok(())
+        };
+        Box::pin(std::future::ready(result))
     }
 
     fn prove<'a>(
@@ -119,9 +142,7 @@ impl Prover for TempoIdProver {
                 .and_then(extract_payment_scheme)
                 .is_some();
             if holds_credential {
-                return Err(ProverError::new(
-                    "the Tempo ID access token needs Authorization, which holds the Payment Credential: the server must set requires_auth",
-                ));
+                return Err(ProverError::new(REQUIRES_AUTH));
             }
             request.headers_mut().insert(AUTHORIZATION, value);
             if let Some(key) = &self.config.dpop {
