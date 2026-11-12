@@ -192,6 +192,26 @@ async fn test_binding_mismatch_is_reported_before_expiry() {
     assert_eq!(err.code, Some(ErrorCode::Expired), "{err}");
 }
 
+/// A route opaque with numbers JCS keeps as written is issued with the default
+/// nonce, and the handler accepts its own Challenges.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_numeric_route_opaque_with_nonce_verifies_its_own_challenges() {
+    let opaque = Base64UrlJson::from_raw(crate::protocol::core::base64url_encode(
+        br#"{"price":1,"rate":0.5,"n":-3,"big":9007199254740991,"tier":"a"}"#,
+    ));
+    let mpp = spec_mpp().with_opaque(opaque);
+    assert!(mpp.nonce());
+    let challenge = mpp.charge("0.10").unwrap().remove(0);
+    let issued = challenge.opaque.as_ref().unwrap().decode_value().unwrap();
+    assert!(issued.get("_mpp_nonce").is_some(), "{issued}");
+    assert_eq!(issued["price"], 1);
+    let credential =
+        PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+    let result = mpp.verify_charge(&credential, "0.10").await;
+    assert!(result.is_ok(), "{result:?}");
+}
+
 /// A route opaque that is an empty object, another JSON value, raw JSON with
 /// numbers JCS would rewrite, or not JSON at all is issued and matched with the nonce on and off, so a handler accepts
 /// its own Challenges.
