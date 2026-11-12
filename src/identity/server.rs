@@ -191,6 +191,12 @@ pub trait PaymentCheck: Send + Sync + 'static {
     /// Identities the check requires, advertised in every 402 of the route.
     fn requires(&self) -> &[Requirement];
 
+    /// Whether the check reads its credential from `Authorization`, as
+    /// [`Verifier::reads_authorization`].
+    fn reads_authorization(&self) -> bool {
+        false
+    }
+
     /// Returns the check's outcome for the paid retry.
     fn verify<'a>(
         &'a self,
@@ -312,6 +318,7 @@ impl<V: Verifier> From<Handle<V>> for ErasedVerifier {
 
 trait DynCheck: Send + Sync {
     fn requires(&self) -> &[Requirement];
+    fn reads_authorization(&self) -> bool;
     fn verify_any<'a>(
         &'a self,
         input: PaymentCheckInput<'a>,
@@ -321,6 +328,10 @@ trait DynCheck: Send + Sync {
 impl<C: PaymentCheck> DynCheck for C {
     fn requires(&self) -> &[Requirement] {
         PaymentCheck::requires(self)
+    }
+
+    fn reads_authorization(&self) -> bool {
+        PaymentCheck::reads_authorization(self)
     }
 
     fn verify_any<'a>(
@@ -1002,10 +1013,14 @@ impl RouteIdentity {
         self
     }
 
-    /// Whether any verifier reads `Authorization`, so the server must be
-    /// created with `requires_auth`.
+    /// Whether any verifier or the payment check reads `Authorization`, so
+    /// the server must be created with `requires_auth`.
     pub fn reads_authorization(&self) -> bool {
         self.request.iter().any(ErasedVerifier::reads_authorization)
+            || self
+                .payment
+                .as_ref()
+                .is_some_and(|check| check.inner.reads_authorization())
     }
 
     /// Identities the payment check requires.

@@ -14,6 +14,7 @@ use super::jwt;
 use super::DpopKey;
 use crate::identity::client::{ProveContext, Prover, ProverError, Scope};
 use crate::identity::BoxFuture;
+use crate::protocol::core::headers::extract_payment_scheme;
 
 type TokenFn = Arc<dyn Fn() -> BoxFuture<'static, Result<String, ProverError>> + Send + Sync>;
 type IdTokenFn = Arc<dyn Fn() -> BoxFuture<'static, Option<String>> + Send + Sync>;
@@ -108,6 +109,20 @@ impl Prover for TempoIdProver {
                 HeaderValue::from_str(&format!("{scheme} {access_token}")).map_err(|_| {
                     ProverError::new("the Tempo ID access token is not a valid header value")
                 })?;
+            // The access token would replace a Payment Credential in
+            // Authorization; a server created with requires_auth takes the
+            // Credential in Payment-Authorization instead.
+            let holds_credential = request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(extract_payment_scheme)
+                .is_some();
+            if holds_credential {
+                return Err(ProverError::new(
+                    "the Tempo ID access token needs Authorization, which holds the Payment Credential: the server must set requires_auth",
+                ));
+            }
             request.headers_mut().insert(AUTHORIZATION, value);
             if let Some(key) = &self.config.dpop {
                 let proof = proof(key, &access_token, request);

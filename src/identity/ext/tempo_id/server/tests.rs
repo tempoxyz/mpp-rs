@@ -664,5 +664,40 @@ mod dpop {
         assert_eq!(proof.claims["htm"], "GET");
         assert_eq!(proof.claims["htu"], URL);
         assert_eq!(proof.claims["ath"], jwt::sha256("token-2"));
+
+        // A paid attempt whose Credential is in Authorization fails instead of
+        // losing the Credential.
+        let mut request = reqwest::Request::new(reqwest::Method::GET, URL.parse().unwrap());
+        request.headers_mut().insert(
+            "authorization",
+            "Payment eyJjaGFsbGVuZ2UiOnt9fQ".parse().unwrap(),
+        );
+        assert!(dpop.prove(&mut request, &context).await.is_err());
+        assert!(request.headers()["authorization"]
+            .to_str()
+            .unwrap()
+            .starts_with("Payment "));
     }
+}
+
+#[test]
+fn htu_keeps_the_host_for_scheme_relative_paths() {
+    let request = IdentityRequest::new(
+        http_types::Method::GET,
+        "//evil.example/x?q=1".parse().unwrap(),
+        http_types::HeaderMap::new(),
+    );
+    assert_eq!(
+        htu(Some("https://api.example"), &request).as_deref(),
+        Some("https://api.example//evil.example/x")
+    );
+}
+
+#[test]
+fn payment_check_needs_requires_auth() {
+    let issuer = "https://id.example";
+    let tempo_id = create(Config::new(CLIENT_ID).issuer(issuer));
+    assert!(crate::identity::RouteIdentity::new()
+        .payment(&tempo_id.payment_check)
+        .reads_authorization());
 }

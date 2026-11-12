@@ -99,7 +99,8 @@ impl Config {
     ///
     /// mppx reads the full request URL; a Rust server often sees only the
     /// path, so without this the origin is the request URI's, else
-    /// `https://` and the `Host` header.
+    /// `https://` and the `Host` header. The client sends `Host`, so set
+    /// this whenever DPoP-bound tokens should be bound to this API's origin.
     pub fn origin(mut self, origin: impl Into<String>) -> Self {
         self.origin = Some(origin.into());
         self
@@ -213,6 +214,11 @@ impl Verifier for TempoIdVerifier {
 
 impl PaymentCheck for TempoIdPaymentCheck {
     type Value = Payer;
+
+    // The token travels in Authorization, so the route's server needs requires_auth.
+    fn reads_authorization(&self) -> bool {
+        true
+    }
 
     fn requires(&self) -> &[Requirement] {
         &self.core.requires
@@ -578,15 +584,24 @@ impl Core {
 
     /// The request URL without its query, as the proof's `htu` must name it.
     fn htu(&self, request: &IdentityRequest) -> Option<String> {
-        let uri = request.uri();
-        let origin = match (&self.config.origin, uri.scheme_str(), uri.authority()) {
-            (Some(origin), _, _) => origin.clone(),
-            (None, Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
-            (None, _, _) => format!("https://{}", request.header(http_types::header::HOST)?),
-        };
-        let url = Url::parse(&origin).ok()?.join(uri.path()).ok()?;
-        Some(jwt::htu(&url))
+        htu(self.config.origin.as_deref(), request)
     }
+}
+
+/// The URL of `request` without its query, on `origin` when given, else on
+/// the request's own scheme and host, as mppx's `Jwt.htu(request.url)`.
+fn htu(origin: Option<&str>, request: &IdentityRequest) -> Option<String> {
+    let uri = request.uri();
+    let origin = match (origin, uri.scheme_str(), uri.authority()) {
+        (Some(origin), _, _) => origin.to_owned(),
+        (None, Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+        (None, _, _) => format!("https://{}", request.header(http_types::header::HOST)?),
+    };
+    let mut url = Url::parse(&origin).ok()?;
+    // Set the path literally: resolved as a reference, a path such as
+    // `//other.example/x` would replace the host.
+    url.set_path(uri.path());
+    Some(jwt::htu(&url))
 }
 
 fn str_claim<'a>(map: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a str> {
