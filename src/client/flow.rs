@@ -58,6 +58,14 @@ pub trait Exchange: Send {
         true
     }
 
+    /// Whether the last [`send`](Self::send) that failed did so before the
+    /// request left, such as an identity prover refusing it, so the server
+    /// cannot have seen its Credential. Defaults to false: a failed send may
+    /// have reached the server.
+    fn unsent(&self) -> bool {
+        false
+    }
+
     /// Caller-configured client available for session management requests.
     fn http_client(&self) -> Option<reqwest::Client> {
         None
@@ -493,6 +501,18 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             resp = match exchange.send(paid).await {
                 Ok(resp) => resp,
+                Err(err) if exchange.unsent() => {
+                    // The Credential never left: release it as unused.
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    pending.rollback().await.map_err(HttpError::Payment)?;
+                    return Err(FlowError::Send(err));
+                }
                 Err(err) => {
                     let reason = outcome_unknown(None, &challenge, &credential);
                     self.events

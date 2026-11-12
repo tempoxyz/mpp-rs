@@ -24,9 +24,19 @@ const PAYMENT_HEADERS: &[&str] = &[
     "www-authenticate",
 ];
 
-/// Identity proofs a client sends the proxy, such as Tempo ID's DPoP proof
-/// and ID token, which name the user to the proxy and never go upstream.
-const IDENTITY_HEADERS: &[&str] = &["dpop", "tempo-id-token"];
+/// Identity proofs a client sends the proxy (`Identity.Headers` request
+/// headers, Tempo ID's DPoP proof and ID token), which name the user to the
+/// proxy and never go upstream.
+const IDENTITY_HEADERS: &[&str] = &[
+    "dpop",
+    "identity-attestation",
+    "identity-presentation",
+    "tempo-id-token",
+];
+
+/// Identity response headers an upstream must not send the client: the
+/// proxy decides which identity the client presents.
+const IDENTITY_RESPONSE_HEADERS: &[&str] = &["identity-attestation-required", "identity-required"];
 
 fn eq_ascii_lower(name: &str, lower: &str) -> bool {
     name.len() == lower.len()
@@ -71,6 +81,12 @@ pub fn is_response_header_stripped(name: &str) -> bool {
     if PAYMENT_HEADERS
         .iter()
         .any(|h| *h != "authorization" && *h != "www-authenticate" && eq_ascii_lower(name, h))
+    {
+        return true;
+    }
+    if IDENTITY_RESPONSE_HEADERS
+        .iter()
+        .any(|h| eq_ascii_lower(name, h))
     {
         return true;
     }
@@ -236,8 +252,16 @@ mod tests {
 
     #[test]
     fn test_identity_proofs_stay_with_the_proxy() {
-        for name in ["DPoP", "Tempo-Id-Token"] {
+        for name in [
+            "DPoP",
+            "Identity-Attestation",
+            "Identity-Presentation",
+            "Tempo-Id-Token",
+        ] {
             assert!(is_request_header_stripped(name), "{name}");
+        }
+        for name in ["Identity-Required", "Identity-Attestation-Required"] {
+            assert!(is_response_header_stripped(name), "{name}");
         }
     }
 

@@ -605,6 +605,10 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>,
     > {
+        // The verification future is created here but polled only after the
+        // gate admits the Credential: implementations must settle when polled,
+        // not in the method body, as the built-in Tempo and Stripe ones do
+        // (they override this method and admit first).
         let credential = parse_authorization(credential_str);
         let verified = self.verify_payment_for_route_with_realm(
             credential_str,

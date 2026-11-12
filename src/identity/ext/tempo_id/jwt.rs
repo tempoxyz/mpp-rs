@@ -225,6 +225,8 @@ impl Keys {
                 keys.insert(kid.to_owned(), key);
             }
         }
-        Some(keys)
+        // A set with no usable key is a failed fetch: it never replaces the
+        // last set that loaded.
+        (!keys.is_empty()).then_some(keys)
     }
 }

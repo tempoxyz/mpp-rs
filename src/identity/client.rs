@@ -252,11 +252,19 @@ impl IdentityClient {
         let parts = ResponseParts::of(response);
         let context = PrepareContext {
             challenge: challenge.clone(),
+            // A list may be split across several field lines.
             requirements: requirements::parse(
-                response
-                    .headers()
-                    .get(requirements::HEADER)
-                    .and_then(|value| value.to_str().ok()),
+                Some(
+                    response
+                        .headers()
+                        .get_all(requirements::HEADER)
+                        .iter()
+                        .filter_map(|value| value.to_str().ok())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+                .as_deref()
+                .filter(|value| !value.is_empty()),
             ),
         };
         for prover in self.in_scope(response.url()) {
@@ -313,6 +321,8 @@ pub(crate) struct IdentityExchange<'a, X> {
     /// Headers a retry returned earlier in the same logical request, carried
     /// to the paid attempt.
     carried: Vec<(HeaderName, HeaderValue)>,
+    /// Whether the last send failed in a prover, before the request left.
+    unsent: bool,
 }
 
 impl<'a, X> IdentityExchange<'a, X> {
@@ -321,6 +331,7 @@ impl<'a, X> IdentityExchange<'a, X> {
             inner,
             identity,
             carried: Vec::new(),
+            unsent: false,
         }
     }
 }
@@ -370,10 +381,10 @@ where
         }
         let context = ProveContext::create(challenge);
         for prover in &scoped {
-            prover
-                .prove(&mut request, &context)
-                .await
-                .map_err(|error| X::Error::from(prover_failed(error)))?;
+            if let Err(error) = prover.prove(&mut request, &context).await {
+                self.unsent = true;
+                return Err(X::Error::from(prover_failed(error)));
+            }
         }
         let sent = request.try_clone();
         Ok((sent, self.inner.send(request).await?))
@@ -451,7 +462,12 @@ where
         self.inner.prepare_challenge(response, challenge).await
     }
 
+    fn unsent(&self) -> bool {
+        self.unsent
+    }
+
     async fn send(&mut self, request: Request) -> Result<Response, Self::Error> {
+        self.unsent = false;
         let paid = is_paid(&request);
         // Keep a copy only when the attempt may be resent: paid attempts never are.
         let original = if paid { None } else { request.try_clone() };
@@ -629,6 +645,94 @@ mod tests {
             contexts[0].challenge.as_ref().map(|c| c.id.as_str()),
             Some("challenge-1")
         );
+    }
+
+    /// Refuses every request.
+    struct Refusing(Scope);
+
+    impl Prover for Refusing {
+        fn scope(&self) -> &Scope {
+            &self.0
+        }
+
+        fn prove<'a>(
+            &'a self,
+            _request: &'a mut Request,
+            _context: &'a ProveContext,
+        ) -> BoxFuture<'a, Result<(), ProverError>> {
+            Box::pin(std::future::ready(Err(ProverError::new("no token"))))
+        }
+    }
+
+    #[tokio::test]
+    async fn prover_failure_reports_the_attempt_unsent() {
+        let identity =
+            IdentityClient::new(vec![Arc::new(Refusing(Scope::Any)) as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(
+            Scripted {
+                status: 200,
+                sent: Vec::new(),
+            },
+            &identity,
+        );
+        assert!(exchange
+            .send(get("https://api.example/paid"))
+            .await
+            .is_err());
+        assert!(exchange.unsent());
+        assert!(exchange.inner.sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_reads_every_identity_required_line() {
+        struct Requirements(Mutex<Vec<Requirement>>);
+        impl Prover for Requirements {
+            fn scope(&self) -> &Scope {
+                &Scope::Any
+            }
+            fn prove<'a>(
+                &'a self,
+                _request: &'a mut Request,
+                _context: &'a ProveContext,
+            ) -> BoxFuture<'a, Result<(), ProverError>> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+            fn prepare<'a>(
+                &'a self,
+                _response: &'a ResponseParts,
+                context: &'a PrepareContext,
+            ) -> BoxFuture<'a, Result<(), ProverError>> {
+                *self.0.lock().unwrap() = context.requirements.clone();
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+        let recorder = Arc::new(Requirements(Mutex::default()));
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let response = http_types::Response::builder()
+            .status(402)
+            .header(requirements::HEADER, "kyc")
+            .header(requirements::HEADER, "email")
+            .body("")
+            .unwrap();
+        let challenge = PaymentChallenge::new(
+            "id",
+            "realm",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+        );
+        identity
+            .prepare(&Response::from(response), &challenge)
+            .await
+            .unwrap();
+        let kinds: Vec<String> = recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|requirement| requirement.kind.clone())
+            .collect();
+        assert_eq!(kinds, ["kyc", "email"]);
     }
 
     #[tokio::test]

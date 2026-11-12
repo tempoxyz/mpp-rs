@@ -577,7 +577,9 @@ impl Core {
                 "mppx:tempo-id:dpop:{}",
                 jwt::sha256(&format!("{jkt}:{jti}"))
             );
-            let ttl = std::time::Duration::from_secs_f64((expires - now as f64).max(1.0));
+            // Held one second past expiry: the proof still verifies through
+            // the whole second `now == expires`.
+            let ttl = std::time::Duration::from_secs_f64((expires - now as f64 + 1.0).max(1.0));
             let claimed = store
                 .put_if_absent_with_ttl(&key, Value::Bool(true), ttl)
                 .await

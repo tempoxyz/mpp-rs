@@ -355,6 +355,32 @@ async fn failed_key_fetch_cools_down_before_any_key_set_loads() {
 }
 
 #[tokio::test]
+async fn key_set_without_keys_counts_as_a_failed_fetch() {
+    // An issuer whose key set has no keys.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            let body = r#"{"keys":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let tempo_id = create(Config::new(CLIENT_ID).issuer(&url));
+    let token = sign(
+        json!({ "alg": "RS256", "typ": "at+jwt", "kid": "key-1" }),
+        json!({ "iss": url, "sub": "user_1" }),
+    );
+    let rejection = rejected(tempo_id.verifier.verify(&bearer(&token)).await);
+    assert_eq!(rejection.status, RejectionStatus::Unavailable);
+}
+
+#[tokio::test]
 async fn keys_are_cached() {
     let issuer = issuer().await;
     let tempo_id = server_for(&issuer);
