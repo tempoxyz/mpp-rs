@@ -938,7 +938,7 @@ fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
 fn authorization_has_payment(value: &HeaderValue) -> bool {
     let tokenized = value
         .to_str()
-        .is_ok_and(|text| !crate::protocol::core::headers::payment_credentials(text).is_empty());
+        .is_ok_and(crate::protocol::core::headers::has_payment_scheme);
     tokenized
         || scheme_starts(value.as_bytes())
             .any(|(element, starts)| starts && is_payment_element(element))

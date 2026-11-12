@@ -35,6 +35,16 @@ fn with_nonce(
         // nonce; it is issued as configured and matched as raw text.
         Some(_) => return Ok(opaque),
     };
+    // The opaque is re-encoded with JCS, which rewrites some numbers (`1.0`,
+    // integers above 2^53). Such an opaque is issued as configured, without a
+    // nonce, so the route still matches its own Challenges exactly.
+    let original = serde_json::Value::Object(members.clone());
+    let reencoded = serde_json_canonicalizer::to_string(&original)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+    if reencoded.as_ref() != Some(&original) {
+        return Ok(opaque);
+    }
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|error| {
         crate::error::MppError::Internal(format!("failed to generate challenge nonce: {error}"))
@@ -58,15 +68,19 @@ where
     #[cfg(any(feature = "tempo", feature = "stripe"))]
     pub(super) fn apply_pinned_opaque(
         &self,
-        mut challenge: PaymentChallenge,
+        challenge: PaymentChallenge,
     ) -> Result<PaymentChallenge> {
+        self.pin_opaque(challenge, self.config.nonce)
+    }
+
+    /// [`apply_pinned_opaque`](Self::apply_pinned_opaque), adding the nonce
+    /// only when `nonce` is set: building the request a route expects needs
+    /// no nonce, so it draws no random bytes.
+    #[cfg(any(feature = "tempo", feature = "stripe"))]
+    fn pin_opaque(&self, mut challenge: PaymentChallenge, nonce: bool) -> Result<PaymentChallenge> {
         self.check_secret_key()?;
         let opaque = self.config.opaque.clone().or(challenge.opaque.take());
-        let opaque = if self.config.nonce {
-            with_nonce(opaque)?
-        } else {
-            opaque
-        };
+        let opaque = if nonce { with_nonce(opaque)? } else { opaque };
         if opaque.is_none() && self.config.credential_header.is_none() {
             return Ok(challenge);
         }
@@ -141,7 +155,7 @@ where
         self.config
             .currencies
             .iter()
-            .map(|currency| self.charge_for_currency(amount, currency, &options))
+            .map(|currency| self.charge_for_currency(amount, currency, &options, self.config.nonce))
             .collect()
     }
 
@@ -162,13 +176,15 @@ where
             .collect())
     }
 
-    /// Generate a charge challenge for one bound currency.
+    /// Generate a charge challenge for one bound currency, with a nonce when
+    /// `nonce` is set.
     #[cfg(feature = "tempo")]
     fn charge_for_currency(
         &self,
         amount: &str,
         currency: &str,
         options: &crate::server::ChargeOptions<'_>,
+        nonce: bool,
     ) -> Result<PaymentChallenge> {
         let (_, recipient) = self.require_bound_config()?;
         let base_units = crate::server::parse_dollar_amount(amount, self.config.decimals)?;
@@ -212,7 +228,7 @@ where
             options.expires,
             options.description,
         )?;
-        self.apply_pinned_opaque(challenge)
+        self.pin_opaque(challenge, nonce)
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -282,7 +298,7 @@ where
         options: crate::server::ChargeOptions<'_>,
     ) -> Result<ChargeRequest> {
         let (currency, _) = self.require_bound_config()?;
-        self.charge_for_currency(amount, currency, &options)?
+        self.charge_for_currency(amount, currency, &options, false)?
             .request
             .decode()
     }
@@ -334,6 +350,16 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         &self,
         amount: &str,
         options: crate::server::StripeChargeOptions<'_>,
+    ) -> Result<PaymentChallenge> {
+        self.stripe_charge_for(amount, options, self.config.nonce)
+    }
+
+    /// Generate a Stripe charge challenge, with a nonce when `nonce` is set.
+    fn stripe_charge_for(
+        &self,
+        amount: &str,
+        options: crate::server::StripeChargeOptions<'_>,
+        nonce: bool,
     ) -> Result<PaymentChallenge> {
         use time::{Duration, OffsetDateTime};
 
@@ -387,18 +413,21 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             None,
         );
 
-        self.apply_pinned_opaque(PaymentChallenge {
-            id,
-            realm: self.config.realm.clone(),
-            method: crate::protocol::methods::stripe::METHOD_NAME.into(),
-            intent: crate::protocol::methods::stripe::INTENT_CHARGE.into(),
-            request: encoded_request,
-            expires: Some(expires),
-            description: options.description.map(|s| s.to_string()),
-            digest: None,
-            opaque: None,
-            header: None,
-        })
+        self.pin_opaque(
+            PaymentChallenge {
+                id,
+                realm: self.config.realm.clone(),
+                method: crate::protocol::methods::stripe::METHOD_NAME.into(),
+                intent: crate::protocol::methods::stripe::INTENT_CHARGE.into(),
+                request: encoded_request,
+                expires: Some(expires),
+                description: options.description.map(|s| s.to_string()),
+                digest: None,
+                opaque: None,
+                header: None,
+            },
+            nonce,
+        )
     }
 
     /// Generate a Stripe charge challenge with options and bind it to the actual request body bytes.
@@ -425,7 +454,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         amount: &str,
         options: crate::server::StripeChargeOptions<'_>,
     ) -> Result<ChargeRequest> {
-        self.stripe_charge_with_options(amount, options)?
+        self.stripe_charge_for(amount, options, false)?
             .request
             .decode()
     }
