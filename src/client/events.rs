@@ -506,8 +506,11 @@ impl ClientEvents {
     /// `false` (or [`ChallengeDecision::Decline`]) to return the `402`
     /// response to the caller without paying, or a credential to send instead
     /// of paying with the provider. A hook that panics declines. While a hook
-    /// is set, session providers do not send prepaid vouchers before a
-    /// `402`, so the hook sees every payment.
+    /// is set, session providers neither send prepaid vouchers before a
+    /// `402` nor top up a channel ahead of the next request after a paid
+    /// one (the client records receipts with
+    /// [`PaymentProvider::record_receipt_without_prepay`](crate::client::PaymentProvider::record_receipt_without_prepay)),
+    /// so the hook sees every payment.
     ///
     /// Every clone of this registry shares the hook.
     pub fn set_on_challenge<F, Fut, R>(&self, handler: F)

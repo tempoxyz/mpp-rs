@@ -1001,6 +1001,20 @@ impl PaymentProvider for TempoAccountsProvider {
             .record_receipt(context, challenge, receipt)
     }
 
+    fn record_receipt_without_prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &crate::protocol::core::Receipt,
+    ) -> Option<u128> {
+        if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
+            return None;
+        }
+        self.configured_session_provider(Some(context.url.as_str()))
+            .ok()?
+            .record_receipt_without_prepay(context, challenge, receipt)
+    }
+
     fn stream_event(
         &self,
         client: &reqwest::Client,

@@ -251,6 +251,10 @@ struct TestProvider {
     rolled_back: Arc<AtomicU32>,
     invalidated: Arc<AtomicU32>,
     abandoned: Arc<AtomicU32>,
+    /// Receipts recorded with [`PaymentProvider::record_receipt`].
+    recorded: Arc<AtomicU32>,
+    /// Receipts recorded with [`PaymentProvider::record_receipt_without_prepay`].
+    recorded_without_prepay: Arc<AtomicU32>,
     /// Send a session voucher before the server asks for payment.
     prepaid: bool,
     /// The realm of the prepaid voucher's cached Challenge, when not the request's host.
@@ -352,6 +356,26 @@ impl PaymentProvider for TestProvider {
 
     fn abandon_payment(&self, _: &PaymentChallenge, _: &PaymentCredential) {
         self.abandoned.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_receipt(
+        &self,
+        _: &PaymentContext,
+        _: &PaymentChallenge,
+        _: &crate::protocol::core::Receipt,
+    ) -> Option<u128> {
+        self.recorded.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+
+    fn record_receipt_without_prepay(
+        &self,
+        _: &PaymentContext,
+        _: &PaymentChallenge,
+        _: &crate::protocol::core::Receipt,
+    ) -> Option<u128> {
+        self.recorded_without_prepay.fetch_add(1, Ordering::SeqCst);
+        None
     }
 
     async fn prepaid_credential(
@@ -590,6 +614,53 @@ async fn on_challenge_hook_disables_prepaid_credentials() {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
         assert!(provider.paid().is_empty(), "{via:?}");
         assert_eq!(credentials.load(Ordering::SeqCst), 0, "{via:?}");
+    }
+}
+
+/// With an approval hook set, a paid session request's receipt is recorded
+/// without prepaying, so the provider arms no prepaid voucher or top-up that
+/// would pay the next request without the hook.
+#[tokio::test]
+async fn on_challenge_hook_records_receipts_without_prepay() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if !is_paid(&request) {
+                return payment_required("session-1", "session");
+            }
+            let mut receipt = crate::protocol::core::Receipt::success("tempo", "0xsession");
+            receipt
+                .extensions
+                .insert("challengeId".into(), serde_json::json!("session-1"));
+            (
+                StatusCode::OK,
+                [("payment-receipt", receipt.to_header().unwrap())],
+            )
+                .into_response()
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        for hooked in [false, true] {
+            let provider = TestProvider::default();
+            let events = ClientEvents::default();
+            if hooked {
+                events.set_on_challenge(|_| async { true });
+            }
+            let request = reqwest::Client::new().get(format!("{url}/paid"));
+            let response = via.send(request, &provider, events).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{via:?}, {hooked}");
+            assert_eq!(
+                provider.recorded.load(Ordering::SeqCst),
+                u32::from(!hooked),
+                "{via:?}, {hooked}"
+            );
+            assert_eq!(
+                provider.recorded_without_prepay.load(Ordering::SeqCst),
+                u32::from(hooked),
+                "{via:?}, {hooked}"
+            );
+        }
     }
 }
 
@@ -2013,6 +2084,47 @@ fn padded_auth_params_are_not_read_as_schemes() {
     );
     assert_eq!(remove("Payment eyJhIjoxfQ=="), Vec::<String>::new());
     assert_eq!(remove("Payment eyJhIjoxfQ=, Bearer t"), ["Bearer t"]);
+}
+
+/// A value with bytes outside visible ASCII, such as obs-text in a quoted
+/// parameter, is read as bytes: a non-Payment credential stays byte for
+/// byte, and a Payment credential comma-joined with it is still removed.
+#[test]
+fn obs_text_authorization_values_are_kept_or_split_as_bytes() {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+
+    let remove = |value: &[u8]| {
+        let mut headers = HeaderMap::new();
+        headers.append(AUTHORIZATION, HeaderValue::from_bytes(value).unwrap());
+        let carried = super::carries_payment_credential(&headers);
+        super::remove_payment_credentials(&mut headers);
+        let kept = headers
+            .get_all(AUTHORIZATION)
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        (carried, kept)
+    };
+
+    let value = b"Digest realm=\"caf\xe9\", nonce=\"n\xff\"";
+    assert!(HeaderValue::from_bytes(value).unwrap().to_str().is_err());
+    assert_eq!(remove(value), (false, vec![value.to_vec()]));
+
+    // A padded auth-param named Payment is a parameter here too.
+    let value = b"Digest realm=\"caf\xe9\", Payment = \"aux\"";
+    assert_eq!(remove(value), (false, vec![value.to_vec()]));
+
+    assert_eq!(
+        remove(b"Digest realm=\"caf\xe9\", Payment abc, Bearer t\xe9"),
+        (
+            true,
+            vec![b"Digest realm=\"caf\xe9\", Bearer t\xe9".to_vec()]
+        )
+    );
+    assert_eq!(
+        remove(b"Payment abc, opaque=\"\xe9\""),
+        (true, Vec::<Vec<u8>>::new())
+    );
 }
 
 /// A Payment credential the flow cannot see on the request, from the

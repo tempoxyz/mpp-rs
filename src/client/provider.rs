@@ -305,6 +305,21 @@ pub trait PaymentProvider: Clone + Send + Sync {
         None
     }
 
+    /// Record a receipt like [`record_receipt`](Self::record_receipt), without
+    /// arranging any payment for a later request, such as a prepaid voucher
+    /// or a channel top-up ahead of it. The client calls this instead of
+    /// `record_receipt` while an approval hook is set (see
+    /// [`ClientEvents::set_on_challenge`](crate::client::ClientEvents::set_on_challenge)),
+    /// so the hook sees every payment. The default calls `record_receipt`.
+    fn record_receipt_without_prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        self.record_receipt(context, challenge, receipt)
+    }
+
     /// The token the payer spent on `challenge`'s credential, when it differs from or is not
     /// stated by the challenge, such as MACH swapped into a charge's currency. Providers that
     /// fund payments in the challenge currency report nothing, the default.
@@ -764,6 +779,22 @@ impl PaymentProvider for MultiProvider {
             .and_then(|provider| provider.dyn_record_receipt(context, challenge, receipt))
     }
 
+    fn record_receipt_without_prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        let method = challenge.method.as_str();
+        let intent = challenge.intent.as_str();
+        self.providers
+            .iter()
+            .find(|provider| provider.dyn_supports(method, intent))
+            .and_then(|provider| {
+                provider.dyn_record_receipt_without_prepay(context, challenge, receipt)
+            })
+    }
+
     fn stream_event(
         &self,
         client: &reqwest::Client,
@@ -868,6 +899,12 @@ trait DynPaymentProvider: Send + Sync {
         receipt: &Receipt,
     );
     fn dyn_record_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128>;
+    fn dyn_record_receipt_without_prepay(
         &self,
         context: &PaymentContext,
         challenge: &PaymentChallenge,
@@ -1009,6 +1046,15 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         receipt: &Receipt,
     ) -> Option<u128> {
         PaymentProvider::record_receipt(self, context, challenge, receipt)
+    }
+
+    fn dyn_record_receipt_without_prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        PaymentProvider::record_receipt_without_prepay(self, context, challenge, receipt)
     }
 
     fn dyn_stream_event(

@@ -830,8 +830,17 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         session: bool,
     ) -> Option<u128> {
         if session {
-            return receipt
-                .and_then(|receipt| self.provider.record_receipt(context, challenge, receipt));
+            // A prepaid voucher or top-up for the next request would be paid
+            // without the approval hook, so with one set none is arranged.
+            let hooked = self.events.has_on_challenge();
+            return receipt.and_then(|receipt| {
+                if hooked {
+                    self.provider
+                        .record_receipt_without_prepay(context, challenge, receipt)
+                } else {
+                    self.provider.record_receipt(context, challenge, receipt)
+                }
+            });
         }
         challenge
             .request
@@ -924,37 +933,30 @@ fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
 }
 
 /// Whether an `Authorization` value holds a `Payment` scheme in any of its
-/// comma-separated elements.
+/// comma-separated elements. A value with bytes outside visible ASCII, such
+/// as obs-text in a quoted parameter, is read as bytes the same way.
 fn authorization_has_payment(value: &HeaderValue) -> bool {
-    match value.to_str() {
-        Ok(text) => {
-            !crate::protocol::core::headers::payment_credentials(text).is_empty()
-                || scheme_starts(text)
-                    .any(|(element, starts)| starts && is_payment_element(element))
-        }
-        Err(_) => value.as_bytes().split(|byte| *byte == b',').any(|element| {
-            element
-                .trim_ascii_start()
-                .split(|byte| *byte == b' ')
-                .next()
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"payment"))
-        }),
-    }
+    let tokenized = value
+        .to_str()
+        .is_ok_and(|text| !crate::protocol::core::headers::payment_credentials(text).is_empty());
+    tokenized
+        || scheme_starts(value.as_bytes())
+            .any(|(element, starts)| starts && is_payment_element(element))
 }
 
 /// The comma-separated elements of an `Authorization` value, with commas
-/// inside quoted strings kept.
-fn authorization_elements(value: &str) -> Vec<&str> {
+/// inside quoted strings kept. Works on bytes, so obs-text is carried as it is.
+fn authorization_elements(value: &[u8]) -> Vec<&[u8]> {
     let mut elements = Vec::new();
     let (mut start, mut quoted, mut escaped) = (0, false, false);
-    for (index, byte) in value.bytes().enumerate() {
+    for (index, byte) in value.iter().enumerate() {
         if escaped {
             escaped = false;
-        } else if quoted && byte == b'\\' {
+        } else if quoted && *byte == b'\\' {
             escaped = true;
-        } else if byte == b'"' {
+        } else if *byte == b'"' {
             quoted = !quoted;
-        } else if byte == b',' && !quoted {
+        } else if *byte == b',' && !quoted {
             elements.push(&value[start..index]);
             start = index + 1;
         }
@@ -965,7 +967,7 @@ fn authorization_elements(value: &str) -> Vec<&str> {
 
 /// The elements of an `Authorization` value, each with whether it starts a
 /// new scheme. The first non-empty element is the first word of the value.
-fn scheme_starts(value: &str) -> impl Iterator<Item = (&str, bool)> {
+fn scheme_starts(value: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
     let mut first = true;
     authorization_elements(value)
         .into_iter()
@@ -978,13 +980,13 @@ fn scheme_starts(value: &str) -> impl Iterator<Item = (&str, bool)> {
 
 /// Whether an element that starts a scheme starts a `Payment` one:
 /// `Payment` alone or followed by whitespace.
-fn is_payment_element(element: &str) -> bool {
+fn is_payment_element(element: &[u8]) -> bool {
     let scheme = element
         .trim_ascii_start()
-        .split(|c: char| c.is_ascii_whitespace())
+        .split(|byte| byte.is_ascii_whitespace())
         .next()
-        .unwrap_or("");
-    scheme.eq_ignore_ascii_case("payment")
+        .unwrap_or_default();
+    scheme.eq_ignore_ascii_case(b"payment")
 }
 
 /// Whether an element starts a new scheme rather than continuing the
@@ -994,39 +996,40 @@ fn is_payment_element(element: &str) -> bool {
 /// (`first`), where a word followed by SP or HTAB is always a scheme. A
 /// token68 ending in `=` padding follows its scheme and a space, so it does
 /// not make its element an auth-param.
-fn starts_scheme(element: &str, first: bool) -> bool {
+fn starts_scheme(element: &[u8], first: bool) -> bool {
     let element = element.trim_ascii_start();
     if element.is_empty() {
         return false;
     }
     let name_end = element
-        .find(|c: char| c == '=' || c.is_ascii_whitespace())
+        .iter()
+        .position(|byte| *byte == b'=' || byte.is_ascii_whitespace())
         .unwrap_or(element.len());
     let after_name = &element[name_end..];
-    !after_name.trim_ascii_start().starts_with('=')
-        || (first && after_name.starts_with([' ', '\t']))
+    !after_name.trim_ascii_start().starts_with(b"=")
+        || (first && matches!(after_name.first(), Some(b' ' | b'\t')))
 }
 
 /// An `Authorization` value without its `Payment` schemes and their
 /// parameters, or `None` when nothing else is left.
-fn without_payment_schemes(value: &str) -> Option<String> {
-    let mut kept: Vec<&str> = Vec::new();
+fn without_payment_schemes(value: &[u8]) -> Option<Vec<u8>> {
+    let mut kept: Vec<&[u8]> = Vec::new();
     let mut in_payment = false;
     for (element, starts) in scheme_starts(value) {
         if starts {
             in_payment = is_payment_element(element);
         }
-        if !in_payment && !element.trim().is_empty() {
-            kept.push(element.trim());
+        if !in_payment && !element.trim_ascii().is_empty() {
+            kept.push(element.trim_ascii());
         }
     }
-    (!kept.is_empty()).then(|| kept.join(", "))
+    (!kept.is_empty()).then(|| kept.join(&b", "[..]))
 }
 
 /// Remove every Payment credential from a request's headers:
 /// `Payment-Authorization` and any `Payment` scheme in an `Authorization`
 /// value, including one comma-joined with another scheme. The other schemes
-/// stay.
+/// stay, byte for byte, also when they carry bytes outside visible ASCII.
 fn remove_payment_credentials(headers: &mut HeaderMap) {
     headers.remove("payment-authorization");
     let kept: Vec<HeaderValue> = headers
@@ -1036,8 +1039,10 @@ fn remove_payment_credentials(headers: &mut HeaderMap) {
             if !authorization_has_payment(value) {
                 return Some(value.clone());
             }
-            let rest = without_payment_schemes(value.to_str().ok()?)?;
-            let mut rebuilt = HeaderValue::from_str(&rest).ok()?;
+            let rest = without_payment_schemes(value.as_bytes())?;
+            // The rest is made of the value's own bytes, so it is a valid
+            // value; keep the original rather than drop it if it were not.
+            let mut rebuilt = HeaderValue::from_bytes(&rest).unwrap_or_else(|_| value.clone());
             rebuilt.set_sensitive(value.is_sensitive());
             Some(rebuilt)
         })
