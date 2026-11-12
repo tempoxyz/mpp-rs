@@ -1601,8 +1601,9 @@ async fn bare_402_after_payment_is_final() {
     }
 }
 
-/// A problem body past the read limit is not buffered whole: its type is
-/// unknown, so the 402 is final, and the body handed back stops at the limit.
+/// A problem body past the read limit is not buffered whole to learn its
+/// type: the type is unknown, so the 402 is final, and the caller still gets
+/// the whole body.
 #[tokio::test]
 async fn oversized_problem_body_is_final_and_bounded() {
     let mut body = String::from(
@@ -1610,6 +1611,7 @@ async fn oversized_problem_body_is_final_and_bounded() {
     );
     body.push_str(&"x".repeat(super::MAX_PROBLEM_BODY_BYTES * 2));
     body.push_str(r#""}"#);
+    let body_len = body.len();
     let url = spawn_server(rejecting_route(Some("application/problem+json"), body)).await;
     for via in BOTH {
         let provider = TestProvider {
@@ -1627,7 +1629,58 @@ async fn oversized_problem_body_is_final_and_bounded() {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
         assert_eq!(provider.paid().len(), 1, "{via:?}");
         let returned = response.bytes().await.unwrap();
-        assert_eq!(returned.len(), super::MAX_PROBLEM_BODY_BYTES, "{via:?}");
+        assert_eq!(returned.len(), body_len, "{via:?}");
+    }
+}
+
+/// An empty 402 answering a credential is final even without a
+/// `Content-Length` header, as a chunked or HTTP/2 response sends it.
+#[tokio::test]
+async fn streamed_empty_402_after_payment_is_final() {
+    let issued = Arc::new(AtomicU32::new(0));
+    let router = Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let issued = issued.clone();
+            async move {
+                let n = issued.fetch_add(1, Ordering::SeqCst);
+                if !is_paid(&request) {
+                    return payment_required(&format!("fresh-{n}"), "charge");
+                }
+                let challenge = www_authenticate(&format!("fresh-{n}"), "tempo", "charge");
+                let body = Body::from_stream(futures_util::stream::empty::<
+                    Result<bytes::Bytes, std::io::Error>,
+                >());
+                let response = (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(WWW_AUTHENTICATE, challenge)],
+                    body,
+                )
+                    .into_response();
+                assert!(response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .is_none());
+                response
+            }
+        }),
+    );
+    let url = spawn_server(router).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            transaction: true,
+            ..TestProvider::default()
+        };
+        let response = via
+            .send(
+                reqwest::Client::new().get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert_eq!(provider.paid().len(), 1, "{via:?}");
     }
 }
 

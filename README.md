@@ -80,7 +80,7 @@ let receipt = mpp.stripe_verify_charge(&credential, "1").await?;
 
 The Axum `MppCharge` extractors can use the incoming HTTP request hostname as the challenge realm, as in mppx, and verify credentials against that same hostname. Configure `.trusted_hosts(["api.example.com"])` with the public hostnames your server accepts before enabling this behavior: clients control the HTTP `Host` header, so unlisted hosts continue to use the configured or environment-detected realm. An explicit `.realm(...)` or `MPP_REALM` overrides the request hostname. Direct `Mpp::charge` calls have no HTTP request and continue to use the configured or environment-detected realm; set it to the public hostname when accepting zero-amount Tempo proofs from clients that check the request origin.
 
-If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`, and the reqwest `send_with_payment` and `PaymentMiddleware` APIs send the credential in that header. reqwest forwards `Payment-Authorization` across redirects, so build the client with `redirect::Policy::none()`.
+If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`. The reqwest `send_with_payment` and `PaymentMiddleware` APIs reject those challenges before paying: they accept caller-owned clients and cannot enforce a safe redirect policy for the custom credential header. Use a transport that sends credential-bearing requests with redirects disabled until these APIs support a verified redirect-safe client.
 
 ```rust
 let mpp = Mpp::create(tempo(config).requires_auth(true))?;

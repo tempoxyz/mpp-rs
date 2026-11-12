@@ -1055,8 +1055,7 @@ async fn credential_rejected(resp: Response) -> (Response, bool) {
         let rejected = problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge"));
         (rebuilt, rejected)
     } else {
-        let rejected = has_empty_body(&resp);
-        (resp, rejected)
+        has_empty_body(resp).await
     }
 }
 
@@ -1074,58 +1073,71 @@ fn is_problem_json(resp: &Response) -> bool {
         })
 }
 
-/// Read the problem type of a problem-details response, and return an
-/// equivalent response with the same status, headers, URL and body. A body
-/// that cannot be read comes back empty, with no type.
-/// Whether `resp` declares an empty body (`Content-Length: 0`).
-fn has_empty_body(resp: &Response) -> bool {
-    resp.headers()
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == "0")
-}
-
-/// The most of a paid request's `402` problem body the flow reads to learn
-/// its type. The server picks the body's size, so reading stops here.
+/// The most of a paid request's `402` body the flow reads to learn its
+/// problem type or whether it is empty. The server picks the body's size, so
+/// reading stops here; the rest is handed back unread.
 const MAX_PROBLEM_BODY_BYTES: usize = 64 * 1024;
 
-/// Read at most `limit` bytes of `resp`'s body, and whether that was all of
-/// it. A body that fails to arrive counts as incomplete.
-async fn read_limited(mut resp: Response, limit: usize) -> (Vec<u8>, bool) {
-    let mut body = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let room = limit - body.len();
-                if chunk.len() > room {
-                    body.extend_from_slice(&chunk[..room]);
-                    return (body, false);
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => return (body, true),
-            Err(_) => return (body, false),
-        }
-    }
-}
-
-async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
+/// Read up to `limit` bytes of `resp`'s body and return them, whether that
+/// was the whole body, and an equivalent response: same status, version,
+/// headers, extensions and URL, whose body is the bytes read followed by the
+/// unread rest of the stream, or by the read error that cut it short.
+async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool) {
+    use futures_util::StreamExt;
     use reqwest::ResponseBuilderExt;
 
     let status = resp.status();
     let version = resp.version();
     let url = resp.url().clone();
     let headers = resp.headers().clone();
-    let (body, complete) = read_limited(resp, MAX_PROBLEM_BODY_BYTES).await;
-    // A body cut at the limit is handed back as read and its type is unknown.
-    let problem_type = complete
-        .then(|| serde_json::from_slice::<serde_json::Value>(&body).ok())
-        .flatten()
-        .and_then(|problem| problem.get("type")?.as_str().map(str::to_string));
+    let extensions = resp.extensions().clone();
+    let mut read = Vec::new();
+    let mut overflow = None;
+    let mut error = None;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = limit - read.len();
+                if chunk.len() > room {
+                    read.extend_from_slice(&chunk[..room]);
+                    overflow = Some(chunk.slice(room..));
+                    break;
+                }
+                read.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                error = Some(err);
+                break;
+            }
+        }
+    }
+    let complete = overflow.is_none() && error.is_none();
+    let body = if complete {
+        reqwest::Body::from(read.clone())
+    } else {
+        let head = futures_util::stream::once(std::future::ready(Ok::<_, reqwest::Error>(
+            bytes::Bytes::from(read.clone()),
+        )));
+        match (overflow, error) {
+            (Some(overflow), _) => reqwest::Body::wrap_stream(
+                head.chain(futures_util::stream::once(std::future::ready(Ok(overflow))))
+                    .chain(resp.bytes_stream()),
+            ),
+            (None, Some(err)) => reqwest::Body::wrap_stream(
+                head.chain(futures_util::stream::once(std::future::ready(Err(err)))),
+            ),
+            (None, None) => unreachable!("an incomplete read has overflow or an error"),
+        }
+    };
     let mut builder = http_types::Response::builder()
         .status(status)
-        .version(version)
-        .url(url);
+        .version(version);
+    if let Some(builder_extensions) = builder.extensions_mut() {
+        *builder_extensions = extensions;
+    }
+    // After the extensions, so the URL is kept.
+    let mut builder = builder.url(url);
     if let Some(builder_headers) = builder.headers_mut() {
         *builder_headers = headers;
     }
@@ -1133,6 +1145,25 @@ async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
         .body(body)
         .map(Response::from)
         .unwrap_or_else(|_| Response::from(http_types::Response::new(Vec::<u8>::new())));
+    (rebuilt, read, complete)
+}
+
+/// Whether `resp`'s body is empty, with an equivalent response. A body
+/// that fails to arrive is not counted as empty.
+async fn has_empty_body(resp: Response) -> (Response, bool) {
+    let (rebuilt, read, complete) = peek_body(resp, MAX_PROBLEM_BODY_BYTES).await;
+    (rebuilt, complete && read.is_empty())
+}
+
+/// Read the problem type of a problem-details response, and return an
+/// equivalent response with the same status, headers, extensions, URL and
+/// whole body. A body cut at the limit or by a read error has no type.
+async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
+    let (rebuilt, read, complete) = peek_body(resp, MAX_PROBLEM_BODY_BYTES).await;
+    let problem_type = complete
+        .then(|| serde_json::from_slice::<serde_json::Value>(&read).ok())
+        .flatten()
+        .and_then(|problem| problem.get("type")?.as_str().map(str::to_string));
     (rebuilt, problem_type)
 }
 

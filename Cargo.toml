@@ -35,7 +35,7 @@ default = ["reqwest-default-tls"]
 
 # Side selection
 # http-types rebuilds a response whose problem body the payment flow read.
-client = ["dep:reqwest", "http-types"]
+client = ["dep:reqwest", "reqwest?/stream", "http-types", "dep:bytes", "dep:futures-util"]
 server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations
