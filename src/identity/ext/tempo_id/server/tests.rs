@@ -128,7 +128,11 @@ fn access_token(claims: &Value) -> String {
 }
 
 fn server_for(issuer: &Issuer) -> TempoId {
-    create(Config::new(CLIENT_ID).issuer(issuer.url.clone()))
+    create(
+        Config::new(CLIENT_ID)
+            .issuer(issuer.url.clone())
+            .origin("https://api.example"),
+    )
 }
 
 fn request(headers: &[(&str, String)]) -> IdentityRequest {
@@ -533,6 +537,7 @@ mod dpop {
         let tempo_id = create(
             Config::new(CLIENT_ID)
                 .issuer(issuer.url.clone())
+                .origin("https://api.example")
                 .store(store),
         );
         let key = dpop_key();
@@ -610,6 +615,7 @@ mod dpop {
         let tempo_id = create(
             Config::new(CLIENT_ID)
                 .issuer(issuer.url.clone())
+                .origin("https://api.example")
                 .store(store),
         );
         let key = dpop_key();
@@ -716,7 +722,7 @@ mod dpop {
 #[tokio::test]
 async fn dpop_without_an_origin_is_a_server_error() {
     let issuer = issuer().await;
-    let tempo_id = server_for(&issuer);
+    let tempo_id = create(Config::new(CLIENT_ID).issuer(issuer.url.clone()));
     let key = dpop::dpop_key();
     let token = dpop::bound_token(&issuer, &key);
     let proof = dpop::proof_for(&key, &token, reqwest::Method::GET, URL);
@@ -735,6 +741,17 @@ fn htu_never_trusts_the_host_header() {
     headers.insert("host", "other.example".parse().unwrap());
     let request = IdentityRequest::new(http_types::Method::GET, "/haiku".parse().unwrap(), headers);
     assert_eq!(htu(None, &request), None);
+    // An absolute-form target names the client's choice of origin too.
+    let absolute = IdentityRequest::new(
+        http_types::Method::GET,
+        "https://other.example/haiku".parse().unwrap(),
+        http_types::HeaderMap::new(),
+    );
+    assert_eq!(htu(None, &absolute), None);
+    assert_eq!(
+        htu(Some("https://api.example"), &absolute).as_deref(),
+        Some("https://api.example/haiku")
+    );
     assert_eq!(
         htu(Some("https://api.example"), &request).as_deref(),
         Some("https://api.example/haiku")

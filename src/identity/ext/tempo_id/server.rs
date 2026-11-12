@@ -97,10 +97,10 @@ impl Config {
     /// This API's public origin, such as `https://api.example`, which a
     /// DPoP proof's `htu` names.
     ///
-    /// mppx reads the full request URL; a Rust server often sees only the
-    /// path. Without this the origin is the request URI's, and a request
-    /// whose URI names none rejects DPoP-bound tokens: the `Host` header is
-    /// the client's to choose, so it never stands in.
+    /// Required for DPoP-bound tokens, which are refused with a 503 without
+    /// it. mppx reads the full request URL; a Rust server often sees only the
+    /// path, and the `Host` header and an absolute-form request target are
+    /// the client's to choose, so neither stands in.
     pub fn origin(mut self, origin: impl Into<String>) -> Self {
         self.origin = Some(origin.into());
         self
@@ -596,24 +596,18 @@ impl Core {
     }
 }
 
-/// The URL of `request` without its query, on `origin` when given, else on
-/// the request URI's own scheme and host, as mppx's `Jwt.htu(request.url)`.
+/// The URL of `request` without its query, on the configured `origin`, as
+/// mppx's `Jwt.htu(request.url)`.
 ///
-/// `None` when neither names an origin. mppx's request URL is absolute; a
-/// Rust server often sees only the path, and the `Host` header is the
-/// client's to choose, so it never stands in: a proof made for another origin
-/// would then match.
+/// `None` without an origin. mppx's request URL is absolute; a Rust server
+/// often sees only the path, and both the `Host` header and an absolute-form
+/// request target are the client's to choose, so neither stands in: a proof
+/// made for another origin would then match.
 fn htu(origin: Option<&str>, request: &IdentityRequest) -> Option<String> {
-    let uri = request.uri();
-    let origin = match (origin, uri.scheme_str(), uri.authority()) {
-        (Some(origin), _, _) => origin.to_owned(),
-        (None, Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
-        (None, _, _) => return None,
-    };
-    let mut url = Url::parse(&origin).ok()?;
+    let mut url = Url::parse(origin?).ok()?;
     // Set the path literally: resolved as a reference, a path such as
     // `//other.example/x` would replace the host.
-    url.set_path(uri.path());
+    url.set_path(request.uri().path());
     Some(jwt::htu(&url))
 }
 
