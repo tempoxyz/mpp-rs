@@ -34,7 +34,7 @@ tempo-alloy = { version = "1.11.0", default-features = false }
 default = ["reqwest-default-tls"]
 
 # Side selection
-client = ["dep:reqwest", "http-types"]
+client = ["dep:reqwest"]
 server = ["tokio", "futures-core", "async-stream", "http-types"]
 
 # Method implementations

@@ -291,23 +291,6 @@ pub trait PaymentProvider: Clone + Send + Sync {
         let _ = (context, challenge, receipt);
     }
 
-    /// Observe the problem details of a `402` response that refused this
-    /// provider's credential, before the payment flow pays again. `problem`
-    /// is `null` when the response carried no problem details the flow could
-    /// read.
-    ///
-    /// Session providers learn from it whether a server that accepts vouchers
-    /// out of order refused a voucher as already accepted or stale, so they
-    /// never cover its range again.
-    fn observe_refusal(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-        problem: &serde_json::Value,
-    ) {
-        let _ = (challenge, credential, problem);
-    }
-
     /// Observe a receipt like [`observe_receipt`](Self::observe_receipt) and
     /// return what the server charged for the request, when the provider tracks
     /// it. Session providers report the change in the channel's `spent`. The
@@ -767,23 +750,6 @@ impl PaymentProvider for MultiProvider {
         }
     }
 
-    fn observe_refusal(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-        problem: &serde_json::Value,
-    ) {
-        let method = challenge.method.as_str();
-        let intent = challenge.intent.as_str();
-
-        for provider in &self.providers {
-            if provider.dyn_supports(method, intent) {
-                provider.dyn_observe_refusal(challenge, credential, problem);
-                return;
-            }
-        }
-    }
-
     fn record_receipt(
         &self,
         context: &PaymentContext,
@@ -907,12 +873,6 @@ trait DynPaymentProvider: Send + Sync {
         challenge: &PaymentChallenge,
         receipt: &Receipt,
     ) -> Option<u128>;
-    fn dyn_observe_refusal(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-        problem: &serde_json::Value,
-    );
     fn dyn_stream_event(
         &self,
         client: &reqwest::Client,
@@ -1049,15 +1009,6 @@ impl<P: PaymentProvider + 'static> DynPaymentProvider for P {
         receipt: &Receipt,
     ) -> Option<u128> {
         PaymentProvider::record_receipt(self, context, challenge, receipt)
-    }
-
-    fn dyn_observe_refusal(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-        problem: &serde_json::Value,
-    ) {
-        PaymentProvider::observe_refusal(self, challenge, credential, problem);
     }
 
     fn dyn_stream_event(

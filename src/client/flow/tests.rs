@@ -1266,35 +1266,3 @@ fn late_voucher_receipt_is_bounded_by_the_accepted_amount() {
         );
     }
 }
-
-/// Reading a refusal's problem details hands the response back intact.
-#[tokio::test]
-async fn small_problem_is_read_and_the_response_kept() {
-    use reqwest::ResponseBuilderExt as _;
-
-    let body = r#"{"type":"https://paymentauth.org/problems/session/delta-too-small","acceptedCumulative":"120"}"#;
-    let url = reqwest::Url::parse("https://api.example.com/paid").unwrap();
-    let response = axum::http::Response::builder()
-        .status(402)
-        .header("content-type", "application/problem+json")
-        .header("content-length", body.len())
-        .header(WWW_AUTHENTICATE, "Payment id=\"x\"")
-        .url(url.clone())
-        .body(body)
-        .unwrap();
-    let (response, problem) = super::read_small_problem(reqwest::Response::from(response)).await;
-    assert_eq!(problem.unwrap()["acceptedCumulative"], "120");
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(response.url(), &url);
-    assert_eq!(response.headers()[WWW_AUTHENTICATE], "Payment id=\"x\"");
-    assert_eq!(response.text().await.unwrap(), body);
-
-    // Another content type is left unread.
-    let response = axum::http::Response::builder()
-        .status(402)
-        .header("content-type", "text/html")
-        .body(body)
-        .unwrap();
-    let (_, problem) = super::read_small_problem(reqwest::Response::from(response)).await;
-    assert!(problem.is_none());
-}

@@ -162,44 +162,6 @@ pub trait ChannelStore: Send + Sync {
     }
     /// Remove the channel cached for `key`.
     async fn delete(&self, key: &str) -> ChannelStoreResult<()>;
-    /// Atomically raise the cumulative amount of channel `channel_id`, cached
-    /// for `key`, from `start`, the higher of it and `floor`, to
-    /// `raised = max(start + amount, target)`, and return `(start, raised)`.
-    /// `None` when the store keeps no open entry for that channel under
-    /// `key`, or `raised` would exceed `cap`. `target` is an absolute
-    /// cumulative amount (`0` for none), read in the same atomic step, so
-    /// callers that overlap each add `amount` beyond it at most.
-    ///
-    /// Callers sharing the store, in this process or others, get disjoint
-    /// ranges `(start, raised]`: session providers sign one voucher from
-    /// each, with `after` set to the range's start, for servers that accept
-    /// vouchers out of order (`reorderWindow`). Session providers call
-    /// it without holding [`acquire`](Self::acquire)'s lease, so it must be
-    /// one atomic update. A store that overrides it must also return `true`
-    /// from [`allocates_atomically`](Self::allocates_atomically).
-    ///
-    /// The default allocates nothing and returns `None`: payments over such a
-    /// store take the serialized path under [`acquire`](Self::acquire).
-    async fn allocate(
-        &self,
-        _key: &str,
-        _channel_id: B256,
-        _floor: u128,
-        _amount: u128,
-        _target: u128,
-        _cap: u128,
-    ) -> ChannelStoreResult<Option<(u128, u128)>> {
-        Ok(None)
-    }
-    /// Whether [`allocate`](Self::allocate) raises the counter in one atomic
-    /// update. Session providers allocate vouchers concurrently, for servers
-    /// that accept them out of order, only from stores that return `true`;
-    /// others pay serialized under [`acquire`](Self::acquire).
-    ///
-    /// Defaults to `false`.
-    fn allocates_atomically(&self) -> bool {
-        false
-    }
     /// The `spent` a server receipt last reported for `channel_id`, the channel
     /// cached for `key`. `None` when the store keeps no such record, or when
     /// the channel's vouchers moved after it was recorded: a client that keeps
@@ -224,22 +186,6 @@ pub trait ChannelStore: Send + Sync {
     ) -> ChannelStoreResult<()> {
         Ok(())
     }
-}
-
-/// The range `(start, raised]` [`ChannelStore::allocate`] raises a counter
-/// at `stored` by: `start = max(stored, floor)` and
-/// `raised = max(start + amount, target)`, or `None` when `raised` would
-/// exceed `cap`.
-fn raise_counter(
-    stored: u128,
-    floor: u128,
-    amount: u128,
-    target: u128,
-    cap: u128,
-) -> Option<(u128, u128)> {
-    let start = stored.max(floor);
-    let raised = start.checked_add(amount)?.max(target);
-    (raised <= cap).then_some((start, raised))
 }
 
 /// In-memory channel store used when persistence is not configured.
@@ -308,33 +254,6 @@ impl ChannelStore for MemoryChannelStore {
         self.entries.lock().unwrap().remove(key);
         self.server_spent.lock().unwrap().remove(key);
         Ok(())
-    }
-
-    fn allocates_atomically(&self) -> bool {
-        true
-    }
-
-    async fn allocate(
-        &self,
-        key: &str,
-        channel_id: B256,
-        floor: u128,
-        amount: u128,
-        target: u128,
-        cap: u128,
-    ) -> ChannelStoreResult<Option<(u128, u128)>> {
-        let mut entries = self.entries.lock().unwrap();
-        let Some(entry) = entries
-            .get_mut(key)
-            .filter(|entry| entry.channel_id == channel_id && entry.opened)
-        else {
-            return Ok(None);
-        };
-        let range = raise_counter(entry.cumulative_amount, floor, amount, target, cap);
-        if let Some((_, raised)) = range {
-            entry.cumulative_amount = raised;
-        }
-        Ok(range)
     }
 
     async fn server_spent(&self, key: &str, channel_id: B256) -> ChannelStoreResult<Option<u128>> {
@@ -624,36 +543,6 @@ impl ChannelStore for OriginBoundChannelStore {
         spent: u128,
     ) -> ChannelStoreResult<()> {
         self.inner.set_server_spent(key, channel_id, spent).await
-    }
-
-    fn allocates_atomically(&self) -> bool {
-        self.inner.allocates_atomically()
-    }
-
-    /// Allocates from the provider's channel for `key` in its current
-    /// namespace only, where [`get`](Self::get) reads it.
-    async fn allocate(
-        &self,
-        key: &str,
-        channel_id: B256,
-        floor: u128,
-        amount: u128,
-        target: u128,
-        cap: u128,
-    ) -> ChannelStoreResult<Option<(u128, u128)>> {
-        if self.check(channel_id).is_err() {
-            return Ok(None);
-        }
-        let namespace = self.namespace();
-        let at = self.location(key, namespace.as_deref());
-        match self.inner.get(&at).await? {
-            Some(stored) if stored.origin == namespace && stored.channel_id == channel_id => {
-                self.inner
-                    .allocate(&at, channel_id, floor, amount, target, cap)
-                    .await
-            }
-            _ => Ok(None),
-        }
     }
 }
 
@@ -984,11 +873,7 @@ mod sqlite {
         async fn set_at(&self, key: &str, entry: &StoredChannelEntry) -> ChannelStoreResult<()> {
             let scope_key = self.scoped_key(key);
             let mut connection = self.connection.lock().unwrap();
-            // Take the write lock before reading what is merged, so a
-            // concurrent `allocate` in another process cannot land in between.
-            let transaction = connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(io_error)?;
+            let transaction = connection.transaction().map_err(io_error)?;
             let current: Option<StoredChannelEntry> = transaction
                 .query_row(
                     "SELECT entry_json FROM channels WHERE scope_key = ?1",
@@ -1135,71 +1020,6 @@ mod sqlite {
                 )
                 .map_err(io_error)?;
             Ok(())
-        }
-
-        fn allocates_atomically(&self) -> bool {
-            true
-        }
-
-        /// One immediate transaction that reads the counter and writes the
-        /// raised one, so processes sharing the database get disjoint ranges
-        /// without holding the payment lease, and an absolute `target` is
-        /// applied to the counter it read. A stored cumulative amount that is
-        /// not a plain decimal returns `None`, which falls back to a
-        /// serialized payment.
-        async fn allocate(
-            &self,
-            key: &str,
-            channel_id: B256,
-            floor: u128,
-            amount: u128,
-            target: u128,
-            cap: u128,
-        ) -> ChannelStoreResult<Option<(u128, u128)>> {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(io_error)?
-                .as_secs();
-            let now = i64::try_from(now)
-                .map_err(|_| ChannelStoreError::Io("system time exceeds SQLite range".into()))?;
-            let scope_key = self.scoped_key(key);
-            let channel_id = format!("{channel_id:#x}");
-            let mut connection = self.connection.lock().unwrap();
-            let transaction = connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(io_error)?;
-            let stored: Option<String> = transaction
-                .query_row(
-                    "SELECT cumulative_amount FROM channels
-                     WHERE scope_key = ?1 AND lower(channel_id) = ?2 AND state = 'active'",
-                    params![scope_key, channel_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(io_error)?;
-            let Some(stored) = stored
-                .filter(|stored| !stored.is_empty() && stored.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|stored| stored.parse::<u128>().ok())
-            else {
-                return Ok(None);
-            };
-            let Some((start, raised)) = raise_counter(stored, floor, amount, target, cap) else {
-                return Ok(None);
-            };
-            transaction
-                .execute(
-                    "UPDATE channels SET
-                        cumulative_amount = ?3,
-                        entry_json = CASE WHEN entry_json IS NULL THEN NULL ELSE json_set(
-                            entry_json, '$.cumulativeAmount', ?3
-                        ) END,
-                        last_used_at = ?4
-                     WHERE scope_key = ?1 AND lower(channel_id) = ?2 AND state = 'active'",
-                    params![scope_key, channel_id, raised.to_string(), now],
-                )
-                .map_err(io_error)?;
-            transaction.commit().map_err(io_error)?;
-            Ok(Some((start, raised)))
         }
 
         /// Reads the `server_spent` column, which tempo-wallet also keeps. Its
@@ -1875,176 +1695,6 @@ mod tests {
             pending_open: None,
             origin: None,
         }
-    }
-
-    /// Allocations from a channel get disjoint ranges above the floor, never
-    /// exceed the cap, and are what the store reads back.
-    #[tokio::test]
-    async fn allocations_are_disjoint_capped_and_monotonic() {
-        on_every_store(|store| async move {
-            let entry = entry();
-            let key = entry.key();
-            store.set(&entry).await.unwrap();
-            let id = entry.channel_id;
-            assert_eq!(
-                store
-                    .allocate(&key, id, 0, 1_000, 0, 10_000_000)
-                    .await
-                    .unwrap(),
-                Some((2_000_000, 2_001_000))
-            );
-            // A floor above the stored amount, such as one resynchronized
-            // from the server, raises it first.
-            assert_eq!(
-                store
-                    .allocate(&key, id, 3_000_000, 1_000, 0, 10_000_000)
-                    .await
-                    .unwrap(),
-                Some((3_000_000, 3_001_000))
-            );
-            assert_eq!(
-                store
-                    .allocate(&key, id, 0, 7_000_000, 0, 10_000_000)
-                    .await
-                    .unwrap(),
-                None,
-                "the cap is never exceeded"
-            );
-            assert_eq!(
-                store
-                    .allocate(&key, B256::repeat_byte(0x99), 0, 1, 0, u128::MAX)
-                    .await
-                    .unwrap(),
-                None,
-                "only the stored channel allocates"
-            );
-            assert_eq!(
-                store.get(&key).await.unwrap().unwrap().cumulative_amount,
-                3_001_000
-            );
-            store.set(&entry).await.unwrap();
-            assert_eq!(
-                store.get(&key).await.unwrap().unwrap().cumulative_amount,
-                3_001_000,
-                "a write of an older amount does not lower it"
-            );
-        })
-        .await;
-    }
-
-    /// An absolute target is applied to the counter each allocation reads:
-    /// overlapping allocations toward one target, such as prepaid requests
-    /// from providers sharing the store, raise it to the target once and then
-    /// by their amount each, with disjoint ranges.
-    #[tokio::test]
-    async fn overlapping_target_allocations_reach_the_target_once() {
-        on_every_store(|store| async move {
-            let entry = entry();
-            let key = entry.key();
-            store.set(&entry).await.unwrap();
-            let id = entry.channel_id;
-            // Stored at 2_000_000; price 1_500, target 2_004_500, eight requests.
-            let ranges = futures_util::future::join_all((0..8).map(|_| {
-                let (store, key) = (store.clone(), key.clone());
-                async move {
-                    store
-                        .allocate(&key, id, 0, 1_500, 2_004_500, 10_000_000)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                }
-            }))
-            .await;
-            let mut ranges = ranges;
-            ranges.sort_unstable();
-            assert_eq!(ranges[0], (2_000_000, 2_004_500));
-            for pair in ranges.windows(2) {
-                assert_eq!(pair[0].1, pair[1].0, "ranges are disjoint and contiguous");
-                assert_eq!(pair[1].1 - pair[1].0, 1_500);
-            }
-            let total = store.get(&key).await.unwrap().unwrap().cumulative_amount;
-            assert_eq!(total, 2_004_500 + 7 * 1_500);
-            assert!(total <= 2_004_500 + 8 * 1_500);
-            // A target below the counter adds the amount only.
-            assert_eq!(
-                store
-                    .allocate(&key, id, 0, 1_500, 2_004_500, 10_000_000)
-                    .await
-                    .unwrap(),
-                Some((total, total + 1_500))
-            );
-            // Neither the target nor the amount may pass the cap.
-            assert_eq!(
-                store
-                    .allocate(&key, id, 0, 1, 10_000_001, 10_000_000)
-                    .await
-                    .unwrap(),
-                None
-            );
-        })
-        .await;
-    }
-
-    /// Processes sharing a SQLite store allocate disjoint voucher ranges
-    /// without holding the payment lease.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_allocations_are_disjoint_across_store_instances() {
-        let directory =
-            std::env::temp_dir().join(format!("mpp-rs-store-alloc-{}", uuid::Uuid::new_v4()));
-        let options = SqliteChannelStoreOptions {
-            namespace: "https://api.example.com".into(),
-            path: Some(directory.join("channels.db")),
-            request_url: None,
-        };
-        let stores: Vec<Arc<SqliteChannelStore>> = (0..4)
-            .map(|_| Arc::new(SqliteChannelStore::open(options.clone()).unwrap()))
-            .collect();
-        let entry = entry();
-        let (key, id) = (entry.key(), entry.channel_id);
-        stores[0].set(&entry).await.unwrap();
-        // Another process holding the payment lease does not block allocation.
-        let _lease = stores[1].acquire(&key).await.unwrap();
-
-        let tasks: Vec<_> = stores
-            .iter()
-            .cloned()
-            .map(|store| {
-                let key = key.clone();
-                tokio::spawn(async move {
-                    let mut raised = Vec::new();
-                    for _ in 0..25 {
-                        raised.push(
-                            store
-                                .allocate(&key, id, 0, 10, 0, u128::MAX)
-                                .await
-                                .unwrap()
-                                .unwrap()
-                                .1,
-                        );
-                    }
-                    raised
-                })
-            })
-            .collect();
-        let mut raised = Vec::new();
-        for task in tasks {
-            raised.extend(task.await.unwrap());
-        }
-        raised.sort_unstable();
-        let expected: Vec<u128> = (1..=100).map(|i| 2_000_000 + 10 * i).collect();
-        assert_eq!(raised, expected);
-        assert_eq!(
-            stores[3]
-                .get(&key)
-                .await
-                .unwrap()
-                .unwrap()
-                .cumulative_amount,
-            2_001_000
-        );
-        drop(stores);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

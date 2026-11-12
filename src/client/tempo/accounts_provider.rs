@@ -979,19 +979,6 @@ impl PaymentProvider for TempoAccountsProvider {
         let _ = self.record_receipt(context, challenge, receipt);
     }
 
-    fn observe_refusal(
-        &self,
-        challenge: &PaymentChallenge,
-        credential: &PaymentCredential,
-        problem: &serde_json::Value,
-    ) {
-        if challenge.intent.as_str() == INTENT_SESSION {
-            if let Ok(provider) = self.session_provider_holding(challenge, credential) {
-                provider.observe_refusal(challenge, credential, problem);
-            }
-        }
-    }
-
     fn funding_currency(&self, challenge: &PaymentChallenge) -> Option<String> {
         self.funding
             .lock()

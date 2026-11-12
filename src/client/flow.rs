@@ -547,23 +547,6 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             let has_receipt = resp.headers().contains_key("payment-receipt");
 
-            // A server that accepts vouchers out of order says, in the
-            // problem refusing one, whether it was already accepted or stale,
-            // so the provider knows whether the voucher's range was lost.
-            if session
-                && status == StatusCode::PAYMENT_REQUIRED
-                && credential.payload.get("after").is_some()
-            {
-                let (refused, problem) = read_small_problem(resp).await;
-                resp = refused;
-                // A problem that could not be read is reported as null.
-                self.provider.observe_refusal(
-                    &challenge,
-                    &credential,
-                    &problem.unwrap_or(serde_json::Value::Null),
-                );
-            }
-
             // The credential was spent but the server failed, so the payment
             // may have settled. Report it like mppx before any fallible state
             // transition, and still return the response so callers can inspect
@@ -884,9 +867,8 @@ fn session_receipt(
 /// Remote receipt accounting cannot exceed the voucher sent on this request.
 ///
 /// A voucher sent with `after` may arrive after a higher one from the same
-/// channel, so the server's accepted amount, and what it spent, may exceed
-/// it: the receipt is then bounded by its accepted amount, and the provider
-/// bounds that by what it signed.
+/// channel, so what the server spent may exceed it: its accepted amount
+/// bounds the receipt instead, and the provider bounds that by what it signed.
 fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentCredential) -> bool {
     let amount = |value: &serde_json::Value| value.as_str()?.parse::<u128>().ok();
     let Some(spent) = receipt.extensions.get("spent") else {
@@ -914,48 +896,6 @@ fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentC
         .is_none_or(|value| {
             amount(value).is_some_and(|accepted| spent <= accepted && accepted <= authorized)
         })
-}
-
-/// Reads the problem details of a small `application/problem+json`
-/// response, and returns the response with the same status, headers, URL
-/// and body. Other responses, and ones without a length within the limit,
-/// are returned unread.
-async fn read_small_problem(resp: Response) -> (Response, Option<serde_json::Value>) {
-    const MAX_PROBLEM_BYTES: u64 = 16 * 1024;
-    let is_problem = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("application/problem+json")
-        });
-    if !is_problem
-        || resp
-            .content_length()
-            .is_none_or(|length| length > MAX_PROBLEM_BYTES)
-    {
-        return (resp, None);
-    }
-    let (status, version, headers, url) = (
-        resp.status(),
-        resp.version(),
-        resp.headers().clone(),
-        resp.url().clone(),
-    );
-    let body = resp.bytes().await.unwrap_or_default();
-    let problem = serde_json::from_slice(&body).ok();
-    use reqwest::ResponseBuilderExt as _;
-    let mut rebuilt = http_types::Response::builder()
-        .status(status)
-        .version(version)
-        .url(url)
-        .body(body)
-        .expect("status and version come from a response");
-    *rebuilt.headers_mut() = headers;
-    (Response::from(rebuilt), problem)
 }
 
 /// The `payment.failed` reason for a credential that was sent without a
