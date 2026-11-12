@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -293,6 +294,9 @@ async fn acquire(
     Err(error.unwrap_or_else(|| IdentityError::email_otp("The code was rejected.", Some(400))))
 }
 
+/// Longest an issuer request may take, from sending it to reading its body.
+const ISSUER_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn no_redirect_client() -> Result<reqwest::Client, IdentityError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -321,6 +325,10 @@ async fn post(
     let response = client
         .post(format!("{}{path}", issuer.trim_end_matches('/')))
         .json(&body)
+        // Bounded so a stalled issuer cannot hang the request, and every
+        // retry waiting on the same acquisition, forever. The code callback
+        // itself stays unbounded: a person may be typing the code.
+        .timeout(ISSUER_TIMEOUT)
         .send()
         .await
         .map_err(IdentityError::Request)?;

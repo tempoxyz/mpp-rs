@@ -404,6 +404,8 @@ impl AttestationProver {
                 })
                 .collect();
             decided.sort_by_key(|(_, decision)| decision.rank());
+            let keys: Vec<Key> = decided.iter().map(|(key, _)| key.clone()).collect();
+            let mut met = false;
             for (key, decision) in decided {
                 tried.insert(key.clone());
                 let result = match decision {
@@ -413,6 +415,7 @@ impl AttestationProver {
                 match result {
                     Ok(Some(token)) => {
                         obtained.push((key, token));
+                        met = true;
                         break;
                     }
                     Ok(None) => {}
@@ -420,6 +423,16 @@ impl AttestationProver {
                     Err(error) => {
                         failure.get_or_insert(error);
                     }
+                }
+            }
+            // Refreshing inside the refresh margin failed or was declined:
+            // fall back to a cached attestation that has not expired and that
+            // the server has not rejected, rather than leave the group unmet.
+            if !met {
+                if let Some((key, token)) = keys.iter().find_map(|key| {
+                    Some((key.clone(), self.fallback(key, tokens_for(&sent, key))?))
+                }) {
+                    obtained.push((key, token));
                 }
             }
         }
@@ -500,6 +513,14 @@ impl AttestationProver {
             return Decision::Reuse(entry.token.clone());
         }
         Decision::Acquire { rejected: None }
+    }
+
+    /// A cached attestation for `key` that has not expired beyond the clock
+    /// tolerance and that the rejected request did not send.
+    fn fallback(&self, key: &Key, sent: &[String]) -> Option<String> {
+        let state = self.state();
+        let entry = state.slots.get(key)?;
+        (entry.usable(now(), true) && !sent.contains(&entry.token)).then(|| entry.token.clone())
     }
 
     /// Acquires an attestation for `key`, or joins an acquisition another
@@ -595,8 +616,9 @@ pub fn requirements(headers: &HeaderMap) -> Vec<Vec<AttestationRequirement>> {
                         .find(|(key, _)| key.as_str() == "issuer")
                     {
                         None => None,
+                        // Trimmed as configured issuers and `iss` claims are compared.
                         Some((_, BareItem::String(issuer))) if is_issuer(issuer.as_str()) => {
-                            Some(issuer.as_str().to_owned())
+                            Some(trim_issuer(issuer.as_str()).to_owned())
                         }
                         Some(_) => return None,
                     };
@@ -799,6 +821,69 @@ mod tests {
         let mut paid = request("https://api.example/");
         prover.present(&mut paid, true);
         assert_eq!(sent(&paid), vec![near]);
+    }
+
+    fn rejection(url: &str) -> ResponseParts {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REQUIRED_HEADER,
+            format!(r#"email;issuer="{ISSUER}/""#).parse().unwrap(),
+        );
+        ResponseParts {
+            status: StatusCode::UNAUTHORIZED,
+            headers,
+            url: url.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn requirements_trim_issuers() {
+        let groups = requirements(&rejection("https://api.example/").headers);
+        assert_eq!(groups[0][0].issuer.as_deref(), Some(ISSUER));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_a_cached_attestation_when_a_refresh_fails() {
+        // Inside the refresh margin, so an unpaid attempt leaves it out.
+        let near = token(100, |c| c["iat"] = (now() - 1_000).into());
+        let prover = AttestationProver::new([AUDIENCE], [ISSUER])
+            .unwrap()
+            .with_acquire(|_| async { Ok(None) })
+            .with_attestations([&near])
+            .unwrap();
+        let url: Url = "https://api.example/".parse().unwrap();
+        let value = prover
+            .retry_value(&url, &HeaderMap::new(), &rejection(url.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(value.unwrap(), near.as_str());
+
+        // Once the server rejected it, it is not offered again.
+        let mut sent = HeaderMap::new();
+        sent.insert(HEADER, near.parse().unwrap());
+        let value = prover
+            .retry_value(&url, &sent, &rejection(url.as_str()))
+            .await
+            .unwrap();
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn obtains_attestations_for_issuers_named_with_a_trailing_slash() {
+        let fresh = token(900, |_| {});
+        let acquired = fresh.clone();
+        let prover = AttestationProver::new([AUDIENCE], [ISSUER])
+            .unwrap()
+            .with_acquire(move |_| {
+                let token = acquired.clone();
+                async move { Ok(Some(token)) }
+            });
+        let url: Url = "https://api.example/".parse().unwrap();
+        let value = prover
+            .retry_value(&url, &HeaderMap::new(), &rejection(url.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(value.unwrap(), fresh.as_str());
     }
 
     #[test]
