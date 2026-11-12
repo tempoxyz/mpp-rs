@@ -9,7 +9,7 @@ use crate::protocol::methods::tempo::PATH_USD;
 
 pub use crate::protocol::methods::tempo::session_method::{
     deduct_from_channel, InMemoryChannelStore as SessionChannelStore,
-    SessionMethod as TempoSessionMethod, SessionMethodConfig, StreamCheck,
+    SessionMethod as TempoSessionMethod, SessionMethodConfig, StreamCheck, DEFAULT_REORDER_WINDOW,
 };
 pub use crate::protocol::methods::tempo::ChargeMethod as TempoChargeMethod;
 pub use crate::protocol::methods::tempo::{

@@ -13,7 +13,7 @@ use crate::protocol::core::{PaymentCredential, Receipt};
 use crate::protocol::methods::tempo::session::{
     SessionCredentialPayload, TempoSessionMethodDetails,
 };
-use crate::protocol::traits::VerificationError;
+use crate::protocol::traits::{ErrorCode, VerificationError};
 
 impl<P> SessionMethod<P>
 where
@@ -28,24 +28,31 @@ where
         expected_payee: Address,
         expected_token: Address,
     ) -> Result<Receipt, VerificationError> {
-        let (channel_id_str, descriptor, settlement_route, cumulative_amount_str, signature_str) =
-            match payload {
-                SessionCredentialPayload::Voucher {
-                    channel_id,
-                    descriptor,
-                    settlement_route,
-                    cumulative_amount,
-                    signature,
-                    ..
-                } => (
-                    channel_id,
-                    descriptor.as_ref(),
-                    settlement_route.as_ref(),
-                    cumulative_amount,
-                    signature,
-                ),
-                _ => unreachable!(),
-            };
+        let (
+            channel_id_str,
+            descriptor,
+            settlement_route,
+            cumulative_amount_str,
+            after_str,
+            signature_str,
+        ) = match payload {
+            SessionCredentialPayload::Voucher {
+                channel_id,
+                descriptor,
+                settlement_route,
+                cumulative_amount,
+                after,
+                signature,
+            } => (
+                channel_id,
+                descriptor.as_ref(),
+                settlement_route.as_ref(),
+                cumulative_amount,
+                after.as_ref(),
+                signature,
+            ),
+            _ => unreachable!(),
+        };
         let channel_id_str = &normalize_channel_id(channel_id_str);
 
         // The on-chain read does not depend on the stored channel, so it
@@ -98,6 +105,12 @@ where
             }
 
             let cumulative_amount = Self::parse_amount(cumulative_amount_str, "cumulativeAmount")?;
+            // `after` only matters to a server that accepts vouchers out of
+            // order; any other ignores it, as it did before the field existed.
+            let after = match (self.reorder_window, after_str) {
+                (Some(_), Some(after)) => Some(Self::parse_amount(after, "after")?),
+                _ => None,
+            };
 
             let escrow = self.resolve_escrow(details)?;
             let chain_id = self.resolve_chain_id(details);
@@ -112,9 +125,9 @@ where
                     "channel escrow does not match session escrow",
                 ));
             }
-            Ok(cumulative_amount)
+            Ok((cumulative_amount, after))
         };
-        let (cumulative_amount, on_chain) =
+        let ((cumulative_amount, after), on_chain) =
             tokio::try_join!(check_stored, async { Ok(read_on_chain.await) })?;
         let on_chain = on_chain?;
         let min_delta = self.resolve_min_delta(details);
@@ -144,6 +157,7 @@ where
                 channel_id_str,
                 Some(on_chain),
                 cumulative_amount,
+                after,
                 signature_str,
                 min_delta,
             )
@@ -160,6 +174,7 @@ where
         channel_id_str: &str,
         on_chain: Option<OnChainChannel>,
         cumulative_amount: u128,
+        after: Option<u128>,
         signature_str: &str,
         min_delta: u128,
     ) -> Result<ChannelState, VerificationError> {
@@ -190,33 +205,62 @@ where
                 }));
             }
         }
-        let channel_id = channel_id_str.to_owned();
-        let signature = signature_str.to_owned();
-        self.store
-            .update_channel(
-                channel_id_str,
-                Box::new(move |current| {
-                    let state = current
-                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    let state = match on_chain {
-                        Some(on_chain) => ChannelState {
-                            finalized: state.finalized || on_chain.finalized,
-                            ..state.refresh_on_chain(&on_chain)
-                        },
-                        None => state,
-                    };
-                    Self::accept_authenticated_voucher(
-                        state,
-                        &channel_id,
-                        cumulative_amount,
-                        &signature,
-                        min_delta,
-                    )
-                    .map(Some)
-                }),
-            )
-            .await?
-            .ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+        let window = self.reorder_window.map(|window| VoucherAcceptance {
+            after,
+            window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            now_ms: now_ms(),
+        });
+        // Vouchers inside a reorder window arrive concurrently by design, so
+        // on a store shared by several server instances a lost
+        // compare-exchange is routine: apply the voucher again against the
+        // fresh state rather than failing the request.
+        let attempts = if window.is_some() {
+            MAX_VOUCHER_UPDATE_ATTEMPTS
+        } else {
+            1
+        };
+        let mut attempt = 1;
+        loop {
+            let channel_id = channel_id_str.to_owned();
+            let signature = signature_str.to_owned();
+            let on_chain = on_chain.clone();
+            let result = self
+                .store
+                .update_channel(
+                    channel_id_str,
+                    Box::new(move |current| {
+                        let state = current.ok_or_else(|| {
+                            VerificationError::channel_not_found("channel not found")
+                        })?;
+                        let state = match on_chain {
+                            Some(on_chain) => ChannelState {
+                                finalized: state.finalized || on_chain.finalized,
+                                ..state.refresh_on_chain(&on_chain)
+                            },
+                            None => state,
+                        };
+                        Self::accept_authenticated_voucher(
+                            state,
+                            &channel_id,
+                            cumulative_amount,
+                            &signature,
+                            min_delta,
+                            window,
+                        )
+                        .map(Some)
+                    }),
+                )
+                .await;
+            match result {
+                Err(err) if err.code == Some(ErrorCode::ConcurrentUpdate) && attempt < attempts => {
+                    attempt += 1;
+                }
+                result => {
+                    return result?
+                        .ok_or_else(|| VerificationError::channel_not_found("channel not found"))
+                }
+            }
+        }
     }
 
     fn accept_authenticated_voucher(
@@ -225,6 +269,7 @@ where
         cumulative_amount: u128,
         signature_str: &str,
         min_delta: u128,
+        window: Option<VoucherAcceptance>,
     ) -> Result<ChannelState, VerificationError> {
         if channel.closing {
             return Err(VerificationError::channel_closed("channel is closing"));
@@ -264,7 +309,11 @@ where
             }
         }
 
-        if cumulative_amount < channel.settled_on_chain {
+        // Within a reorder window a late voucher adds no funds of its own:
+        // requests are charged from the highest voucher, so only a voucher
+        // that raises it must be above the settled amount.
+        let raises = cumulative_amount > channel.highest_voucher_amount;
+        if cumulative_amount < channel.settled_on_chain && (window.is_none() || raises) {
             return Err(VerificationError::new(
                 "voucher cumulativeAmount is below on-chain settled amount",
             ));
@@ -275,6 +324,45 @@ where
             ));
         }
 
-        channel.accept_voucher(cumulative_amount, sig_bytes, min_delta)
+        match window {
+            Some(window) => channel.accept_voucher_in_window(
+                cumulative_amount,
+                window.after,
+                sig_bytes,
+                min_delta,
+                window.now_ms,
+                window.window_ms,
+            ),
+            None => channel.accept_voucher(cumulative_amount, sig_bytes, min_delta),
+        }
     }
+}
+
+/// Most times a session method with a reorder window applies one voucher to
+/// a channel whose store write lost a race (see
+/// [`ErrorCode::ConcurrentUpdate`]).
+///
+/// The bound comes from the store: within one process the channel store
+/// serializes updates to a channel (as `ChannelStoreAdapter`'s per-channel lock
+/// does), so a write loses only to another instance sharing the store that
+/// committed between this attempt's read and its write. Eight attempts carry
+/// a voucher through contention from several instances on one channel while
+/// keeping the store round trips one request can make small; past them the
+/// conflict is returned with its own code.
+pub(super) const MAX_VOUCHER_UPDATE_ATTEMPTS: usize = 8;
+
+/// How a session method with a reorder window accepts one voucher.
+#[derive(Clone, Copy)]
+struct VoucherAcceptance {
+    after: Option<u128>,
+    window_ms: u64,
+    now_ms: u64,
+}
+
+/// The current time in Unix milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }

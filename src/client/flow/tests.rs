@@ -1221,3 +1221,48 @@ fn session_receipt_spending_is_bounded_by_the_sent_voucher() {
         );
     }
 }
+
+/// A voucher sent with `after` may land after a higher one, so the server's
+/// accepted amount bounds the receipt instead of the voucher's own amount.
+#[test]
+fn late_voucher_receipt_is_bounded_by_the_accepted_amount() {
+    let challenge = PaymentChallenge::new(
+        "test",
+        "api.example.com",
+        "tempo",
+        "session",
+        Base64UrlJson::from_value(&serde_json::json!({})).unwrap(),
+    );
+    let credential = PaymentCredential {
+        challenge: challenge.to_echo(),
+        payload: serde_json::json!({
+            "channelId": "channel",
+            "cumulativeAmount": "1000",
+            "after": "900"
+        }),
+        source: None,
+    };
+    for (spent, accepted, valid) in [
+        (Some("1500"), Some("2000"), true),
+        (Some("2000"), Some("2000"), true),
+        (Some("2001"), Some("2000"), false),
+        (Some("500"), None, false),
+    ] {
+        let mut receipt = crate::protocol::core::Receipt::success("tempo", "channel");
+        if let Some(spent) = spent {
+            receipt
+                .extensions
+                .insert("spent".into(), serde_json::json!(spent));
+        }
+        if let Some(accepted) = accepted {
+            receipt
+                .extensions
+                .insert("acceptedCumulative".into(), serde_json::json!(accepted));
+        }
+        assert_eq!(
+            super::session_receipt_within_authorization(&receipt, &credential),
+            valid,
+            "{spent:?} {accepted:?}"
+        );
+    }
+}

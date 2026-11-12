@@ -865,6 +865,10 @@ fn session_receipt(
 }
 
 /// Remote receipt accounting cannot exceed the voucher sent on this request.
+///
+/// A voucher sent with `after` may arrive after a higher one from the same
+/// channel, so what the server spent may exceed it: its accepted amount
+/// bounds the receipt instead, and the provider bounds that by what it signed.
 fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentCredential) -> bool {
     let amount = |value: &serde_json::Value| value.as_str()?.parse::<u128>().ok();
     let Some(spent) = receipt.extensions.get("spent") else {
@@ -873,6 +877,13 @@ fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentC
     let Some(spent) = amount(spent) else {
         return false;
     };
+    if credential.payload.get("after").is_some() {
+        return receipt
+            .extensions
+            .get("acceptedCumulative")
+            .and_then(amount)
+            .is_some_and(|accepted| spent <= accepted);
+    }
     let Some(authorized) = credential.payload.get("cumulativeAmount").and_then(amount) else {
         return false;
     };

@@ -75,7 +75,7 @@ pub use tempo::{
     deduct_from_channel, tempo, tempo_provider, SessionChannelStore, SessionMethodConfig,
     StreamCheck, TempoBuilder, TempoChargeExt, TempoChargeMethod, TempoConfig, TempoMethodDetails,
     TempoProvider, TempoRelayConfig, TempoRelayErrorCode, TempoRemoteFeePayer, TempoSessionMethod,
-    CHAIN_ID, METHOD_NAME,
+    CHAIN_ID, DEFAULT_REORDER_WINDOW, METHOD_NAME,
 };
 
 // Re-export stripe types at server level for backward compatibility

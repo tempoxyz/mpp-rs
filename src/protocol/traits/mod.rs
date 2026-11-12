@@ -65,6 +65,11 @@ pub enum ErrorCode {
     /// Reported as `verification-failed` with status 403 and no challenge,
     /// since paying again would not help.
     CredentialReplayed,
+    /// The store refused a write because the record changed after it was
+    /// read, such as when another server instance sharing the store updated
+    /// the same channel first. The operation can be applied again against
+    /// fresh state.
+    ConcurrentUpdate,
 }
 
 impl ErrorCode {
@@ -91,6 +96,7 @@ impl ErrorCode {
             Self::Internal => "internal",
             Self::PaymentActionRequired => "payment-action-required",
             Self::CredentialReplayed => "credential-replayed",
+            Self::ConcurrentUpdate => "concurrent-update",
         }
     }
 
@@ -268,6 +274,12 @@ impl VerificationError {
     pub fn credential_replayed(message: impl Into<String>) -> Self {
         Self::with_code(message, ErrorCode::CredentialReplayed)
     }
+
+    /// Create a "concurrent-update" verification error for a store write
+    /// that lost a race against another writer.
+    pub fn concurrent_update(message: impl Into<String>) -> Self {
+        Self::with_code(message, ErrorCode::ConcurrentUpdate)
+    }
 }
 
 impl fmt::Display for VerificationError {
@@ -315,9 +327,9 @@ impl From<VerificationError> for MppError {
         match err.code {
             Some(ErrorCode::Expired) => MppError::PaymentExpired(None),
             Some(ErrorCode::InvalidChallenge) => MppError::invalid_challenge_reason(err.message),
-            Some(ErrorCode::NetworkError) | Some(ErrorCode::Internal) => {
-                MppError::Internal(err.message)
-            }
+            Some(ErrorCode::NetworkError)
+            | Some(ErrorCode::Internal)
+            | Some(ErrorCode::ConcurrentUpdate) => MppError::Internal(err.message),
             Some(ErrorCode::InvalidCredential) => MppError::MalformedCredential(Some(err.message)),
             Some(ErrorCode::ChannelNotFound) => MppError::ChannelNotFound(Some(err.message)),
             Some(ErrorCode::ChannelClosed) => MppError::ChannelClosed(Some(err.message)),
@@ -527,6 +539,7 @@ mod tests {
             (ErrorCode::Internal, "internal-payment-error"),
             (ErrorCode::PaymentActionRequired, "payment-action-required"),
             (ErrorCode::CredentialReplayed, "verification-failed"),
+            (ErrorCode::ConcurrentUpdate, "internal-payment-error"),
         ];
         for (code, suffix) in codes {
             let label = format!("{code:?}");

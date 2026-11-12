@@ -12,6 +12,12 @@ pub const SESSION_PROTOCOL_LEGACY: &str = "v1";
 /// TIP-1034 precompile-backed Tempo session protocol marker.
 pub const SESSION_PROTOCOL_TIP1034: &str = "v2";
 
+/// Longest `reorderWindow`, in seconds, that a session server advertises:
+/// one day. Clients treat a longer window as not advertised and pay
+/// serialized, and servers cap a longer configured window at it, so no
+/// window arithmetic can overflow.
+pub const MAX_REORDER_WINDOW_SECS: u64 = 86_400;
+
 /// Full TIP-1034 channel descriptor used to derive and verify a channel ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +115,7 @@ where
 ///     settlement_token: None,
 ///     session_protocol: None,
 ///     session_snapshot: None,
+///     reorder_window: None,
 /// };
 /// assert_eq!(details.escrow_contract, "0x1234567890abcdef1234567890abcdef12345678");
 /// ```
@@ -155,6 +162,12 @@ pub struct TempoSessionMethodDetails {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_snapshot: Option<SessionSnapshot>,
+
+    /// Seconds within which the server accepts vouchers out of order (see
+    /// [`SessionMethod::with_reorder_window`](crate::protocol::methods::tempo::session_method::SessionMethod::with_reorder_window)).
+    /// Clients send concurrent vouchers with `after` only when it is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reorder_window: Option<u64>,
 }
 
 /// Session credential payload, discriminated on the `action` field.
@@ -230,6 +243,12 @@ pub enum SessionCredentialPayload {
         settlement_route: Option<SettlementRoute>,
         #[serde(rename = "cumulativeAmount")]
         cumulative_amount: String,
+        /// Cumulative amount the client had counted before this voucher, as a
+        /// decimal string: `(after, cumulativeAmount]` is this voucher's own
+        /// increment. Unsigned, and sent only to servers that advertise a
+        /// `reorderWindow`, which use it to accept vouchers out of order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
         signature: String,
     },
     #[serde(rename = "close")]
@@ -457,6 +476,7 @@ mod tests {
             operator: Some("0x1111111111111111111111111111111111111111".to_string()),
             session_protocol: Some(SESSION_PROTOCOL_TIP1034.to_string()),
             session_snapshot: None,
+            reorder_window: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
@@ -499,6 +519,7 @@ mod tests {
             operator: None,
             session_protocol: None,
             session_snapshot: None,
+            reorder_window: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
@@ -585,6 +606,7 @@ mod tests {
                 settlement_route: Some(route.clone()),
                 cumulative_amount: "1".to_string(),
                 signature: "0xsig".to_string(),
+                after: None,
             },
             SessionCredentialPayload::Close {
                 channel_id: "0xchannel".to_string(),
@@ -695,6 +717,7 @@ mod tests {
             settlement_route: None,
             cumulative_amount: "15000".to_string(),
             signature: "0xvouchersig".to_string(),
+            after: None,
         };
 
         let json = serde_json::to_string(&payload).unwrap();

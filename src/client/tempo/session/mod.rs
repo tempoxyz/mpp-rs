@@ -176,6 +176,14 @@ pub struct TempoSessionProvider {
     /// Held across a save of receipted `spent`, so a save that read an older
     /// receipt cannot land after a newer one's.
     server_spent_saves: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a voucher for a server that accepts vouchers out of order
+    /// takes its slice of the channel's counter and is signed, so payments
+    /// and stream vouchers never sign overlapping slices.
+    allocation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The highest cumulative amount each channel's server reported as
+    /// accepted, by channel ID. A stream voucher that takes a fresh slice of
+    /// a reorder-window channel's counter is sized from it.
+    server_accepted: Arc<Mutex<HashMap<String, u128>>>,
     /// Receives `channel.deposit` events for accepted opens and top-ups.
     events: ClientEvents,
     trusted_tempo_proof_realms: Vec<(reqwest::Url, String)>,
@@ -194,6 +202,25 @@ pub struct TempoSessionProvider {
     /// Client for requests carrying a `Payment-Session` channel hint; a
     /// no-redirect default client when unset.
     hint_client: Option<reqwest::Client>,
+}
+
+/// Whether a session challenge's server accepts vouchers out of order on a
+/// channel with escrow `escrow`: it advertises a `reorderWindow` of at most
+/// [`MAX_REORDER_WINDOW_SECS`](crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS)
+/// and the channel is a TIP-1034 one. Payments over such a channel each sign
+/// their own slice of its counter, `(after, cumulativeAmount]`, without
+/// waiting for each other's answers. Legacy escrow channels pay serialized.
+fn pays_concurrently(session_req: &SessionRequest, escrow: Address) -> bool {
+    is_precompile_escrow(escrow)
+        && session_req
+            .method_details
+            .as_ref()
+            .and_then(|details| details.get("reorderWindow"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|window| {
+                (1..=crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS)
+                    .contains(&window)
+            })
 }
 
 /// How long a session management request may take before it fails with an
@@ -235,7 +262,9 @@ pub struct SessionSpend {
 /// Server charges from receipts: each request costs the change in its
 /// channel's `spent`, or its quoted price the first time a channel is seen
 /// with no `spent` to start from. A restored channel starts from its session
-/// snapshot's `spent`, else from the one its store recorded.
+/// snapshot's `spent`, else from the one its store recorded. A request paid
+/// with its own voucher slice costs that slice instead (see
+/// [`record_slice`](Self::record_slice)).
 #[derive(Debug, Default)]
 struct SpendLedger {
     channels: HashMap<String, u128>,
@@ -244,6 +273,19 @@ struct SpendLedger {
 }
 
 impl SpendLedger {
+    /// Records a request paid with its own voucher slice on a server that
+    /// accepts vouchers out of order. Concurrent receipts arrive in any
+    /// order, so the change between two of them is not one request's cost:
+    /// it costs `slice`, and the channel's `spent` only rises.
+    fn record_slice(&mut self, channel_id: &str, spent: u128, slice: u128) -> u128 {
+        let previous = self.channels.get(channel_id).copied().unwrap_or_default();
+        self.channels
+            .insert(channel_id.to_owned(), previous.max(spent));
+        self.spent += slice;
+        self.last = Some(slice);
+        slice
+    }
+
     fn record(&mut self, channel_id: &str, spent: u128, quoted: Option<u128>) -> u128 {
         let cost = match self.channels.get(channel_id) {
             Some(previous) => spent.saturating_sub(*previous),
@@ -407,6 +449,8 @@ impl TempoSessionProvider {
             topping_up: Arc::new(Mutex::new(HashSet::new())),
             spend: Arc::default(),
             server_spent_saves: Arc::default(),
+            allocation_lock: Arc::default(),
+            server_accepted: Arc::default(),
             events: ClientEvents::default(),
             trusted_tempo_proof_realms: Vec::new(),
             management_timeout: MANAGEMENT_REQUEST_TIMEOUT,
@@ -2513,8 +2557,24 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         required_cumulative: u128,
     ) -> Result<PaymentCredential, MppError> {
+        self.stream_voucher_credential(challenge, channel_id_hex, required_cumulative, None)
+            .await
+    }
+
+    /// Signs a stream voucher for `challenge`. `resend` is the
+    /// `(after, cumulativeAmount]` range of a voucher refused for an expired
+    /// Challenge: a reorder-window channel signs that range again rather than
+    /// taking another slice of the counter.
+    async fn stream_voucher_credential(
+        &self,
+        challenge: &PaymentChallenge,
+        channel_id_hex: &str,
+        required_cumulative: u128,
+        resend: Option<(u128, u128)>,
+    ) -> Result<PaymentCredential, MppError> {
         self.check_policy(challenge)?;
         self.assert_within_max_deposit(required_cumulative)?;
+        let session_req: Option<SessionRequest> = challenge.request.decode().ok();
 
         // Find the channel entry by channel ID
         let key = {
@@ -2531,6 +2591,23 @@ impl TempoSessionProvider {
             ));
         }
 
+        // On a server that accepts vouchers out of order, a voucher that
+        // raises the counter covers only the slice above it, so it never
+        // claims the slices of concurrent payments still in flight.
+        let escrow = self
+            .channels
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|entry| entry.escrow_contract);
+        let concurrent = session_req
+            .as_ref()
+            .zip(escrow)
+            .is_some_and(|(request, escrow)| pays_concurrently(request, escrow));
+        let _allocation = match concurrent {
+            true => Some(self.allocation_lock.lock().await),
+            false => None,
+        };
         let mut entry = {
             let channels = self.channels.lock().unwrap();
             channels.get(&key).cloned()
@@ -2543,28 +2620,48 @@ impl TempoSessionProvider {
         }
         self.merge_stored_channel(&key, &mut entry).await?;
 
-        if required_cumulative > entry.cumulative_amount
-            && self
-                .pending_opens
-                .lock()
-                .unwrap()
-                .contains_key(channel_id_hex)
-        {
+        let pending = self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .contains_key(channel_id_hex);
+        if required_cumulative > entry.cumulative_amount && pending {
             return Err(MppError::InvalidConfig(
                 "pending channel open requires settlement reconciliation before another payment"
                     .into(),
             ));
         }
 
-        // Update cumulative to at least the required amount
-        if required_cumulative > entry.cumulative_amount {
-            entry.cumulative_amount = required_cumulative;
+        // On a reorder-window channel a voucher that raises the counter always
+        // carries `after`. Concurrent payments may have raised the counter
+        // past what the stream asks for with slices still in flight, so the
+        // stream takes a fresh slice above it rather than re-signing the
+        // counter, which would claim them.
+        let counter = entry.cumulative_amount;
+        let (after, cumulative) = match resend {
+            Some((after, cumulative)) if concurrent => (Some(after), cumulative),
+            _ if concurrent && required_cumulative > counter => {
+                (Some(counter), required_cumulative)
+            }
+            _ if concurrent && !pending => {
+                let increment =
+                    self.stream_increment(&entry, session_req.as_ref(), required_cumulative);
+                let cumulative = counter.checked_add(increment).ok_or_else(|| {
+                    MppError::InvalidConfig("session cumulative amount overflowed".into())
+                })?;
+                (Some(counter), cumulative)
+            }
+            _ => (None, required_cumulative.max(counter)),
+        };
+        if after.is_some() {
+            self.assert_within_max_deposit(cumulative)?;
         }
-        if entry.cumulative_amount > entry.deposit {
+        if cumulative > entry.deposit {
             return Err(MppError::InvalidConfig(
                 "voucher cumulative amount exceeds channel deposit".into(),
             ));
         }
+        entry.cumulative_amount = counter.max(cumulative);
 
         let mut payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_voucher_payload_with_descriptor_primitive(
@@ -2572,7 +2669,7 @@ impl TempoSessionProvider {
                 entry.descriptor.clone().ok_or_else(|| {
                     MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                 })?,
-                entry.cumulative_amount,
+                cumulative,
                 entry.chain_id,
             )
             .await?
@@ -2580,7 +2677,7 @@ impl TempoSessionProvider {
             create_voucher_payload(
                 self.secp256k1_signer()?,
                 entry.channel_id,
-                entry.cumulative_amount,
+                cumulative,
                 entry.escrow_contract,
                 entry.chain_id,
             )
@@ -2592,6 +2689,9 @@ impl TempoSessionProvider {
         {
             *settlement_route = entry.settlement_route.clone();
         }
+        if let SessionCredentialPayload::Voucher { after: field, .. } = &mut payload {
+            *field = after.map(|after| after.to_string());
+        }
 
         // Update the registry only after the voucher has been signed.
         self.persist_channel(&entry).await?;
@@ -2600,6 +2700,48 @@ impl TempoSessionProvider {
 
         let payer = self.signing_mode.from_address(self.signer.address());
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
+    }
+
+    /// What a stream voucher taking a fresh slice of a reorder-window
+    /// channel's counter adds: what the stream asks for above the amount the
+    /// server last reported as accepted, and at least the Challenge's
+    /// `minVoucherDelta` (one base unit without one). Without a reported
+    /// amount it adds the minimum, and the server asks again if that falls
+    /// short.
+    fn stream_increment(
+        &self,
+        entry: &ChannelEntry,
+        request: Option<&SessionRequest>,
+        required_cumulative: u128,
+    ) -> u128 {
+        let minimum = request
+            .and_then(|request| request.min_voucher_delta())
+            .and_then(|delta| delta.parse::<u128>().ok())
+            .unwrap_or(0)
+            .max(1);
+        self.server_accepted
+            .lock()
+            .unwrap()
+            .get(&entry.channel_id.to_string())
+            .and_then(|accepted| required_cumulative.checked_sub(*accepted))
+            .unwrap_or(0)
+            .max(minimum)
+    }
+
+    /// Remembers the highest cumulative amount the server reported as
+    /// accepted for a channel this provider holds.
+    fn record_server_accepted(&self, channel_id: &str, accepted: u128) {
+        if !self
+            .channel_id_to_key
+            .lock()
+            .unwrap()
+            .contains_key(channel_id)
+        {
+            return;
+        }
+        let mut server_accepted = self.server_accepted.lock().unwrap();
+        let highest = server_accepted.entry(channel_id.to_owned()).or_default();
+        *highest = (*highest).max(accepted);
     }
 
     async fn top_up_credential_for_challenge(
@@ -3480,8 +3622,18 @@ impl TempoSessionProvider {
         let refreshed = Self::refreshed_challenge(&resp);
         if let Some(refreshed) = &refreshed {
             ensure_redirect_safe_credential_header(refreshed)?;
+            // The refused voucher's range is signed again, so it takes no
+            // second slice of a reorder-window channel's counter.
+            let resend = match credential.payload_as::<SessionCredentialPayload>() {
+                Ok(SessionCredentialPayload::Voucher {
+                    after: Some(after),
+                    cumulative_amount,
+                    ..
+                }) => after.parse().ok().zip(cumulative_amount.parse().ok()),
+                _ => None,
+            };
             let credential = self
-                .voucher_credential_for_challenge(refreshed, channel_id_hex, required_cumulative)
+                .stream_voucher_credential(refreshed, channel_id_hex, required_cumulative, resend)
                 .await?;
             resp = self
                 .post_credential(client, url, refreshed, &credential, "voucher POST failed")
@@ -3569,6 +3721,14 @@ impl TempoSessionProvider {
         let _ = self.channel_store.set_server_spent(&key, id, spent).await;
     }
 
+    /// Records the cumulative amount the server reports as accepted for a
+    /// channel, and resolves a pending open it covers. Returns whether an
+    /// open was resolved.
+    ///
+    /// On a channel whose server accepts vouchers out of order, a stream
+    /// voucher that takes a fresh slice of the counter covers what the stream
+    /// asks for above this amount. WebSocket clients pass a `needVoucher`
+    /// frame's `acceptedCumulative` here before signing its voucher.
     pub async fn acknowledge_accepted(
         &self,
         channel_id_hex: &str,
@@ -3578,6 +3738,7 @@ impl TempoSessionProvider {
             .parse::<B256>()
             .map_err(|_| MppError::InvalidConfig("invalid session channel ID".into()))?
             .to_string();
+        self.record_server_accepted(&channel_id, accepted_cumulative);
         if !self.pending_opens.lock().unwrap().contains_key(&channel_id) {
             return Ok(false);
         }
@@ -3850,6 +4011,13 @@ impl TempoSessionProvider {
             .await
             .map_err(Self::store_error)?;
         let credential = self.payment_credential_inner(challenge, top_up).await?;
+        // A voucher sent with `after` pays for its own slice of the channel's
+        // counter, which is already raised past it, so later payments need
+        // not wait for its answer: the leases are released before the request
+        // is sent.
+        if credential.payload.get("after").is_some() {
+            return Ok(credential);
+        }
         self.pending_payment_leases.lock().unwrap().insert(
             challenge.id.clone(),
             SessionPaymentLease {
@@ -4234,7 +4402,40 @@ impl TempoSessionProvider {
                     }
                 }
 
-                let payload = if precompile {
+                // A server that accepts vouchers out of order gets this
+                // request's own slice of the counter, `(after,
+                // cumulativeAmount]`. Stream vouchers raise the counter under
+                // the same lock, so the slice starts above the latest one.
+                let concurrent = !includes_request
+                    && !pending
+                    && pays_concurrently(&session_req, escrow_contract);
+                let _allocation = match concurrent {
+                    true => Some(self.allocation_lock.lock().await),
+                    false => None,
+                };
+                let after = if concurrent {
+                    let mut after = entry.cumulative_amount - amount;
+                    if let Some(current) = self.channels.lock().unwrap().get(&key) {
+                        if current.channel_id == entry.channel_id {
+                            after = after.max(current.cumulative_amount);
+                            entry.deposit = entry.deposit.max(current.deposit);
+                        }
+                    }
+                    entry.cumulative_amount = after.checked_add(amount).ok_or_else(|| {
+                        MppError::InvalidConfig("session cumulative amount overflowed".into())
+                    })?;
+                    self.assert_within_max_deposit(entry.cumulative_amount)?;
+                    if entry.cumulative_amount > entry.deposit {
+                        return Err(MppError::InvalidConfig(
+                            "session cumulative amount exceeds channel deposit".into(),
+                        ));
+                    }
+                    Some(after.to_string())
+                } else {
+                    None
+                };
+
+                let mut payload = if precompile {
                     create_precompile_voucher_payload_with_descriptor_primitive(
                         &self.signer,
                         entry.descriptor.clone().ok_or_else(|| {
@@ -4254,6 +4455,9 @@ impl TempoSessionProvider {
                     )
                     .await?
                 };
+                if let SessionCredentialPayload::Voucher { after: field, .. } = &mut payload {
+                    *field = after;
+                }
 
                 // Update the registry
                 self.persist_channel(&entry).await?;
@@ -4646,6 +4850,16 @@ impl PaymentProvider for TempoSessionProvider {
             .get(&state.channel_id)
             .cloned()?;
         let mut entry = self.channels.lock().unwrap().get(&key).cloned()?;
+        // A server that accepts vouchers out of order gets each request's own
+        // slice when it asks: prepaid vouchers stay on the serialized path.
+        if state
+            .challenge
+            .request
+            .decode::<SessionRequest>()
+            .is_ok_and(|request| pays_concurrently(&request, entry.escrow_contract))
+        {
+            return None;
+        }
         self.merge_stored_channel(&key, &mut entry).await.ok()?;
         if state.spent > entry.cumulative_amount {
             return None;
@@ -4691,24 +4905,44 @@ impl PaymentProvider for TempoSessionProvider {
             .and_then(|value| value.as_str())
             .and_then(|value| value.parse::<u128>().ok())?;
         let channel_id = receipt.reference.parse::<B256>().ok()?.to_string();
-        let quoted = challenge
-            .request
-            .decode::<SessionRequest>()
-            .ok()
+        let request = challenge.request.decode::<SessionRequest>().ok();
+        let quoted = request
+            .as_ref()
             .and_then(|request| request.parse_amount().ok());
         let (key, _) = self.expected_channel_key(challenge).ok()?;
         let entry = self.channels.lock().unwrap().get(&key).cloned()?;
         if entry.channel_id.to_string() != channel_id || spent > entry.cumulative_amount {
             return None;
         }
+        if let Some(accepted) = receipt
+            .extensions
+            .get("acceptedCumulative")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<u128>().ok())
+        {
+            self.record_server_accepted(&channel_id, accepted);
+        }
+        // A concurrent payment's voucher slice, `cumulativeAmount - after`, is
+        // the challenge's amount, and its receipt may arrive before an
+        // earlier request's.
+        let slice = quoted.filter(|_| {
+            request
+                .as_ref()
+                .is_some_and(|request| pays_concurrently(request, entry.escrow_contract))
+        });
         let mut ledger = self.spend.lock().unwrap();
         let previous = ledger
             .channels
             .get(&channel_id)
             .copied()
             .unwrap_or_default();
-        let delta = spent.checked_sub(previous)?;
-        let cost = ledger.record(&channel_id, spent, quoted);
+        let (delta, cost) = match slice {
+            Some(slice) => (slice, ledger.record_slice(&channel_id, spent, slice)),
+            None => (
+                spent.checked_sub(previous)?,
+                ledger.record(&channel_id, spent, quoted),
+            ),
+        };
         drop(ledger);
         // A prepaid request commits nothing afterwards, so its save runs in the background.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -6811,6 +7045,290 @@ mod tests {
         channel_id
     }
 
+    /// A challenge for the channel [`seed_precompile_channel`] tracks, whose
+    /// server accepts vouchers out of order when `reorder_window` is set.
+    fn reorder_challenge(
+        id: &str,
+        payee: Address,
+        currency: Address,
+        reorder_window: Option<u64>,
+    ) -> PaymentChallenge {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let mut challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let mut request: serde_json::Value = challenge.request.decode().unwrap();
+        if let Some(window) = reorder_window {
+            request["methodDetails"]["reorderWindow"] = window.into();
+        }
+        challenge.id = id.into();
+        challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+        challenge
+    }
+
+    /// The `after` and `cumulativeAmount` of a voucher credential.
+    fn voucher_slice(credential: &PaymentCredential) -> (Option<u128>, u128) {
+        match credential.payload_as::<SessionCredentialPayload>().unwrap() {
+            SessionCredentialPayload::Voucher {
+                after,
+                cumulative_amount,
+                ..
+            } => (
+                after.map(|after| after.parse().unwrap()),
+                cumulative_amount.parse().unwrap(),
+            ),
+            other => panic!("expected a voucher, got {other:?}"),
+        }
+    }
+
+    /// Against a server that advertises a reorder window, concurrent payments
+    /// each sign their own slice of the channel's counter, with `after` at
+    /// its start, and none holds the payment lock once it is signed.
+    #[tokio::test]
+    async fn reorder_window_payments_sign_disjoint_slices_without_holding_the_lock() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+
+        let challenges = ["a", "b", "c"].map(|id| reorder_challenge(id, payee, currency, Some(30)));
+        let (a, b, c) = tokio::join!(
+            provider.pay(&challenges[0]),
+            provider.pay(&challenges[1]),
+            provider.pay(&challenges[2])
+        );
+        let mut slices: Vec<_> = [a, b, c]
+            .iter()
+            .map(|credential| voucher_slice(credential.as_ref().unwrap()))
+            .collect();
+        slices.sort();
+        assert_eq!(
+            slices,
+            [
+                (Some(1_000), 2_000),
+                (Some(2_000), 3_000),
+                (Some(3_000), 4_000)
+            ]
+        );
+        assert!(provider.pending_payment_leases.lock().unwrap().is_empty());
+        let fourth = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.pay(&reorder_challenge("d", payee, currency, Some(30))),
+        )
+        .await
+        .expect("no payment lock is held")
+        .unwrap();
+        assert_eq!(voucher_slice(&fourth), (Some(4_000), 5_000));
+        assert_eq!(provider.cumulative(), 5_000);
+    }
+
+    /// Without a reorder window, or above the longest one, a payment sends no
+    /// `after` and holds the payment lock until its answer, as before.
+    #[tokio::test]
+    async fn payments_without_a_reorder_window_stay_serialized() {
+        for window in [None, Some(0), Some(86_401)] {
+            let provider = make_test_provider();
+            let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+            seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+
+            let first = reorder_challenge("first", payee, currency, window);
+            let credential = provider.pay(&first).await.unwrap();
+            assert_eq!(voucher_slice(&credential), (None, 2_000), "{window:?}");
+            assert!(provider.has_pending_lease("first"));
+            let second = reorder_challenge("second", payee, currency, window);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), provider.pay(&second))
+                    .await
+                    .is_err(),
+                "{window:?}"
+            );
+            provider.commit_payment(&first, &credential).await.unwrap();
+            let credential = provider.pay(&second).await.unwrap();
+            assert_eq!(voucher_slice(&credential), (None, 3_000), "{window:?}");
+        }
+    }
+
+    /// A stream voucher on a reorder-window channel covers only the slice
+    /// above the counter, so it never claims vouchers still in flight.
+    #[tokio::test]
+    async fn reorder_window_stream_voucher_covers_only_its_own_slice() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = reorder_challenge("stream", payee, currency, Some(30));
+
+        let paid = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_slice(&paid), (Some(1_000), 2_000));
+        let streamed = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 2_500)
+            .await
+            .unwrap();
+        assert_eq!(voucher_slice(&streamed), (Some(2_000), 2_500));
+        let paid = provider.pay(&challenge).await.unwrap();
+        assert_eq!(voucher_slice(&paid), (Some(2_500), 3_500));
+    }
+
+    /// When concurrent payments raised the counter past what the stream asks
+    /// for, with their slices still in flight, the stream voucher takes a
+    /// fresh slice above the counter, sized from the server's accepted
+    /// amount, rather than re-signing the counter without `after`.
+    #[tokio::test]
+    async fn reorder_window_stream_voucher_below_the_counter_takes_a_fresh_slice() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = reorder_challenge("stream", payee, currency, Some(30));
+        let channel = channel_id.to_string();
+        provider
+            .acknowledge_accepted(&channel, 1_000)
+            .await
+            .unwrap();
+
+        let (a, b) = tokio::join!(provider.pay(&challenge), provider.pay(&challenge));
+        let mut slices = [voucher_slice(&a.unwrap()), voucher_slice(&b.unwrap())];
+        slices.sort();
+        assert_eq!(slices, [(Some(1_000), 2_000), (Some(2_000), 3_000)]);
+
+        let streamed = provider
+            .voucher_credential_for_challenge(&challenge, &channel, 1_500)
+            .await
+            .unwrap();
+        assert_eq!(voucher_slice(&streamed), (Some(3_000), 3_500));
+        assert_eq!(provider.cumulative(), 3_500);
+
+        // The Challenge's minimum voucher delta bounds the slice from below.
+        let mut request: serde_json::Value = challenge.request.decode().unwrap();
+        request["methodDetails"]["minVoucherDelta"] = "700".into();
+        let mut challenge = challenge;
+        challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+        let streamed = provider
+            .voucher_credential_for_challenge(&challenge, &channel, 1_500)
+            .await
+            .unwrap();
+        assert_eq!(voucher_slice(&streamed), (Some(3_500), 4_200));
+    }
+
+    /// Receipts of concurrent payments arrive in any order: each request
+    /// costs its own slice, and the channel's `spent` only rises.
+    #[tokio::test]
+    async fn reorder_window_receipts_cost_each_slice_in_any_order() {
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 3_000, 10_000);
+        let challenge = reorder_challenge("receipt", payee, currency, Some(30));
+        let context = PaymentContext {
+            url: "https://test-realm/data".parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        for spent in ["3000", "2000"] {
+            let mut receipt = Receipt::success("tempo", channel_id.to_string());
+            receipt
+                .extensions
+                .insert("spent".into(), serde_json::json!(spent));
+            assert_eq!(
+                provider.record_receipt(&context, &challenge, &receipt),
+                Some(1_000)
+            );
+        }
+        assert_eq!(provider.spend().spent, 2_000);
+        assert_eq!(
+            provider.spend.lock().unwrap().channels[&channel_id.to_string()],
+            3_000
+        );
+    }
+
+    /// Two requests through one provider to a server with a reorder window
+    /// are both in flight at once: the second does not wait for the first's
+    /// answer.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn reorder_window_requests_are_in_flight_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::Fetch;
+
+        let store = Arc::new(MemoryChannelStore::default());
+        let provider = make_test_provider().with_channel_store(store.clone());
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let entry = provider.channels().into_values().next().unwrap();
+        let key = TempoSessionProvider::channel_key(
+            &payee,
+            &currency,
+            &TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        store
+            .set_at(
+                &store::origin_channel_key(&key, &origin),
+                &StoredChannelEntry {
+                    origin: Some(origin),
+                    ..TempoSessionProvider::stored_entry(&entry).unwrap()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut challenge = reorder_challenge("slow", payee, currency, Some(30));
+        challenge.realm = "127.0.0.1".into();
+        let challenges = Arc::new(AtomicUsize::new(0));
+        // Each paid request waits until both are in flight.
+        let both_in_flight = Arc::new(tokio::sync::Barrier::new(2));
+        let app = Router::new().route(
+            "/paid",
+            get(move |headers: HeaderMap| {
+                let mut challenge = challenge.clone();
+                let challenges = challenges.clone();
+                let both_in_flight = both_in_flight.clone();
+                async move {
+                    if headers.contains_key("authorization") {
+                        let waited =
+                            tokio::time::timeout(Duration::from_secs(5), both_in_flight.wait())
+                                .await;
+                        return match waited {
+                            Ok(_) => StatusCode::OK.into_response(),
+                            Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+                        };
+                    }
+                    challenge.id =
+                        format!("challenge-{}", challenges.fetch_add(1, Ordering::SeqCst));
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        [("www-authenticate", challenge.to_header().unwrap())],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let request = || {
+            reqwest::Client::new()
+                .get(format!("http://{address}/paid"))
+                .header("Accept-Payment", "tempo/session")
+                .send_with_payment(&provider)
+        };
+        let (first, second) = tokio::join!(request(), request());
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.unwrap().status(), StatusCode::OK);
+        assert_eq!(provider.cumulative(), 3_000);
+        assert_eq!(
+            provider.channels()[&key].channel_id,
+            channel_id,
+            "both paid over the same channel"
+        );
+    }
+
     fn channel_state_response(deposit: u128) -> String {
         use alloy::sol_types::SolValue;
         alloy::primitives::Bytes::from((0u128, deposit, 0u64).abi_encode()).to_string()
@@ -6911,6 +7429,7 @@ mod tests {
                     settlement_route: None,
                     cumulative_amount: "1000".into(),
                     signature: "0x00".into(),
+                    after: None,
                 },
             );
             let result = provider.invalidate_payment(&challenge, &credential).await;
@@ -7002,6 +7521,7 @@ mod tests {
                 settlement_route: None,
                 cumulative_amount: "100".into(),
                 signature: "0x00".into(),
+                after: None,
             },
         );
 
@@ -8164,6 +8684,60 @@ mod tests {
         assert!(provider.close(&client, &url).await.unwrap().is_some());
         assert_eq!(attempts("close"), ["test-id", "refreshed-id"]);
         assert!(provider.channels().is_empty());
+    }
+
+    /// A stream voucher refused for an expired Challenge on a reorder-window
+    /// channel is signed again for the refreshed one over the same range, so
+    /// it takes no second slice, also when it reaches the deposit.
+    #[tokio::test]
+    async fn refreshed_challenge_resends_the_same_voucher_range() {
+        use axum::{http::StatusCode, response::IntoResponse};
+
+        let provider = make_test_provider();
+        let (payee, currency) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+        // A payment's slice `(1000, 2000]` is still in flight.
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 2_000, 3_000);
+        let expired = reorder_challenge("expired", payee, currency, Some(30));
+        let refreshed = reorder_challenge("refreshed", payee, currency, Some(30));
+        let channel = channel_id.to_string();
+        provider
+            .acknowledge_accepted(&channel, 1_000)
+            .await
+            .unwrap();
+        *provider.last_challenge.lock().unwrap() = Some(expired);
+
+        let (url, posted) = management_server(move |challenge_id, _| {
+            if challenge_id == "refreshed" {
+                return StatusCode::OK.into_response();
+            }
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                [("www-authenticate", refreshed.to_header().unwrap())],
+            )
+                .into_response()
+        })
+        .await;
+        provider
+            .send_voucher(&reqwest::Client::new(), &url, &channel, 2_000)
+            .await
+            .unwrap();
+
+        let posted = posted.lock().unwrap();
+        let sent: Vec<_> = posted
+            .iter()
+            .map(|(challenge_id, payload)| {
+                (
+                    challenge_id.as_str(),
+                    payload["after"].as_str().unwrap(),
+                    payload["cumulativeAmount"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            [("expired", "2000", "3000"), ("refreshed", "2000", "3000")]
+        );
+        assert_eq!(provider.cumulative(), 3_000);
     }
 
     #[tokio::test]
@@ -9541,6 +10115,7 @@ mod tests {
                 settlement_token: None,
                 operator: Some(Address::ZERO.to_string()),
                 session_protocol: Some("v2".into()),
+                reorder_window: None,
                 session_snapshot: Some(SessionSnapshot {
                     accepted_cumulative: "2000".into(),
                     chain_id: 42431,

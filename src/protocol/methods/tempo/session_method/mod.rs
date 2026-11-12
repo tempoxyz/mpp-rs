@@ -22,6 +22,7 @@ pub(crate) use receipt::channel_receipt;
 pub(crate) use store::normalize_channel_id;
 pub use store::{
     deduct_from_channel, ChannelState, ChannelStore, InMemoryChannelStore, PendingClose,
+    VoucherRun, VoucherWindow, MAX_VOUCHER_RUNS,
 };
 pub use stream::StreamCheck;
 
@@ -69,7 +70,15 @@ pub struct SessionMethod<P> {
     close_signer: Option<Arc<super::DynSigner>>,
     /// When each streaming channel's escrow was last read successfully.
     stream_checks: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    /// Window within which vouchers are accepted out of order; see
+    /// [`with_reorder_window`](Self::with_reorder_window).
+    reorder_window: Option<std::time::Duration>,
 }
+
+/// Reorder window that [`SessionMethod::with_reorder_window`] is meant to
+/// be used with: it must exceed the time between signing and acceptance of
+/// concurrent requests, which is seconds of network and queueing.
+pub const DEFAULT_REORDER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl<P> SessionMethod<P>
 where
@@ -86,7 +95,30 @@ where
             config,
             close_signer: None,
             stream_checks: Arc::default(),
+            reorder_window: None,
         }
+    }
+
+    /// Accept vouchers out of order within `window`, and advertise it as the
+    /// `reorderWindow` (whole seconds) of session challenges.
+    ///
+    /// A payer's concurrent requests then pay over one channel without
+    /// waiting for each other: each voucher carries `after`, the cumulative
+    /// amount its client counted before it, and is accepted once as long as
+    /// its increment `(after, cumulativeAmount]` was not accepted before and
+    /// it is newer than the window. A late voucher, below the highest
+    /// accepted one, adds no funds: requests are still charged from the
+    /// highest voucher, which remains what settles on chain. Without a window
+    /// (the default) every voucher must raise the highest accepted amount.
+    /// A window shorter than a second disables it, and one longer than
+    /// [`MAX_REORDER_WINDOW_SECS`](crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS)
+    /// is capped at it. See [`DEFAULT_REORDER_WINDOW`].
+    pub fn with_reorder_window(mut self, window: std::time::Duration) -> Self {
+        let max = std::time::Duration::from_secs(
+            crate::protocol::methods::tempo::session::MAX_REORDER_WINDOW_SECS,
+        );
+        self.reorder_window = (window.as_secs() > 0).then_some(window.min(max));
+        self
     }
 
     /// Set the signer used for submitting on-chain close transactions.
@@ -129,6 +161,7 @@ where
                 operator: None,
                 session_protocol: None,
                 session_snapshot: None,
+                reorder_window: None,
             }),
         }
     }
@@ -179,6 +212,7 @@ where
             operator: None,
             session_protocol: None,
             session_snapshot: None,
+            reorder_window: self.reorder_window.map(|window| window.as_secs()),
         };
         serde_json::to_value(details).ok()
     }
