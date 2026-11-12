@@ -11,7 +11,7 @@ use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::VerificationError;
 
 use super::super::{proof, TempoChargeExt, METHOD_NAME};
-use super::memo::assert_challenge_bound_memos;
+use super::memo::assert_hash_credential_attribution;
 use super::receipt_logs::{match_receipt_transfers, ReceiptSenderPolicy};
 use super::transaction_credential::funding_currency;
 use super::ChargeMethod;
@@ -112,14 +112,14 @@ where
             },
         )?;
 
-        // The receipt is settled, so a memo that is not bound to this
-        // challenge is final: answer it as a replay, not a retryable failure.
-        assert_challenge_bound_memos(
+        // A push payment must carry attribution bound to this challenge, and
+        // attribution for another challenge or realm fails verification.
+        assert_hash_credential_attribution(
             matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+            &expected,
             &challenge.id,
             &challenge.realm,
-        )
-        .map_err(|error| VerificationError::credential_replayed(error.message))?;
+        )?;
 
         // The payer is the account the matched transfers debited, not the
         // submitter. Settlement-contract transfers are funded by the

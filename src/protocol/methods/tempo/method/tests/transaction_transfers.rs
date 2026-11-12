@@ -218,8 +218,10 @@ fn test_validate_transaction_transfers_checks_challenge_bound_memo() {
             )),
             false,
         ),
+        // Another realm's attribution could later be claimed there as a
+        // hash credential, so a pull carrying it is rejected.
         (
-            "wrong realm",
+            "other realm",
             Some(attribution::encode(
                 "challenge-123",
                 "other.example.com",
@@ -227,8 +229,8 @@ fn test_validate_transaction_transfers_checks_challenge_bound_memo() {
             )),
             false,
         ),
-        ("non-MPP memo", Some([0xab; 32]), false),
-        ("plain transfer", None, false),
+        ("non-MPP memo", Some([0xab; 32]), true),
+        ("plain transfer", None, true),
     ];
 
     for require_exact_calls in [false, true] {
@@ -405,7 +407,7 @@ fn test_machine_token_route_checks_challenge_binding() {
             attribution::encode("challenge-123", "other.example.com", None),
             false,
         ),
-        ([0xab; 32], false),
+        ([0xab; 32], true),
     ] {
         let mut actual = expected.clone();
         actual[0].memo = Some(memo);
@@ -446,7 +448,11 @@ fn test_legacy_primary_memo_does_not_disable_challenge_binding() {
             attribution::encode("challenge-123", "api.example.com", None),
             true,
         ),
-        ([0xab; 32], false),
+        ([0xab; 32], true),
+        (
+            attribution::encode("challenge-456", "api.example.com", None),
+            false,
+        ),
     ] {
         let tx_bytes = encode_signed_tx(
             vec![tempo_alloy::primitives::transaction::Call {
@@ -893,4 +899,66 @@ fn test_policy_override_adjusts_fee_payer_gas_limit() {
             true,
         )
         .expect("override should raise ceiling above default");
+}
+
+/// A memo the server configures is matched exactly, so it passes even when
+/// it is attribution for another realm or challenge; an unconfigured slot in
+/// the same charge still rejects such attribution.
+#[test]
+fn test_validate_transaction_transfers_accepts_configured_attribution_memo() {
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let method = ChargeMethod::new(provider);
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let split_recipient = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let configured = attribution::encode("challenge-456", "other.example.com", None);
+    let other_realm = attribution::encode("challenge-123", "other.example.com", None);
+
+    for (split_memo, should_accept) in [(None, true), (Some(other_realm), false)] {
+        let mut expected = vec![Transfer {
+            amount,
+            recipient,
+            memo: Some(configured),
+        }];
+        let mut calls = vec![tempo_alloy::primitives::transaction::Call {
+            to: TxKind::Call(currency),
+            value: U256::ZERO,
+            input: make_transfer_with_memo_input(recipient, amount, configured),
+        }];
+        if let Some(split_memo) = split_memo {
+            expected.push(Transfer {
+                amount,
+                recipient: split_recipient,
+                memo: None,
+            });
+            calls.push(tempo_alloy::primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_with_memo_input(split_recipient, amount, split_memo),
+            });
+        }
+        let tx_bytes = encode_signed_tx(calls, MAX_FEE_PAYER_GAS_LIMIT);
+        for require_exact_calls in [false, true] {
+            let result = method.validate_transaction_transfers_with_machine_token(
+                &tx_bytes,
+                currency,
+                &expected,
+                CHAIN_ID,
+                TransactionValidationOptions {
+                    require_exact_calls,
+                    challenge_binding: Some(("challenge-123", "api.example.com")),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.is_ok(), should_accept, "{result:?}");
+            if let Err(error) = result {
+                assert!(error
+                    .to_string()
+                    .contains("memo is not bound to this challenge"));
+            }
+        }
+    }
 }
