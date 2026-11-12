@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
-use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
+use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge, WithReceipt};
 use mpp::server::{tempo, Mpp, TempoConfig};
 
 struct OneCent;
@@ -17,8 +17,12 @@ impl ChargeConfig for OneCent {
     }
 }
 
-async fn paid(charge: MppCharge<OneCent>) -> String {
-    format!("paid: {}", charge.receipt.reference)
+// WithReceipt adds the Payment-Receipt header to the paid response.
+async fn paid(charge: MppCharge<OneCent>) -> WithReceipt<String> {
+    WithReceipt {
+        body: format!("paid: {}", charge.receipt.reference),
+        receipt: charge.receipt,
+    }
 }
 
 #[tokio::main]

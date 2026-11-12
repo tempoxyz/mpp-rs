@@ -1957,12 +1957,56 @@ mod core_spec_credentials {
         }
     }
 
+    /// Accepts every credential, recording the amount each verification
+    /// was asked to check.
+    struct AmountRecorder {
+        verified: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ChargeChallenger for AmountRecorder {
+        fn challenge(
+            &self,
+            amount: &str,
+            options: ChallengeOptions,
+        ) -> Result<PaymentChallenge, String> {
+            MockChallenger { accept: true }.challenge(amount, options)
+        }
+
+        fn verify_payment(
+            &self,
+            credential_str: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            MockChallenger { accept: true }.verify_payment(credential_str)
+        }
+
+        fn verify_payment_for_amount_and_scope(
+            &self,
+            credential_str: &str,
+            amount: &str,
+            _mppx_scope: Option<serde_json::Value>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            self.verified.lock().unwrap().push(amount.to_string());
+            self.verify_payment(credential_str)
+        }
+    }
+
     async fn run_dynamic<C: DynamicChargeConfig>(
         uri: &str,
         auth: Option<&str>,
         extension: Option<ChargeAmount>,
     ) -> Result<MppDynamicCharge<C>, MppChargeRejection> {
-        let state: Arc<dyn ChargeChallenger> = Arc::new(MockChallenger { accept: true });
+        run_dynamic_with(uri, auth, extension, Default::default()).await
+    }
+
+    async fn run_dynamic_with<C: DynamicChargeConfig>(
+        uri: &str,
+        auth: Option<&str>,
+        extension: Option<ChargeAmount>,
+        verified: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<MppDynamicCharge<C>, MppChargeRejection> {
+        let state: Arc<dyn ChargeChallenger> = Arc::new(AmountRecorder { verified });
         let mut builder = http_types::Request::builder().uri(uri);
         if let Some(auth) = auth {
             builder = builder.header(header::AUTHORIZATION, auth);
@@ -1985,20 +2029,29 @@ mod core_spec_credentials {
         };
         assert_eq!(challenge.request.decode_value().unwrap()["amount"], "2.50");
 
-        let paid = run_dynamic::<QueryPrice>("/test?price=2.50", Some("Payment eyJ9"), None)
-            .await
-            .unwrap();
+        let verified = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let paid = run_dynamic_with::<QueryPrice>(
+            "/test?price=2.50",
+            Some("Payment eyJ9"),
+            None,
+            verified.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(paid.amount, "2.50");
         assert_eq!(paid.receipt.reference, "0xabc");
 
-        let paid = run_dynamic::<ChargeAmount>(
+        let paid = run_dynamic_with::<ChargeAmount>(
             "/test",
             Some("Payment eyJ9"),
             Some(ChargeAmount("0.25".into())),
+            verified.clone(),
         )
         .await
         .unwrap();
         assert_eq!(paid.amount, "0.25");
+        // Each credential is verified against its own request's amount.
+        assert_eq!(*verified.lock().unwrap(), ["2.50", "0.25"]);
 
         // A request nobody priced is the server's failure: 500, no challenge.
         let response = run_dynamic::<ChargeAmount>("/test", None, None)

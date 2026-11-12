@@ -1260,23 +1260,33 @@ where
 /// # Example
 ///
 /// ```ignore
+/// use axum::extract::Query;
 /// use mpp::server::axum::{DynamicChargeConfig, MppDynamicCharge};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Order {
+///     items: u32,
+/// }
 ///
 /// struct PerItem;
 /// impl DynamicChargeConfig for PerItem {
 ///     fn amount(parts: &http::request::Parts) -> String {
-///         let items: u32 = parts
-///             .uri
-///             .query()
-///             .and_then(|q| q.strip_prefix("items="))
-///             .and_then(|n| n.parse().ok())
-///             .unwrap_or(1);
-///         format!("{items}.00")
+///         // An empty amount is refused with 500, but the handler's
+///         // `Query<Order>` runs first and answers a bad query with 400.
+///         Query::<Order>::try_from_uri(&parts.uri)
+///             .map(|Query(order)| format!("{}.00", order.items))
+///             .unwrap_or_default()
 ///     }
 /// }
 ///
-/// async fn handler(charge: MppDynamicCharge<PerItem>) -> String {
-///     format!("paid {}", charge.amount)
+/// // Axum runs extractors in order, so a malformed query is rejected
+/// // before any challenge is issued.
+/// async fn handler(
+///     Query(order): Query<Order>,
+///     charge: MppDynamicCharge<PerItem>,
+/// ) -> String {
+///     format!("paid {} for {} items", charge.amount, order.items)
 /// }
 /// ```
 pub trait DynamicChargeConfig {
