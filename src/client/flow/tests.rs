@@ -2076,6 +2076,14 @@ fn padded_auth_params_are_not_read_as_schemes() {
     );
     assert_eq!(remove("Bearer t, Payment xyz"), ["Bearer t"]);
     assert_eq!(remove("Bearer t,Payment\txyz"), ["Bearer t"]);
+    // SP and HTAB both end the scheme, as in the tokenizer.
+    for value in ["Payment\txyz", "payment\t xyz", "Bearer t,\tPayment\txyz"] {
+        let mut headers = HeaderMap::new();
+        headers.append(AUTHORIZATION, HeaderValue::from_static(value));
+        assert!(super::carries_payment_credential(&headers), "{value}");
+    }
+    assert_eq!(remove("Payment\txyz"), Vec::<String>::new());
+    assert_eq!(remove("Bearer t,\tPayment\txyz, a=b"), ["Bearer t"]);
 
     // token68 credentials with `=` padding, before and as the Payment one.
     assert_eq!(
@@ -2125,6 +2133,51 @@ fn obs_text_authorization_values_are_kept_or_split_as_bytes() {
         remove(b"Payment abc, opaque=\"\xe9\""),
         (true, Vec::<Vec<u8>>::new())
     );
+}
+
+/// Every 402 the flow reads and rebuilds keeps the response's extensions,
+/// URL, headers and whole body, problem details or not.
+#[tokio::test]
+async fn rebuilt_402_responses_keep_extensions_url_and_body() {
+    #[derive(Clone, Debug, PartialEq)]
+    struct Marker(u8);
+
+    let response = |content_type: &str, body: &'static str| {
+        use reqwest::ResponseBuilderExt;
+        let mut response = http_types::Response::builder()
+            .status(StatusCode::PAYMENT_REQUIRED)
+            .url("https://api.example.com/paid".parse().unwrap())
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, body.len())
+            .body(body)
+            .unwrap();
+        response.extensions_mut().insert(Marker(7));
+        reqwest::Response::from(response)
+    };
+    let check = |rebuilt: &reqwest::Response, body_len: usize| {
+        assert_eq!(rebuilt.extensions().get::<Marker>(), Some(&Marker(7)));
+        assert_eq!(rebuilt.url().as_str(), "https://api.example.com/paid");
+        assert_eq!(
+            rebuilt.headers()[reqwest::header::CONTENT_LENGTH],
+            body_len.to_string().as_str()
+        );
+    };
+
+    let problem = r#"{"type":"https://paymentauth.org/problems/verification-failed"}"#;
+    let (rebuilt, rejected) =
+        super::credential_rejected(response("application/problem+json", problem)).await;
+    assert!(!rejected);
+    check(&rebuilt, problem.len());
+    assert_eq!(rebuilt.text().await.unwrap(), problem);
+
+    let (rebuilt, rejected) = super::credential_rejected(response("text/plain", "")).await;
+    assert!(rejected);
+    check(&rebuilt, 0);
+
+    let (rebuilt, rejected) = super::credential_rejected(response("text/plain", "pay")).await;
+    assert!(!rejected);
+    check(&rebuilt, 3);
+    assert_eq!(rebuilt.text().await.unwrap(), "pay");
 }
 
 /// A Payment credential the flow cannot see on the request, from the

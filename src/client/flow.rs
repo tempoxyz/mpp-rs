@@ -1030,7 +1030,7 @@ fn without_payment_schemes(value: &[u8]) -> Option<Vec<u8>> {
 /// `Payment-Authorization` and any `Payment` scheme in an `Authorization`
 /// value, including one comma-joined with another scheme. The other schemes
 /// stay, byte for byte, also when they carry bytes outside visible ASCII.
-fn remove_payment_credentials(headers: &mut HeaderMap) {
+pub(crate) fn remove_payment_credentials(headers: &mut HeaderMap) {
     headers.remove("payment-authorization");
     let kept: Vec<HeaderValue> = headers
         .get_all(reqwest::header::AUTHORIZATION)
@@ -1040,9 +1040,10 @@ fn remove_payment_credentials(headers: &mut HeaderMap) {
                 return Some(value.clone());
             }
             let rest = without_payment_schemes(value.as_bytes())?;
-            // The rest is made of the value's own bytes, so it is a valid
-            // value; keep the original rather than drop it if it were not.
-            let mut rebuilt = HeaderValue::from_bytes(&rest).unwrap_or_else(|_| value.clone());
+            // The rest is the value's own non-empty, trimmed elements joined
+            // by ", ", so it is always a valid value. Were it not, keeping the
+            // original would send its Payment credential next to the new one.
+            let mut rebuilt = HeaderValue::from_bytes(&rest).ok()?;
             rebuilt.set_sensitive(value.is_sensitive());
             Some(rebuilt)
         })
