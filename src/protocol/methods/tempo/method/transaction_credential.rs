@@ -521,6 +521,13 @@ where
         // kept until they settle, so a retry after a failed broadcast can
         // still recover a transaction that landed later.
         let mut broadcast_record: Option<String> = None;
+        // The records this attempt wrote itself, and whether it reached the
+        // send: an attempt that fails before sending removes them again, so a
+        // retry neither skips simulation nor the inclusion check for a
+        // transaction that was never broadcast.
+        let mut created_broadcast_record = false;
+        let mut wrote_hosted_record = false;
+        let mut sent = false;
         let result: Result<B256, VerificationError> = async {
             // Simulation and the dedup claim took round trips since co-signing:
             // right before broadcasting, make sure the sponsored transaction
@@ -551,7 +558,8 @@ where
             // attempt of this credential may have landed after that attempt
             // failed: its broadcast record lets the retry recover it below.
             let broadcast_key = format!(
-                "mpp:charge:broadcast-pending:{:#x}",
+                "{}{:#x}",
+                crate::store::TEMPO_BROADCAST_PENDING_PREFIX,
                 keccak256(&final_tx_bytes)
             );
             // The record names the challenge it was broadcast for: only a
@@ -564,7 +572,11 @@ where
                     .map_err(|e| {
                         VerificationError::internal(format!("Failed to read broadcast record: {e}"))
                     })?
-                    .is_some_and(|recorded| recorded.as_str() == Some(challenge_id)),
+                    .is_some_and(|recorded| {
+                        recorded.as_str().is_some_and(|recorded| {
+                            crate::protocol::core::constant_time_eq(recorded, challenge_id)
+                        })
+                    }),
                 _ => false,
             };
             if !broadcast_before {
@@ -572,27 +584,18 @@ where
                     .await?;
             }
 
-            if let (Some(store), Some(key), Some(fill)) =
-                (&self.store, &hosted_record, hosted_fill.take())
-            {
-                store.put(key, fill).await.map_err(|e| {
-                    VerificationError::internal(format!("Failed to record sponsorship: {e}"))
-                })?;
-            }
-
             // Recorded right before the send, and only for as long as a
-            // retry could still settle: past the challenge's expiry and the
-            // transaction's validity it can neither land nor be retried.
+            // retry could still settle: past the challenge's expiry it can no
+            // longer be retried.
             if let (Some(store), Some(_)) = (&self.store, &submission_key) {
                 if !broadcast_before {
                     // A record another challenge holds stays: this attempt
-                    // then has no record of its own. A failed write, such as
-                    // a full MemoryStore expiring capacity, fails before the
-                    // send: without the record, a send whose outcome is lost
-                    // and that lands later could not be settled by a retry,
-                    // leaving the payer charged with no receipt. Size an
-                    // expiring capacity for in-flight broadcasts as well as
-                    // proof reservations.
+                    // then has no record of its own. A failed write fails
+                    // before the send: without the record, a send whose
+                    // outcome is lost and that lands later could not be
+                    // settled by a retry, leaving the payer charged with no
+                    // receipt. MemoryStore's expiring capacity does not count
+                    // these records, so proof reservations cannot fill it.
                     let created = store
                         .put_if_absent_with_ttl(
                             &broadcast_key,
@@ -605,17 +608,34 @@ where
                         })?;
                     if created {
                         broadcast_record = Some(broadcast_key);
+                        created_broadcast_record = true;
                     }
                 } else {
                     broadcast_record = Some(broadcast_key);
                 }
             }
 
+            // After the broadcast record, so that a failed write of either
+            // leaves no hosted record for a transaction that was never sent.
+            if let (Some(store), Some(key), Some(fill)) =
+                (&self.store, &hosted_record, hosted_fill.take())
+            {
+                store.put(key, fill).await.map_err(|e| {
+                    VerificationError::internal(format!("Failed to record sponsorship: {e}"))
+                })?;
+                wrote_hosted_record = true;
+            }
+
+            // The lookups and writes above took round trips: a challenge
+            // that expired meanwhile is not broadcast.
+            ensure_challenge_not_expired(expires)?;
+
             // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
             // receipt. The Tempo node holds the connection open until the transaction
             // is mined/pre-confirmed and returns the full receipt, avoiding the
             // client-side polling loop of send_raw_transaction + get_receipt.
             let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
+            sent = true;
             let broadcast: Result<<TempoNetwork as alloy::network::Network>::ReceiptResponse, _> =
                 self.provider
                     .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
@@ -736,8 +756,18 @@ where
         // transaction can be mined at most once, and a mined one is still
         // caught by its transaction hash claim.
         if result.is_err() {
-            if let (Some(store), Some(key)) = (&self.store, &submission_key) {
-                let _ = store.delete(key).await;
+            if let Some(store) = &self.store {
+                let unsent = |written: bool, key: &Option<String>| {
+                    (!sent && written).then(|| key.clone()).flatten()
+                };
+                let keys = [
+                    submission_key.clone(),
+                    unsent(wrote_hosted_record, &hosted_record),
+                    unsent(created_broadcast_record, &broadcast_record),
+                ];
+                for key in keys.into_iter().flatten() {
+                    let _ = store.delete(&key).await;
+                }
             }
         } else if let Some(store) = &self.store {
             // Settled: the transaction hash claim now guards it.
@@ -765,14 +795,16 @@ fn broadcast_refused(error: &alloy::transports::TransportError) -> bool {
     })
 }
 
-/// How long a broadcast record is kept: until the later of the challenge's
-/// expiry and the transaction's `valid_before`, plus a minute, or an hour
-/// when neither bounds it.
-fn broadcast_record_ttl(
+/// How long a broadcast record is kept: until the challenge's expiry plus a
+/// minute, since a retry after it is refused. Without an expiry, until the
+/// transaction's `valid_before` plus a minute, at most an hour (plus the
+/// minute) from now.
+pub(super) fn broadcast_record_ttl(
     expires: Option<&str>,
     tx_bytes: &[u8],
 ) -> Result<std::time::Duration, VerificationError> {
     const MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_WITHOUT_EXPIRY: u64 = 3600;
     let now = super::fee_payer::unix_now()?.as_secs();
     let challenge_deadline = expires
         .and_then(|expires| {
@@ -780,14 +812,14 @@ fn broadcast_record_ttl(
                 .ok()
         })
         .map(|at| u64::try_from(at.unix_timestamp()).unwrap_or(0));
-    let tx_deadline = tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..])
-        .ok()
-        .and_then(|signed| signed.tx().valid_before.map(|vb| vb.get()));
-    let ttl = match challenge_deadline.max(tx_deadline) {
-        Some(deadline) => std::time::Duration::from_secs(deadline.saturating_sub(now)),
-        None => std::time::Duration::from_secs(3600),
-    };
-    Ok(ttl + MARGIN)
+    let deadline = challenge_deadline.unwrap_or_else(|| {
+        let cap = now.saturating_add(MAX_WITHOUT_EXPIRY);
+        tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..])
+            .ok()
+            .and_then(|signed| signed.tx().valid_before.map(|vb| vb.get()))
+            .map_or(cap, |valid_before| valid_before.min(cap))
+    });
+    Ok(std::time::Duration::from_secs(deadline.saturating_sub(now)) + MARGIN)
 }
 
 /// The hosted sponsorship a retry reconciles: the exact co-signed transaction

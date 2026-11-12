@@ -93,6 +93,15 @@ pub enum StoreError {
 
 // ==================== MemoryStore ====================
 
+/// Key prefix of Tempo charge's in-flight pull broadcast records, which
+/// [`MemoryStore::with_expiring_capacity`] does not count or cap.
+pub(crate) const TEMPO_BROADCAST_PENDING_PREFIX: &str = "mpp:charge:broadcast-pending:";
+
+/// Whether a TTL reservation under `key` counts against the expiring capacity.
+fn is_capped(key: &str) -> bool {
+    !key.starts_with(TEMPO_BROADCAST_PENDING_PREFIX)
+}
+
 /// In-memory store backed by a HashMap. JSON-roundtrips values to match production behavior.
 pub struct MemoryStore {
     data: std::sync::Mutex<MemoryData>,
@@ -103,6 +112,8 @@ pub struct MemoryStore {
 struct MemoryData {
     values: std::collections::HashMap<String, (String, Option<std::time::SystemTime>)>,
     expirations: std::collections::BTreeSet<(std::time::SystemTime, String)>,
+    /// How many of `expirations` count against the expiring capacity.
+    capped: usize,
 }
 
 impl MemoryData {
@@ -117,6 +128,7 @@ impl MemoryData {
     fn remove(&mut self, key: &str) {
         if let Some((_, Some(deadline))) = self.values.remove(key) {
             self.expirations.remove(&(deadline, key.to_owned()));
+            self.capped -= usize::from(is_capped(key));
         }
     }
 
@@ -133,6 +145,7 @@ impl MemoryData {
         self.remove(&key);
         if let Some(deadline) = deadline {
             self.expirations.insert((deadline, key.clone()));
+            self.capped += usize::from(is_capped(&key));
         }
         self.values.insert(key, (value, deadline));
     }
@@ -145,6 +158,7 @@ impl MemoryData {
         {
             let (_, key) = self.expirations.pop_first().expect("expiry exists");
             self.values.remove(&key);
+            self.capped -= usize::from(is_capped(&key));
         }
     }
 }
@@ -166,13 +180,20 @@ impl MemoryStore {
     /// Opts into a limit on simultaneously live TTL reservations.
     /// The default removes expired records without rejecting live traffic at a global cap.
     /// A full store rejects new reservations; it never evicts live replay markers.
-    /// Tempo charge's in-flight pull broadcast records count against the cap too,
-    /// and a pull payment fails before its broadcast while the store is full.
+    /// Tempo charge's in-flight pull broadcast records expire too but neither
+    /// count against nor are rejected at the cap, so filling it with proof
+    /// reservations cannot block pull payments.
     pub fn with_expiring_capacity(capacity: usize) -> Self {
         Self {
             expiring_capacity: capacity,
             ..Self::default()
         }
+    }
+
+    /// The keys of every live record.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<String> {
+        self.lock().values.keys().cloned().collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MemoryData> {
@@ -291,7 +312,7 @@ impl Store for MemoryStore {
             if data.contains_key(&key) {
                 return Ok(false);
             }
-            if data.expirations.len() >= self.expiring_capacity {
+            if is_capped(&key) && data.capped >= self.expiring_capacity {
                 return Err(StoreError::Internal(
                     "live replay reservation capacity reached".into(),
                 ));
@@ -647,6 +668,50 @@ mod tests {
             .put_if_absent_with_ttl("new", serde_json::json!(true), Duration::from_secs(10))
             .await
             .unwrap());
+    }
+
+    /// Tempo pull broadcast records expire like other reservations but are
+    /// not capped, so a cap full of proof reservations cannot block them,
+    /// and they do not take capacity from proof reservations.
+    #[tokio::test]
+    async fn broadcast_records_are_not_capped() {
+        use std::time::{Duration, SystemTime};
+        let store = MemoryStore::with_expiring_capacity(1);
+        let broadcast = |i: u32| format!("{TEMPO_BROADCAST_PENDING_PREFIX}{i:#x}");
+        assert!(store
+            .put_if_absent_with_ttl(
+                &broadcast(0),
+                serde_json::json!("c"),
+                Duration::from_secs(10)
+            )
+            .await
+            .unwrap());
+        assert!(store
+            .put_if_absent_with_ttl("proof", serde_json::json!(true), Duration::from_secs(10))
+            .await
+            .unwrap());
+        assert!(store
+            .put_if_absent_with_ttl("proof-2", serde_json::json!(true), Duration::from_secs(10))
+            .await
+            .is_err());
+        assert!(store
+            .put_if_absent_with_ttl(
+                &broadcast(1),
+                serde_json::json!("c"),
+                Duration::from_secs(10)
+            )
+            .await
+            .unwrap());
+        store.delete(&broadcast(1)).await.unwrap();
+        assert_eq!(store.data.lock().unwrap().capped, 1);
+        store
+            .data
+            .lock()
+            .unwrap()
+            .expire(SystemTime::now() + Duration::from_secs(20));
+        let data = store.data.lock().unwrap();
+        assert!(data.values.is_empty());
+        assert_eq!(data.capped, 0);
     }
 
     #[tokio::test]

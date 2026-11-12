@@ -43,8 +43,13 @@ pub(super) fn assert_pull_attribution_logs(
 /// challenge and realm, including another realm's attribution.
 ///
 /// Plain transfers, memos that are not in attribution format (their first
-/// five bytes are not the MPP tag and version) and memos equal to one the
-/// server configured in `expected` are accepted.
+/// five bytes are not the MPP tag and version) and the memos of transfers
+/// matched to an expected transfer that configures that memo are accepted.
+/// `memos` are the memos of all matched transfers, and an expected transfer
+/// with a memo only matches a transfer with that memo, so each memo the
+/// server configured in `expected` exempts one occurrence of it: a copy of
+/// a configured memo on a transfer matched to an unconfigured expected
+/// transfer is checked like any other memo.
 ///
 /// A failure is a verification failure (402 with a fresh challenge), as the
 /// spec requires, not a replayed credential.
@@ -54,10 +59,21 @@ pub(super) fn assert_pull_attribution<'a>(
     challenge_id: &str,
     realm: &str,
 ) -> Result<(), VerificationError> {
+    let mut configured_memos: Vec<&[u8; 32]> = expected
+        .iter()
+        .filter_map(|transfer| transfer.memo.as_ref())
+        .collect();
     for memo in memos {
-        let configured = expected
+        let configured = match configured_memos
             .iter()
-            .any(|transfer| transfer.memo.as_ref() == Some(memo));
+            .position(|configured| *configured == memo)
+        {
+            Some(index) => {
+                configured_memos.swap_remove(index);
+                true
+            }
+            None => false,
+        };
         if !configured
             && attribution::is_mpp_memo(memo)
             && !is_challenge_bound_memo(memo, challenge_id, realm)
@@ -133,5 +149,45 @@ mod tests {
             assert_hash_credential_attribution([&[0u8; 32]], &[], "challenge-a", "a.example")
                 .is_err()
         );
+    }
+
+    /// A memo the server configured on one split exempts only the transfer
+    /// matched to that split: a copy of it on the primary transfer is
+    /// checked like any other attribution memo.
+    #[test]
+    fn configured_memo_exempts_only_its_own_transfer() {
+        let foreign = attribution::encode("challenge-b", "b.example", None);
+        let expected = [
+            Transfer {
+                amount: alloy::primitives::U256::from(90u64),
+                recipient: alloy::primitives::Address::repeat_byte(0x33),
+                memo: None,
+            },
+            Transfer {
+                amount: alloy::primitives::U256::from(10u64),
+                recipient: alloy::primitives::Address::repeat_byte(0x44),
+                memo: Some(foreign),
+            },
+        ];
+        assert!(assert_pull_attribution([&foreign], &expected, "challenge-a", "a.example").is_ok());
+        assert!(assert_pull_attribution(
+            [&foreign, &foreign],
+            &expected,
+            "challenge-a",
+            "a.example"
+        )
+        .is_err());
+        let own = attribution::encode("challenge-a", "a.example", None);
+        assert!(
+            assert_pull_attribution([&own, &foreign], &expected, "challenge-a", "a.example")
+                .is_ok()
+        );
+        assert!(assert_hash_credential_attribution(
+            [&foreign, &foreign, &own],
+            &expected,
+            "challenge-a",
+            "a.example"
+        )
+        .is_err());
     }
 }

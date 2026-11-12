@@ -526,3 +526,53 @@ async fn test_hosted_sponsorship_retry_after_failed_simulation_simulates_again()
     );
     assert_eq!(requests.lock().unwrap().len(), 2);
 }
+
+/// A sponsorship whose records could not be written was never sent: it
+/// leaves neither its hosted record nor its broadcast record, so a retry
+/// asks and simulates again rather than broadcasting it unchecked.
+#[tokio::test]
+async fn test_hosted_sponsorship_retry_after_failed_record_write_simulates_again() {
+    let client = alloy::signers::local::PrivateKeySigner::random();
+    let sponsor = alloy::signers::local::PrivateKeySigner::random();
+    let (envelope, request) = sponsored_charge_envelope(&client);
+    let (url, requests) = mock_fee_payer(fill_answer(
+        &envelope,
+        &sponsor,
+        PATH_USD.parse().unwrap(),
+        |_| {},
+    ))
+    .await;
+    let attempt = || {
+        [
+            Ok(serde_json::json!("0x")),
+            Ok(serde_json::json!("0x")),
+            Ok(serde_json::Value::Null),
+        ]
+    };
+    let (method, asserter) = node(attempt().into_iter().chain(attempt()).collect());
+    let store = Arc::new(TestStore {
+        fail_put: true,
+        ..TestStore::default()
+    });
+    let method = method
+        .with_remote_fee_payer(hosted(&url))
+        .unwrap()
+        .with_store(store.clone());
+
+    for _ in 0..2 {
+        let error = broadcast(&method, &envelope, &request)
+            .await
+            .expect_err("the sponsorship record cannot be written");
+        assert!(
+            error.message.contains("Failed to record sponsorship"),
+            "{error}"
+        );
+        let records = store.inner.keys();
+        assert!(records.is_empty(), "{records:?}");
+    }
+    assert!(
+        asserter.read_q().is_empty(),
+        "both attempts simulated twice"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}

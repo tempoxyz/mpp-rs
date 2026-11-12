@@ -185,6 +185,80 @@ fn encode_signed_tx(
     tx.into_signed(signature).encoded_2718()
 }
 
+/// A [`MemoryStore`](crate::store::MemoryStore) whose TTL reservations take
+/// `reservation_delay` and whose plain `put` fails when `fail_put` is set.
+#[derive(Default)]
+struct TestStore {
+    inner: crate::store::MemoryStore,
+    reservation_delay: std::time::Duration,
+    fail_put: bool,
+}
+
+impl crate::store::Store for TestStore {
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<serde_json::Value>, crate::store::StoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.inner.get(key)
+    }
+
+    fn put(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::store::StoreError>> + Send + '_>,
+    > {
+        if self.fail_put {
+            return Box::pin(async {
+                Err(crate::store::StoreError::Internal("unavailable".into()))
+            });
+        }
+        self.inner.put(key, value)
+    }
+
+    fn delete(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::store::StoreError>> + Send + '_>,
+    > {
+        self.inner.delete(key)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, crate::store::StoreError>> + Send + '_>,
+    > {
+        self.inner.put_if_absent(key, value)
+    }
+
+    fn put_if_absent_with_ttl(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        ttl: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, crate::store::StoreError>> + Send + '_>,
+    > {
+        let key = key.to_owned();
+        Box::pin(async move {
+            tokio::time::sleep(self.reservation_delay).await;
+            self.inner.put_if_absent_with_ttl(&key, value, ttl).await
+        })
+    }
+}
+
 const TRANSFER_EVENT_TOPIC: B256 = ITIP20::Transfer::SIGNATURE_HASH;
 const TRANSFER_WITH_MEMO_EVENT_TOPIC: B256 = ITIP20::TransferWithMemo::SIGNATURE_HASH;
 

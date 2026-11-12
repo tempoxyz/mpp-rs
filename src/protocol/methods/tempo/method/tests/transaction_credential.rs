@@ -1246,3 +1246,261 @@ async fn test_broadcast_record_settles_only_its_own_challenge() {
     );
     assert!(asserter.read_q().is_empty());
 }
+
+fn plain_transfer_receipt(
+    currency: Address,
+    sender: Address,
+    recipient: Address,
+    amount: U256,
+    tx_hash: B256,
+) -> serde_json::Value {
+    let mut log = make_transfer_log(currency, sender, recipient, amount);
+    log["blockHash"] = serde_json::json!(B256::repeat_byte(0xdd));
+    log["blockNumber"] = serde_json::json!("0x1");
+    log["transactionHash"] = serde_json::json!(tx_hash);
+    log["transactionIndex"] = serde_json::json!("0x0");
+    log["logIndex"] = serde_json::json!("0x0");
+    log["removed"] = serde_json::json!(false);
+    serde_json::json!({
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "blockHash": B256::repeat_byte(0xdd),
+        "blockNumber": "0x1",
+        "from": sender,
+        "to": currency,
+        "cumulativeGasUsed": "0x5208",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "contractAddress": null,
+        "logs": [log],
+        "logsBloom": alloy::primitives::Bloom::ZERO,
+        "status": "0x1",
+        "type": "0x76",
+        "feePayer": sender,
+    })
+}
+
+fn plain_transfer_call(
+    currency: Address,
+    recipient: Address,
+    amount: U256,
+) -> tempo_alloy::primitives::transaction::Call {
+    tempo_alloy::primitives::transaction::Call {
+        to: TxKind::Call(currency),
+        value: U256::ZERO,
+        input: make_transfer_input(recipient, amount),
+    }
+}
+
+/// The receipt matcher takes a memo transfer before a plain one, so the
+/// pre-broadcast call matcher does too: a plain transfer followed by an
+/// equal transfer carrying another challenge's attribution is rejected
+/// before broadcast, instead of moving funds and then failing.
+#[tokio::test]
+async fn test_broadcast_matches_calls_as_receipt_logs_before_rpc() {
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let foreign = attribution::encode("challenge-456", "api.example.com", None);
+    let tx_bytes = encode_signed_tx(
+        vec![
+            plain_transfer_call(currency, recipient, amount),
+            tempo_alloy::primitives::transaction::Call {
+                to: TxKind::Call(currency),
+                value: U256::ZERO,
+                input: make_transfer_with_memo_input(recipient, amount, foreign),
+            },
+        ],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    // No mock responses: reaching the provider fails with another error.
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(Asserter::new());
+    let method = ChargeMethod::new(provider);
+
+    let error = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await
+        .expect_err("the memo transfer is matched and its attribution rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("memo is not bound to this challenge"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Proof reservations that fill a capped MemoryStore do not block the
+/// broadcast record of a pull payment.
+#[tokio::test]
+async fn test_full_expiring_capacity_does_not_block_pull_broadcast() {
+    use crate::store::Store;
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![plain_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    let asserter = Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
+    asserter.push_success(&plain_transfer_receipt(
+        currency, sender, recipient, amount, tx_hash,
+    ));
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(crate::store::MemoryStore::with_expiring_capacity(1));
+    assert!(store
+        .put_if_absent_with_ttl(
+            "mpp:proof:reservation",
+            serde_json::json!(true),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap());
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+
+    let hash = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(&tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            Some(&rfc3339_from_now(time::Duration::minutes(5))),
+        )
+        .await
+        .expect("a full proof cap does not block the pull");
+    assert_eq!(hash, tx_hash);
+    assert!(asserter.read_q().is_empty());
+    assert!(
+        store
+            .put_if_absent_with_ttl(
+                "mpp:proof:another",
+                serde_json::json!(true),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .is_err(),
+        "proof reservations stay capped"
+    );
+}
+
+/// A challenge that expires during the pre-broadcast lookups and writes is
+/// not broadcast, and the broadcast record that attempt wrote is removed,
+/// so a later credential for the same bytes still gets the inclusion check.
+#[tokio::test]
+async fn test_broadcast_rechecks_expiry_right_before_send() {
+    use crate::store::Store;
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![plain_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    // Only the pre-broadcast lookup is answered: a send would fail with a
+    // network error instead of the expiry asserted below.
+    let asserter = Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(TestStore {
+        reservation_delay: std::time::Duration::from_millis(1_500),
+        ..TestStore::default()
+    });
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+    let expires = rfc3339_from_now(time::Duration::milliseconds(1_000));
+
+    let error = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(&tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            Some(&expires),
+        )
+        .await
+        .expect_err("expired before the send");
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::Expired),
+        "{error}"
+    );
+    assert!(asserter.read_q().is_empty());
+    for key in [
+        format!("mpp:charge:broadcast-pending:{tx_hash:#x}"),
+        format!("mpp:charge:submission:{tx_hash:#x}"),
+    ] {
+        assert!(store.get(&key).await.unwrap().is_none(), "{key}");
+    }
+}
+
+/// A broadcast record lives until the challenge expires, since a retry
+/// after that is refused, and never longer than an hour without one, so a
+/// far-future `valid_before` neither fails the write nor pins the record.
+#[test]
+fn test_broadcast_record_ttl_is_bounded() {
+    use alloy::eips::Encodable2718;
+    use alloy::signers::SignerSync;
+    use std::time::Duration;
+
+    let signed_with_valid_before = |valid_before: u64| {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut tx = make_fee_payer_tx(0);
+        tx.fee_payer_signature = None;
+        tx.valid_before = NonZeroU64::new(valid_before);
+        let signature: tempo_alloy::primitives::transaction::TempoSignature =
+            signer.sign_hash_sync(&tx.signature_hash()).unwrap().into();
+        tx.into_signed(signature).encoded_2718()
+    };
+    let ttl = super::super::transaction_credential::broadcast_record_ttl;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let far = signed_with_valid_before(u64::MAX);
+
+    assert_eq!(ttl(None, &far).unwrap(), Duration::from_secs(3_660));
+    assert_eq!(ttl(None, &[]).unwrap(), Duration::from_secs(3_660));
+    let soon = ttl(None, &signed_with_valid_before(now + 30)).unwrap();
+    assert!(
+        (Duration::from_secs(85)..=Duration::from_secs(90)).contains(&soon),
+        "{soon:?}"
+    );
+    let expires = rfc3339_from_now(time::Duration::seconds(120));
+    let bounded = ttl(Some(&expires), &far).unwrap();
+    assert!(
+        (Duration::from_secs(175)..=Duration::from_secs(181)).contains(&bounded),
+        "{bounded:?}"
+    );
+}
