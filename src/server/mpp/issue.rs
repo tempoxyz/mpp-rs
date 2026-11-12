@@ -35,6 +35,16 @@ fn with_nonce(
         // nonce; it is issued as configured and matched as raw text.
         Some(_) => return Ok(opaque),
     };
+    // The opaque is re-encoded with JCS, which rewrites some numbers (`1.0`,
+    // integers above 2^53). Such an opaque is issued as configured, without a
+    // nonce, so the route still matches its own Challenges exactly.
+    let original = serde_json::Value::Object(members.clone());
+    let reencoded = serde_json_canonicalizer::to_string(&original)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+    if reencoded.as_ref() != Some(&original) {
+        return Ok(opaque);
+    }
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|error| {
         crate::error::MppError::Internal(format!("failed to generate challenge nonce: {error}"))

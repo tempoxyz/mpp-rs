@@ -193,7 +193,7 @@ async fn test_binding_mismatch_is_reported_before_expiry() {
 }
 
 /// A route opaque that is an empty object, another JSON value, raw JSON with
-/// numbers JCS rewrites, or not JSON at all is issued and matched with the nonce on and off, so a handler accepts
+/// numbers JCS would rewrite, or not JSON at all is issued and matched with the nonce on and off, so a handler accepts
 /// its own Challenges.
 #[cfg(feature = "tempo")]
 #[tokio::test]
@@ -218,6 +218,25 @@ async fn test_any_route_opaque_verifies_its_own_challenges() {
             assert!(result.is_ok(), "{} nonce={nonce}: {result:?}", opaque.raw());
         }
     }
+
+    // A route opaque JCS would rewrite is issued as configured, without a
+    // nonce, and another route whose integer differs beyond 2^53 is refused.
+    let big = |n: &str| {
+        Base64UrlJson::from_raw(crate::protocol::core::base64url_encode(
+            format!(r#"{{"big":{n}}}"#).as_bytes(),
+        ))
+    };
+    let route_a = spec_mpp().with_opaque(big("9007199254740993"));
+    let challenge = route_a.charge("0.10").unwrap().remove(0);
+    assert_eq!(challenge.opaque, Some(big("9007199254740993")));
+    let credential =
+        PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xdeadbeef"));
+    let route_b = spec_mpp().with_opaque(big("9007199254740992"));
+    let err = route_b
+        .verify_charge(&credential, "0.10")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::InvalidChallenge), "{err}");
 
     // A different raw opaque still fails the route match.
     let mpp = spec_mpp()

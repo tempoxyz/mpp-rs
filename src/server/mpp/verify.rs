@@ -19,26 +19,12 @@ fn same_amount(a: &str, b: &str) -> bool {
 }
 
 /// An `opaque` in the form it is matched in: a JSON object without the
-/// per-challenge nonces (an object left empty counts as absent) or any other
-/// JSON value, in its JCS form, and a value that is not JSON as its raw text.
-///
-/// Comparing the JCS form keeps a configured `opaque` whose numbers JCS
-/// rewrites (`1.0`, integers above 2^53) equal to the one issued with a
-/// nonce, which is re-encoded through JCS.
+/// per-challenge nonces (an object left empty counts as absent), any other
+/// JSON value as is, and a value that is not JSON as its raw text.
 #[derive(Debug, PartialEq)]
 enum MatchedOpaque {
-    Json(String),
+    Json(serde_json::Value),
     Raw(String),
-}
-
-fn canonical(
-    value: &serde_json::Value,
-    opaque: &crate::protocol::core::Base64UrlJson,
-) -> MatchedOpaque {
-    serde_json_canonicalizer::to_string(value).map_or_else(
-        |_| MatchedOpaque::Raw(opaque.raw().to_string()),
-        MatchedOpaque::Json,
-    )
 }
 
 fn matched_opaque(opaque: Option<&crate::protocol::core::Base64UrlJson>) -> Option<MatchedOpaque> {
@@ -47,12 +33,9 @@ fn matched_opaque(opaque: Option<&crate::protocol::core::Base64UrlJson>) -> Opti
         Ok(serde_json::Value::Object(mut members)) => {
             members.remove(super::NONCE_KEY);
             members.remove(super::LEGACY_NONCE_KEY);
-            if members.is_empty() {
-                return None;
-            }
-            Some(canonical(&serde_json::Value::Object(members), opaque))
+            (!members.is_empty()).then_some(MatchedOpaque::Json(serde_json::Value::Object(members)))
         }
-        Ok(other) => Some(canonical(&other, opaque)),
+        Ok(other) => Some(MatchedOpaque::Json(other)),
         Err(_) => Some(MatchedOpaque::Raw(opaque.raw().to_string())),
     }
 }
