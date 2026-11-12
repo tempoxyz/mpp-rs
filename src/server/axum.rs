@@ -1250,6 +1250,108 @@ where
     }
 }
 
+/// Per-request charge configuration for [`MppDynamicCharge`].
+///
+/// Like [`ChargeConfig`], but the amount is computed from each request, for
+/// example from its path, query or headers, or from a [`ChargeAmount`] an
+/// earlier layer stored in its extensions. Verification checks the credential
+/// against the amount computed for the request that carries it.
+///
+/// # Example
+///
+/// ```ignore
+/// use mpp::server::axum::{DynamicChargeConfig, MppDynamicCharge};
+///
+/// struct PerItem;
+/// impl DynamicChargeConfig for PerItem {
+///     fn amount(parts: &http::request::Parts) -> String {
+///         let items: u32 = parts
+///             .uri
+///             .query()
+///             .and_then(|q| q.strip_prefix("items="))
+///             .and_then(|n| n.parse().ok())
+///             .unwrap_or(1);
+///         format!("{items}.00")
+///     }
+/// }
+///
+/// async fn handler(charge: MppDynamicCharge<PerItem>) -> String {
+///     format!("paid {}", charge.amount)
+/// }
+/// ```
+pub trait DynamicChargeConfig {
+    /// The dollar amount to charge for this request (e.g., `"0.01"`).
+    fn amount(parts: &http_types::request::Parts) -> String;
+
+    /// Human-readable description included in the challenge.
+    fn description(_parts: &http_types::request::Parts) -> Option<&'static str> {
+        None
+    }
+}
+
+/// A per-request amount, in dollars, stored in the request's extensions by an
+/// earlier layer (such as a middleware that looks the price up).
+///
+/// [`MppDynamicCharge<ChargeAmount>`](MppDynamicCharge) charges it; a request
+/// without one is rejected with `500` and no challenge, since the server
+/// failed to price it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChargeAmount(pub String);
+
+impl DynamicChargeConfig for ChargeAmount {
+    fn amount(parts: &http_types::request::Parts) -> String {
+        parts
+            .extensions
+            .get::<ChargeAmount>()
+            .map(|amount| amount.0.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Axum extractor that gates a handler behind payment verification, with the
+/// amount computed per request by a [`DynamicChargeConfig`].
+///
+/// Requires `Arc<dyn ChargeChallenger>` in router state, as [`MppCharge`] does.
+#[derive(Debug)]
+pub struct MppDynamicCharge<C: DynamicChargeConfig> {
+    /// The verified payment receipt.
+    pub receipt: Receipt,
+    /// The amount, in dollars, this request was charged.
+    pub amount: String,
+    _config: std::marker::PhantomData<C>,
+}
+
+impl<S, C> FromRequestParts<S> for MppDynamicCharge<C>
+where
+    Arc<dyn ChargeChallenger>: FromRef<S>,
+    C: DynamicChargeConfig,
+    S: Send + Sync,
+{
+    type Rejection = MppChargeRejection;
+
+    fn from_request_parts(
+        parts: &mut http_types::request::Parts,
+        state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let inputs = ChargeInputs::from_parts(parts, state);
+        let amount = C::amount(parts);
+        let description = C::description(parts);
+        async move {
+            if amount.is_empty() {
+                return Err(MppChargeRejection::InternalError(
+                    "no amount for this request".into(),
+                ));
+            }
+            let receipt = inputs.verify(&amount, description, None).await?;
+            Ok(MppDynamicCharge {
+                receipt,
+                amount,
+                _config: std::marker::PhantomData,
+            })
+        }
+    }
+}
+
 fn request_realm_from_parts(parts: &http_types::request::Parts) -> Option<String> {
     if parts
         .uri

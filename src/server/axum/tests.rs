@@ -1943,4 +1943,69 @@ mod core_spec_credentials {
             assert_eq!(body["title"], "Payment Required");
         }
     }
+
+    #[derive(Debug)]
+    struct QueryPrice;
+    impl DynamicChargeConfig for QueryPrice {
+        fn amount(parts: &http_types::request::Parts) -> String {
+            parts
+                .uri
+                .query()
+                .and_then(|query| query.strip_prefix("price="))
+                .unwrap_or("0.01")
+                .to_string()
+        }
+    }
+
+    async fn run_dynamic<C: DynamicChargeConfig>(
+        uri: &str,
+        auth: Option<&str>,
+        extension: Option<ChargeAmount>,
+    ) -> Result<MppDynamicCharge<C>, MppChargeRejection> {
+        let state: Arc<dyn ChargeChallenger> = Arc::new(MockChallenger { accept: true });
+        let mut builder = http_types::Request::builder().uri(uri);
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        let (mut parts, _body) = builder.body(()).unwrap().into_parts();
+        if let Some(extension) = extension {
+            parts.extensions.insert(extension);
+        }
+        MppDynamicCharge::<C>::from_request_parts(&mut parts, &state).await
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_charge_prices_each_request() {
+        let MppChargeRejection::Challenge(PaymentRequired(challenge)) =
+            run_dynamic::<QueryPrice>("/test?price=2.50", None, None)
+                .await
+                .unwrap_err()
+        else {
+            panic!("expected a challenge");
+        };
+        assert_eq!(challenge.request.decode_value().unwrap()["amount"], "2.50");
+
+        let paid = run_dynamic::<QueryPrice>("/test?price=2.50", Some("Payment eyJ9"), None)
+            .await
+            .unwrap();
+        assert_eq!(paid.amount, "2.50");
+        assert_eq!(paid.receipt.reference, "0xabc");
+
+        let paid = run_dynamic::<ChargeAmount>(
+            "/test",
+            Some("Payment eyJ9"),
+            Some(ChargeAmount("0.25".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paid.amount, "0.25");
+
+        // A request nobody priced is the server's failure: 500, no challenge.
+        let response = run_dynamic::<ChargeAmount>("/test", None, None)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+    }
 }

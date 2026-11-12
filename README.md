@@ -48,16 +48,71 @@ cargo add mpp
 
 ### Server (Tempo)
 
+Add the server features, Axum and Tokio:
+
+```bash
+cargo add mpp --features server,tempo,axum
+cargo add axum
+cargo add tokio --features full
+```
+
+This server charges $0.01 per request to `/paid` on the Moderato testnet:
+
 ```rust
-use mpp::server::{Mpp, tempo, TempoConfig};
+use std::sync::Arc;
 
-let mpp = Mpp::create(tempo(TempoConfig {
-    recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
-}))?;
+use axum::{routing::get, Router};
+use mpp::server::axum::{ChargeChallenger, ChargeConfig, MppCharge};
+use mpp::server::{tempo, Mpp, TempoConfig};
 
-let challenges = mpp.charge("1")?; // OUSD, then USDC.e on mainnet
+struct OneCent;
+
+impl ChargeConfig for OneCent {
+    fn amount() -> &'static str {
+        "0.01"
+    }
+}
+
+async fn paid(charge: MppCharge<OneCent>) -> String {
+    format!("paid: {}", charge.receipt.reference)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reads the challenge-binding secret from MPP_SECRET_KEY (at least 32 bytes).
+    let mpp = Mpp::create(
+        tempo(TempoConfig {
+            recipient: "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        })
+        .rpc_url("https://rpc.moderato.tempo.xyz"),
+    )?;
+
+    let app = Router::new()
+        .route("/paid", get(paid))
+        .with_state(Arc::new(mpp) as Arc<dyn ChargeChallenger>);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+```
+
+The server signs challenge ids with `MPP_SECRET_KEY`, which must be at least 32 bytes. Generate one and run the server:
+
+```bash
+export MPP_SECRET_KEY=$(openssl rand -base64 32)
+cargo run
+curl -i http://127.0.0.1:3000/paid   # 402 with a Payment challenge
+```
+
+To verify credentials yourself, issue challenges with `charge` and pass the route's amount to `verify_charge`:
+
+```rust
+let challenges = mpp.charge("1")?; // OUSD, then pathUSD on Moderato
 let receipt = mpp.verify_charge(&credential, "1").await?;
 ```
+
+For a price that depends on the request, use the `MppDynamicCharge` extractor with a `DynamicChargeConfig`.
 
 ### Server (Stripe)
 
