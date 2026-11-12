@@ -192,8 +192,8 @@ async fn test_binding_mismatch_is_reported_before_expiry() {
     assert_eq!(err.code, Some(ErrorCode::Expired), "{err}");
 }
 
-/// A route opaque that is an empty object, another JSON value or not JSON at
-/// all is issued and matched with the nonce on and off, so a handler accepts
+/// A route opaque that is an empty object, another JSON value, raw JSON with
+/// numbers JCS rewrites, or not JSON at all is issued and matched with the nonce on and off, so a handler accepts
 /// its own Challenges.
 #[cfg(feature = "tempo")]
 #[tokio::test]
@@ -203,6 +203,10 @@ async fn test_any_route_opaque_verifies_its_own_challenges() {
         Base64UrlJson::from_value(&serde_json::json!("route-a")).unwrap(),
         Base64UrlJson::from_value(&serde_json::json!(["a", 1])).unwrap(),
         Base64UrlJson::from_raw("bm90LWpzb24"),
+        // Raw JSON whose numbers JCS rewrites when the nonce is added.
+        Base64UrlJson::from_raw(crate::protocol::core::base64url_encode(
+            br#"{"price":1.0,"big":9007199254740993}"#,
+        )),
     ];
     for opaque in opaques {
         for nonce in [true, false] {
