@@ -1966,6 +1966,55 @@ fn comma_joined_payment_credentials_are_found_and_removed() {
     assert!(!super::carries_payment_credential(&headers));
 }
 
+/// An auth-param written with whitespace around its `=` (RFC 9110 BWS) is
+/// read as the tokenizer reads it, as a parameter of the scheme before it,
+/// even when its name is `Payment`, so a paid retry keeps it and every
+/// parameter after it. A token68 ending in `=` padding stays its scheme's.
+#[test]
+fn padded_auth_params_are_not_read_as_schemes() {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+
+    let remove = |value: &'static str| {
+        let mut headers = HeaderMap::new();
+        headers.append(AUTHORIZATION, HeaderValue::from_static(value));
+        super::remove_payment_credentials(&mut headers);
+        headers
+            .get_all(AUTHORIZATION)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    for value in [
+        "Digest realm=x, Payment = \"aux\", nonce=y",
+        "Digest realm=x, Payment =\"aux\", nonce=y",
+        "Digest realm=x, Payment= \"aux\", nonce=y",
+        "Digest realm=x, Payment\t=\taux, nonce=y",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.append(AUTHORIZATION, HeaderValue::from_static(value));
+        assert!(!super::carries_payment_credential(&headers), "{value}");
+        assert_eq!(remove(value), [value], "{value}");
+    }
+
+    // A real Payment credential after the padded parameter is still removed,
+    // with its own parameters, and the schemes after it stay.
+    assert_eq!(
+        remove("Digest realm=x, Payment = \"aux\", Payment xyz, a = b, Bearer t"),
+        ["Digest realm=x, Payment = \"aux\", Bearer t"]
+    );
+    assert_eq!(remove("Bearer t, Payment xyz"), ["Bearer t"]);
+    assert_eq!(remove("Bearer t,Payment\txyz"), ["Bearer t"]);
+
+    // token68 credentials with `=` padding, before and as the Payment one.
+    assert_eq!(
+        remove("Basic dXNlcjpwYQ==, Payment eyJhIjoxfQ==, Basic dXM="),
+        ["Basic dXNlcjpwYQ==, Basic dXM="]
+    );
+    assert_eq!(remove("Payment eyJhIjoxfQ=="), Vec::<String>::new());
+    assert_eq!(remove("Payment eyJhIjoxfQ=, Bearer t"), ["Bearer t"]);
+}
+
 /// A Payment credential the flow cannot see on the request, from the
 /// client's default headers or comma-joined after another scheme, is still
 /// not paid again when the server answers it with invalid-challenge.

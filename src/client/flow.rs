@@ -929,9 +929,8 @@ fn authorization_has_payment(value: &HeaderValue) -> bool {
     match value.to_str() {
         Ok(text) => {
             !crate::protocol::core::headers::payment_credentials(text).is_empty()
-                || authorization_elements(text)
-                    .iter()
-                    .any(|element| is_payment_element(element))
+                || scheme_starts(text)
+                    .any(|(element, starts)| starts && is_payment_element(element))
         }
         Err(_) => value.as_bytes().split(|byte| *byte == b',').any(|element| {
             element
@@ -964,19 +963,48 @@ fn authorization_elements(value: &str) -> Vec<&str> {
     elements
 }
 
-/// Whether an element starts a `Payment` scheme: `Payment` alone or
-/// followed by a space.
+/// The elements of an `Authorization` value, each with whether it starts a
+/// new scheme. The first non-empty element is the first word of the value.
+fn scheme_starts(value: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut first = true;
+    authorization_elements(value)
+        .into_iter()
+        .map(move |element| {
+            let starts = starts_scheme(element, first);
+            first &= element.trim_ascii().is_empty();
+            (element, starts)
+        })
+}
+
+/// Whether an element that starts a scheme starts a `Payment` one:
+/// `Payment` alone or followed by whitespace.
 fn is_payment_element(element: &str) -> bool {
-    let scheme = element.trim_start().split(' ').next().unwrap_or("");
+    let scheme = element
+        .trim_ascii_start()
+        .split(|c: char| c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("");
     scheme.eq_ignore_ascii_case("payment")
 }
 
 /// Whether an element starts a new scheme rather than continuing the
-/// previous one's auth-params (`name=value`).
-fn starts_scheme(element: &str) -> bool {
-    let element = element.trim_start();
-    let token_end = element.find([' ', '=']).unwrap_or(element.len());
-    !element.is_empty() && !element[token_end..].starts_with('=')
+/// previous one's auth-params (`name BWS = BWS value`), as the crate's
+/// header tokenizer decides: a first word followed by `=`, after optional
+/// whitespace, is an auth-param, except in the first element of the value
+/// (`first`), where a word followed by SP or HTAB is always a scheme. A
+/// token68 ending in `=` padding follows its scheme and a space, so it does
+/// not make its element an auth-param.
+fn starts_scheme(element: &str, first: bool) -> bool {
+    let element = element.trim_ascii_start();
+    if element.is_empty() {
+        return false;
+    }
+    let name_end = element
+        .find(|c: char| c == '=' || c.is_ascii_whitespace())
+        .unwrap_or(element.len());
+    let after_name = &element[name_end..];
+    !after_name.trim_ascii_start().starts_with('=')
+        || (first && after_name.starts_with([' ', '\t']))
 }
 
 /// An `Authorization` value without its `Payment` schemes and their
@@ -984,8 +1012,8 @@ fn starts_scheme(element: &str) -> bool {
 fn without_payment_schemes(value: &str) -> Option<String> {
     let mut kept: Vec<&str> = Vec::new();
     let mut in_payment = false;
-    for element in authorization_elements(value) {
-        if starts_scheme(element) {
+    for (element, starts) in scheme_starts(value) {
+        if starts {
             in_payment = is_payment_element(element);
         }
         if !in_payment && !element.trim().is_empty() {
