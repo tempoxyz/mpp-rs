@@ -79,7 +79,13 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
 
 /// The Payment credentials in one field value, in order: each `Payment
 /// <token>` fragment, or `None` for a bare `Payment` with no token.
+///
+/// A value longer than 64 KiB is not tokenized and carries no credential,
+/// as [`extract_payment_scheme`] treats it.
 pub(crate) fn payment_credentials(value: &str) -> Vec<Option<&str>> {
+    if value.len() > MAX_AUTHORIZATION_LEN {
+        return Vec::new();
+    }
     let mut found = Vec::new();
     let mut tokens = Tokenizer::new(value);
     while let Some(token) = tokens.next() {
@@ -1165,6 +1171,19 @@ mod tests {
             let err = parse_authorization(&header).unwrap_err();
             assert!(err.to_string().contains("exceeds maximum length"));
         }
+    }
+
+    #[test]
+    fn test_oversized_field_values_carry_no_credential() {
+        let oversized = format!("Bearer {}, Payment abc", "a".repeat(MAX_AUTHORIZATION_LEN));
+        assert!(payment_credentials(&oversized).is_empty());
+        let found = select_payment_credential(
+            [oversized.as_str()],
+            ["Payment abc"],
+            "Payment-Authorization",
+        )
+        .unwrap();
+        assert_eq!(found, Some("Payment abc"));
     }
 
     #[test]
