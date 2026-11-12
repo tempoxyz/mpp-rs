@@ -67,6 +67,10 @@ identity-tempo-id = [
   "dep:rsa",
   "dep:uuid",
 ]
+# Identity attestations (`Identity-Attestation` EdDSA tokens and issuer JWKS; requires identity)
+identity-attestation = ["identity", "dep:reqwest", "dep:ed25519-dalek"]
+# Email OTP identity attestations (requires identity-attestation)
+identity-email-otp = ["identity-attestation"]
 
 # Utilities
 utils = ["hex"]
@@ -198,6 +202,7 @@ uuid = { version = "1", features = ["v4"], optional = true }
 # Identity dependencies (optional)
 sfv = { version = "0.16", optional = true }
 rsa = { version = "0.10", default-features = false, features = ["std", "pkcs1v15"], optional = true }
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.180", optional = true }
