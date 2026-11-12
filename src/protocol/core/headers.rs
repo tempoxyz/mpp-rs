@@ -28,6 +28,20 @@ const MAX_TOKEN_LEN: usize = 16 * 1024;
 /// base64url encoding.
 const MAX_AUTHORIZATION_LEN: usize = 64 * 1024;
 
+/// Most `Authorization` and `Payment-Authorization` field values one request
+/// may carry when selecting its Payment credential.
+const MAX_AUTHORIZATION_VALUES: usize = 32;
+
+/// Most bytes of those field values tokenized, in all, when selecting the
+/// Payment credential: room for one value at the limit beside another.
+const MAX_SCANNED_AUTHORIZATION_LEN: usize = 2 * MAX_AUTHORIZATION_LEN;
+
+/// The reason of the `bad-request` error for a request whose credential
+/// fields exceed [`MAX_AUTHORIZATION_VALUES`] or
+/// [`MAX_SCANNED_AUTHORIZATION_LEN`].
+const TOO_MANY_AUTHORIZATION_VALUES_REASON: &str =
+    "too many Authorization or Payment-Authorization field values";
+
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {
     ($params:expr, $key:literal) => {
@@ -77,21 +91,6 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
     None
 }
 
-/// The Payment credentials in one field value, in order: each `Payment
-/// <token>` fragment, or `None` for a bare `Payment` with no token.
-pub(crate) fn payment_credentials(value: &str) -> Vec<Option<&str>> {
-    let mut found = Vec::new();
-    let mut tokens = Tokenizer::new(value);
-    while let Some(token) = tokens.next() {
-        match token {
-            Ok(token) if token.is_payment_scheme() => found.push(tokens.credentials()),
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    found
-}
-
 /// Pick the Payment credential a request carries, following steps 1 and 2 of
 /// the core spec's credential processing.
 ///
@@ -102,6 +101,11 @@ pub(crate) fn payment_credentials(value: &str) -> Vec<Option<&str>> {
 /// fragment, to pass to [`parse_authorization`]) when it is in `selected`,
 /// the field the challenge selects. A credential in the other field, or a
 /// bare `Payment` with no token, counts as absent.
+///
+/// A value longer than 64 KiB is not tokenized and carries no credential, as
+/// [`extract_payment_scheme`] treats it. Scanning stops at the second
+/// credential, and a request with more than 32 values, or more than 128 KiB
+/// of values to tokenize, is also a `bad-request` error.
 ///
 /// # Examples
 ///
@@ -123,25 +127,50 @@ pub fn select_payment_credential<'a>(
     payment_authorization: impl IntoIterator<Item = &'a str>,
     selected: &str,
 ) -> Result<Option<&'a str>> {
-    let collect = |values: &mut dyn Iterator<Item = &'a str>| {
-        values
-            .flat_map(payment_credentials)
-            .flatten()
-            .collect::<Vec<_>>()
-    };
-    let in_authorization = collect(&mut authorization.into_iter());
-    let in_payment_authorization = collect(&mut payment_authorization.into_iter());
-    if in_authorization.len() + in_payment_authorization.len() > 1 {
-        return Err(MppError::bad_request(
-            crate::error::MULTIPLE_CREDENTIALS_REASON,
-        ));
+    let too_many = || MppError::bad_request(TOO_MANY_AUTHORIZATION_VALUES_REASON);
+    let fields = authorization
+        .into_iter()
+        .map(|value| (false, value))
+        .chain(payment_authorization.into_iter().map(|value| (true, value)));
+    let mut scanned = 0usize;
+    // The credential found so far, and whether it is in Payment-Authorization.
+    let mut found: Option<(bool, &'a str)> = None;
+    for (count, (in_payment_authorization, value)) in fields.enumerate() {
+        if count >= MAX_AUTHORIZATION_VALUES {
+            return Err(too_many());
+        }
+        if value.len() > MAX_AUTHORIZATION_LEN {
+            continue;
+        }
+        scanned += value.len();
+        if scanned > MAX_SCANNED_AUTHORIZATION_LEN {
+            return Err(too_many());
+        }
+        let mut tokens = Tokenizer::new(value);
+        while let Some(token) = tokens.next() {
+            match token {
+                Ok(token) if token.is_payment_scheme() => {
+                    let Some(credential) = tokens.credentials() else {
+                        continue;
+                    };
+                    if found.is_some() {
+                        return Err(MppError::bad_request(
+                            crate::error::MULTIPLE_CREDENTIALS_REASON,
+                        ));
+                    }
+                    found = Some((in_payment_authorization, credential));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     }
-    let chosen = if selected.eq_ignore_ascii_case(PAYMENT_AUTHORIZATION_HEADER) {
-        in_payment_authorization
-    } else {
-        in_authorization
-    };
-    Ok(chosen.into_iter().next())
+    let want_payment_authorization = selected.eq_ignore_ascii_case(PAYMENT_AUTHORIZATION_HEADER);
+    Ok(found
+        .filter(|(in_payment_authorization, _)| {
+            *in_payment_authorization == want_payment_authorization
+        })
+        .map(|(_, credential)| credential))
 }
 
 /// Header name for payment challenges (from server)
@@ -1165,6 +1194,72 @@ mod tests {
             let err = parse_authorization(&header).unwrap_err();
             assert!(err.to_string().contains("exceeds maximum length"));
         }
+    }
+
+    #[test]
+    fn test_oversized_field_values_carry_no_credential() {
+        let oversized = format!("Bearer {}, Payment abc", "a".repeat(MAX_AUTHORIZATION_LEN));
+        let found = select_payment_credential([oversized.as_str()], [], "Authorization").unwrap();
+        assert_eq!(found, None);
+        let found = select_payment_credential(
+            [oversized.as_str()],
+            ["Payment abc"],
+            "Payment-Authorization",
+        )
+        .unwrap();
+        assert_eq!(found, Some("Payment abc"));
+    }
+
+    #[test]
+    fn test_credential_selection_bounds_the_values_it_scans() {
+        // Up to the value limit, values without a credential are scanned.
+        let bearers = vec!["Bearer token"; MAX_AUTHORIZATION_VALUES - 1];
+        let found =
+            select_payment_credential(bearers, ["Payment abc"], "Payment-Authorization").unwrap();
+        assert_eq!(found, Some("Payment abc"));
+
+        // One more value is refused, oversized ones included.
+        let oversized = "a".repeat(MAX_AUTHORIZATION_LEN + 1);
+        let mut values = vec!["Bearer token"; MAX_AUTHORIZATION_VALUES];
+        values[0] = oversized.as_str();
+        let err = select_payment_credential(values, ["Payment abc"], "Payment-Authorization")
+            .unwrap_err();
+        assert!(matches!(err, MppError::BadRequest(_)), "{err}");
+
+        // Values under the per-value limit are refused once their total
+        // exceeds what is tokenized in all.
+        let large = format!("Bearer {}", "a".repeat(MAX_AUTHORIZATION_LEN - 7));
+        assert_eq!(large.len(), MAX_AUTHORIZATION_LEN);
+        let found =
+            select_payment_credential([large.as_str(), large.as_str()], [], "Authorization")
+                .unwrap();
+        assert_eq!(found, None);
+        let err = select_payment_credential(
+            [large.as_str(), large.as_str()],
+            ["Payment abc"],
+            "Payment-Authorization",
+        )
+        .unwrap_err();
+        assert!(matches!(err, MppError::BadRequest(_)), "{err}");
+    }
+
+    #[test]
+    fn test_credential_selection_stops_at_the_second_credential() {
+        // The second credential is refused before later values are read: the
+        // values after it, which would exceed the limits, are never reached.
+        let large = "a".repeat(MAX_AUTHORIZATION_LEN);
+        let values = ["Payment a", "Payment b", large.as_str(), large.as_str()];
+        let multiple = MppError::bad_request(crate::error::MULTIPLE_CREDENTIALS_REASON).to_string();
+        let err = select_payment_credential(values, [], "Authorization").unwrap_err();
+        assert_eq!(err.to_string(), multiple);
+        // A credential in each field is two credentials too.
+        let err =
+            select_payment_credential(["Payment a"], ["Payment b"], "Authorization").unwrap_err();
+        assert_eq!(err.to_string(), multiple);
+        // A bare Payment carries no credential and does not count.
+        let found =
+            select_payment_credential(["Payment, Payment abc"], [], "Authorization").unwrap();
+        assert_eq!(found, Some("Payment abc"));
     }
 
     #[test]

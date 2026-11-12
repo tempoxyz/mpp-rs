@@ -589,22 +589,20 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     }
 }
 
-/// Verify a credential string against the route's expected challenge.
+/// Verify a credential string against the route's expected charge request.
 #[cfg(any(feature = "stripe", feature = "tempo"))]
 fn verify_expected<M, S>(
     mpp: &super::Mpp<M, S>,
     credential_str: &str,
-    expected: crate::error::Result<PaymentChallenge>,
+    expected: crate::error::Result<crate::protocol::intents::ChargeRequest>,
     body: Option<&[u8]>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
 where
     M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    let prepared = parse_authorization(credential_str).and_then(|credential| {
-        let expected_request = expected?.request.decode()?;
-        Ok((credential, expected_request))
-    });
+    let prepared =
+        parse_authorization(credential_str).and_then(|credential| Ok((credential, expected?)));
     let mpp = mpp.clone();
     let body = body.map(<[u8]>::to_vec);
     Box::pin(async move {
@@ -717,21 +715,11 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.expected_charge_request(amount, Default::default()) {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -774,21 +762,11 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.expected_charge_request(amount, Default::default()) {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -844,15 +822,13 @@ where
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
     {
         let mpp = self.for_request_realm(request_realm);
-        let expected = mpp
-            .charge_with_options(
-                amount,
-                super::ChargeOptions {
-                    mppx_scope: mppx_scope.as_ref(),
-                    ..Default::default()
-                },
-            )
-            .map(|mut offers| offers.remove(0));
+        let expected = mpp.expected_charge_request(
+            amount,
+            super::ChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        );
         verify_expected(&mpp, credential_str, expected, body)
     }
 
@@ -974,21 +950,12 @@ where
             }
         };
 
-        let expected_challenge = match self.stripe_charge(amount) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.stripe_expected_charge_request(amount, Default::default())
+        {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -1031,21 +998,12 @@ where
             }
         };
 
-        let expected_challenge = match self.stripe_charge(amount) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.stripe_expected_charge_request(amount, Default::default())
+        {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -1101,7 +1059,7 @@ where
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
     {
         let mpp = self.for_request_realm(request_realm);
-        let expected = mpp.stripe_charge_with_options(
+        let expected = mpp.stripe_expected_charge_request(
             amount,
             super::StripeChargeOptions {
                 mppx_scope: mppx_scope.as_ref(),
