@@ -90,7 +90,9 @@ fn offer(challenges: &[PaymentChallenge]) -> axum::response::Response {
             format_www_authenticate(challenge).unwrap(),
         )
     });
-    let mut response = StatusCode::PAYMENT_REQUIRED.into_response();
+    // A body, so a 402 answering a credential reads as a request for another
+    // payment rather than an empty rejection.
+    let mut response = (StatusCode::PAYMENT_REQUIRED, "pay up").into_response();
     for (name, value) in headers {
         response.headers_mut().append(name, value.parse().unwrap());
     }
@@ -591,7 +593,9 @@ async fn missing_malformed_ambiguous_and_disabled_preferences_never_prepare() {
     .await;
     let mut defaults = HeaderMap::new();
     defaults.insert(ACCEPT_PAYMENT_HEADER, "test/charge".parse().unwrap());
-    let client = ChargeClient::new(Client::builder().no_proxy().default_headers(defaults)).unwrap();
+    let client = ChargeClient::new(Client::builder().no_proxy().default_headers(defaults))
+        .unwrap()
+        .with_accept_payment_policy(AcceptPaymentPolicy::Explicit);
     for preference in [None, Some(""), Some("invalid"), Some("test/charge;q=0")] {
         let provider = Provider::default();
         let mut request = client.request(Method::GET, &url);
@@ -714,4 +718,98 @@ async fn noncloneable_body_is_sent_once_and_never_paid() {
     }
     assert_eq!(provider.prepared.load(Ordering::SeqCst), 0);
     assert!(provider.paid.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn default_policy_pays_without_accept_payment_and_disabled_never_pays() {
+    let url = server(Router::new().route(
+        "/",
+        get(|headers: HeaderMap| async move {
+            if headers.contains_key("payment-authorization") {
+                assert!(!headers.contains_key("authorization"));
+                StatusCode::OK.into_response()
+            } else {
+                offer(&[challenge("charge", "charge", "Payment-Authorization")])
+            }
+        }),
+    ))
+    .await;
+    let client = client();
+    let provider = Provider::default();
+    let response = client
+        .send_with_payment(client.request(Method::GET, &url), &provider)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*provider.paid.lock().unwrap(), ["charge"]);
+
+    // Malformed or opted-out request preferences still block payment.
+    for preference in ["invalid", "test/charge;q=0"] {
+        let provider = Provider::default();
+        let response = client
+            .send_with_payment(
+                client
+                    .request(Method::GET, &url)
+                    .header(ACCEPT_PAYMENT_HEADER, preference),
+                &provider,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(provider.prepared.load(Ordering::SeqCst), 0);
+    }
+
+    let disabled = client
+        .clone()
+        .with_accept_payment_policy(AcceptPaymentPolicy::Disabled);
+    let provider = Provider::default();
+    let response = disabled
+        .send_with_payment(
+            disabled
+                .request(Method::GET, &url)
+                .header(ACCEPT_PAYMENT_HEADER, "test/charge"),
+            &provider,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(provider.prepared.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn on_challenge_declines_or_approves_payment() {
+    let url = server(Router::new().route(
+        "/",
+        get(|headers: HeaderMap| async move {
+            if headers.contains_key("authorization") {
+                StatusCode::OK.into_response()
+            } else {
+                offer(&[challenge("charge", "charge", "Authorization")])
+            }
+        }),
+    ))
+    .await;
+    for approve in [false, true] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = client().with_on_challenge({
+            let seen = seen.clone();
+            move |context: crate::client::OnChallengeContext| {
+                seen.lock().unwrap().push(context.challenge.id.clone());
+                async move { approve }
+            }
+        });
+        let provider = Provider::default();
+        let response = client
+            .send_with_payment(client.request(Method::GET, &url), &provider)
+            .await
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["charge"]);
+        if approve {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(*provider.paid.lock().unwrap(), ["charge"]);
+        } else {
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+            assert!(provider.paid.lock().unwrap().is_empty());
+        }
+    }
 }

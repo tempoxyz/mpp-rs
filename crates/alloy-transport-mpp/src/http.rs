@@ -41,8 +41,8 @@ impl<P> MppHttpTransport<P> {
     }
 
     /// Create an MPP transport for `url` using `provider`.
-    /// Set `Accept-Payment` through `with_headers` or per-request headers to authorize payment.
-    /// Opaque client default headers alone do not authorize automatic payment.
+    /// The transport pays 402 responses by default; an `Accept-Payment` header set
+    /// through `with_headers` or per request narrows which methods it pays.
     pub const fn new(client: reqwest::Client, url: Url, provider: P) -> Self {
         Self {
             client,

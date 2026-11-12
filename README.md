@@ -80,7 +80,7 @@ let receipt = mpp.stripe_verify_charge(&credential, "1").await?;
 
 The Axum `MppCharge` extractors can use the incoming HTTP request hostname as the challenge realm, as in mppx, and verify credentials against that same hostname. Configure `.trusted_hosts(["api.example.com"])` with the public hostnames your server accepts before enabling this behavior: clients control the HTTP `Host` header, so unlisted hosts continue to use the configured or environment-detected realm. An explicit `.realm(...)` or `MPP_REALM` overrides the request hostname. Direct `Mpp::charge` calls have no HTTP request and continue to use the configured or environment-detected realm; set it to the public hostname when accepting zero-amount Tempo proofs from clients that check the request origin.
 
-If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`. The reqwest `send_with_payment` and `PaymentMiddleware` APIs reject those challenges before paying: they accept caller-owned clients and cannot enforce a safe redirect policy for the custom credential header. Use a transport that sends credential-bearing requests with redirects disabled until these APIs support a verified redirect-safe client.
+If the endpoint already uses `Authorization` (API keys, Bearer tokens), create the server with `requires_auth(true)`. Challenges then advertise `header="Payment-Authorization"`, and the reqwest `send_with_payment` and `PaymentMiddleware` APIs send the credential in that header. reqwest forwards `Payment-Authorization` across redirects, so build the client with `redirect::Policy::none()`.
 
 ```rust
 let mpp = Mpp::create(tempo(config).requires_auth(true))?;
@@ -97,10 +97,10 @@ let client = ClientBuilder::new(reqwest::Client::new())
     .with(PaymentMiddleware::new(provider))
     .build();
 
-// Explicitly authorize payment for this request.
-let resp = client.get("https://mpp.dev/api/ping/paid")
-    .header("Accept-Payment", "tempo/charge")
-    .send().await?;
+// Pays the 402 automatically. Use `with_on_challenge` to approve or decline
+// each payment, or `AcceptPaymentPolicy::Explicit` to pay only requests that
+// send `Accept-Payment`.
+let resp = client.get("https://mpp.dev/api/ping/paid").send().await?;
 ```
 
 ### Client (Stripe)
@@ -122,7 +122,6 @@ let provider = StripeProvider::new(|params| {
 
 let resp = reqwest::Client::new()
     .get("https://api.example.com/paid")
-    .header("Accept-Payment", "stripe/charge")
     .send_with_payment(&provider)
     .await?;
 ```
@@ -205,7 +204,7 @@ shall be dual licensed as above, without any additional terms or conditions.
 
 ### Payment policy and store migration
 
-HTTP payment helpers now default to `AcceptPaymentPolicy::Explicit`: set a request-level `Accept-Payment` header to authorize automatic payment. Reqwest client default headers cannot be inspected by middleware and do not authorize payments. A request-level `q=0` remains an opt-out. `Disabled` prevents all automatic payment, even with an explicit header. Applications that intentionally authorize provider-selected payment can pass `Always`; this explicitly overrides opaque client defaults. Origin policies authorize automatic payment only for matching origins unless a request supplies its own preference.
+HTTP payment helpers default to `AcceptPaymentPolicy::Always` and pay a 402 without a request-level `Accept-Payment` header, as mppx does. A request-level `Accept-Payment` narrows which methods they pay, and `q=0` opts out. `Explicit` pays only requests that send `Accept-Payment`, and `Disabled` prevents all automatic payment. Origin policies authorize automatic payment only for matching origins unless a request supplies its own preference. An `on_challenge` hook (`PaymentMiddleware::with_on_challenge`, `ChargeClient::with_on_challenge`) approves or declines each payment before it is made; a declined payment returns the 402.
 
 `ChannelStoreAdapter` requires a native atomic `Store::compare_exchange`. Implement it as a transaction or conditional write shared by every client using the backend; a read followed by a write is unsafe. `MemoryStore` supports it. `FileStore` and custom backends without this operation fail closed on channel updates. Concurrent conflicts fail before resource delivery and must be retried against fresh state.
 

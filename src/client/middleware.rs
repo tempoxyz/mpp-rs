@@ -8,8 +8,8 @@ use reqwest_middleware::{Middleware, Next};
 
 use crate::client::accept_payment_policy::AcceptPaymentPolicy;
 use crate::client::events::{
-    ChallengeReceivedContext, ClientEventSubscription, ClientEvents, CredentialCreatedContext,
-    PaymentFailedContext, PaymentResponseContext,
+    ChallengeDecision, ChallengeReceivedContext, ClientEventSubscription, ClientEvents,
+    CredentialCreatedContext, OnChallengeContext, PaymentFailedContext, PaymentResponseContext,
 };
 use crate::client::flow::{same_resource, Exchange, FlowError, PaymentFlow};
 use crate::client::provider::PaymentProvider;
@@ -20,10 +20,14 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 /// When a request returns 402, the middleware:
 /// 1. Parses the challenge from the `WWW-Authenticate` header
 /// 2. Calls the provider to execute the payment
-/// 3. Retries the request with the credential in the `Authorization` header
+/// 3. Retries the request with the credential in `Authorization`
 ///
-/// Challenges that select `Payment-Authorization` are rejected before payment
-/// because this middleware cannot control the underlying client's redirect policy.
+/// It pays without a request-level `Accept-Payment` header by default, as
+/// mppx does; select [`AcceptPaymentPolicy::Explicit`] to pay only requests
+/// that set one. A challenge that asks for `Payment-Authorization` is
+/// refused before anything is signed, since the inner client may follow a
+/// redirect and forward that header to another host. Approve or decline each
+/// payment with [`with_on_challenge`](Self::with_on_challenge).
 ///
 /// Payment failures are returned as [`HttpError`](crate::client::HttpError) inside
 /// [`reqwest_middleware::Error::Middleware`] and can be recovered with
@@ -41,8 +45,8 @@ use crate::client::DEFAULT_MAX_PAYMENT_RETRIES;
 ///     .with(PaymentMiddleware::new(provider))
 ///     .build();
 ///
-/// // Explicitly authorize payment for this request
-/// let resp = client.get("https://api.example.com/paid").header("Accept-Payment", "tempo/charge").send().await?;
+/// // A 402 is paid automatically
+/// let resp = client.get("https://api.example.com/paid").send().await?;
 /// ```
 pub struct PaymentMiddleware<P> {
     provider: P,
@@ -55,7 +59,7 @@ pub struct PaymentMiddleware<P> {
 
 impl<P> PaymentMiddleware<P> {
     /// Create middleware with the given provider. Defaults to
-    /// [`AcceptPaymentPolicy::Explicit`].
+    /// [`AcceptPaymentPolicy::Always`].
     pub fn new(provider: P) -> Self {
         Self {
             provider,
@@ -106,8 +110,26 @@ impl<P> PaymentMiddleware<P> {
     }
 
     /// Use an existing event registry for payment callbacks.
+    ///
+    /// This replaces the registry, including an
+    /// [`on_challenge`](Self::with_on_challenge) hook set before it.
     pub fn with_events(mut self, events: ClientEvents) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Call `handler` before paying each challenge, as mppx's `onChallenge`
+    /// option does: return `true` to pay, `false` to return the `402` response
+    /// without paying, or a [`ChallengeDecision`]. See
+    /// [`ClientEvents::set_on_challenge`]. The hook is set on this
+    /// middleware's event registry, which clones of it share.
+    pub fn with_on_challenge<F, Fut, R>(self, handler: F) -> Self
+    where
+        F: Fn(OnChallengeContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: Into<ChallengeDecision> + Send + 'static,
+    {
+        self.events.set_on_challenge(handler);
         self
     }
 

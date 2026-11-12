@@ -152,62 +152,56 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn custom_credential_header_is_rejected_before_payment() {
-        for manual in [false, true] {
-            let contacted = Arc::new(AtomicU32::new(0));
-            let target_contacted = contacted.clone();
-            let target = spawn_server(Router::new().route(
-                "/",
-                get(move || {
-                    let contacted = target_contacted.clone();
-                    async move {
-                        contacted.fetch_add(1, Ordering::SeqCst);
-                        "ok"
+    async fn payment_authorization_credential_is_never_sent_by_redirect_following_clients() {
+        let contacted = Arc::new(AtomicU32::new(0));
+        let target_contacted = contacted.clone();
+        let target = spawn_server(Router::new().route(
+            "/",
+            get(move || {
+                let contacted = target_contacted.clone();
+                async move {
+                    contacted.fetch_add(1, Ordering::SeqCst);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let (challenge, _) = test_challenge();
+        let header =
+            format_www_authenticate(&challenge.with_header("Payment-Authorization")).unwrap();
+        let origin = spawn_server(Router::new().route(
+            "/",
+            get(move |headers: axum::http::HeaderMap| {
+                let target = target.clone();
+                let header = header.clone();
+                async move {
+                    if headers.contains_key("payment-authorization") {
+                        (AxumStatusCode::TEMPORARY_REDIRECT, [("location", target)]).into_response()
+                    } else {
+                        (
+                            AxumStatusCode::PAYMENT_REQUIRED,
+                            [("www-authenticate", header)],
+                        )
+                            .into_response()
                     }
-                }),
-            ))
-            .await;
-            let (challenge, _) = test_challenge();
-            let header =
-                format_www_authenticate(&challenge.with_header("Payment-Authorization")).unwrap();
-            let origin = spawn_server(Router::new().route(
-                "/",
-                get(move |headers: axum::http::HeaderMap| {
-                    let target = target.clone();
-                    let header = header.clone();
-                    async move {
-                        if headers.contains_key("payment-authorization") {
-                            (AxumStatusCode::TEMPORARY_REDIRECT, [("location", target)])
-                                .into_response()
-                        } else {
-                            (
-                                AxumStatusCode::PAYMENT_REQUIRED,
-                                [("www-authenticate", header)],
-                            )
-                                .into_response()
-                        }
-                    }
-                }),
-            ))
-            .await;
-            let builder = reqwest::Client::builder();
-            let client = if manual {
-                builder.redirect(reqwest::redirect::Policy::none())
-            } else {
-                builder
-            }
-            .build()
-            .unwrap();
-            let provider = MockProvider::new();
-            let error = client
-                .get(origin)
-                .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Always)
-                .await
-                .unwrap_err();
-            assert!(matches!(error, HttpError::UnsafeCredentialHeader));
-            assert_eq!(provider.call_count(), 0);
-            assert_eq!(contacted.load(Ordering::SeqCst), 0);
-        }
+                }
+            }),
+        ))
+        .await;
+        // reqwest's default client follows redirects and keeps custom headers
+        // on a cross-host hop, so the challenge is refused before signing.
+        let provider = MockProvider::new();
+        let error = reqwest::Client::new()
+            .get(origin)
+            .send_with_payment(&provider)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HttpError::UnsafeCredentialHeader),
+            "{error}"
+        );
+        assert_eq!(provider.call_count(), 0);
+        assert_eq!(contacted.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2028,11 +2022,22 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_send_with_payment_default_requires_explicit_preference() {
+    async fn test_send_with_payment_default_injects_preferences() {
         let (base_url, captured) = spawn_header_capture().await;
         reqwest::Client::new()
             .get(format!("{}/probe", base_url))
             .send_with_payment(&AdvertisingProvider)
+            .await
+            .unwrap();
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("tempo/charge"));
+    }
+
+    #[tokio::test]
+    async fn test_send_with_payment_explicit_policy_requires_preference() {
+        let (base_url, captured) = spawn_header_capture().await;
+        reqwest::Client::new()
+            .get(format!("{}/probe", base_url))
+            .send_with_payment_policy(&AdvertisingProvider, &AcceptPaymentPolicy::Explicit)
             .await
             .unwrap();
         assert_eq!(captured.lock().unwrap().as_deref(), None);

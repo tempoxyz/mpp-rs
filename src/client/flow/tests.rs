@@ -257,6 +257,8 @@ struct TestProvider {
     prepaid_realm: Option<&'static str>,
     /// The realm this caller pins for every origin.
     trusted_realm: Option<&'static str>,
+    /// Pay charges with a transaction (pull) credential instead of a hash.
+    transaction: bool,
 }
 
 impl TestProvider {
@@ -289,6 +291,12 @@ impl PaymentProvider for TestProvider {
             return Ok(PaymentCredential::new(
                 challenge.to_echo(),
                 serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
+            ));
+        }
+        if self.transaction {
+            return Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::transaction("0x76f8"),
             ));
         }
         Ok(PaymentCredential::new(
@@ -401,41 +409,282 @@ fn streaming_body(content: &'static str) -> reqwest::Body {
 }
 
 #[tokio::test]
-async fn custom_header_offer_falls_back_to_safe_challenge() {
+async fn payment_authorization_offer_is_refused_before_signing() {
     let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
-    let unsafe_challenge =
-        PaymentChallenge::new("unsafe", "flow.example.com", "tempo", "charge", request)
-            .with_header("Payment-Authorization");
-    let combined = format!(
-        "{}, {}",
-        format_www_authenticate(&unsafe_challenge).unwrap(),
-        www_authenticate("safe", "tempo", "charge"),
-    );
+    let challenge = PaymentChallenge::new("pa", "127.0.0.1", "tempo", "charge", request)
+        .with_header("Payment-Authorization");
+    let header = format_www_authenticate(&challenge).unwrap();
+    let paid_requests = Arc::new(AtomicU32::new(0));
     let app = Router::new().route(
         "/paid",
-        get(move |request: Request<Body>| {
-            let combined = combined.clone();
-            async move {
-                if is_paid(&request) {
-                    StatusCode::OK.into_response()
-                } else {
-                    (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, combined)]).into_response()
+        get({
+            let paid_requests = paid_requests.clone();
+            move |request: Request<Body>| {
+                let header = header.clone();
+                let paid_requests = paid_requests.clone();
+                async move {
+                    if request.headers().contains_key("payment-authorization") {
+                        paid_requests.fetch_add(1, Ordering::SeqCst);
+                    }
+                    (StatusCode::PAYMENT_REQUIRED, [(WWW_AUTHENTICATE, header)]).into_response()
                 }
             }
         }),
     );
     let url = spawn_server(app).await;
 
+    // A caller-owned client may follow redirects, which would forward
+    // Payment-Authorization to another host, so nothing is signed.
     for via in BOTH {
         let provider = TestProvider::default();
-        let request = reqwest::Client::new().get(format!("{url}/paid"));
-        let response = via
+        let request = reqwest::Client::new()
+            .get(format!("{url}/paid"))
+            .header("authorization", "Bearer api-key");
+        let error = via
             .send(request, &provider, ClientEvents::default())
             .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
-        assert_eq!(provider.paid(), ["safe"], "{via:?}");
+            .unwrap_err();
+        assert!(
+            matches!(error, HttpError::UnsafeCredentialHeader),
+            "{via:?}: {error}"
+        );
+        assert!(provider.paid().is_empty(), "{via:?}");
     }
+    assert_eq!(paid_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn default_policy_pays_without_accept_payment() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("default", "charge")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+
+    let provider = TestProvider::default();
+    let response = reqwest::Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment(&provider)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(provider.paid(), ["default"]);
+
+    let provider = TestProvider::default();
+    let response = ClientBuilder::new(reqwest::Client::new())
+        .with(PaymentMiddleware::new(provider.clone()))
+        .build()
+        .get(format!("{url}/paid"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(provider.paid(), ["default"]);
+
+    // The explicit policy stays available and leaves the 402 unpaid.
+    let provider = TestProvider::default();
+    let response = reqwest::Client::new()
+        .get(format!("{url}/paid"))
+        .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Explicit)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert!(provider.paid().is_empty());
+}
+
+fn paid_route() -> Router {
+    Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("hooked", "charge")
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn on_challenge_decline_returns_402_without_paying() {
+    let url = spawn_server(paid_route()).await;
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let events = ClientEvents::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        events.set_on_challenge({
+            let seen = seen.clone();
+            move |context: crate::client::OnChallengeContext| {
+                seen.lock().unwrap().push((
+                    context.challenge.id.clone(),
+                    context.method.clone(),
+                    context.url.path().to_owned(),
+                    context.headers.get("x-caller").cloned(),
+                ));
+                async { false }
+            }
+        });
+        let credentials = Arc::new(AtomicU32::new(0));
+        let _created = events.on_credential_created({
+            let credentials = credentials.clone();
+            move |_| {
+                credentials.fetch_add(1, Ordering::SeqCst);
+                async {}
+            }
+        });
+        let request = reqwest::Client::new()
+            .get(format!("{url}/paid"))
+            .header("x-caller", "yes");
+        let response = via.send(request, &provider, events).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert!(response.headers().contains_key(WWW_AUTHENTICATE), "{via:?}");
+        assert!(provider.paid().is_empty(), "{via:?}");
+        assert_eq!(credentials.load(Ordering::SeqCst), 0, "{via:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{via:?}");
+        assert_eq!(seen[0].0, "hooked");
+        assert_eq!(seen[0].1, reqwest::Method::GET);
+        assert_eq!(seen[0].2, "/paid");
+        assert_eq!(seen[0].3.as_ref().unwrap(), "yes");
+    }
+}
+
+/// A session provider's prepaid voucher is sent before any 402, so with an
+/// approval hook set none is sent: a declining hook stops every payment.
+#[tokio::test]
+async fn on_challenge_hook_disables_prepaid_credentials() {
+    let app = Router::new().route(
+        "/paid",
+        get(|request: Request<Body>| async move {
+            if is_paid(&request) {
+                StatusCode::OK.into_response()
+            } else {
+                payment_required("session-1", "session")
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            prepaid: true,
+            ..TestProvider::default()
+        };
+        let events = ClientEvents::default();
+        events.set_on_challenge(|_| async { false });
+        let credentials = Arc::new(AtomicU32::new(0));
+        let _created = events.on_credential_created({
+            let credentials = credentials.clone();
+            move |_| {
+                credentials.fetch_add(1, Ordering::SeqCst);
+                async {}
+            }
+        });
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via.send(request, &provider, events).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert!(provider.paid().is_empty(), "{via:?}");
+        assert_eq!(credentials.load(Ordering::SeqCst), 0, "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn on_challenge_approval_pays() {
+    let url = spawn_server(paid_route()).await;
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let events = ClientEvents::default();
+        let calls = Arc::new(AtomicU32::new(0));
+        events.set_on_challenge({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { crate::client::ChallengeDecision::Pay }
+            }
+        });
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via.send(request, &provider, events).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+        assert_eq!(provider.paid(), ["hooked"], "{via:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn on_challenge_credential_replaces_provider_payment() {
+    let url = spawn_server(paid_route()).await;
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let events = ClientEvents::default();
+        events.set_on_challenge(|context: crate::client::OnChallengeContext| async move {
+            Some(PaymentCredential::new(
+                context.challenge.to_echo(),
+                crate::protocol::core::PaymentPayload::hash("0xhook"),
+            ))
+        });
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via.send(request, &provider, events).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+        assert!(provider.paid().is_empty(), "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn challenge_received_credential_skips_on_challenge() {
+    let url = spawn_server(paid_route()).await;
+    let provider = TestProvider::default();
+    let events = ClientEvents::default();
+    let _override = events.on_challenge_received(|context| async move {
+        Some(PaymentCredential::new(
+            context.challenge.to_echo(),
+            crate::protocol::core::PaymentPayload::hash("0xevent"),
+        ))
+    });
+    events.set_on_challenge(|_| async { false });
+    let response = Via::Fetch
+        .send(
+            reqwest::Client::new().get(format!("{url}/paid")),
+            &provider,
+            events,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(provider.paid().is_empty());
+}
+
+#[tokio::test]
+async fn panicking_on_challenge_declines() {
+    let url = spawn_server(paid_route()).await;
+    let provider = TestProvider::default();
+    let events = ClientEvents::default();
+    events.set_on_challenge(|_| -> std::future::Ready<bool> { panic!("hook failed") });
+    let response = Via::Middleware
+        .send(
+            reqwest::Client::new().get(format!("{url}/paid")),
+            &provider,
+            events.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert!(provider.paid().is_empty());
+
+    events.clear_on_challenge();
+    let response = Via::Middleware
+        .send(
+            reqwest::Client::new().get(format!("{url}/paid")),
+            &provider,
+            events,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -793,7 +1042,7 @@ async fn management_context_uses_the_callers_redirect_policy() {
 }
 
 #[tokio::test]
-async fn opaque_client_defaults_cannot_authorize_payment() {
+async fn opaque_client_defaults_cannot_authorize_explicit_payment() {
     for via in BOTH {
         for default in ["tempo/charge;q=0", "tempo/charge"] {
             for preference in [
@@ -827,12 +1076,15 @@ async fn opaque_client_defaults_cannot_authorize_payment() {
                 let provider = TestProvider::default();
                 let result = match via {
                     Via::Fetch => request
-                        .send_with_payment(&provider)
+                        .send_with_payment_policy(&provider, &AcceptPaymentPolicy::Explicit)
                         .await
                         .map(|r| r.status())
                         .map_err(|e| e.to_string()),
                     Via::Middleware => ClientBuilder::new(client)
-                        .with(PaymentMiddleware::new(provider.clone()))
+                        .with(
+                            PaymentMiddleware::new(provider.clone())
+                                .with_accept_payment_policy(AcceptPaymentPolicy::Explicit),
+                        )
                         .build()
                         .execute(request.build().unwrap())
                         .await
@@ -1219,5 +1471,494 @@ fn session_receipt_spending_is_bounded_by_the_sent_voucher() {
             super::session_receipt_within_authorization(&receipt, &credential),
             valid
         );
+    }
+}
+
+/// A 402 answering a credential with `invalid-challenge` (also the replay
+/// answer) is final: paying its fresh challenge could pay twice.
+#[tokio::test]
+async fn invalid_challenge_after_payment_is_final() {
+    let issued = Arc::new(AtomicU32::new(0));
+    let app = Router::new().route(
+        "/paid",
+        get({
+            let issued = issued.clone();
+            move |request: Request<Body>| {
+                let issued = issued.clone();
+                async move {
+                    let n = issued.fetch_add(1, Ordering::SeqCst);
+                    let request_json =
+                        Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap();
+                    let challenge = PaymentChallenge::new(
+                        format!("fresh-{n}"),
+                        "127.0.0.1",
+                        "tempo",
+                        "charge",
+                        request_json,
+                    );
+                    let header = format_www_authenticate(&challenge).unwrap();
+                    let problem = if request.headers().contains_key("authorization") {
+                        "https://paymentauth.org/problems/invalid-challenge"
+                    } else {
+                        "https://paymentauth.org/problems/payment-required"
+                    };
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        [
+                            (WWW_AUTHENTICATE, header),
+                            (
+                                reqwest::header::CONTENT_TYPE,
+                                "application/problem+json".to_string(),
+                            ),
+                        ],
+                        serde_json::json!({"type": problem, "status": 402}).to_string(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+    for via in BOTH {
+        // A transaction credential: a hash credential's answer is final
+        // before the invalid-challenge check is reached.
+        let provider = TestProvider {
+            transaction: true,
+            ..TestProvider::default()
+        };
+        let response = via
+            .send(
+                reqwest::Client::new().get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert_eq!(provider.paid().len(), 1, "{via:?}");
+        assert!(response.url().path().ends_with("/paid"), "{via:?}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["type"], "https://paymentauth.org/problems/invalid-challenge",
+            "{via:?}"
+        );
+    }
+}
+
+/// A server whose 402 problem is not readable after a credential: answers
+/// every paid request with `body` and `content_type` and a fresh challenge.
+fn rejecting_route(content_type: Option<&'static str>, body: String) -> Router {
+    let issued = Arc::new(AtomicU32::new(0));
+    Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let issued = issued.clone();
+            let body = body.clone();
+            async move {
+                let n = issued.fetch_add(1, Ordering::SeqCst);
+                let challenge = www_authenticate(&format!("fresh-{n}"), "tempo", "charge");
+                if !is_paid(&request) {
+                    return payment_required(&format!("fresh-{n}"), "charge");
+                }
+                let mut response = (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(WWW_AUTHENTICATE, challenge)],
+                    body,
+                )
+                    .into_response();
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(reqwest::header::CONTENT_TYPE, content_type.parse().unwrap());
+                }
+                response
+            }
+        }),
+    )
+}
+
+/// A 402 without a problem body answering a credential (as the Tower layer
+/// answers a replay) is final too: its cause is unknown, so it is not paid
+/// again.
+#[tokio::test]
+async fn bare_402_after_payment_is_final() {
+    let url = spawn_server(rejecting_route(None, String::new())).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            transaction: true,
+            ..TestProvider::default()
+        };
+        let response = via
+            .send(
+                reqwest::Client::new().get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert_eq!(provider.paid().len(), 1, "{via:?}");
+    }
+}
+
+/// A problem body past the read limit is not buffered whole: its type is
+/// unknown, so the 402 is final, and the body handed back stops at the limit.
+#[tokio::test]
+async fn oversized_problem_body_is_final_and_bounded() {
+    let mut body = String::from(
+        r#"{"type":"https://paymentauth.org/problems/verification-failed","detail":""#,
+    );
+    body.push_str(&"x".repeat(super::MAX_PROBLEM_BODY_BYTES * 2));
+    body.push_str(r#""}"#);
+    let url = spawn_server(rejecting_route(Some("application/problem+json"), body)).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            transaction: true,
+            ..TestProvider::default()
+        };
+        let response = via
+            .send(
+                reqwest::Client::new().get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert_eq!(provider.paid().len(), 1, "{via:?}");
+        let returned = response.bytes().await.unwrap();
+        assert_eq!(returned.len(), super::MAX_PROBLEM_BODY_BYTES, "{via:?}");
+    }
+}
+
+/// A problem naming another failure, such as verification-failed, still lets
+/// the client pay the fresh challenge.
+#[tokio::test]
+async fn verification_failed_after_payment_pays_fresh_challenge() {
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/verification-failed"})
+        .to_string();
+    let url = spawn_server(rejecting_route(Some("application/problem+json"), body)).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            transaction: true,
+            ..TestProvider::default()
+        };
+        let response = via
+            .send(
+                reqwest::Client::new().get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert!(provider.paid().len() > 1, "{via:?}: {:?}", provider.paid());
+    }
+}
+
+/// A server that answers any request carrying a Payment credential with a
+/// 402 of `content_type` and `body` and a fresh challenge, and asks for
+/// payment otherwise.
+fn caller_credential_route(content_type: Option<&'static str>, body: String) -> Router {
+    let issued = Arc::new(AtomicU32::new(0));
+    Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let issued = issued.clone();
+            let body = body.clone();
+            async move {
+                let n = issued.fetch_add(1, Ordering::SeqCst);
+                if !super::carries_payment_credential(request.headers()) {
+                    return payment_required(&format!("fresh-{n}"), "charge");
+                }
+                let challenge = www_authenticate(&format!("fresh-{n}"), "tempo", "charge");
+                let mut response = (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(WWW_AUTHENTICATE, challenge)],
+                    body,
+                )
+                    .into_response();
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(reqwest::header::CONTENT_TYPE, content_type.parse().unwrap());
+                }
+                response
+            }
+        }),
+    )
+}
+
+/// A credential the caller set on the request is answered under the same
+/// final rules as one the flow sent: `invalid-challenge` (the replay answer)
+/// or an empty 402 is returned without paying the fresh challenge, as mppx
+/// does after `initialCredentialSent`.
+#[tokio::test]
+async fn refused_caller_credential_is_not_paid_again() {
+    let invalid_challenge =
+        serde_json::json!({"type": "https://paymentauth.org/problems/invalid-challenge"})
+            .to_string();
+    for (name, content_type, body) in [
+        (
+            "invalid-challenge",
+            Some("application/problem+json"),
+            invalid_challenge,
+        ),
+        ("empty body", None, String::new()),
+    ] {
+        let url = spawn_server(caller_credential_route(content_type, body)).await;
+        for (header, value) in [
+            ("authorization", "Payment eyJjaGFsbGVuZ2UiOnt9fQ"),
+            ("payment-authorization", "eyJjaGFsbGVuZ2UiOnt9fQ"),
+        ] {
+            for via in BOTH {
+                let provider = TestProvider::default();
+                let response = via
+                    .send(
+                        reqwest::Client::new()
+                            .get(format!("{url}/paid"))
+                            .header(header, value),
+                        &provider,
+                        ClientEvents::default(),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("{name}, {header}, {via:?}: {err}"));
+                assert_eq!(
+                    response.status(),
+                    StatusCode::PAYMENT_REQUIRED,
+                    "{name}, {header}, {via:?}"
+                );
+                assert!(
+                    provider.paid().is_empty(),
+                    "{name}, {header}, {via:?}: {:?}",
+                    provider.paid()
+                );
+            }
+        }
+    }
+}
+
+/// A caller credential refused for another reason, such as
+/// verification-failed, still lets the client pay the fresh challenge.
+#[tokio::test]
+async fn caller_credential_verification_failed_pays_fresh_challenge() {
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/verification-failed"})
+        .to_string();
+    let url = spawn_server(caller_credential_route(
+        Some("application/problem+json"),
+        body,
+    ))
+    .await;
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let response = via
+            .send(
+                reqwest::Client::new()
+                    .get(format!("{url}/paid"))
+                    .header("authorization", "Payment eyJjaGFsbGVuZ2UiOnt9fQ"),
+                &provider,
+                ClientEvents::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+        assert!(!provider.paid().is_empty(), "{via:?}");
+    }
+}
+
+#[test]
+fn carries_payment_credential_reads_both_headers() {
+    let headers = |pairs: &[(&'static str, &'static str)]| {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert!(super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "Payment abc"
+    )])));
+    assert!(super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "payment abc"
+    )])));
+    assert!(super::carries_payment_credential(&headers(&[(
+        "Payment-Authorization",
+        "abc"
+    )])));
+    assert!(!super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "Bearer abc"
+    )])));
+    assert!(!super::carries_payment_credential(&headers(&[(
+        "authorization",
+        "Paymentabc"
+    )])));
+    assert!(!super::carries_payment_credential(&headers(&[])));
+}
+
+/// A caller's own hash (push) credential has its transfer on chain already,
+/// so any 402 answering it is final, even verification-failed, as for a hash
+/// credential the flow sent.
+#[tokio::test]
+async fn caller_hash_credential_is_never_paid_again() {
+    let challenge = crate::protocol::core::parse_www_authenticate(&www_authenticate(
+        "caller", "tempo", "charge",
+    ))
+    .unwrap();
+    let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xabc"));
+    let authorization = crate::protocol::core::format_authorization(&credential).unwrap();
+    let token = authorization.trim_start_matches("Payment ").to_string();
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/verification-failed"})
+        .to_string();
+    let url = spawn_server(caller_credential_route(
+        Some("application/problem+json"),
+        body,
+    ))
+    .await;
+    for (header, value) in [
+        ("authorization", authorization.clone()),
+        ("payment-authorization", token.clone()),
+        ("payment-authorization", authorization.clone()),
+    ] {
+        for via in BOTH {
+            let provider = TestProvider::default();
+            let response = via
+                .send(
+                    reqwest::Client::new()
+                        .get(format!("{url}/paid"))
+                        .header(header, value.as_str()),
+                    &provider,
+                    ClientEvents::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "{header}, {via:?}"
+            );
+            assert!(
+                provider.paid().is_empty(),
+                "{header}, {via:?}: {:?}",
+                provider.paid()
+            );
+        }
+    }
+}
+
+/// A paid retry replaces the caller's credential in either field, so the
+/// server never sees two Payment credentials.
+#[test]
+fn remove_payment_credentials_clears_both_fields() {
+    let mut headers = HeaderMap::new();
+    headers.append("payment-authorization", HeaderValue::from_static("abc"));
+    headers.append(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static("Payment abc"),
+    );
+    headers.append(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer token"),
+    );
+    super::remove_payment_credentials(&mut headers);
+    assert!(!headers.contains_key("payment-authorization"));
+    let authorization: Vec<_> = headers
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .collect();
+    assert_eq!(authorization, [HeaderValue::from_static("Bearer token")]);
+    assert!(!super::carries_payment_credential(&headers));
+}
+
+#[test]
+fn comma_joined_payment_credentials_are_found_and_removed() {
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    let mut headers = HeaderMap::new();
+    headers.append(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer t, Payment abc"),
+    );
+    assert!(super::carries_payment_credential(&headers));
+    super::remove_payment_credentials(&mut headers);
+    let values: Vec<_> = headers.get_all(AUTHORIZATION).iter().collect();
+    assert_eq!(values, vec![HeaderValue::from_static("Bearer t")]);
+
+    let mut headers = HeaderMap::new();
+    headers.append(
+        AUTHORIZATION,
+        HeaderValue::from_static("Digest realm=\"a, b\", nonce=x, Payment abc, Basic dXM="),
+    );
+    assert!(super::carries_payment_credential(&headers));
+    super::remove_payment_credentials(&mut headers);
+    let values: Vec<_> = headers.get_all(AUTHORIZATION).iter().collect();
+    assert_eq!(
+        values,
+        vec![HeaderValue::from_static(
+            "Digest realm=\"a, b\", nonce=x, Basic dXM="
+        )]
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.append(AUTHORIZATION, HeaderValue::from_static("Payment abc"));
+    super::remove_payment_credentials(&mut headers);
+    assert!(headers.get(AUTHORIZATION).is_none());
+
+    let mut headers = HeaderMap::new();
+    headers.append(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer payment, Basic x"),
+    );
+    assert!(!super::carries_payment_credential(&headers));
+}
+
+/// A Payment credential the flow cannot see on the request, from the
+/// client's default headers or comma-joined after another scheme, is still
+/// not paid again when the server answers it with invalid-challenge.
+#[tokio::test]
+async fn hidden_caller_credential_is_not_paid_again() {
+    let body = serde_json::json!({"type": "https://paymentauth.org/problems/invalid-challenge"})
+        .to_string();
+    let url = spawn_server(caller_credential_route(
+        Some("application/problem+json"),
+        body,
+    ))
+    .await;
+    let mut defaults = reqwest::header::HeaderMap::new();
+    defaults.insert(
+        reqwest::header::AUTHORIZATION,
+        "Payment eyJjaGFsbGVuZ2UiOnt9fQ".parse().unwrap(),
+    );
+    let default_client = reqwest::Client::builder()
+        .default_headers(defaults)
+        .build()
+        .unwrap();
+    for via in BOTH {
+        for (name, builder) in [
+            ("default headers", default_client.get(format!("{url}/paid"))),
+            (
+                "comma-joined",
+                reqwest::Client::new()
+                    .get(format!("{url}/paid"))
+                    .header("authorization", "Bearer t, Payment eyJjaGFsbGVuZ2UiOnt9fQ"),
+            ),
+        ] {
+            let provider = TestProvider::default();
+            let response = via
+                .send(builder, &provider, ClientEvents::default())
+                .await
+                .unwrap_or_else(|err| panic!("{name}, {via:?}: {err}"));
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "{name}, {via:?}"
+            );
+            assert!(
+                provider.paid().is_empty(),
+                "{name}, {via:?}: {:?}",
+                provider.paid()
+            );
+        }
     }
 }
