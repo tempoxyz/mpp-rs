@@ -126,3 +126,25 @@ pub struct ChargeOptions<'a> {
     /// Framework adapter route/resource/query scope.
     pub mppx_scope: Option<&'a serde_json::Value>,
 }
+
+/// The Payment credential in an HTTP request's `Authorization` and
+/// `Payment-Authorization` fields, read from the field `selected` as
+/// [`select_payment_credential`](crate::protocol::core::select_payment_credential)
+/// does: `Err` (`bad-request`) for more than one credential, `None` when
+/// absent. Field values that are not visible ASCII are not credentials.
+pub(crate) fn credential_from_headers(
+    headers: &http_types::HeaderMap,
+    selected: &str,
+) -> Result<Option<String>, crate::error::MppError> {
+    let values = |name: &str| {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>()
+    };
+    let authorization = values(http_types::header::AUTHORIZATION.as_str());
+    let payment_authorization = values(crate::protocol::core::PAYMENT_AUTHORIZATION_HEADER);
+    crate::protocol::core::select_payment_credential(authorization, payment_authorization, selected)
+        .map(|credential| credential.map(str::to_string))
+}

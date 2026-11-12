@@ -22,20 +22,55 @@ fn validate_charge_modes(modes: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Add a fresh `_mpp_nonce` (16 random bytes, base64url without padding) to
+/// a route's `opaque`, keeping its other members.
+#[cfg(any(feature = "tempo", feature = "stripe"))]
+fn with_nonce(
+    opaque: Option<crate::protocol::core::Base64UrlJson>,
+) -> Result<Option<crate::protocol::core::Base64UrlJson>> {
+    let mut members = match opaque.as_ref().map(|opaque| opaque.decode_value()) {
+        None => serde_json::Map::new(),
+        Some(Ok(serde_json::Value::Object(members))) => members,
+        // A route opaque that is not a JSON object has nowhere to carry a
+        // nonce; it is issued as configured and matched as raw text.
+        Some(_) => return Ok(opaque),
+    };
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|error| {
+        crate::error::MppError::Internal(format!("failed to generate challenge nonce: {error}"))
+    })?;
+    members.insert(
+        super::NONCE_KEY.to_string(),
+        serde_json::Value::String(crate::protocol::core::base64url_encode(&nonce)),
+    );
+    crate::protocol::core::Base64UrlJson::from_value(&serde_json::Value::Object(members)).map(Some)
+}
+
 impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
 {
-    /// Stamp configured `opaque` and credential `header` onto an issued
-    /// challenge and recompute its HMAC id. No-op when neither is configured.
+    /// Stamp the configured `opaque` (with a fresh `_mpp_nonce` unless
+    /// disabled) and credential `header` onto an issued challenge and
+    /// recompute its HMAC id.
+    ///
+    /// Refuses a secret key shorter than 32 bytes.
     #[cfg(any(feature = "tempo", feature = "stripe"))]
-    pub(super) fn apply_pinned_opaque(&self, mut challenge: PaymentChallenge) -> PaymentChallenge {
-        if self.config.opaque.is_none() && self.config.credential_header.is_none() {
-            return challenge;
+    pub(super) fn apply_pinned_opaque(
+        &self,
+        mut challenge: PaymentChallenge,
+    ) -> Result<PaymentChallenge> {
+        self.check_secret_key()?;
+        let opaque = self.config.opaque.clone().or(challenge.opaque.take());
+        let opaque = if self.config.nonce {
+            with_nonce(opaque)?
+        } else {
+            opaque
+        };
+        if opaque.is_none() && self.config.credential_header.is_none() {
+            return Ok(challenge);
         }
-        if let Some(opaque) = &self.config.opaque {
-            challenge.opaque = Some(opaque.clone());
-        }
+        challenge.opaque = opaque;
         challenge.header = self.config.credential_header.clone();
         challenge.id = crate::protocol::core::compute_challenge_id_with_header(
             &self.config.secret_key,
@@ -48,7 +83,7 @@ where
             challenge.opaque.as_ref().map(|o| o.raw()),
             challenge.header.as_deref(),
         );
-        challenge
+        Ok(challenge)
     }
 
     #[cfg(feature = "tempo")]
@@ -177,7 +212,7 @@ where
             options.expires,
             options.description,
         )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        self.apply_pinned_opaque(challenge)
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -229,7 +264,7 @@ where
             expires,
             description,
         )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        self.apply_pinned_opaque(challenge)
     }
 
     /// The charge request [`charge_with_options()`](Self::charge_with_options)
@@ -352,7 +387,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             None,
         );
 
-        Ok(self.apply_pinned_opaque(PaymentChallenge {
+        self.apply_pinned_opaque(PaymentChallenge {
             id,
             realm: self.config.realm.clone(),
             method: crate::protocol::methods::stripe::METHOD_NAME.into(),
@@ -363,7 +398,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             digest: None,
             opaque: None,
             header: None,
-        }))
+        })
     }
 
     /// Generate a Stripe charge challenge with options and bind it to the actual request body bytes.

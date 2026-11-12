@@ -80,8 +80,8 @@ use http_types::{header, HeaderValue, StatusCode};
 use crate::error::{MppError, PaymentError, PaymentErrorDetails};
 use crate::protocol::core::headers::parse_authorization;
 use crate::protocol::core::headers::{
-    extract_payment_scheme, format_receipt, format_www_authenticate, with_private_cache_control,
-    PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
+    format_receipt, format_www_authenticate, with_private_cache_control, PAYMENT_RECEIPT_HEADER,
+    WWW_AUTHENTICATE_HEADER,
 };
 use crate::protocol::core::{PaymentChallenge, Receipt};
 
@@ -132,14 +132,14 @@ impl IntoResponse for PaymentOffers {
 ///
 /// Payment problems (expired, invalid challenge, failed verification, …) are
 /// answered with the problem's status and one fresh `WWW-Authenticate`
-/// challenge per offer. A server-side failure (`5xx`) or a final `403` (such
-/// as a replayed credential) is answered without a challenge, so that clients
-/// do not pay again when paying would not help.
+/// challenge per offer. A server-side failure (`5xx`), a final `403` or a
+/// `bad-request` (more than one credential) is answered without a
+/// challenge, so that clients do not pay again when paying would not help.
 #[derive(Debug)]
 pub struct PaymentProblem {
     /// Problem details sent as the `application/problem+json` body.
     pub problem: PaymentErrorDetails,
-    /// Fresh challenges for retry. Not sent with a `5xx` or `403` problem.
+    /// Fresh challenges for retry. Not sent with a `5xx`, `403` or `bad-request` problem.
     pub offers: Vec<PaymentChallenge>,
 }
 
@@ -147,11 +147,11 @@ impl PaymentProblem {
     /// Build the response for `error`, retryable with `offers`.
     ///
     /// The problem references the first offer's challenge id. A problem
-    /// answered without a challenge (`5xx` or `403`) drops the offers and
+    /// answered without a challenge (`5xx`, `403` or `bad-request`) drops the offers and
     /// references none.
     pub fn new(error: &impl PaymentError, offers: Vec<PaymentChallenge>) -> Self {
         let problem = error.to_problem_details(None);
-        if !sends_challenges(problem.status) {
+        if !sends_challenges(&problem) {
             return Self {
                 problem,
                 offers: Vec::new(),
@@ -163,18 +163,20 @@ impl PaymentProblem {
 }
 
 /// Whether a problem with `status` is answered with fresh challenges: a
-/// server-side failure or a final `403` (such as a replayed credential) is
-/// not, since paying again would not help.
-fn sends_challenges(status: u16) -> bool {
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    !(status.is_server_error() || status == StatusCode::FORBIDDEN)
+/// server-side failure, a final `403` or a `bad-request` (more than one
+/// credential, which the core spec answers without a challenge) is not.
+fn sends_challenges(problem: &PaymentErrorDetails) -> bool {
+    let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    !(status.is_server_error()
+        || status == StatusCode::FORBIDDEN
+        || problem.problem_type.ends_with("/bad-request"))
 }
 
 impl IntoResponse for PaymentProblem {
     fn into_response(self) -> axum_core::response::Response {
         let status =
             StatusCode::from_u16(self.problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let values = if !sends_challenges(self.problem.status) {
+        let values = if !sends_challenges(&self.problem) {
             Vec::new()
         } else {
             match challenge_header_values(&self.offers) {
@@ -364,13 +366,13 @@ impl MppChargeRejection {
     /// Build the rejection for a credential that failed with `error`.
     ///
     /// `offers` generates the fresh challenges; it is only called for payment
-    /// problems a new payment can resolve, since a server-side failure or a
-    /// replayed credential is not answered with a challenge.
+    /// problems a new payment can resolve, since a server-side failure, a
+    /// `403` or a `bad-request` is not answered with a challenge.
     fn from_error(
         error: MppError,
         offers: impl FnOnce() -> Result<Vec<PaymentChallenge>, String>,
     ) -> Self {
-        if !error.is_payment_problem() || matches!(error, MppError::CredentialReplayed(_)) {
+        if !error.is_payment_problem() || !sends_challenges(&error.to_problem_details(None)) {
             return Self::Problem(PaymentProblem::new(&error, Vec::new()));
         }
         match offers() {
@@ -1114,6 +1116,84 @@ where
     }
 }
 
+/// What the charge extractors read from the request before verifying it.
+struct ChargeInputs {
+    challenger: Arc<dyn ChargeChallenger>,
+    mppx_scope: Option<serde_json::Value>,
+    request_realm: Option<String>,
+    credential: Result<Option<String>, MppError>,
+}
+
+impl ChargeInputs {
+    fn from_parts<S>(parts: &http_types::request::Parts, state: &S) -> Self
+    where
+        Arc<dyn ChargeChallenger>: FromRef<S>,
+    {
+        let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
+        let credential =
+            super::credential_from_headers(&parts.headers, challenger.credential_header());
+        Self {
+            mppx_scope: mppx_scope_from_parts(parts),
+            request_realm: request_realm_from_parts(parts),
+            credential,
+            challenger,
+        }
+    }
+
+    /// Verify the request's credential for `amount`, or reject it with fresh
+    /// challenges. With `body`, challenges and verification bind its digest.
+    // The rejection is the extractors' own `Rejection` type, returned as is.
+    #[allow(clippy::result_large_err)]
+    async fn verify(
+        self,
+        amount: &str,
+        description: Option<&'static str>,
+        body: Option<&[u8]>,
+    ) -> Result<Receipt, MppChargeRejection> {
+        let Self {
+            challenger,
+            mppx_scope,
+            request_realm,
+            credential,
+        } = self;
+        let options = ChallengeOptions {
+            description,
+            mppx_scope: mppx_scope.clone(),
+            request_realm: request_realm.clone(),
+        };
+        let offers = |options: ChallengeOptions| match body {
+            Some(body) => challenger.challenges_with_body(amount, options, body),
+            None => challenger.challenges(amount, options),
+        };
+
+        let credential_str = match credential {
+            // More than one Payment credential: 400 without a challenge.
+            Err(error) => {
+                return Err(MppChargeRejection::Problem(PaymentProblem::new(
+                    &error,
+                    Vec::new(),
+                )))
+            }
+            Ok(Some(credential)) => credential,
+            Ok(None) => {
+                let offers = offers(options).map_err(MppChargeRejection::InternalError)?;
+                return Err(MppChargeRejection::from_offers(offers));
+            }
+        };
+
+        challenger
+            .verify_payment_for_route_with_realm(
+                &credential_str,
+                amount,
+                mppx_scope,
+                body,
+                request_realm.as_deref(),
+            )
+            .await
+            .map_err(|error| MppChargeRejection::from_error(error, || offers(options)))
+    }
+}
+
 impl<S, C> FromRequestParts<S> for MppCharge<C>
 where
     Arc<dyn ChargeChallenger>: FromRef<S>,
@@ -1126,51 +1206,9 @@ where
         parts: &mut http_types::request::Parts,
         state: &S,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
-        let mppx_scope = mppx_scope_from_parts(parts);
-        let request_realm = request_realm_from_parts(parts);
-        let auth_header = parts
-            .headers
-            .get(challenger.credential_header())
-            .and_then(|v| v.to_str().ok())
-            .and_then(extract_payment_scheme)
-            .map(|s| s.to_string());
-
+        let inputs = ChargeInputs::from_parts(parts, state);
         async move {
-            let options = ChallengeOptions {
-                description: C::description(),
-                mppx_scope: mppx_scope.clone(),
-                request_realm: request_realm.clone(),
-            };
-
-            let credential_str = match auth_header {
-                Some(c) => c,
-                None => {
-                    let offers = challenger
-                        .challenges(C::amount(), options)
-                        .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::from_offers(offers));
-                }
-            };
-
-            let receipt = match challenger
-                .verify_payment_for_route_with_realm(
-                    &credential_str,
-                    C::amount(),
-                    mppx_scope,
-                    None,
-                    request_realm.as_deref(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(error) => {
-                    return Err(MppChargeRejection::from_error(error, || {
-                        challenger.challenges(C::amount(), options)
-                    }));
-                }
-            };
-
+            let receipt = inputs.verify(C::amount(), C::description(), None).await?;
             Ok(MppCharge {
                 receipt,
                 _config: std::marker::PhantomData,
@@ -1191,16 +1229,8 @@ where
         req: Request,
         state: &S,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
         let (parts, body) = req.into_parts();
-        let mppx_scope = mppx_scope_from_parts(&parts);
-        let request_realm = request_realm_from_parts(&parts);
-        let auth_header = parts
-            .headers
-            .get(challenger.credential_header())
-            .and_then(|v| v.to_str().ok())
-            .and_then(extract_payment_scheme)
-            .map(|s| s.to_string());
+        let inputs = ChargeInputs::from_parts(&parts, state);
         let req = Request::from_parts(parts, body);
 
         async move {
@@ -1208,40 +1238,9 @@ where
             let body = Bytes::from_request(req, state)
                 .await
                 .map_err(MppChargeRejection::Body)?;
-            let options = ChallengeOptions {
-                description: C::description(),
-                mppx_scope: mppx_scope.clone(),
-                request_realm: request_realm.clone(),
-            };
-
-            let credential_str = match auth_header {
-                Some(c) => c,
-                None => {
-                    let offers = challenger
-                        .challenges_with_body(C::amount(), options, &body)
-                        .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::from_offers(offers));
-                }
-            };
-
-            let receipt = match challenger
-                .verify_payment_for_route_with_realm(
-                    &credential_str,
-                    C::amount(),
-                    mppx_scope,
-                    Some(&body),
-                    request_realm.as_deref(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(error) => {
-                    return Err(MppChargeRejection::from_error(error, || {
-                        challenger.challenges_with_body(C::amount(), options, &body)
-                    }));
-                }
-            };
-
+            let receipt = inputs
+                .verify(C::amount(), C::description(), Some(&body))
+                .await?;
             Ok(MppChargeWithBody {
                 receipt,
                 body,

@@ -717,3 +717,26 @@ async fn test_session_accepts_every_offered_currency_including_existing_channels
         err.message
     );
 }
+
+/// The core engine does not consume challenge ids: a session reuses one
+/// challenge for its open, voucher and close credentials.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_session_credentials_reuse_one_challenge() {
+    let mpp = create_session_test_mpp();
+    let challenge = mpp
+        .session_challenge(
+            "1000",
+            "0x20c0000000000000000000000000000000000000",
+            "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+        )
+        .unwrap();
+    for payload in [
+        serde_json::json!({"action": "voucher", "channelId": "0xabc", "cumulativeAmount": "5000", "signature": "0xdef"}),
+        serde_json::json!({"action": "voucher", "channelId": "0xabc", "cumulativeAmount": "6000", "signature": "0xdef"}),
+        serde_json::json!({"action": "close", "channelId": "0xabc", "cumulativeAmount": "6000", "signature": "0xdef"}),
+    ] {
+        let credential = PaymentCredential::new(challenge.to_echo(), payload);
+        assert!(mpp.verify_session(&credential).await.is_ok());
+    }
+}
