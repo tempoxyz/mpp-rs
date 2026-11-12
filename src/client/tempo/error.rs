@@ -28,7 +28,15 @@ pub enum TempoClientError {
     },
 
     /// Wallet has insufficient balance to complete the payment.
-    #[error("Insufficient {token} balance: have {available}, need {required}")]
+    ///
+    /// When the payer is short of MACH on Tempo mainnet, `token` is `MACH`,
+    /// the amounts are decimal MACH and `funding_url` links to where the
+    /// payer can buy the shortfall (see
+    /// [`machine_token::funding_url`](crate::protocol::methods::tempo::machine_token::funding_url)).
+    #[error(
+        "Insufficient {token} balance: have {available}, need {required}{}",
+        format_funding_url(.funding_url)
+    )]
     InsufficientBalance {
         /// Token symbol or address.
         token: String,
@@ -36,11 +44,67 @@ pub enum TempoClientError {
         available: String,
         /// Required amount (human-readable).
         required: String,
+        /// Where the payer can buy the missing balance, when known.
+        funding_url: Option<String>,
     },
 
     /// Transaction reverted on-chain (e.g., during gas estimation or broadcast).
     #[error("Transaction reverted: {0}")]
     TransactionReverted(String),
+}
+
+fn format_funding_url(funding_url: &Option<String>) -> String {
+    match funding_url {
+        Some(url) => format!(". Buy MACH at {url}"),
+        None => String::new(),
+    }
+}
+
+/// Reports an insufficient-balance failure of a payment the payer could fund
+/// with MACH (`currency`, the token it spends or the charge currency) as a
+/// MACH shortfall with the link to buy it, as
+/// [`TempoClientError::machine_token_shortfall`] builds.
+///
+/// Other errors, failures naming another token (such as the gas token), chains
+/// without MACH funding, a payer already holding `required` MACH and a
+/// failed balance read keep the original error.
+pub(crate) async fn with_machine_token_funding<P>(
+    error: crate::error::MppError,
+    provider: &P,
+    chain_id: u64,
+    payer: alloy::primitives::Address,
+    currency: alloy::primitives::Address,
+    required: alloy::primitives::U256,
+) -> crate::error::MppError
+where
+    P: alloy::providers::Provider<tempo_alloy::TempoNetwork>,
+{
+    use crate::error::MppError;
+    use crate::protocol::methods::tempo::machine_token::{self, MACH};
+
+    if machine_token::funding_url(chain_id, None, None).is_none() || error.funding_url().is_some() {
+        return error;
+    }
+    let names_payment_token = match &error {
+        MppError::InsufficientBalance(_) => true,
+        MppError::Tempo(TempoClientError::InsufficientBalance { token, .. }) => {
+            match token.parse::<alloy::primitives::Address>() {
+                Ok(token) => token == MACH || token == currency,
+                // The node's message named no token.
+                Err(_) => true,
+            }
+        }
+        _ => false,
+    };
+    if !names_payment_token {
+        return error;
+    }
+    let Ok(available) = ITIP20::new(MACH, provider).balanceOf(payer).call().await else {
+        return error;
+    };
+    TempoClientError::machine_token_shortfall(chain_id, payer, available, required)
+        .map(MppError::from)
+        .unwrap_or(error)
 }
 
 /// Extract the value for `key` from a revert string like `"{ key: value, ... }"`.
@@ -59,6 +123,44 @@ fn extract_field(raw: &str, key: &str) -> Option<String> {
 }
 
 impl TempoClientError {
+    /// Where the payer can buy the balance it is missing, such as the MACH
+    /// funding link of an [`InsufficientBalance`](Self::InsufficientBalance)
+    /// error.
+    pub fn funding_url(&self) -> Option<&str> {
+        match self {
+            Self::InsufficientBalance { funding_url, .. } => funding_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// An [`InsufficientBalance`](Self::InsufficientBalance) error for a payer
+    /// holding `available` of the `required` MACH on `chain_id`, with the link
+    /// to buy the shortfall. `None` when nothing is short or the chain sells
+    /// no MACH.
+    pub(crate) fn machine_token_shortfall(
+        chain_id: u64,
+        payer: alloy::primitives::Address,
+        available: alloy::primitives::U256,
+        required: alloy::primitives::U256,
+    ) -> Option<Self> {
+        use crate::protocol::methods::tempo::machine_token;
+
+        if available >= required {
+            return None;
+        }
+        let saturate =
+            |amount: alloy::primitives::U256| u128::try_from(amount).unwrap_or(u128::MAX);
+        let (available, required) = (saturate(available), saturate(required));
+        let funding_url =
+            machine_token::funding_url(chain_id, Some(payer), Some(required - available))?;
+        Some(Self::InsufficientBalance {
+            token: "MACH".to_owned(),
+            available: machine_token::format_amount(available),
+            required: machine_token::format_amount(required),
+            funding_url: Some(funding_url),
+        })
+    }
+
     /// Classify a transport error by first trying ABI-decoded revert data,
     /// then falling back to string-based classification.
     pub fn from_transport_error(e: &TransportError) -> Option<Self> {
@@ -68,6 +170,7 @@ impl TempoClientError {
                     token: err.token.to_string(),
                     available: err.available.to_string(),
                     required: err.required.to_string(),
+                    funding_url: None,
                 });
             }
             if payload
@@ -114,6 +217,7 @@ impl TempoClientError {
                 token: extract_field(&msg, "token").unwrap_or_default(),
                 available: extract_field(&msg, "available").unwrap_or_default(),
                 required: extract_field(&msg, "required").unwrap_or(msg),
+                funding_url: None,
             });
         }
 
@@ -154,11 +258,175 @@ mod tests {
             token: "pathUSD".to_string(),
             available: "0.50".to_string(),
             required: "1.00".to_string(),
+            funding_url: None,
         };
         assert_eq!(
             err.to_string(),
             "Insufficient pathUSD balance: have 0.50, need 1.00"
         );
+        assert_eq!(err.funding_url(), None);
+    }
+
+    fn mach_balance_provider(
+        balance: u64,
+    ) -> impl alloy::providers::Provider<tempo_alloy::TempoNetwork> {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+        use alloy::sol_types::SolCall;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            ITIP20::balanceOfCall::abi_encode_returns(&alloy::primitives::U256::from(balance)),
+        ));
+        ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter)
+    }
+
+    #[tokio::test]
+    async fn test_with_machine_token_funding_reports_the_mach_shortfall() {
+        use crate::error::MppError;
+        use crate::protocol::methods::tempo::{machine_token::MACH_FUNDING_URL, CHAIN_ID};
+        use alloy::primitives::{Address, U256};
+
+        let payer = Address::repeat_byte(0x11);
+        let usdc = Address::repeat_byte(0x33);
+        let original = MppError::from(TempoClientError::InsufficientBalance {
+            token: usdc.to_string(),
+            available: "0".into(),
+            required: "1000000".into(),
+            funding_url: None,
+        });
+        let error = with_machine_token_funding(
+            original,
+            &mach_balance_provider(400_000),
+            CHAIN_ID,
+            payer,
+            usdc,
+            U256::from(1_000_000),
+        )
+        .await;
+        let url = format!("{MACH_FUNDING_URL}&address={payer}&amount=0.60");
+        assert_eq!(error.funding_url(), Some(url.as_str()));
+        assert!(
+            error.to_string().contains("have 0.40, need 1.00"),
+            "{error}"
+        );
+
+        // Autoswap's "no route" failure names no token.
+        let error = with_machine_token_funding(
+            MppError::InsufficientBalance(Some("no route".into())),
+            &mach_balance_provider(0),
+            CHAIN_ID,
+            payer,
+            usdc,
+            U256::from(1_000_000),
+        )
+        .await;
+        assert!(error.funding_url().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_with_machine_token_funding_keeps_unrelated_failures() {
+        use crate::error::MppError;
+        use crate::protocol::methods::tempo::{CHAIN_ID, MODERATO_CHAIN_ID};
+        use alloy::primitives::{Address, U256};
+
+        let payer = Address::repeat_byte(0x11);
+        let usdc = Address::repeat_byte(0x33);
+        let gas = |token: Address| {
+            MppError::from(TempoClientError::InsufficientBalance {
+                token: token.to_string(),
+                available: "0".into(),
+                required: "1".into(),
+                funding_url: None,
+            })
+        };
+        let required = U256::from(1_000_000);
+
+        // The gas token is short, not the payment.
+        let other = Address::repeat_byte(0x44);
+        let error = with_machine_token_funding(
+            gas(other),
+            &mach_balance_provider(0),
+            CHAIN_ID,
+            payer,
+            usdc,
+            required,
+        )
+        .await;
+        assert!(error.funding_url().is_none());
+        // The payer already holds the MACH.
+        let error = with_machine_token_funding(
+            gas(usdc),
+            &mach_balance_provider(1_000_000),
+            CHAIN_ID,
+            payer,
+            usdc,
+            required,
+        )
+        .await;
+        assert!(error.funding_url().is_none());
+        // MACH is not sold on testnet.
+        let error = with_machine_token_funding(
+            gas(usdc),
+            &mach_balance_provider(0),
+            MODERATO_CHAIN_ID,
+            payer,
+            usdc,
+            required,
+        )
+        .await;
+        assert!(error.funding_url().is_none());
+        // Not a balance failure.
+        let error = with_machine_token_funding(
+            MppError::Http("boom".into()),
+            &mach_balance_provider(0),
+            CHAIN_ID,
+            payer,
+            usdc,
+            required,
+        )
+        .await;
+        assert!(matches!(error, MppError::Http(_)));
+    }
+
+    #[test]
+    fn test_machine_token_shortfall_links_the_funding_page() {
+        use crate::protocol::methods::tempo::{machine_token::MACH_FUNDING_URL, CHAIN_ID};
+        use alloy::primitives::{Address, U256};
+
+        let payer = Address::repeat_byte(0x11);
+        let err = TempoClientError::machine_token_shortfall(
+            CHAIN_ID,
+            payer,
+            U256::from(250_000),
+            U256::from(1_000_000),
+        )
+        .unwrap();
+        let url = format!("{MACH_FUNDING_URL}&address={payer}&amount=0.75");
+        assert_eq!(err.funding_url(), Some(url.as_str()));
+        assert_eq!(
+            err.to_string(),
+            format!("Insufficient MACH balance: have 0.25, need 1.00. Buy MACH at {url}")
+        );
+        assert_eq!(
+            crate::error::MppError::from(err).funding_url(),
+            Some(url.as_str())
+        );
+
+        assert!(TempoClientError::machine_token_shortfall(
+            CHAIN_ID,
+            payer,
+            U256::from(1_000_000),
+            U256::from(1_000_000)
+        )
+        .is_none());
+        assert!(TempoClientError::machine_token_shortfall(
+            crate::protocol::methods::tempo::MODERATO_CHAIN_ID,
+            payer,
+            U256::ZERO,
+            U256::from(1_000_000)
+        )
+        .is_none());
     }
 
     #[test]
@@ -250,6 +518,7 @@ mod tests {
                 token,
                 available,
                 required,
+                ..
             } => {
                 assert_eq!(available, "0");
                 assert_eq!(required, "64467");
@@ -286,6 +555,7 @@ mod tests {
                 token,
                 available,
                 required,
+                ..
             } => {
                 assert!(token.is_empty());
                 assert!(available.is_empty());

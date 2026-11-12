@@ -580,8 +580,8 @@ async fn test_non_expired_challenge_accepted() {
 async fn test_malformed_expires_rejected() {
     let mpp = create_hmac_test_mpp();
 
-    // Manually create a credential with a malformed expires that has a valid HMAC
-    let challenge = mpp
+    // Issuing a Challenge with an unreadable expires fails...
+    assert!(mpp
         .charge_with_options(
             "0.10",
             crate::server::ChargeOptions {
@@ -589,9 +589,22 @@ async fn test_malformed_expires_rejected() {
                 ..Default::default()
             },
         )
-        .unwrap()
-        .remove(0);
-    let echo = challenge.to_echo();
+        .is_err());
+
+    // ...so build one by hand, with a valid HMAC over the malformed expires.
+    let challenge = mpp.charge("0.10").unwrap().remove(0);
+    let mut echo = challenge.to_echo();
+    echo.expires = Some("not-a-timestamp".into());
+    echo.id = crate::protocol::core::compute_challenge_id(
+        TEST_SECRET,
+        "MPP Payment",
+        "tempo",
+        "charge",
+        echo.request.raw(),
+        echo.expires.as_deref(),
+        echo.digest.as_deref(),
+        echo.opaque.as_ref().map(|o| o.raw()),
+    );
     let credential = PaymentCredential::new(echo, PaymentPayload::hash("0xdeadbeef"));
 
     let result = mpp.verify_credential(&credential).await;

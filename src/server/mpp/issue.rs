@@ -330,6 +330,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
         let encoded_request = Base64UrlJson::from_typed(&request)?;
 
         let expires = if let Some(exp) = options.expires {
+            crate::expires::ensure_verifiable(exp)?;
             exp.to_string()
         } else {
             let expiry_time = OffsetDateTime::now_utc() + Duration::minutes(5);

@@ -18,7 +18,8 @@
 //! use mpp::store::MemoryStore;
 //!
 //! let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
-//! // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+//! // The default in-memory store makes credentials single-use within this
+//! // instance and its clones; pass a shared store when several instances serve.
 //! let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 //!
 //! // In your server handler:
@@ -129,7 +130,8 @@ fn ensure_submission_mode_allowed(
 /// use mpp::store::MemoryStore;
 ///
 /// let provider = tempo_provider("https://rpc.moderato.tempo.xyz");
-/// // The store makes credentials single-use; `TempoChargeMethod::new` has none.
+/// // The default in-memory store makes credentials single-use within this
+/// // instance and its clones; pass a shared store when several instances serve.
 /// let method = TempoChargeMethod::new(provider).with_store(Arc::new(MemoryStore::new()));
 ///
 /// // Verify a payment
@@ -145,6 +147,9 @@ pub struct ChargeMethod<P> {
     store: Option<Arc<dyn Store>>,
     authenticated_expiry: bool,
     proof_store: Option<Arc<dyn Store>>,
+    /// Proof store for HMAC-authenticated verification when [`Self::proof_store`]
+    /// is unset. Its reservations expire with their Challenge, so it stays bounded.
+    authenticated_proof_store: Option<Arc<dyn Store>>,
     cached_chain_id: Arc<OnceCell<u64>>,
     fee_payer_policy_override: Option<FeePayerPolicyOverride>,
     validate_sender: Option<Arc<ValidateSenderCallback>>,
@@ -163,17 +168,28 @@ where
     /// The provider must be configured for `TempoNetwork`. Use
     /// [`tempo_provider`](crate::server::tempo_provider) to create one.
     ///
-    /// No replay store is configured. Until [`with_store`](Self::with_store) is
-    /// called, a hash or proof credential is accepted again for as long as its
-    /// challenge is valid. [`Mpp::create`](crate::server::Mpp::create) configures
-    /// an in-memory store by default.
+    /// Hash replay protection is on by default: the method gets an in-memory
+    /// [`MemoryStore`](crate::store::MemoryStore), as
+    /// [`Mpp::create`](crate::server::Mpp::create) does, so a hash
+    /// credential is accepted once. That store is shared only by clones of this
+    /// method instance: a deployment with several instances or processes must
+    /// pass a shared store with [`with_store`](Self::with_store).
+    ///
+    /// Zero-amount proof credentials verified through [`Mpp`](crate::server::Mpp)
+    /// are single-use by default too, in a separate in-memory store whose
+    /// reservations expire with their Challenge. Proofs verified directly with
+    /// [`ChargeMethod::verify`](ChargeMethodTrait::verify) need
+    /// [`with_store`](Self::with_store) to be single-use: their reservations
+    /// never expire and are keyed by the client's Challenge ID, so a default store
+    /// would grow with every proof.
     pub fn new(provider: P) -> Self {
         Self {
             provider: Arc::new(provider),
             fee_payer_signer: None,
-            store: None,
+            store: Some(Arc::new(crate::store::MemoryStore::new())),
             authenticated_expiry: false,
             proof_store: None,
+            authenticated_proof_store: Some(Arc::new(crate::store::MemoryStore::new())),
             cached_chain_id: Arc::new(OnceCell::new()),
             fee_payer_policy_override: None,
             validate_sender: None,
@@ -239,11 +255,13 @@ where
         self
     }
 
-    /// Configure a store for replay deduplication.
+    /// Configure a store for replay deduplication, replacing the default
+    /// in-memory store.
     ///
-    /// When set, each verified transaction hash is recorded and subsequent
-    /// attempts to replay the same hash are rejected. Zero-amount proof
-    /// challenges are likewise made single-use per challenge id.
+    /// Each verified transaction hash is recorded and subsequent attempts to
+    /// replay the same hash are rejected. Zero-amount proof challenges are
+    /// likewise made single-use per challenge id. Pass a shared backend (Redis,
+    /// SQL, etc.) when several instances verify credentials for the same realm.
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
@@ -253,6 +271,18 @@ where
     pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
         self.proof_store = Some(Arc::clone(&store));
         self.store = Some(store);
+        self
+    }
+
+    /// Remove the replay store, the default in-memory one included.
+    ///
+    /// Without a store, a hash or proof credential is accepted again for as
+    /// long as its challenge is valid. Use only when something else rejects
+    /// replays.
+    pub fn without_store(mut self) -> Self {
+        self.proof_store = None;
+        self.authenticated_proof_store = None;
+        self.store = None;
         self
     }
 
@@ -378,7 +408,7 @@ where
                     expected_chain_id,
                 )
                 .await?;
-            if let Some(store) = &self.proof_store {
+            if let Some(store) = self.active_proof_store() {
                 if store
                     .get(&Self::proof_replay_key(credential))
                     .await

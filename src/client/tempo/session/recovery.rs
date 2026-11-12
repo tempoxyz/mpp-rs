@@ -137,21 +137,10 @@ pub fn recover_stored_channel(
     Ok(entry)
 }
 
-/// Hydrate a fresh client store from a server snapshot plus on-chain state.
-pub fn hydrate_session_snapshot(
-    snapshot: &SessionSnapshot,
-    scope: RecoveryScope,
-    state: OnChainChannelState,
-) -> Result<StoredChannelEntry, MppError> {
+/// Validate the signed spending bound before using any snapshot accounting hints.
+pub(crate) fn validate_snapshot_voucher(snapshot: &SessionSnapshot) -> Result<u128, MppError> {
     let channel_id = parse_b256("snapshot channelId", &snapshot.channel_id)?;
     let escrow = parse_address("snapshot escrow", &snapshot.escrow)?;
-    if snapshot.chain_id != scope.chain_id || escrow != scope.escrow {
-        return Err(invalid(
-            "snapshot chain or escrow does not match the challenge",
-        ));
-    }
-    validate_descriptor(&snapshot.descriptor, channel_id, scope)?;
-
     let signed = snapshot
         .highest_voucher
         .as_ref()
@@ -168,7 +157,7 @@ pub fn hydrate_session_snapshot(
         "snapshot voucher cumulativeAmount",
         &signed.cumulative_amount,
     )?;
-    let required = parse_amount("snapshot requiredCumulative", &snapshot.required_cumulative)?;
+    parse_amount("snapshot requiredCumulative", &snapshot.required_cumulative)?;
     let snapshot_deposit = parse_amount("snapshot deposit", &snapshot.deposit)?;
     let snapshot_settled = parse_amount("snapshot settled", &snapshot.settled)?;
     let spent = parse_amount("snapshot spent", &snapshot.spent)?;
@@ -180,10 +169,6 @@ pub fn hydrate_session_snapshot(
     if spent > accepted || snapshot_settled > snapshot_deposit {
         return Err(invalid("snapshot amounts are inconsistent"));
     }
-    if state.deposit == 0 || state.close_requested_at != 0 {
-        return Err(invalid("snapshot channel is absent or closing on-chain"));
-    }
-
     let signature = alloy::hex::decode(signed.signature.trim_start_matches("0x"))
         .map_err(|e| invalid(format!("invalid snapshot voucher signature: {e}")))?;
     let authority = descriptor_authority(&snapshot.descriptor)?;
@@ -198,7 +183,31 @@ pub fn hydrate_session_snapshot(
         return Err(invalid("snapshot highest voucher signature is invalid"));
     }
 
-    let cumulative_amount = accepted.max(required).max(state.settled);
+    Ok(accepted)
+}
+
+/// Hydrate a fresh client store from a server snapshot plus on-chain state.
+pub fn hydrate_session_snapshot(
+    snapshot: &SessionSnapshot,
+    scope: RecoveryScope,
+    state: OnChainChannelState,
+) -> Result<StoredChannelEntry, MppError> {
+    let channel_id = parse_b256("snapshot channelId", &snapshot.channel_id)?;
+    let escrow = parse_address("snapshot escrow", &snapshot.escrow)?;
+    if snapshot.chain_id != scope.chain_id || escrow != scope.escrow {
+        return Err(invalid(
+            "snapshot chain or escrow does not match the challenge",
+        ));
+    }
+    validate_descriptor(&snapshot.descriptor, channel_id, scope)?;
+
+    let accepted = validate_snapshot_voucher(snapshot)?;
+    if state.deposit == 0 || state.close_requested_at != 0 {
+        return Err(invalid("snapshot channel is absent or closing on-chain"));
+    }
+
+    // requiredCumulative is an unsigned server hint, not payer authorization.
+    let cumulative_amount = accepted.max(state.settled);
     if cumulative_amount > state.deposit {
         return Err(invalid(
             "recovered cumulative amount exceeds the on-chain channel deposit",
@@ -524,7 +533,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(entry.cumulative_amount, 250);
+        assert_eq!(entry.cumulative_amount, 200);
     }
 
     #[tokio::test]

@@ -826,24 +826,36 @@ impl PaymentProvider for TempoAccountsProvider {
             self.client_id.as_deref(),
         )?;
         let rpc_provider = self.settlement_provider(charge.chain_id())?;
-        let (charge, funding, fee_token) =
-            super::provider::fund(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
-        self.funding
-            .lock()
-            .map_err(|_| MppError::InvalidConfig("Tempo funding state is unavailable".to_owned()))?
-            .insert(challenge.id.clone(), funding);
-
-        let signed = charge
-            .sign_with_accounts_provider_options(
-                &self.wallet,
-                &rpc_provider,
-                from,
-                SignOptions {
-                    fee_token,
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let machine_token = super::provider::machine_token_payment(&charge);
+        let signed = async {
+            let (charge, funding, fee_token) =
+                super::provider::fund(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
+            self.funding
+                .lock()
+                .map_err(|_| {
+                    MppError::InvalidConfig("Tempo funding state is unavailable".to_owned())
+                })?
+                .insert(challenge.id.clone(), funding);
+            charge
+                .sign_with_accounts_provider_options(
+                    &self.wallet,
+                    &rpc_provider,
+                    from,
+                    SignOptions {
+                        fee_token,
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+        .await;
+        let signed = match (signed, machine_token) {
+            (Ok(signed), _) => signed,
+            (Err(error), Some(payment)) => {
+                return Err(payment.explain(error, &rpc_provider, from).await)
+            }
+            (Err(error), None) => return Err(error),
+        };
         let reservation = signed.authorization_reservation();
         let credential = signed.into_credential();
         if let Some(reservation) = reservation {
