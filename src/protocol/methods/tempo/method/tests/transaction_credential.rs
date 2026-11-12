@@ -490,7 +490,7 @@ async fn test_failed_broadcast_releases_submission_claim() {
     let asserter = Asserter::new();
     for _ in 0..2 {
         asserter.push_success(&serde_json::Value::Null);
-        asserter.push_failure(node_refusal("node unavailable"));
+        asserter.push_failure(node_refusal("insufficient funds for gas * price + value"));
         asserter.push_success(&serde_json::Value::Null);
     }
     let provider =
@@ -1503,4 +1503,256 @@ fn test_broadcast_record_ttl_is_bounded() {
         (Duration::from_secs(175)..=Duration::from_secs(181)).contains(&bounded),
         "{bounded:?}"
     );
+}
+
+/// Only errors that name a validation failure prove the node never admitted
+/// the transaction; anything else leaves the outcome open.
+#[test]
+fn test_broadcast_refused_only_for_definite_validation_errors() {
+    let refused = |code: i64, message: &'static str| {
+        super::super::transaction_credential::broadcast_refused(
+            &alloy::transports::TransportError::ErrorResp(alloy_json_rpc::ErrorPayload {
+                code,
+                message: message.into(),
+                data: None,
+            }),
+        )
+    };
+    for message in [
+        "already known",
+        "insufficient funds for gas * price + value",
+        "invalid signature",
+        "intrinsic gas too low",
+        "transaction underpriced",
+        "max fee per gas less than block base fee",
+        "valid_before has passed",
+    ] {
+        assert!(refused(-32000, message), "{message}");
+    }
+    assert!(refused(-32602, "invalid params"));
+    for (code, message) in [
+        (-32000, "nonce too low"),
+        (-32000, "nonce already used"),
+        (-32000, "node unavailable"),
+        (-32000, "upstream request failed"),
+        (-32000, "request timed out"),
+        (4, "transaction was not included in time"),
+        (-32603, "insufficient funds"),
+    ] {
+        assert!(!refused(code, message), "{code} {message}");
+    }
+    assert!(!super::super::transaction_credential::broadcast_refused(
+        &alloy::transports::TransportErrorKind::custom_str("connection reset")
+    ));
+}
+
+/// Store whose deletes of broadcast records fail.
+struct UndeletableBroadcastRecords(crate::store::MemoryStore);
+
+impl crate::store::Store for UndeletableBroadcastRecords {
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<serde_json::Value>, crate::store::StoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        self.0.get(key)
+    }
+
+    fn put(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::store::StoreError>> + Send + '_>,
+    > {
+        self.0.put(key, value)
+    }
+
+    fn delete(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::store::StoreError>> + Send + '_>,
+    > {
+        if key.starts_with(crate::store::TEMPO_BROADCAST_PENDING_PREFIX) {
+            return Box::pin(async {
+                Err(crate::store::StoreError::Internal("unavailable".into()))
+            });
+        }
+        self.0.delete(key)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, crate::store::StoreError>> + Send + '_>,
+    > {
+        self.0.put_if_absent(key, value)
+    }
+
+    fn put_if_absent_with_ttl(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        ttl: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<bool, crate::store::StoreError>> + Send + '_>,
+    > {
+        self.0.put_if_absent_with_ttl(key, value, ttl)
+    }
+}
+
+/// A refused broadcast whose record cannot be removed fails without
+/// recovering a receipt: the surviving record would otherwise exempt this
+/// attempt's settlement, and a retry, from the inclusion check.
+#[tokio::test]
+async fn test_refused_broadcast_fails_when_its_record_cannot_be_removed() {
+    use crate::store::Store;
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let amount = U256::from(100u64);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+
+    // Not on chain before the send, then refused. No receipt lookup follows.
+    let asserter = Asserter::new();
+    asserter.push_success(&serde_json::Value::Null);
+    asserter.push_failure(node_refusal("insufficient funds"));
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(asserter.clone());
+    let store = Arc::new(UndeletableBroadcastRecords(crate::store::MemoryStore::new()));
+    let method = ChargeMethod::new(provider).with_store(store.clone());
+
+    let error = method
+        .broadcast_transaction(
+            &alloy::hex::encode_prefixed(&tx_bytes),
+            &request,
+            None,
+            CHAIN_ID,
+            "challenge-123",
+            "api.example.com",
+            None,
+        )
+        .await
+        .expect_err("a refused broadcast with a surviving record must fail");
+    assert_eq!(
+        error.code,
+        Some(crate::protocol::traits::ErrorCode::Internal),
+        "{error}"
+    );
+    assert!(asserter.read_q().is_empty(), "no receipt was looked up");
+    assert!(store
+        .get(&format!("mpp:charge:submission:{tx_hash:#x}"))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A broadcast that fails with an error the node does not explain, such as
+/// a nonce error the transaction itself may have caused, keeps its record:
+/// once the transaction lands, a retry settles it instead of rejecting it
+/// as already on chain.
+#[tokio::test]
+async fn test_unexplained_broadcast_error_keeps_record_for_retry() {
+    use crate::store::Store;
+    use alloy::providers::mock::Asserter;
+
+    let currency = Address::repeat_byte(0x20);
+    let recipient = Address::repeat_byte(0x33);
+    let sender = Address::repeat_byte(0x44);
+    let amount = U256::from(100u64);
+    let memo = attribution::encode("challenge-123", "api.example.com", None);
+    let tx_bytes = encode_signed_tx(
+        vec![challenge_bound_transfer_call(currency, recipient, amount)],
+        MAX_FEE_PAYER_GAS_LIMIT,
+    );
+    let tx_hash = keccak256(&tx_bytes);
+    let request = challenge_bound_request(currency, recipient, amount);
+    let mut log = make_transfer_with_memo_log(currency, sender, recipient, amount, memo);
+    log["blockHash"] = serde_json::json!(B256::repeat_byte(0xdd));
+    log["blockNumber"] = serde_json::json!("0x1");
+    log["transactionHash"] = serde_json::json!(tx_hash);
+    log["transactionIndex"] = serde_json::json!("0x0");
+    log["logIndex"] = serde_json::json!("0x0");
+    log["removed"] = serde_json::json!(false);
+    let receipt = serde_json::json!({
+        "transactionHash": tx_hash,
+        "transactionIndex": "0x0",
+        "blockHash": B256::repeat_byte(0xdd),
+        "blockNumber": "0x1",
+        "from": sender,
+        "to": currency,
+        "cumulativeGasUsed": "0x5208",
+        "gasUsed": "0x5208",
+        "effectiveGasPrice": "0x1",
+        "contractAddress": null,
+        "logs": [log],
+        "logsBloom": alloy::primitives::Bloom::ZERO,
+        "status": "0x1",
+        "type": "0x76",
+        "feePayer": sender,
+    });
+
+    for message in ["nonce too low", "upstream request failed"] {
+        let asserter = Asserter::new();
+        // First attempt: not on chain yet, the node answers with an error that
+        // does not say it refused the transaction, and nothing is found.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_failure(node_refusal(message));
+        asserter.push_success(&serde_json::Value::Null);
+        // Retry, after the transaction landed: no inclusion check, the
+        // duplicate is refused and the receipt recovered.
+        asserter.push_failure(node_refusal("already known"));
+        asserter.push_success(&receipt);
+        let provider =
+            alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+                .connect_mocked_client(asserter.clone());
+        let store = Arc::new(crate::store::MemoryStore::new());
+        let method = ChargeMethod::new(provider).with_store(store.clone());
+        let signed_tx = alloy::hex::encode_prefixed(&tx_bytes);
+        let broadcast = || {
+            method.broadcast_transaction(
+                &signed_tx,
+                &request,
+                None,
+                CHAIN_ID,
+                "challenge-123",
+                "api.example.com",
+                None,
+            )
+        };
+
+        let error = broadcast().await.expect_err("the first attempt fails");
+        assert_eq!(
+            error.code,
+            Some(crate::protocol::traits::ErrorCode::NetworkError),
+            "{message}: {error}"
+        );
+        let broadcast_key = format!("mpp:charge:broadcast-pending:{tx_hash:#x}");
+        assert!(
+            store.get(&broadcast_key).await.unwrap().is_some(),
+            "{message}"
+        );
+
+        let hash = broadcast()
+            .await
+            .expect("the retry settles this server's own transaction");
+        assert_eq!(hash, tx_hash, "{message}");
+        assert!(asserter.read_q().is_empty(), "{message}");
+    }
 }

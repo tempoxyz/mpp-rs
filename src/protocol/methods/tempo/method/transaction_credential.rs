@@ -528,6 +528,8 @@ where
         let mut created_broadcast_record = false;
         let mut wrote_hosted_record = false;
         let mut sent = false;
+        // A refused attempt's broadcast record whose removal failed.
+        let mut uncleared_refused_record: Option<String> = None;
         let result: Result<B256, VerificationError> = async {
             // Simulation and the dedup claim took round trips since co-signing:
             // right before broadcasting, make sure the sponsored transaction
@@ -657,7 +659,17 @@ where
                     let refused = broadcast_refused(&broadcast_error);
                     if !broadcast_before && refused {
                         if let (Some(store), Some(key)) = (&self.store, broadcast_record.take()) {
-                            let _ = store.delete(&key).await;
+                            // A record that survives would let a retry skip
+                            // the inclusion check and the bound-memo
+                            // requirement for a transaction this server
+                            // never broadcast: fail instead of settling, and
+                            // try once more to remove it below.
+                            if store.delete(&key).await.is_err() {
+                                uncleared_refused_record = Some(key);
+                                return Err(VerificationError::internal(
+                                    "Failed to clear broadcast record after the node refused the transaction",
+                                ));
+                            }
                         }
                     }
                     // The node may have included the transaction before its
@@ -764,6 +776,7 @@ where
                     submission_key.clone(),
                     unsent(wrote_hosted_record, &hosted_record),
                     unsent(created_broadcast_record, &broadcast_record),
+                    uncleared_refused_record,
                 ];
                 for key in keys.into_iter().flatten() {
                     let _ = store.delete(&key).await;
@@ -780,18 +793,58 @@ where
 }
 
 /// Whether a failed `eth_sendRawTransactionSync` is the node's definite
-/// rejection of the transaction (a JSON-RPC error that is not a timeout),
-/// rather than a transport failure or timeout after which it may still land.
-fn broadcast_refused(error: &alloy::transports::TransportError) -> bool {
+/// refusal of the transaction, so it never admitted this submission, rather
+/// than a failure after which it may still land.
+///
+/// Only a JSON-RPC error that names a validation failure counts: malformed
+/// requests, insufficient funds or balance, a bad signature, too little gas,
+/// a fee below what the node takes, an expired or out-of-range
+/// `valid_before`, or "already known" (the node already held the
+/// transaction from another submission). Nonce errors, timeouts (EIP-7966
+/// code 4), internal errors (-32603), transport failures and any error the
+/// node does not explain leave the outcome open, so the broadcast record is
+/// kept for a retry to settle from.
+pub(super) fn broadcast_refused(error: &alloy::transports::TransportError) -> bool {
+    /// Message fragments of node validation errors that reject a
+    /// transaction before it enters the pool.
+    const REFUSALS: &[&str] = &[
+        "already known",
+        "insufficient funds",
+        "insufficient balance",
+        "invalid signature",
+        "signature is invalid",
+        "intrinsic gas",
+        "gas limit too low",
+        "exceeds block gas limit",
+        "fee too low",
+        "underpriced",
+        "max fee per gas less than",
+        "fee cap",
+        "valid_before",
+        "validbefore",
+        "valid_after",
+        "validafter",
+        "transaction expired",
+        "transaction type not supported",
+        "invalid chain id",
+        "chain id mismatch",
+    ];
     error.as_error_resp().is_some_and(|response| {
-        // EIP-7966 answers a transaction that was not included in time with
-        // code 4; an internal error (-32603) or a proxy's own timeout says
-        // nothing about whether the node admitted it.
         let message = response.message.to_ascii_lowercase();
-        response.code != 4
-            && response.code != -32603
-            && !message.contains("timeout")
-            && !message.contains("timed out")
+        // A nonce that is already used may have been used by this very
+        // submission; timeouts say nothing about admission.
+        if response.code == 4
+            || response.code == -32603
+            || message.contains("nonce")
+            || message.contains("timeout")
+            || message.contains("timed out")
+        {
+            return false;
+        }
+        // Parse error, invalid request and invalid params: the request was
+        // rejected before the transaction was looked at.
+        matches!(response.code, -32700 | -32600 | -32602)
+            || REFUSALS.iter().any(|refusal| message.contains(refusal))
     })
 }
 
