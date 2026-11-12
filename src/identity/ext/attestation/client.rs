@@ -515,12 +515,16 @@ impl AttestationProver {
         Decision::Acquire { rejected: None }
     }
 
-    /// A cached attestation for `key` that has not expired beyond the clock
-    /// tolerance and that the rejected request did not send.
+    /// A cached attestation for `key` that the rejected request did not send
+    /// and that outlives a payment: it expires more than the clock tolerance
+    /// from now, so the paid retry still carries it and the server still
+    /// accepts it. One closer to expiry could pass the unpaid resend and then
+    /// fail the paid retry after the payment was pushed.
     fn fallback(&self, key: &Key, sent: &[String]) -> Option<String> {
         let state = self.state();
         let entry = state.slots.get(key)?;
-        (entry.usable(now(), true) && !sent.contains(&entry.token)).then(|| entry.token.clone())
+        let lasts = entry.exp > now().saturating_add(CLOCK_TOLERANCE);
+        (lasts && !sent.contains(&entry.token)).then(|| entry.token.clone())
     }
 
     /// Acquires an attestation for `key`, or joins an acquisition another
@@ -863,6 +867,24 @@ mod tests {
         sent.insert(HEADER, near.parse().unwrap());
         let value = prover
             .retry_value(&url, &sent, &rejection(url.as_str()))
+            .await
+            .unwrap();
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn never_falls_back_to_an_attestation_that_could_expire_before_paying() {
+        // Expires in 30 s: within the clock tolerance, so it could lapse
+        // between the unpaid resend and the paid retry.
+        let lapsing = token(30, |c| c["iat"] = (now() - 1_000).into());
+        let prover = AttestationProver::new([AUDIENCE], [ISSUER])
+            .unwrap()
+            .with_acquire(|_| async { Ok(None) })
+            .with_attestations([&lapsing])
+            .unwrap();
+        let url: Url = "https://api.example/".parse().unwrap();
+        let value = prover
+            .retry_value(&url, &HeaderMap::new(), &rejection(url.as_str()))
             .await
             .unwrap();
         assert!(value.is_none());
