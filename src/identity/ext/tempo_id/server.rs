@@ -393,6 +393,14 @@ impl Core {
             return invalid("The access token scheme does not match its binding.");
         }
         if dpop {
+            // A server with no origin to check `htu` against is misconfigured:
+            // answer 503, a server error, rather than blame the client's token.
+            if self.htu(request).is_none() {
+                return Rejection::unavailable(
+                    "This API needs a configured origin to accept DPoP-bound tokens.",
+                )
+                .into();
+            }
             let jkt = jkt.and_then(Value::as_str).unwrap_or_default();
             if let Err(reason) = self.check_proof(request, jkt, now, token).await {
                 return invalid(reason);
@@ -545,9 +553,6 @@ impl Core {
         }
 
         let claims = &proof.claims;
-        if self.htu(request).is_none() {
-            return Err("This API needs a configured origin to accept DPoP-bound tokens.");
-        }
         if str_claim(claims, "htm") != Some(request.method().as_str())
             || str_claim(claims, "htu") != self.htu(request).as_deref()
         {

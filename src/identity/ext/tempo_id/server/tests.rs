@@ -499,11 +499,11 @@ mod dpop {
     use crate::identity::ext::tempo_id::client::proof;
     use crate::identity::ext::tempo_id::DpopKey;
 
-    fn dpop_key() -> DpopKey {
+    pub(super) fn dpop_key() -> DpopKey {
         DpopKey::new(p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap())
     }
 
-    fn bound_token(issuer: &Issuer, key: &DpopKey) -> String {
+    pub(super) fn bound_token(issuer: &Issuer, key: &DpopKey) -> String {
         let mut claims = access_claims(issuer);
         claims["cnf"] = json!({ "jkt": key.thumbprint() });
         access_token(&claims)
@@ -513,7 +513,12 @@ mod dpop {
         request(&[("authorization", format!("DPoP {token}")), ("dpop", proof)])
     }
 
-    fn proof_for(key: &DpopKey, token: &str, method: reqwest::Method, url: &str) -> String {
+    pub(super) fn proof_for(
+        key: &DpopKey,
+        token: &str,
+        method: reqwest::Method,
+        url: &str,
+    ) -> String {
         proof(
             key,
             token,
@@ -705,6 +710,23 @@ mod dpop {
             .unwrap()
             .starts_with("Payment "));
     }
+}
+
+#[cfg(feature = "client")]
+#[tokio::test]
+async fn dpop_without_an_origin_is_a_server_error() {
+    let issuer = issuer().await;
+    let tempo_id = server_for(&issuer);
+    let key = dpop::dpop_key();
+    let token = dpop::bound_token(&issuer, &key);
+    let proof = dpop::proof_for(&key, &token, reqwest::Method::GET, URL);
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", format!("DPoP {token}").parse().unwrap());
+    headers.insert("dpop", proof.parse().unwrap());
+    headers.insert("host", "api.example".parse().unwrap());
+    let request = IdentityRequest::new(Method::GET, "/haiku".parse().unwrap(), headers);
+    let rejection = rejected(tempo_id.verifier.verify(&request).await);
+    assert_eq!(rejection.status, RejectionStatus::Unavailable);
 }
 
 #[test]

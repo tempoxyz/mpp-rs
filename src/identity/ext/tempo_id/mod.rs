@@ -27,6 +27,7 @@
 //!
 //! let tempo_id = server::create(
 //!     Config::new("app_123")
+//!         .origin("https://api.example")
 //!         .store(Arc::new(MemoryStore::new()))
 //!         .allow(|user| user.email_verified == Some(true)),
 //! );
