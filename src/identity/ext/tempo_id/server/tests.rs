@@ -321,6 +321,36 @@ async fn unreachable_keys_are_unavailable() {
 }
 
 #[tokio::test]
+async fn failed_key_fetch_cools_down_before_any_key_set_loads() {
+    // An issuer that answers every key-set request with a 500.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counter = fetches.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0u8; 2048];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        }
+    });
+    let tempo_id = create(Config::new(CLIENT_ID).issuer(&url));
+    let token = sign(
+        json!({ "alg": "RS256", "typ": "at+jwt", "kid": "key-1" }),
+        json!({ "iss": url, "sub": "user_1" }),
+    );
+    for _ in 0..3 {
+        let rejection = rejected(tempo_id.verifier.verify(&bearer(&token)).await);
+        assert_eq!(rejection.status, RejectionStatus::Unavailable);
+    }
+    // Within 30 seconds of the failed fetch, requests answer 503 without refetching.
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn keys_are_cached() {
     let issuer = issuer().await;
     let tempo_id = server_for(&issuer);

@@ -178,6 +178,38 @@ async fn request_verifier_rejects_before_any_402() {
 }
 
 #[tokio::test]
+async fn verifiers_see_the_uri_before_router_nesting() {
+    // Rejects with the path it saw, so the response shows it.
+    let path = from_fn(|request: &IdentityRequest| {
+        let path = request.uri().path().to_owned();
+        async move { Err::<Option<()>, _>(Rejection::forbidden(path)) }
+    });
+    let challenger: Arc<dyn ChargeChallenger> = Arc::new(CountingChallenger {
+        verified: Arc::default(),
+        header: "Authorization",
+    });
+    let (mut parts, ()) = http_types::Request::builder()
+        .uri("/paid")
+        .body(())
+        .unwrap()
+        .into_parts();
+    parts
+        .extensions
+        .insert(axum::extract::OriginalUri("/api/paid".parse().unwrap()));
+    parts.extensions.insert(RouteIdentity::new().verifier(path));
+    let result = MppCharge::<OneCent>::from_request_parts(&mut parts, &challenger).await;
+    let body = result
+        .unwrap_err()
+        .into_response()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&body[..], b"/api/paid");
+}
+
+#[tokio::test]
 async fn verified_identity_reaches_the_handler() {
     let key = api_key();
     let identity = RouteIdentity::new().verifier(&key);

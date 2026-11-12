@@ -1270,7 +1270,14 @@ fn route_identity(parts: &http_types::request::Parts) -> RouteIdentityInput {
         .extensions
         .get::<crate::identity::RouteIdentity>()?
         .clone();
-    let request = crate::identity::IdentityRequest::from_parts(parts);
+    // A nested router sees its path without the nesting prefix, but a proof
+    // names the URI the client requested.
+    let uri = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| parts.uri.clone(), |original| original.0.clone());
+    let request =
+        crate::identity::IdentityRequest::new(parts.method.clone(), uri, parts.headers.clone());
     Some((route, crate::identity::IdentityContext::new(request)))
 }
 

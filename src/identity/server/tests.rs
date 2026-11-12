@@ -392,6 +392,24 @@ async fn memoize_runs_once_per_request_and_key() {
 }
 
 #[tokio::test]
+async fn concurrent_memoize_shares_one_computation() {
+    let request = request(&[]);
+    let key = MemoKey::new();
+    let runs = AtomicUsize::new(0);
+    let compute = || async {
+        // Suspend mid-computation, so the other call starts before a value is stored.
+        tokio::task::yield_now().await;
+        runs.fetch_add(1, Ordering::SeqCst)
+    };
+    let (first, second) = tokio::join!(
+        request.memoize(&key, compute()),
+        request.memoize(&key, compute())
+    );
+    assert_eq!((first, second), (0, 0));
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn reads_authorization_propagates_through_any_of() {
     struct Bearer;
     impl Verifier for Bearer {

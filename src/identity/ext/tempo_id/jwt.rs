@@ -169,14 +169,15 @@ impl Keys {
     async fn fresh(&self, max_age: Duration) -> Result<HashMap<String, RsaKey>, KeysUnavailable> {
         // One lock across the fetch, so concurrent requests share one fetch.
         let mut state = self.state.lock().await;
-        if let Some(cached) = &state.cached {
-            if cached.at.elapsed() < max_age {
+        // Within 30 seconds of the last attempt, the last loaded set serves,
+        // and with none loaded the keys stay unavailable without another fetch.
+        let cooling = state.attempted.is_some_and(|at| at.elapsed() < REFETCH);
+        match &state.cached {
+            Some(cached) if cached.at.elapsed() < max_age || cooling => {
                 return Ok(cached.keys.clone());
             }
-            // Within 30 seconds of the last attempt, the last loaded set serves.
-            if state.attempted.is_some_and(|at| at.elapsed() < REFETCH) {
-                return Ok(cached.keys.clone());
-            }
+            None if cooling => return Err(KeysUnavailable),
+            _ => {}
         }
         state.attempted = Some(Instant::now());
         match self.load().await {

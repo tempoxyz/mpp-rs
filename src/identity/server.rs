@@ -1,12 +1,14 @@
 //! Server-side identity: verifiers, payment checks and the per-request
 //! state that runs them, as mppx's `Identity.Server`.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use tokio::sync::OnceCell;
 
 use http_types::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
@@ -15,6 +17,16 @@ use super::{BoxFuture, Rejection, RejectionStatus, Requirement, Verification};
 use crate::protocol::core::{ChallengeEcho, PaymentCredential};
 
 type AnyValue = Arc<dyn Any + Send + Sync>;
+
+/// A value computed at most once: concurrent callers share one computation
+/// instead of each running it before the first stores its result.
+type Shared<T> = Arc<OnceCell<T>>;
+
+/// The shared cell under `key`, inserted empty when there is none.
+fn cell<K: Eq + std::hash::Hash, T>(map: &Mutex<HashMap<K, Shared<T>>>, key: K) -> Shared<T> {
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key).or_default().clone()
+}
 
 fn next_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -33,7 +45,7 @@ pub struct IdentityRequest {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    memo: Mutex<HashMap<u64, AnyValue>>,
+    memo: Mutex<HashMap<(u64, TypeId), Shared<AnyValue>>>,
 }
 
 impl IdentityRequest {
@@ -76,27 +88,24 @@ impl IdentityRequest {
         self.headers.get(name).and_then(|value| value.to_str().ok())
     }
 
-    /// Runs `compute` once per request and key, returning its value to every
-    /// later call with the same key.
+    /// Runs `compute` once per request, key and value type, returning its
+    /// value to every later or concurrent call with the same key: a call made
+    /// while the first computation runs waits for it rather than computing
+    /// again, so a single-use proof is spent once.
     pub async fn memoize<T, F>(&self, key: &MemoKey, compute: F) -> T
     where
         T: Clone + Send + Sync + 'static,
         F: Future<Output = T>,
     {
-        if let Some(value) = self.memoized::<T>(key) {
-            return value;
-        }
-        let value = compute.await;
-        let mut memo = self.memo.lock().unwrap_or_else(|e| e.into_inner());
-        let stored = memo
-            .entry(key.0)
-            .or_insert_with(|| Arc::new(value.clone()) as AnyValue);
-        stored.downcast_ref::<T>().cloned().unwrap_or(value)
-    }
-
-    fn memoized<T: Clone + 'static>(&self, key: &MemoKey) -> Option<T> {
-        let memo = self.memo.lock().unwrap_or_else(|e| e.into_inner());
-        memo.get(&key.0)?.downcast_ref::<T>().cloned()
+        let shared = cell(&self.memo, (key.0, TypeId::of::<T>()));
+        let stored = shared
+            .get_or_init(|| async { Arc::new(compute.await) as AnyValue })
+            .await;
+        // The map is keyed by the value's type, so the downcast holds.
+        stored
+            .downcast_ref::<T>()
+            .cloned()
+            .expect("memo entries are keyed by their type")
     }
 }
 
@@ -599,8 +608,8 @@ pub struct IdentityContext {
 
 struct ContextInner {
     request: IdentityRequest,
-    verifications: Mutex<HashMap<u64, Verification<AnyValue>>>,
-    checks: Mutex<HashMap<(u64, String, bool), Outcome>>,
+    verifications: Mutex<HashMap<u64, Shared<Verification<AnyValue>>>>,
+    checks: Mutex<HashMap<(u64, String, bool), Shared<Outcome>>>,
 }
 
 impl fmt::Debug for IdentityContext {
@@ -634,33 +643,23 @@ impl IdentityContext {
         verifier: &'a ErasedVerifier,
     ) -> BoxFuture<'a, Verification<AnyValue>> {
         Box::pin(async move {
-            if let Some(outcome) = self.lock_verifications().get(&verifier.id) {
-                return outcome.clone();
-            }
-            let outcome = match verifier.inner.members() {
-                Some(members) => {
-                    let mut outcomes = Vec::with_capacity(members.len());
-                    for member in members {
-                        outcomes.push(self.evaluate(member).await);
+            let shared = cell(&self.inner.verifications, verifier.id);
+            shared
+                .get_or_init(|| async {
+                    match verifier.inner.members() {
+                        Some(members) => {
+                            let mut outcomes = Vec::with_capacity(members.len());
+                            for member in members {
+                                outcomes.push(self.evaluate(member).await);
+                            }
+                            combine_any_of(outcomes).map(|matched| Arc::new(matched) as AnyValue)
+                        }
+                        None => verifier.inner.verify_any(self.request()).await,
                     }
-                    combine_any_of(outcomes).map(|matched| Arc::new(matched) as AnyValue)
-                }
-                None => verifier.inner.verify_any(self.request()).await,
-            };
-            self.lock_verifications()
-                .entry(verifier.id)
-                .or_insert(outcome)
+                })
+                .await
                 .clone()
         })
-    }
-
-    fn lock_verifications(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<u64, Verification<AnyValue>>> {
-        self.inner
-            .verifications
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Runs request-stage verifiers and combines their outcomes: valid only
@@ -690,23 +689,23 @@ impl IdentityContext {
         credential: Option<&PaymentCredential>,
     ) -> Outcome {
         let key = (check.id, challenge.id.clone(), credential.is_some());
-        if let Some(outcome) = self.lock_checks().get(&key) {
-            return outcome.clone();
-        }
-        let input = PaymentCheckInput {
-            request: self.request(),
-            challenge,
-            credential,
-        };
-        let outcome = match check.inner.verify_any(input).await {
-            Verification::Valid(value) => Outcome::Valid(HashMap::from([(check.id, value)])),
-            Verification::Rejected(rejection) => Outcome::Rejected(decide(&[rejection])),
-        };
-        self.lock_checks().entry(key).or_insert(outcome).clone()
-    }
-
-    fn lock_checks(&self) -> std::sync::MutexGuard<'_, HashMap<(u64, String, bool), Outcome>> {
-        self.inner.checks.lock().unwrap_or_else(|e| e.into_inner())
+        let shared = cell(&self.inner.checks, key);
+        shared
+            .get_or_init(|| async {
+                let input = PaymentCheckInput {
+                    request: self.request(),
+                    challenge,
+                    credential,
+                };
+                match check.inner.verify_any(input).await {
+                    Verification::Valid(value) => {
+                        Outcome::Valid(HashMap::from([(check.id, value)]))
+                    }
+                    Verification::Rejected(rejection) => Outcome::Rejected(decide(&[rejection])),
+                }
+            })
+            .await
+            .clone()
     }
 }
 
