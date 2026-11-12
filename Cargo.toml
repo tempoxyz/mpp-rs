@@ -56,6 +56,18 @@ sql-store = []
 postgres-store = ["sql-store", "dep:tokio-postgres"]
 sqlite-store = ["sql-store", "dep:rusqlite", "tokio"]
 
+# Identity: verifiers and payment checks on servers, provers on clients
+identity = ["http-types", "tokio", "dep:sfv", "dep:uuid"]
+# Tempo ID identity provider (requires identity)
+identity-tempo-id = [
+  "identity",
+  "evm",
+  "dep:reqwest",
+  "dep:p256",
+  "dep:rsa",
+  "dep:uuid",
+]
+
 # Utilities
 utils = ["hex"]
 
@@ -182,6 +194,10 @@ rustls-native-certs = { version = "0.8", optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 
 uuid = { version = "1", features = ["v4"], optional = true }
+
+# Identity dependencies (optional)
+sfv = { version = "0.16", optional = true }
+rsa = { version = "0.10", default-features = false, features = ["std", "pkcs1v15"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.180", optional = true }

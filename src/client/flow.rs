@@ -78,6 +78,20 @@ pub trait Exchange: Send {
         !same_resource(request_url, response.url())
     }
 
+    /// Called with the `402` response and the Challenge the flow is about to
+    /// pay, before the credential is created.
+    ///
+    /// Identity provers use it to prepare proofs for the paid retry. Defaults
+    /// to doing nothing; an error stops the flow before paying.
+    fn prepare_challenge(
+        &mut self,
+        response: &Response,
+        challenge: &PaymentChallenge,
+    ) -> impl Future<Output = Result<(), HttpError>> + Send {
+        let _ = (response, challenge);
+        std::future::ready(Ok(()))
+    }
+
     /// Sends `request` and returns its response.
     fn send(
         &mut self,
@@ -406,6 +420,9 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             if let Err(error) =
                 self.check_challenge(exchange, &challenge, ranking_accept.as_deref())
             {
+                return Err(self.fail(Some(challenge), error).await);
+            }
+            if let Err(error) = exchange.prepare_challenge(&resp, &challenge).await {
                 return Err(self.fail(Some(challenge), error).await);
             }
             payment_attempt += 1;

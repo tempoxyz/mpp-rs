@@ -44,6 +44,9 @@ pub mod server;
 #[cfg(feature = "tempo")]
 pub mod tempo;
 
+#[cfg(feature = "identity")]
+pub mod identity;
+
 // ==================== Flat Re-exports ====================
 
 // Error types
