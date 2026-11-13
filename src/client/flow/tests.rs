@@ -1845,6 +1845,65 @@ async fn streamed_empty_402_after_payment_is_final() {
     }
 }
 
+/// A non-empty 402 answering a credential is paid again as soon as its first
+/// byte arrives, even when the server holds the rest of the body open.
+#[tokio::test]
+async fn stalled_402_body_after_payment_does_not_block() {
+    use futures_util::StreamExt;
+
+    let issued = Arc::new(AtomicU32::new(0));
+    let paid = Arc::new(AtomicU32::new(0));
+    let router = Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let issued = issued.clone();
+            let paid = paid.clone();
+            async move {
+                let n = issued.fetch_add(1, Ordering::SeqCst);
+                if !is_paid(&request) {
+                    return payment_required(&format!("fresh-{n}"), "charge");
+                }
+                if paid.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                    return (StatusCode::OK, "paid").into_response();
+                }
+                let challenge = www_authenticate(&format!("fresh-{n}"), "tempo", "charge");
+                let body = Body::from_stream(
+                    futures_util::stream::once(std::future::ready(Ok::<_, std::io::Error>(
+                        bytes::Bytes::from_static(b"x"),
+                    )))
+                    .chain(futures_util::stream::pending()),
+                );
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(WWW_AUTHENTICATE, challenge)],
+                    body,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let url = spawn_server(router).await;
+    for via in BOTH {
+        let provider = TestProvider {
+            transaction: true,
+            ..TestProvider::default()
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            via.send(
+                reqwest::Client::new().get(format!("{url}/paid")),
+                &provider,
+                ClientEvents::default(),
+            ),
+        )
+        .await
+        .expect("the stalled 402 body must not block the flow")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+        assert_eq!(provider.paid().len(), 2, "{via:?}");
+    }
+}
+
 /// A problem naming another failure, such as verification-failed, still lets
 /// the client pay the fresh challenge.
 #[tokio::test]

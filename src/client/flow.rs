@@ -1152,7 +1152,9 @@ fn is_problem_json(resp: &Response) -> bool {
 const MAX_PROBLEM_BODY_BYTES: usize = 64 * 1024;
 
 /// Read up to `limit` bytes of `resp`'s body and return them, whether that
-/// was the whole body, and an equivalent response: same status, version,
+/// was the whole body (a read that reaches `limit` stops there without
+/// waiting to learn whether more follows, and is not complete), and an
+/// equivalent response: same status, version,
 /// headers, extensions and URL, whose body is the bytes read followed by the
 /// unread rest of the stream, or by the read error that cut it short.
 async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool) {
@@ -1167,6 +1169,7 @@ async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool
     let mut read = Vec::new();
     let mut overflow = None;
     let mut error = None;
+    let mut at_limit = false;
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
@@ -1177,6 +1180,12 @@ async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool
                     break;
                 }
                 read.extend_from_slice(&chunk);
+                if read.len() == limit {
+                    // The limit is reached: whether more follows is not
+                    // awaited, so a stalled stream cannot hold the caller.
+                    at_limit = true;
+                    break;
+                }
             }
             Ok(None) => break,
             Err(err) => {
@@ -1185,22 +1194,21 @@ async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool
             }
         }
     }
-    let complete = overflow.is_none() && error.is_none();
+    let complete = overflow.is_none() && error.is_none() && !at_limit;
     let body = if complete {
         reqwest::Body::from(read.clone())
     } else {
         let head = futures_util::stream::once(std::future::ready(Ok::<_, reqwest::Error>(
             bytes::Bytes::from(read.clone()),
         )));
-        match (overflow, error) {
-            (Some(overflow), _) => reqwest::Body::wrap_stream(
-                head.chain(futures_util::stream::once(std::future::ready(Ok(overflow))))
-                    .chain(resp.bytes_stream()),
-            ),
-            (None, Some(err)) => reqwest::Body::wrap_stream(
+        match error {
+            Some(err) => reqwest::Body::wrap_stream(
                 head.chain(futures_util::stream::once(std::future::ready(Err(err)))),
             ),
-            (None, None) => unreachable!("an incomplete read has overflow or an error"),
+            None => reqwest::Body::wrap_stream(
+                head.chain(futures_util::stream::iter(overflow.map(Ok)))
+                    .chain(resp.bytes_stream()),
+            ),
         }
     };
     let mut builder = http_types::Response::builder()
@@ -1224,7 +1232,9 @@ async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool
 /// Whether `resp`'s body is empty, with an equivalent response. A body
 /// that fails to arrive is not counted as empty.
 async fn has_empty_body(resp: Response) -> (Response, bool) {
-    let (rebuilt, read, complete) = peek_body(resp, MAX_PROBLEM_BODY_BYTES).await;
+    // One byte settles it, so the read stops at the first byte instead of
+    // waiting for the server to finish the body.
+    let (rebuilt, read, complete) = peek_body(resp, 1).await;
     (rebuilt, complete && read.is_empty())
 }
 
