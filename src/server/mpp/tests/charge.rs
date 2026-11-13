@@ -4,7 +4,7 @@ use super::*;
 #[test]
 fn test_mpp_create() {
     let mpp = create_test_mpp();
-    assert_eq!(mpp.realm(), "MPP Payment");
+    assert_eq!(mpp.realm(), "localhost");
     assert_eq!(mpp.currency(), Some(crate::protocol::methods::tempo::OUSD));
     assert_eq!(mpp.chain_id(), Some(CHAIN_ID));
     assert_eq!(
@@ -233,7 +233,7 @@ fn test_charge_dollar_amount() {
     let challenge = mpp.charge("0.10").unwrap().remove(0);
     assert_eq!(challenge.method.as_str(), "tempo");
     assert_eq!(challenge.intent.as_str(), "charge");
-    assert_eq!(challenge.realm, "MPP Payment");
+    assert_eq!(challenge.realm, "localhost");
 
     let request: ChargeRequest = challenge.request.decode().unwrap();
     assert_eq!(request.amount, "100000");
@@ -302,7 +302,11 @@ fn test_charge_default_expires() {
 #[cfg(feature = "tempo")]
 #[test]
 fn test_charge_requires_bound_currency() {
-    let payment = Mpp::new(MockMethod, "api.example.com", "secret");
+    let payment = Mpp::new(
+        MockMethod,
+        "api.example.com",
+        "test-secret-key-at-least-32-bytes",
+    );
     let result = payment.charge("1.00").map(|mut offers| offers.remove(0));
     assert!(result.is_err());
 }

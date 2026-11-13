@@ -419,10 +419,10 @@ async fn test_pinned_opaque_charge_helper_roundtrips() {
     // charge() emits the configured opaque, so its credential verifies.
     let mpp = create_hmac_test_mpp().with_opaque(route_opaque());
     let challenge = mpp.charge("0.10").unwrap().remove(0);
-    assert_eq!(
-        challenge.opaque.as_ref().map(|o| o.raw()),
-        Some(route_opaque().raw())
-    );
+    // It carries the route's members and a fresh `_mpp_nonce`.
+    let opaque = challenge.opaque.as_ref().unwrap().decode_value().unwrap();
+    assert_eq!(opaque["route"], "a");
+    assert!(opaque["_mpp_nonce"].is_string());
 
     let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xbeef"));
     assert!(mpp.verify_credential(&credential).await.is_ok());
@@ -784,7 +784,11 @@ async fn test_expected_charge_request_matches_issued_request() {
 async fn test_verify_charge_rejects_without_bound_currency() {
     use crate::protocol::methods::tempo::PATH_USD;
 
-    let mpp = Mpp::new(TempoSuccessMethod, "MPP Payment", "test-secret");
+    let mpp = Mpp::new(
+        TempoSuccessMethod,
+        "MPP Payment",
+        "test-secret-key-at-least-32-bytes",
+    );
     let challenge = mpp
         .charge_challenge("10000", PATH_USD, TEST_RECIPIENT)
         .unwrap();

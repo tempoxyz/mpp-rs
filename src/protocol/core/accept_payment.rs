@@ -472,7 +472,8 @@ mod tests {
     fn parse_accepts_method_name_grammar() {
         let e = parse("eip155:8453_usdc/charge;q=0.5").unwrap();
         assert_eq!(e[0].method, "eip155:8453_usdc");
-        assert!(MethodName::new(e[0].method.as_str()).is_valid());
+        // Accept-Payment keeps its wider token grammar; challenges don't.
+        assert!(!MethodName::new(e[0].method.as_str()).is_valid());
 
         // The intent token grammar has neither.
         assert!(parse("tempo/char:ge").is_err());

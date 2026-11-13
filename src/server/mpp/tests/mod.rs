@@ -24,6 +24,7 @@ use std::{
 mod binding;
 mod body_digest;
 mod charge;
+mod core_spec;
 #[cfg(feature = "tempo")]
 mod currencies;
 mod expected_request;
