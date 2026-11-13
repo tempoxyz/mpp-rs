@@ -54,6 +54,9 @@ type CodeFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
 type CodeCallback = dyn Fn(CodeContext) -> CodeFuture + Send + Sync;
 
 /// Asks `issuer` to email a one-time code to `email` for `audience`.
+///
+/// `client` must not follow redirects: one would re-post the address to
+/// wherever the issuer redirects. [`EmailOtpProver`] builds such a client.
 pub async fn send_code(
     client: &reqwest::Client,
     issuer: &str,
@@ -85,6 +88,8 @@ pub async fn send_code(
 }
 
 /// Exchanges an emailed one-time code for an email attestation.
+///
+/// `client` must not follow redirects, as for [`send_code`].
 pub async fn verify_code(
     client: &reqwest::Client,
     issuer: &str,
@@ -159,7 +164,7 @@ pub struct EmailOtpProver {
     issuers: Vec<String>,
     scope: Vec<String>,
     code: Arc<CodeCallback>,
-    client: Option<reqwest::Client>,
+    client: Option<reqwest::ClientBuilder>,
     attestations: Vec<String>,
 }
 
@@ -201,10 +206,12 @@ impl EmailOtpProver {
         }
     }
 
-    /// Sends issuer requests with `client` instead of one that follows no
-    /// redirects. It must not pay `402` responses or follow redirects.
-    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
-        self.client = Some(client);
+    /// Builds the client that sends issuer requests from `builder`, such as
+    /// for a proxy or TLS settings. Redirects are turned off whatever it
+    /// sets, so the address and code never follow a redirect to another
+    /// origin, and each request still times out.
+    pub fn with_http_client_builder(mut self, builder: reqwest::ClientBuilder) -> Self {
+        self.client = Some(builder);
         self
     }
 
@@ -237,10 +244,12 @@ impl EmailOtpProver {
                 "issuer {issuer:?} must be an https URL (http only on localhost)"
             )));
         }
-        let client = match self.client {
-            Some(client) => client,
-            None => no_redirect_client()?,
-        };
+        let client = self
+            .client
+            .unwrap_or_default()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(IdentityError::Request)?;
         let email = self.email;
         let code = self.code;
         AttestationProver::new(&self.scope, &self.issuers)?
@@ -297,6 +306,7 @@ async fn acquire(
 /// Longest an issuer request may take, from sending it to reading its body.
 const ISSUER_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
 fn no_redirect_client() -> Result<reqwest::Client, IdentityError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -332,6 +342,15 @@ async fn post(
         .send()
         .await
         .map_err(IdentityError::Request)?;
+    // A client that followed a redirect has already sent the body on; at
+    // least never trust the answer of another origin.
+    let issuer_origin = reqwest::Url::parse(issuer).map(|url| url.origin());
+    if issuer_origin.as_ref().ok() != Some(&response.url().origin()) {
+        return Err(IdentityError::email_otp(
+            "The issuer redirected to another origin.",
+            None,
+        ));
+    }
     let status = response.status();
     let json: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {

@@ -120,14 +120,14 @@ impl Entry {
 /// How a retry answers one requirement.
 enum Decision {
     Reuse(String),
-    Acquire { rejected: Option<String> },
+    Acquire,
 }
 
 impl Decision {
     fn rank(&self) -> u8 {
         match self {
             Self::Reuse(_) => 0,
-            Self::Acquire { .. } => 1,
+            Self::Acquire => 1,
         }
     }
 }
@@ -145,8 +145,16 @@ struct State {
 struct Cache {
     state: Mutex<State>,
     /// One lock per cache key, held while acquiring, so concurrent retries
-    /// for one requirement share an acquisition.
-    acquiring: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    /// for one requirement share an acquisition. It holds the outcome of the
+    /// last acquisition, which retries that waited on it reuse.
+    acquiring: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<Option<Acquired>>>>>,
+}
+
+/// The outcome of one acquisition and when it finished.
+struct Acquired {
+    at: std::time::Instant,
+    /// The attestation, `None` when declined, or the error's message.
+    outcome: Result<Option<String>, String>,
 }
 
 /// Presents identity attestations, and obtains them when a server asks, as
@@ -410,7 +418,7 @@ impl AttestationProver {
                 tried.insert(key.clone());
                 let result = match decision {
                     Decision::Reuse(token) => Ok(Some(token)),
-                    Decision::Acquire { .. } => self.acquire(&key, tokens_for(&sent, &key)).await,
+                    Decision::Acquire => self.acquire(&key, tokens_for(&sent, &key)).await,
                 };
                 match result {
                     Ok(Some(token)) => {
@@ -501,18 +509,16 @@ impl AttestationProver {
     fn decide(&self, key: &Key, sent: &[String]) -> Decision {
         let state = self.state();
         let Some(entry) = state.slots.get(key) else {
-            return Decision::Acquire { rejected: None };
+            return Decision::Acquire;
         };
         let time = now();
         if !entry.usable(time, true) || sent.contains(&entry.token) {
-            return Decision::Acquire {
-                rejected: Some(entry.token.clone()),
-            };
+            return Decision::Acquire;
         }
         if !sent.is_empty() || entry.usable(time, false) {
             return Decision::Reuse(entry.token.clone());
         }
-        Decision::Acquire { rejected: None }
+        Decision::Acquire
     }
 
     /// A cached attestation for `key` that the rejected request did not send
@@ -541,23 +547,32 @@ impl AttestationProver {
             .entry(key.clone())
             .or_default()
             .clone();
-        let _guard = lock.lock().await;
-        // Another retry may have acquired one while this one waited.
-        let rejected = match self.decide(key, sent) {
-            Decision::Reuse(token) => return Ok(Some(token)),
-            Decision::Acquire { rejected } => rejected,
-        };
-        if let Some(rejected) = rejected {
-            // The server rejected it, so it is not kept while a new one is acquired.
-            let mut state = self.state();
-            if state
-                .slots
-                .get(key)
-                .is_some_and(|entry| entry.token == rejected)
-            {
-                state.slots.remove(key);
-            }
+        let queued = std::time::Instant::now();
+        let mut last = lock.lock().await;
+        // An acquisition that finished while this retry waited answers it too,
+        // whether it obtained one, was declined or failed, so concurrent
+        // requests send one code and prompt once.
+        if let Some(acquired) = last.as_ref().filter(|acquired| acquired.at >= queued) {
+            return acquired.outcome.clone().map_err(IdentityError::Acquire);
         }
+        if let Decision::Reuse(token) = self.decide(key, sent) {
+            return Ok(Some(token));
+        }
+        // A rejected attestation stays cached until a new one replaces it:
+        // another request's paid attempt in flight may still carry it.
+        let outcome = self.obtain(acquire.as_ref(), key).await;
+        *last = Some(Acquired {
+            at: std::time::Instant::now(),
+            outcome: outcome
+                .as_ref()
+                .map(Clone::clone)
+                .map_err(ToString::to_string),
+        });
+        outcome
+    }
+
+    /// Calls the acquirer for `key` and caches what it returns.
+    async fn obtain(&self, acquire: &Acquire, key: &Key) -> Result<Option<String>, IdentityError> {
         let (audience, issuer, attestation_type) = key.clone();
         let token = acquire(AttestationRequest {
             audience,
@@ -906,6 +921,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value.unwrap(), fresh.as_str());
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_share_a_declined_acquisition() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let prover = AttestationProver::new([AUDIENCE], [ISSUER])
+            .unwrap()
+            .with_acquire(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(None)
+                }
+            });
+        let url: Url = "https://api.example/".parse().unwrap();
+        let response = rejection(url.as_str());
+        let headers = HeaderMap::new();
+        let (a, b) = tokio::join!(
+            prover.retry_value(&url, &headers, &response),
+            prover.retry_value(&url, &headers, &response),
+        );
+        assert!(a.unwrap().is_none() && b.unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A later retry asks again.
+        assert!(prover
+            .retry_value(&url, &headers, &response)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

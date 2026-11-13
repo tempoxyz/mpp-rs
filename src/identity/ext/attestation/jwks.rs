@@ -174,9 +174,19 @@ impl JwksResolver {
         }
 
         // Concurrent lookups for one issuer wait here and then see the fetch
-        // the first one made.
+        // the first one made. While a fetch is in flight, a lookup the last
+        // good set (within `max_stale`) answers does not wait for it, so an
+        // issuer that hangs cannot stall every request until the timeout.
         let lock = self.attempt_lock(issuer);
-        let mut attempt = lock.lock().await;
+        let mut attempt = match lock.clone().try_lock_owned() {
+            Ok(attempt) => attempt,
+            Err(_) => {
+                if let Ok(Some(key)) = self.stale(self.good(issuer).as_ref(), key_id, "") {
+                    return Ok(Some(key));
+                }
+                lock.lock_owned().await
+            }
+        };
         let good = self.good(issuer);
         let fresh = good
             .as_ref()
@@ -199,8 +209,12 @@ impl JwksResolver {
             return self.stale(good.as_ref(), key_id, "JWKS request failed recently.");
         }
 
-        attempt.started_at = Some(Instant::now());
-        match self.fetch(issuer).await {
+        // The attempt is recorded only once the fetch finishes, so a lookup
+        // dropped mid-fetch leaves no attempt that looks recent and successful.
+        let started_at = Instant::now();
+        let fetched = self.fetch(issuer).await;
+        attempt.started_at = Some(started_at);
+        match fetched {
             Ok(keys) => {
                 attempt.failed = false;
                 let key = keys.get(key_id).copied();
@@ -211,7 +225,7 @@ impl JwksResolver {
                     .insert(
                         issuer.to_string(),
                         KeySet {
-                            fetched_at: attempt.started_at.unwrap_or_else(Instant::now),
+                            fetched_at: started_at,
                             keys,
                         },
                     );

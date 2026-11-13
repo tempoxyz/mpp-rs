@@ -124,7 +124,8 @@ impl EmailOtpVerifier {
             expires_at: i64::try_from(claims.exp)
                 .ok()
                 .and_then(|exp| OffsetDateTime::from_unix_timestamp(exp).ok())
-                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                // Past what `time` represents (year 9999): the latest it can.
+                .unwrap_or_else(|| time::PrimitiveDateTime::MAX.assume_utc()),
             id: claims.jti,
             issuer: claims.iss,
         })
