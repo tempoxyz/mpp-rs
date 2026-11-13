@@ -58,6 +58,14 @@ pub trait Exchange: Send {
         true
     }
 
+    /// Whether the last [`send`](Self::send) that failed did so before the
+    /// request left, such as an identity prover refusing it, so the server
+    /// cannot have seen its Credential. Defaults to false: a failed send may
+    /// have reached the server.
+    fn unsent(&self) -> bool {
+        false
+    }
+
     /// Caller-configured client available for session management requests.
     fn http_client(&self) -> Option<reqwest::Client> {
         None
@@ -493,6 +501,20 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             resp = match exchange.send(paid).await {
                 Ok(resp) => resp,
+                Err(err) if exchange.unsent() && !already_settled(&credential) => {
+                    // The Credential never left: release it as unused. A hash
+                    // Credential's transfer is already on chain, so it takes
+                    // the unknown-outcome path below and is never released.
+                    self.events
+                        .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                            challenge: Some(challenge),
+                            error: err.to_string(),
+                            reason: None,
+                        }))
+                        .await;
+                    pending.rollback().await.map_err(HttpError::Payment)?;
+                    return Err(FlowError::Send(err));
+                }
                 Err(err) => {
                     let reason = outcome_unknown(None, &challenge, &credential);
                     self.events
@@ -906,6 +928,13 @@ fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentC
 
 /// The `payment.failed` reason for a credential that was sent without a
 /// successful answer, or `None` when the credential cannot be serialized.
+/// Whether the Credential's payment settled before it was sent, as a push-mode
+/// Tempo charge whose transaction the client already broadcast: releasing it
+/// would lose a payment that can still be presented.
+fn already_settled(credential: &PaymentCredential) -> bool {
+    credential.payload.get("type").and_then(|v| v.as_str()) == Some("hash")
+}
+
 fn outcome_unknown(
     status: Option<u16>,
     challenge: &PaymentChallenge,

@@ -135,10 +135,21 @@ struct KeyState {
     attempted: Option<Instant>,
 }
 
+impl KeyState {
+    /// The last loaded set while it is younger than an hour.
+    fn stale(&self) -> Option<HashMap<String, RsaKey>> {
+        self.cached
+            .as_ref()
+            .filter(|cached| cached.at.elapsed() < STALE)
+            .map(|cached| cached.keys.clone())
+    }
+}
+
 /// An issuer's RS256 keys by key ID, from `<issuer>/oauth2/jwks`, as mppx's
 /// `Jwt.keys`. The set is cached for five minutes, an unknown key ID
 /// refetches it at most every 30 seconds, and a failed fetch keeps the last
-/// set that loaded.
+/// set that loaded for up to one hour after it loaded, so a removed key stops
+/// verifying within an hour even while the issuer is unreachable.
 pub(crate) struct Keys {
     url: String,
     http: reqwest::Client,
@@ -147,6 +158,8 @@ pub(crate) struct Keys {
 
 const MAX_AGE: Duration = Duration::from_secs(300);
 const REFETCH: Duration = Duration::from_secs(30);
+/// How long after it loaded a set still serves when refetches fail.
+const STALE: Duration = Duration::from_secs(3600);
 
 impl Keys {
     pub(crate) fn new(issuer: &str, http: reqwest::Client) -> Self {
@@ -172,12 +185,13 @@ impl Keys {
         // Within 30 seconds of the last attempt, the last loaded set serves,
         // and with none loaded the keys stay unavailable without another fetch.
         let cooling = state.attempted.is_some_and(|at| at.elapsed() < REFETCH);
-        match &state.cached {
-            Some(cached) if cached.at.elapsed() < max_age || cooling => {
+        if let Some(cached) = &state.cached {
+            if cached.at.elapsed() < max_age {
                 return Ok(cached.keys.clone());
             }
-            None if cooling => return Err(KeysUnavailable),
-            _ => {}
+        }
+        if cooling {
+            return state.stale().ok_or(KeysUnavailable);
         }
         state.attempted = Some(Instant::now());
         match self.load().await {
@@ -188,11 +202,7 @@ impl Keys {
                 });
                 Ok(keys)
             }
-            None => state
-                .cached
-                .as_ref()
-                .map(|cached| cached.keys.clone())
-                .ok_or(KeysUnavailable),
+            None => state.stale().ok_or(KeysUnavailable),
         }
     }
 
@@ -225,6 +235,8 @@ impl Keys {
                 keys.insert(kid.to_owned(), key);
             }
         }
-        Some(keys)
+        // A set with no usable key is a failed fetch: it never replaces the
+        // last set that loaded.
+        (!keys.is_empty()).then_some(keys)
     }
 }

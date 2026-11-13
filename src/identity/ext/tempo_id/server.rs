@@ -28,7 +28,8 @@ pub type AllowFn = Arc<dyn Fn(&Payer) -> BoxFuture<'static, bool> + Send + Sync>
 pub struct Config {
     allow: Option<AllowFn>,
     chain_id: u64,
-    client_ids: Vec<String>,
+    /// `None` accepts any app's tokens.
+    client_ids: Option<Vec<String>>,
     store: Option<Arc<dyn Store>>,
     audience: Option<String>,
     issuer: String,
@@ -48,13 +49,13 @@ impl fmt::Debug for Config {
     }
 }
 
-impl Config {
-    /// Accepts tokens of the app `client_id`.
-    pub fn new(client_id: impl Into<String>) -> Self {
+impl Default for Config {
+    /// Accepts any app's tokens on Tempo mainnet, as [`Config::any_app`].
+    fn default() -> Self {
         Self {
             allow: None,
             chain_id: 4217,
-            client_ids: vec![client_id.into()],
+            client_ids: None,
             store: None,
             audience: None,
             issuer: ISSUER.to_owned(),
@@ -62,10 +63,29 @@ impl Config {
             http: None,
         }
     }
+}
+
+impl Config {
+    /// Accepts tokens of the app `client_id`.
+    pub fn new(client_id: impl Into<String>) -> Self {
+        Self {
+            client_ids: Some(vec![client_id.into()]),
+            ..Self::default()
+        }
+    }
+
+    /// Accepts any app's tokens, as mppx does without `clientId`. Its
+    /// [`allow`](Self::allow) callback can still decide by the caller's
+    /// `client_id`.
+    pub fn any_app() -> Self {
+        Self::default()
+    }
 
     /// Also accepts tokens of the app `client_id`.
     pub fn client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.client_ids.push(client_id.into());
+        self.client_ids
+            .get_or_insert_with(Vec::new)
+            .push(client_id.into());
         self
     }
 
@@ -241,6 +261,10 @@ impl PaymentCheck for TempoIdPaymentCheck {
             if input.challenge.method.as_str() != "tempo" {
                 return Rejection::forbidden("Pay with the tempo method.").into();
             }
+            // A Zone payment does not bind its source to the paying account.
+            if credential.payload.get("type").and_then(Value::as_str) == Some("zone") {
+                return Rejection::forbidden("Pay from a Tempo account, not a Zone.").into();
+            }
             // The source is a did:pkh:eip155:<chainId>:<address>.
             let parts: Vec<&str> = credential
                 .source
@@ -249,11 +273,14 @@ impl PaymentCheck for TempoIdPaymentCheck {
                 .split(':')
                 .collect();
             let chain_id = core.config.chain_id;
-            let account = match (
-                parts.get(3),
-                parts.get(4).and_then(|address| parse_address(address)),
-            ) {
-                (Some(chain), Some(account)) if *chain == chain_id.to_string() => account,
+            let account = match parts.as_slice() {
+                ["did", "pkh", "eip155", chain, address] if *chain == chain_id.to_string() => {
+                    parse_address(address)
+                }
+                _ => None,
+            };
+            let account = match account {
+                Some(account) => account,
                 _ => {
                     return Rejection::invalid(format!(
                         "The payment must name its source account on chain {chain_id}."
@@ -329,12 +356,7 @@ impl Core {
     }
 
     async fn check(&self, request: &IdentityRequest) -> Verification<Caller> {
-        let authorization = request.header(AUTHORIZATION).unwrap_or_default();
-        let mut words = authorization.split(' ');
-        let (scheme, token) = (
-            words.next().unwrap_or_default(),
-            words.next().unwrap_or_default(),
-        );
+        let (scheme, token) = scheme_and_token(request.header(AUTHORIZATION).unwrap_or_default());
         let dpop = scheme.eq_ignore_ascii_case("dpop");
         if token.is_empty() || (!dpop && !scheme.eq_ignore_ascii_case("bearer")) {
             return Rejection::new(RejectionStatus::Missing)
@@ -379,10 +401,21 @@ impl Core {
         {
             return invalid("The access token has expired.");
         }
-        let client_id = str_claim(claims, "client_id");
-        let Some(client_id) =
-            client_id.filter(|id| self.config.client_ids.iter().any(|allowed| allowed == id))
-        else {
+        if let Some(nbf) = claims.get("nbf") {
+            if !nbf
+                .as_f64()
+                .is_some_and(|nbf| nbf <= (now + CLOCK_TOLERANCE) as f64)
+            {
+                return invalid("The access token is not valid yet.");
+            }
+        }
+        // Without configured apps, any app's token passes; allow can still decide.
+        let Some(client_id) = str_claim(claims, "client_id").filter(|id| {
+            self.config
+                .client_ids
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|allowed| allowed == id))
+        }) else {
             return Rejection::forbidden("This app may not call this API.").into();
         };
 
@@ -402,8 +435,13 @@ impl Core {
                 .into();
             }
             let jkt = jkt.and_then(Value::as_str).unwrap_or_default();
-            if let Err(reason) = self.check_proof(request, jkt, now, token).await {
-                return invalid(reason);
+            match self.check_proof(request, jkt, now, token).await {
+                Ok(()) => {}
+                // A replay store failure rejects, so the proof cannot be spent twice.
+                Err(ProofError::StoreUnavailable) => {
+                    return Rejection::unavailable("The DPoP replay store is unavailable.").into()
+                }
+                Err(ProofError::Invalid(reason)) => return invalid(reason),
             }
         }
 
@@ -528,63 +566,70 @@ impl Core {
         jkt: &str,
         now: i64,
         token: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), ProofError> {
         let proof = jwt::decode(request.header("DPoP").unwrap_or_default())
             .filter(|proof| {
                 str_claim(&proof.header, "alg") == Some("ES256")
                     && str_claim(&proof.header, "typ") == Some("dpop+jwt")
             })
-            .ok_or("The DPoP proof is malformed.")?;
+            .ok_or(ProofError::Invalid("The DPoP proof is malformed."))?;
         let jwk = proof.header.get("jwk").and_then(Value::as_object);
         let member = |name: &str| jwk.and_then(|jwk| jwk.get(name)).and_then(Value::as_str);
         let (Some(crv), Some(kty), Some(x), Some(y)) =
             (member("crv"), member("kty"), member("x"), member("y"))
         else {
-            return Err("The DPoP proof key does not bind the token.");
+            return Err(ProofError::Invalid(
+                "The DPoP proof key does not bind the token.",
+            ));
         };
         if jwk.is_some_and(|jwk| jwk.contains_key("d")) || jwt::thumbprint(crv, kty, x, y) != jkt {
-            return Err("The DPoP proof key does not bind the token.");
+            return Err(ProofError::Invalid(
+                "The DPoP proof key does not bind the token.",
+            ));
         }
         if crv != "P-256"
             || kty != "EC"
             || !jwt::verify_es256(x, y, &proof.signing_input, &proof.signature)
         {
-            return Err("The DPoP proof signature is invalid.");
+            return Err(ProofError::Invalid("The DPoP proof signature is invalid."));
         }
 
         let claims = &proof.claims;
         if str_claim(claims, "htm") != Some(request.method().as_str())
             || str_claim(claims, "htu") != self.htu(request).as_deref()
         {
-            return Err("The DPoP proof is for another request.");
+            return Err(ProofError::Invalid(
+                "The DPoP proof is for another request.",
+            ));
         }
         if str_claim(claims, "ath") != Some(jwt::sha256(token).as_str()) {
-            return Err("The DPoP proof is for another token.");
+            return Err(ProofError::Invalid("The DPoP proof is for another token."));
         }
         let iat = claims
             .get("iat")
             .and_then(Value::as_f64)
-            .ok_or("The DPoP proof has expired.")?;
+            .ok_or(ProofError::Invalid("The DPoP proof has expired."))?;
         let expires = iat + (PROOF_MAX_AGE + CLOCK_TOLERANCE) as f64;
         if iat > (now + CLOCK_TOLERANCE) as f64 || expires < now as f64 {
-            return Err("The DPoP proof has expired.");
+            return Err(ProofError::Invalid("The DPoP proof has expired."));
         }
         let jti = str_claim(claims, "jti")
             .filter(|jti| !jti.is_empty())
-            .ok_or("The DPoP proof has no ID.")?;
+            .ok_or(ProofError::Invalid("The DPoP proof has no ID."))?;
         if let Some(store) = &self.config.store {
             let key = format!(
                 "mppx:tempo-id:dpop:{}",
                 jwt::sha256(&format!("{jkt}:{jti}"))
             );
-            let ttl = std::time::Duration::from_secs_f64((expires - now as f64).max(1.0));
+            // Held one second past expiry: the proof still verifies through
+            // the whole second `now == expires`.
+            let ttl = std::time::Duration::from_secs_f64((expires - now as f64 + 1.0).max(1.0));
             let claimed = store
                 .put_if_absent_with_ttl(&key, Value::Bool(true), ttl)
                 .await
-                // A store that cannot claim the proof fails closed.
-                .unwrap_or(false);
+                .map_err(|_| ProofError::StoreUnavailable)?;
             if !claimed {
-                return Err("The DPoP proof was already used.");
+                return Err(ProofError::Invalid("The DPoP proof was already used."));
             }
         }
         Ok(())
@@ -609,6 +654,34 @@ fn htu(origin: Option<&str>, request: &IdentityRequest) -> Option<String> {
     // `//other.example/x` would replace the host.
     url.set_path(request.uri().path());
     Some(jwt::htu(&url))
+}
+
+/// Why a DPoP proof did not verify.
+enum ProofError {
+    /// The proof is not valid for this request and token.
+    Invalid(&'static str),
+    /// The replay store could not claim the proof.
+    StoreUnavailable,
+}
+
+impl From<&'static str> for ProofError {
+    fn from(reason: &'static str) -> Self {
+        Self::Invalid(reason)
+    }
+}
+
+/// The scheme and token of an `Authorization` value: RFC 9110 separates
+/// them with one or more spaces, and neither holds whitespace.
+fn scheme_and_token(value: &str) -> (&str, &str) {
+    let value = value.trim_end_matches(' ');
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return ("", "");
+    };
+    let token = token.trim_start_matches(' ');
+    if scheme.chars().any(char::is_whitespace) || token.chars().any(char::is_whitespace) {
+        return ("", "");
+    }
+    (scheme, token)
 }
 
 fn str_claim<'a>(map: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a str> {
