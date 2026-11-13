@@ -27,7 +27,9 @@ mod server;
 mod tests;
 
 #[cfg(feature = "client")]
-pub use client::{send_code, verify_code, CodeContext, CodeRequest, EmailOtpProver, VerifiedCode};
+pub use client::{
+    send_code, verify_code, CodeContext, CodeRequest, EmailOtpProver, IssuerClient, VerifiedCode,
+};
 pub use server::{EmailOtpVerifier, VerifiedEmail};
 
 /// Attestation type for a verified email address.

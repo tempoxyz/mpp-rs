@@ -209,33 +209,41 @@ impl JwksResolver {
             return self.stale(good.as_ref(), key_id, "JWKS request failed recently.");
         }
 
-        // The attempt is recorded only once the fetch finishes, so a lookup
-        // dropped mid-fetch leaves no attempt that looks recent and successful.
-        let started_at = Instant::now();
-        let fetched = self.fetch(issuer).await;
-        attempt.started_at = Some(started_at);
-        match fetched {
-            Ok(keys) => {
-                attempt.failed = false;
-                let key = keys.get(key_id).copied();
-                self.state
-                    .good
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        issuer.to_string(),
-                        KeySet {
-                            fetched_at: started_at,
-                            keys,
-                        },
-                    );
-                Ok(key)
+        // The fetch runs as its own task, holding the per-issuer lock, so a
+        // lookup cancelled mid-fetch neither skips recording the attempt
+        // (which would lift the refetch limit) nor leaves a half-recorded one.
+        let this = self.clone();
+        let issuer = issuer.to_string();
+        let key_id = key_id.to_string();
+        let task = tokio::spawn(async move {
+            let started_at = Instant::now();
+            let fetched = this.fetch(&issuer).await;
+            attempt.started_at = Some(started_at);
+            match fetched {
+                Ok(keys) => {
+                    attempt.failed = false;
+                    let key = keys.get(&key_id).copied();
+                    this.state
+                        .good
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            issuer,
+                            KeySet {
+                                fetched_at: started_at,
+                                keys,
+                            },
+                        );
+                    Ok(key)
+                }
+                Err(error) => {
+                    attempt.failed = true;
+                    this.stale(good.as_ref(), &key_id, &error.0)
+                }
             }
-            Err(error) => {
-                attempt.failed = true;
-                self.stale(good.as_ref(), key_id, &error.0)
-            }
-        }
+        });
+        task.await
+            .unwrap_or_else(|_| Err(KeyResolveError("JWKS request failed.".into())))
     }
 
     /// The key from the last good set while it is within `max_stale`. A stale

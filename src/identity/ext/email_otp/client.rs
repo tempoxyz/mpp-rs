@@ -53,12 +53,33 @@ pub struct CodeContext {
 type CodeFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
 type CodeCallback = dyn Fn(CodeContext) -> CodeFuture + Send + Sync;
 
+/// The HTTP client that sends email OTP issuer requests. It never follows
+/// redirects, so the address and code are never re-posted to another origin.
+#[derive(Debug, Clone)]
+pub struct IssuerClient {
+    client: reqwest::Client,
+}
+
+impl IssuerClient {
+    /// A client with reqwest's defaults.
+    pub fn new() -> Result<Self, IdentityError> {
+        Self::from_builder(reqwest::Client::builder())
+    }
+
+    /// A client built from `builder`, such as for a proxy or TLS settings,
+    /// with redirects turned off whatever it sets.
+    pub fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, IdentityError> {
+        let client = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(IdentityError::Request)?;
+        Ok(Self { client })
+    }
+}
+
 /// Asks `issuer` to email a one-time code to `email` for `audience`.
-///
-/// `client` must not follow redirects: one would re-post the address to
-/// wherever the issuer redirects. [`EmailOtpProver`] builds such a client.
 pub async fn send_code(
-    client: &reqwest::Client,
+    client: &IssuerClient,
     issuer: &str,
     email: &str,
     audience: &str,
@@ -89,9 +110,8 @@ pub async fn send_code(
 
 /// Exchanges an emailed one-time code for an email attestation.
 ///
-/// `client` must not follow redirects, as for [`send_code`].
 pub async fn verify_code(
-    client: &reqwest::Client,
+    client: &IssuerClient,
     issuer: &str,
     id: &str,
     code: &str,
@@ -244,12 +264,7 @@ impl EmailOtpProver {
                 "issuer {issuer:?} must be an https URL (http only on localhost)"
             )));
         }
-        let client = self
-            .client
-            .unwrap_or_default()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(IdentityError::Request)?;
+        let client = IssuerClient::from_builder(self.client.unwrap_or_default())?;
         let email = self.email;
         let code = self.code;
         AttestationProver::new(&self.scope, &self.issuers)?
@@ -264,7 +279,7 @@ impl EmailOtpProver {
 /// Sends a code, prompts for it and verifies it, asking again after a
 /// rejected code.
 async fn acquire(
-    client: reqwest::Client,
+    client: IssuerClient,
     email: String,
     code: Arc<CodeCallback>,
     request: AttestationRequest,
@@ -306,21 +321,13 @@ async fn acquire(
 /// Longest an issuer request may take, from sending it to reading its body.
 const ISSUER_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(test)]
-fn no_redirect_client() -> Result<reqwest::Client, IdentityError> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(IdentityError::Request)
-}
-
 /// Parses an issuer timestamp, or returns `None` when it is not RFC 3339.
 fn date(value: Option<&Value>) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value?.as_str()?, &Rfc3339).ok()
 }
 
 async fn post(
-    client: &reqwest::Client,
+    client: &IssuerClient,
     issuer: &str,
     path: &str,
     body: Value,
@@ -333,6 +340,7 @@ async fn post(
         ));
     }
     let response = client
+        .client
         .post(format!("{}{path}", issuer.trim_end_matches('/')))
         .json(&body)
         // Bounded so a stalled issuer cannot hang the request, and every
@@ -444,7 +452,7 @@ mod tests {
             })
         });
         let token = acquire(
-            no_redirect_client().unwrap(),
+            IssuerClient::new().unwrap(),
             "me@example.com".into(),
             code,
             AttestationRequest {
@@ -475,7 +483,7 @@ mod tests {
         let wrong: Arc<CodeCallback> =
             Arc::new(|_| -> CodeFuture { Box::pin(async { Some("000000".into()) }) });
         let error = acquire(
-            no_redirect_client().unwrap(),
+            IssuerClient::new().unwrap(),
             "me@example.com".into(),
             wrong,
             request.clone(),
@@ -492,7 +500,7 @@ mod tests {
 
         let declined: Arc<CodeCallback> = Arc::new(|_| -> CodeFuture { Box::pin(async { None }) });
         let result = acquire(
-            no_redirect_client().unwrap(),
+            IssuerClient::new().unwrap(),
             "me@example.com".into(),
             declined,
             request,
@@ -505,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_plain_http_issuers() {
         let error = send_code(
-            &reqwest::Client::new(),
+            &IssuerClient::new().unwrap(),
             "http://issuer.example",
             "me@example.com",
             "https://api.example",

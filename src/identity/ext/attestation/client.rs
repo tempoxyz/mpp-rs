@@ -117,6 +117,9 @@ impl Entry {
     }
 }
 
+/// Most acquisitions one rejected response can start.
+const MAX_ACQUISITIONS: usize = 3;
+
 /// How a retry answers one requirement.
 enum Decision {
     Reuse(String),
@@ -392,6 +395,9 @@ impl AttestationProver {
     ) -> Result<Option<HeaderValue>, IdentityError> {
         let mut obtained: Vec<(Key, String)> = Vec::new();
         let mut tried: HashSet<Key> = HashSet::new();
+        // A server lists what it wants; cap how many acquisitions one
+        // response can start, so it cannot drive an unbounded number.
+        let mut acquisitions = 0;
         let mut failure = None;
 
         // Every group must be met; one alternative meets it.
@@ -418,7 +424,11 @@ impl AttestationProver {
                 tried.insert(key.clone());
                 let result = match decision {
                     Decision::Reuse(token) => Ok(Some(token)),
-                    Decision::Acquire => self.acquire(&key, tokens_for(&sent, &key)).await,
+                    Decision::Acquire if acquisitions >= MAX_ACQUISITIONS => continue,
+                    Decision::Acquire => {
+                        acquisitions += 1;
+                        self.acquire(&key, tokens_for(&sent, &key)).await
+                    }
                 };
                 match result {
                     Ok(Some(token)) => {
@@ -568,6 +578,22 @@ impl AttestationProver {
                 .map(Clone::clone)
                 .map_err(ToString::to_string),
         });
+        drop(last);
+        // Drop the key's lock once nobody waits on it, so the map does not
+        // grow with every type a server ever listed.
+        let mut acquiring = self
+            .cache
+            .acquiring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if acquiring
+            .get(key)
+            .is_some_and(|held| Arc::ptr_eq(held, &lock))
+            && Arc::strong_count(&lock) == 2
+        {
+            acquiring.remove(key);
+        }
+        drop(acquiring);
         outcome
     }
 
@@ -954,6 +980,37 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn one_response_starts_at_most_three_acquisitions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let prover = AttestationProver::new([AUDIENCE], [ISSUER])
+            .unwrap()
+            .with_acquire(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok(None) }
+            });
+        let url: Url = "https://api.example/".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        let listed: Vec<String> = (0..10)
+            .map(|i| format!(r#"t{i};issuer="{ISSUER}""#))
+            .collect();
+        headers.insert(REQUIRED_HEADER, listed.join(", ").parse().unwrap());
+        let response = ResponseParts {
+            status: StatusCode::UNAUTHORIZED,
+            headers,
+            url: url.clone(),
+        };
+        let value = prover
+            .retry_value(&url, &HeaderMap::new(), &response)
+            .await
+            .unwrap();
+        assert!(value.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_ACQUISITIONS);
+        assert!(prover.cache.acquiring.lock().unwrap().is_empty());
     }
 
     #[test]
