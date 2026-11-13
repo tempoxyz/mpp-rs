@@ -10,8 +10,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings   # lint
 RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo doc --no-deps --all-features   # docs build without warnings
 sg scan -c sgconfig.yml src/ && sg test -c sgconfig.yml         # ast-grep rules (ast-grep 0.45)
 typos                                                           # spelling (_typos.toml)
-cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,integration-stripe,integration-ws   # unit and offline integration tests
-cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,integration-stripe,integration-ws   # doc tests
+cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,identity-tempo-id,integration-stripe,integration-ws   # unit and offline integration tests
+cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,identity-tempo-id,integration-stripe,integration-ws   # doc tests
 cargo check --workspace --exclude mpp                           # examples and alloy-transport-mpp
 cargo hack check --feature-powerset --depth 2 --no-dev-deps --skip integration,integration-stripe,integration-ws --exclude-features reqwest-default-tls,reqwest-native-tls,reqwest-rustls-tls,reqwest-rustls-tls-no-provider   # feature combinations
 cargo deny check                                                # licenses and advisories (deny.toml)
@@ -37,7 +37,7 @@ A bare `cargo test` builds only the default features and skips most of the suite
 
 ## Conventions
 
-- Features gate everything beyond the core types: `client`, `server`, `tempo` (implies `evm`), `stripe`, `middleware`, `tower`, `axum`, `ws`, `sqlite`, `utils`, `forward-proxy` and the `reqwest-*-tls` backends. New code compiles under every pairing of features (`cargo hack` above); put it behind the narrowest feature that needs it.
+- Features gate everything beyond the core types: `client`, `server`, `tempo` (implies `evm`), `stripe`, `middleware`, `tower`, `axum`, `ws`, `sqlite`, `utils`, `forward-proxy`, `identity`, `identity-tempo-id` and the `reqwest-*-tls` backends. New code compiles under every pairing of features (`cargo hack` above); put it behind the narrowest feature that needs it.
 - Compare HMACs and Challenge IDs with `constant_time_eq`, never `==` or `!=`; the `no-hmac-equality-compare` ast-grep rule enforces it.
 - Match mppx's names, defaults and errors. Behavior ported from mppx says so in the changelog (for example "as mppx does").
 - Payment helpers pay only when a request authorizes it (`AcceptPaymentPolicy::Explicit` by default) and verification takes the route's amount; keep both when changing client or server flows.

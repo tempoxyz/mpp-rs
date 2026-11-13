@@ -6,6 +6,17 @@ use crate::protocol::intents::ChargeRequest;
 use crate::protocol::traits::{ChargeMethod, ChargeValidation, VerificationError};
 use crate::server::events::PaymentSuccessContext;
 
+/// Decides whether a Credential may settle, after its HMAC, expiry, body
+/// digest and pinned fields are checked and before it is validated or
+/// broadcast. Identity payment checks use it.
+pub(crate) trait CredentialGate: Send + Sync {
+    /// Whether `credential` may settle.
+    fn admit<'a>(
+        &'a self,
+        credential: &'a PaymentCredential,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
 /// Whether two base-10 amounts are equal numerically: receivers accept
 /// leading zeros, as the Tempo charge spec requires. Anything that is not a
 /// digit string compares as text.
@@ -541,11 +552,48 @@ where
         request: &ChargeRequest,
         body: Option<&[u8]>,
     ) -> std::result::Result<Receipt, VerificationError> {
+        self.broadcast_gated(credential, request, body, None)
+            .await?
+            .ok_or_else(|| VerificationError::new("credential refused before settlement"))
+    }
+
+    /// Accept a credential matching expected route values, if `gate` admits
+    /// it once its HMAC, expiry, body digest and pinned fields check out.
+    ///
+    /// Returns `None` when the gate refuses; the credential is then neither
+    /// validated nor broadcast.
+    #[allow(dead_code)]
+    pub(crate) async fn verify_credential_with_expected_request_gated(
+        &self,
+        credential: &PaymentCredential,
+        expected: &ChargeRequest,
+        body: Option<&[u8]>,
+        gate: Option<&dyn CredentialGate>,
+    ) -> std::result::Result<Option<Receipt>, VerificationError> {
+        let request = Self::decode_credential_request(credential)?;
+        self.verify_expected_request_matches(credential, &request, expected)?;
+        self.broadcast_gated(credential, &request, body, gate).await
+    }
+
+    async fn broadcast_gated(
+        &self,
+        credential: &PaymentCredential,
+        request: &ChargeRequest,
+        body: Option<&[u8]>,
+        gate: Option<&dyn CredentialGate>,
+    ) -> std::result::Result<Option<Receipt>, VerificationError> {
         // Tier 1: HMAC provenance + expiry
         self.verify_hmac_and_expiry(credential)?;
         self.verify_body_digest(credential, body)?;
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request)?;
+        // An identity payment check runs before the payment is validated or
+        // broadcast, as mppx runs it before settlement.
+        if let Some(gate) = gate {
+            if !gate.admit(credential).await {
+                return Ok(None);
+            }
+        }
         let validation = self.validate_before_broadcast(credential, request).await?;
         let receipt = self
             .method
@@ -562,7 +610,7 @@ where
                 payer: validation.and_then(|validation| validation.payer),
             })
             .await;
-        Ok(receipt)
+        Ok(Some(receipt))
     }
 
     /// Backwards-compatible alias for [`Self::broadcast`].

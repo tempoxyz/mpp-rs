@@ -27,6 +27,7 @@ mod charge;
 #[cfg(feature = "tempo")]
 mod currencies;
 mod expected_request;
+mod gate;
 mod lifecycle;
 mod session;
 #[cfg(feature = "stripe")]

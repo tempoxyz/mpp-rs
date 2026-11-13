@@ -299,6 +299,10 @@ pub struct ChallengeOptions {
 pub struct MppCharge<C: ChargeConfig> {
     /// The verified payment receipt.
     pub receipt: Receipt,
+    /// Verified identities, when the route carries a
+    /// [`RouteIdentity`](crate::identity::RouteIdentity) extension; empty otherwise.
+    #[cfg(feature = "identity")]
+    pub identity: crate::identity::IdentityResults,
     _config: std::marker::PhantomData<C>,
 }
 
@@ -315,6 +319,10 @@ pub struct MppCharge<C: ChargeConfig> {
 pub struct MppChargeWithBody<C: ChargeConfig> {
     /// The verified payment receipt.
     pub receipt: Receipt,
+    /// Verified identities, when the route carries a
+    /// [`RouteIdentity`](crate::identity::RouteIdentity) extension; empty otherwise.
+    #[cfg(feature = "identity")]
+    pub identity: crate::identity::IdentityResults,
     /// The request body bytes that were bound to the challenge digest.
     pub body: Bytes,
     _config: std::marker::PhantomData<C>,
@@ -346,6 +354,14 @@ pub enum MppChargeRejection {
     /// The credential was rejected — return its problem details, with fresh
     /// challenges for retry unless the failure is the server's own.
     Problem(PaymentProblem),
+    /// The route's identity was rejected — return the rejection as is: its
+    /// status code, headers and reason, never a 402.
+    #[cfg(feature = "identity")]
+    Identity(crate::identity::IdentityRejection),
+    /// A 402 of a route with an identity payment check: the inner rejection,
+    /// with this `Identity-Required` header when it answers 402.
+    #[cfg(feature = "identity")]
+    IdentityRequired(Box<MppChargeRejection>, HeaderValue),
 }
 
 impl MppChargeRejection {
@@ -397,6 +413,21 @@ impl IntoResponse for MppChargeRejection {
             }
             MppChargeRejection::Body(rejection) => rejection.into_response(),
             MppChargeRejection::Problem(problem) => problem.into_response(),
+            #[cfg(feature = "identity")]
+            MppChargeRejection::Identity(rejection) => {
+                let (parts, body) = rejection.into_response().into_parts();
+                axum_core::response::Response::from_parts(parts, body.into())
+            }
+            #[cfg(feature = "identity")]
+            MppChargeRejection::IdentityRequired(inner, required) => {
+                let mut response = inner.into_response();
+                if response.status() == StatusCode::PAYMENT_REQUIRED {
+                    response
+                        .headers_mut()
+                        .insert(crate::identity::requirements::HEADER, required);
+                }
+                response
+            }
         }
     }
 }
@@ -551,6 +582,50 @@ pub trait ChargeChallenger: Send + Sync + 'static {
         self.verify_payment_for_route(credential_str, amount, mppx_scope, body)
     }
 
+    /// Verify a credential for a route with an identity payment check,
+    /// settling it only if `gate` admits it. Returns `Ok(None)` when the
+    /// gate refuses; the extractors then answer with the identity rejection.
+    ///
+    /// The built-in Tempo and Stripe challengers run the gate after the
+    /// credential's HMAC, expiry and pinned fields are checked and before it
+    /// settles, as mppx does. The default runs it on the parsed credential
+    /// before polling the future of
+    /// [`verify_payment_for_route_with_realm`](Self::verify_payment_for_route_with_realm),
+    /// which it creates first, so that method must not settle until polled.
+    /// A custom challenger should override this to check provenance first.
+    #[cfg(feature = "identity")]
+    fn verify_payment_for_route_with_identity(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: Option<&[u8]>,
+        request_realm: Option<&str>,
+        gate: crate::identity::PaymentGate,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>,
+    > {
+        // The verification future is created here but polled only after the
+        // gate admits the Credential: implementations must settle when polled,
+        // not in the method body, as the built-in Tempo and Stripe ones do
+        // (they override this method and admit first).
+        let credential = parse_authorization(credential_str);
+        let verified = self.verify_payment_for_route_with_realm(
+            credential_str,
+            amount,
+            mppx_scope,
+            body,
+            request_realm,
+        );
+        Box::pin(async move {
+            let credential = credential?;
+            if !gate.admit(&credential).await {
+                return Ok(None);
+            }
+            verified.await.map(Some)
+        })
+    }
+
     /// HTTP field containing the Payment credential.
     ///
     /// Defaults to `Authorization`. Servers created with `requires_auth`
@@ -599,6 +674,29 @@ where
     M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
+    let verified = verify_expected_gated(mpp, credential_str, expected, body, None);
+    Box::pin(async move {
+        verified
+            .await?
+            .ok_or_else(|| MppError::Internal("credential refused before settlement".to_owned()))
+    })
+}
+
+/// Verify a credential string against the route's expected challenge,
+/// settling it only if `gate` admits it. `None` when the gate refuses.
+#[cfg(any(feature = "stripe", feature = "tempo"))]
+#[allow(clippy::type_complexity)]
+fn verify_expected_gated<M, S>(
+    mpp: &super::Mpp<M, S>,
+    credential_str: &str,
+    expected: crate::error::Result<PaymentChallenge>,
+    body: Option<&[u8]>,
+    gate: Option<Arc<dyn super::CredentialGate>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>>
+where
+    M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
     let prepared = parse_authorization(credential_str).and_then(|credential| {
         let expected_request = expected?.request.decode()?;
         Ok((credential, expected_request))
@@ -607,20 +705,14 @@ where
     let body = body.map(<[u8]>::to_vec);
     Box::pin(async move {
         let (credential, expected_request) = prepared?;
-        let receipt = match &body {
-            Some(body) => {
-                mpp.verify_credential_with_expected_request_and_body(
-                    &credential,
-                    &expected_request,
-                    body,
-                )
-                .await
-            }
-            None => {
-                mpp.verify_credential_with_expected_request(&credential, &expected_request)
-                    .await
-            }
-        };
+        let receipt = mpp
+            .verify_credential_with_expected_request_gated(
+                &credential,
+                &expected_request,
+                body.as_deref(),
+                gate.as_deref(),
+            )
+            .await;
         Ok(receipt?)
     })
 }
@@ -852,6 +944,31 @@ where
             )
             .map(|mut offers| offers.remove(0));
         verify_expected(&mpp, credential_str, expected, body)
+    }
+
+    #[cfg(feature = "identity")]
+    fn verify_payment_for_route_with_identity(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: Option<&[u8]>,
+        request_realm: Option<&str>,
+        gate: crate::identity::PaymentGate,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>,
+    > {
+        let mpp = self.for_request_realm(request_realm);
+        let expected = mpp
+            .charge_with_options(
+                amount,
+                super::ChargeOptions {
+                    mppx_scope: mppx_scope.as_ref(),
+                    ..Default::default()
+                },
+            )
+            .map(|mut offers| offers.remove(0));
+        verify_expected_gated(&mpp, credential_str, expected, body, Some(Arc::new(gate)))
     }
 
     fn credential_header(&self) -> &str {
@@ -1109,8 +1226,223 @@ where
         verify_expected(&mpp, credential_str, expected, body)
     }
 
+    #[cfg(feature = "identity")]
+    fn verify_payment_for_route_with_identity(
+        &self,
+        credential_str: &str,
+        amount: &str,
+        mppx_scope: Option<serde_json::Value>,
+        body: Option<&[u8]>,
+        request_realm: Option<&str>,
+        gate: crate::identity::PaymentGate,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>,
+    > {
+        let mpp = self.for_request_realm(request_realm);
+        let expected = mpp.stripe_charge_with_options(
+            amount,
+            super::StripeChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        );
+        verify_expected_gated(&mpp, credential_str, expected, body, Some(Arc::new(gate)))
+    }
+
     fn credential_header(&self) -> &str {
         super::Mpp::credential_header(self)
+    }
+}
+
+/// The identity a route runs, from its [`RouteIdentity`](crate::identity::RouteIdentity) extension.
+#[cfg(feature = "identity")]
+type RouteIdentityInput = Option<(
+    crate::identity::RouteIdentity,
+    crate::identity::IdentityContext,
+)>;
+#[cfg(not(feature = "identity"))]
+type RouteIdentityInput = ();
+
+#[cfg(feature = "identity")]
+type Identified = crate::identity::IdentityResults;
+#[cfg(not(feature = "identity"))]
+type Identified = ();
+
+#[cfg(feature = "identity")]
+fn route_identity(parts: &http_types::request::Parts) -> RouteIdentityInput {
+    let route = parts
+        .extensions
+        .get::<crate::identity::RouteIdentity>()?
+        .clone();
+    // A nested router sees its path without the nesting prefix, but a proof
+    // names the URI the client requested.
+    let uri = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| parts.uri.clone(), |original| original.0.clone());
+    let request =
+        crate::identity::IdentityRequest::new(parts.method.clone(), uri, parts.headers.clone());
+    Some((route, crate::identity::IdentityContext::new(request)))
+}
+
+#[cfg(not(feature = "identity"))]
+fn route_identity(_parts: &http_types::request::Parts) -> RouteIdentityInput {}
+
+/// The route's offers, bound to `body` when the route binds one.
+fn route_offers(
+    challenger: &dyn ChargeChallenger,
+    amount: &str,
+    options: ChallengeOptions,
+    body: Option<&[u8]>,
+) -> Result<Vec<PaymentChallenge>, String> {
+    match body {
+        Some(body) => challenger.challenges_with_body(amount, options, body),
+        None => challenger.challenges(amount, options),
+    }
+}
+
+/// Adds the route's `Identity-Required` header to a 402 rejection.
+#[cfg(feature = "identity")]
+fn identity_required(
+    rejection: MppChargeRejection,
+    call: &mut Option<crate::identity::server::IdentityCall>,
+) -> MppChargeRejection {
+    match call
+        .as_mut()
+        .and_then(crate::identity::server::IdentityCall::challenge)
+    {
+        Some(required) => MppChargeRejection::IdentityRequired(Box::new(rejection), required),
+        None => rejection,
+    }
+}
+
+/// Runs a route's identity and payment checks, as mppx's route handler:
+/// request-stage verifiers first (a rejection is sent as is), then a 402 with
+/// the route's offers and `Identity-Required` header, or the Credential's
+/// verification with the payment check before it settles.
+#[allow(clippy::result_large_err)]
+async fn verify_route(
+    challenger: Arc<dyn ChargeChallenger>,
+    amount: &'static str,
+    options: ChallengeOptions,
+    credential_str: Option<String>,
+    body: Option<&[u8]>,
+    identity: RouteIdentityInput,
+) -> Result<(Receipt, Identified), MppChargeRejection> {
+    let mppx_scope = options.mppx_scope.clone();
+    let request_realm = options.request_realm.clone();
+
+    #[cfg(feature = "identity")]
+    let mut call = match identity {
+        None => None,
+        Some((route, context)) => {
+            // A verifier reading Authorization would take the Payment Credential's header.
+            if route.reads_authorization()
+                && challenger
+                    .credential_header()
+                    .eq_ignore_ascii_case(header::AUTHORIZATION.as_str())
+            {
+                return Err(MppChargeRejection::InternalError(
+                    "route identity reads Authorization: create the server with requires_auth"
+                        .into(),
+                ));
+            }
+            Some(
+                route
+                    .verify_request(&context)
+                    .await
+                    .map_err(MppChargeRejection::Identity)?,
+            )
+        }
+    };
+    #[cfg(not(feature = "identity"))]
+    let () = identity;
+
+    let Some(credential_str) = credential_str else {
+        let offers = route_offers(challenger.as_ref(), amount, options, body)
+            .map_err(MppChargeRejection::InternalError)?;
+        let rejection = MppChargeRejection::from_offers(offers);
+        #[cfg(feature = "identity")]
+        let rejection = identity_required(rejection, &mut call);
+        return Err(rejection);
+    };
+
+    #[cfg(feature = "identity")]
+    let verified = match call
+        .as_ref()
+        .and_then(crate::identity::server::IdentityCall::payment_gate)
+    {
+        Some(gate) => {
+            challenger
+                .verify_payment_for_route_with_identity(
+                    &credential_str,
+                    amount,
+                    mppx_scope,
+                    body,
+                    request_realm.as_deref(),
+                    gate,
+                )
+                .await
+        }
+        None => challenger
+            .verify_payment_for_route_with_realm(
+                &credential_str,
+                amount,
+                mppx_scope,
+                body,
+                request_realm.as_deref(),
+            )
+            .await
+            .map(Some),
+    };
+    #[cfg(not(feature = "identity"))]
+    let verified = challenger
+        .verify_payment_for_route_with_realm(
+            &credential_str,
+            amount,
+            mppx_scope,
+            body,
+            request_realm.as_deref(),
+        )
+        .await
+        .map(Some);
+
+    let receipt = match verified {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let rejection = MppChargeRejection::from_error(error, || {
+                route_offers(challenger.as_ref(), amount, options, body)
+            });
+            #[cfg(feature = "identity")]
+            let rejection = identity_required(rejection, &mut call);
+            return Err(rejection);
+        }
+    };
+
+    #[cfg(feature = "identity")]
+    {
+        let identified = match call {
+            None => crate::identity::IdentityResults::default(),
+            Some(call) => {
+                let credential = parse_authorization(&credential_str)
+                    .map_err(|e| MppChargeRejection::InternalError(e.to_string()))?;
+                // The payment check's memoized outcome: a refusal is sent as is.
+                call.accept(&credential)
+                    .await
+                    .map_err(MppChargeRejection::Identity)?
+            }
+        };
+        let receipt = receipt.ok_or_else(|| {
+            MppChargeRejection::InternalError("credential refused before settlement".into())
+        })?;
+        Ok((receipt, identified))
+    }
+    #[cfg(not(feature = "identity"))]
+    {
+        let receipt = receipt.ok_or_else(|| {
+            MppChargeRejection::InternalError("credential refused before settlement".into())
+        })?;
+        Ok((receipt, ()))
     }
 }
 
@@ -1135,44 +1467,30 @@ where
             .and_then(|v| v.to_str().ok())
             .and_then(extract_payment_scheme)
             .map(|s| s.to_string());
+        let identity = route_identity(parts);
 
         async move {
             let options = ChallengeOptions {
                 description: C::description(),
-                mppx_scope: mppx_scope.clone(),
-                request_realm: request_realm.clone(),
+                mppx_scope,
+                request_realm,
             };
-
-            let credential_str = match auth_header {
-                Some(c) => c,
-                None => {
-                    let offers = challenger
-                        .challenges(C::amount(), options)
-                        .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::from_offers(offers));
-                }
-            };
-
-            let receipt = match challenger
-                .verify_payment_for_route_with_realm(
-                    &credential_str,
-                    C::amount(),
-                    mppx_scope,
-                    None,
-                    request_realm.as_deref(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(error) => {
-                    return Err(MppChargeRejection::from_error(error, || {
-                        challenger.challenges(C::amount(), options)
-                    }));
-                }
-            };
-
+            #[allow(clippy::let_unit_value)]
+            let (receipt, identified) = verify_route(
+                challenger,
+                C::amount(),
+                options,
+                auth_header,
+                None,
+                identity,
+            )
+            .await?;
+            #[cfg(not(feature = "identity"))]
+            let () = identified;
             Ok(MppCharge {
                 receipt,
+                #[cfg(feature = "identity")]
+                identity: identified,
                 _config: std::marker::PhantomData,
             })
         }
@@ -1201,6 +1519,7 @@ where
             .and_then(|v| v.to_str().ok())
             .and_then(extract_payment_scheme)
             .map(|s| s.to_string());
+        let identity = route_identity(&parts);
         let req = Request::from_parts(parts, body);
 
         async move {
@@ -1210,40 +1529,25 @@ where
                 .map_err(MppChargeRejection::Body)?;
             let options = ChallengeOptions {
                 description: C::description(),
-                mppx_scope: mppx_scope.clone(),
-                request_realm: request_realm.clone(),
+                mppx_scope,
+                request_realm,
             };
-
-            let credential_str = match auth_header {
-                Some(c) => c,
-                None => {
-                    let offers = challenger
-                        .challenges_with_body(C::amount(), options, &body)
-                        .map_err(MppChargeRejection::InternalError)?;
-                    return Err(MppChargeRejection::from_offers(offers));
-                }
-            };
-
-            let receipt = match challenger
-                .verify_payment_for_route_with_realm(
-                    &credential_str,
-                    C::amount(),
-                    mppx_scope,
-                    Some(&body),
-                    request_realm.as_deref(),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(error) => {
-                    return Err(MppChargeRejection::from_error(error, || {
-                        challenger.challenges_with_body(C::amount(), options, &body)
-                    }));
-                }
-            };
-
+            #[allow(clippy::let_unit_value)]
+            let (receipt, identified) = verify_route(
+                challenger,
+                C::amount(),
+                options,
+                auth_header,
+                Some(&body),
+                identity,
+            )
+            .await?;
+            #[cfg(not(feature = "identity"))]
+            let () = identified;
             Ok(MppChargeWithBody {
                 receipt,
+                #[cfg(feature = "identity")]
+                identity: identified,
                 body,
                 _config: std::marker::PhantomData,
             })
@@ -1430,3 +1734,6 @@ impl<T: IntoResponse> IntoResponse for WithReceipt<T> {
 #[cfg(test)]
 #[allow(clippy::result_large_err)]
 mod tests;
+
+#[cfg(all(test, feature = "identity"))]
+mod identity_tests;
