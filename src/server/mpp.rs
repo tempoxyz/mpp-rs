@@ -31,6 +31,8 @@ mod session;
 mod verify;
 
 pub use session::SessionVerifyResult;
+#[allow(unused_imports)]
+pub(crate) use verify::CredentialGate;
 
 const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const DEFAULT_DECIMALS: u32 = 6;

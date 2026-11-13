@@ -43,6 +43,8 @@ use crate::protocol::core::PaymentChallenge;
 #[derive(Clone, Debug)]
 pub struct ChargeClient {
     client: Client,
+    #[cfg(feature = "identity")]
+    identity: Option<crate::identity::client::IdentityClient>,
     accept_payment_policy: AcceptPaymentPolicy,
     events: ClientEvents,
 }
@@ -55,9 +57,23 @@ impl ChargeClient {
             client: builder
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            #[cfg(feature = "identity")]
+            identity: None,
             accept_payment_policy: AcceptPaymentPolicy::default(),
             events: ClientEvents::default(),
         })
+    }
+
+    /// Proves every attempt of each request, unpaid and paid, with
+    /// `identity`'s in-scope provers, as mppx's `Mppx.create({ identity })`.
+    ///
+    /// Provers run on requests that do not authorize payment too. This client
+    /// never follows redirects, so proofs never reach another URL. A prover may
+    /// resend a rejected unpaid attempt once; a paid attempt is never resent.
+    #[cfg(feature = "identity")]
+    pub fn with_identity(mut self, identity: crate::identity::client::IdentityClient) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Choose when requests are paid and carry the provider's `Accept-Payment`
@@ -139,11 +155,39 @@ impl ChargeClient {
                         .is_some_and(|entries| entries.iter().any(|entry| entry.q > 0.0))
             }
         };
-        let mut exchange = ChargeExchange(&self.client);
-        if !payment_allowed || max_payment_retries == 0 {
+        let exchange = ChargeExchange(&self.client);
+        let max_payment_retries = if payment_allowed {
+            max_payment_retries
+        } else {
+            0
+        };
+        #[cfg(feature = "identity")]
+        if let Some(identity) = &self.identity {
+            let exchange = crate::identity::client::IdentityExchange::new(exchange, identity);
+            return self
+                .run(exchange, request, provider, max_payment_retries)
+                .await;
+        }
+        self.run(exchange, request, provider, max_payment_retries)
+            .await
+    }
+
+    /// Sends `request` through `exchange`, paying charge challenges unless
+    /// `max_payment_retries` is zero.
+    async fn run<X, P>(
+        &self,
+        mut exchange: X,
+        request: Request,
+        provider: &P,
+        max_payment_retries: usize,
+    ) -> Result<Response, HttpError>
+    where
+        X: Exchange<Error = HttpError>,
+        P: PaymentProvider,
+    {
+        if max_payment_retries == 0 {
             return exchange.send(request).await;
         }
-
         let flow = PaymentFlow {
             provider,
             policy: &self.accept_payment_policy,

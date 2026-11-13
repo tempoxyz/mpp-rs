@@ -13,6 +13,7 @@ use reqwest::header::{HeaderMap, HeaderValue, HOST};
 use reqwest_middleware::ClientBuilder;
 use tokio::net::TcpListener;
 
+use crate::client::flow::{send_with_exchange, Exchange};
 use crate::client::{
     AcceptPaymentPolicy, ClientEvents, Fetch, HttpError, PaymentContext, PaymentFailureReason,
     PaymentMiddleware, PaymentProvider,
@@ -1542,6 +1543,95 @@ fn session_receipt_spending_is_bounded_by_the_sent_voucher() {
             super::session_receipt_within_authorization(&receipt, &credential),
             valid
         );
+    }
+}
+
+/// Refuses every paid attempt before it leaves, as an identity prover can.
+struct RefusesPaid {
+    client: reqwest::Client,
+    unsent: bool,
+}
+
+impl Exchange for RefusesPaid {
+    type Error = HttpError;
+
+    fn unsent(&self) -> bool {
+        self.unsent
+    }
+
+    async fn send(&mut self, request: reqwest::Request) -> Result<reqwest::Response, HttpError> {
+        self.unsent = request
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION);
+        if self.unsent {
+            return Err(HttpError::Payment(MppError::InvalidConfig(
+                "refused".into(),
+            )));
+        }
+        self.client
+            .execute(request)
+            .await
+            .map_err(HttpError::request)
+    }
+}
+
+/// An unsent voucher is released, but an unsent hash Credential's transfer is
+/// already on chain: it is kept and reported with an unknown outcome.
+#[tokio::test]
+async fn unsent_paid_attempt_releases_only_unsettled_credentials() {
+    for intent in ["session", "charge"] {
+        let app = Router::new().route(
+            "/paid",
+            get(move || async move { payment_required("challenge-1", intent) }),
+        );
+        let url = spawn_server(app).await;
+        let provider = TestProvider::default();
+        let events = ClientEvents::default();
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = events.on_payment_failed({
+            let failed = failed.clone();
+            move |ctx| {
+                failed.lock().unwrap().push(ctx);
+                async {}
+            }
+        });
+        let client = reqwest::Client::new();
+        let request = client.get(format!("{url}/paid")).build().unwrap();
+        let mut exchange = RefusesPaid {
+            client,
+            unsent: false,
+        };
+
+        let result = send_with_exchange(
+            &mut exchange,
+            request,
+            &provider,
+            &AcceptPaymentPolicy::Always,
+            &events,
+            1,
+        )
+        .await;
+
+        assert!(result.is_err(), "{intent}");
+        assert_eq!(provider.paid(), ["challenge-1"], "{intent}");
+        let settled = intent == "charge";
+        assert_eq!(
+            provider.rolled_back.load(Ordering::SeqCst),
+            u32::from(!settled),
+            "{intent}"
+        );
+        let failed = failed.lock().unwrap().clone();
+        assert_eq!(failed.len(), 1, "{intent}");
+        match &failed[0].reason {
+            Some(PaymentFailureReason::OutcomeUnknown {
+                transaction_hash, ..
+            }) => {
+                assert!(settled, "{intent}");
+                assert_eq!(transaction_hash.as_deref(), Some("0xproof"));
+            }
+            None => assert!(!settled, "{intent}"),
+            other => panic!("{intent}: {other:?}"),
+        }
     }
 }
 
