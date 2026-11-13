@@ -97,7 +97,7 @@ jobs:
           # saving cost 8-16s at the end of every job.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Tests
-        run: cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,integration-stripe,integration-ws
+        run: cargo test --lib --bins --tests --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,identity-tempo-id,integration-stripe,integration-ws
         env:
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
       - name: Check Ring transport dependency graph
@@ -156,7 +156,7 @@ jobs:
       # Edition 2021 compiles each doctest separately (~15s), so they run
       # alongside the unit tests instead of after them.
       - name: Doc tests
-        run: cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,integration-stripe,integration-ws
+        run: cargo test --doc --features tempo,stripe,ws,server,client,axum,middleware,tower,utils,sqlite,sqlite-store,identity-tempo-id,integration-stripe,integration-ws
 
   features:
     name: Features ${{ matrix.partition }}
