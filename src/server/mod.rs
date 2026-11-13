@@ -67,6 +67,8 @@ pub use compose::{compose, compose_verify_with_expected_requests, ChargeVerifier
 pub use events::{
     PaymentSuccessContext, ServerEvent, ServerEventKind, ServerEventSubscription, ServerEvents,
 };
+#[allow(unused_imports)]
+pub(crate) use mpp::CredentialGate;
 pub use mpp::{Mpp, SessionVerifyResult};
 
 // Re-export tempo types at server level for backward compatibility

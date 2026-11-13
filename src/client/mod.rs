@@ -40,7 +40,7 @@ pub mod directory;
 #[cfg(feature = "client")]
 mod fetch;
 #[cfg(feature = "client")]
-mod flow;
+pub(crate) mod flow;
 #[cfg(feature = "forward-proxy")]
 mod forward_proxy;
 
