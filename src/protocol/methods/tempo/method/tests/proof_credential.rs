@@ -548,6 +548,11 @@ fn fixture_key(byte: u8) -> alloy::signers::local::PrivateKeySigner {
 
 /// The AccountKeychain `getKey` answer for the fixture's access key.
 fn get_key_result(expiry: u64, revoked: bool) -> serde_json::Value {
+    get_key_result_for(fixture_key(0x22).address(), expiry, revoked)
+}
+
+/// The AccountKeychain `getKey` answer naming `key_id`.
+fn get_key_result_for(key_id: Address, expiry: u64, revoked: bool) -> serde_json::Value {
     let word = |value: &[u8]| {
         let mut word = [0u8; 32];
         word[32 - value.len()..].copy_from_slice(value);
@@ -556,7 +561,7 @@ fn get_key_result(expiry: u64, revoked: bool) -> serde_json::Value {
     serde_json::Value::String(format!(
         "0x{}{}{}{}{}",
         word(&[0]),
-        word(fixture_key(0x22).address().as_slice()),
+        word(key_id.as_slice()),
         word(&expiry.to_be_bytes()),
         word(&[0]),
         word(&[u8::from(revoked)]),
@@ -584,8 +589,14 @@ fn keychain_method(
     expiry: u64,
     revoked: bool,
 ) -> ChargeMethod<impl alloy::providers::Provider<tempo_alloy::TempoNetwork> + Clone> {
+    keychain_method_with(get_key_result(expiry, revoked))
+}
+
+fn keychain_method_with(
+    get_key: serde_json::Value,
+) -> ChargeMethod<impl alloy::providers::Provider<tempo_alloy::TempoNetwork> + Clone> {
     let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&get_key_result(expiry, revoked));
+    asserter.push_success(&get_key);
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(asserter);
@@ -621,6 +632,87 @@ async fn test_viem_keychain_v2_proof_rejected_for_inactive_access_key() {
             "expiry {expiry}, revoked {revoked}: {err}"
         );
     }
+}
+
+/// Tempo's AccountKeychain answers a missing or revoked key with a blank
+/// entry: an access key is active only when `getKey` names it (non-zero key
+/// ID equal to the signer), it is not revoked, and its expiry is non-zero and
+/// in the future. A key that never expires has expiry `u64::MAX`.
+#[tokio::test]
+async fn test_keychain_proof_requires_key_id_matching_signer() {
+    let (credential, request) = keychain_proof_credential();
+    let far_future = u64::MAX - 1;
+    for (name, key_id) in [
+        ("zero key id", Address::ZERO),
+        ("other key id", fixture_key(0x33).address()),
+    ] {
+        let err = keychain_method_with(get_key_result_for(key_id, far_future, false))
+            .verify(&credential, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Proof signature does not match source"),
+            "{name}: {err}"
+        );
+    }
+    // A blank (missing key) entry is rejected too.
+    let err = keychain_method_with(get_key_result_for(Address::ZERO, 0, false))
+        .verify(&credential, &request)
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Proof signature does not match source"));
+    keychain_method(far_future, false)
+        .verify(&credential, &request)
+        .await
+        .unwrap();
+}
+
+#[test]
+fn test_is_active_access_key() {
+    use super::super::proof_credential::is_active_access_key;
+    use tempo_alloy::contracts::precompiles::IAccountKeychain::{KeyInfo, SignatureType};
+
+    let signer = Address::repeat_byte(0x22);
+    let key = |key_id: Address, expiry: u64, revoked: bool| KeyInfo {
+        signatureType: SignatureType::Secp256k1,
+        keyId: key_id,
+        expiry,
+        enforceLimits: false,
+        isRevoked: revoked,
+    };
+    let now = 1_000;
+    assert!(is_active_access_key(
+        &key(signer, u64::MAX, false),
+        signer,
+        now
+    ));
+    assert!(is_active_access_key(
+        &key(signer, now + 1, false),
+        signer,
+        now
+    ));
+    // Expired once the time reaches the expiry.
+    assert!(!is_active_access_key(&key(signer, now, false), signer, now));
+    // Expiry 0 means the key does not exist.
+    assert!(!is_active_access_key(&key(signer, 0, false), signer, now));
+    assert!(!is_active_access_key(
+        &key(signer, u64::MAX, true),
+        signer,
+        now
+    ));
+    assert!(!is_active_access_key(
+        &key(Address::ZERO, u64::MAX, false),
+        signer,
+        now
+    ));
+    assert!(!is_active_access_key(
+        &key(Address::repeat_byte(0x33), u64::MAX, false),
+        signer,
+        now
+    ));
 }
 
 /// A Keychain envelope that names another account is rejected before any

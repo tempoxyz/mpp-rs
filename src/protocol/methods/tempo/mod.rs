@@ -376,7 +376,8 @@ pub fn charge_challenge_with_options(
     use time::{Duration, OffsetDateTime};
 
     // Apply decimals transform if present (matches TS SDK's parseUnits behavior).
-    let request = request.clone().with_base_units()?;
+    let mut request = request.clone().with_base_units()?;
+    canonicalize_amounts(&mut request);
     get_request_transfers(&request)?;
 
     let encoded_request = Base64UrlJson::from_typed(&request)?;
@@ -425,6 +426,38 @@ pub fn charge_challenge_with_options(
         opaque: None,
         header: None,
     })
+}
+
+/// Strip leading zeros from a base-10 integer amount (`"0001000"` becomes
+/// `"1000"`, `"000"` becomes `"0"`). Anything else is returned unchanged
+/// for validation to reject.
+fn canonical_amount(amount: &str) -> Option<String> {
+    if amount.is_empty() || !amount.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let trimmed = amount.trim_start_matches('0');
+    Some(if trimmed.is_empty() { "0" } else { trimmed }.to_string())
+}
+
+/// The Tempo charge spec forbids senders to emit amounts with leading zeros:
+/// rewrite `amount` and every `methodDetails.splits[].amount` canonically.
+fn canonicalize_amounts(request: &mut crate::protocol::intents::ChargeRequest) {
+    if let Some(amount) = canonical_amount(&request.amount) {
+        request.amount = amount;
+    }
+    let splits = request
+        .method_details
+        .as_mut()
+        .and_then(|details| details.get_mut("splits"))
+        .and_then(serde_json::Value::as_array_mut);
+    for split in splits.into_iter().flatten() {
+        let Some(amount) = split.get_mut("amount") else {
+            continue;
+        };
+        if let Some(canonical) = amount.as_str().and_then(canonical_amount) {
+            *amount = serde_json::Value::String(canonical);
+        }
+    }
 }
 
 /// Generate a challenge ID using HMAC-SHA256 (cross-SDK compatible).
@@ -598,6 +631,65 @@ mod tests {
             challenge.expires.is_some(),
             "Challenge should have default expires"
         );
+    }
+
+    #[test]
+    fn test_charge_challenge_emits_amounts_without_leading_zeros() {
+        use crate::protocol::intents::ChargeRequest;
+
+        let request = ChargeRequest {
+            amount: "0001000".into(),
+            currency: "0x20c0000000000000000000000000000000000000".into(),
+            recipient: Some("0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2".into()),
+            method_details: Some(serde_json::json!({
+                "splits": [{
+                    "amount": "0000200",
+                    "recipient": "0x1111111111111111111111111111111111111111",
+                }],
+            })),
+            ..Default::default()
+        };
+        let challenge =
+            charge_challenge_with_options(TEST_SECRET, "api.example.com", &request, None, None)
+                .unwrap();
+        let issued: ChargeRequest = challenge.request.decode().unwrap();
+        assert_eq!(issued.amount, "1000");
+        assert_eq!(
+            issued.method_details.unwrap()["splits"][0]["amount"],
+            serde_json::json!("200")
+        );
+
+        let canonical = ChargeRequest {
+            amount: "1000".into(),
+            method_details: Some(serde_json::json!({
+                "splits": [{
+                    "amount": "200",
+                    "recipient": "0x1111111111111111111111111111111111111111",
+                }],
+            })),
+            ..request
+        };
+        let same = charge_challenge_with_options(
+            TEST_SECRET,
+            "api.example.com",
+            &canonical,
+            challenge.expires.as_deref(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(challenge.request.raw(), same.request.raw());
+        assert_eq!(challenge.id, same.id);
+    }
+
+    #[test]
+    fn test_canonical_amount() {
+        assert_eq!(canonical_amount("0001000").as_deref(), Some("1000"));
+        assert_eq!(canonical_amount("1000").as_deref(), Some("1000"));
+        assert_eq!(canonical_amount("000").as_deref(), Some("0"));
+        assert_eq!(canonical_amount("0").as_deref(), Some("0"));
+        assert_eq!(canonical_amount(""), None);
+        assert_eq!(canonical_amount("1.5"), None);
+        assert_eq!(canonical_amount("-1"), None);
     }
 
     #[test]

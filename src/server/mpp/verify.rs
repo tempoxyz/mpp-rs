@@ -17,6 +17,18 @@ pub(crate) trait CredentialGate: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 }
 
+/// Whether two base-10 amounts are equal numerically: receivers accept
+/// leading zeros, as the Tempo charge spec requires. Anything that is not a
+/// digit string compares as text.
+fn same_amount(a: &str, b: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if digits(a) && digits(b) {
+        a.trim_start_matches('0') == b.trim_start_matches('0')
+    } else {
+        a == b
+    }
+}
+
 impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
@@ -408,7 +420,7 @@ where
         request: &ChargeRequest,
         expected: &ChargeRequest,
     ) -> std::result::Result<(), VerificationError> {
-        if request.amount != expected.amount {
+        if !same_amount(&request.amount, &expected.amount) {
             return Err(VerificationError::with_code(
                 format!(
                     "Amount mismatch: credential has {} but endpoint expects {}",

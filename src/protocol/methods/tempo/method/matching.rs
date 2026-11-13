@@ -22,13 +22,15 @@ pub(super) struct TransferEffect {
 }
 
 /// Where the transfers given to [`match_transfers`] were read from.
+///
+/// From either source, an expected transfer without a memo takes a memo
+/// transfer before a plain one, so that the calls of a transaction checked
+/// before its broadcast match the same transfers its receipt logs do after.
 pub(super) enum TransferSource<'a> {
-    /// The calls of a transaction that is not broadcast yet. An expected
-    /// transfer without a memo takes the first matching call.
+    /// The calls of a transaction that is not broadcast yet.
     Calls,
-    /// The receipt logs. An expected transfer without a memo takes a memo
-    /// transfer before a plain one, and the sender of every matched transfer
-    /// must satisfy the policy.
+    /// The receipt logs. The sender of every matched transfer must satisfy
+    /// the policy.
     ReceiptLogs(ReceiptSenderPolicy<'a>),
 }
 
@@ -90,11 +92,9 @@ pub(super) fn match_transfers(
             })
         };
 
-        let index = match source {
-            TransferSource::ReceiptLogs(_) if expected.memo.is_none() => {
-                find(Some(true)).or_else(|| find(Some(false)))
-            }
-            _ => find(None),
+        let index = match expected.memo {
+            None => find(Some(true)).or_else(|| find(Some(false))),
+            Some(_) => find(None),
         };
 
         let Some(index) = index else {
