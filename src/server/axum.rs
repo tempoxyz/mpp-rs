@@ -1281,7 +1281,7 @@ fn identity_required(
 #[allow(clippy::result_large_err)]
 async fn verify_route(
     challenger: Arc<dyn ChargeChallenger>,
-    amount: &'static str,
+    amount: &str,
     options: ChallengeOptions,
     credential: Result<Option<String>, MppError>,
     body: Option<&[u8]>,
@@ -1502,6 +1502,138 @@ where
                 #[cfg(feature = "identity")]
                 identity: identified,
                 body,
+                _config: std::marker::PhantomData,
+            })
+        }
+    }
+}
+
+/// Per-request charge configuration for [`MppDynamicCharge`].
+///
+/// Like [`ChargeConfig`], but the amount is computed from each request, for
+/// example from its path, query or headers, or from a [`ChargeAmount`] an
+/// earlier layer stored in its extensions. Verification checks the credential
+/// against the amount computed for the request that carries it.
+///
+/// # Example
+///
+/// ```ignore
+/// use axum::extract::Query;
+/// use mpp::server::axum::{DynamicChargeConfig, MppDynamicCharge};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Order {
+///     items: u32,
+/// }
+///
+/// struct PerItem;
+/// impl DynamicChargeConfig for PerItem {
+///     fn amount(parts: &http::request::Parts) -> String {
+///         // An empty amount is refused with 500, but the handler's
+///         // `Query<Order>` runs first and answers a bad query with 400.
+///         Query::<Order>::try_from_uri(&parts.uri)
+///             .map(|Query(order)| format!("{}.00", order.items))
+///             .unwrap_or_default()
+///     }
+/// }
+///
+/// // Axum runs extractors in order, so a malformed query is rejected
+/// // before any challenge is issued.
+/// async fn handler(
+///     Query(order): Query<Order>,
+///     charge: MppDynamicCharge<PerItem>,
+/// ) -> String {
+///     format!("paid {} for {} items", charge.amount, order.items)
+/// }
+/// ```
+pub trait DynamicChargeConfig {
+    /// The dollar amount to charge for this request (e.g., `"0.01"`).
+    fn amount(parts: &http_types::request::Parts) -> String;
+
+    /// Human-readable description included in the challenge.
+    fn description(_parts: &http_types::request::Parts) -> Option<&'static str> {
+        None
+    }
+}
+
+/// A per-request amount, in dollars, stored in the request's extensions by an
+/// earlier layer (such as a middleware that looks the price up).
+///
+/// [`MppDynamicCharge<ChargeAmount>`](MppDynamicCharge) charges it; a request
+/// without one is rejected with `500` and no challenge, since the server
+/// failed to price it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChargeAmount(pub String);
+
+impl DynamicChargeConfig for ChargeAmount {
+    fn amount(parts: &http_types::request::Parts) -> String {
+        parts
+            .extensions
+            .get::<ChargeAmount>()
+            .map(|amount| amount.0.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Axum extractor that gates a handler behind payment verification, with the
+/// amount computed per request by a [`DynamicChargeConfig`].
+///
+/// Requires `Arc<dyn ChargeChallenger>` in router state, as [`MppCharge`] does.
+#[derive(Debug)]
+pub struct MppDynamicCharge<C: DynamicChargeConfig> {
+    /// The verified payment receipt.
+    pub receipt: Receipt,
+    /// The amount, in dollars, this request was charged.
+    pub amount: String,
+    /// Verified identities, when the route carries a
+    /// [`RouteIdentity`](crate::identity::RouteIdentity) extension; empty otherwise.
+    #[cfg(feature = "identity")]
+    pub identity: crate::identity::IdentityResults,
+    _config: std::marker::PhantomData<C>,
+}
+
+impl<S, C> FromRequestParts<S> for MppDynamicCharge<C>
+where
+    Arc<dyn ChargeChallenger>: FromRef<S>,
+    C: DynamicChargeConfig,
+    S: Send + Sync,
+{
+    type Rejection = MppChargeRejection;
+
+    fn from_request_parts(
+        parts: &mut http_types::request::Parts,
+        state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
+        let mppx_scope = mppx_scope_from_parts(parts);
+        let request_realm = request_realm_from_parts(parts);
+        let credential =
+            super::credential_from_headers(&parts.headers, challenger.credential_header());
+        let identity = route_identity(parts);
+        let amount = C::amount(parts);
+        let description = C::description(parts);
+        async move {
+            if amount.is_empty() {
+                return Err(MppChargeRejection::InternalError(
+                    "no amount for this request".into(),
+                ));
+            }
+            let options = ChallengeOptions {
+                description,
+                mppx_scope,
+                request_realm,
+            };
+            #[allow(clippy::let_unit_value)]
+            let (receipt, identified) =
+                verify_route(challenger, &amount, options, credential, None, identity).await?;
+            #[cfg(not(feature = "identity"))]
+            let () = identified;
+            Ok(MppDynamicCharge {
+                receipt,
+                amount,
+                #[cfg(feature = "identity")]
+                identity: identified,
                 _config: std::marker::PhantomData,
             })
         }

@@ -1943,4 +1943,122 @@ mod core_spec_credentials {
             assert_eq!(body["title"], "Payment Required");
         }
     }
+
+    #[derive(Debug)]
+    struct QueryPrice;
+    impl DynamicChargeConfig for QueryPrice {
+        fn amount(parts: &http_types::request::Parts) -> String {
+            parts
+                .uri
+                .query()
+                .and_then(|query| query.strip_prefix("price="))
+                .unwrap_or("0.01")
+                .to_string()
+        }
+    }
+
+    /// Accepts every credential, recording the amount each verification
+    /// was asked to check.
+    struct AmountRecorder {
+        verified: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ChargeChallenger for AmountRecorder {
+        fn challenge(
+            &self,
+            amount: &str,
+            options: ChallengeOptions,
+        ) -> Result<PaymentChallenge, String> {
+            MockChallenger { accept: true }.challenge(amount, options)
+        }
+
+        fn verify_payment(
+            &self,
+            credential_str: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            MockChallenger { accept: true }.verify_payment(credential_str)
+        }
+
+        fn verify_payment_for_amount_and_scope(
+            &self,
+            credential_str: &str,
+            amount: &str,
+            _mppx_scope: Option<serde_json::Value>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, String>> + Send>>
+        {
+            self.verified.lock().unwrap().push(amount.to_string());
+            self.verify_payment(credential_str)
+        }
+    }
+
+    async fn run_dynamic<C: DynamicChargeConfig>(
+        uri: &str,
+        auth: Option<&str>,
+        extension: Option<ChargeAmount>,
+    ) -> Result<MppDynamicCharge<C>, MppChargeRejection> {
+        run_dynamic_with(uri, auth, extension, Default::default()).await
+    }
+
+    async fn run_dynamic_with<C: DynamicChargeConfig>(
+        uri: &str,
+        auth: Option<&str>,
+        extension: Option<ChargeAmount>,
+        verified: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Result<MppDynamicCharge<C>, MppChargeRejection> {
+        let state: Arc<dyn ChargeChallenger> = Arc::new(AmountRecorder { verified });
+        let mut builder = http_types::Request::builder().uri(uri);
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        let (mut parts, _body) = builder.body(()).unwrap().into_parts();
+        if let Some(extension) = extension {
+            parts.extensions.insert(extension);
+        }
+        MppDynamicCharge::<C>::from_request_parts(&mut parts, &state).await
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_charge_prices_each_request() {
+        let MppChargeRejection::Challenge(PaymentRequired(challenge)) =
+            run_dynamic::<QueryPrice>("/test?price=2.50", None, None)
+                .await
+                .unwrap_err()
+        else {
+            panic!("expected a challenge");
+        };
+        assert_eq!(challenge.request.decode_value().unwrap()["amount"], "2.50");
+
+        let verified = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let paid = run_dynamic_with::<QueryPrice>(
+            "/test?price=2.50",
+            Some("Payment eyJ9"),
+            None,
+            verified.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paid.amount, "2.50");
+        assert_eq!(paid.receipt.reference, "0xabc");
+
+        let paid = run_dynamic_with::<ChargeAmount>(
+            "/test",
+            Some("Payment eyJ9"),
+            Some(ChargeAmount("0.25".into())),
+            verified.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paid.amount, "0.25");
+        // Each credential is verified against its own request's amount.
+        assert_eq!(*verified.lock().unwrap(), ["2.50", "0.25"]);
+
+        // A request nobody priced is the server's failure: 500, no challenge.
+        let response = run_dynamic::<ChargeAmount>("/test", None, None)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+    }
 }

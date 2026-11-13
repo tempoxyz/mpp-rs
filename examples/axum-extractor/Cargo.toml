@@ -9,6 +9,10 @@ name = "axum-server"
 path = "src/server.rs"
 
 [[bin]]
+name = "axum-readme"
+path = "src/readme.rs"
+
+[[bin]]
 name = "axum-client"
 path = "src/client.rs"
 
