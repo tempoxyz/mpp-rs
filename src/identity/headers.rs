@@ -6,7 +6,12 @@
 /// expires, so it is never sent across origins or forwarded upstream by a
 /// proxy. Provers declare their own extra sensitive headers in
 /// [`Prover::headers`](super::client::Prover::headers).
-pub const REQUEST: &[&str] = &["identity-attestation", "identity-presentation"];
+pub const REQUEST: &[&str] = &[
+    "dpop",
+    "identity-attestation",
+    "identity-presentation",
+    "tempo-id-token",
+];
 
 /// `WWW-Authenticate` schemes that ask for an identity, lowercased. A proxy
 /// removes them from upstream responses: the proxy, not the upstream, decides
