@@ -15,8 +15,9 @@ use super::challenge_selection::{
 };
 use super::error::HttpError;
 use super::events::{
-    ChallengeReceivedContext, ClientEvent, ClientEvents, CredentialCreatedContext,
-    PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
+    ChallengeDecision, ChallengeReceivedContext, ClientEvent, ClientEvents,
+    CredentialCreatedContext, OnChallengeContext, PaymentFailedContext, PaymentFailureReason,
+    PaymentResponseContext,
 };
 use super::provider::{PaymentContext, PaymentProvider, PendingPayment};
 use crate::error::MppError;
@@ -38,11 +39,19 @@ pub trait Exchange: Send {
     /// Restricts server challenges before provider preparation and after preparation.
     /// Prepaid credentials are controlled separately by [`Self::allows_prepaid`].
     ///
-    /// The default rejects custom credential headers because a caller-owned
-    /// client may forward them across redirects. Only override this restriction
-    /// when the transport enforces its own redirect-safe credential handling.
+    /// The default accepts only challenges that send the credential in
+    /// `Authorization`, which HTTP clients drop on a redirect to another
+    /// host. A client that follows redirects forwards `Payment-Authorization`
+    /// to wherever the server redirects the paid request, so the default
+    /// refuses it with [`HttpError::UnsafeCredentialHeader`] before signing.
+    /// Override this to accept `Payment-Authorization` on a transport that
+    /// never follows redirects, as [`ChargeClient`](super::ChargeClient) does,
+    /// or to restrict challenges further.
     fn check_challenge(&self, challenge: &PaymentChallenge) -> Result<(), HttpError> {
-        if challenge.credential_header() == "Authorization" {
+        if challenge
+            .credential_header()
+            .eq_ignore_ascii_case("Authorization")
+        {
             Ok(())
         } else {
             Err(HttpError::UnsafeCredentialHeader)
@@ -219,8 +228,19 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 headers,
             }
         });
+        // A credential the caller set on the request is sent as it is, like
+        // mppx's `initialCredentialSent`; its rejection is answered below.
+        let caller_credential = carries_payment_credential(request.headers());
+        let request_headers = caller_credential.then(|| request.headers().clone());
         let prepaid = match (&initial_response, &payment_context) {
-            (None, Some(context)) if payment_allowed && exchange.allows_prepaid() => {
+            // A prepaid credential is sent before any 402, so it would bypass
+            // the approval hook; with a hook set, every payment waits for one.
+            (None, Some(context))
+                if payment_allowed
+                    && !caller_credential
+                    && exchange.allows_prepaid()
+                    && !self.events.has_on_challenge() =>
+            {
                 self.provider.prepaid_credential(context.clone()).await
             }
             _ => None,
@@ -268,6 +288,33 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
         if resp.status() != StatusCode::PAYMENT_REQUIRED || !payment_allowed {
             return Ok(resp);
+        }
+
+        // The caller's own credential was refused. Under the same rules as a
+        // credential this flow sent, the 402 is final: the earlier payment
+        // behind that credential may have settled, so paying the fresh
+        // challenge could pay twice.
+        if caller_credential {
+            // A hash credential's transfer is already on chain, so any 402
+            // answering it is final, as for a hash credential this flow sent.
+            if carries_hash_credential(request_headers.as_ref()) {
+                return Ok(resp);
+            }
+            let (rebuilt, rejected) = credential_rejected(resp).await;
+            resp = rebuilt;
+            if rejected {
+                return Ok(resp);
+            }
+        } else if is_problem_json(&resp) {
+            // A credential can reach the server without being on the request
+            // seen here, such as from the client's default headers. Servers
+            // answer invalid-challenge only to a credential, so it is final
+            // here too.
+            let (rebuilt, problem_type) = read_problem_type(resp).await;
+            resp = rebuilt;
+            if problem_type.is_some_and(|kind| kind.ends_with("/invalid-challenge")) {
+                return Ok(resp);
+            }
         }
 
         let (Some(retry), Some(payment_context)) = (retry, payment_context) else {
@@ -446,13 +493,36 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Ok(resp);
             }
 
-            let override_credential = self
+            let mut override_credential = self
                 .events
                 .emit_challenge_received(ChallengeReceivedContext {
                     challenge: challenge.clone(),
-                    challenges,
+                    challenges: challenges.clone(),
                 })
                 .await;
+            // As in mppx, `challenge.received` credentials skip `onChallenge`.
+            if override_credential.is_none() {
+                match self
+                    .events
+                    .decide_on_challenge(OnChallengeContext {
+                        challenge: challenge.clone(),
+                        challenges,
+                        // The credential goes to the final URL of any
+                        // same-origin redirect, so that is what is approved.
+                        url: resp.url().clone(),
+                        method: retry.method().clone(),
+                        headers: payment_context.headers.clone(),
+                    })
+                    .await
+                {
+                    ChallengeDecision::Pay => {}
+                    // Declined before anything was signed: hand back the 402.
+                    ChallengeDecision::Decline => return Ok(resp),
+                    ChallengeDecision::Credential(credential) => {
+                        override_credential = Some(*credential);
+                    }
+                }
+            }
 
             let credential = match override_credential {
                 Some(credential) => credential,
@@ -494,6 +564,10 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             // The challenge came from the final URL of any same-origin redirect,
             // so that is where the credential goes.
             *paid.url_mut() = resp.url().clone();
+            // The paid retry carries this credential alone: a caller's
+            // credential in the field the challenge does not select would
+            // make the server refuse a request that now carries two.
+            remove_payment_credentials(paid.headers_mut());
             paid.headers_mut().insert(
                 crate::client::payment_credential_header_name(&challenge),
                 auth_header,
@@ -627,6 +701,23 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 .is_ok_and(|payload| payload.is_hash())
             {
                 return Ok(resp);
+            }
+
+            // A credential the server refused as an invalid challenge (which is
+            // also how a replayed credential is answered) must not be paid
+            // again: the earlier payment may have settled, and paying the fresh
+            // challenge could pay twice, so that 402 is final. So is an empty
+            // 402, which is how the default Tower layer answers a rejected
+            // credential, and a problem whose type cannot be read. A problem
+            // naming another failure, such as verification-failed, or a 402
+            // with another body is paid again, as in mppx (which has no
+            // empty-body rejections to tell apart).
+            if status == StatusCode::PAYMENT_REQUIRED {
+                let (rebuilt, rejected) = credential_rejected(resp).await;
+                resp = rebuilt;
+                if rejected {
+                    return Ok(resp);
+                }
             }
 
             // Any other completed HTTP response is the application's answer,
@@ -778,8 +869,17 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         session: bool,
     ) -> Option<u128> {
         if session {
-            return receipt
-                .and_then(|receipt| self.provider.record_receipt(context, challenge, receipt));
+            // A prepaid voucher or top-up for the next request would be paid
+            // without the approval hook, so with one set none is arranged.
+            let hooked = self.events.has_on_challenge();
+            return receipt.and_then(|receipt| {
+                if hooked {
+                    self.provider
+                        .record_receipt_without_prepay(context, challenge, receipt)
+                } else {
+                    self.provider.record_receipt(context, challenge, receipt)
+                }
+            });
         }
         challenge
             .request
@@ -858,6 +958,296 @@ pub fn is_cross_realm_proof_with_trust(
     binds_realm
         && !requested_host.is_some_and(|host| challenge.realm.eq_ignore_ascii_case(&host))
         && trusted_realm != Some(challenge.realm.as_str())
+}
+
+/// Whether `headers` carry a Payment credential: a `Payment-Authorization`
+/// header, or a `Payment` scheme anywhere in an `Authorization` value,
+/// including one comma-joined after another scheme, as the server reads it.
+fn carries_payment_credential(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key("payment-authorization")
+        || headers
+            .get_all(reqwest::header::AUTHORIZATION)
+            .iter()
+            .any(authorization_has_payment)
+}
+
+/// Whether an `Authorization` value holds a `Payment` scheme in any of its
+/// comma-separated elements. A value with bytes outside visible ASCII, such
+/// as obs-text in a quoted parameter, is read as bytes the same way.
+fn authorization_has_payment(value: &HeaderValue) -> bool {
+    let tokenized = value
+        .to_str()
+        .is_ok_and(crate::protocol::core::headers::has_payment_scheme);
+    tokenized
+        || scheme_starts(value.as_bytes())
+            .any(|(element, starts)| starts && is_payment_element(element))
+}
+
+/// The comma-separated elements of an `Authorization` value, with commas
+/// inside quoted strings kept. Works on bytes, so obs-text is carried as it is.
+fn authorization_elements(value: &[u8]) -> Vec<&[u8]> {
+    let mut elements = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, byte) in value.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && *byte == b'\\' {
+            escaped = true;
+        } else if *byte == b'"' {
+            quoted = !quoted;
+        } else if *byte == b',' && !quoted {
+            elements.push(&value[start..index]);
+            start = index + 1;
+        }
+    }
+    elements.push(&value[start..]);
+    elements
+}
+
+/// The elements of an `Authorization` value, each with whether it starts a
+/// new scheme. The first non-empty element is the first word of the value.
+fn scheme_starts(value: &[u8]) -> impl Iterator<Item = (&[u8], bool)> {
+    let mut first = true;
+    authorization_elements(value)
+        .into_iter()
+        .map(move |element| {
+            let starts = starts_scheme(element, first);
+            first &= element.trim_ascii().is_empty();
+            (element, starts)
+        })
+}
+
+/// Whether an element that starts a scheme starts a `Payment` one:
+/// `Payment` alone or followed by whitespace.
+fn is_payment_element(element: &[u8]) -> bool {
+    let scheme = element
+        .trim_ascii_start()
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default();
+    scheme.eq_ignore_ascii_case(b"payment")
+}
+
+/// Whether an element starts a new scheme rather than continuing the
+/// previous one's auth-params (`name BWS = BWS value`), as the crate's
+/// header tokenizer decides: a first word followed by `=`, after optional
+/// whitespace, is an auth-param, except in the first element of the value
+/// (`first`), where a word followed by SP or HTAB is always a scheme. A
+/// token68 ending in `=` padding follows its scheme and a space, so it does
+/// not make its element an auth-param.
+fn starts_scheme(element: &[u8], first: bool) -> bool {
+    let element = element.trim_ascii_start();
+    if element.is_empty() {
+        return false;
+    }
+    let name_end = element
+        .iter()
+        .position(|byte| *byte == b'=' || byte.is_ascii_whitespace())
+        .unwrap_or(element.len());
+    let after_name = &element[name_end..];
+    !after_name.trim_ascii_start().starts_with(b"=")
+        || (first && matches!(after_name.first(), Some(b' ' | b'\t')))
+}
+
+/// An `Authorization` value without its `Payment` schemes and their
+/// parameters, or `None` when nothing else is left.
+fn without_payment_schemes(value: &[u8]) -> Option<Vec<u8>> {
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut in_payment = false;
+    for (element, starts) in scheme_starts(value) {
+        if starts {
+            in_payment = is_payment_element(element);
+        }
+        if !in_payment && !element.trim_ascii().is_empty() {
+            kept.push(element.trim_ascii());
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join(&b", "[..]))
+}
+
+/// Remove every Payment credential from a request's headers:
+/// `Payment-Authorization` and any `Payment` scheme in an `Authorization`
+/// value, including one comma-joined with another scheme. The other schemes
+/// stay, byte for byte, also when they carry bytes outside visible ASCII.
+pub(crate) fn remove_payment_credentials(headers: &mut HeaderMap) {
+    headers.remove("payment-authorization");
+    let kept: Vec<HeaderValue> = headers
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .filter_map(|value| {
+            if !authorization_has_payment(value) {
+                return Some(value.clone());
+            }
+            let rest = without_payment_schemes(value.as_bytes())?;
+            // The rest is the value's own non-empty, trimmed elements joined
+            // by ", ", so it is always a valid value. Were it not, keeping the
+            // original would send its Payment credential next to the new one.
+            let mut rebuilt = HeaderValue::from_bytes(&rest).ok()?;
+            rebuilt.set_sensitive(value.is_sensitive());
+            Some(rebuilt)
+        })
+        .collect();
+    headers.remove(reqwest::header::AUTHORIZATION);
+    for value in kept {
+        headers.append(reqwest::header::AUTHORIZATION, value);
+    }
+}
+
+/// Whether the caller's own credential on a request is a Tempo hash (push)
+/// credential, whose transfer is already on chain. Reads `Authorization:
+/// Payment` and `Payment-Authorization` (with or without the scheme).
+fn carries_hash_credential(headers: Option<&HeaderMap>) -> bool {
+    let Some(headers) = headers else {
+        return false;
+    };
+    let is_hash = |value: &str| {
+        crate::protocol::core::parse_authorization(value)
+            .or_else(|_| crate::protocol::core::parse_authorization(&format!("Payment {value}")))
+            .ok()
+            .and_then(|credential| credential.charge_payload().ok())
+            .is_some_and(|payload| payload.is_hash())
+    };
+    headers
+        .get_all(reqwest::header::AUTHORIZATION)
+        .iter()
+        .chain(headers.get_all("payment-authorization").iter())
+        .filter_map(|value| value.to_str().ok())
+        .any(is_hash)
+}
+
+/// Whether a `402` answering a credential is final rather than a fresh
+/// Challenge to pay: an `invalid-challenge` problem (how a replayed
+/// credential is answered), a problem whose type cannot be read, or an empty
+/// body (how the default Tower layer answers a rejected credential). A
+/// problem naming another failure, such as `verification-failed`, or a 402
+/// with another body is paid again, as in mppx. Returns an equivalent
+/// response, since reading the problem type consumes the body.
+async fn credential_rejected(resp: Response) -> (Response, bool) {
+    if is_problem_json(&resp) {
+        let (rebuilt, problem_type) = read_problem_type(resp).await;
+        let rejected = problem_type.is_none_or(|kind| kind.ends_with("/invalid-challenge"));
+        (rebuilt, rejected)
+    } else {
+        has_empty_body(resp).await
+    }
+}
+
+/// Whether a response's body is RFC 9457 problem details.
+fn is_problem_json(resp: &Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media| {
+                media
+                    .trim()
+                    .eq_ignore_ascii_case("application/problem+json")
+            })
+        })
+}
+
+/// The most of a paid request's `402` body the flow reads to learn its
+/// problem type or whether it is empty. The server picks the body's size, so
+/// reading stops here; the rest is handed back unread.
+const MAX_PROBLEM_BODY_BYTES: usize = 64 * 1024;
+
+/// Read up to `limit` bytes of `resp`'s body and return them, whether that
+/// was the whole body (a read that reaches `limit` stops there without
+/// waiting to learn whether more follows, and is not complete), and an
+/// equivalent response: same status, version,
+/// headers, extensions and URL, whose body is the bytes read followed by the
+/// unread rest of the stream, or by the read error that cut it short.
+async fn peek_body(mut resp: Response, limit: usize) -> (Response, Vec<u8>, bool) {
+    use futures_util::StreamExt;
+    use reqwest::ResponseBuilderExt;
+
+    let status = resp.status();
+    let version = resp.version();
+    let url = resp.url().clone();
+    let headers = resp.headers().clone();
+    let extensions = resp.extensions().clone();
+    let mut read = Vec::new();
+    let mut overflow = None;
+    let mut error = None;
+    let mut at_limit = false;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = limit - read.len();
+                if chunk.len() > room {
+                    read.extend_from_slice(&chunk[..room]);
+                    overflow = Some(chunk.slice(room..));
+                    break;
+                }
+                read.extend_from_slice(&chunk);
+                if read.len() == limit {
+                    // The limit is reached: whether more follows is not
+                    // awaited, so a stalled stream cannot hold the caller.
+                    at_limit = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                error = Some(err);
+                break;
+            }
+        }
+    }
+    let complete = overflow.is_none() && error.is_none() && !at_limit;
+    let body = if complete {
+        reqwest::Body::from(read.clone())
+    } else {
+        let head = futures_util::stream::once(std::future::ready(Ok::<_, reqwest::Error>(
+            bytes::Bytes::from(read.clone()),
+        )));
+        match error {
+            Some(err) => reqwest::Body::wrap_stream(
+                head.chain(futures_util::stream::once(std::future::ready(Err(err)))),
+            ),
+            None => reqwest::Body::wrap_stream(
+                head.chain(futures_util::stream::iter(overflow.map(Ok)))
+                    .chain(resp.bytes_stream()),
+            ),
+        }
+    };
+    let mut builder = http_types::Response::builder()
+        .status(status)
+        .version(version);
+    if let Some(builder_extensions) = builder.extensions_mut() {
+        *builder_extensions = extensions;
+    }
+    // After the extensions, so the URL is kept.
+    let mut builder = builder.url(url);
+    if let Some(builder_headers) = builder.headers_mut() {
+        *builder_headers = headers;
+    }
+    let rebuilt = builder
+        .body(body)
+        .map(Response::from)
+        .unwrap_or_else(|_| Response::from(http_types::Response::new(Vec::<u8>::new())));
+    (rebuilt, read, complete)
+}
+
+/// Whether `resp`'s body is empty, with an equivalent response. A body
+/// that fails to arrive is not counted as empty.
+async fn has_empty_body(resp: Response) -> (Response, bool) {
+    // One byte settles it, so the read stops at the first byte instead of
+    // waiting for the server to finish the body.
+    let (rebuilt, read, complete) = peek_body(resp, 1).await;
+    (rebuilt, complete && read.is_empty())
+}
+
+/// Read the problem type of a problem-details response, and return an
+/// equivalent response with the same status, headers, extensions, URL and
+/// whole body. A body cut at the limit or by a read error has no type.
+async fn read_problem_type(resp: Response) -> (Response, Option<String>) {
+    let (rebuilt, read, complete) = peek_body(resp, MAX_PROBLEM_BODY_BYTES).await;
+    let problem_type = complete
+        .then(|| serde_json::from_slice::<serde_json::Value>(&read).ok())
+        .flatten()
+        .and_then(|problem| problem.get("type")?.as_str().map(str::to_string));
+    (rebuilt, problem_type)
 }
 
 /// The receipt answering a session `credential`, when the response carries a valid one.

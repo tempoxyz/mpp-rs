@@ -1172,7 +1172,7 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_policy_default_requires_explicit_preference() {
+    async fn test_policy_default_injects_preferences() {
         let (base_url, captured) = spawn_header_capture().await;
         let client = ClientBuilder::new(reqwest::Client::new())
             .with(PaymentMiddleware::new(AdvertisingProvider))
@@ -1182,7 +1182,54 @@ mod integration {
             .send()
             .await
             .unwrap();
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("tempo/charge"));
+    }
+
+    #[tokio::test]
+    async fn test_policy_explicit_requires_preference() {
+        let (base_url, captured) = spawn_header_capture().await;
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(
+                PaymentMiddleware::new(AdvertisingProvider)
+                    .with_accept_payment_policy(AcceptPaymentPolicy::Explicit),
+            )
+            .build();
+        client
+            .get(format!("{}/probe", base_url))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(captured.lock().unwrap().as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn test_with_on_challenge_declines_payment() {
+        let (_, www_auth) = test_challenge();
+        let app = Router::new().route(
+            "/paid",
+            get(move || {
+                let www_auth = www_auth.clone();
+                async move {
+                    (
+                        AxumStatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTH_NAME, www_auth)],
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let base_url = spawn_server(app).await;
+        let provider = TestProvider::new();
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(PaymentMiddleware::new(provider.clone()).with_on_challenge(|_| async { false }))
+            .build();
+        let response = client
+            .get(format!("{}/paid", base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(provider.call_count(), 0);
     }
 
     #[tokio::test]

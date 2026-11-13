@@ -17,9 +17,13 @@ use crate::protocol::core::PaymentChallenge;
 /// Session challenges and session management are excluded. The provider's
 /// prepaid-credential hook is never called; payment follows a server challenge.
 ///
-/// Automatic payment requires a valid request-level `Accept-Payment` header.
-/// Client default headers do not authorize payment. Preferences, including
-/// `q=0` opt-outs, are respected by the shared challenge selector.
+/// It pays without a request-level `Accept-Payment` header by default, as
+/// mppx does ([`AcceptPaymentPolicy::Always`]). Select
+/// [`AcceptPaymentPolicy::Explicit`] with [`Self::with_accept_payment_policy`]
+/// to require a valid request-level header; client default headers never count.
+/// A request-level header that is repeated, malformed or opts out of every
+/// method (`q=0`) is never paid. Approve or decline each payment with
+/// [`Self::with_on_challenge`].
 ///
 /// ```no_run
 /// # async fn example<P: mpp::client::PaymentProvider>(provider: &P)
@@ -30,8 +34,7 @@ use crate::protocol::core::PaymentChallenge;
 /// let client = ChargeClient::new(reqwest::Client::builder())?;
 /// let response = client.send_with_payment(
 ///     client.request(Method::GET, "https://api.example.com/paid")
-///         .bearer_auth("api-key")
-///         .header("Accept-Payment", "tempo/charge"),
+///         .bearer_auth("api-key"),
 ///     provider,
 /// ).await?;
 /// # Ok(())
@@ -42,6 +45,8 @@ pub struct ChargeClient {
     client: Client,
     #[cfg(feature = "identity")]
     identity: Option<crate::identity::client::IdentityClient>,
+    accept_payment_policy: AcceptPaymentPolicy,
+    events: ClientEvents,
 }
 
 impl ChargeClient {
@@ -54,6 +59,8 @@ impl ChargeClient {
                 .build()?,
             #[cfg(feature = "identity")]
             identity: None,
+            accept_payment_policy: AcceptPaymentPolicy::default(),
+            events: ClientEvents::default(),
         })
     }
 
@@ -69,12 +76,43 @@ impl ChargeClient {
         self
     }
 
+    /// Choose when requests are paid and carry the provider's `Accept-Payment`
+    /// preferences. Defaults to [`AcceptPaymentPolicy::Always`];
+    /// [`AcceptPaymentPolicy::Explicit`] pays only requests with a valid
+    /// request-level header, and [`AcceptPaymentPolicy::Disabled`] never pays.
+    pub fn with_accept_payment_policy(mut self, policy: AcceptPaymentPolicy) -> Self {
+        self.accept_payment_policy = policy;
+        self
+    }
+
+    /// Use an existing event registry for payment callbacks, including its
+    /// [`on_challenge`](ClientEvents::set_on_challenge) hook.
+    pub fn with_events(mut self, events: ClientEvents) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Call `handler` before paying each challenge, as mppx's `onChallenge`
+    /// option does: return `true` to pay, `false` to return the `402` response
+    /// without paying, or a [`ChallengeDecision`](super::ChallengeDecision).
+    /// See [`ClientEvents::set_on_challenge`]; the hook is set on this client's
+    /// event registry, which its clones share.
+    pub fn with_on_challenge<F, Fut, R>(self, handler: F) -> Self
+    where
+        F: Fn(super::OnChallengeContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = R> + Send + 'static,
+        R: Into<super::ChallengeDecision> + Send + 'static,
+    {
+        self.events.set_on_challenge(handler);
+        self
+    }
+
     /// Build a request for this client. Use [`Self::send_with_payment`] to send it.
     pub fn request(&self, method: Method, url: impl IntoUrl) -> RequestBuilder {
         self.client.request(method, url)
     }
 
-    /// Send a request with explicit, charge-only payment handling.
+    /// Send a request with charge-only payment handling.
     ///
     /// Only the request is taken from `request`; its embedded client is ignored.
     /// A request built by another client still executes through this client.
@@ -98,17 +136,25 @@ impl ChargeClient {
         let request = request.build().map_err(HttpError::request)?;
         let preference = request.headers().get(ACCEPT_PAYMENT_HEADER);
         // Fail closed for ambiguous repeated or malformed preferences. Reqwest
-        // applies client defaults at execute time, after this opt-in decision.
-        let payment_allowed = request
-            .headers()
-            .get_all(ACCEPT_PAYMENT_HEADER)
-            .iter()
-            .count()
-            == 1
-            && preference
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| accept_payment::parse(value).ok())
-                .is_some_and(|entries| entries.iter().any(|entry| entry.q > 0.0));
+        // applies client defaults at execute time, after this decision.
+        let payment_allowed = match &self.accept_payment_policy {
+            AcceptPaymentPolicy::Disabled => false,
+            policy if preference.is_none() => {
+                !matches!(policy, AcceptPaymentPolicy::Explicit) && policy.allows(request.url())
+            }
+            _ => {
+                request
+                    .headers()
+                    .get_all(ACCEPT_PAYMENT_HEADER)
+                    .iter()
+                    .count()
+                    == 1
+                    && preference
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| accept_payment::parse(value).ok())
+                        .is_some_and(|entries| entries.iter().any(|entry| entry.q > 0.0))
+            }
+        };
         let exchange = ChargeExchange(&self.client);
         let max_payment_retries = if payment_allowed {
             max_payment_retries
@@ -118,38 +164,42 @@ impl ChargeClient {
         #[cfg(feature = "identity")]
         if let Some(identity) = &self.identity {
             let exchange = crate::identity::client::IdentityExchange::new(exchange, identity);
-            return run(exchange, request, provider, max_payment_retries).await;
+            return self
+                .run(exchange, request, provider, max_payment_retries)
+                .await;
         }
-        run(exchange, request, provider, max_payment_retries).await
+        self.run(exchange, request, provider, max_payment_retries)
+            .await
     }
-}
 
-/// Sends `request` through `exchange`, paying charge challenges unless
-/// `max_payment_retries` is zero.
-async fn run<X, P>(
-    mut exchange: X,
-    request: Request,
-    provider: &P,
-    max_payment_retries: usize,
-) -> Result<Response, HttpError>
-where
-    X: Exchange<Error = HttpError>,
-    P: PaymentProvider,
-{
-    if max_payment_retries == 0 {
-        return exchange.send(request).await;
+    /// Sends `request` through `exchange`, paying charge challenges unless
+    /// `max_payment_retries` is zero.
+    async fn run<X, P>(
+        &self,
+        mut exchange: X,
+        request: Request,
+        provider: &P,
+        max_payment_retries: usize,
+    ) -> Result<Response, HttpError>
+    where
+        X: Exchange<Error = HttpError>,
+        P: PaymentProvider,
+    {
+        if max_payment_retries == 0 {
+            return exchange.send(request).await;
+        }
+        let flow = PaymentFlow {
+            provider,
+            policy: &self.accept_payment_policy,
+            events: &self.events,
+            max_payment_retries,
+        };
+        flow.run(&mut exchange, request, None)
+            .await
+            .map_err(|error| match error {
+                FlowError::Payment(error) | FlowError::Send(error) => error,
+            })
     }
-    let flow = PaymentFlow {
-        provider,
-        policy: &AcceptPaymentPolicy::Never,
-        events: &ClientEvents::default(),
-        max_payment_retries,
-    };
-    flow.run(&mut exchange, request, None)
-        .await
-        .map_err(|error| match error {
-            FlowError::Payment(error) | FlowError::Send(error) => error,
-        })
 }
 
 // This transport can only be constructed beside the privately retained client.
@@ -168,12 +218,9 @@ impl Exchange for ChargeExchange<'_> {
                 "ChargeClient only supports charge intents".to_owned(),
             ));
         }
-        if challenge
-            .credential_header()
-            .eq_ignore_ascii_case("Authorization")
-            || challenge
-                .credential_header()
-                .eq_ignore_ascii_case("Payment-Authorization")
+        let header = challenge.credential_header();
+        if header.eq_ignore_ascii_case("Authorization")
+            || header.eq_ignore_ascii_case("Payment-Authorization")
         {
             Ok(())
         } else {

@@ -91,6 +91,21 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
     None
 }
 
+/// Whether one field value holds a `Payment` auth-scheme, with or without a
+/// token, as the tokenizer reads it. The client uses it to find a caller's
+/// own Payment credential on a request.
+#[cfg(feature = "client")]
+pub(crate) fn has_payment_scheme(value: &str) -> bool {
+    for token in Tokenizer::new(value) {
+        match token {
+            Ok(token) if token.is_payment_scheme() => return true,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    false
+}
+
 /// Pick the Payment credential a request carries, following steps 1 and 2 of
 /// the core spec's credential processing.
 ///

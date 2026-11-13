@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use reqwest::{StatusCode, Url};
+use reqwest::header::HeaderMap;
+use reqwest::{Method, StatusCode, Url};
 
 use crate::protocol::core::{PaymentChallenge, PaymentCredential, Receipt};
 
@@ -15,6 +16,8 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type EventHandler = Arc<dyn Fn(ClientEvent) -> BoxFuture<Option<PaymentCredential>> + Send + Sync>;
 type ChallengeReceivedHandler =
     Arc<dyn Fn(ChallengeReceivedContext) -> BoxFuture<Option<PaymentCredential>> + Send + Sync>;
+type OnChallengeHandler =
+    Arc<dyn Fn(OnChallengeContext) -> BoxFuture<ChallengeDecision> + Send + Sync>;
 
 /// Return type for client event callbacks.
 ///
@@ -81,6 +84,60 @@ pub struct ChallengeReceivedContext {
     pub challenge: PaymentChallenge,
     /// All parseable challenges from the 402 response.
     pub challenges: Vec<PaymentChallenge>,
+}
+
+/// Context for the [`on_challenge`](ClientEvents::set_on_challenge) approval hook.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct OnChallengeContext {
+    /// The challenge the client selected and is about to pay.
+    pub challenge: PaymentChallenge,
+    /// All parseable challenges from the 402 response.
+    pub challenges: Vec<PaymentChallenge>,
+    /// URL of the request being paid for.
+    pub url: Url,
+    /// Method of the request being paid for.
+    pub method: Method,
+    /// Headers of the request as the caller built it.
+    pub headers: HeaderMap,
+}
+
+/// What the [`on_challenge`](ClientEvents::set_on_challenge) hook decided
+/// for a challenge.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ChallengeDecision {
+    /// Pay the challenge with the provider.
+    Pay,
+    /// Don't pay: the client returns the `402` response to the caller.
+    Decline,
+    /// Send this credential instead of asking the provider to pay.
+    Credential(Box<PaymentCredential>),
+}
+
+impl From<bool> for ChallengeDecision {
+    /// `true` pays the challenge and `false` declines it.
+    fn from(approved: bool) -> Self {
+        if approved {
+            Self::Pay
+        } else {
+            Self::Decline
+        }
+    }
+}
+
+impl From<Option<PaymentCredential>> for ChallengeDecision {
+    /// `Some` sends that credential and `None` pays with the provider, like
+    /// mppx's `onChallenge` returning a credential or `undefined`.
+    fn from(credential: Option<PaymentCredential>) -> Self {
+        credential.map_or(Self::Pay, Self::from)
+    }
+}
+
+impl From<PaymentCredential> for ChallengeDecision {
+    fn from(credential: PaymentCredential) -> Self {
+        Self::Credential(Box::new(credential))
+    }
 }
 
 /// Context for `credential.created`.
@@ -268,12 +325,27 @@ struct ClientEventsInner {
     next_id: AtomicUsize,
     challenge_received: Mutex<Vec<(usize, ChallengeReceivedHandler)>>,
     event_handlers: Mutex<Vec<(usize, Option<ClientEventKind>, EventHandler)>>,
+    on_challenge: Mutex<Option<OnChallengeHandler>>,
 }
 
 /// Cloneable registry for client payment event callbacks.
+///
+/// Clones share one registry, including the
+/// [`on_challenge`](Self::set_on_challenge) hook.
 #[derive(Clone, Default)]
 pub struct ClientEvents {
     inner: Arc<ClientEventsInner>,
+}
+
+impl std::fmt::Debug for ClientEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientEvents")
+            .field(
+                "on_challenge",
+                &self.inner.on_challenge.lock().unwrap().is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientEvents {
@@ -423,6 +495,65 @@ impl ClientEvents {
                 }
             }
         })
+    }
+
+    /// Set the approval hook called before every payment, replacing any
+    /// earlier one, as mppx's `onChallenge` option does.
+    ///
+    /// The client calls it with the selected challenge and the request after
+    /// `challenge.received` handlers, unless one of them returned a
+    /// credential. Return `true` (or [`ChallengeDecision::Pay`]) to pay,
+    /// `false` (or [`ChallengeDecision::Decline`]) to return the `402`
+    /// response to the caller without paying, or a credential to send instead
+    /// of paying with the provider. A hook that panics declines. While a hook
+    /// is set, session providers neither send prepaid vouchers before a
+    /// `402` nor top up a channel ahead of the next request after a paid
+    /// one (the client records receipts with
+    /// [`PaymentProvider::record_receipt_without_prepay`](crate::client::PaymentProvider::record_receipt_without_prepay)),
+    /// so the hook sees every payment.
+    ///
+    /// Every clone of this registry shares the hook.
+    pub fn set_on_challenge<F, Fut, R>(&self, handler: F)
+    where
+        F: Fn(OnChallengeContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: Into<ChallengeDecision> + Send + 'static,
+    {
+        let wrapped: OnChallengeHandler = Arc::new(move |context| {
+            let future = handler(context);
+            Box::pin(async move { future.await.into() }) as BoxFuture<ChallengeDecision>
+        });
+        *self.inner.on_challenge.lock().unwrap() = Some(wrapped);
+    }
+
+    /// Remove the hook set with [`Self::set_on_challenge`], so the client pays
+    /// every challenge it selects again.
+    pub fn clear_on_challenge(&self) {
+        *self.inner.on_challenge.lock().unwrap() = None;
+    }
+
+    /// Whether an approval hook is set with [`Self::set_on_challenge`].
+    pub(crate) fn has_on_challenge(&self) -> bool {
+        self.inner.on_challenge.lock().unwrap().is_some()
+    }
+
+    /// Ask the approval hook about a challenge; [`ChallengeDecision::Pay`]
+    /// when none is set.
+    pub(crate) async fn decide_on_challenge(
+        &self,
+        context: OnChallengeContext,
+    ) -> ChallengeDecision {
+        let handler = self.inner.on_challenge.lock().unwrap().clone();
+        let Some(handler) = handler else {
+            return ChallengeDecision::Pay;
+        };
+        let future = match catch_unwind(AssertUnwindSafe(|| handler(context))) {
+            Ok(future) => future,
+            Err(_) => return ChallengeDecision::Decline,
+        };
+        catch_future(future)
+            .await
+            .unwrap_or(ChallengeDecision::Decline)
     }
 
     pub(crate) async fn emit_challenge_received(

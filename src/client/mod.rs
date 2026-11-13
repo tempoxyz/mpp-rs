@@ -14,8 +14,7 @@
 //! use mpp::client::{Fetch, TempoProvider};
 //!
 //! let provider = TempoProvider::new(signer, "https://rpc.moderato.tempo.xyz")?;
-//! let resp = client.get(url).header("Accept-Payment", "tempo/charge")
-//!     .send_with_payment(&provider).await?;
+//! let resp = client.get(url).send_with_payment(&provider).await?;
 //! ```
 
 #[cfg(feature = "client")]
@@ -65,9 +64,10 @@ pub use accept_payment_policy::AcceptPaymentPolicy;
 
 #[cfg(feature = "client")]
 pub use events::{
-    ChallengeReceivedContext, ClientEvent, ClientEventKind, ClientEventSubscription, ClientEvents,
-    CredentialCreatedContext, DepositContext, PaymentFailedContext, PaymentFailureReason,
-    PaymentResponseContext, PaymentUpdateContext,
+    ChallengeDecision, ChallengeReceivedContext, ClientEvent, ClientEventKind,
+    ClientEventSubscription, ClientEvents, CredentialCreatedContext, DepositContext,
+    OnChallengeContext, PaymentFailedContext, PaymentFailureReason, PaymentResponseContext,
+    PaymentUpdateContext,
 };
 
 #[cfg(feature = "client")]

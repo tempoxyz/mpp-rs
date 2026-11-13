@@ -1897,7 +1897,7 @@ impl TempoSessionProvider {
         mut headers: reqwest::header::HeaderMap,
         challenge: &PaymentChallenge,
     ) -> Result<PaymentChallenge, MppError> {
-        use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+        use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
 
         self.bind_origin(url)?;
         headers = management_headers(headers);
@@ -1935,13 +1935,9 @@ impl TempoSessionProvider {
                     .parse()
                     .mpp_config("invalid Payment-Session header")?,
             );
-            if headers
-                .get(AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("Payment "))
-            {
-                headers.remove(AUTHORIZATION);
-            }
+            // The caller's own Payment credential is not for this request; its
+            // other credentials, such as an API key, stay.
+            crate::client::flow::remove_payment_credentials(&mut headers);
             // reqwest forwards custom headers across redirects, so the channel
             // hint goes through a client that never follows one.
             if let Ok(response) = self
@@ -1987,20 +1983,16 @@ impl TempoSessionProvider {
         url: &str,
         mut headers: reqwest::header::HeaderMap,
     ) -> Result<Option<StoredChannelEntry>, MppError> {
-        use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+        use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
 
         self.bind_origin(url)?;
         headers.insert(
             crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER,
             HeaderValue::from_static("tempo/charge"),
         );
-        if headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("Payment "))
-        {
-            headers.remove(AUTHORIZATION);
-        }
+        // The caller's own Payment credential is not for this request; its
+        // other credentials, such as an API key, stay.
+        crate::client::flow::remove_payment_credentials(&mut headers);
 
         let challenge_response = client
             .head(url)
@@ -2277,6 +2269,72 @@ impl TempoSessionProvider {
                 .await;
             provider.topping_up.lock().unwrap().remove(&channel_id);
         });
+    }
+
+    /// Records a session receipt for [`PaymentProvider::record_receipt`] and
+    /// returns what the request cost. With `prepay`, a route whose price is
+    /// within the caps gets a prepaid voucher for its next request and a
+    /// top-up ahead of it; without, any prepaid state for the URL is dropped,
+    /// so nothing is paid before the next `402`.
+    fn record_session_receipt(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+        prepay: bool,
+    ) -> Option<u128> {
+        if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
+            return None;
+        }
+        let spent = receipt
+            .extensions
+            .get("spent")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<u128>().ok())?;
+        let channel_id = receipt.reference.parse::<B256>().ok()?.to_string();
+        let quoted = challenge
+            .request
+            .decode::<SessionRequest>()
+            .ok()
+            .and_then(|request| request.parse_amount().ok());
+        let (key, _) = self.expected_channel_key(challenge).ok()?;
+        let entry = self.channels.lock().unwrap().get(&key).cloned()?;
+        if entry.channel_id.to_string() != channel_id || spent > entry.cumulative_amount {
+            return None;
+        }
+        let mut ledger = self.spend.lock().unwrap();
+        let previous = ledger
+            .channels
+            .get(&channel_id)
+            .copied()
+            .unwrap_or_default();
+        let delta = spent.checked_sub(previous)?;
+        let cost = ledger.record(&channel_id, spent, quoted);
+        drop(ledger);
+        // A prepaid request commits nothing afterwards, so its save runs in the background.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let provider = self.clone();
+            let id = channel_id.clone();
+            runtime.spawn(async move { provider.save_server_spent(&id).await });
+        }
+        if self.pending_opens.lock().unwrap().contains_key(&channel_id) {
+            let key = self
+                .channel_id_to_key
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .cloned();
+            let entry = key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned());
+            if let Some(entry) = entry {
+                self.report_deposit(context.url.as_str(), &entry, entry.deposit, true);
+            }
+        }
+        if prepay && self.price_within_caps(delta) {
+            self.prepay(context, challenge, channel_id, spent, quoted);
+        } else {
+            self.prepaid.lock().unwrap().remove(context.url.as_str());
+        }
+        Some(cost)
     }
 
     /// Sizes the prepaid voucher for the receipt's URL from what the server
@@ -4682,58 +4740,16 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         receipt: &Receipt,
     ) -> Option<u128> {
-        if challenge.intent.as_str() != crate::protocol::methods::tempo::INTENT_SESSION {
-            return None;
-        }
-        let spent = receipt
-            .extensions
-            .get("spent")
-            .and_then(|value| value.as_str())
-            .and_then(|value| value.parse::<u128>().ok())?;
-        let channel_id = receipt.reference.parse::<B256>().ok()?.to_string();
-        let quoted = challenge
-            .request
-            .decode::<SessionRequest>()
-            .ok()
-            .and_then(|request| request.parse_amount().ok());
-        let (key, _) = self.expected_channel_key(challenge).ok()?;
-        let entry = self.channels.lock().unwrap().get(&key).cloned()?;
-        if entry.channel_id.to_string() != channel_id || spent > entry.cumulative_amount {
-            return None;
-        }
-        let mut ledger = self.spend.lock().unwrap();
-        let previous = ledger
-            .channels
-            .get(&channel_id)
-            .copied()
-            .unwrap_or_default();
-        let delta = spent.checked_sub(previous)?;
-        let cost = ledger.record(&channel_id, spent, quoted);
-        drop(ledger);
-        // A prepaid request commits nothing afterwards, so its save runs in the background.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let provider = self.clone();
-            let id = channel_id.clone();
-            runtime.spawn(async move { provider.save_server_spent(&id).await });
-        }
-        if self.pending_opens.lock().unwrap().contains_key(&channel_id) {
-            let key = self
-                .channel_id_to_key
-                .lock()
-                .unwrap()
-                .get(&channel_id)
-                .cloned();
-            let entry = key.and_then(|key| self.channels.lock().unwrap().get(&key).cloned());
-            if let Some(entry) = entry {
-                self.report_deposit(context.url.as_str(), &entry, entry.deposit, true);
-            }
-        }
-        if self.price_within_caps(delta) {
-            self.prepay(context, challenge, channel_id, spent, quoted);
-        } else {
-            self.prepaid.lock().unwrap().remove(context.url.as_str());
-        }
-        Some(cost)
+        self.record_session_receipt(context, challenge, receipt, true)
+    }
+
+    fn record_receipt_without_prepay(
+        &self,
+        context: &PaymentContext,
+        challenge: &PaymentChallenge,
+        receipt: &Receipt,
+    ) -> Option<u128> {
+        self.record_session_receipt(context, challenge, receipt, false)
     }
 
     fn stream_event(
@@ -5564,6 +5580,59 @@ mod tests {
                 assert_eq!(provider.cumulative(), 1_000);
             }
         }
+    }
+
+    /// With an approval hook set, the client records receipts without
+    /// prepaying: the cost is still counted, but no prepaid voucher is armed
+    /// and no top-up starts, and an earlier prepaid entry for the URL is
+    /// dropped, so the next payment waits for a 402 and the hook.
+    #[tokio::test]
+    async fn receipts_recorded_without_prepay_arm_nothing() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let provider = make_test_provider().with_prepaid_requests(2);
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 1_000, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let context = PaymentContext {
+            url: "https://api.example.com/data".parse().unwrap(),
+            headers: reqwest::header::HeaderMap::new(),
+            http_client: None,
+        };
+        provider.bind_origin(context.url.as_str()).unwrap();
+        let receipt = |spent: u128| {
+            let mut receipt = Receipt::success("tempo", channel_id.to_string());
+            receipt
+                .extensions
+                .insert("spent".into(), serde_json::json!(spent.to_string()));
+            receipt
+        };
+        let prepaid = || {
+            provider
+                .prepaid
+                .lock()
+                .unwrap()
+                .contains_key(context.url.as_str())
+        };
+
+        assert!(provider
+            .record_receipt_without_prepay(&context, &challenge, &receipt(300))
+            .is_some());
+        assert!(!prepaid());
+        assert!(provider.topping_up.lock().unwrap().is_empty());
+        assert!(provider.prepaid_credential(context.clone()).await.is_none());
+        assert_eq!(provider.cumulative(), 1_000);
+
+        // A receipt recorded with prepay arms the URL; one recorded without
+        // drops it again.
+        assert!(provider
+            .record_receipt(&context, &challenge, &receipt(400))
+            .is_some());
+        assert!(prepaid());
+        assert!(provider
+            .record_receipt_without_prepay(&context, &challenge, &receipt(500))
+            .is_some());
+        assert!(!prepaid());
     }
 
     #[tokio::test]
@@ -9895,6 +9964,67 @@ mod tests {
                 source_task.abort();
                 target_task.abort();
             }
+        }
+    }
+
+    /// A caller's own Payment credential is not sent on the bootstrap request,
+    /// whether SP or HTAB ends its scheme and whichever field carries it, while
+    /// its other credentials stay.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn bootstrap_drops_only_the_callers_payment_credentials() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::head,
+            Router,
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/responses",
+            head({
+                let seen = seen.clone();
+                move |headers: HeaderMap| {
+                    let seen = seen.clone();
+                    async move {
+                        let values = headers
+                            .get_all("authorization")
+                            .iter()
+                            .chain(headers.get_all("payment-authorization").iter())
+                            .map(|value| value.to_str().unwrap().to_owned())
+                            .collect::<Vec<_>>();
+                        seen.lock().unwrap().push(values);
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for (authorization, kept) in [
+            ("Payment\tabc", vec![]),
+            ("Bearer k, Payment\tabc", vec!["Bearer k".to_owned()]),
+            ("Bearer k", vec!["Bearer k".to_owned()]),
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                authorization.parse().unwrap(),
+            );
+            headers.insert("payment-authorization", "abc".parse().unwrap());
+            seen.lock().unwrap().clear();
+            let result = make_test_provider()
+                .bootstrap_with_headers(
+                    &reqwest::Client::new(),
+                    &format!("http://{address}/v1/responses"),
+                    headers,
+                )
+                .await
+                .unwrap();
+            assert!(result.is_none(), "{authorization}");
+            assert_eq!(*seen.lock().unwrap(), [kept], "{authorization}");
         }
     }
 
