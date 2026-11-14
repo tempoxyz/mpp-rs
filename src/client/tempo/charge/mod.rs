@@ -749,6 +749,11 @@ impl TempoCharge {
             .mpp_http("failed to prepare Tempo Accounts access key")?;
         let from = access_key.account();
         request.inner.gas = Some(match explicit_gas {
+            // A sponsored charge that installs the access key needs the gas
+            // of writing its limits and call scopes too.
+            Some(_) if options.gas_limit.is_none() && request.key_authorization.is_some() => {
+                crate::client::tempo::session::channel_ops::KEY_AUTHORIZATION_GAS_LIMIT
+            }
             Some(gas_limit) => gas_limit,
             None => estimate_gas(provider, request.clone()).await?,
         });
@@ -915,8 +920,13 @@ impl TempoCharge {
         } else if self.fee_payer {
             // In fee-payer mode the client may not hold native gas, so
             // eth_estimateGas would revert. Use a safe default; the server
-            // co-signs and pays for gas.
-            1_000_000
+            // co-signs and pays for gas, plus the gas of installing the key
+            // when this transaction authorizes it.
+            if key_authorization.is_some() {
+                crate::client::tempo::session::channel_ops::KEY_AUTHORIZATION_GAS_LIMIT
+            } else {
+                1_000_000
+            }
         } else {
             let mut req = TempoTransactionRequest {
                 calls: calls.clone(),
