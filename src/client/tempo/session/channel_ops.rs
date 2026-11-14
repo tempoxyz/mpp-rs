@@ -43,21 +43,23 @@ const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 #[cfg(feature = "tempo")]
 const SPONSORED_GAS_LIMIT: u64 = 2_000_000;
 
-/// Gas declared by a sponsored session transaction that also authorizes the
-/// signing access key. Installing a key writes its limits and call scopes to
-/// the account keychain, which needs far more than [`SPONSORED_GAS_LIMIT`]: an
-/// open that installed a key with four limits and 14 scoped selectors used
-/// 18,503,016 gas on Tempo mainnet. It stays under the 25,000,000 gas that
-/// fee payers such as Tempo Gateway sponsor.
+/// Gas declared by a transaction the client doesn't estimate (a sponsored
+/// one, or a legacy session open) when it also authorizes the signing access
+/// key, and the most an estimate for one that does may ask for. Installing a
+/// key writes its limits and call scopes to the account keychain, which needs
+/// far more than [`SPONSORED_GAS_LIMIT`]: an open that installed a key with
+/// four limits and 14 scoped selectors used 18,503,016 gas on Tempo mainnet.
+/// It stays under the 25,000,000 gas that fee payers such as Tempo Gateway
+/// sponsor.
 #[cfg(feature = "tempo")]
-const SPONSORED_KEY_AUTHORIZATION_GAS_LIMIT: u64 = 20_000_000;
+pub(crate) const KEY_AUTHORIZATION_GAS_LIMIT: u64 = 20_000_000;
 
-/// The gas a sponsored session transaction declares: more when it carries a
-/// key authorization.
+/// The gas a session transaction the client doesn't estimate declares: more
+/// when it carries a key authorization.
 #[cfg(feature = "tempo")]
 const fn sponsored_gas_limit(authorizes_key: bool) -> u64 {
     if authorizes_key {
-        SPONSORED_KEY_AUTHORIZATION_GAS_LIMIT
+        KEY_AUTHORIZATION_GAS_LIMIT
     } else {
         SPONSORED_GAS_LIMIT
     }
