@@ -7,6 +7,7 @@
 //! Ported from the TypeScript SDK's `Session.ts`.
 
 pub mod channel_ops;
+pub mod configurable;
 pub mod recovery;
 pub mod store;
 use std::collections::{HashMap, HashSet};
@@ -24,8 +25,11 @@ use tempo_alloy::TempoNetwork;
 
 use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload,
-    create_precompile_close_payload_with_descriptor_primitive, create_precompile_open_payload,
+    create_precompile_close_payload_with_descriptor_configurable,
+    create_precompile_close_payload_with_descriptor_primitive,
+    create_precompile_open_payload_with_voucher_signer,
     create_precompile_top_up_transaction_payload,
+    create_precompile_voucher_payload_with_descriptor_configurable,
     create_precompile_voucher_payload_with_descriptor_primitive, create_voucher_payload,
     is_precompile_escrow, resolve_chain_id, resolve_escrow_with_policy, try_recover_channel,
     ChannelEntry, OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
@@ -123,6 +127,8 @@ pub struct TempoSessionProvider {
     allow_custom_escrow: bool,
     /// Address authorized to sign vouchers. Defaults to signer address.
     authorized_signer: Option<Address>,
+    /// TIP-1166 configurable account that signs TIP-1034 vouchers, if any.
+    configurable_voucher_signer: Option<configurable::ConfigurableVoucherSigner>,
     /// Signing mode (direct or keychain).
     signing_mode: crate::client::tempo::signing::TempoSigningMode,
     /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`
@@ -383,6 +389,7 @@ impl TempoSessionProvider {
             escrow_contract: None,
             allow_custom_escrow: false,
             authorized_signer: None,
+            configurable_voucher_signer: None,
             signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
             max_deposit: None,
             default_deposit: None,
@@ -574,6 +581,26 @@ impl TempoSessionProvider {
     /// Set the authorized signer address (for delegated voucher signing).
     pub fn with_authorized_signer(mut self, addr: Address) -> Self {
         self.authorized_signer = Some(addr);
+        self
+    }
+
+    /// Sign TIP-1034 vouchers with a TIP-1166 configurable account (`0x05`
+    /// signatures, settled from T15), which becomes the channels' authorized
+    /// signer. The payer still signs transactions and close authorizations.
+    ///
+    /// New channels open with the account's on-chain configuration
+    /// commitment as salt when it has one. Opening fails unless the server's
+    /// challenge advertises `methodDetails.configurableVouchers: true`, since
+    /// other servers would reject the vouchers after the deposit is locked.
+    /// A top-up after the account's configuration changed fails with an error
+    /// [`configurable::is_signer_config_changed`] recognizes: close the
+    /// channel and open a new one.
+    pub fn with_configurable_voucher_signer(
+        mut self,
+        signer: configurable::ConfigurableVoucherSigner,
+    ) -> Self {
+        self.authorized_signer = Some(signer.account());
+        self.configurable_voucher_signer = Some(signer);
         self
     }
 
@@ -2604,8 +2631,7 @@ impl TempoSessionProvider {
 
         self.assert_within_max_deposit(entry.cumulative_amount)?;
         let mut payload = if is_precompile_escrow(entry.escrow_contract) {
-            create_precompile_voucher_payload_with_descriptor_primitive(
-                &self.signer,
+            self.precompile_voucher_payload(
                 entry.descriptor.clone().ok_or_else(|| {
                     MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                 })?,
@@ -2639,6 +2665,82 @@ impl TempoSessionProvider {
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
+    /// The configurable voucher signer, when it is `descriptor`'s
+    /// authorized signer.
+    fn configurable_signer_for(
+        &self,
+        descriptor: &crate::protocol::methods::tempo::session::ChannelDescriptor,
+    ) -> Option<&configurable::ConfigurableVoucherSigner> {
+        self.configurable_voucher_signer.as_ref().filter(|signer| {
+            descriptor.authorized_signer.parse::<Address>().ok() == Some(signer.account())
+        })
+    }
+
+    /// A TIP-1034 voucher payload, signed by the configurable voucher signer
+    /// when it is the channel's authorized signer, else by the primitive signer.
+    async fn precompile_voucher_payload(
+        &self,
+        descriptor: crate::protocol::methods::tempo::session::ChannelDescriptor,
+        cumulative_amount: u128,
+        chain_id: u64,
+    ) -> Result<SessionCredentialPayload, MppError> {
+        match self.configurable_signer_for(&descriptor) {
+            Some(voucher_signer) => {
+                create_precompile_voucher_payload_with_descriptor_configurable(
+                    voucher_signer,
+                    descriptor,
+                    cumulative_amount,
+                    chain_id,
+                )
+                .await
+            }
+            None => {
+                create_precompile_voucher_payload_with_descriptor_primitive(
+                    &self.signer,
+                    descriptor,
+                    cumulative_amount,
+                    chain_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Fails before an open with a configurable voucher signer that the
+    /// server or the channel could not settle: the escrow must be the TIP-1034
+    /// precompile and the challenge must advertise
+    /// `methodDetails.configurableVouchers: true`.
+    fn ensure_configurable_vouchers_supported(
+        &self,
+        session_req: &SessionRequest,
+        precompile: bool,
+    ) -> Result<(), MppError> {
+        let Some(signer) = &self.configurable_voucher_signer else {
+            return Ok(());
+        };
+        if !precompile {
+            return Err(MppError::InvalidConfig(format!(
+                "configurable account {} can only sign TIP-1034 channel reserve vouchers",
+                signer.account()
+            )));
+        }
+        let advertised = session_req
+            .method_details
+            .as_ref()
+            .and_then(|details| details.get("configurableVouchers"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !advertised {
+            return Err(MppError::InvalidConfig(format!(
+                "server does not accept configurable account vouchers \
+                 (methodDetails.configurableVouchers is not true); refusing to open a channel \
+                 signed by configurable account {}",
+                signer.account()
+            )));
+        }
+        Ok(())
+    }
+
     async fn top_up_credential_for_challenge(
         &self,
         challenge: &PaymentChallenge,
@@ -2666,6 +2768,15 @@ impl TempoSessionProvider {
                 additional_deposit,
             )
             .await?;
+        if let Some(voucher_signer) = self.configurable_signer_for(descriptor) {
+            let salt = descriptor
+                .salt
+                .parse::<B256>()
+                .mpp_config("invalid TIP-1034 descriptor salt")?;
+            voucher_signer
+                .ensure_unchanged(&self.rpc_provider, salt)
+                .await?;
+        }
         let payload = create_precompile_top_up_transaction_payload(
             &self.rpc_provider,
             &self.signer,
@@ -3401,16 +3512,32 @@ impl TempoSessionProvider {
         // Closing settles an existing authorization; it never increases it, even
         // when the caller lowered the cap after that authorization was issued.
         let payload = if is_precompile_escrow(entry.escrow_contract) {
-            create_precompile_close_payload_with_descriptor_primitive(
-                &self.signer,
-                entry.channel_id,
-                entry.descriptor.ok_or_else(|| {
-                    MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
-                })?,
-                cumulative_amount,
-                entry.chain_id,
-            )
-            .await?
+            let descriptor = entry.descriptor.ok_or_else(|| {
+                MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+            })?;
+            match self.configurable_signer_for(&descriptor) {
+                Some(voucher_signer) => {
+                    create_precompile_close_payload_with_descriptor_configurable(
+                        voucher_signer,
+                        &self.signer,
+                        entry.channel_id,
+                        descriptor,
+                        cumulative_amount,
+                        entry.chain_id,
+                    )
+                    .await?
+                }
+                None => {
+                    create_precompile_close_payload_with_descriptor_primitive(
+                        &self.signer,
+                        entry.channel_id,
+                        descriptor,
+                        cumulative_amount,
+                        entry.chain_id,
+                    )
+                    .await?
+                }
+            }
         } else {
             create_close_payload(
                 self.secp256k1_signer()?,
@@ -4336,8 +4463,7 @@ impl TempoSessionProvider {
                 }
 
                 let payload = if precompile {
-                    create_precompile_voucher_payload_with_descriptor_primitive(
-                        &self.signer,
+                    self.precompile_voucher_payload(
                         entry.descriptor.clone().ok_or_else(|| {
                             MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                         })?,
@@ -4423,6 +4549,7 @@ impl TempoSessionProvider {
         }
 
         // No existing channel — open a new one
+        self.ensure_configurable_vouchers_supported(&session_req, precompile)?;
         let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
         if deposit < amount {
             return Err(MppError::InvalidConfig(format!(
@@ -4430,11 +4557,28 @@ impl TempoSessionProvider {
             )));
         }
 
+        if let (Some(voucher_signer), true) = (
+            self.configurable_voucher_signer.as_ref(),
+            settlement_route.is_some(),
+        ) {
+            // A settlement route fixes the salt, but from T15 a signer with a
+            // configuration commitment must open with it as salt.
+            if voucher_signer
+                .open_salt(&self.rpc_provider)
+                .await?
+                .is_some()
+            {
+                return Err(MppError::InvalidConfig(format!(
+                    "configurable account {} has a configuration commitment, which cannot be combined with a settlement route's salt",
+                    voucher_signer.account()
+                )));
+            }
+        }
         let (mut entry, mut payload) = if precompile {
             let (prefix_calls, route) = self
                 .autoswap_calls(&self.rpc_provider, chain_id, payer, currency, deposit)
                 .await?;
-            create_precompile_open_payload(
+            create_precompile_open_payload_with_voucher_signer(
                 &self.rpc_provider,
                 &self.signer,
                 Some(&self.signing_mode),
@@ -4458,6 +4602,7 @@ impl TempoSessionProvider {
                         )
                     }),
                 },
+                self.configurable_voucher_signer.as_ref(),
             )
             .await?
         } else {
@@ -11124,5 +11269,63 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn configurable_voucher_signer_requires_server_support_before_open() {
+        use crate::protocol::methods::tempo::configurable_account::{
+            ConfigurableAccountConfig, ConfigurableAccountOwner,
+        };
+        let owner = PrivateKeySigner::random();
+        let config = ConfigurableAccountConfig {
+            salt: B256::repeat_byte(1),
+            version: 0,
+            threshold: 1,
+            owners: vec![ConfigurableAccountOwner {
+                owner: owner.address(),
+                weight: 1,
+            }],
+        };
+        let account = config.account_address().unwrap();
+        let signer =
+            configurable::ConfigurableVoucherSigner::new(account, config, [owner]).unwrap();
+        let request = |details: serde_json::Value| SessionRequest {
+            amount: "1".into(),
+            method_details: Some(details),
+            ..Default::default()
+        };
+
+        let plain =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.test.invalid")
+                .unwrap();
+        // Without a configurable signer nothing changes.
+        plain
+            .ensure_configurable_vouchers_supported(&request(serde_json::json!({})), true)
+            .unwrap();
+
+        let provider = plain.with_configurable_voucher_signer(signer);
+        assert_eq!(provider.authorized_signer, Some(account));
+        let err = provider
+            .ensure_configurable_vouchers_supported(&request(serde_json::json!({})), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("configurableVouchers"), "{err}");
+        assert!(provider
+            .ensure_configurable_vouchers_supported(
+                &request(serde_json::json!({ "configurableVouchers": false })),
+                true,
+            )
+            .is_err());
+        assert!(provider
+            .ensure_configurable_vouchers_supported(
+                &request(serde_json::json!({ "configurableVouchers": true })),
+                false,
+            )
+            .is_err());
+        provider
+            .ensure_configurable_vouchers_supported(
+                &request(serde_json::json!({ "configurableVouchers": true })),
+                true,
+            )
+            .unwrap();
     }
 }
