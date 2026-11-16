@@ -951,6 +951,53 @@ async fn test_zone_credential_grace_applies_only_to_zone_credentials() {
 }
 
 #[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_zone_credential_grace_needs_a_challenge_issued_with_it() {
+    use crate::protocol::core::expiry_grace::has_expiry_grace;
+
+    // Issued with the grace off: no marker, so turning the grace on later
+    // never extends it.
+    let issued = grace_mpp(std::time::Duration::ZERO);
+    let (credential, expected) = expired_offer(&issued, time::Duration::seconds(1), zone_payload());
+    assert!(!has_expiry_grace(credential.challenge.opaque.as_ref()));
+    let error = grace_mpp(std::time::Duration::from_secs(60))
+        .verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+
+    // Issued with it on, the HMAC-bound marker rides beside the route's
+    // pinned `opaque`, which verification still checks.
+    let route = Base64UrlJson::from_value(&serde_json::json!({ "plan": "pro" })).unwrap();
+    let mpp = grace_mpp(std::time::Duration::from_secs(60)).with_opaque(route.clone());
+    let (credential, expected) = expired_offer(&mpp, time::Duration::seconds(1), zone_payload());
+    assert!(has_expiry_grace(credential.challenge.opaque.as_ref()));
+    mpp.verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap();
+    let other = Base64UrlJson::from_value(&serde_json::json!({ "plan": "free" })).unwrap();
+    let error = grace_mpp(std::time::Duration::from_secs(60))
+        .with_opaque(other)
+        .verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap_err();
+    assert_ne!(error.code, None, "{error}");
+}
+
+#[cfg(feature = "tempo")]
+#[test]
+fn test_zone_credential_grace_is_refused_with_a_relay() {
+    let error = Mpp::create(
+        offers_builder()
+            .zone_credential_grace(std::time::Duration::from_secs(60))
+            .relay(crate::server::TempoRelayConfig::new("test-api-key")),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("relay"), "{error}");
+}
+
+#[cfg(feature = "tempo")]
 #[test]
 fn test_zone_credential_grace_rejects_more_than_five_minutes() {
     let error = Mpp::create(

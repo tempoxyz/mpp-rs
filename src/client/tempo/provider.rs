@@ -854,8 +854,12 @@ impl PaymentProvider for TempoProvider {
     ) -> Result<PaymentCredential, MppError> {
         // The origin of the request that returned the challenge, so a Zone
         // withdrawal started for it is only ever resumed for that origin.
-        let origin = context.url.origin();
-        let origin = origin.is_tuple().then(|| origin.ascii_serialization());
+        // Only an HTTP(S) origin counts, as mppx's: an opaque one serializes
+        // as "null" for every such URL, so it fails closed as unknown.
+        let origin = matches!(context.url.scheme(), "http" | "https")
+            .then(|| context.url.origin())
+            .filter(|origin| origin.is_tuple())
+            .map(|origin| origin.ascii_serialization());
         self.pay_from(challenge, origin).await
     }
 

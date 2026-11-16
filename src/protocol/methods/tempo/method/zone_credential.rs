@@ -84,9 +84,8 @@ where
     /// `WithdrawalProcessed` event pays the recipient, and the withdrawal's
     /// memo in the `processWithdrawals` calldata binds it to this challenge.
     ///
-    /// With `reserve`, the withdrawal's sender tag is claimed in the store so
-    /// it pays for one challenge only; without it, a claimed one is rejected.
-    /// Refuse a settlement whose block is not older than `expires_at`.
+    /// Refuse a settlement whose block is not older than `expires_at`, at the
+    /// block's millisecond precision.
     async fn ensure_settled_before(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
@@ -103,7 +102,10 @@ where
             .ok_or_else(|| {
                 VerificationError::network_error(format!("Block {block_number} not found"))
             })?;
-        let settled_at = i128::from(alloy::consensus::BlockHeader::timestamp(&block.header)) * 1000;
+        // Tempo blocks have millisecond timestamps: `BlockHeader::timestamp`
+        // is only the seconds, so a settlement later in the expiry's second
+        // would pass as earlier.
+        let settled_at = i128::from(block.header.inner.inner.timestamp_millis());
         let expires_ms = expires_at.unix_timestamp_nanos() / 1_000_000;
         if settled_at >= expires_ms {
             return Err(VerificationError::expired(
@@ -123,10 +125,19 @@ where
         let hash = parse_b256(Some(payload.data()), "hash")?;
         let sender_tag = parse_b256(payload.zone_sender_tag(), "senderTag")?;
         // A server's `zone_credential_grace` lets a zone Credential arrive
-        // after its challenge expired, but never past the grace.
+        // after its challenge expired, but never past the grace, and only for
+        // a challenge issued with the grace on: one carrying the HMAC-bound
+        // `_mppx_expiry_grace` marker in its `opaque`.
         let expired = expired_at(challenge.expires.as_deref())?;
         if let Some(expires_at) = expired {
-            if time::OffsetDateTime::now_utc() >= expires_at + self.zone_credential_grace {
+            let grace =
+                if crate::protocol::core::expiry_grace::has_expiry_grace(challenge.opaque.as_ref())
+                {
+                    self.zone_credential_grace
+                } else {
+                    std::time::Duration::ZERO
+                };
+            if time::OffsetDateTime::now_utc() >= expires_at + grace {
                 return Err(VerificationError::expired(format!(
                     "Challenge expired at {}",
                     challenge.expires.as_deref().unwrap_or_default()

@@ -29,12 +29,35 @@ where
     /// Stamp configured `opaque` and credential `header` onto an issued
     /// challenge and recompute its HMAC id. No-op when neither is configured.
     #[cfg(any(feature = "tempo", feature = "stripe"))]
-    pub(super) fn apply_pinned_opaque(&self, mut challenge: PaymentChallenge) -> PaymentChallenge {
-        if self.config.opaque.is_none() && self.config.credential_header.is_none() {
+    pub(super) fn apply_pinned_opaque(&self, challenge: PaymentChallenge) -> PaymentChallenge {
+        self.apply_issuance_opaque(challenge, false)
+    }
+
+    /// [`apply_pinned_opaque`](Self::apply_pinned_opaque) for a Tempo charge
+    /// challenge: while `zone_credential_grace` is on, its `opaque` also
+    /// carries the HMAC-bound expiry grace marker (`_mppx_expiry_grace`), as
+    /// mppx's `CredentialExpiry.issuanceMeta`. Only a challenge issued with
+    /// the marker gets the grace.
+    #[cfg(feature = "tempo")]
+    pub(super) fn apply_charge_opaque(&self, challenge: PaymentChallenge) -> PaymentChallenge {
+        self.apply_issuance_opaque(challenge, !self.config.zone_credential_grace.is_zero())
+    }
+
+    #[cfg(any(feature = "tempo", feature = "stripe"))]
+    fn apply_issuance_opaque(
+        &self,
+        mut challenge: PaymentChallenge,
+        expiry_grace: bool,
+    ) -> PaymentChallenge {
+        if self.config.opaque.is_none() && self.config.credential_header.is_none() && !expiry_grace
+        {
             return challenge;
         }
-        if let Some(opaque) = &self.config.opaque {
-            challenge.opaque = Some(opaque.clone());
+        if self.config.opaque.is_some() || expiry_grace {
+            challenge.opaque = crate::protocol::core::expiry_grace::with_expiry_grace(
+                self.config.opaque.as_ref(),
+                expiry_grace,
+            );
         }
         challenge.header = self.config.credential_header.clone();
         challenge.id = crate::protocol::core::compute_challenge_id_with_header(
@@ -180,7 +203,7 @@ where
             options.expires,
             options.description,
         )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        Ok(self.apply_charge_opaque(challenge))
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -252,7 +275,7 @@ where
             expires,
             description,
         )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        Ok(self.apply_charge_opaque(challenge))
     }
 
     /// The charge request [`charge_with_options()`](Self::charge_with_options)

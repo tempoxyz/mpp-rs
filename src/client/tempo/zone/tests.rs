@@ -1459,18 +1459,182 @@ async fn test_withdrawal_past_its_redemption_window_is_never_paid_again() {
             origin: Some("https://api.example.com".into()),
             terms: zone.terms_key(&expired, &signer, &signing_mode),
             request: OnceCell::new(),
+            redeemed_late: Mutex::default(),
+            waiters: Default::default(),
             settlement_cursor: Mutex::default(),
         }),
     );
+    // A retry of its own challenge still fails closed.
+    let error = provider
+        .pay_with_context(&expired, context_for("https://api.example.com/paid"))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), expired.id);
+    assert!(sent.lock().unwrap().is_empty());
+
+    // No server accepts its Credential any more, so it no longer blocks a new
+    // challenge for its terms, which withdraws on its own.
     let next = same_terms(json!({}), "zone-challenge-2");
-    for challenge in [&expired, &next] {
-        let error = provider
-            .pay_with_context(challenge, context_for("https://api.example.com/paid"))
+    let error = provider
+        .pay_with_context(&next, context_for("https://api.example.com/paid"))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), next.id);
+    assert_eq!(sent.lock().unwrap().len(), 1);
+    assert!(!zone
+        .pending
+        .lock()
+        .unwrap()
+        .values()
+        .any(|entry| entry.challenge.id == expired.id));
+}
+
+/// Inserts a withdrawal for `challenge` whose request already returned
+/// `sender_tag`, as one an earlier payment started.
+fn insert_withdrawal(
+    provider: &TempoProvider,
+    challenge: &PaymentChallenge,
+    origin: &str,
+    sender_tag: B256,
+) -> Arc<PendingWithdrawal> {
+    let zone = provider.zone.as_ref().unwrap();
+    let signer = TempoPrimitiveSigner::from(payer());
+    let signing_mode = TempoSigningMode::Direct;
+    let entry = Arc::new(PendingWithdrawal {
+        challenge: challenge.clone(),
+        origin: Some(origin.into()),
+        terms: zone.terms_key(challenge, &signer, &signing_mode),
+        request: OnceCell::new_with(Some(Ok(sender_tag))),
+        redeemed_late: Mutex::default(),
+        waiters: Default::default(),
+        settlement_cursor: Mutex::default(),
+    });
+    zone.pending.lock().unwrap().insert(
+        zone.pending_key(challenge, &signer, &signing_mode),
+        entry.clone(),
+    );
+    entry
+}
+
+#[tokio::test]
+async fn test_late_credential_is_reused_only_for_its_own_challenge() {
+    let (provider, sent, logs) = resumable_provider().await;
+    let origin = "https://api.example.com/paid";
+    // A withdrawal whose challenge expired before its settlement was found,
+    // within the largest server grace.
+    let expired = challenge_with(
+        json!({}),
+        Some(
+            (time::OffsetDateTime::now_utc() - time::Duration::seconds(10))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        ),
+    );
+    let sender_tag = B256::repeat_byte(0x77);
+    insert_withdrawal(&provider, &expired, "https://api.example.com", sender_tag);
+    let settlement = B256::repeat_byte(0x33);
+    *logs.lock().unwrap() = json!([settlement_log(sender_tag, true, settlement)]);
+
+    // Its own challenge gets the late Credential, and a retry of it gets the
+    // same one rather than paying again on Tempo.
+    for _ in 0..2 {
+        let credential = provider
+            .pay_with_context(&expired, context_for(origin))
             .await
-            .unwrap_err();
-        assert_eq!(pending_challenge_id(error), expired.id);
+            .unwrap();
+        assert_eq!(credential.challenge.id, expired.id);
+        assert_eq!(
+            credential.charge_payload().unwrap().data(),
+            format!("{settlement:#x}")
+        );
+    }
+
+    // Another challenge for its terms neither gets it nor pays again until
+    // its window ends: the error names the paid challenge and its sender tag.
+    let next = same_terms(json!({}), "zone-challenge-2");
+    match provider
+        .pay_with_context(&next, context_for(origin))
+        .await
+        .unwrap_err()
+    {
+        MppError::ZoneSettlementPending {
+            challenge_id,
+            sender_tag: pending_tag,
+            ..
+        } => {
+            assert_eq!(challenge_id, expired.id);
+            assert_eq!(pending_tag, format!("{sender_tag:#x}"));
+        }
+        error => panic!("expected ZoneSettlementPending, got {error}"),
     }
     assert!(sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_withdrawal_another_payment_waits_on_is_not_shared() {
+    let (provider, sent, _) = resumable_provider().await;
+    let origin = "https://api.example.com/paid";
+    let first = challenge_with(json!({}), expires_in(600));
+    let entry = insert_withdrawal(
+        &provider,
+        &first,
+        "https://api.example.com",
+        B256::repeat_byte(0x77),
+    );
+    // Another payment is still waiting on it: a concurrent request with the
+    // same terms is a payment of its own.
+    let waiting = Waiting::new(&entry);
+    let second = same_terms(json!({}), "zone-challenge-2");
+    let error = provider
+        .pay_with_context(&second, context_for(origin))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), second.id);
+    assert_eq!(sent.lock().unwrap().len(), 1);
+    drop(waiting);
+    assert_eq!(entry.waiters.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_refuses_an_expired_challenge_before_paying() {
+    let (zone_url, zone_calls) = unused_zone_rpc().await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    let expired = challenge_with(
+        json!({}),
+        Some(
+            (time::OffsetDateTime::now_utc() - time::Duration::seconds(10))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        ),
+    );
+    let error = provider.pay(&expired).await.unwrap_err();
+    assert!(matches!(error, MppError::PaymentExpired(_)), "{error}");
+    assert!(zone_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_opaque_origin_never_resumes_a_withdrawal() {
+    let (provider, sent, logs) = resumable_provider().await;
+    let first = challenge_with(json!({}), expires_in(600));
+    let sender_tag = B256::repeat_byte(0x77);
+    insert_withdrawal(&provider, &first, "null", sender_tag);
+    *logs.lock().unwrap() = json!([settlement_log(sender_tag, true, B256::repeat_byte(0x33))]);
+    // Every opaque origin serializes as "null", so it is no proof that the
+    // new challenge came from where the first one did.
+    let second = same_terms(json!({}), "zone-challenge-2");
+    let error = provider
+        .pay_with_context(&second, context_for("file:///tmp/paid"))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), first.id);
+    assert!(sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn test_far_future_expiry_is_redeemable() {
+    let challenge = challenge_with(json!({}), Some("9999-12-31T23:59:59Z".into()));
+    assert!(is_redeemable(&challenge));
 }
 
 /// A provider paying from Zone 3, whose outbox charges a fee of 5, with the

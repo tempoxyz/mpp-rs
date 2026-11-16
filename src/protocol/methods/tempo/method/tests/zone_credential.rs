@@ -889,7 +889,17 @@ fn expired_zone_challenge(request: &ChargeRequest, ago: time::Duration) -> (Paym
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap(),
     );
+    // Issued with the grace on: only such a challenge gets it.
+    challenge.opaque = crate::protocol::core::expiry_grace::with_expiry_grace(None, true);
     (challenge, expires_at.unix_timestamp())
+}
+
+/// A block at `timestamp` seconds and `millis` milliseconds past it.
+fn block_at_millis(timestamp: u64, millis: u64) -> serde_json::Value {
+    let mut block = block_at(timestamp);
+    block["timestampMillis"] = format!("{:#x}", timestamp * 1000 + millis).into();
+    block["timestampMillisPart"] = format!("{millis:#x}").into();
+    block
 }
 
 fn grace_method(
@@ -956,6 +966,72 @@ async fn test_zone_credential_grace_rejects_after_window_without_rpc() {
             .unwrap_err();
         assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
     }
+}
+
+#[tokio::test]
+async fn test_zone_credential_grace_needs_the_issuance_marker() {
+    let request = zone_request(serde_json::json!({}));
+    let (mut challenge, _) = expired_zone_challenge(&request, time::Duration::seconds(1));
+    // Issued without the grace, by an earlier release or with it off.
+    challenge.opaque = None;
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    // No RPC answers are queued: fetching the receipt would fail differently.
+    let (method, _) = grace_method(&fixture, std::time::Duration::from_secs(60));
+    let error = method
+        .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+}
+
+#[tokio::test]
+async fn test_zone_credential_grace_compares_block_milliseconds() {
+    let request = zone_request(serde_json::json!({}));
+    let expires_at = (time::OffsetDateTime::now_utc() - time::Duration::seconds(2))
+        .replace_millisecond(100)
+        .unwrap();
+    let mut challenge = zone_challenge("challenge-a", &request);
+    challenge.expires = Some(
+        expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    challenge.opaque = crate::protocol::core::expiry_grace::with_expiry_grace(None, true);
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = grace_method(&fixture, std::time::Duration::from_secs(60));
+    // Settled in the expiry's second, but 800ms after it.
+    push_settlement(&asserter, &fixture);
+    asserter.push_success(&block_at_millis(
+        u64::try_from(expires_at.unix_timestamp()).unwrap(),
+        900,
+    ));
+    let error = method
+        .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+}
+
+#[test]
+fn test_zone_credential_grace_is_refused_with_a_relay() {
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let relay = || crate::protocol::methods::tempo::RelayConfig::new("test-api-key");
+    let error = ChargeMethod::new(provider.clone())
+        .with_zone_credential_grace(std::time::Duration::from_secs(60))
+        .unwrap()
+        .with_relay(relay())
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("relay"), "{error}");
+    let error = ChargeMethod::new(provider)
+        .with_relay(relay())
+        .unwrap()
+        .with_zone_credential_grace(std::time::Duration::from_secs(60))
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("relay"), "{error}");
 }
 
 #[test]

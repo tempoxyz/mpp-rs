@@ -140,6 +140,14 @@ struct PendingWithdrawal {
     /// matches another.
     terms: Option<String>,
     request: OnceCell<Result<B256, WithdrawalFailure>>,
+    /// The sender tag of a withdrawal whose Credential was returned after its
+    /// challenge expired, as mppx's `redeemedLate`. Only a retry of that
+    /// challenge may get the Credential again; until its redemption window
+    /// ends, a challenge with the same terms fails closed, since the server
+    /// may have redeemed or refused it.
+    redeemed_late: Mutex<Option<String>>,
+    /// Payments waiting on this withdrawal for a Credential right now.
+    waiters: std::sync::atomic::AtomicUsize,
     /// The first Tempo block the first wait for its settlement searched: a
     /// resumed wait searches from there again, so a settlement older than
     /// the lookback window is still found.
@@ -335,8 +343,17 @@ impl TempoZone {
         // terms is resumed, even under a new challenge, and a new one starts
         // only when it can settle before the challenge expires; an expired
         // challenge would invite another payment.
-        Ok(self.find_pending(challenge, signer, signing_mode).is_some()
-            || settles_before_expiry(challenge, self.settlement_timeout))
+        if self
+            .find_pending(challenge, signer, signing_mode)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        // With nothing outstanding, an expired challenge can't be paid: its
+        // server refuses any Credential for it, so a payment on Tempo would
+        // be lost.
+        ensure_unexpired(challenge)?;
+        Ok(settles_before_expiry(challenge, self.settlement_timeout))
     }
 
     /// The Zone, the paying account and its signing key, so a clone used by
@@ -409,28 +426,84 @@ impl TempoZone {
 
     /// The outstanding withdrawal that pays `challenge`, with its key: its
     /// own, or, for a new challenge with the same terms, one an earlier
-    /// challenge started. A withdrawal stays outstanding until it produces a
-    /// Credential, even after its challenge expires: it may have settled, so
-    /// paying its terms again could pay twice.
+    /// challenge started and no payment is still waiting on. A withdrawal
+    /// stays outstanding until it produces a Credential, even after its
+    /// challenge expires: it may have settled, so paying its terms again could
+    /// pay twice. It stops paying other challenges once its own can no longer
+    /// be redeemed, as mppx's `findZoneWithdrawal`.
+    ///
+    /// # Errors
+    ///
+    /// [`MppError::ZoneSettlementPending`], naming the challenge the
+    /// withdrawal paid and its sender tag, when a withdrawal with the same
+    /// terms returned its Credential after its challenge expired and may still
+    /// be redeemed.
     fn find_pending(
         &self,
         challenge: &PaymentChallenge,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
-    ) -> Option<(String, Arc<PendingWithdrawal>)> {
-        let key = self.pending_key(challenge, signer, signing_mode);
-        let pending = self
+    ) -> Result<Option<(String, Arc<PendingWithdrawal>)>, MppError> {
+        let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.find_pending_in(&mut pending, challenge, signer, signing_mode)
+    }
+
+    /// [`find_pending`](Self::find_pending) over the locked map, so a
+    /// payment can look up and insert its withdrawal under one lock.
+    fn find_pending_in(
+        &self,
+        pending: &mut HashMap<String, Arc<PendingWithdrawal>>,
+        challenge: &PaymentChallenge,
+        signer: &TempoPrimitiveSigner,
+        signing_mode: &TempoSigningMode,
+    ) -> Result<Option<(String, Arc<PendingWithdrawal>)>, MppError> {
+        let key = self.pending_key(challenge, signer, signing_mode);
         if let Some(own) = pending.get(&key) {
-            return Some((key, own.clone()));
+            return Ok(Some((key, own.clone())));
         }
-        let terms = self.terms_key(challenge, signer, signing_mode)?;
-        pending
-            .iter()
-            .find(|(_, entry)| entry.terms.as_deref() == Some(terms.as_str()))
-            .map(|(key, entry)| (key.clone(), entry.clone()))
+        let Some(terms) = self.terms_key(challenge, signer, signing_mode) else {
+            return Ok(None);
+        };
+        // No server accepts their Credentials any more, so they can't pay
+        // this challenge.
+        pending.retain(|_, entry| {
+            entry.terms.as_deref() != Some(terms.as_str()) || is_redeemable(&entry.challenge)
+        });
+        for (key, entry) in pending.iter() {
+            if entry.terms.as_deref() != Some(terms.as_str()) {
+                continue;
+            }
+            // Its Credential was sent after its challenge expired, and its
+            // server may still accept or refuse it. Sending it again for this
+            // challenge could redeem it twice, and a new payment could pay
+            // twice if it was refused, so fail closed until its redemption
+            // window ends. The error names the challenge the withdrawal paid,
+            // whose retry gets its Credential.
+            let redeemed_late = entry
+                .redeemed_late
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(sender_tag) = redeemed_late {
+                return Err(MppError::ZoneSettlementPending {
+                    challenge: Box::new(entry.challenge.clone()),
+                    challenge_id: entry.challenge.id.clone(),
+                    sender_tag,
+                    zone_id: self.zone_id.unwrap_or_default(),
+                });
+            }
+            // A payment still waiting on it is another payment in flight, not
+            // one this challenge retries: sharing its Credential would leave
+            // one of the two unpaid.
+            if entry.waiters.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                continue;
+            }
+            return Ok(Some((key.clone(), entry.clone())));
+        }
+        Ok(None)
     }
 
     fn forget(&self, key: &str, withdrawal: &Arc<PendingWithdrawal>) {
@@ -480,19 +553,22 @@ impl TempoZone {
         // paying again. Concurrent payments share the request, which is stored
         // before it is sent.
         let own_key = self.pending_key(challenge, signer, signing_mode);
-        let (key, withdrawal) = {
-            let found = self.find_pending(challenge, signer, signing_mode);
+        let (key, withdrawal, _waiting) = {
+            // One lock covers the lookup and the insertion, so two payments
+            // for the same terms never both find nothing and both withdraw.
             let mut pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match found.filter(|(key, entry)| {
-                pending
-                    .get(key)
-                    .is_some_and(|current| Arc::ptr_eq(current, entry))
-            }) {
-                Some(found) => found,
+            match self.find_pending_in(&mut pending, challenge, signer, signing_mode)? {
+                Some((key, entry)) => {
+                    let waiting = Waiting::new(&entry);
+                    (key, entry, waiting)
+                }
                 None => {
+                    // With nothing outstanding, an expired challenge can't be
+                    // paid: its server refuses any Credential for it.
+                    ensure_unexpired(challenge)?;
                     let entry = pending
                         .entry(own_key.clone())
                         .or_insert_with(|| {
@@ -501,11 +577,16 @@ impl TempoZone {
                                 origin: origin.map(str::to_owned),
                                 terms: self.terms_key(challenge, signer, signing_mode),
                                 request: OnceCell::new(),
+                                redeemed_late: Mutex::default(),
+                                waiters: Default::default(),
                                 settlement_cursor: Mutex::default(),
                             })
                         })
                         .clone();
-                    (own_key.clone(), entry)
+                    // Counted while the map is locked, so a concurrent payment
+                    // for the same terms never shares it.
+                    let waiting = Waiting::new(&entry);
+                    (own_key.clone(), entry, waiting)
                 }
             }
         };
@@ -617,11 +698,18 @@ impl TempoZone {
         .map_err(|_| pending_error(format!("{sender_tag:#x}")))?;
         // The Credential pays once: a later challenge with the same terms is a
         // new payment. One made after its challenge expired is accepted only by
-        // a server that grants a grace period, so the withdrawal stays
-        // outstanding and a later challenge for its terms fails closed instead
-        // of paying again. A bounced payout paid nothing and may be paid again.
+        // a server that grants a grace period, so the withdrawal stays for a
+        // retry of its own challenge, which would otherwise pay again on Tempo,
+        // and blocks other challenges for its terms until its window ends. A
+        // bounced payout paid nothing and may be paid again.
         if settlement.bounced || !expired {
             self.forget(&key, &withdrawal);
+        } else {
+            *withdrawal
+                .redeemed_late
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(format!("{sender_tag:#x}"));
         }
         // A bounced payout returned the amount to the payer's Zone balance and
         // paid nothing, so the server would reject its Credential: fail
@@ -940,6 +1028,38 @@ fn settles_before_expiry(challenge: &PaymentChallenge, timeout: Duration) -> boo
     })
 }
 
+/// Refuse an expired `challenge` before paying it, as mppx's
+/// `Expires.assert`.
+fn ensure_unexpired(challenge: &PaymentChallenge) -> Result<(), MppError> {
+    if is_expired(challenge) {
+        return Err(MppError::payment_expired(
+            challenge.expires.clone().unwrap_or_default(),
+        ));
+    }
+    Ok(())
+}
+
+/// Counts a payment waiting on a withdrawal for as long as it lives, so the
+/// count drops when the payment is cancelled too.
+struct Waiting(Arc<PendingWithdrawal>);
+
+impl Waiting {
+    fn new(withdrawal: &Arc<PendingWithdrawal>) -> Self {
+        withdrawal
+            .waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(withdrawal.clone())
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0
+            .waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Whether `challenge` has expired.
 fn is_expired(challenge: &PaymentChallenge) -> bool {
     challenge
@@ -951,8 +1071,14 @@ fn is_expired(challenge: &PaymentChallenge) -> bool {
 /// [`zone::MAX_ZONE_CREDENTIAL_GRACE`], the longest grace a server gives, after
 /// it expires.
 fn is_redeemable(challenge: &PaymentChallenge) -> bool {
+    // An expiry too far in the future to add the grace to is redeemable.
     challenge.expires_at().is_none_or(|expires_at| {
-        time::OffsetDateTime::now_utc() < expires_at + zone::MAX_ZONE_CREDENTIAL_GRACE
+        expires_at
+            .checked_add(
+                time::Duration::try_from(zone::MAX_ZONE_CREDENTIAL_GRACE)
+                    .unwrap_or(time::Duration::MAX),
+            )
+            .is_none_or(|end| time::OffsetDateTime::now_utc() < end)
     })
 }
 

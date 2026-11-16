@@ -21,14 +21,23 @@ impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
 {
-    /// Reject unless the credential's echoed `opaque` equals the configured one.
+    /// Reject unless the credential's echoed `opaque` equals the configured
+    /// one, apart from the expiry grace marker (`_mppx_expiry_grace`) that
+    /// Tempo charge challenges carry while `zone_credential_grace` is on.
     pub(super) fn verify_opaque(
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
-        let configured_opaque = self.config.opaque.as_ref().map(|o| o.raw());
-        let echoed_opaque = credential.challenge.opaque.as_ref().map(|o| o.raw());
-        if echoed_opaque != configured_opaque {
+        use crate::protocol::core::expiry_grace::route_meta;
+
+        let configured_opaque = self.config.opaque.as_ref();
+        let echoed_opaque = credential.challenge.opaque.as_ref();
+        let matches = echoed_opaque.map(|o| o.raw()) == configured_opaque.map(|o| o.raw())
+            || matches!(
+                (route_meta(echoed_opaque), route_meta(configured_opaque)),
+                (Ok(echoed), Ok(configured)) if echoed == configured
+            );
+        if !matches {
             return Err(VerificationError::with_code(
                 "credential opaque data does not match this route's requirements",
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
@@ -130,6 +139,9 @@ where
 
         #[cfg(feature = "tempo")]
         self.verify_zone(credential, bound)?;
+        // Only Zone checks read it.
+        #[cfg(not(feature = "tempo"))]
+        let _ = bound;
 
         Ok(())
     }
@@ -241,7 +253,12 @@ where
         expires_at: time::OffsetDateTime,
     ) -> bool {
         let grace = self.config.zone_credential_grace;
+        // Only a challenge issued with the grace on, which carries the
+        // HMAC-bound marker, gets it.
         !grace.is_zero()
+            && crate::protocol::core::expiry_grace::has_expiry_grace(
+                credential.challenge.opaque.as_ref(),
+            )
             && credential
                 .charge_payload()
                 .is_ok_and(|payload| payload.is_zone())

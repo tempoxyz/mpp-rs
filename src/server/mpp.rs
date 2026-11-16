@@ -472,6 +472,14 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         // A relay verifies every credential itself, and one that does not
         // know Zone credentials would reject them only after the payer's
         // withdrawal settled to the recipient.
+        // Nor can it honor `zone_credential_grace`: it verifies credentials
+        // without the check that a late `zone` Credential settled before
+        // its challenge expired.
+        if !builder.zone_credential_grace.is_zero() && builder.relay.is_some() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "zone_credential_grace is not supported with relay(...)".into(),
+            ));
+        }
         if zones.is_some() && builder.relay.is_some() {
             return Err(crate::error::MppError::InvalidConfig(
                 "zones(...) cannot be combined with relay(...): the relay does not verify Zone credentials".into(),

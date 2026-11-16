@@ -66,6 +66,16 @@ pub use simulate::{PaymentSimulationError, PaymentSimulationPhase};
 use transaction_credential::ensure_transaction_credential_source;
 use zone_credential::ensure_zone_credential_has_no_source;
 
+/// A relay verifies Credentials itself, without the local check that a late
+/// `zone` Credential settled before its challenge expired, so it can't honor
+/// `zone_credential_grace` safely, as mppx refuses `zoneCredentialGraceMs`
+/// with `relay`.
+fn relay_grace_error() -> crate::error::MppError {
+    crate::error::MppError::InvalidConfig(
+        "zone_credential_grace is not supported with relay(...)".into(),
+    )
+}
+
 /// Reject a Zone credential in relay mode: the relay does not verify Zone
 /// credentials, so it must not be handed one.
 fn reject_relayed_zone_credential(credential: &PaymentCredential) -> Result<(), VerificationError> {
@@ -236,11 +246,17 @@ where
     ///
     /// Returns an error when `grace` exceeds
     /// [`MAX_ZONE_CREDENTIAL_GRACE`](super::zone::MAX_ZONE_CREDENTIAL_GRACE), the
-    /// longest a client waits before it may pay for the same terms again.
+    /// longest a client waits before it may pay for the same terms again, or
+    /// when a relay is configured: a relay verifies Credentials without the
+    /// check that a late `zone` Credential settled before its challenge
+    /// expired.
     pub fn with_zone_credential_grace(
         mut self,
         grace: std::time::Duration,
     ) -> crate::error::Result<Self> {
+        if self.relay.is_some() && !grace.is_zero() {
+            return Err(relay_grace_error());
+        }
         if grace > super::zone::MAX_ZONE_CREDENTIAL_GRACE {
             return Err(crate::error::MppError::InvalidConfig(format!(
                 "zone_credential_grace must be at most {}ms, got {}ms",
@@ -256,7 +272,15 @@ where
     ///
     /// The relay broadcasts pull credentials and finalizes already-broadcast
     /// push credentials without submitting them again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid relay configuration, or when a
+    /// `zone_credential_grace` is set.
     pub fn with_relay(mut self, config: RelayConfig) -> crate::error::Result<Self> {
+        if !self.zone_credential_grace.is_zero() {
+            return Err(relay_grace_error());
+        }
         self.relay = Some(Relay::new(config)?);
         Ok(self)
     }
