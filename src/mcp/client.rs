@@ -214,18 +214,26 @@ where
                 ));
             }
 
-            let paid = match management {
-                Some(management) => {
-                    self.provider
-                        .pay_with_management(&challenge, self.context.clone(), management)
-                        .await
-                }
-                None => {
-                    self.provider
-                        .pay_with_context(&challenge, self.context.clone())
-                        .await
-                }
-            };
+            // A Zone withdrawal still settling is resumed for this challenge,
+            // not paid again.
+            let paid = crate::client::resume_pending_settlement(
+                crate::client::DEFAULT_MAX_PAYMENT_RETRIES,
+                || async {
+                    match management {
+                        Some(management) => {
+                            self.provider
+                                .pay_with_management(&challenge, self.context.clone(), management)
+                                .await
+                        }
+                        None => {
+                            self.provider
+                                .pay_with_context(&challenge, self.context.clone())
+                                .await
+                        }
+                    }
+                },
+            )
+            .await;
             match paid {
                 Ok(credential) => {
                     return Ok(Some(PendingPayment::new(

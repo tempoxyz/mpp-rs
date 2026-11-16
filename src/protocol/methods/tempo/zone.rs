@@ -16,6 +16,12 @@ use serde::{Deserialize, Serialize};
 /// `defaultSettlementTimeoutMs`.
 pub const DEFAULT_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The largest grace a server gives a `zone` Credential after its challenge
+/// expires, as mppx's `maxZoneCredentialGraceMs` (five minutes). A client
+/// never pays again for a withdrawal it sent until this long after the
+/// challenge it answered expired.
+pub const MAX_ZONE_CREDENTIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The Zone outbox predeploy, which takes withdrawal requests on every Zone.
 pub const ZONE_OUTBOX: Address = address!("1c00000000000000000000000000000000000002");
 
@@ -205,6 +211,15 @@ pub fn portal_address(zone_id: u32) -> Address {
     }
 }
 
+/// Whether `address` is the Tempo portal of some Zone, as mppx's
+/// `isPortalAddress`: a prefixed portal address for any Zone ID, or the
+/// legacy portal of Zone 6 or 7.
+pub fn is_portal_address(address: Address) -> bool {
+    address.as_slice().starts_with(&ZONE_PORTAL_PREFIX)
+        || address == portal_address(6)
+        || address == portal_address(7)
+}
+
 /// Derives a Zone ID from a Zone chain ID, or `None` when the chain ID doesn't
 /// follow a known Zone scheme.
 ///
@@ -302,6 +317,39 @@ mod tests {
             Some(1337)
         );
         assert_eq!(parent_chain_id_from_chain_id(42_431), None);
+    }
+
+    #[test]
+    fn test_is_portal_address() {
+        // Zone 3's portal, in either case.
+        assert!(is_portal_address(portal_address(3)));
+        assert!(is_portal_address(
+            "0x5AD0000000000000000000000000000000000003"
+                .parse()
+                .unwrap()
+        ));
+        assert!(is_portal_address(
+            "0x5ad0000000000000000000000000000000000003"
+                .parse()
+                .unwrap()
+        ));
+        // The legacy portals of Zones 6 and 7.
+        assert!(is_portal_address(address!(
+            "7069DeC4E64Fd07334A0933eDe836C17259c9B23"
+        )));
+        assert!(is_portal_address(address!(
+            "3F5296303400B56271b476F5A0B9cBF74350D6Ac"
+        )));
+        // A near miss of the prefix, and an unrelated address.
+        assert!(!is_portal_address(address!(
+            "5ad1000000000000000000000000000000000003"
+        )));
+        assert!(!is_portal_address(address!(
+            "5ad0000000000000000000010000000000000003"
+        )));
+        assert!(!is_portal_address(address!(
+            "d8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+        )));
     }
 
     #[test]

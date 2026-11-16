@@ -270,7 +270,15 @@ async fn test_never_withdraws_on_a_parent_chain_that_does_not_match_zone_chain()
     assert!(error.to_string().contains("does not match"), "{error}");
     let tempo = super::super::rpc_provider(tempo_url.parse().unwrap(), None);
     let error = zone
-        .pay(&challenge, None, &signer, &signing_mode, &tempo)
+        .pay(
+            &challenge,
+            None,
+            None,
+            ZoneCaps::default(),
+            &signer,
+            &signing_mode,
+            &tempo,
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("does not match"), "{error}");
@@ -720,8 +728,13 @@ async fn test_serializes_nonces_across_challenges() {
         .with_settlement_timeout(Duration::ZERO);
     let (provider, _) = provider_with_zone(zone).await;
     let first = challenge_with(json!({}), None);
+    // Another payment: a challenge for the same terms would share the
+    // first withdrawal.
     let mut second = first.clone();
     second.id = "other-challenge".into();
+    let mut request = second.request.decode_value().unwrap();
+    request["amount"] = json!("2000000");
+    second.request = Base64UrlJson::from_value(&request).unwrap();
     let other = provider.clone();
     let (a, b) = tokio::join!(provider.pay(&first), other.pay(&second));
     assert!(a.is_err() && b.is_err());
@@ -1322,4 +1335,224 @@ async fn test_settlement_wait_retries_a_failed_tempo_rpc_call() {
     .unwrap();
     assert_eq!(settlement.hash, B256::repeat_byte(0x55));
     assert!(!settlement.bounced);
+}
+
+/// A payment context for a request to BTurlBT.
+fn context_for(url: &str) -> crate::client::PaymentContext {
+    crate::client::PaymentContext {
+        url: url.parse().unwrap(),
+        headers: Default::default(),
+        http_client: None,
+    }
+}
+
+/// A new challenge for the same terms as BTchallenge_with(details, ..)BT.
+fn same_terms(details: Value, id: &str) -> PaymentChallenge {
+    let mut challenge = challenge_with(details, expires_in(900));
+    challenge.id = id.into();
+    challenge
+}
+
+/// A provider paying from Zone 3 whose settlement wait gives up at once, with
+/// the Zone sends it records and the Tempo logs it reads.
+async fn resumable_provider() -> (TempoProvider, Arc<Mutex<Vec<String>>>, Arc<Mutex<Value>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let logs = Arc::new(Mutex::new(json!([])));
+    let (tempo_url, _) = tempo_rpc(logs.clone()).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    (provider, sent, logs)
+}
+
+fn pending_challenge_id(error: MppError) -> String {
+    match error {
+        MppError::ZoneSettlementPending { challenge_id, .. } => challenge_id,
+        error => panic!("expected ZoneSettlementPending, got {error}"),
+    }
+}
+
+#[tokio::test]
+async fn test_new_challenge_for_same_terms_resumes_the_withdrawal_from_its_origin() {
+    let (provider, sent, logs) = resumable_provider().await;
+    let first = challenge_with(json!({}), expires_in(600));
+    let origin = "https://api.example.com/paid";
+    let error = provider
+        .pay_with_context(&first, context_for(origin))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), first.id);
+    let sender_tag = sent_sender_tag(&sent);
+
+    // A new challenge for the same terms, from another origin or from one
+    // the caller did not verify, fails closed and names the first challenge.
+    let second = same_terms(json!({}), "zone-challenge-2");
+    for error in [
+        provider
+            .pay_with_context(&second, context_for("https://other.example.com/paid"))
+            .await
+            .unwrap_err(),
+        provider.pay(&second).await.unwrap_err(),
+    ] {
+        assert_eq!(pending_challenge_id(error), first.id);
+    }
+    assert_eq!(sent.lock().unwrap().len(), 1);
+
+    // From its origin, it resumes the first withdrawal and answers the first
+    // challenge.
+    *logs.lock().unwrap() = json!([settlement_log(sender_tag, true, B256::repeat_byte(0x33))]);
+    let credential = provider
+        .pay_with_context(&second, context_for(origin))
+        .await
+        .unwrap();
+    assert_eq!(credential.challenge.id, first.id);
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_new_challenge_for_other_terms_withdraws_again() {
+    let (provider, sent, _) = resumable_provider().await;
+    let origin = "https://api.example.com/paid";
+    let first = challenge_with(json!({}), expires_in(600));
+    provider
+        .pay_with_context(&first, context_for(origin))
+        .await
+        .unwrap_err();
+    let mut other = same_terms(json!({}), "zone-challenge-2");
+    let mut request = other.request.decode_value().unwrap();
+    request["amount"] = json!("2000000");
+    other.request = Base64UrlJson::from_value(&request).unwrap();
+    let error = provider
+        .pay_with_context(&other, context_for(origin))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), other.id);
+    assert_eq!(sent.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_withdrawal_past_its_redemption_window_is_never_paid_again() {
+    let (provider, sent, _) = resumable_provider().await;
+    let zone = provider.zone.as_ref().unwrap();
+    // A withdrawal whose challenge expired more than the largest server grace
+    // ago, as one left outstanding would be by then.
+    let expired = challenge_with(
+        json!({}),
+        Some(
+            (time::OffsetDateTime::now_utc() - time::Duration::seconds(301))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        ),
+    );
+    let signer = TempoPrimitiveSigner::from(payer());
+    let signing_mode = TempoSigningMode::Direct;
+    let key = zone.pending_key(&expired, &signer, &signing_mode);
+    zone.pending.lock().unwrap().insert(
+        key,
+        Arc::new(PendingWithdrawal {
+            challenge: expired.clone(),
+            origin: Some("https://api.example.com".into()),
+            terms: zone.terms_key(&expired, &signer, &signing_mode),
+            request: OnceCell::new(),
+            settlement_cursor: Mutex::default(),
+        }),
+    );
+    let next = same_terms(json!({}), "zone-challenge-2");
+    for challenge in [&expired, &next] {
+        let error = provider
+            .pay_with_context(challenge, context_for("https://api.example.com/paid"))
+            .await
+            .unwrap_err();
+        assert_eq!(pending_challenge_id(error), expired.id);
+    }
+    assert!(sent.lock().unwrap().is_empty());
+}
+
+/// A provider paying from Zone 3, whose outbox charges a fee of 5, with the
+/// Zone sends it records.
+async fn fee_provider(
+    caps: impl FnOnce(TempoProvider) -> TempoProvider,
+) -> (TempoProvider, Arc<Mutex<Vec<String>>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let inner = recording_zone_handler(sent.clone());
+    let (zone_url, _) = spawn_rpc(Arc::new(move |method, params| {
+        if method == "eth_call" {
+            return Ok(json!(format!("{:#066x}", 5)));
+        }
+        inner(method, params)
+    }))
+    .await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    (
+        caps(provider.with_currencies([format!("{CURRENCY:#x}")])),
+        sent,
+    )
+}
+
+#[tokio::test]
+async fn test_withdrawal_fee_counts_against_client_caps() {
+    type Caps = fn(TempoProvider) -> TempoProvider;
+    let over: [(Caps, &str); 2] = [
+        (
+            |p| p.with_max_atomic_amount(U256::from(1_000_004u64)),
+            "max_atomic_amount",
+        ),
+        (|p| p.with_max_amount("1.000004", 6).unwrap(), "max_amount"),
+    ];
+    for (caps, name) in over {
+        let (provider, sent) = fee_provider(caps).await;
+        let challenge = challenge_with(json!({}), None);
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "Tempo charge amount plus Zone withdrawal fee exceeds {name}."
+            )),
+            "{error}"
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        // Nothing was sent, so the same challenge may be paid again.
+        assert!(provider
+            .zone
+            .as_ref()
+            .unwrap()
+            .pending
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    let at: [Caps; 2] = [
+        |p| p.with_max_atomic_amount(U256::from(1_000_005u64)),
+        |p| p.with_max_amount("1.000005", 6).unwrap(),
+    ];
+    for caps in at {
+        let (provider, sent) = fee_provider(caps).await;
+        let challenge = challenge_with(json!({}), None);
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert_eq!(pending_challenge_id(error), challenge.id);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn test_settlement_pending_message_omits_unknown_sender_tag() {
+    let challenge = challenge_with(json!({}), None);
+    let error = MppError::ZoneSettlementPending {
+        challenge: Box::new(challenge.clone()),
+        challenge_id: challenge.id.clone(),
+        sender_tag: String::new(),
+        zone_id: 3,
+    };
+    assert_eq!(
+        error.to_string(),
+        "Zone 3 withdrawal for challenge \"zone-challenge\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again."
+    );
 }

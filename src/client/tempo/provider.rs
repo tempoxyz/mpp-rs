@@ -284,7 +284,7 @@ pub struct TempoProvider {
     /// No RPC was configured: pay on the challenge's chain via its default RPC.
     follow_challenge_chain: bool,
     allowed_chain_ids: Option<Vec<u64>>,
-    zone: Option<super::zone::TempoZone>,
+    pub(super) zone: Option<super::zone::TempoZone>,
     chain_providers: Arc<
         std::sync::Mutex<
             std::collections::HashMap<
@@ -657,6 +657,94 @@ impl TempoProvider {
         Ok(())
     }
 
+    /// Pay `challenge`, returned by a request to `origin` when known.
+    async fn pay_from(
+        &self,
+        challenge: &PaymentChallenge,
+        origin: Option<String>,
+    ) -> Result<PaymentCredential, MppError> {
+        self.check_policy(challenge)?;
+        let from = self
+            .signing_mode
+            .from_address(alloy::signers::Signer::address(&self.signer));
+        let challenge_chain_id = {
+            use crate::protocol::methods::tempo::charge::TempoChargeExt;
+            challenge
+                .request
+                .decode::<crate::protocol::intents::ChargeRequest>()?
+                .chain_id()
+        };
+        // An explicit pin is enforced against the challenge's chain.
+        if let (Some(expected), Some(got)) = (self.expected_chain_id, challenge_chain_id) {
+            if expected != got {
+                return Err(MppError::ChainIdMismatch { expected, got });
+            }
+        }
+        let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
+        self.ensure_allowed_chain(Some(chain_id))?;
+        // A challenge names the chain it settles on: refuse another one before
+        // choosing the Zone path, as the ordinary path does, so an unpinned
+        // provider never withdraws from a Zone settling on its RPC chain.
+        if let Some(got) = challenge_chain_id {
+            if got != chain_id {
+                return Err(MppError::ChainIdMismatch {
+                    expected: chain_id,
+                    got,
+                });
+            }
+        }
+        if let Some(zone) = &self.zone {
+            let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
+            if zone.pays(
+                challenge,
+                &request,
+                chain_id,
+                &self.signer,
+                &self.signing_mode,
+            )? {
+                return zone
+                    .pay(
+                        challenge,
+                        origin.as_deref(),
+                        self.client_id.as_deref(),
+                        super::zone::ZoneCaps {
+                            max_amount: self.max_amount,
+                            max_atomic_amount: self.max_atomic_amount,
+                        },
+                        &self.signer,
+                        &self.signing_mode,
+                        &rpc_provider,
+                    )
+                    .await;
+            }
+        }
+        let charge = prepare_charge_request(challenge, Some(chain_id), self.client_id.as_deref())?;
+        let machine_token = machine_token_payment(&charge);
+        let paid = async {
+            let funded = fund_routed(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
+            let options = SignOptions {
+                signing_mode: Some(self.signing_mode.clone()),
+                fee_token: select_fee_token(
+                    self.fee_token,
+                    funded.fee_token,
+                    funded.charge.currency(),
+                    funded.swapped,
+                ),
+                ..Default::default()
+            };
+            funded
+                .charge
+                .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
+                .await
+        }
+        .await;
+        match (paid, machine_token) {
+            (Ok(signed), _) => Ok(signed.into_credential()),
+            (Err(error), Some(payment)) => Err(payment.explain(error, &rpc_provider, from).await),
+            (Err(error), None) => Err(error),
+        }
+    }
+
     /// Get the pinned expected chain ID, if set.
     pub fn expected_chain_id(&self) -> Option<u64> {
         self.expected_chain_id
@@ -756,81 +844,19 @@ impl PaymentProvider for TempoProvider {
     }
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
-        self.check_policy(challenge)?;
-        let from = self
-            .signing_mode
-            .from_address(alloy::signers::Signer::address(&self.signer));
-        let challenge_chain_id = {
-            use crate::protocol::methods::tempo::charge::TempoChargeExt;
-            challenge
-                .request
-                .decode::<crate::protocol::intents::ChargeRequest>()?
-                .chain_id()
-        };
-        // An explicit pin is enforced against the challenge's chain.
-        if let (Some(expected), Some(got)) = (self.expected_chain_id, challenge_chain_id) {
-            if expected != got {
-                return Err(MppError::ChainIdMismatch { expected, got });
-            }
-        }
-        let (chain_id, rpc_provider) = self.resolve_chain(challenge_chain_id).await?;
-        self.ensure_allowed_chain(Some(chain_id))?;
-        // A challenge names the chain it settles on: refuse another one before
-        // choosing the Zone path, as the ordinary path does, so an unpinned
-        // provider never withdraws from a Zone settling on its RPC chain.
-        if let Some(got) = challenge_chain_id {
-            if got != chain_id {
-                return Err(MppError::ChainIdMismatch {
-                    expected: chain_id,
-                    got,
-                });
-            }
-        }
-        if let Some(zone) = &self.zone {
-            let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
-            if zone.pays(
-                challenge,
-                &request,
-                chain_id,
-                &self.signer,
-                &self.signing_mode,
-            )? {
-                return zone
-                    .pay(
-                        challenge,
-                        self.client_id.as_deref(),
-                        &self.signer,
-                        &self.signing_mode,
-                        &rpc_provider,
-                    )
-                    .await;
-            }
-        }
-        let charge = prepare_charge_request(challenge, Some(chain_id), self.client_id.as_deref())?;
-        let machine_token = machine_token_payment(&charge);
-        let paid = async {
-            let funded = fund_routed(charge, self.autoswap.as_ref(), &rpc_provider, from).await?;
-            let options = SignOptions {
-                signing_mode: Some(self.signing_mode.clone()),
-                fee_token: select_fee_token(
-                    self.fee_token,
-                    funded.fee_token,
-                    funded.charge.currency(),
-                    funded.swapped,
-                ),
-                ..Default::default()
-            };
-            funded
-                .charge
-                .sign_with_primitive_provider_options(&self.signer, &rpc_provider, options)
-                .await
-        }
-        .await;
-        match (paid, machine_token) {
-            (Ok(signed), _) => Ok(signed.into_credential()),
-            (Err(error), Some(payment)) => Err(payment.explain(error, &rpc_provider, from).await),
-            (Err(error), None) => Err(error),
-        }
+        self.pay_from(challenge, None).await
+    }
+
+    async fn pay_with_context(
+        &self,
+        challenge: &PaymentChallenge,
+        context: crate::client::PaymentContext,
+    ) -> Result<PaymentCredential, MppError> {
+        // The origin of the request that returned the challenge, so a Zone
+        // withdrawal started for it is only ever resumed for that origin.
+        let origin = context.url.origin();
+        let origin = origin.is_tuple().then(|| origin.ascii_serialization());
+        self.pay_from(challenge, origin).await
     }
 
     fn accept_payment_header(&self) -> Option<String> {

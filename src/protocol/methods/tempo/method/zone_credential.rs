@@ -20,6 +20,21 @@ fn zone_replay_key(portal: alloy::primitives::Address, sender_tag: B256) -> Stri
     format!("mpp:charge:zone:{portal:#x}:{sender_tag:#x}")
 }
 
+/// The challenge's expiry when it has passed, or `None` while it is valid or
+/// carries none. Server-level verification already requires a well-formed
+/// `expires`; a malformed one is refused here too.
+fn expired_at(expires: Option<&str>) -> Result<Option<time::OffsetDateTime>, VerificationError> {
+    let Some(expires) = expires else {
+        return Ok(None);
+    };
+    let expires_at =
+        time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| {
+                VerificationError::invalid_challenge("Invalid expires timestamp in challenge")
+            })?;
+    Ok((expires_at <= time::OffsetDateTime::now_utc()).then_some(expires_at))
+}
+
 fn parse_b256(value: Option<&str>, field: &str) -> Result<B256, VerificationError> {
     let value = value.unwrap_or_default();
     let hex = value.strip_prefix("0x").ok_or_else(|| {
@@ -71,6 +86,33 @@ where
     ///
     /// With `reserve`, the withdrawal's sender tag is claimed in the store so
     /// it pays for one challenge only; without it, a claimed one is rejected.
+    /// Refuse a settlement whose block is not older than `expires_at`.
+    async fn ensure_settled_before(
+        &self,
+        receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
+        expires_at: time::OffsetDateTime,
+    ) -> Result<(), VerificationError> {
+        let block_number = receipt.block_number().ok_or_else(|| {
+            VerificationError::pending("Zone settlement transaction is not mined yet.")
+        })?;
+        let block = self
+            .provider
+            .get_block_by_number(block_number.into())
+            .await
+            .map_err(|e| VerificationError::network_error(format!("Failed to fetch block: {e}")))?
+            .ok_or_else(|| {
+                VerificationError::network_error(format!("Block {block_number} not found"))
+            })?;
+        let settled_at = i128::from(alloy::consensus::BlockHeader::timestamp(&block.header)) * 1000;
+        let expires_ms = expires_at.unix_timestamp_nanos() / 1_000_000;
+        if settled_at >= expires_ms {
+            return Err(VerificationError::expired(
+                "Payment expired: the Zone withdrawal settled after its challenge expired.",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn verify_zone(
         &self,
         payload: &PaymentPayload,
@@ -80,6 +122,17 @@ where
     ) -> Result<Receipt, VerificationError> {
         let hash = parse_b256(Some(payload.data()), "hash")?;
         let sender_tag = parse_b256(payload.zone_sender_tag(), "senderTag")?;
+        // A server's `zone_credential_grace` lets a zone Credential arrive
+        // after its challenge expired, but never past the grace.
+        let expired = expired_at(challenge.expires.as_deref())?;
+        if let Some(expires_at) = expired {
+            if time::OffsetDateTime::now_utc() >= expires_at + self.zone_credential_grace {
+                return Err(VerificationError::expired(format!(
+                    "Challenge expired at {}",
+                    challenge.expires.as_deref().unwrap_or_default()
+                )));
+            }
+        }
         let zone_id = payload
             .zone_id()
             .filter(|id| zone::is_id(u64::from(*id)))
@@ -166,6 +219,12 @@ where
         // would not help: an unbound memo is a replay, as for hash credentials.
         assert_challenge_bound_memos([&withdrawal.memo.0], &challenge.id, &challenge.realm)
             .map_err(|error| VerificationError::credential_replayed(error.message))?;
+
+        // Only a withdrawal settled before the expiry paid for an expired
+        // challenge.
+        if let Some(expires_at) = expired {
+            self.ensure_settled_before(&receipt, expires_at).await?;
+        }
 
         if let Some(store) = &self.store {
             let replay_key = zone_replay_key(portal, sender_tag);

@@ -207,7 +207,9 @@ where
                     VerificationError::invalid_challenge("Invalid expires timestamp in challenge")
                 })?;
 
-        if expires_at <= time::OffsetDateTime::now_utc() {
+        if expires_at <= time::OffsetDateTime::now_utc()
+            && !self.in_zone_grace(credential, expires_at)
+        {
             return Err(VerificationError::expired(format!(
                 "Challenge expired at {}",
                 expires
@@ -215,6 +217,33 @@ where
         }
 
         Ok(())
+    }
+
+    /// Whether an expired challenge's credential is a `zone` Credential still
+    /// within the handler's `zone_credential_grace`. Only a Zone withdrawal
+    /// gets the grace: the method then requires its settlement to predate the
+    /// expiry.
+    #[cfg(feature = "tempo")]
+    fn in_zone_grace(
+        &self,
+        credential: &PaymentCredential,
+        expires_at: time::OffsetDateTime,
+    ) -> bool {
+        let grace = self.config.zone_credential_grace;
+        !grace.is_zero()
+            && credential
+                .charge_payload()
+                .is_ok_and(|payload| payload.is_zone())
+            && time::OffsetDateTime::now_utc() < expires_at + grace
+    }
+
+    #[cfg(not(feature = "tempo"))]
+    fn in_zone_grace(
+        &self,
+        _credential: &PaymentCredential,
+        _expires_at: time::OffsetDateTime,
+    ) -> bool {
+        false
     }
 
     /// Whether the credential's challenge ID is this handler's HMAC over the

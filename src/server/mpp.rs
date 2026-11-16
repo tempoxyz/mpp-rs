@@ -147,6 +147,9 @@ struct Config {
     /// verify Zone credentials, so challenges must not advertise Zones.
     #[cfg(feature = "tempo")]
     relay: bool,
+    /// How long after expiry a `zone` Credential is still accepted.
+    #[cfg(feature = "tempo")]
+    zone_credential_grace: std::time::Duration,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
 }
@@ -169,6 +172,8 @@ impl Config {
             zones: None,
             #[cfg(feature = "tempo")]
             relay: false,
+            #[cfg(feature = "tempo")]
+            zone_credential_grace: std::time::Duration::ZERO,
             opaque: None,
             credential_header: None,
         }
@@ -486,7 +491,8 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         crate::protocol::core::validate_secret_key(&secret_key)?;
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
-        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
+        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider)
+            .with_zone_credential_grace(builder.zone_credential_grace)?;
         if let Some(signer) = builder.fee_payer_signer {
             method = method.with_fee_payer_arc(signer);
         }
@@ -524,6 +530,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 chain_id: builder.chain_id,
                 zones,
                 relay,
+                zone_credential_grace: builder.zone_credential_grace,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),
                 ..Config::new(builder.realm, secret_key)
             },

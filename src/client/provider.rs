@@ -54,6 +54,29 @@ pub trait ManagementTransport: Send + Sync {
     ) -> ManagementFuture<'a>;
 }
 
+/// Creates a credential with `create` and, while the Zone withdrawal that pays
+/// its challenge is still settling, creates it again for the same challenge,
+/// up to `attempts` times in all, as mppx's `PendingSettlement.resume`. Each
+/// attempt resumes waiting for that withdrawal; requesting a new challenge
+/// instead would not settle it sooner. Other errors return at once. Dropping
+/// the future stops it.
+pub(crate) async fn resume_pending_settlement<T, F, Fut>(
+    attempts: usize,
+    mut create: F,
+) -> Result<T, MppError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, MppError>>,
+{
+    let mut attempt = 1;
+    loop {
+        match create().await {
+            Err(MppError::ZoneSettlementPending { .. }) if attempt < attempts => attempt += 1,
+            result => return result,
+        }
+    }
+}
+
 /// HTTP request context available while creating a payment credential.
 ///
 /// Session providers use this to submit management credentials, such as a
@@ -1069,6 +1092,57 @@ mod tests {
             &url("https://api.example"),
             &url("https://api.example:443/pay")
         ));
+    }
+
+    #[tokio::test]
+    async fn resume_pending_settlement_retries_only_while_settling() {
+        use super::*;
+        let pending = || MppError::ZoneSettlementPending {
+            challenge: Box::new(PaymentChallenge::new(
+                "id",
+                "realm",
+                "tempo",
+                "charge",
+                crate::protocol::core::Base64UrlJson::from_raw("e30"),
+            )),
+            challenge_id: "id".into(),
+            sender_tag: String::new(),
+            zone_id: 3,
+        };
+        // Retried up to the limit, then returned.
+        let calls = std::cell::Cell::new(0);
+        let result: Result<(), _> = resume_pending_settlement(3, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err(pending()))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(MppError::ZoneSettlementPending { .. })
+        ));
+        assert_eq!(calls.get(), 3);
+        // Settles on a retry.
+        calls.set(0);
+        let result = resume_pending_settlement(3, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(if calls.get() < 2 {
+                Err(pending())
+            } else {
+                Ok(7)
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.get(), 2);
+        // Any other error returns at once.
+        calls.set(0);
+        let result: Result<(), _> = resume_pending_settlement(3, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Err(MppError::Http("boom".into())))
+        })
+        .await;
+        assert!(matches!(result, Err(MppError::Http(_))));
+        assert_eq!(calls.get(), 1);
     }
 
     use super::*;

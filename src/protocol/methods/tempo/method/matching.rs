@@ -6,6 +6,7 @@ use alloy::primitives::{Address, U256};
 use crate::protocol::traits::VerificationError;
 
 use super::super::transfers::Transfer;
+use super::super::zone;
 use super::receipt_logs::ReceiptSenderPolicy;
 
 /// A TIP-20 transfer made by a transaction, read from one of its calls or
@@ -77,6 +78,10 @@ pub(super) fn match_transfers(
         let find = |with_memo: Option<bool>| {
             transfers.iter().enumerate().position(|(index, transfer)| {
                 !used[index]
+                    // A Zone portal's payout settles a Zone withdrawal, which pays
+                    // only through its `zone` Credential, so the same settlement
+                    // can't also be redeemed by transaction hash.
+                    && !transfer.from.is_some_and(zone::is_portal_address)
                     && transfer.token == currency
                     && transfer.to == expected.recipient
                     && transfer.amount == expected.amount

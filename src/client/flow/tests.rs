@@ -257,6 +257,8 @@ struct TestProvider {
     prepaid_realm: Option<&'static str>,
     /// The realm this caller pins for every origin.
     trusted_realm: Option<&'static str>,
+    /// Payments that fail as a Zone withdrawal still settling before one succeeds.
+    settling: Arc<AtomicU32>,
 }
 
 impl TestProvider {
@@ -285,6 +287,15 @@ impl PaymentProvider for TestProvider {
 
     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
         self.paid.lock().unwrap().push(challenge.id.clone());
+        if self.settling.load(Ordering::SeqCst) > 0 {
+            self.settling.fetch_sub(1, Ordering::SeqCst);
+            return Err(MppError::ZoneSettlementPending {
+                challenge: Box::new(challenge.clone()),
+                challenge_id: challenge.id.clone(),
+                sender_tag: String::new(),
+                zone_id: 3,
+            });
+        }
         if challenge.intent.as_str() == "session" {
             return Ok(PaymentCredential::new(
                 challenge.to_echo(),
@@ -1184,5 +1195,61 @@ async fn refused_hash_credential_is_not_paid_again() {
 
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
         assert_eq!(provider.paid(), ["charge-0"], "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn settling_zone_withdrawal_is_resumed_for_the_same_challenge() {
+    let challenged = Arc::new(AtomicU32::new(0));
+    let app = Router::new().route(
+        "/paid",
+        get({
+            let challenged = challenged.clone();
+            move |request: Request<Body>| async move {
+                if is_paid(&request) {
+                    StatusCode::OK.into_response()
+                } else {
+                    challenged.fetch_add(1, Ordering::SeqCst);
+                    payment_required("charge-1", "charge")
+                }
+            }
+        }),
+    );
+    let url = spawn_server(app).await;
+
+    for via in BOTH {
+        challenged.store(0, Ordering::SeqCst);
+        // Settles on the third attempt, within the retry limit, without
+        // asking the server for a new challenge.
+        let provider = TestProvider {
+            settling: Arc::new(AtomicU32::new(2)),
+            ..Default::default()
+        };
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+        assert_eq!(provider.paid(), ["charge-1"; 3], "{via:?}");
+        assert_eq!(challenged.load(Ordering::SeqCst), 1, "{via:?}");
+
+        // Past the limit, the error is returned.
+        challenged.store(0, Ordering::SeqCst);
+        let provider = TestProvider {
+            settling: Arc::new(AtomicU32::new(10)),
+            ..Default::default()
+        };
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let error = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("has not settled"),
+            "{via:?}: {error}"
+        );
+        assert_eq!(provider.paid(), ["charge-1"; 3], "{via:?}");
+        assert_eq!(challenged.load(Ordering::SeqCst), 1, "{via:?}");
     }
 }

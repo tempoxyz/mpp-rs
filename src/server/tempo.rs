@@ -51,6 +51,7 @@ pub struct TempoBuilder {
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
     pub(crate) zones: Option<crate::protocol::methods::tempo::zone::Zones>,
+    pub(crate) zone_credential_grace: std::time::Duration,
 }
 
 impl TempoBuilder {
@@ -261,6 +262,20 @@ impl TempoBuilder {
         self.zones = Some(zones);
         self
     }
+
+    /// How long after its challenge expires a `zone` Credential is still
+    /// accepted, as mppx's `zoneCredentialGraceMs`. Defaults to zero.
+    ///
+    /// A Zone withdrawal can settle on Tempo shortly before its challenge
+    /// expires and reach the server only after. Within the grace, a `zone`
+    /// Credential for an expired challenge is accepted when its settlement's
+    /// block is older than the expiry; every other Credential type gets no
+    /// grace. [`Mpp::create()`](super::Mpp::create) rejects a grace above
+    /// [`MAX_ZONE_CREDENTIAL_GRACE`](crate::protocol::methods::tempo::zone::MAX_ZONE_CREDENTIAL_GRACE).
+    pub fn zone_credential_grace(mut self, grace: std::time::Duration) -> Self {
+        self.zone_credential_grace = grace;
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -345,6 +360,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         relay: None,
         requires_auth: false,
         zones: None,
+        zone_credential_grace: std::time::Duration::ZERO,
     }
 }
 

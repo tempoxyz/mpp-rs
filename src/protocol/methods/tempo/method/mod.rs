@@ -179,6 +179,7 @@ pub struct ChargeMethod<P> {
     relay: Option<Relay>,
     fee_payer_fee_token: Option<Address>,
     remote_fee_payer: Option<hosted_fee_payer::HostedFeePayer>,
+    zone_credential_grace: std::time::Duration,
 }
 
 impl<P> ChargeMethod<P>
@@ -219,7 +220,36 @@ where
             relay: None,
             fee_payer_fee_token: None,
             remote_fee_payer: None,
+            zone_credential_grace: std::time::Duration::ZERO,
         }
+    }
+
+    /// Accept a `zone` Credential this long after its challenge expires, as
+    /// mppx's `zoneCredentialGraceMs`. Defaults to zero.
+    ///
+    /// A Zone withdrawal can settle on Tempo shortly before its challenge
+    /// expires and reach the server only after. Within the grace, a `zone`
+    /// Credential for an expired challenge is accepted when the block of its
+    /// settlement is older than the expiry. Other Credential types get no grace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `grace` exceeds
+    /// [`MAX_ZONE_CREDENTIAL_GRACE`](super::zone::MAX_ZONE_CREDENTIAL_GRACE), the
+    /// longest a client waits before it may pay for the same terms again.
+    pub fn with_zone_credential_grace(
+        mut self,
+        grace: std::time::Duration,
+    ) -> crate::error::Result<Self> {
+        if grace > super::zone::MAX_ZONE_CREDENTIAL_GRACE {
+            return Err(crate::error::MppError::InvalidConfig(format!(
+                "zone_credential_grace must be at most {}ms, got {}ms",
+                super::zone::MAX_ZONE_CREDENTIAL_GRACE.as_millis(),
+                grace.as_millis()
+            )));
+        }
+        self.zone_credential_grace = grace;
+        Ok(self)
     }
 
     /// Delegate credential validation and finalization to a Tempo API relay.

@@ -732,3 +732,246 @@ async fn test_zone_batch_still_verifies_after_hash_credential_attempts() {
         .await
         .unwrap();
 }
+
+/// The settlement receipt with the TIP-20 transfer the portal makes for each
+/// withdrawal, as Tempo logs it. Without `settlement`, the portal's
+/// `WithdrawalProcessed` events are left out, so only the transfer shows.
+fn portal_transfer_receipt(
+    withdrawals: &[WithdrawalFixture],
+    settlement: bool,
+) -> serde_json::Value {
+    let mut receipt = settlement_receipt(withdrawals, true);
+    let portal = zone::portal_address(ZONE_ID);
+    let transfers = withdrawals.iter().map(|w| {
+        serde_json::json!({
+            "address": format!("{:#x}", w.token),
+            "topics": [
+                format!("{:#x}", ITIP20::TransferWithMemo::SIGNATURE_HASH),
+                format!("{:#x}", portal.into_word()),
+                format!("{:#x}", w.to.into_word()),
+                format!("{:#x}", B256::from(w.memo)),
+            ],
+            "data": format!("{:#x}", B256::from(U256::from(w.amount))),
+            "blockHash": format!("{:#x}", settlement_hash()),
+            "blockNumber": "0x10",
+            "transactionHash": format!("{:#x}", settlement_hash()),
+            "transactionIndex": "0x0",
+            "logIndex": "0x20",
+            "removed": false,
+        })
+    });
+    let logs = receipt["logs"].as_array_mut().unwrap();
+    if !settlement {
+        logs.clear();
+    }
+    logs.extend(transfers);
+    receipt
+}
+
+/// A hash credential naming the settlement transaction, with `source`.
+fn settlement_hash_credential_from(
+    challenge: &PaymentChallenge,
+    source: Option<String>,
+) -> PaymentCredential {
+    let mut credential = settlement_hash_credential(challenge);
+    credential.source = source;
+    credential
+}
+
+fn assert_no_matching_transfer(error: VerificationError) {
+    assert!(
+        error.message.contains("No matching transfer event found"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_zone_settlement_redeemed_by_zone_credential_is_refused_as_hash_credential() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = zone_method(&fixture, true);
+    asserter.write_q().clear();
+    asserter.push_success(&portal_transfer_receipt(&fixture, true));
+    asserter.push_success(&settlement_transaction(&fixture));
+    method
+        .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
+        .await
+        .unwrap();
+    asserter.push_success(&portal_transfer_receipt(&fixture, true));
+    let error = method
+        .verify(&settlement_hash_credential(&challenge), &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::InvalidCredential), "{error}");
+}
+
+#[tokio::test]
+async fn test_hash_credential_refuses_portal_transfer() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = zone_method(&fixture, true);
+    asserter.write_q().clear();
+    let portal = zone::portal_address(ZONE_ID);
+    // As the portal, and with no source.
+    for source in [
+        Some(format!("did:pkh:eip155:{MODERATO_CHAIN_ID}:{portal:#x}")),
+        None,
+    ] {
+        asserter.push_success(&portal_transfer_receipt(&fixture, false));
+        assert_no_matching_transfer(
+            method
+                .verify(
+                    &settlement_hash_credential_from(&challenge, source),
+                    &request,
+                )
+                .await
+                .unwrap_err(),
+        );
+    }
+    // The zone credential still redeems the settlement, once.
+    push_settlement(&asserter, &fixture);
+    let credential = zone_credential(&challenge, tag_a(), ZONE_ID);
+    method.verify(&credential, &request).await.unwrap();
+    push_settlement(&asserter, &fixture);
+    let error = method.verify(&credential, &request).await.unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::CredentialReplayed), "{error}");
+}
+
+#[tokio::test]
+async fn test_hash_credential_refuses_portal_transfer_whatever_validate_sender_says() {
+    let request = zone_request(serde_json::json!({}));
+    let challenge = zone_challenge("challenge-a", &request);
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = zone_method(&fixture, true);
+    let method = method.with_validate_sender(|_| true);
+    asserter.write_q().clear();
+    asserter.push_success(&portal_transfer_receipt(&fixture, false));
+    assert_no_matching_transfer(
+        method
+            .verify(&settlement_hash_credential(&challenge), &request)
+            .await
+            .unwrap_err(),
+    );
+}
+
+/// A block response with the given timestamp, in seconds.
+fn block_at(timestamp: u64) -> serde_json::Value {
+    let header = tempo_alloy::rpc::TempoHeaderResponse {
+        inner: alloy::rpc::types::Header {
+            hash: B256::repeat_byte(0xee),
+            inner: tempo_alloy::primitives::TempoHeader {
+                inner: alloy::consensus::Header {
+                    number: 0x10,
+                    timestamp,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            total_difficulty: None,
+            size: None,
+        },
+        timestamp_millis: timestamp * 1000,
+    };
+    let block: alloy::rpc::types::Block<serde_json::Value, _> =
+        alloy::rpc::types::Block::empty(header);
+    serde_json::to_value(block).unwrap()
+}
+
+/// A zone challenge whose expiry was `ago` before now.
+fn expired_zone_challenge(request: &ChargeRequest, ago: time::Duration) -> (PaymentChallenge, i64) {
+    let expires_at = time::OffsetDateTime::now_utc() - ago;
+    let expires_at = expires_at.replace_nanosecond(0).unwrap();
+    let mut challenge = zone_challenge("challenge-a", request);
+    challenge.expires = Some(
+        expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+    );
+    (challenge, expires_at.unix_timestamp())
+}
+
+fn grace_method(
+    fixture: &[WithdrawalFixture],
+    grace: std::time::Duration,
+) -> (
+    ChargeMethod<impl Provider<tempo_alloy::TempoNetwork> + Clone>,
+    alloy::providers::mock::Asserter,
+) {
+    let (method, asserter) = zone_method(fixture, true);
+    asserter.write_q().clear();
+    (method.with_zone_credential_grace(grace).unwrap(), asserter)
+}
+
+#[tokio::test]
+async fn test_zone_credential_grace_accepts_settlement_before_expiry_once() {
+    let request = zone_request(serde_json::json!({}));
+    let (challenge, expires) = expired_zone_challenge(&request, time::Duration::seconds(1));
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = grace_method(&fixture, std::time::Duration::from_secs(60));
+    let settled = u64::try_from(expires - 30).unwrap();
+    let credential = zone_credential(&challenge, tag_a(), ZONE_ID);
+    push_settlement(&asserter, &fixture);
+    asserter.push_success(&block_at(settled));
+    method.verify(&credential, &request).await.unwrap();
+
+    push_settlement(&asserter, &fixture);
+    asserter.push_success(&block_at(settled));
+    let error = method.verify(&credential, &request).await.unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::CredentialReplayed), "{error}");
+}
+
+#[tokio::test]
+async fn test_zone_credential_grace_rejects_settlement_after_expiry() {
+    let request = zone_request(serde_json::json!({}));
+    let (challenge, expires) = expired_zone_challenge(&request, time::Duration::seconds(1));
+    let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+    let (method, asserter) = grace_method(&fixture, std::time::Duration::from_secs(60));
+    push_settlement(&asserter, &fixture);
+    asserter.push_success(&block_at(u64::try_from(expires).unwrap()));
+    let error = method
+        .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+}
+
+#[tokio::test]
+async fn test_zone_credential_grace_rejects_after_window_without_rpc() {
+    let request = zone_request(serde_json::json!({}));
+    for (ago, grace) in [
+        // Past the grace.
+        (61, std::time::Duration::from_secs(60)),
+        // The default grace is zero.
+        (1, std::time::Duration::ZERO),
+    ] {
+        let (challenge, _) = expired_zone_challenge(&request, time::Duration::seconds(ago));
+        let fixture = [WithdrawalFixture::new(tag_a(), challenge_memo(&challenge))];
+        // No RPC answers are queued: fetching the receipt would fail differently.
+        let (method, _) = grace_method(&fixture, grace);
+        let error = method
+            .verify(&zone_credential(&challenge, tag_a(), ZONE_ID), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+    }
+}
+
+#[test]
+fn test_zone_credential_grace_is_at_most_five_minutes() {
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let error = ChargeMethod::new(provider.clone())
+        .with_zone_credential_grace(std::time::Duration::from_millis(300_001))
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("zone_credential_grace"),
+        "{error}"
+    );
+    ChargeMethod::new(provider)
+        .with_zone_credential_grace(zone::MAX_ZONE_CREDENTIAL_GRACE)
+        .unwrap();
+}

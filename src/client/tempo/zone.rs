@@ -117,9 +117,28 @@ impl std::fmt::Debug for TempoZone {
     }
 }
 
-/// A withdrawal request shared by every payment of one Challenge.
-#[derive(Default)]
+/// The client's caps on what one charge may cost, checked against the amount
+/// plus the Zone withdrawal fee before anything is signed or sent.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ZoneCaps {
+    /// The provider's `max_amount`, in base units of the charge currency.
+    pub(crate) max_amount: Option<U256>,
+    /// The provider's `max_atomic_amount`.
+    pub(crate) max_atomic_amount: Option<U256>,
+}
+
+/// A Zone withdrawal that was sent, or is being sent, and has not yet produced
+/// a Credential. Every payment of its Challenge, and of a later Challenge for
+/// the same terms, shares it.
 struct PendingWithdrawal {
+    /// The Challenge the withdrawal pays, bound to it by its memo.
+    challenge: PaymentChallenge,
+    /// The HTTP origin that issued the Challenge, when known.
+    origin: Option<String>,
+    /// What another Challenge must ask for to be paid by this withdrawal:
+    /// `None` when the Challenge's metadata can't be read, so it never
+    /// matches another.
+    terms: Option<String>,
     request: OnceCell<Result<B256, WithdrawalFailure>>,
     /// The first Tempo block the first wait for its settlement searched: a
     /// resumed wait searches from there again, so a settlement older than
@@ -312,13 +331,24 @@ impl TempoZone {
         {
             return Ok(false);
         }
-        // A withdrawal can't be undone, so start one only when it can settle
-        // before the challenge expires; an expired challenge would invite
-        // another payment.
-        Ok(self
-            .pending_withdrawal(&self.pending_key(challenge, signer, signing_mode))
-            .is_some()
+        // A withdrawal can't be undone, so one still outstanding for these
+        // terms is resumed, even under a new challenge, and a new one starts
+        // only when it can settle before the challenge expires; an expired
+        // challenge would invite another payment.
+        Ok(self.find_pending(challenge, signer, signing_mode).is_some()
             || settles_before_expiry(challenge, self.settlement_timeout))
+    }
+
+    /// The Zone, the paying account and its signing key, so a clone used by
+    /// another signer never answers with this signer's withdrawal.
+    fn signer_scope(
+        &self,
+        signer: &TempoPrimitiveSigner,
+        signing_mode: &TempoSigningMode,
+    ) -> String {
+        let key = alloy::signers::Signer::address(signer);
+        let from = signing_mode.from_address(key);
+        format!("{}:{:?}:{from:#x}:{key:#x}", self.chain_id, self.zone_id)
     }
 
     /// The key of a withdrawal paying `challenge` from this Zone with
@@ -329,26 +359,78 @@ impl TempoZone {
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
     ) -> String {
-        // The Zone, the paying account and its signing key, so a clone used by
-        // another signer never answers with this signer's withdrawal; and the
-        // whole challenge, so one from another realm or request with the same
-        // ID never matches.
-        let key = alloy::signers::Signer::address(signer);
-        let from = signing_mode.from_address(key);
+        // The whole challenge, so one from another realm or request with the
+        // same ID never matches.
         let challenge =
             serde_json::to_string(challenge).unwrap_or_else(|_| format!("{challenge:?}"));
-        format!(
-            "{}:{:?}:{from:#x}:{key:#x}:{challenge}",
-            self.chain_id, self.zone_id
-        )
+        format!("{}:{challenge}", self.signer_scope(signer, signing_mode))
     }
 
-    fn pending_withdrawal(&self, key: &str) -> Option<Arc<PendingWithdrawal>> {
-        self.pending
+    /// Keys what `challenge` asks a withdrawal to pay, as mppx's
+    /// `zoneTermsKey`: its realm, method, intent, request, digest and route
+    /// metadata, everything a server compares when it accepts another
+    /// challenge's Credential, but not its ID, expiry or issuance nonce.
+    /// `None` when its metadata can't be read.
+    fn terms_key(
+        &self,
+        challenge: &PaymentChallenge,
+        signer: &TempoPrimitiveSigner,
+        signing_mode: &TempoSigningMode,
+    ) -> Option<String> {
+        let zone_id = self.zone_id?;
+        let request = challenge.request.decode_value().ok()?;
+        let mut terms = serde_json::Map::new();
+        terms.insert("zoneId".into(), zone_id.into());
+        terms.insert("realm".into(), challenge.realm.clone().into());
+        terms.insert("method".into(), challenge.method.as_str().into());
+        terms.insert("intent".into(), challenge.intent.as_str().into());
+        terms.insert("request".into(), request);
+        if let Some(digest) = &challenge.digest {
+            terms.insert("digest".into(), digest.clone().into());
+        }
+        if let Some(opaque) = &challenge.opaque {
+            let serde_json::Value::Object(mut meta) = opaque.decode_value().ok()? else {
+                return None;
+            };
+            // Issuance nonces differ between challenges for the same route.
+            for nonce in ["_mppx_nonce", "_mpp_nonce", "_mppx_identity"] {
+                meta.remove(nonce);
+            }
+            if !meta.is_empty() {
+                terms.insert("meta".into(), meta.into());
+            }
+        }
+        let terms = serde_json_canonicalizer::to_string(&serde_json::Value::Object(terms)).ok()?;
+        Some(format!(
+            "{}:{terms}",
+            self.signer_scope(signer, signing_mode)
+        ))
+    }
+
+    /// The outstanding withdrawal that pays `challenge`, with its key: its
+    /// own, or, for a new challenge with the same terms, one an earlier
+    /// challenge started. A withdrawal stays outstanding until it produces a
+    /// Credential, even after its challenge expires: it may have settled, so
+    /// paying its terms again could pay twice.
+    fn find_pending(
+        &self,
+        challenge: &PaymentChallenge,
+        signer: &TempoPrimitiveSigner,
+        signing_mode: &TempoSigningMode,
+    ) -> Option<(String, Arc<PendingWithdrawal>)> {
+        let key = self.pending_key(challenge, signer, signing_mode);
+        let pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(key)
-            .cloned()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(own) = pending.get(&key) {
+            return Some((key, own.clone()));
+        }
+        let terms = self.terms_key(challenge, signer, signing_mode)?;
+        pending
+            .iter()
+            .find(|(_, entry)| entry.terms.as_deref() == Some(terms.as_str()))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
     }
 
     fn forget(&self, key: &str, withdrawal: &Arc<PendingWithdrawal>) {
@@ -364,17 +446,26 @@ impl TempoZone {
         }
     }
 
-    /// Pay `challenge` from the Zone and wait for its settlement on Tempo
-    /// through `tempo`.
+    /// Pay `challenge`, issued by `origin` when the caller verified it, from
+    /// the Zone and wait for its settlement on Tempo through `tempo`.
+    ///
+    /// A withdrawal already outstanding for `challenge`, or for an earlier
+    /// challenge with the same terms, is resumed instead of paying again, and
+    /// the Credential answers the challenge that withdrawal pays.
     ///
     /// # Errors
     ///
     /// [`MppError::ZoneSettlementPending`] when the withdrawal did not settle
-    /// in time: paying the challenge it carries again resumes the wait.
+    /// in time, or when it pays an earlier challenge that only its own origin
+    /// may be sent a Credential for: paying the challenge it carries again
+    /// resumes the wait.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pay(
         &self,
         challenge: &PaymentChallenge,
+        origin: Option<&str>,
         client_id: Option<&str>,
+        caps: ZoneCaps,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
         tempo: &impl Provider<TempoNetwork>,
@@ -383,20 +474,72 @@ impl TempoZone {
             MppError::InvalidConfig("Zone ID is unknown: use TempoZone::with_zone_id".into())
         })?;
         self.check_parent_chain_id()?;
-        let request: ChargeRequest = challenge.request.decode()?;
-        let recipient = request.recipient_address()?;
 
-        // A withdrawal can't be undone, so a retry after a failed wait resumes
-        // it instead of paying again. Concurrent payments of one challenge
-        // share the request, which is stored before it is sent.
-        let key = self.pending_key(challenge, signer, signing_mode);
-        let withdrawal = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(key.clone())
-            .or_default()
-            .clone();
+        // A withdrawal can't be undone, so a retry after a failed wait, or
+        // under a new challenge for the same terms, resumes it instead of
+        // paying again. Concurrent payments share the request, which is stored
+        // before it is sent.
+        let own_key = self.pending_key(challenge, signer, signing_mode);
+        let (key, withdrawal) = {
+            let found = self.find_pending(challenge, signer, signing_mode);
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match found.filter(|(key, entry)| {
+                pending
+                    .get(key)
+                    .is_some_and(|current| Arc::ptr_eq(current, entry))
+            }) {
+                Some(found) => found,
+                None => {
+                    let entry = pending
+                        .entry(own_key.clone())
+                        .or_insert_with(|| {
+                            Arc::new(PendingWithdrawal {
+                                challenge: challenge.clone(),
+                                origin: origin.map(str::to_owned),
+                                terms: self.terms_key(challenge, signer, signing_mode),
+                                request: OnceCell::new(),
+                                settlement_cursor: Mutex::default(),
+                            })
+                        })
+                        .clone();
+                    (own_key.clone(), entry)
+                }
+            }
+        };
+        // The withdrawal pays its own challenge, which may be an earlier one.
+        let paid = &withdrawal.challenge;
+        let pending_error = |sender_tag: String| MppError::ZoneSettlementPending {
+            challenge: Box::new(paid.clone()),
+            challenge_id: paid.id.clone(),
+            sender_tag,
+            zone_id,
+        };
+        // A withdrawal started for an earlier challenge pays only that
+        // challenge, so its Credential goes only back to the origin that
+        // issued it; under any other origin, or one the caller did not verify,
+        // fail closed.
+        let foreign = key != own_key;
+        let other_origin = if foreign {
+            origin.is_none() || origin != withdrawal.origin.as_deref()
+        } else {
+            origin.is_some()
+                && withdrawal.origin.is_some()
+                && origin != withdrawal.origin.as_deref()
+        };
+        if other_origin {
+            return Err(pending_error(String::new()));
+        }
+        // Past its redemption window, the server refuses the challenge's
+        // Credential, but the withdrawal may still have paid it: fail closed
+        // rather than withdraw again.
+        if !is_redeemable(paid) {
+            return Err(pending_error(String::new()));
+        }
+        let request: ChargeRequest = paid.request.decode()?;
+        let recipient = request.recipient_address()?;
         // The request runs in its own task, so a caller that is cancelled or
         // times out after the transaction is sent still leaves its outcome in
         // the shared cell for the retry to reconcile, instead of sending
@@ -404,7 +547,7 @@ impl TempoZone {
         let task = {
             let zone = self.clone();
             let withdrawal = withdrawal.clone();
-            let challenge = challenge.clone();
+            let challenge = paid.clone();
             let client_id = client_id.map(str::to_owned);
             let signer = signer.clone();
             let signing_mode = signing_mode.clone();
@@ -417,6 +560,7 @@ impl TempoZone {
                             .request_withdrawal(
                                 &challenge,
                                 client_id.as_deref(),
+                                caps,
                                 &signer,
                                 &signing_mode,
                             )
@@ -450,9 +594,16 @@ impl TempoZone {
             }
         };
 
-        let timeout = settlement_timeout(challenge, self.settlement_timeout);
-        // Even the first search ends at the challenge's expiry.
-        let limit = settlement_timeout(challenge, timeout.max(FIRST_SCAN_TIMEOUT));
+        let timeout = settlement_timeout(paid, self.settlement_timeout);
+        let expired = is_expired(paid);
+        // Even the first search ends at the challenge's expiry. After it, the
+        // wait looks once: only a settlement from before then can still be
+        // redeemed.
+        let limit = if expired {
+            FIRST_SCAN_TIMEOUT
+        } else {
+            settlement_timeout(paid, timeout.max(FIRST_SCAN_TIMEOUT))
+        };
         let settlement = wait_for_settlement_from(
             tempo,
             zone::portal_address(zone_id),
@@ -463,13 +614,15 @@ impl TempoZone {
             &withdrawal.settlement_cursor,
         )
         .await
-        .map_err(|_| MppError::ZoneSettlementPending {
-            challenge: Box::new(challenge.clone()),
-            challenge_id: challenge.id.clone(),
-            sender_tag: format!("{sender_tag:#x}"),
-            zone_id,
-        })?;
-        self.forget(&key, &withdrawal);
+        .map_err(|_| pending_error(format!("{sender_tag:#x}")))?;
+        // The Credential pays once: a later challenge with the same terms is a
+        // new payment. One made after its challenge expired is accepted only by
+        // a server that grants a grace period, so the withdrawal stays
+        // outstanding and a later challenge for its terms fails closed instead
+        // of paying again. A bounced payout paid nothing and may be paid again.
+        if settlement.bounced || !expired {
+            self.forget(&key, &withdrawal);
+        }
         // A bounced payout returned the amount to the payer's Zone balance and
         // paid nothing, so the server would reject its Credential: fail
         // without one, and let a retry withdraw again. The withdrawal's fees
@@ -477,7 +630,7 @@ impl TempoZone {
         // not answer by paying another offer.
         if settlement.bounced {
             return Err(MppError::ZoneWithdrawalBounced {
-                challenge_id: challenge.id.clone(),
+                challenge_id: paid.id.clone(),
                 sender_tag: format!("{sender_tag:#x}"),
                 zone_id,
             });
@@ -485,7 +638,7 @@ impl TempoZone {
         let hash = settlement.hash;
 
         Ok(PaymentCredential::new(
-            challenge.to_echo(),
+            paid.to_echo(),
             PaymentPayload::zone(format!("{hash:#x}"), format!("{sender_tag:#x}"), zone_id),
         ))
     }
@@ -499,6 +652,7 @@ impl TempoZone {
         &self,
         challenge: &PaymentChallenge,
         client_id: Option<&str>,
+        caps: ZoneCaps,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
     ) -> Result<B256, (WithdrawalFailure, MppError)> {
@@ -517,6 +671,23 @@ impl TempoZone {
 
         // The outbox pulls the amount plus its withdrawal fee.
         let fee = self.withdrawal_fee().await.map_err(retryable)?;
+        // The fee is part of what the charge costs the payer, so it counts
+        // against the client's caps; offer selection compared the bare
+        // amount. Nothing is signed or sent past a cap.
+        let total = amount.saturating_add(U256::from(fee));
+        for (cap, name) in [
+            (caps.max_atomic_amount, "max_atomic_amount"),
+            (caps.max_amount, "max_amount"),
+        ] {
+            if cap.is_some_and(|cap| total > cap) {
+                return Err(retryable(MppError::InvalidChallenge {
+                    id: Some(challenge.id.clone()),
+                    reason: Some(format!(
+                        "Tempo charge amount plus Zone withdrawal fee exceeds {name}."
+                    )),
+                }));
+            }
+        }
         let calls = vec![
             Call {
                 to: TxKind::Call(currency),
@@ -766,6 +937,22 @@ fn settles_before_expiry(challenge: &PaymentChallenge, timeout: Duration) -> boo
         timeout
             .checked_add(SUBMISSION_MARGIN)
             .is_some_and(|needed| expires_at - time::OffsetDateTime::now_utc() > needed)
+    })
+}
+
+/// Whether `challenge` has expired.
+fn is_expired(challenge: &PaymentChallenge) -> bool {
+    challenge
+        .expires_at()
+        .is_some_and(|expires_at| time::OffsetDateTime::now_utc() >= expires_at)
+}
+
+/// Whether a Credential for `challenge` may still be redeemed: until
+/// [`zone::MAX_ZONE_CREDENTIAL_GRACE`], the longest grace a server gives, after
+/// it expires.
+fn is_redeemable(challenge: &PaymentChallenge) -> bool {
+    challenge.expires_at().is_none_or(|expires_at| {
+        time::OffsetDateTime::now_utc() < expires_at + zone::MAX_ZONE_CREDENTIAL_GRACE
     })
 }
 

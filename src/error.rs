@@ -221,15 +221,17 @@ pub enum MppError {
     ///
     /// Pay `challenge` again with the same provider to resume waiting
     /// without withdrawing again, or find the settlement with `sender_tag` on
-    /// the Zone's portal. Re-sending the request instead gets a fresh
-    /// challenge, which another withdrawal would pay.
-    #[error("Zone {zone_id} withdrawal {sender_tag} for challenge \"{challenge_id}\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again.")]
+    /// the Zone's portal. A fresh challenge for the same terms never starts
+    /// another withdrawal: from the origin that issued `challenge` it resumes
+    /// this one and answers `challenge`; otherwise it fails with this error.
+    #[error("Zone {zone_id} withdrawal {}for challenge \"{challenge_id}\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again.", sender_tag_clause(.sender_tag))]
     ZoneSettlementPending {
         /// The challenge the withdrawal pays, to pay again to resume waiting.
         challenge: Box<crate::protocol::core::PaymentChallenge>,
         /// ID of the challenge the withdrawal pays.
         challenge_id: String,
-        /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed` event carries it.
+        /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed`
+        /// event carries it; empty when it was not read.
         sender_tag: String,
         /// ID of the Zone the withdrawal left.
         zone_id: u32,
@@ -555,6 +557,16 @@ fn format_channel_closed(reason: &Option<String>) -> String {
     match reason {
         Some(r) => format!("Channel closed: {}.", r),
         None => "Channel is closed.".to_string(),
+    }
+}
+
+/// The sender tag, followed by a space, in a settlement-pending message; empty
+/// when the tag is unknown.
+fn sender_tag_clause(sender_tag: &str) -> String {
+    if sender_tag.is_empty() {
+        String::new()
+    } else {
+        format!("{sender_tag} ")
     }
 }
 

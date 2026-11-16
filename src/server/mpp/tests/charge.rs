@@ -869,3 +869,99 @@ async fn test_explicit_charge_challenge_verifies_against_its_own_request() {
         .await
         .unwrap();
 }
+
+/// A credential for a zone challenge issued with an expiry `ago` in the past.
+#[cfg(feature = "tempo")]
+fn expired_offer(
+    mpp: &Mpp<TempoSuccessMethod>,
+    ago: time::Duration,
+    payload: PaymentPayload,
+) -> (PaymentCredential, ChargeRequest) {
+    let expires = (time::OffsetDateTime::now_utc() - ago)
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let options = || ChargeOptions {
+        expires: Some(&expires),
+        ..Default::default()
+    };
+    let challenges = mpp.charge_with_options("0.10", options()).unwrap();
+    let expected = mpp.expected_charge_request("0.10", options()).unwrap();
+    (
+        PaymentCredential::new(challenges[0].to_echo(), payload),
+        expected,
+    )
+}
+
+#[cfg(feature = "tempo")]
+fn zone_payload() -> PaymentPayload {
+    PaymentPayload::zone(
+        format!("0x{}", "ab".repeat(32)),
+        format!("0x{}", "a1".repeat(32)),
+        3,
+    )
+}
+
+#[cfg(feature = "tempo")]
+fn grace_mpp(grace: std::time::Duration) -> Mpp<TempoSuccessMethod> {
+    use crate::protocol::methods::tempo::zone::Zones;
+    success_mpp_from(
+        offers_builder()
+            .chain_id(CHAIN_ID)
+            .zones(Zones::ids([3]).unwrap())
+            .zone_credential_grace(grace),
+    )
+}
+
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_zone_credential_grace_applies_only_to_zone_credentials() {
+    let grace = std::time::Duration::from_secs(60);
+    let mpp = grace_mpp(grace);
+    let (credential, expected) = expired_offer(&mpp, time::Duration::seconds(1), zone_payload());
+    mpp.verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap();
+
+    // A hash credential for an expired challenge gets no grace.
+    let (credential, expected) = expired_offer(
+        &mpp,
+        time::Duration::seconds(1),
+        PaymentPayload::hash(format!("0x{}", "cd".repeat(32))),
+    );
+    let error = mpp
+        .verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+
+    // Nor does a zone credential past the grace, or one with the default grace.
+    let (credential, expected) = expired_offer(&mpp, time::Duration::seconds(61), zone_payload());
+    let error = mpp
+        .verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+    let mpp = grace_mpp(std::time::Duration::ZERO);
+    let (credential, expected) = expired_offer(&mpp, time::Duration::seconds(1), zone_payload());
+    let error = mpp
+        .verify_credential_with_expected_request(&credential, &expected)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some(ErrorCode::Expired), "{error}");
+}
+
+#[cfg(feature = "tempo")]
+#[test]
+fn test_zone_credential_grace_rejects_more_than_five_minutes() {
+    let error = Mpp::create(
+        offers_builder().zone_credential_grace(std::time::Duration::from_millis(300_001)),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        error.to_string().contains("zone_credential_grace"),
+        "{error}"
+    );
+    Mpp::create(offers_builder().zone_credential_grace(std::time::Duration::from_secs(300)))
+        .unwrap();
+}

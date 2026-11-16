@@ -431,10 +431,16 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             let credential = match override_credential {
                 Some(credential) => credential,
-                None => match self
-                    .provider
-                    .pay_with_context(&challenge, payment_context.clone())
-                    .await
+                // A Zone withdrawal still settling is resumed for this
+                // challenge, not paid again.
+                None => match super::provider::resume_pending_settlement(
+                    self.max_payment_retries,
+                    || {
+                        self.provider
+                            .pay_with_context(&challenge, payment_context.clone())
+                    },
+                )
+                .await
                 {
                     Ok(credential) => credential,
                     Err(err) => {
