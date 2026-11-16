@@ -4,11 +4,9 @@
 //! are identified by a [`ChannelDescriptor`] rather than by escrow-contract
 //! storage: every credential carries the descriptor, which must hash to the
 //! claimed channel id, and on-chain state is read with `getChannelState`.
-//! Primitive vouchers are secp256k1 signatures only (65-byte `r || s || v` or
-//! 64-byte EIP-2098): although the escrow settles P-256 and WebAuthn ones,
-//! draft-tempo-session-01 rejects them so that vouchers stay interoperable
-//! with servers of earlier revisions. With configurable vouchers enabled,
-//! TIP-1166 `0x05` signatures are accepted too. Mirrors mppx's precompile
+//! Vouchers are TIP-1020 primitive signatures (secp256k1, P-256 or WebAuthn),
+//! so access keys authorized by Tempo Wallet can pay, and, with configurable
+//! vouchers enabled, TIP-1166 `0x05` signatures. Mirrors mppx's precompile
 //! session server.
 
 use alloy::consensus::transaction::SignerRecoverable;
@@ -22,7 +20,6 @@ use tempo_alloy::TempoNetwork;
 
 use super::chain::OnChainChannel;
 use super::{ChannelState, SessionMethod};
-use crate::protocol::methods::tempo::configurable_account::SIGNATURE_TYPE_CONFIGURABLE_ACCOUNT;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id_with_escrow,
     precompile_close_authorization_signing_hash_with_escrow,
@@ -30,7 +27,7 @@ use crate::protocol::methods::tempo::precompile_voucher::{
     PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::ChannelDescriptor;
-use crate::protocol::methods::tempo::voucher::{canonical_voucher_signature, verify_voucher};
+use crate::protocol::methods::tempo::voucher::verify_voucher;
 use crate::protocol::traits::VerificationError;
 
 impl<P> SessionMethod<P>
@@ -225,8 +222,7 @@ pub(super) fn validate_descriptor(
 
 /// Decode a signature for `escrow`'s voucher scheme: TIP-1020 primitive or
 /// TIP-1166 bytes for the precompile, canonical secp256k1 for the legacy
-/// escrow. A 64-byte EIP-2098 signature for the precompile is expanded to the
-/// 65-byte form the precompile settles.
+/// escrow.
 pub(super) fn parse_signature_for<P>(
     escrow: Address,
     signature: &str,
@@ -242,28 +238,7 @@ pub(super) fn parse_signature_for<P>(
             "voucher signature has an invalid length",
         ));
     }
-    if bytes.len() == 64 {
-        if let Some(expanded) = canonical_voucher_signature(&bytes) {
-            return Ok(expanded.to_vec());
-        }
-    }
     Ok(bytes)
-}
-
-/// Whether `signature` may be a draft-tempo-session-01 v2 voucher
-/// signature: a canonical secp256k1 signature or, with `configurable`, a
-/// TIP-1166 configurable account (`0x05`) signature. P-256, WebAuthn,
-/// keychain and unknown types are rejected even though the escrow settles
-/// P-256 and WebAuthn vouchers.
-pub(super) fn is_session_voucher_signature(signature: &[u8], configurable: bool) -> bool {
-    if configurable
-        && signature.len() != 65
-        && signature.first() == Some(&SIGNATURE_TYPE_CONFIGURABLE_ACCOUNT)
-    {
-        return true;
-    }
-    canonical_voucher_signature(signature)
-        .is_some_and(|canonical| signature.len() == 64 || canonical.as_slice() == signature)
 }
 
 /// Verify a voucher with the scheme of `escrow`. `options` (configurable
@@ -287,9 +262,6 @@ pub(super) fn verify_voucher_for(
             signature,
             expected_signer,
         );
-    }
-    if !is_session_voucher_signature(signature, options.configurable) {
-        return false;
     }
     verify_precompile_voucher_signature_with(
         signature,

@@ -621,73 +621,12 @@ async fn test_unknown_signer_snapshot_lookup_failure_rejects_voucher() {
     assert_eq!(stored.highest_voucher_amount, 0);
 }
 
-#[test]
-fn test_precompile_vouchers_accept_only_secp256k1_primitives() {
-    use alloy::signers::SignerSync;
-    let (channel_id, state, signer, signature) = unknown_snapshot_channel(1_000);
-    let channel_id: B256 = channel_id.parse().unwrap();
-    let verify = |sig: &[u8]| {
-        precompile::verify_voucher_for(
-            PRECOMPILE,
-            state.chain_id,
-            channel_id,
-            1_000,
-            sig,
-            signer.address(),
-            &crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
-                configurable: true,
-                signer_snapshot: Some(B256::ZERO),
-            },
-        )
-    };
-    let full =
-        precompile::parse_signature_for::<crate::server::TempoProvider>(PRECOMPILE, &signature)
-            .unwrap();
-    assert_eq!(full.len(), 65);
-    assert!(verify(&full));
-
-    // 64-byte EIP-2098 is expanded to the 65-byte form.
-    let hash = crate::protocol::methods::tempo::precompile_voucher::precompile_voucher_signing_hash_with_escrow(
-        channel_id,
-        1_000,
-        PRECOMPILE,
-        state.chain_id,
-    )
-    .unwrap();
-    let compact = signer.sign_hash_sync(&hash).unwrap().as_erc2098();
-    let expanded = precompile::parse_signature_for::<crate::server::TempoProvider>(
-        PRECOMPILE,
-        &alloy::hex::encode_prefixed(compact),
-    )
-    .unwrap();
-    assert_eq!(expanded, full);
-    assert!(verify(&expanded));
-
-    // P-256 and WebAuthn envelopes and non-canonical bytes are refused.
-    assert!(!precompile::is_session_voucher_signature(
-        &[0x01; 130],
-        true
-    ));
-    assert!(!precompile::is_session_voucher_signature(
-        &[0x02; 200],
-        true
-    ));
-    let mut high_v = full.clone();
-    high_v[64] = 1;
-    assert!(!precompile::is_session_voucher_signature(&high_v, true));
-    assert!(precompile::is_session_voucher_signature(&[0x05; 200], true));
-    assert!(!precompile::is_session_voucher_signature(
-        &[0x05; 200],
-        false
-    ));
-}
-
 #[cfg(feature = "client")]
 #[tokio::test]
-async fn test_precompile_vouchers_reject_p256_signatures() {
+async fn test_precompile_vouchers_still_accept_p256_primitives() {
     use crate::client::tempo::signing::{P256Jwk, TempoP256Signer};
     use crate::protocol::methods::tempo::precompile_voucher::{
-        sign_precompile_voucher_primitive, verify_precompile_voucher_signature,
+        sign_precompile_voucher_primitive, VoucherVerifyOptions,
     };
     use alloy::signers::Signer;
 
@@ -703,28 +642,36 @@ async fn test_precompile_vouchers_reject_p256_signatures() {
     let signature = sign_precompile_voucher_primitive(&signer, channel_id, 1_000, 42431)
         .await
         .unwrap();
-    // The escrow would settle it, but session servers refuse it.
-    assert!(verify_precompile_voucher_signature(
-        &signature,
-        signer.address(),
-        channel_id,
-        1_000,
+    let parsed = precompile::parse_signature_for::<crate::server::TempoProvider>(
         PRECOMPILE,
-        42431,
+        &alloy::hex::encode_prefixed(&signature),
     )
-    .unwrap());
-    for configurable in [false, true] {
-        assert!(!precompile::verify_voucher_for(
+    .unwrap();
+    assert_eq!(parsed, signature);
+    let verify = |options: VoucherVerifyOptions| {
+        precompile::verify_voucher_for(
             PRECOMPILE,
             42431,
             channel_id,
             1_000,
-            &signature,
+            &parsed,
             signer.address(),
-            &crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
-                configurable,
-                signer_snapshot: Some(B256::ZERO),
-            },
-        ));
+            &options,
+        )
+    };
+
+    // As before configurable vouchers: P-256 primitives verify under the
+    // defaults and on a zero snapshot, with or without configurable vouchers.
+    assert!(verify(VoucherVerifyOptions::default()));
+    for configurable in [false, true] {
+        assert!(verify(VoucherVerifyOptions {
+            configurable,
+            signer_snapshot: Some(B256::ZERO),
+        }));
+        // A nonzero snapshot accepts only `0x05`.
+        assert!(!verify(VoucherVerifyOptions {
+            configurable,
+            signer_snapshot: Some(B256::repeat_byte(0x42)),
+        }));
     }
 }
