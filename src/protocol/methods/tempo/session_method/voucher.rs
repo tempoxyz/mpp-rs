@@ -190,6 +190,12 @@ where
                 }));
             }
         }
+        // A TIP-1034 channel recorded without its signer snapshot gets it
+        // from chain first; the transition below reads the recorded one.
+        let resolved_snapshot = match self.store.get_channel(channel_id_str).await? {
+            Some(channel) => self.resolve_signer_snapshot(&channel).await?,
+            None => None,
+        };
         let channel_id = channel_id_str.to_owned();
         let signature = signature_str.to_owned();
         let configurable_vouchers = self.configurable_vouchers();
@@ -197,8 +203,11 @@ where
             .update_channel(
                 channel_id_str,
                 Box::new(move |current| {
-                    let state = current
+                    let mut state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    if state.signer_snapshot.is_none() {
+                        state.signer_snapshot = resolved_snapshot;
+                    }
                     let state = match on_chain {
                         Some(on_chain) => ChannelState {
                             finalized: state.finalized || on_chain.finalized,

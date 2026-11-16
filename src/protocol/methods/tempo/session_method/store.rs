@@ -61,8 +61,10 @@ pub struct ChannelState {
     pub created_at: String,
     /// TIP-1166 signer snapshot: the configurable account commitment the
     /// voucher signer had when the channel opened, from the open receipt's
-    /// `SignerSnapshotCached` event. `None` (records stored before this
-    /// field existed included) means zero: the signer had no commitment.
+    /// `SignerSnapshotCached` event, or zero when it had none. `None` means
+    /// unknown (a channel reused without its open receipt, or a record stored
+    /// before this field existed): a TIP-1034 channel looks it up on chain
+    /// before verifying a voucher, and never takes it to be zero.
     #[serde(default)]
     pub signer_snapshot: Option<B256>,
 }

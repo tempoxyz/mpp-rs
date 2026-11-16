@@ -349,6 +349,15 @@ pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
     })
 }
 
+/// The salt of a TIP-1034 channel descriptor.
+#[cfg(feature = "tempo")]
+fn descriptor_salt(descriptor: &ChannelDescriptor) -> Result<B256, MppError> {
+    descriptor
+        .salt
+        .parse::<B256>()
+        .map_err(|e| MppError::InvalidConfig(format!("invalid TIP-1034 descriptor salt: {e}")))
+}
+
 /// Voucher payload for TIP-1034 signed by a TIP-1166 configurable account
 /// (`0x05`). Servers accept it only when they advertise
 /// `configurableVouchers` and the chain runs T15.
@@ -364,6 +373,7 @@ pub async fn create_precompile_voucher_payload_with_descriptor_configurable(
         TIP20_CHANNEL_RESERVE_ADDRESS,
         chain_id,
     )?;
+    signer.ensure_can_sign_channel(descriptor_salt(&descriptor)?)?;
     let signature = signer
         .sign_precompile_voucher(
             channel_id,
@@ -587,6 +597,7 @@ pub async fn create_precompile_close_payload_with_descriptor_configurable(
         ));
     }
 
+    voucher_signer.ensure_can_sign_channel(descriptor_salt(&descriptor)?)?;
     let signature = voucher_signer
         .sign_precompile_voucher(
             channel_id,
@@ -929,6 +940,18 @@ fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
     std::num::NonZeroU64::new(timestamp)
 }
 
+/// The `validAfter` of an open transaction: random and past when its salt is
+/// the voucher signer's configuration commitment, which is the same for every
+/// open, else none (a random salt already makes each open distinct).
+#[cfg(feature = "tempo")]
+fn open_valid_after(salt_is_commitment: bool) -> Option<std::num::NonZeroU64> {
+    if salt_is_commitment {
+        random_past_valid_after()
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "tempo")]
 fn session_estimation_request(
     options: &TempoTxOptions,
@@ -1238,14 +1261,22 @@ where
         }
         None => options.authorized_signer.unwrap_or(payer),
     };
-    let salt = match (options.salt, voucher_signer) {
-        (Some(salt), _) => salt,
-        (None, Some(voucher_signer)) => voucher_signer
-            .open_salt(provider)
-            .await?
-            .unwrap_or_else(B256::random),
-        (None, None) => B256::random(),
+    let (salt, salt_is_commitment) = match (options.salt, voucher_signer) {
+        (Some(salt), _) => (salt, false),
+        (None, Some(voucher_signer)) => match voucher_signer.open_salt(provider).await? {
+            Some(commitment) => (commitment, true),
+            None => (B256::random(), false),
+        },
+        (None, None) => (B256::random(), false),
     };
+    if let Some(voucher_signer) = voucher_signer {
+        voucher_signer.ensure_can_sign_channel(salt)?;
+    }
+    // A salt fixed to the signer's commitment leaves two identical opens
+    // without per-open entropy, so they would serialize to the same
+    // transaction and expiring-nonce hash. Give them a random past
+    // `validAfter`, as top-ups get.
+    let valid_after = open_valid_after(salt_is_commitment);
 
     let open_data = ITIP20ChannelReserve::openCall::new((
         options.payee,
@@ -1294,7 +1325,7 @@ where
     if !options.fee_payer {
         let request = session_estimation_request(
             &transaction_options,
-            None,
+            valid_after,
             payer,
             primitive_signer.address(),
             signature_type,
@@ -1318,7 +1349,8 @@ where
             }
         };
     }
-    let unsigned_tx = build_tempo_tx(transaction_options);
+    let mut unsigned_tx = build_tempo_tx(transaction_options);
+    unsigned_tx.valid_after = valid_after;
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
     let expiring_nonce_hash = if options.fee_payer {
@@ -1945,6 +1977,83 @@ mod tests {
             error.to_string(),
             format!("Insufficient MACH balance: have 1.00, need 5.00. Buy MACH at {url}")
         );
+    }
+
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn opens_salted_with_a_commitment_stay_distinct() {
+        use crate::protocol::methods::tempo::configurable_account::{
+            ConfigurableAccountConfig, ConfigurableAccountOwner,
+        };
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            signers::local::PrivateKeySigner,
+        };
+
+        let owner = PrivateKeySigner::random();
+        let config = ConfigurableAccountConfig {
+            salt: B256::repeat_byte(3),
+            version: 0,
+            threshold: 1,
+            owners: vec![ConfigurableAccountOwner {
+                owner: owner.address(),
+                weight: 1,
+            }],
+        };
+        let account = config.account_address().unwrap();
+        let voucher_signer = ConfigurableVoucherSigner::new(account, config, vec![owner]).unwrap();
+        let commitment = voucher_signer.commitment();
+        let payer = PrivateKeySigner::random();
+
+        let open = || async {
+            let asserter = Asserter::new();
+            asserter.push_success(&Bytes::from(commitment.to_vec())); // getConfigCommitment
+            asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+            let provider =
+                ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+            create_precompile_open_payload_with_voucher_signer(
+                &provider,
+                &payer,
+                None,
+                payer.address(),
+                OpenPrecompilePayloadOptions {
+                    prefix_calls: vec![],
+                    operator: Address::ZERO,
+                    authorized_signer: None,
+                    payee: Address::repeat_byte(0x11),
+                    currency: Address::repeat_byte(0x22),
+                    fee_token: Address::repeat_byte(0x22),
+                    deposit: 1_000,
+                    initial_amount: 10,
+                    chain_id: 4217,
+                    fee_payer: true,
+                    salt: None,
+                },
+                Some(&voucher_signer),
+            )
+            .await
+            .unwrap()
+        };
+        let (first, _) = open().await;
+        let (second, _) = open().await;
+        assert_eq!(first.salt, commitment);
+        assert_eq!(second.salt, commitment);
+        let first_hash = first.descriptor.unwrap().expiring_nonce_hash;
+        let second_hash = second.descriptor.unwrap().expiring_nonce_hash;
+        assert_ne!(first_hash, second_hash);
+        assert_ne!(first.channel_id, second.channel_id);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn only_commitment_salted_opens_get_a_valid_after() {
+        assert!(open_valid_after(false).is_none());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let valid_after = open_valid_after(true).unwrap().get();
+        assert!(valid_after <= now - 60);
     }
 
     #[test]

@@ -145,7 +145,44 @@ impl ConfigurableVoucherSigner {
         Ok(signature.to_bytes())
     }
 
+    /// Check that this signer's `0x05` vouchers settle on a channel opened
+    /// with descriptor salt `salt` (TIP-1166).
+    ///
+    /// A channel opened while the account had a configuration commitment has
+    /// that commitment as its salt and signer snapshot, so the signer must
+    /// present the configuration whose commitment equals the salt. Any other
+    /// channel has a zero snapshot, where the escrow accepts `0x05` only from
+    /// the version-0 configuration that derives the account address, and
+    /// otherwise only a secp256k1 signature by the account's own key, which
+    /// this signer does not hold.
+    pub fn ensure_can_sign_channel(&self, salt: B256) -> Result<(), MppError> {
+        if !salt.is_zero() && salt == self.commitment() {
+            return Ok(());
+        }
+        if self.derives_account() {
+            return Ok(());
+        }
+        Err(MppError::InvalidConfig(format!(
+            "configurable account {} cannot sign vouchers for a channel with salt {salt}: \
+             the channel's signer snapshot is not the commitment {} of the signer's \
+             configuration, and only a version-0 configuration that derives the account \
+             address signs on a channel without one; sign with the account's own \
+             secp256k1 key, or close the channel and open a new one",
+            self.account,
+            self.commitment()
+        )))
+    }
+
+    /// Whether the configuration is the version-0 one that derives the
+    /// account address (an account that has not registered a configuration).
+    fn derives_account(&self) -> bool {
+        self.config.version == 0 && self.config.account_address().ok() == Some(self.account)
+    }
+
     /// Sign a TIP-1034 voucher for the channel reserve precompile at `escrow`.
+    ///
+    /// This does not check that the voucher settles on the channel; see
+    /// [`Self::ensure_can_sign_channel`].
     pub async fn sign_precompile_voucher(
         &self,
         channel_id: B256,
@@ -186,6 +223,12 @@ impl ConfigurableVoucherSigner {
     /// The salt to open a channel with: the account's commitment when it has
     /// one on chain (T15 requires it), else `None` for a random salt.
     ///
+    /// The commitment that counts is the one when the open executes. This SDK
+    /// signs open transactions with the payer's primitive or keychain key,
+    /// never with the configurable account itself (`0x05`), so an open never
+    /// registers the account (TIP-1107 registers it only for a transaction it
+    /// signs) and the commitment read here is the one the open sees.
+    ///
     /// Fails when the signer's configuration is not the one on chain, since
     /// its vouchers could not settle.
     pub async fn open_salt<P: Provider<TempoNetwork>>(
@@ -194,8 +237,7 @@ impl ConfigurableVoucherSigner {
     ) -> Result<Option<B256>, MppError> {
         let on_chain = self.on_chain_commitment(provider).await?;
         if on_chain.is_zero() {
-            if self.config.version == 0 && self.config.account_address().ok() == Some(self.account)
-            {
+            if self.derives_account() {
                 return Ok(None);
             }
             return Err(MppError::InvalidConfig(format!(
@@ -339,6 +381,37 @@ mod tests {
             ConfigurableVoucherSigner::new(account, config, vec![PrivateKeySigner::random()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn signs_only_vouchers_the_channel_snapshot_settles() {
+        let (owners, config) = setup(&[1], 1);
+        let account = config.account_address().unwrap();
+        let derived =
+            ConfigurableVoucherSigner::new(account, config.clone(), owners.clone()).unwrap();
+        // The version-0 config that derives the account signs on a zero
+        // snapshot channel (random salt) and on its own commitment.
+        derived.ensure_can_sign_channel(B256::random()).unwrap();
+        derived.ensure_can_sign_channel(B256::ZERO).unwrap();
+        derived
+            .ensure_can_sign_channel(derived.commitment())
+            .unwrap();
+
+        // A rotated config signs only where the channel cached it.
+        let rotated_config = ConfigurableAccountConfig {
+            version: 1,
+            ..config
+        };
+        let rotated = ConfigurableVoucherSigner::new(account, rotated_config, owners).unwrap();
+        rotated
+            .ensure_can_sign_channel(rotated.commitment())
+            .unwrap();
+        let err = rotated.ensure_can_sign_channel(B256::random()).unwrap_err();
+        assert!(err.to_string().contains("cannot sign vouchers"), "{err}");
+        assert!(rotated.ensure_can_sign_channel(B256::ZERO).is_err());
+        assert!(rotated
+            .ensure_can_sign_channel(derived.commitment())
+            .is_err());
     }
 
     #[test]

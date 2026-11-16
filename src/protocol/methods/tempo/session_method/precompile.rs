@@ -4,9 +4,12 @@
 //! are identified by a [`ChannelDescriptor`] rather than by escrow-contract
 //! storage: every credential carries the descriptor, which must hash to the
 //! claimed channel id, and on-chain state is read with `getChannelState`.
-//! Vouchers are TIP-1020 primitive signatures (secp256k1, P-256 or WebAuthn),
-//! so access keys authorized by Tempo Wallet can pay. Mirrors mppx's
-//! precompile session server.
+//! Primitive vouchers are secp256k1 signatures only (65-byte `r || s || v` or
+//! 64-byte EIP-2098): although the escrow settles P-256 and WebAuthn ones,
+//! draft-tempo-session-01 rejects them so that vouchers stay interoperable
+//! with servers of earlier revisions. With configurable vouchers enabled,
+//! TIP-1166 `0x05` signatures are accepted too. Mirrors mppx's precompile
+//! session server.
 
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::consensus::SignableTransaction;
@@ -18,7 +21,8 @@ use tempo_alloy::primitives::transaction::{Call, PrimitiveSignature, TempoSignat
 use tempo_alloy::TempoNetwork;
 
 use super::chain::OnChainChannel;
-use super::SessionMethod;
+use super::{ChannelState, SessionMethod};
+use crate::protocol::methods::tempo::configurable_account::SIGNATURE_TYPE_CONFIGURABLE_ACCOUNT;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id_with_escrow,
     precompile_close_authorization_signing_hash_with_escrow,
@@ -26,13 +30,68 @@ use crate::protocol::methods::tempo::precompile_voucher::{
     PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::ChannelDescriptor;
-use crate::protocol::methods::tempo::voucher::verify_voucher;
+use crate::protocol::methods::tempo::voucher::{canonical_voucher_signature, verify_voucher};
 use crate::protocol::traits::VerificationError;
 
 impl<P> SessionMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
+    /// The channel's TIP-1166 signer snapshot, looked up on chain when it is
+    /// unknown (see [`find_signer_snapshot`]) and then recorded on the
+    /// channel and cached by channel ID, so each channel is looked up once.
+    ///
+    /// A missing snapshot is unknown, never zero: a zero snapshot accepts
+    /// primitive vouchers, which the escrow does not settle on a channel bound
+    /// to a configurable account. A failed lookup rejects the credential.
+    /// Channels on the legacy escrow have no snapshot.
+    pub(super) async fn resolve_signer_snapshot(
+        &self,
+        channel: &ChannelState,
+    ) -> Result<Option<B256>, VerificationError> {
+        if channel.signer_snapshot.is_some() || !is_precompile(channel.escrow_contract) {
+            return Ok(channel.signer_snapshot);
+        }
+        let channel_id = Self::parse_channel_id(&channel.channel_id)?;
+        let cached = self
+            .signer_snapshots
+            .lock()
+            .map_err(|_| VerificationError::internal("signer snapshot cache poisoned"))?
+            .get(&channel_id)
+            .copied();
+        let snapshot = match cached {
+            Some(snapshot) => snapshot,
+            None => {
+                let snapshot = find_signer_snapshot(
+                    self.provider.as_ref(),
+                    channel.escrow_contract,
+                    channel_id,
+                    channel.authorized_signer,
+                )
+                .await?;
+                self.signer_snapshots
+                    .lock()
+                    .map_err(|_| VerificationError::internal("signer snapshot cache poisoned"))?
+                    .insert(channel_id, snapshot);
+                snapshot
+            }
+        };
+        self.store
+            .update_channel(
+                &channel.channel_id,
+                Box::new(move |current| {
+                    Ok(current.map(|mut state| {
+                        if state.signer_snapshot.is_none() {
+                            state.signer_snapshot = Some(snapshot);
+                        }
+                        state
+                    }))
+                }),
+            )
+            .await?;
+        Ok(Some(snapshot))
+    }
+
     /// Read on-chain channel state from the legacy escrow or, given the
     /// channel's validated descriptor, from the TIP-1034 precompile.
     pub(super) async fn read_channel(
@@ -164,8 +223,10 @@ pub(super) fn validate_descriptor(
     Ok(d)
 }
 
-/// Decode a signature for `escrow`'s voucher scheme: TIP-1020 primitive bytes
-/// for the precompile, canonical secp256k1 for the legacy escrow.
+/// Decode a signature for `escrow`'s voucher scheme: TIP-1020 primitive or
+/// TIP-1166 bytes for the precompile, canonical secp256k1 for the legacy
+/// escrow. A 64-byte EIP-2098 signature for the precompile is expanded to the
+/// 65-byte form the precompile settles.
 pub(super) fn parse_signature_for<P>(
     escrow: Address,
     signature: &str,
@@ -181,7 +242,28 @@ pub(super) fn parse_signature_for<P>(
             "voucher signature has an invalid length",
         ));
     }
+    if bytes.len() == 64 {
+        if let Some(expanded) = canonical_voucher_signature(&bytes) {
+            return Ok(expanded.to_vec());
+        }
+    }
     Ok(bytes)
+}
+
+/// Whether `signature` may be a draft-tempo-session-01 v2 voucher
+/// signature: a canonical secp256k1 signature or, with `configurable`, a
+/// TIP-1166 configurable account (`0x05`) signature. P-256, WebAuthn,
+/// keychain and unknown types are rejected even though the escrow settles
+/// P-256 and WebAuthn vouchers.
+pub(super) fn is_session_voucher_signature(signature: &[u8], configurable: bool) -> bool {
+    if configurable
+        && signature.len() != 65
+        && signature.first() == Some(&SIGNATURE_TYPE_CONFIGURABLE_ACCOUNT)
+    {
+        return true;
+    }
+    canonical_voucher_signature(signature)
+        .is_some_and(|canonical| signature.len() == 64 || canonical.as_slice() == signature)
 }
 
 /// Verify a voucher with the scheme of `escrow`. `options` (configurable
@@ -205,6 +287,9 @@ pub(super) fn verify_voucher_for(
             signature,
             expected_signer,
         );
+    }
+    if !is_session_voucher_signature(signature, options.configurable) {
+        return false;
     }
     verify_precompile_voucher_signature_with(
         signature,
@@ -265,6 +350,94 @@ alloy::sol! {
         /// TIP-1166 (T15): `open` with a salt other than the signer's commitment.
         error SaltNotSignerCommitment(address signer, bytes32 commitment);
     }
+}
+
+alloy::sol! {
+    interface IConfigurableAccountCommitment {
+        /// TIP-1107: the account's configuration commitment, zero until it
+        /// registers or upgrades. Once nonzero it never returns to zero.
+        function getConfigCommitment(address account) external view returns (bytes32 commitment);
+    }
+}
+
+/// The TIP-1107 configuration commitment of `account`: zero when it has
+/// none, including on a chain without the configurable account precompile
+/// (an empty call result).
+pub(super) async fn get_config_commitment<P: Provider<TempoNetwork>>(
+    provider: &P,
+    account: Address,
+) -> Result<B256, VerificationError> {
+    use crate::protocol::methods::tempo::configurable_account::CONFIGURABLE_ACCOUNT_ADDRESS;
+
+    let call = IConfigurableAccountCommitment::getConfigCommitmentCall { account };
+    let mut request = tempo_alloy::rpc::TempoTransactionRequest::default();
+    request.inner = request.inner.to(CONFIGURABLE_ACCOUNT_ADDRESS).input(
+        alloy::rpc::types::TransactionInput::new(Bytes::from(call.abi_encode())),
+    );
+    let output = provider.call(request).await.map_err(|e| {
+        VerificationError::network_error(format!(
+            "failed to read configurable account commitment: {e}"
+        ))
+    })?;
+    if output.is_empty() {
+        return Ok(B256::ZERO);
+    }
+    IConfigurableAccountCommitment::getConfigCommitmentCall::abi_decode_returns(&output).map_err(
+        |e| {
+            VerificationError::network_error(format!(
+                "failed to decode configurable account commitment: {e}"
+            ))
+        },
+    )
+}
+
+/// The TIP-1166 signer snapshot of an open channel whose open receipt this
+/// server did not see (a reused channel, or state recorded before the field
+/// existed): the commitment of the channel's `SignerSnapshotCached` event, or
+/// zero when the escrow emitted none.
+///
+/// A `signer` without a configuration commitment now had none at open, since
+/// commitments never return to zero, so its snapshot is zero without a log
+/// search. Any read failure is an error: an unknown snapshot is never taken
+/// to be zero.
+pub(super) async fn find_signer_snapshot<P: Provider<TempoNetwork>>(
+    provider: &P,
+    escrow: Address,
+    channel_id: B256,
+    signer: Address,
+) -> Result<B256, VerificationError> {
+    use alloy::sol_types::SolEvent;
+
+    if get_config_commitment(provider, signer).await?.is_zero() {
+        return Ok(B256::ZERO);
+    }
+    let filter = alloy::rpc::types::Filter::new()
+        .address(escrow)
+        .event_signature(IChannelReserveState::SignerSnapshotCached::SIGNATURE_HASH)
+        .topic1(channel_id)
+        .from_block(alloy::eips::BlockNumberOrTag::Earliest)
+        .to_block(alloy::eips::BlockNumberOrTag::Latest);
+    let logs = provider.get_logs(&filter).await.map_err(|e| {
+        VerificationError::network_error(format!("failed to read signer snapshot logs: {e}"))
+    })?;
+    for log in logs
+        .iter()
+        .filter(|log| !log.removed && log.address() == escrow)
+    {
+        let Ok(event) = IChannelReserveState::SignerSnapshotCached::decode_log(&log.inner) else {
+            continue;
+        };
+        if event.channelId != channel_id {
+            continue;
+        }
+        if event.signer != signer || event.commitment.is_zero() {
+            return Err(VerificationError::invalid_signature(
+                "channel signer snapshot does not match its authorized signer",
+            ));
+        }
+        return Ok(event.commitment);
+    }
+    Ok(B256::ZERO)
 }
 
 /// The TIP-1166 signer snapshot an open transaction's receipt reports for

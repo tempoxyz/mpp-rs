@@ -265,8 +265,13 @@ where
             )));
         }
         let open_tx_hash = tx_receipt.transaction_hash().to_string();
+        // The open's receipt settles the snapshot: zero (recorded as such,
+        // not as unknown) when the escrow cached none.
         let signer_snapshot = if precompile_descriptor.is_some() {
-            precompile::signer_snapshot_from_logs(tx_receipt.logs(), escrow, channel_id_b256)
+            Some(
+                precompile::signer_snapshot_from_logs(tx_receipt.logs(), escrow, channel_id_b256)
+                    .unwrap_or_default(),
+            )
         } else {
             None
         };
@@ -328,7 +333,8 @@ where
         // The signature was verified against the transaction's signer above;
         // only a channel that reports a different signer, or a signer
         // snapshot, needs another check.
-        if (authorized_signer != voucher_signer || signer_snapshot.is_some())
+        if (authorized_signer != voucher_signer
+            || signer_snapshot.is_some_and(|snapshot| !snapshot.is_zero()))
             && !verify_open_voucher(authorized_signer, signer_snapshot)
         {
             return Err(VerificationError::invalid_signature(

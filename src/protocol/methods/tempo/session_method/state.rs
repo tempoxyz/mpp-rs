@@ -22,7 +22,8 @@ pub(super) struct Opening {
     pub(super) settlement_route: Option<SettlementRoute>,
     pub(super) cumulative_amount: u128,
     pub(super) signature: Vec<u8>,
-    /// TIP-1166 signer snapshot from the open receipt.
+    /// TIP-1166 signer snapshot from the open receipt: zero when it cached
+    /// none, `None` only for the legacy escrow.
     pub(super) signer_snapshot: Option<alloy::primitives::B256>,
 }
 

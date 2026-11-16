@@ -313,8 +313,9 @@ pub struct VoucherVerifyOptions {
     pub configurable: bool,
     /// The channel's signer snapshot: the commitment the voucher signer's
     /// configurable account had when the channel opened, which the open
-    /// receipt's `SignerSnapshotCached` event reports. `None` or zero when the
-    /// signer had none.
+    /// receipt's `SignerSnapshotCached` event reports, or zero when the signer
+    /// had none. `None` is treated as zero, so a caller whose snapshot is
+    /// unknown must look it up first (the session server does).
     pub signer_snapshot: Option<B256>,
 }
 

@@ -72,6 +72,12 @@ pub struct SessionMethod<P> {
     /// Accept TIP-1166 configurable account vouchers; see
     /// [`with_configurable_vouchers`](Self::with_configurable_vouchers).
     configurable_vouchers: bool,
+    /// TIP-1166 signer snapshots looked up on chain, by channel ID.
+    signer_snapshots: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<alloy::primitives::B256, alloy::primitives::B256>,
+        >,
+    >,
 }
 
 impl<P> SessionMethod<P>
@@ -90,6 +96,7 @@ where
             close_signer: None,
             stream_checks: Arc::default(),
             configurable_vouchers: false,
+            signer_snapshots: Arc::default(),
         }
     }
 
