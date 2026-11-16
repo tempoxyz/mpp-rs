@@ -1877,3 +1877,84 @@ async fn test_withdrawal_being_sent_is_never_forgotten_as_abandoned() {
     zone.forget_abandoned(&key, &entry);
     assert!(!zone.pending.lock().unwrap().contains_key(&key));
 }
+
+/// A JSON-RPC server that never answers the methods in `stalled` and answers
+/// every other call with `handler`, recording each method.
+async fn spawn_stalling_rpc(
+    handler: Handler,
+    stalled: &'static [&'static str],
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    #[derive(Clone)]
+    struct Rpc {
+        handler: Handler,
+        stalled: &'static [&'static str],
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    async fn rpc(State(state): State<Rpc>, Json(request): Json<Value>) -> Json<Value> {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request["method"].as_str().unwrap_or_default().to_string();
+        state.calls.lock().unwrap().push(method.clone());
+        if state.stalled.contains(&method.as_str()) {
+            std::future::pending::<()>().await;
+        }
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        Json(match (state.handler)(&method, &params) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err((code, message)) => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+            }
+        })
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route("/", post(rpc)).with_state(Rpc {
+        handler,
+        stalled,
+        calls: calls.clone(),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, calls)
+}
+
+#[tokio::test]
+async fn test_stalled_zone_rpc_does_not_hold_the_account() {
+    // The Zone never answers the send or the receipt lookup: the withdrawal's
+    // outcome is unknown, and the account's next withdrawal still goes out.
+    let (zone_url, zone_calls) = spawn_stalling_rpc(
+        zone_handler(|_| Ok(Value::Null)),
+        &["eth_sendRawTransactionSync", "eth_getTransactionReceipt"],
+    )
+    .await;
+    let mut zone = TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap();
+    zone.rpc_timeout = Duration::from_millis(200);
+    zone.receipt_recovery_timeout = Duration::from_millis(300);
+    let (provider, _) = provider_with_zone(zone).await;
+    let first = challenge_with(json!({}), None);
+    let mut second = first.clone();
+    second.id = "other-challenge".into();
+    let mut request = second.request.decode_value().unwrap();
+    request["amount"] = json!("2000000");
+    second.request = Base64UrlJson::from_value(&request).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let first = provider.pay(&first).await.unwrap_err();
+        let second = provider.pay(&second).await.unwrap_err();
+        (first, second)
+    })
+    .await
+    .expect("a stalled Zone RPC held the account");
+    for error in [result.0, result.1] {
+        assert!(
+            matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+            "{error}"
+        );
+    }
+    let sends = zone_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| *call == "eth_sendRawTransactionSync")
+        .count();
+    assert_eq!(sends, 2);
+}

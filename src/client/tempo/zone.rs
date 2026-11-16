@@ -46,6 +46,11 @@ const SUBMISSION_MARGIN: Duration = Duration::from_secs(15);
 /// response fails.
 const RECEIPT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long one Zone RPC call made for a withdrawal may take. The account's
+/// nonce lock is held across these calls, so a Zone RPC that never answers
+/// must not keep later withdrawals from the same account waiting.
+const ZONE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The error code `eth_sendRawTransactionSync` answers with when the node
 /// admitted the transaction but no receipt arrived in time (EIP-7966).
 const SYNC_SEND_TIMEOUT_CODE: i64 = 4;
@@ -96,6 +101,8 @@ pub struct TempoZone {
     fee_token: Option<Address>,
     /// How long to look for a withdrawal's receipt after its send fails.
     receipt_recovery_timeout: Duration,
+    /// How long one Zone RPC call made for a withdrawal may take.
+    rpc_timeout: Duration,
     /// Withdrawals by Zone, paying account, signing key and Challenge, so a
     /// retry resumes waiting instead of paying again. Shared by clones, so
     /// providers with different signers never share a withdrawal.
@@ -204,6 +211,7 @@ impl TempoZone {
             settlement_timeout: zone::DEFAULT_SETTLEMENT_TIMEOUT,
             fee_token: None,
             receipt_recovery_timeout: RECEIPT_RECOVERY_TIMEOUT,
+            rpc_timeout: ZONE_RPC_TIMEOUT,
             pending: Arc::default(),
             nonce_locks: Arc::default(),
         })
@@ -773,11 +781,11 @@ impl TempoZone {
         };
 
         let timeout = settlement_timeout(paid, self.settlement_timeout);
-        let expired = is_expired(paid);
+        let expired_before_wait = is_expired(paid);
         // Even the first search ends at the challenge's expiry. After it, the
         // wait looks once: only a settlement from before then can still be
         // redeemed.
-        let limit = if expired {
+        let limit = if expired_before_wait {
             FIRST_SCAN_TIMEOUT
         } else {
             settlement_timeout(paid, timeout.max(FIRST_SCAN_TIMEOUT))
@@ -798,8 +806,9 @@ impl TempoZone {
         // a server that grants a grace period, so the withdrawal stays for a
         // retry of its own challenge, which would otherwise pay again on Tempo,
         // and blocks other challenges for its terms until its window ends. A
-        // bounced payout paid nothing and may be paid again.
-        if settlement.bounced || !expired {
+        // bounced payout paid nothing and may be paid again. The challenge
+        // may have expired during the wait, so its expiry is read again.
+        if settlement.bounced || !is_expired(paid) {
             self.forget(&key, &withdrawal);
         } else {
             *withdrawal
@@ -927,15 +936,22 @@ impl TempoZone {
         // Prepare and sign first: a failure there sent nothing, so the
         // challenge may be retried. The protocol nonce is the Zone's.
         let nonce = self
-            .rpc_provider
-            .get_transaction_count(from)
-            .pending()
+            .bounded(async {
+                self.rpc_provider
+                    .get_transaction_count(from)
+                    .pending()
+                    .await
+            })
             .await
+            .ok_or_else(|| retryable(MppError::Http("timed out fetching the Zone nonce".into())))?
             .map_err(|e| retryable(MppError::Http(format!("failed to fetch Zone nonce: {e}"))))?;
-        let signed = TempoCharge::from_challenge(challenge)
+        let charge = TempoCharge::from_challenge(challenge)
             .map_err(retryable)?
-            .into_zone_withdrawal(self.chain_id, calls)
-            .sign_with_primitive_provider_options(
+            .into_zone_withdrawal(self.chain_id, calls);
+        // Signing reads gas and fees from the Zone: nothing is sent yet, so a
+        // timeout may be retried.
+        let signed = self
+            .bounded(charge.sign_with_primitive_provider_options(
                 signer,
                 &self.rpc_provider,
                 SignOptions {
@@ -947,8 +963,13 @@ impl TempoZone {
                     fee_token: self.fee_token,
                     ..Default::default()
                 },
-            )
+            ))
             .await
+            .ok_or_else(|| {
+                retryable(MppError::Http(
+                    "timed out preparing the Zone withdrawal".into(),
+                ))
+            })?
             .map_err(retryable)?;
         let tx_bytes = signed.tx_bytes().to_vec();
         // The signed transaction fixes its hash, so a lost send response can
@@ -973,16 +994,18 @@ impl TempoZone {
         if !begin_send() {
             return Err(abandon());
         }
+        // A send that never answers may still have been admitted: its outcome
+        // is unknown, so look for its receipt as after a failed send.
         let receipt: serde_json::Value = match self
-            .rpc_provider
-            .raw_request(
+            .bounded(self.rpc_provider.raw_request(
                 "eth_sendRawTransactionSync".into(),
                 [alloy::hex::encode_prefixed(&tx_bytes)],
-            )
+            ))
             .await
         {
-            Ok(receipt) => receipt,
-            Err(error) => {
+            None => self.recover_receipt(hash).await.ok_or_else(unknown)?,
+            Some(Ok(receipt)) => receipt,
+            Some(Err(error)) => {
                 if self.refused(&error, hash).await {
                     return Err(retryable(MppError::Http(format!(
                         "failed to send Zone withdrawal: {error}"
@@ -1050,14 +1073,17 @@ impl TempoZone {
         {
             return false;
         }
+        // A lookup that never answers proves nothing.
         matches!(
-            self.rpc_provider
-                .raw_request::<_, Option<serde_json::Value>>(
-                    "eth_getTransactionByHash".into(),
-                    [hash],
-                )
-                .await,
-            Ok(None)
+            self.bounded(
+                self.rpc_provider
+                    .raw_request::<_, Option<serde_json::Value>>(
+                        "eth_getTransactionByHash".into(),
+                        [hash],
+                    )
+            )
+            .await,
+            Some(Ok(None))
         )
     }
 
@@ -1077,37 +1103,54 @@ impl TempoZone {
             IZoneOutbox::calculateWithdrawalFeeCall { gasLimit: 0 }.abi_encode(),
         );
         let result: Bytes = self
-            .rpc_provider
-            .raw_request(
+            .bounded(self.rpc_provider.raw_request(
                 "eth_call".into(),
                 (
                     serde_json::json!({ "to": zone::ZONE_OUTBOX, "data": data }),
                     "latest",
                 ),
-            )
+            ))
             .await
+            .ok_or_else(|| MppError::Http("timed out reading the Zone withdrawal fee".into()))?
             .map_err(|e| MppError::Http(format!("failed to read the Zone withdrawal fee: {e}")))?;
         IZoneOutbox::calculateWithdrawalFeeCall::abi_decode_returns(&result)
             .map_err(|e| MppError::Http(format!("invalid Zone withdrawal fee: {e}")))
     }
 
+    /// Awaits one Zone RPC call for at most the RPC timeout: `None` when it
+    /// took longer.
+    async fn bounded<T>(&self, call: impl std::future::Future<Output = T>) -> Option<T> {
+        match tokio::time::Instant::now().checked_add(self.rpc_timeout) {
+            Some(deadline) => tokio::time::timeout_at(deadline, call).await.ok(),
+            None => Some(call.await),
+        }
+    }
+
     /// Looks for the receipt of a withdrawal whose send response failed.
+    ///
+    /// The recovery timeout bounds the whole search, including a lookup that
+    /// never answers, since the account's nonce lock is held meanwhile.
     async fn recover_receipt(&self, hash: B256) -> Option<serde_json::Value> {
-        let deadline = tokio::time::Instant::now().checked_add(self.receipt_recovery_timeout);
-        loop {
-            let receipt: Result<Option<serde_json::Value>, _> = self
-                .rpc_provider
-                .raw_request("eth_getTransactionReceipt".into(), [hash])
-                .await;
-            if let Ok(Some(receipt)) = receipt {
-                return Some(receipt);
+        let search = async {
+            loop {
+                let receipt: Option<Result<Option<serde_json::Value>, _>> = self
+                    .bounded(
+                        self.rpc_provider
+                            .raw_request("eth_getTransactionReceipt".into(), [hash]),
+                    )
+                    .await;
+                if let Some(Ok(Some(receipt))) = receipt {
+                    return receipt;
+                }
+                tokio::time::sleep(POLLING_INTERVAL).await;
             }
-            if deadline
-                .is_some_and(|deadline| tokio::time::Instant::now() + POLLING_INTERVAL > deadline)
-            {
-                return None;
-            }
-            tokio::time::sleep(POLLING_INTERVAL).await;
+        };
+        // One lookup always runs, even with a zero timeout.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.receipt_recovery_timeout.max(POLLING_INTERVAL / 2));
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, search).await.ok(),
+            None => Some(search.await),
         }
     }
 }
