@@ -260,6 +260,8 @@ struct TestProvider {
     trusted_realm: Option<&'static str>,
     /// Payments that fail as a Zone withdrawal still settling before one succeeds.
     settling: Arc<AtomicU32>,
+    /// Pay charges with a `zone` Credential instead of a hash.
+    zone: bool,
 }
 
 impl TestProvider {
@@ -301,6 +303,16 @@ impl PaymentProvider for TestProvider {
             return Ok(PaymentCredential::new(
                 challenge.to_echo(),
                 serde_json::json!({"type": "voucher", "channelId": "0xsession", "cumulativeAmount": "1000"}),
+            ));
+        }
+        if self.zone {
+            return Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::zone(
+                    format!("0x{}", "ab".repeat(32)),
+                    format!("0x{}", "a1".repeat(32)),
+                    3,
+                ),
             ));
         }
         Ok(PaymentCredential::new(
@@ -1320,6 +1332,58 @@ async fn unsent_paid_attempt_releases_only_unsettled_credentials() {
             None => assert!(!settled, "{intent}"),
             other => panic!("{intent}: {other:?}"),
         }
+    }
+}
+
+/// An unsent Zone Credential's withdrawal is already on chain too: it is kept
+/// and reported with an unknown outcome, so a retry does not withdraw again.
+#[tokio::test]
+async fn unsent_zone_credential_is_not_released() {
+    let app = Router::new().route(
+        "/paid",
+        get(|| async { payment_required("challenge-1", "charge") }),
+    );
+    let url = spawn_server(app).await;
+    let provider = TestProvider {
+        zone: true,
+        ..Default::default()
+    };
+    let events = ClientEvents::default();
+    let failed = Arc::new(Mutex::new(Vec::new()));
+    let _subscription = events.on_payment_failed({
+        let failed = failed.clone();
+        move |ctx| {
+            failed.lock().unwrap().push(ctx);
+            async {}
+        }
+    });
+    let client = reqwest::Client::new();
+    let request = client.get(format!("{url}/paid")).build().unwrap();
+    let mut exchange = RefusesPaid {
+        client,
+        unsent: false,
+    };
+
+    let result = send_with_exchange(
+        &mut exchange,
+        request,
+        &provider,
+        &AcceptPaymentPolicy::Always,
+        &events,
+        1,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(provider.paid(), ["challenge-1"]);
+    assert_eq!(provider.rolled_back.load(Ordering::SeqCst), 0);
+    let failed = failed.lock().unwrap().clone();
+    assert_eq!(failed.len(), 1);
+    match &failed[0].reason {
+        Some(PaymentFailureReason::OutcomeUnknown {
+            transaction_hash, ..
+        }) => assert_eq!(transaction_hash, &None),
+        other => panic!("{other:?}"),
     }
 }
 

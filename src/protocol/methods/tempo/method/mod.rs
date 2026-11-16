@@ -575,6 +575,14 @@ where
         true
     }
 
+    fn zone_credential_grace(&self) -> std::time::Duration {
+        self.zone_credential_grace
+    }
+
+    fn verifies_zone_credentials(&self) -> bool {
+        self.relay.is_none()
+    }
+
     fn validate(
         &self,
         credential: &PaymentCredential,

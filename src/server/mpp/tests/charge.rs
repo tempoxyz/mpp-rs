@@ -1012,3 +1012,61 @@ fn test_zone_credential_grace_rejects_more_than_five_minutes() {
     Mpp::create(offers_builder().zone_credential_grace(std::time::Duration::from_secs(300)))
         .unwrap();
 }
+
+/// `Mpp::new` honors the method's own Zone settings, as `Mpp::create` does:
+/// its `zone_credential_grace`, and a relay's refusal of Zone Challenges.
+#[cfg(feature = "tempo")]
+#[test]
+fn test_mpp_new_honors_the_method_zone_settings() {
+    use crate::protocol::core::expiry_grace::has_expiry_grace;
+    use crate::protocol::methods::tempo::{ChargeMethod as TempoChargeMethod, RelayConfig};
+
+    let provider =
+        alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let new_mpp = |method| {
+        Mpp::new_with_config(
+            method,
+            "api.example.com",
+            TEST_SECRET,
+            crate::protocol::methods::tempo::OUSD,
+            TEST_RECIPIENT,
+        )
+    };
+
+    let grace = std::time::Duration::from_secs(60);
+    let mpp = new_mpp(
+        TempoChargeMethod::new(provider.clone())
+            .with_zone_credential_grace(grace)
+            .unwrap(),
+    );
+    assert_eq!(mpp.config.zone_credential_grace, grace);
+    let challenges = mpp
+        .charge_with_options("0.10", ChargeOptions::default())
+        .unwrap();
+    assert!(has_expiry_grace(challenges[0].opaque.as_ref()));
+
+    let mpp = new_mpp(TempoChargeMethod::new(provider.clone()));
+    assert!(mpp.config.zone_credential_grace.is_zero());
+    let challenges = mpp
+        .charge_with_options("0.10", ChargeOptions::default())
+        .unwrap();
+    assert!(!has_expiry_grace(challenges[0].opaque.as_ref()));
+
+    let mpp = new_mpp(
+        TempoChargeMethod::new(provider)
+            .with_relay(RelayConfig::new("test-api-key"))
+            .unwrap(),
+    );
+    let request = ChargeRequest {
+        amount: "1000".into(),
+        currency: crate::protocol::methods::tempo::OUSD.into(),
+        recipient: Some(TEST_RECIPIENT.into()),
+        method_details: Some(serde_json::json!({ "zones": [3] })),
+        ..Default::default()
+    };
+    let error = mpp
+        .charge_challenge_with_options(&request, None, None)
+        .unwrap_err();
+    assert!(error.to_string().contains("relay"), "{error}");
+}

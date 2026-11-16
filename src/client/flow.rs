@@ -509,8 +509,8 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 Ok(resp) => resp,
                 Err(err) if exchange.unsent() && !already_settled(&credential) => {
                     // The Credential never left: release it as unused. A hash
-                    // Credential's transfer is already on chain, so it takes
-                    // the unknown-outcome path below and is never released.
+                    // or Zone Credential's payment is already on chain, so it
+                    // takes the unknown-outcome path below and is never released.
                     self.events
                         .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                             challenge: Some(challenge),
@@ -932,15 +932,19 @@ fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentC
         })
 }
 
-/// The `payment.failed` reason for a credential that was sent without a
-/// successful answer, or `None` when the credential cannot be serialized.
 /// Whether the Credential's payment settled before it was sent, as a push-mode
-/// Tempo charge whose transaction the client already broadcast: releasing it
-/// would lose a payment that can still be presented.
+/// Tempo charge whose transaction the client already broadcast or a Zone
+/// withdrawal: releasing it would lose a payment that can still be presented,
+/// and a retry would pay again.
 fn already_settled(credential: &PaymentCredential) -> bool {
-    credential.payload.get("type").and_then(|v| v.as_str()) == Some("hash")
+    matches!(
+        credential.payload.get("type").and_then(|v| v.as_str()),
+        Some("hash" | "zone")
+    )
 }
 
+/// The `payment.failed` reason for a credential that was sent without a
+/// successful answer, or `None` when the credential cannot be serialized.
 fn outcome_unknown(
     status: Option<u16>,
     challenge: &PaymentChallenge,

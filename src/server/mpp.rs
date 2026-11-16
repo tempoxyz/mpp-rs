@@ -145,8 +145,8 @@ struct Config {
     /// Zones charge challenges accept (`methodDetails.zones`), as JSON.
     #[cfg(feature = "tempo")]
     zones: Option<serde_json::Value>,
-    /// Whether a Tempo API relay verifies credentials. The relay does not
-    /// verify Zone credentials, so challenges must not advertise Zones.
+    /// Whether a Tempo API relay verifies credentials, or the method otherwise
+    /// does not verify Zone credentials, so challenges must not advertise Zones.
     #[cfg(feature = "tempo")]
     relay: bool,
     /// How long after expiry a `zone` Credential is still accepted.
@@ -217,6 +217,16 @@ where
     }
 
     fn from_config(method: M, config: Config) -> Self {
+        // The method's own Zone settings hold under every constructor, as
+        // mppx's method registers its Credential expiry grace itself.
+        #[cfg(feature = "tempo")]
+        let config = Config {
+            relay: config.relay || !method.verifies_zone_credentials(),
+            zone_credential_grace: config
+                .zone_credential_grace
+                .max(method.zone_credential_grace()),
+            ..config
+        };
         Mpp {
             method: Arc::new(method),
             session_method: None,
