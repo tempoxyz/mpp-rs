@@ -228,7 +228,9 @@ pub enum MppError {
     /// Providers return this when they cannot prove that no payment happened,
     /// for example when a submission timed out, and have no transaction hash
     /// to report. Clients that try alternative offers stop on it rather than
-    /// risk paying twice.
+    /// risk paying twice, and a session top-up that fails with it is treated
+    /// like one whose management response was lost: no further top-up is
+    /// signed for that channel until it is reconciled.
     #[error("payment outcome unknown{}; reconcile before retrying", reference.as_deref().map(|r| format!(" (ref {r})")).unwrap_or_default())]
     UnknownPaymentOutcome {
         /// Optional provider reference to correlate the payment when reconciling,

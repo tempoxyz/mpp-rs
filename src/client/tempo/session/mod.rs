@@ -2770,7 +2770,10 @@ impl TempoSessionProvider {
         // A transport failure after the credential may have been delivered
         // leaves the outcome unknown, as on HTTP; a definite rejection does not.
         let receipt = receipt.map_err(|error| {
-            if matches!(error, MppError::Http(_)) {
+            if matches!(
+                error,
+                MppError::Http(_) | MppError::UnknownPaymentOutcome { .. }
+            ) {
                 self.uncertain_top_ups
                     .lock()
                     .unwrap()
@@ -7623,9 +7626,20 @@ mod tests {
 
     #[tokio::test]
     async fn failed_management_top_up_blocks_another_top_up() {
+        failed_management_top_up_blocks_another_top_up_on(|| {
+            MppError::Http("MCP payment management call failed".into())
+        })
+        .await;
+        failed_management_top_up_blocks_another_top_up_on(|| MppError::UnknownPaymentOutcome {
+            reference: Some("req-1".into()),
+        })
+        .await;
+    }
+
+    async fn failed_management_top_up_blocks_another_top_up_on(fail: fn() -> MppError) {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
-        struct Failing(Arc<Mutex<usize>>);
+        struct Failing(Arc<Mutex<usize>>, fn() -> MppError);
         impl ManagementTransport for Failing {
             fn send<'a>(
                 &'a self,
@@ -7633,7 +7647,8 @@ mod tests {
                 _credential: &'a PaymentCredential,
             ) -> crate::client::ManagementFuture<'a> {
                 *self.0.lock().unwrap() += 1;
-                Box::pin(async { Err(MppError::Http("MCP payment management call failed".into())) })
+                let error = (self.1)();
+                Box::pin(async move { Err(error) })
             }
         }
 
@@ -7648,7 +7663,7 @@ mod tests {
             &[&channel_state_response(10_000), "0x4a817c800", "0x5208"],
         );
         let sends = Arc::new(Mutex::new(0));
-        let transport = Failing(sends.clone());
+        let transport = Failing(sends.clone(), fail);
 
         let error = provider
             .top_up_with_management(
