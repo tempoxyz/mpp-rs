@@ -186,7 +186,7 @@ pub async fn verify(
     if text(claims, "aud") != Some(options.audience.as_str()) {
         return Err(invalid("The attestation is for another audience."));
     }
-    if !text(claims, "sub").is_some_and(|sub| !sub.is_empty()) {
+    if text(claims, "sub").is_none_or(|sub| sub.is_empty()) {
         return Err(invalid("The attestation has no subject."));
     }
     if claims.get("jti").is_some_and(|jti| !jti.is_string()) {
