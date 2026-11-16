@@ -115,8 +115,12 @@ fuzz_target!(|input: Input| {
     let mut params = json!({ "name": "tool" });
     // Fails when `opaque` is not base64url JSON; it has no MCP form then.
     if mcp::try_attach_credential(&mut params, &credential).is_ok() {
-        let extracted = mcp::extract_credential(&params["_meta"]).expect("credential is present");
-        assert_same(&extracted, &credential);
+        let extracted = mcp::extract_credential(&params["_meta"]);
+        if has_supported_header(credential.challenge.header.as_deref()) {
+            assert_same(&extracted.expect("credential is present"), &credential);
+        } else {
+            assert!(extracted.is_none(), "extracted {credential:?}");
+        }
     }
 
     let receipt = Receipt::success(challenge.method.clone(), &input.reference);
