@@ -1768,6 +1768,7 @@ impl TempoSessionProvider {
                     "recovered session cumulative amount exceeds channel deposit".into(),
                 ));
             }
+            self.assert_within_max_deposit(recovered.cumulative_amount)?;
             self.channel_store
                 .set(&recovered)
                 .await
@@ -1811,6 +1812,7 @@ impl TempoSessionProvider {
             return Ok(None);
         }
         let recovered = recover_stored_channel(stored, scope, state)?;
+        self.assert_within_max_deposit(recovered.cumulative_amount)?;
         let pending = recovered.pending_open.clone();
         if let Some(challenge_id) = &pending {
             self.pending_opens.lock().unwrap().insert(
@@ -2386,7 +2388,7 @@ impl TempoSessionProvider {
                     chain_id,
                 },
                 session_req.session_snapshot().as_ref(),
-                session_req.parse_amount()?,
+                0,
                 Self::settlement_binding(&session_req)?,
             )
             .await?;
@@ -3319,6 +3321,8 @@ impl TempoSessionProvider {
             )));
         }
 
+        self.assert_within_max_deposit(cumulative_amount)?;
+
         let payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_close_payload_with_descriptor_primitive(
                 &self.signer,
@@ -3380,12 +3384,23 @@ impl TempoSessionProvider {
     /// Reads a management error response's body within the management
     /// deadline, so a server that stalls after its headers cannot hold the
     /// payment lock. A body that does not arrive in time is left out.
-    async fn management_body(&self, response: reqwest::Response) -> String {
-        tokio::time::timeout(self.management_timeout, response.text())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+    async fn management_body(&self, mut response: reqwest::Response) -> String {
+        const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+        tokio::time::timeout(self.management_timeout, async {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                let remaining = MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() == MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            Ok::<_, reqwest::Error>(String::from_utf8_lossy(&body).into_owned())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
     }
 
     /// POSTs a management credential that answers `challenge` to `url`.
@@ -5875,6 +5890,100 @@ mod tests {
             provider.channel_store.get(&stored.key()).await.unwrap(),
             Some(written)
         );
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_authorize_a_request_or_exceed_the_local_cap() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        for limit in [300, 400, 2_000] {
+            let mut provider = make_test_provider()
+                .with_channel_store(Arc::new(MemoryChannelStore::default()))
+                .with_max_deposit(limit);
+            let payee = Address::repeat_byte(0x11);
+            let currency = Address::repeat_byte(0x22);
+            let channel_id = seed_precompile_channel(&provider, payee, currency, 400, 10_000);
+            let entry = provider.channels().into_values().next().unwrap();
+            provider.channels.lock().unwrap().clear();
+            provider.channel_id_to_key.lock().unwrap().clear();
+            let signature = crate::protocol::methods::tempo::precompile_voucher::sign_precompile_voucher_primitive(
+                &provider.signer, channel_id, 400, 42431,
+            ).await.unwrap();
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["methodDetails"]["sessionSnapshot"] = serde_json::json!({
+                "acceptedCumulative": "400", "chainId": 42431, "channelId": channel_id.to_string(),
+                "deposit": "10000", "descriptor": entry.descriptor,
+                "escrow": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+                "highestVoucher": {
+                    "channelId": channel_id.to_string(), "cumulativeAmount": "400",
+                    "signature": alloy::hex::encode_prefixed(signature)
+                },
+                "requiredCumulative": "1300", "settled": "0", "spent": "300"
+            });
+            challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+            let result = provider.restore(&challenge).await;
+            if limit < 400 {
+                assert!(result.unwrap_err().to_string().contains("max_deposit"));
+                assert!(provider.channels().is_empty());
+                let key = provider.expected_channel_key(&challenge).unwrap().0;
+                assert!(provider.channel_store.get(&key).await.unwrap().is_none());
+            } else {
+                assert!(result.unwrap());
+                assert_eq!(provider.cumulative(), 400);
+                assert!(provider.restore(&challenge).await.unwrap());
+                assert_eq!(provider.cumulative(), 400);
+                if limit == 2_000 {
+                    provider.pay(&challenge).await.unwrap();
+                    assert_eq!(provider.cumulative(), 1_400);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn close_refuses_a_cached_amount_above_the_local_cap() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let provider = make_test_provider().with_max_deposit(300);
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 400, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let error = provider
+            .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("max_deposit"));
+    }
+
+    #[tokio::test]
+    async fn management_error_bodies_are_byte_bounded() {
+        use tokio::io::AsyncWriteExt;
+        for chunked in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let headers = if chunked {
+                    "HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\n\r\n20000\r\n"
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 131072\r\n\r\n"
+                };
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                let _ = socket.write_all(&vec![b'x'; 131_072]).await;
+                // The client must stop at the byte limit without waiting for EOF.
+                std::future::pending::<()>().await;
+            });
+            let provider = make_test_provider();
+            let response = reqwest::get(url).await.unwrap();
+            let body =
+                tokio::time::timeout(Duration::from_secs(2), provider.management_body(response))
+                    .await
+                    .unwrap();
+            assert_eq!(body, "x".repeat(64 * 1024));
+            server.abort();
+        }
     }
 
     #[tokio::test]
