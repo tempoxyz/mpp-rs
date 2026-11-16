@@ -456,10 +456,16 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
 
             let credential = match override_credential {
                 Some(credential) => credential,
-                None => match self
-                    .provider
-                    .pay_with_context(&challenge, payment_context.clone())
-                    .await
+                // A Zone withdrawal still settling is resumed for this
+                // challenge, not paid again.
+                None => match super::provider::resume_pending_settlement(
+                    self.max_payment_retries,
+                    || {
+                        self.provider
+                            .pay_with_context(&challenge, payment_context.clone())
+                    },
+                )
+                .await
                 {
                     Ok(credential) => credential,
                     Err(err) => {
@@ -619,12 +625,12 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 pending.rollback().await.map_err(HttpError::Payment)?;
             }
 
-            // A hash credential's transfer is already on chain: paying a new
-            // challenge for the same request would pay twice, so its answer is
-            // final.
+            // A hash or Zone credential's payment is already on chain: paying
+            // a new challenge for the same request would pay twice, so its
+            // answer is final.
             if credential
                 .charge_payload()
-                .is_ok_and(|payload| payload.is_hash())
+                .is_ok_and(|payload| payload.is_hash() || payload.is_zone())
             {
                 return Ok(resp);
             }
