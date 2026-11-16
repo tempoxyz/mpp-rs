@@ -37,6 +37,34 @@ use crate::protocol::methods::tempo::CHAIN_ID;
 #[cfg(feature = "tempo")]
 const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 
+/// Gas declared by a sponsored session transaction, which the client can't
+/// estimate: the node bills the sender in `eth_estimateGas` when no fee payer
+/// has signed, and the sender may hold none of the fee token.
+#[cfg(feature = "tempo")]
+const SPONSORED_GAS_LIMIT: u64 = 2_000_000;
+
+/// Gas declared by a transaction the client doesn't estimate (a sponsored
+/// one, or a legacy session open) when it also authorizes the signing access
+/// key, and the most an estimate for one that does may ask for. Installing a
+/// key writes its limits and call scopes to the account keychain, which needs
+/// far more than [`SPONSORED_GAS_LIMIT`]: an open that installed a key with
+/// four limits and 14 scoped selectors used 18,503,016 gas on Tempo mainnet.
+/// It stays under the 25,000,000 gas that fee payers such as Tempo Gateway
+/// sponsor.
+#[cfg(feature = "tempo")]
+pub(crate) const KEY_AUTHORIZATION_GAS_LIMIT: u64 = 20_000_000;
+
+/// The gas a session transaction the client doesn't estimate declares: more
+/// when it carries a key authorization.
+#[cfg(feature = "tempo")]
+const fn sponsored_gas_limit(authorizes_key: bool) -> u64 {
+    if authorizes_key {
+        KEY_AUTHORIZATION_GAS_LIMIT
+    } else {
+        SPONSORED_GAS_LIMIT
+    }
+}
+
 /// Default escrow contract addresses per chain ID.
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
     match chain_id {
@@ -641,7 +669,7 @@ where
         fee_token: options.currency,
         nonce,
         nonce_key,
-        gas_limit: 2_000_000,
+        gas_limit: sponsored_gas_limit(key_authorization.is_some()),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
@@ -1097,7 +1125,7 @@ where
         fee_token: options.fee_token,
         nonce,
         nonce_key,
-        gas_limit: 2_000_000,
+        gas_limit: sponsored_gas_limit(key_authorization.is_some()),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
@@ -1295,7 +1323,7 @@ where
         fee_token: options.fee_token,
         nonce,
         nonce_key,
-        gas_limit: 2_000_000,
+        gas_limit: sponsored_gas_limit(key_authorization.is_some()),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,

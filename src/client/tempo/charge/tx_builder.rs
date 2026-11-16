@@ -79,8 +79,10 @@ pub fn build_tempo_tx(options: TempoTxOptions) -> TempoTransaction {
 /// (`gasCap × baseFee / conversionRate`) to exceed moderate wallet balances,
 /// triggering spurious `InsufficientBalance` errors during estimation.
 ///
-/// 3M covers key provisioning (~1M intrinsic) with headroom for execution,
-/// while keeping the fee-token reservation manageable (~0.06 USDC at 20 gwei).
+/// 3M covers a transaction that installs no key while keeping the fee-token
+/// reservation manageable (~0.06 USDC at 20 gwei). One that installs a key
+/// estimates under the key-authorization limit instead, since writing the
+/// key's limits and call scopes can take more than 18M.
 const GAS_ESTIMATION_CAP: u64 = 3_000_000;
 
 /// Safety buffer added to gas estimates to account for estimation variance.
@@ -95,7 +97,11 @@ pub async fn estimate_gas(
     provider: &impl Provider<TempoNetwork>,
     mut req: TempoTransactionRequest,
 ) -> Result<u64, MppError> {
-    req.inner.gas = Some(GAS_ESTIMATION_CAP);
+    req.inner.gas = Some(if req.key_authorization.is_some() {
+        crate::client::tempo::session::channel_ops::KEY_AUTHORIZATION_GAS_LIMIT
+    } else {
+        GAS_ESTIMATION_CAP
+    });
 
     provider
         .estimate_gas(req)
