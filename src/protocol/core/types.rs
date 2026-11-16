@@ -355,6 +355,7 @@ impl fmt::Display for PaymentProtocol {
 /// - `transaction`: Signed blockchain transaction (to be broadcast by server)
 /// - `hash`: Transaction hash (already broadcast by client)
 /// - `proof`: Signed typed proof for zero-amount identity flows
+/// - `zone`: Tempo settlement of a Zone withdrawal (Tempo charge)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PayloadType {
@@ -364,6 +365,8 @@ pub enum PayloadType {
     Hash,
     /// Signed typed proof for zero-amount identity flows
     Proof,
+    /// Tempo transaction that settled a Zone withdrawal to the recipient
+    Zone,
 }
 
 impl fmt::Display for PayloadType {
@@ -372,6 +375,7 @@ impl fmt::Display for PayloadType {
             Self::Transaction => write!(f, "transaction"),
             Self::Hash => write!(f, "hash"),
             Self::Proof => write!(f, "proof"),
+            Self::Zone => write!(f, "zone"),
         }
     }
 }
@@ -572,6 +576,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PayloadType::Proof).unwrap(),
             "\"proof\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PayloadType::Zone).unwrap(),
+            "\"zone\""
         );
     }
 
