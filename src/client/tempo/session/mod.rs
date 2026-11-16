@@ -1768,7 +1768,11 @@ impl TempoSessionProvider {
                     "recovered session cumulative amount exceeds channel deposit".into(),
                 ));
             }
-            self.assert_within_max_deposit(recovered.cumulative_amount)?;
+            // Loading an already authorized obligation must remain possible for close.
+            // Payment recovery checks the cap before persisting any new request amount.
+            if request_amount != 0 {
+                self.assert_within_max_deposit(recovered.cumulative_amount)?;
+            }
             self.channel_store
                 .set(&recovered)
                 .await
@@ -1812,7 +1816,9 @@ impl TempoSessionProvider {
             return Ok(None);
         }
         let recovered = recover_stored_channel(stored, scope, state)?;
-        self.assert_within_max_deposit(recovered.cumulative_amount)?;
+        if request_amount != 0 {
+            self.assert_within_max_deposit(recovered.cumulative_amount)?;
+        }
         let pending = recovered.pending_open.clone();
         if let Some(challenge_id) = &pending {
             self.pending_opens.lock().unwrap().insert(
@@ -2154,6 +2160,7 @@ impl TempoSessionProvider {
             },
             state,
         )?;
+        self.assert_within_max_deposit(recovered.cumulative_amount)?;
         // A channel kept in another namespace is not copied into this one.
         if self
             .channel_store
@@ -2568,6 +2575,7 @@ impl TempoSessionProvider {
             ));
         }
 
+        self.assert_within_max_deposit(entry.cumulative_amount)?;
         let mut payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_voucher_payload_with_descriptor_primitive(
                 &self.signer,
@@ -3321,8 +3329,8 @@ impl TempoSessionProvider {
             )));
         }
 
-        self.assert_within_max_deposit(cumulative_amount)?;
-
+        // Closing settles an existing authorization; it never increases it, even
+        // when the caller lowered the cap after that authorization was issued.
         let payload = if is_precompile_escrow(entry.escrow_contract) {
             create_precompile_close_payload_with_descriptor_primitive(
                 &self.signer,
@@ -5893,7 +5901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_does_not_authorize_a_request_or_exceed_the_local_cap() {
+    async fn restore_preserves_authorized_close_without_allowing_over_cap_payments() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
         for limit in [300, 400, 2_000] {
             let mut provider = make_test_provider()
@@ -5922,39 +5930,66 @@ mod tests {
                 "requiredCumulative": "1300", "settled": "0", "spent": "300"
             });
             challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
-            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
-            let result = provider.restore(&challenge).await;
-            if limit < 400 {
-                assert!(result.unwrap_err().to_string().contains("max_deposit"));
+            if limit <= 400 {
+                mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+                let error = provider.pay(&challenge).await.unwrap_err();
+                assert!(error.to_string().contains("max_deposit"));
                 assert!(provider.channels().is_empty());
                 let key = provider.expected_channel_key(&challenge).unwrap().0;
                 assert!(provider.channel_store.get(&key).await.unwrap().is_none());
+            }
+            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+            let result = provider.restore(&challenge).await;
+            assert!(result.unwrap());
+            assert_eq!(provider.cumulative(), 400);
+            assert!(provider.restore(&challenge).await.unwrap());
+            assert_eq!(provider.cumulative(), 400);
+            provider.channels.lock().unwrap().clear();
+            provider.channel_id_to_key.lock().unwrap().clear();
+            let stored_challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+            assert!(provider.restore(&stored_challenge).await.unwrap());
+            assert_eq!(provider.cumulative(), 400);
+            if limit < 400 {
+                let error = provider
+                    .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 100)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("max_deposit"));
+            }
+            provider
+                .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
+                .await
+                .unwrap();
+            if limit == 2_000 {
+                provider.pay(&challenge).await.unwrap();
+                assert_eq!(provider.cumulative(), 1_400);
             } else {
-                assert!(result.unwrap());
+                let error = provider.pay(&challenge).await.unwrap_err();
+                assert!(error.to_string().contains("max_deposit"));
                 assert_eq!(provider.cumulative(), 400);
-                assert!(provider.restore(&challenge).await.unwrap());
-                assert_eq!(provider.cumulative(), 400);
-                if limit == 2_000 {
-                    provider.pay(&challenge).await.unwrap();
-                    assert_eq!(provider.cumulative(), 1_400);
-                }
             }
         }
     }
 
     #[tokio::test]
-    async fn close_refuses_a_cached_amount_above_the_local_cap() {
+    async fn close_settles_a_cached_authorization_above_a_lowered_cap() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
         let provider = make_test_provider().with_max_deposit(300);
         let payee = Address::repeat_byte(0x11);
         let currency = Address::repeat_byte(0x22);
         let channel_id = seed_precompile_channel(&provider, payee, currency, 400, 10_000);
         let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
-        let error = provider
+        provider
             .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
             .await
+            .unwrap();
+        let error = provider
+            .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), Some(401))
+            .await
             .unwrap_err();
-        assert!(error.to_string().contains("max_deposit"));
+        assert!(error.to_string().contains("exceeds locally authorized"));
     }
 
     #[tokio::test]
@@ -6341,6 +6376,18 @@ mod tests {
             .is_none());
         assert!(provider.channels().is_empty());
         provider = provider.with_origin(&url.parse().unwrap()).unwrap();
+        provider.max_deposit = Some(300);
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(provider.channels().is_empty());
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let key = provider.expected_channel_key(&challenge).unwrap().0;
+        assert!(provider.channel_store.get(&key).await.unwrap().is_none());
+        provider.max_deposit = Some(1_000);
         mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
         assert!(provider
             .bootstrap(&reqwest::Client::new(), &url)
