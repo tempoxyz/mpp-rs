@@ -142,6 +142,16 @@ struct Config {
     can_sponsor: bool,
     machine_token_enabled: bool,
     chain_id: Option<u64>,
+    /// Zones charge challenges accept (`methodDetails.zones`), as JSON.
+    #[cfg(feature = "tempo")]
+    zones: Option<serde_json::Value>,
+    /// Whether a Tempo API relay verifies credentials. The relay does not
+    /// verify Zone credentials, so challenges must not advertise Zones.
+    #[cfg(feature = "tempo")]
+    relay: bool,
+    /// How long after expiry a `zone` Credential is still accepted.
+    #[cfg(feature = "tempo")]
+    zone_credential_grace: std::time::Duration,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
 }
@@ -160,6 +170,12 @@ impl Config {
             can_sponsor: true,
             machine_token_enabled: false,
             chain_id: None,
+            #[cfg(feature = "tempo")]
+            zones: None,
+            #[cfg(feature = "tempo")]
+            relay: false,
+            #[cfg(feature = "tempo")]
+            zone_credential_grace: std::time::Duration::ZERO,
             opaque: None,
             credential_header: None,
         }
@@ -437,6 +453,30 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 )));
             }
         }
+        let zones = match builder.zones {
+            Some(crate::protocol::methods::tempo::zone::Zones::Ids(ref ids))
+                if ids.is_empty()
+                    || ids.iter().any(|id| {
+                        !crate::protocol::methods::tempo::zone::is_id(u64::from(*id))
+                    }) =>
+            {
+                return Err(crate::error::MppError::InvalidConfig(
+                    "zones must be Zones::Any or a non-empty list of valid Zone IDs".into(),
+                ));
+            }
+            Some(ref zones) => Some(serde_json::to_value(zones).map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!("invalid zones: {e}"))
+            })?),
+            None => None,
+        };
+        // A relay verifies every credential itself, and one that does not
+        // know Zone credentials would reject them only after the payer's
+        // withdrawal settled to the recipient.
+        if zones.is_some() && builder.relay.is_some() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "zones(...) cannot be combined with relay(...): the relay does not verify Zone credentials".into(),
+            ));
+        }
         // Resolve accepted currencies (explicit list, legacy single currency,
         // or chain defaults) before moving fields out of the builder.
         let currencies = super::tempo::resolve_currencies(&builder)?;
@@ -453,7 +493,8 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         crate::protocol::core::validate_secret_key(&secret_key)?;
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
-        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
+        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider)
+            .with_zone_credential_grace(builder.zone_credential_grace)?;
         if let Some(signer) = builder.fee_payer_signer {
             method = method.with_fee_payer_arc(signer);
         }
@@ -470,6 +511,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             Some(store) => method.with_store(store),
             None => method.without_store(),
         };
+        let relay = builder.relay.is_some();
         if let Some(relay) = builder.relay {
             method = method.with_relay(relay)?;
         }
@@ -488,6 +530,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 can_sponsor,
                 machine_token_enabled: builder.machine_token_enabled,
                 chain_id: builder.chain_id,
+                zones,
+                relay,
+                zone_credential_grace: builder.zone_credential_grace,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),
                 ..Config::new(builder.realm, secret_key)
             },

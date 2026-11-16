@@ -43,10 +43,14 @@ where
     /// by this server, this check compares economically-significant fields
     /// from the credential against the server's current configuration to
     /// prevent cross-route credential replay attacks.
+    ///
+    /// `bound` says whether the caller already compared the credential's
+    /// request with the route's expected request.
     fn verify_pinned_fields(
         &self,
         credential: &PaymentCredential,
         request: &ChargeRequest,
+        bound: bool,
     ) -> std::result::Result<(), VerificationError> {
         // Challenge-level fields: method, intent, realm
         if credential.challenge.method.as_str() != self.method.method() {
@@ -124,6 +128,66 @@ where
             }
         }
 
+        #[cfg(feature = "tempo")]
+        self.verify_zone(credential, bound)?;
+
+        Ok(())
+    }
+
+    /// Reject a `zone` credential from a Zone its challenge does not accept.
+    ///
+    /// The HMAC-verified challenge's own `methodDetails.zones` decides, so a
+    /// route that issues its challenges for other Zones than the handler's
+    /// (`charge_challenge_with_options` with explicit `zones`) keeps
+    /// verifying them. Unbound verification (`bound` false) also holds the
+    /// credential to this handler's Zone ID list, so it never takes a
+    /// withdrawal from another Zone for a challenge another handler sharing
+    /// its secret and realm issued.
+    #[cfg(feature = "tempo")]
+    fn verify_zone(
+        &self,
+        credential: &PaymentCredential,
+        bound: bool,
+    ) -> std::result::Result<(), VerificationError> {
+        use crate::protocol::methods::tempo::zone::{self, Zones};
+
+        let Ok(payload) = credential.charge_payload() else {
+            return Ok(());
+        };
+        if !payload.is_zone() {
+            return Ok(());
+        }
+        let parse_zones = |zones: Option<&serde_json::Value>| {
+            zones.and_then(|zones| serde_json::from_value::<Zones>(zones.clone()).ok())
+        };
+        let challenge_zones =
+            Self::decode_credential_request(credential)
+                .ok()
+                .and_then(|request| {
+                    parse_zones(
+                        request
+                            .method_details
+                            .as_ref()
+                            .and_then(|details| details.get("zones")),
+                    )
+                });
+        let accepted = payload.zone_id().is_some_and(|id| {
+            zone::is_accepted(challenge_zones.as_ref(), id)
+                && (bound
+                    || !matches!(
+                        parse_zones(self.config.zones.as_ref()),
+                        Some(Zones::Ids(ref ids)) if !ids.contains(&id)
+                    ))
+        });
+        if !accepted {
+            return Err(VerificationError::with_code(
+                format!(
+                    "credential Zone {:?} does not match this route's requirements",
+                    payload.zone_id()
+                ),
+                crate::protocol::traits::ErrorCode::InvalidChallenge,
+            ));
+        }
         Ok(())
     }
 
@@ -154,7 +218,9 @@ where
                     VerificationError::invalid_challenge("Invalid expires timestamp in challenge")
                 })?;
 
-        if expires_at <= time::OffsetDateTime::now_utc() {
+        if expires_at <= time::OffsetDateTime::now_utc()
+            && !self.in_zone_grace(credential, expires_at)
+        {
             return Err(VerificationError::expired(format!(
                 "Challenge expired at {}",
                 expires
@@ -162,6 +228,33 @@ where
         }
 
         Ok(())
+    }
+
+    /// Whether an expired challenge's credential is a `zone` Credential still
+    /// within the handler's `zone_credential_grace`. Only a Zone withdrawal
+    /// gets the grace: the method then requires its settlement to predate the
+    /// expiry.
+    #[cfg(feature = "tempo")]
+    fn in_zone_grace(
+        &self,
+        credential: &PaymentCredential,
+        expires_at: time::OffsetDateTime,
+    ) -> bool {
+        let grace = self.config.zone_credential_grace;
+        !grace.is_zero()
+            && credential
+                .charge_payload()
+                .is_ok_and(|payload| payload.is_zone())
+            && time::OffsetDateTime::now_utc() < expires_at + grace
+    }
+
+    #[cfg(not(feature = "tempo"))]
+    fn in_zone_grace(
+        &self,
+        _credential: &PaymentCredential,
+        _expires_at: time::OffsetDateTime,
+    ) -> bool {
+        false
     }
 
     /// Whether the credential's challenge ID is this handler's HMAC over the
@@ -228,7 +321,7 @@ where
         body: &[u8],
     ) -> std::result::Result<ChargeValidation, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
-        self.validate_with_body(credential, &request, Some(body))
+        self.validate_with_body(credential, &request, Some(body), false)
             .await
     }
 
@@ -242,7 +335,8 @@ where
     ) -> std::result::Result<ChargeValidation, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
         self.verify_expected_request_matches(credential, &request, expected)?;
-        self.validate(credential, &request).await
+        self.validate_with_body(credential, &request, None, true)
+            .await
     }
 
     /// Validate a credential against expected route values and body bytes.
@@ -256,7 +350,7 @@ where
     ) -> std::result::Result<ChargeValidation, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
         self.verify_expected_request_matches(credential, &request, expected)?;
-        self.validate_with_body(credential, &request, Some(body))
+        self.validate_with_body(credential, &request, Some(body), true)
             .await
     }
 
@@ -285,7 +379,7 @@ where
         body: &[u8],
     ) -> std::result::Result<Receipt, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
-        self.broadcast_with_body(credential, &request, Some(body))
+        self.broadcast_with_body(credential, &request, Some(body), false)
             .await
     }
 
@@ -299,7 +393,8 @@ where
     ) -> std::result::Result<Receipt, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
         self.verify_expected_request_matches(credential, &request, expected)?;
-        self.broadcast(credential, &request).await
+        self.broadcast_with_body(credential, &request, None, true)
+            .await
     }
 
     /// Re-validate and accept a credential matching expected route values and body bytes.
@@ -313,7 +408,7 @@ where
     ) -> std::result::Result<Receipt, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
         self.verify_expected_request_matches(credential, &request, expected)?;
-        self.broadcast_with_body(credential, &request, Some(body))
+        self.broadcast_with_body(credential, &request, Some(body), true)
             .await
     }
 
@@ -488,6 +583,51 @@ where
                     crate::protocol::traits::ErrorCode::InvalidChallenge,
                 ));
             }
+
+            // The Zones a challenge accepts decide which Zone withdrawals pay
+            // it, so they bind the credential to the route like mppx's
+            // `chargeBinding`.
+            // Compared as sets: the order and repeats of listed Zone IDs never
+            // change which withdrawals pay a challenge.
+            let normalize = |zones: serde_json::Value| {
+                use crate::protocol::methods::tempo::zone::Zones;
+                match serde_json::from_value::<Zones>(zones.clone()) {
+                    Ok(Zones::Ids(mut ids)) => {
+                        ids.sort_unstable();
+                        ids.dedup();
+                        serde_json::json!(ids)
+                    }
+                    Ok(Zones::Any) => serde_json::Value::Bool(true),
+                    Err(_) => zones,
+                }
+            };
+            let zones = |request: &ChargeRequest| {
+                request
+                    .method_details
+                    .as_ref()
+                    .and_then(|details| details.get("zones"))
+                    .filter(|zones| !zones.is_null())
+                    .cloned()
+                    .map(normalize)
+            };
+            // An expected request that leaves Zones unset takes this handler's,
+            // as the challenges it issues from caller-built requests do; an
+            // explicit `"zones": null` expects none.
+            let sets_zones = expected
+                .method_details
+                .as_ref()
+                .is_some_and(|details| details.get("zones").is_some());
+            let expected_zones = if sets_zones {
+                zones(expected)
+            } else {
+                self.config.zones.clone().map(normalize)
+            };
+            if zones(request) != expected_zones {
+                return Err(VerificationError::with_code(
+                    "Zone mismatch: credential was issued for different Zones",
+                    crate::protocol::traits::ErrorCode::InvalidChallenge,
+                ));
+            }
         }
 
         self.method.validate_expected_request(request, expected)
@@ -499,7 +639,8 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<ChargeValidation, VerificationError> {
-        self.validate_with_body(credential, request, None).await
+        self.validate_with_body(credential, request, None, false)
+            .await
     }
 
     async fn validate_with_body(
@@ -507,10 +648,11 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
         body: Option<&[u8]>,
+        bound: bool,
     ) -> std::result::Result<ChargeValidation, VerificationError> {
         self.verify_hmac_and_expiry(credential)?;
         self.verify_body_digest(credential, body)?;
-        self.verify_pinned_fields(credential, request)?;
+        self.verify_pinned_fields(credential, request, bound)?;
         self.method.validate(credential, request).await
     }
 
@@ -531,7 +673,8 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
     ) -> std::result::Result<Receipt, VerificationError> {
-        self.broadcast_with_body(credential, request, None).await
+        self.broadcast_with_body(credential, request, None, false)
+            .await
     }
 
     async fn broadcast_with_body(
@@ -539,8 +682,9 @@ where
         credential: &PaymentCredential,
         request: &ChargeRequest,
         body: Option<&[u8]>,
+        bound: bool,
     ) -> std::result::Result<Receipt, VerificationError> {
-        self.broadcast_gated(credential, request, body, None)
+        self.broadcast_gated(credential, request, body, None, bound)
             .await?
             .ok_or_else(|| VerificationError::new("credential refused before settlement"))
     }
@@ -560,7 +704,8 @@ where
     ) -> std::result::Result<Option<Receipt>, VerificationError> {
         let request = Self::decode_credential_request(credential)?;
         self.verify_expected_request_matches(credential, &request, expected)?;
-        self.broadcast_gated(credential, &request, body, gate).await
+        self.broadcast_gated(credential, &request, body, gate, true)
+            .await
     }
 
     async fn broadcast_gated(
@@ -569,12 +714,13 @@ where
         request: &ChargeRequest,
         body: Option<&[u8]>,
         gate: Option<&dyn CredentialGate>,
+        bound: bool,
     ) -> std::result::Result<Option<Receipt>, VerificationError> {
         // Tier 1: HMAC provenance + expiry
         self.verify_hmac_and_expiry(credential)?;
         self.verify_body_digest(credential, body)?;
         // Tier 2: Pinned field safety net
-        self.verify_pinned_fields(credential, request)?;
+        self.verify_pinned_fields(credential, request, bound)?;
         // An identity payment check runs before the payment is validated or
         // broadcast, as mppx runs it before settlement.
         if let Some(gate) = gate {

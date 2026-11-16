@@ -50,6 +50,8 @@ pub struct TempoBuilder {
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
+    pub(crate) zones: Option<crate::protocol::methods::tempo::zone::Zones>,
+    pub(crate) zone_credential_grace: std::time::Duration,
 }
 
 impl TempoBuilder {
@@ -245,6 +247,35 @@ impl TempoBuilder {
         self.requires_auth = enabled;
         self
     }
+
+    /// Accept charges paid from these Zones, as mppx's `zones` server option:
+    /// [`Zones::Any`](crate::protocol::methods::tempo::zone::Zones::Any) for any
+    /// Zone on the challenge's chain, or a list of Zone IDs
+    /// ([`Zones::ids`](crate::protocol::methods::tempo::zone::Zones::ids)).
+    ///
+    /// Charge challenges then advertise them in `methodDetails.zones`, and a
+    /// client may pay from a Zone balance with a `zone` Credential: a
+    /// withdrawal to the recipient, settled on Tempo, whose memo binds it to
+    /// the challenge. [`Mpp::create()`](super::Mpp::create) rejects an empty
+    /// list or an invalid Zone ID.
+    pub fn zones(mut self, zones: crate::protocol::methods::tempo::zone::Zones) -> Self {
+        self.zones = Some(zones);
+        self
+    }
+
+    /// How long after its challenge expires a `zone` Credential is still
+    /// accepted, as mppx's `zoneCredentialGraceMs`. Defaults to zero.
+    ///
+    /// A Zone withdrawal can settle on Tempo shortly before its challenge
+    /// expires and reach the server only after. Within the grace, a `zone`
+    /// Credential for an expired challenge is accepted when its settlement's
+    /// block is older than the expiry; every other Credential type gets no
+    /// grace. [`Mpp::create()`](super::Mpp::create) rejects a grace above
+    /// [`MAX_ZONE_CREDENTIAL_GRACE`](crate::protocol::methods::tempo::zone::MAX_ZONE_CREDENTIAL_GRACE).
+    pub fn zone_credential_grace(mut self, grace: std::time::Duration) -> Self {
+        self.zone_credential_grace = grace;
+        self
+    }
 }
 
 /// Create a Tempo payment method configuration with smart defaults.
@@ -328,6 +359,8 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         relay: None,
         requires_auth: false,
+        zones: None,
+        zone_credential_grace: std::time::Duration::ZERO,
     }
 }
 
