@@ -130,12 +130,11 @@ pub(super) fn is_payment_authorization_header(header: &str) -> bool {
 
 /// Returns an advertised credential header, or `None` for the Authorization default.
 ///
-/// `Payment-Authorization` is the only field a challenge may select, and is
-/// returned in its canonical spelling whatever case it was given in. Other
+/// `Payment-Authorization` is the only field a challenge may select. Other
 /// values are ignored and treated as absent; parsers reject them separately.
 pub fn advertised_credential_header(header: Option<&str>) -> Option<String> {
     let name = header?;
-    is_payment_authorization_header(name).then(|| super::PAYMENT_AUTHORIZATION_HEADER.to_string())
+    is_payment_authorization_header(name).then(|| name.to_string())
 }
 
 /// Reason given when a challenge selects a credential header other than
@@ -146,8 +145,9 @@ const UNSUPPORTED_CREDENTIAL_HEADER: &str =
 /// Returns the credential header a locally built challenge advertises.
 ///
 /// `Authorization` (any case) is accepted as shorthand for the default and is
-/// not emitted; `Payment-Authorization` is emitted canonically. Servers must
-/// not emit any other value, so it is an error.
+/// not emitted. `Payment-Authorization` (any case) is emitted as stored, since
+/// the challenge id binds that spelling. Servers must not emit any other
+/// value, so it is an error.
 pub(super) fn local_credential_header(
     header: Option<&str>,
 ) -> crate::error::Result<Option<String>> {
@@ -162,8 +162,9 @@ pub(super) fn local_credential_header(
 /// Validates the raw value before any normalization, as
 /// [draft-httpauth-payment-01](https://paymentauth.org) requires: an absent
 /// value selects the `Authorization` default and returns `None`, and
-/// `Payment-Authorization` (compared ASCII case-insensitively) returns its
-/// canonical spelling. Any other value, including an explicit
+/// `Payment-Authorization` (compared ASCII case-insensitively) is returned
+/// unchanged, in the spelling received: clients echo it as sent, and the
+/// challenge id binds it. Any other value, including an explicit
 /// `Authorization` or an empty string, makes the challenge unrecognized and
 /// is rejected, so no Credential is created for it.
 pub fn parse_advertised_credential_header(
@@ -173,7 +174,7 @@ pub fn parse_advertised_credential_header(
         return Ok(None);
     };
     if is_payment_authorization_header(name) {
-        return Ok(Some(super::PAYMENT_AUTHORIZATION_HEADER.to_string()));
+        return Ok(Some(name.to_string()));
     }
     Err(crate::error::MppError::invalid_challenge_reason(
         UNSUPPORTED_CREDENTIAL_HEADER,

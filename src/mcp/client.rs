@@ -437,7 +437,7 @@ mod tests {
     use super::*;
     use crate::{
         mcp::{
-            extract_receipt, extract_result_challenges, CREDENTIAL_META_KEY,
+            extract_receipt, extract_result_payment_challenges, CREDENTIAL_META_KEY,
             PAYMENT_REQUIRED_META_KEY, RECEIPT_META_KEY,
         },
         Base64UrlJson, PaymentPayload,
@@ -611,7 +611,9 @@ mod tests {
             &self,
             output: &Self::Output,
         ) -> Option<Vec<PaymentChallenge>> {
-            output.get("_meta").and_then(extract_result_challenges)
+            output
+                .get("_meta")
+                .and_then(extract_result_payment_challenges)
         }
 
         fn receipt_from_output(&self, output: &Self::Output) -> Option<Receipt> {
@@ -1021,21 +1023,27 @@ mod tests {
 
     #[tokio::test]
     async fn paid_retry_answered_only_with_unsupported_header_offer_is_rolled_back() {
-        let caller = TestCaller::new([
-            Err(payment_error(true)),
-            Ok(payment_required_result(vec![challenge_with_header(
-                "unsupported",
-                "Authorization",
-            )])),
-        ]);
-        let provider = TestProvider::new();
-        let client = McpClient::new(caller.clone(), provider.clone(), context());
+        for offers in [
+            vec![challenge_with_header("unsupported", "Authorization")],
+            // A malformed neighbour must not hide the payment requirement.
+            vec![
+                challenge_with_header("unsupported", "Authorization"),
+                json!({}),
+            ],
+        ] {
+            let caller = TestCaller::new([
+                Err(payment_error(true)),
+                Ok(payment_required_result(offers)),
+            ]);
+            let provider = TestProvider::new();
+            let client = McpClient::new(caller.clone(), provider.clone(), context());
 
-        client.call_tool(params()).await.unwrap();
+            client.call_tool(params()).await.unwrap();
 
-        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 0);
-        assert_eq!(provider.lifecycle.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.lifecycle.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.lifecycle.rollbacks.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

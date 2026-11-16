@@ -1654,7 +1654,7 @@ mod tests {
         let cases: [(Option<&str>, Option<&str>); 6] = [
             (None, None),
             (Some("Payment-Authorization"), Some("Payment-Authorization")),
-            (Some("payment-authorization"), Some("Payment-Authorization")),
+            (Some("payment-authorization"), Some("payment-authorization")),
             (Some("Authorization"), None),
             (Some(""), None),
             (Some("X-Payment"), None),
@@ -1724,14 +1724,61 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_canonicalizes_credential_header() {
+    fn test_parse_www_authenticate_keeps_credential_header_spelling() {
         let header = concat!(
             r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
             r#"request="e30", header="payment-authorization""#,
         );
         let parsed = parse_www_authenticate(header).unwrap();
-        assert_eq!(parsed.header.as_deref(), Some("Payment-Authorization"));
+        assert_eq!(parsed.header.as_deref(), Some("payment-authorization"));
         assert_eq!(parsed.credential_header(), "Payment-Authorization");
+        assert_eq!(
+            parsed.to_echo().header.as_deref(),
+            Some("payment-authorization")
+        );
+    }
+
+    #[test]
+    fn test_lowercase_bound_credential_header_round_trips() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1"})).unwrap();
+        let issued = PaymentChallenge::with_secret_key_full(
+            "secret",
+            "api",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            None,
+            Some("payment-authorization"),
+        );
+        assert_eq!(issued.header.as_deref(), Some("payment-authorization"));
+
+        let www_authenticate = format_www_authenticate(&issued).unwrap();
+        assert!(www_authenticate.contains(r#"header="payment-authorization""#));
+        let received = parse_www_authenticate(&www_authenticate).unwrap();
+        assert_eq!(received.credential_header(), "Payment-Authorization");
+
+        let credential = PaymentCredential::new(received.to_echo(), PaymentPayload::hash("0x1"));
+        let verified = parse_authorization(&format_authorization(&credential).unwrap()).unwrap();
+        assert_eq!(
+            verified.challenge.header.as_deref(),
+            Some("payment-authorization")
+        );
+        let echo = &verified.challenge;
+        let recomputed = crate::protocol::core::compute_challenge_id_with_header(
+            "secret",
+            &echo.realm,
+            echo.method.as_str(),
+            echo.intent.as_str(),
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(Base64UrlJson::raw),
+            echo.header.as_deref(),
+        );
+        assert_eq!(recomputed, issued.id);
     }
 
     #[test]
@@ -1756,10 +1803,14 @@ mod tests {
             challenge.header = Some(name.to_string());
             let formatted = format_www_authenticate(&challenge).unwrap();
             assert!(
-                formatted.contains(r#"header="Payment-Authorization""#),
+                formatted.contains(&format!(r#"header="{name}""#)),
                 "{name}: {formatted}"
             );
         }
+        let built = test_challenge().with_header("Payment-Authorization");
+        assert!(format_www_authenticate(&built)
+            .unwrap()
+            .contains(r#"header="Payment-Authorization""#));
     }
 
     #[test]
@@ -1778,7 +1829,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             echoed.challenge.header.as_deref(),
-            Some("Payment-Authorization")
+            Some("payment-authorization")
         );
     }
 
@@ -1914,7 +1965,7 @@ mod tests {
         let challenge = wire_challenge(&[("header", "payment-authorization")]);
         let from_header = parse_wire_challenge_as_header(&challenge).unwrap();
         let from_serde: PaymentChallenge = serde_json::from_value(challenge).unwrap();
-        assert_eq!(from_header.header.as_deref(), Some("Payment-Authorization"));
+        assert_eq!(from_header.header.as_deref(), Some("payment-authorization"));
         assert_eq!(from_serde.header, from_header.header);
     }
 

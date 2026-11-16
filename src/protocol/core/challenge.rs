@@ -319,10 +319,9 @@ impl PaymentChallenge {
 
     /// Set the HTTP field that must carry the Payment credential.
     ///
-    /// `Payment-Authorization` (any case) is the only field a challenge can
-    /// select, and is stored in its canonical spelling. `Authorization` is the
-    /// implicit default and is stored as `None`, as is any other value, which
-    /// servers must not emit.
+    /// `Payment-Authorization` is the only field a challenge can select.
+    /// `Authorization` is the implicit default and is stored as `None`, as is
+    /// any other value.
     /// Note: When using `with_secret_key`, set header BEFORE creating the
     /// challenge since it affects the HMAC. Use [`Self::with_secret_key_full`]
     /// instead if header is needed in the HMAC.
@@ -334,11 +333,14 @@ impl PaymentChallenge {
 
     /// HTTP field a client must use for the payment credential.
     ///
-    /// Returns `header` when it selects `Payment-Authorization`, otherwise
-    /// `Authorization`.
+    /// Returns `Payment-Authorization` when `header` selects it in any case,
+    /// otherwise `Authorization`. `header` itself keeps the spelling the server
+    /// sent, which the Credential echoes unchanged.
     pub fn credential_header(&self) -> &str {
         match self.header.as_deref() {
-            Some(header) if is_payment_authorization_header(header) => header,
+            Some(header) if is_payment_authorization_header(header) => {
+                super::PAYMENT_AUTHORIZATION_HEADER
+            }
             _ => "Authorization",
         }
     }
@@ -1323,7 +1325,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_credential_header_is_bound_canonically() {
+    fn test_credential_header_spelling_is_bound_as_given() {
         let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1000000"})).unwrap();
         let build = |header| {
             PaymentChallenge::with_secret_key_full(
@@ -1342,8 +1344,8 @@ pub(super) mod tests {
         let canonical = build("Payment-Authorization");
         let lowercase = build("payment-authorization");
 
-        assert_eq!(lowercase.header.as_deref(), Some("Payment-Authorization"));
-        assert_eq!(lowercase.id, canonical.id);
+        assert_eq!(lowercase.header.as_deref(), Some("payment-authorization"));
+        assert_ne!(lowercase.id, canonical.id);
         assert!(lowercase.verify("test-secret-key-12345"));
     }
 

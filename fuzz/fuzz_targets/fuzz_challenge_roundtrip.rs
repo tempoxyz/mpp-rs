@@ -1,7 +1,7 @@
 //! Format → parse round trip over structured challenges.
 //!
 //! - The formatter accepts exactly the challenges whose `id` and bound
-//!   fields have their wire form and whose `header` is supported.
+//!   fields have their wire form and whose `header` can be emitted.
 //! - Formatted headers are printable ASCII, so they survive any HTTP stack.
 //! - Every challenge the formatter accepts parses back field for field.
 
@@ -10,13 +10,14 @@
 use libfuzzer_sys::fuzz_target;
 use mpp::{format_www_authenticate, parse_www_authenticate};
 use mpp_fuzz::{
-    assert_same, has_supported_header, is_header_safe, is_well_formed, wire_header, ChallengeInput,
+    assert_same, has_formattable_header, is_header_safe, is_well_formed, wire_header,
+    ChallengeInput,
 };
 
 fuzz_target!(|input: ChallengeInput| {
     let mut challenge = input.build();
     let formattable =
-        is_well_formed(&challenge) && has_supported_header(challenge.header.as_deref());
+        is_well_formed(&challenge) && has_formattable_header(challenge.header.as_deref());
 
     let Ok(header) = format_www_authenticate(&challenge) else {
         assert!(!formattable, "cannot format {challenge:?}");
