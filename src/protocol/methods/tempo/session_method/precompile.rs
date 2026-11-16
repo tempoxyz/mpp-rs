@@ -21,7 +21,8 @@ use super::chain::OnChainChannel;
 use super::SessionMethod;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id_with_escrow,
-    precompile_close_authorization_signing_hash_with_escrow, verify_precompile_voucher_signature,
+    precompile_close_authorization_signing_hash_with_escrow,
+    verify_precompile_voucher_signature_with, VoucherVerifyOptions,
     PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::ChannelDescriptor;
@@ -183,7 +184,9 @@ pub(super) fn parse_signature_for<P>(
     Ok(bytes)
 }
 
-/// Verify a voucher with the scheme of `escrow`.
+/// Verify a voucher with the scheme of `escrow`. `options` (configurable
+/// account vouchers and the channel's signer snapshot) apply only to the
+/// precompile.
 pub(super) fn verify_voucher_for(
     escrow: Address,
     chain_id: u64,
@@ -191,6 +194,7 @@ pub(super) fn verify_voucher_for(
     cumulative_amount: u128,
     signature: &[u8],
     expected_signer: Address,
+    options: &VoucherVerifyOptions,
 ) -> bool {
     if !is_precompile(escrow) {
         return verify_voucher(
@@ -202,13 +206,14 @@ pub(super) fn verify_voucher_for(
             expected_signer,
         );
     }
-    verify_precompile_voucher_signature(
+    verify_precompile_voucher_signature_with(
         signature,
         expected_signer,
         channel_id,
         cumulative_amount,
         escrow,
         chain_id,
+        options,
     )
     .unwrap_or(false)
 }
@@ -250,7 +255,35 @@ alloy::sol! {
             uint32 closeRequestedAt;
         }
         function getChannelState(bytes32 channelId) external view returns (ChannelState memory);
+
+        /// TIP-1166 (T15): `open` cached the voucher signer's configurable
+        /// account commitment, which the descriptor's salt holds.
+        event SignerSnapshotCached(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
+        /// TIP-1166 (T15): a nonzero `topUp` after the snapshotted signer's
+        /// configuration changed.
+        error SignerConfigChanged(address signer);
+        /// TIP-1166 (T15): `open` with a salt other than the signer's commitment.
+        error SaltNotSignerCommitment(address signer, bytes32 commitment);
     }
+}
+
+/// The TIP-1166 signer snapshot an open transaction's receipt reports for
+/// `channel_id`: the commitment of its `SignerSnapshotCached` event from
+/// `escrow`, or `None` when the signer had no commitment.
+pub(super) fn signer_snapshot_from_logs(
+    logs: &[alloy::rpc::types::Log],
+    escrow: Address,
+    channel_id: B256,
+) -> Option<B256> {
+    use alloy::sol_types::SolEvent;
+
+    logs.iter()
+        .filter(|log| log.address() == escrow)
+        .find_map(|log| {
+            let event = IChannelReserveState::SignerSnapshotCached::decode_log(&log.inner).ok()?;
+            (event.channelId == channel_id && !event.commitment.is_zero())
+                .then_some(event.commitment)
+        })
 }
 
 /// Read the precompile's `getChannelState` for `channel_id` as of `block`.
@@ -554,7 +587,8 @@ mod tests {
             channel_id,
             5,
             &sig,
-            signer.address()
+            signer.address(),
+            &VoucherVerifyOptions::default()
         ));
         assert!(!verify_voucher_for(
             escrow,
@@ -562,7 +596,8 @@ mod tests {
             channel_id,
             6,
             &sig,
-            signer.address()
+            signer.address(),
+            &VoucherVerifyOptions::default()
         ));
         assert!(!verify_voucher_for(
             escrow,
@@ -570,7 +605,8 @@ mod tests {
             channel_id,
             5,
             &sig,
-            signer.address()
+            signer.address(),
+            &VoucherVerifyOptions::default()
         ));
         assert!(!verify_voucher_for(
             escrow,
@@ -578,7 +614,8 @@ mod tests {
             channel_id,
             5,
             &sig,
-            Address::ZERO
+            Address::ZERO,
+            &VoucherVerifyOptions::default()
         ));
     }
 
@@ -615,7 +652,8 @@ mod tests {
             channel_id,
             9,
             &close_sig,
-            payer.address()
+            payer.address(),
+            &VoucherVerifyOptions::default()
         ));
     }
 

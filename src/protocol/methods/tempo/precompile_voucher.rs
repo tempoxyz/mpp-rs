@@ -301,6 +301,23 @@ pub async fn sign_precompile_voucher_primitive_with_escrow(
     Ok(signature.to_bytes())
 }
 
+/// Options for [`verify_precompile_voucher_signature_with`].
+///
+/// The defaults accept only primitive signatures by the expected signer, as
+/// [`verify_precompile_voucher_signature`] does.
+#[cfg(feature = "tempo")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoucherVerifyOptions {
+    /// Accept TIP-1166 configurable account (`0x05`) vouchers, which the
+    /// channel reserve precompile settles from T15.
+    pub configurable: bool,
+    /// The channel's signer snapshot: the commitment the voucher signer's
+    /// configurable account had when the channel opened, which the open
+    /// receipt's `SignerSnapshotCached` event reports. `None` or zero when the
+    /// signer had none.
+    pub signer_snapshot: Option<B256>,
+}
+
 /// Verify a canonical TIP-1020 primitive signature over a TIP-1034 voucher.
 #[cfg(feature = "tempo")]
 pub fn verify_precompile_voucher_signature(
@@ -311,12 +328,63 @@ pub fn verify_precompile_voucher_signature(
     escrow_contract: Address,
     chain_id: u64,
 ) -> Result<bool> {
+    verify_precompile_voucher_signature_with(
+        signature,
+        expected_signer,
+        channel_id,
+        cumulative_amount,
+        escrow_contract,
+        chain_id,
+        &VoucherVerifyOptions::default(),
+    )
+}
+
+/// Verify a TIP-1034 voucher signature as the channel reserve precompile
+/// settles it from T15 (TIP-1166):
+///
+/// - A nonzero signer snapshot accepts only a `0x05` signature (with
+///   [`VoucherVerifyOptions::configurable`]) for the expected signer whose
+///   configuration commits to the snapshot and whose owners reach the
+///   threshold. Primitive signatures are rejected: the signer's root key was
+///   retired.
+/// - A zero snapshot accepts a primitive signature that recovers to the
+///   expected signer, or (with [`VoucherVerifyOptions::configurable`]) a
+///   `0x05` signature for the expected signer presenting the version-0
+///   configuration its address derives from.
+///
+/// Keychain signatures are never accepted.
+#[cfg(feature = "tempo")]
+pub fn verify_precompile_voucher_signature_with(
+    signature: &[u8],
+    expected_signer: Address,
+    channel_id: B256,
+    cumulative_amount: u128,
+    escrow_contract: Address,
+    chain_id: u64,
+    options: &VoucherVerifyOptions,
+) -> Result<bool> {
+    use super::configurable_account::ConfigurableAccountSignature;
+
     let signing_hash = precompile_voucher_signing_hash_with_escrow(
         channel_id,
         cumulative_amount,
         escrow_contract,
         chain_id,
     )?;
+    let snapshot = options.signer_snapshot.unwrap_or_default();
+    if options.configurable {
+        if let Some(decoded) = ConfigurableAccountSignature::from_bytes(signature) {
+            let Ok(configurable) = decoded else {
+                return Ok(false);
+            };
+            return Ok(configurable.account() == expected_signer
+                && configurable.validate_account_commitment(snapshot)
+                && configurable.verify_approvals(signing_hash));
+        }
+    }
+    if !snapshot.is_zero() {
+        return Ok(false);
+    }
     let primitive = PrimitiveSignature::from_bytes(signature)
         .map_err(|e| MppError::InvalidSignature(Some(e.to_string())))?;
     if primitive.to_bytes().as_ref() != signature {
@@ -661,5 +729,151 @@ mod tests {
             4217,
         )
         .unwrap());
+    }
+
+    #[cfg(feature = "tempo")]
+    mod configurable {
+        use super::super::*;
+        use crate::protocol::methods::tempo::configurable_account::tests::{config, owners, sign};
+        use alloy::signers::SignerSync;
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        const CHAIN: u64 = 4217;
+        const CHANNEL: B256 = B256::repeat_byte(0x5a);
+
+        fn digest(amount: u128) -> B256 {
+            precompile_voucher_signing_hash_with_escrow(
+                CHANNEL,
+                amount,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                CHAIN,
+            )
+            .unwrap()
+        }
+
+        fn verify(sig: &[u8], signer: Address, options: VoucherVerifyOptions) -> bool {
+            verify_precompile_voucher_signature_with(
+                sig,
+                signer,
+                CHANNEL,
+                10,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                CHAIN,
+                &options,
+            )
+            .unwrap_or(false)
+        }
+
+        fn enabled(snapshot: Option<B256>) -> VoucherVerifyOptions {
+            VoucherVerifyOptions {
+                configurable: true,
+                signer_snapshot: snapshot,
+            }
+        }
+
+        #[test]
+        fn accepts_configurable_voucher_matching_snapshot() {
+            let keys = owners(2);
+            let mut cfg = config(&keys, 2);
+            let account = cfg.account_address().unwrap();
+            cfg.version = 3;
+            let snapshot = cfg.commitment().unwrap();
+            let sig = sign(&[&keys[0], &keys[1]], account, &cfg, digest(10)).to_bytes();
+            assert!(verify(&sig, account, enabled(Some(snapshot))));
+            // Wrong signer, wrong amount, or too few approvals fail.
+            assert!(!verify(
+                &sig,
+                Address::repeat_byte(1),
+                enabled(Some(snapshot))
+            ));
+            let short = sign(&[&keys[0]], account, &cfg, digest(10)).to_bytes();
+            assert!(!verify(&short, account, enabled(Some(snapshot))));
+            let other = sign(&[&keys[0], &keys[1]], account, &cfg, digest(11)).to_bytes();
+            assert!(!verify(&other, account, enabled(Some(snapshot))));
+        }
+
+        #[test]
+        fn rejects_configurable_voucher_under_rotated_config() {
+            let keys = owners(2);
+            let mut cfg = config(&keys, 1);
+            let account = cfg.account_address().unwrap();
+            cfg.version = 1;
+            let snapshot = cfg.commitment().unwrap();
+            // The account rotated to version 2; vouchers signed with it no
+            // longer match the channel's snapshot.
+            cfg.version = 2;
+            let sig = sign(&[&keys[0]], account, &cfg, digest(10)).to_bytes();
+            assert!(!verify(&sig, account, enabled(Some(snapshot))));
+            assert!(!verify(&sig, account, enabled(None)));
+        }
+
+        #[test]
+        fn rejects_primitive_voucher_when_snapshot_is_nonzero() {
+            let key = alloy::signers::local::PrivateKeySigner::random();
+            let sig = key.sign_hash_sync(&digest(10)).unwrap().as_bytes();
+            assert!(verify(&sig, key.address(), enabled(None)));
+            assert!(verify(&sig, key.address(), enabled(Some(B256::ZERO))));
+            assert!(!verify(
+                &sig,
+                key.address(),
+                enabled(Some(B256::repeat_byte(7)))
+            ));
+            // The snapshot applies even without configurable vouchers enabled.
+            assert!(!verify(
+                &sig,
+                key.address(),
+                VoucherVerifyOptions {
+                    configurable: false,
+                    signer_snapshot: Some(B256::repeat_byte(7)),
+                }
+            ));
+        }
+
+        #[test]
+        fn zero_snapshot_accepts_only_version_zero_derived_config() {
+            let keys = owners(1);
+            let cfg = config(&keys, 1);
+            let account = cfg.account_address().unwrap();
+            let sig = sign(&[&keys[0]], account, &cfg, digest(10)).to_bytes();
+            assert!(verify(&sig, account, enabled(None)));
+            // A config that does not derive the signer's address fails.
+            let other = Address::repeat_byte(0x99);
+            let foreign = sign(&[&keys[0]], other, &cfg, digest(10)).to_bytes();
+            assert!(!verify(&foreign, other, enabled(None)));
+            // A later version needs a snapshot.
+            let mut rotated = cfg.clone();
+            rotated.version = 1;
+            let sig = sign(&[&keys[0]], account, &rotated, digest(10)).to_bytes();
+            assert!(!verify(&sig, account, enabled(None)));
+        }
+
+        #[test]
+        fn defaults_reject_configurable_vouchers() {
+            let keys = owners(1);
+            let cfg = config(&keys, 1);
+            let account = cfg.account_address().unwrap();
+            let sig = sign(&[&keys[0]], account, &cfg, digest(10)).to_bytes();
+            assert!(!verify(&sig, account, VoucherVerifyOptions::default()));
+            assert!(!verify_precompile_voucher_signature(
+                &sig,
+                account,
+                CHANNEL,
+                10,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                CHAIN
+            )
+            .unwrap_or(false));
+            let key = alloy::signers::local::PrivateKeySigner::random();
+            let primitive = key.sign_hash_sync(&digest(10)).unwrap().as_bytes();
+            assert!(verify_precompile_voucher_signature(
+                &primitive,
+                key.address(),
+                CHANNEL,
+                10,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                CHAIN
+            )
+            .unwrap());
+        }
     }
 }

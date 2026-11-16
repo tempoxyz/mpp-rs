@@ -390,6 +390,7 @@ where
             cumulative_amount,
             &sig_bytes,
             channel.authorized_signer,
+            &self.voucher_options(channel.signer_snapshot),
         );
 
         if !is_valid {

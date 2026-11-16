@@ -43,6 +43,7 @@ fn test_channel_state(channel_id: &str) -> ChannelState {
         pending_close: None,
         close_requested_at: 0,
         created_at: "2025-01-01T00:00:00Z".to_string(),
+        signer_snapshot: None,
     }
 }
 
@@ -356,4 +357,60 @@ impl ChannelStore for ChangeAfterRead {
     > {
         self.inner.update_channel(channel_id, updater)
     }
+}
+
+#[test]
+fn test_configurable_vouchers_advertised_only_when_enabled() {
+    use crate::protocol::traits::SessionMethod as SessionMethodTrait;
+    let method = test_session_method(Arc::new(InMemoryChannelStore::new()));
+    assert!(!method.configurable_vouchers());
+    let details = method.challenge_method_details().unwrap();
+    assert!(details.get("configurableVouchers").is_none());
+    let method = method.with_configurable_vouchers(true);
+    let details = method.challenge_method_details().unwrap();
+    assert_eq!(details["configurableVouchers"], serde_json::json!(true));
+    let options = method.voucher_options(Some(B256::repeat_byte(1)));
+    assert!(options.configurable);
+    assert_eq!(options.signer_snapshot, Some(B256::repeat_byte(1)));
+}
+
+#[test]
+fn test_signer_snapshot_from_open_receipt_logs() {
+    use alloy::sol_types::SolEvent;
+    let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+    let channel_id = B256::repeat_byte(0x21);
+    let commitment = B256::repeat_byte(0x42);
+    let event = precompile::IChannelReserveState::SignerSnapshotCached {
+        channelId: channel_id,
+        signer: alloy::primitives::Address::repeat_byte(3),
+        commitment,
+    };
+    let log = |address, event: &precompile::IChannelReserveState::SignerSnapshotCached| {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address,
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        }
+    };
+    let logs = vec![log(escrow, &event)];
+    assert_eq!(
+        precompile::signer_snapshot_from_logs(&logs, escrow, channel_id),
+        Some(commitment)
+    );
+    // Another channel, another emitter, or no event: no snapshot.
+    assert_eq!(
+        precompile::signer_snapshot_from_logs(&logs, escrow, B256::ZERO),
+        None
+    );
+    let foreign = vec![log(alloy::primitives::Address::repeat_byte(9), &event)];
+    assert_eq!(
+        precompile::signer_snapshot_from_logs(&foreign, escrow, channel_id),
+        None
+    );
+    assert_eq!(
+        precompile::signer_snapshot_from_logs(&[], escrow, channel_id),
+        None
+    );
 }

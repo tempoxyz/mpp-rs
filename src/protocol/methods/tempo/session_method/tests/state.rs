@@ -85,6 +85,7 @@ fn test_open_on_a_recorded_channel_keeps_the_higher_deposit() {
             settlement_route: None,
             cumulative_amount,
             signature: vec![0xAA; 65],
+            signer_snapshot: None,
         };
         let on_chain = on_chain_channel(&state, on_chain_deposit, 0);
         ChannelState::open(Some(state.clone()), &on_chain, opening)
@@ -213,6 +214,7 @@ mod properties {
             settlement_route: None,
             cumulative_amount,
             signature: vec![0xAA; 65],
+            signer_snapshot: None,
         }
     }
 

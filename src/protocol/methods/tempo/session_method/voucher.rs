@@ -192,6 +192,7 @@ where
         }
         let channel_id = channel_id_str.to_owned();
         let signature = signature_str.to_owned();
+        let configurable_vouchers = self.configurable_vouchers();
         self.store
             .update_channel(
                 channel_id_str,
@@ -211,6 +212,7 @@ where
                         cumulative_amount,
                         &signature,
                         min_delta,
+                        configurable_vouchers,
                     )
                     .map(Some)
                 }),
@@ -225,6 +227,7 @@ where
         cumulative_amount: u128,
         signature_str: &str,
         min_delta: u128,
+        configurable_vouchers: bool,
     ) -> Result<ChannelState, VerificationError> {
         if channel.closing {
             return Err(VerificationError::channel_closed("channel is closing"));
@@ -256,6 +259,10 @@ where
                 cumulative_amount,
                 &sig_bytes,
                 channel.authorized_signer,
+                &crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
+                    configurable: configurable_vouchers,
+                    signer_snapshot: channel.signer_snapshot,
+                },
             );
             if !is_valid {
                 return Err(VerificationError::invalid_signature(
