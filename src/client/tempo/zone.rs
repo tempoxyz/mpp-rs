@@ -571,13 +571,19 @@ impl TempoZone {
             MppError::InvalidConfig("Zone ID is unknown: use TempoZone::with_zone_id".into())
         })?;
         self.check_parent_chain_id()?;
+        // Read what the withdrawal needs before storing it, so a challenge it
+        // can't pay leaves nothing behind.
+        challenge
+            .request
+            .decode::<ChargeRequest>()?
+            .recipient_address()?;
 
         // A withdrawal can't be undone, so a retry after a failed wait, or
         // under a new challenge for the same terms, resumes it instead of
         // paying again. Concurrent payments share the request, which is stored
         // before it is sent.
         let own_key = self.pending_key(challenge, signer, signing_mode);
-        let (key, withdrawal, _waiting) = {
+        let (key, withdrawal, waiting) = {
             // One lock covers the lookup and the insertion, so two payments
             // for the same terms never both find nothing and both withdraw.
             let mut pending = self
@@ -622,29 +628,41 @@ impl TempoZone {
             sender_tag,
             zone_id,
         };
-        // A withdrawal started for an earlier challenge pays only that
-        // challenge, so its Credential goes only back to the origin that
-        // issued it; under any other origin, or one the caller did not verify,
-        // fail closed.
-        let foreign = key != own_key;
-        let other_origin = if foreign {
-            origin.is_none() || origin != withdrawal.origin.as_deref()
-        } else {
-            origin.is_some()
-                && withdrawal.origin.is_some()
-                && origin != withdrawal.origin.as_deref()
+        let checked = (|| {
+            // A withdrawal started for an earlier challenge pays only that
+            // challenge, so its Credential goes only back to the origin that
+            // issued it; under any other origin, or one the caller did not
+            // verify, fail closed.
+            let foreign = key != own_key;
+            let other_origin = if foreign {
+                origin.is_none() || origin != withdrawal.origin.as_deref()
+            } else {
+                origin.is_some()
+                    && withdrawal.origin.is_some()
+                    && origin != withdrawal.origin.as_deref()
+            };
+            if other_origin {
+                return Err(pending_error(String::new()));
+            }
+            // Past its redemption window, the server refuses the challenge's
+            // Credential, but the withdrawal may still have paid it: fail
+            // closed rather than withdraw again.
+            if !is_redeemable(paid) {
+                return Err(pending_error(String::new()));
+            }
+            let request: ChargeRequest = paid.request.decode()?;
+            request.recipient_address()
+        })();
+        let recipient = match checked {
+            Ok(recipient) => recipient,
+            Err(error) => {
+                // Nothing was requested: a withdrawal this payment stored, and
+                // no other payment waits on, is forgotten.
+                drop(waiting);
+                self.forget_abandoned(&key, &withdrawal);
+                return Err(error);
+            }
         };
-        if other_origin {
-            return Err(pending_error(String::new()));
-        }
-        // Past its redemption window, the server refuses the challenge's
-        // Credential, but the withdrawal may still have paid it: fail closed
-        // rather than withdraw again.
-        if !is_redeemable(paid) {
-            return Err(pending_error(String::new()));
-        }
-        let request: ChargeRequest = paid.request.decode()?;
-        let recipient = request.recipient_address()?;
         // The request runs in its own task, so a caller that is cancelled or
         // times out after the transaction is sent still leaves its outcome in
         // the shared cell for the retry to reconcile, instead of sending
@@ -701,9 +719,17 @@ impl TempoZone {
                 (outcome, own_error)
             })
         };
-        let (outcome, own_error) = task
-            .await
-            .map_err(|e| MppError::Http(format!("Zone withdrawal request failed: {e}")))?;
+        let (outcome, own_error) = match task.await {
+            Ok(result) => result,
+            Err(e) => {
+                // A request that never started sent nothing.
+                drop(waiting);
+                self.forget_abandoned(&key, &withdrawal);
+                return Err(MppError::Http(format!(
+                    "Zone withdrawal request failed: {e}"
+                )));
+            }
+        };
         let sender_tag = match outcome {
             Ok(sender_tag) => sender_tag,
             Err(failure) => {

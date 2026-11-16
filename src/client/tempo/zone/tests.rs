@@ -1782,3 +1782,27 @@ async fn test_cancelled_payment_does_not_stop_a_concurrent_one() {
     );
     assert_eq!(sent.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn test_challenge_without_a_recipient_stores_no_withdrawal() {
+    let (zone_url, zone_calls) = unused_zone_rpc().await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    for id in ["zone-challenge", "zone-challenge-2"] {
+        let mut challenge = same_terms(json!({}), id);
+        let mut request: Value = challenge.request.decode_value().unwrap();
+        request.as_object_mut().unwrap().remove("recipient");
+        challenge.request = Base64UrlJson::from_value(&request).unwrap();
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("No recipient"), "{error}");
+    }
+    assert!(zone_calls.lock().unwrap().is_empty());
+    assert!(provider
+        .zone
+        .as_ref()
+        .unwrap()
+        .pending
+        .lock()
+        .unwrap()
+        .is_empty());
+}
