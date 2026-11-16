@@ -162,6 +162,10 @@ enum WithdrawalFailure {
     Retryable(String),
     /// The transaction may have been sent: reconcile its hash.
     OutcomeUnknown(String),
+    /// Every payment waiting on the withdrawal was dropped before its
+    /// transaction was sent, so nothing was signed or sent. Never stored: the
+    /// next payment requests the withdrawal again.
+    Abandoned,
 }
 
 impl WithdrawalFailure {
@@ -171,6 +175,7 @@ impl WithdrawalFailure {
             Self::OutcomeUnknown(transaction_hash) => MppError::PaymentOutcomeUnknown {
                 transaction_hash: transaction_hash.clone(),
             },
+            Self::Abandoned => abandoned_error(),
         }
     }
 }
@@ -519,6 +524,25 @@ impl TempoZone {
         }
     }
 
+    /// Forgets `withdrawal`, abandoned before its transaction was sent, unless
+    /// a payment joined it since: one checked under the same lock that
+    /// payments join under, so a joining payment never shares an entry another
+    /// payment can't find.
+    fn forget_abandoned(&self, key: &str, withdrawal: &Arc<PendingWithdrawal>) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if withdrawal.waiters.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && !withdrawal.request.initialized()
+            && pending
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, withdrawal))
+        {
+            pending.remove(key);
+        }
+    }
+
     /// Pay `challenge`, issued by `origin` when the caller verified it, from
     /// the Zone and wait for its settlement on Tempo through `tempo`.
     ///
@@ -624,19 +648,28 @@ impl TempoZone {
         // The request runs in its own task, so a caller that is cancelled or
         // times out after the transaction is sent still leaves its outcome in
         // the shared cell for the retry to reconcile, instead of sending
-        // another withdrawal.
+        // another withdrawal. Until it is sent, the request stops once no
+        // payment waits on it, and leaves the cell empty for the next one.
         let task = {
             let zone = self.clone();
+            let key = key.clone();
             let withdrawal = withdrawal.clone();
             let challenge = paid.clone();
             let client_id = client_id.map(str::to_owned);
             let signer = signer.clone();
             let signing_mode = signing_mode.clone();
             tokio::spawn(async move {
+                let abandoned =
+                    || withdrawal.waiters.load(std::sync::atomic::Ordering::SeqCst) == 0;
                 let mut own_error = None;
                 let outcome = withdrawal
                     .request
-                    .get_or_init(|| async {
+                    .get_or_try_init(|| async {
+                        // A payment dropped while another held the request
+                        // starts nothing.
+                        if abandoned() {
+                            return Err(());
+                        }
                         match zone
                             .request_withdrawal(
                                 &challenge,
@@ -644,18 +677,27 @@ impl TempoZone {
                                 caps,
                                 &signer,
                                 &signing_mode,
+                                &abandoned,
                             )
                             .await
                         {
-                            Ok(sender_tag) => Ok(sender_tag),
+                            Ok(sender_tag) => Ok(Ok(sender_tag)),
+                            Err((WithdrawalFailure::Abandoned, error)) => {
+                                own_error = Some(error);
+                                Err(())
+                            }
                             Err((failure, error)) => {
                                 own_error = Some(error);
-                                Err(failure)
+                                Ok(Err(failure))
                             }
                         }
                     })
                     .await
-                    .clone();
+                    .cloned();
+                let outcome = outcome.unwrap_or_else(|()| {
+                    zone.forget_abandoned(&key, &withdrawal);
+                    Err(WithdrawalFailure::Abandoned)
+                });
                 (outcome, own_error)
             })
         };
@@ -668,7 +710,10 @@ impl TempoZone {
                 // Only a failure before the transaction was sent is safe to
                 // retry. After that, the withdrawal may have gone through, so
                 // retries of this challenge keep failing.
-                if matches!(failure, WithdrawalFailure::Retryable(_)) {
+                if matches!(
+                    failure,
+                    WithdrawalFailure::Retryable(_) | WithdrawalFailure::Abandoned
+                ) {
                     self.forget(&key, &withdrawal);
                 }
                 return Err(own_error.unwrap_or_else(|| failure.to_error()));
@@ -743,7 +788,9 @@ impl TempoZone {
         caps: ZoneCaps,
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
+        abandoned: &(dyn Fn() -> bool + Sync),
     ) -> Result<B256, (WithdrawalFailure, MppError)> {
+        let abandon = || (WithdrawalFailure::Abandoned, abandoned_error());
         let retryable = |error: MppError| (WithdrawalFailure::Retryable(error.to_string()), error);
         let request: ChargeRequest = challenge.request.decode().map_err(retryable)?;
         let amount = request.amount_u256().map_err(retryable)?;
@@ -809,6 +856,11 @@ impl TempoZone {
         // payment from this account reads the nonce after this one is spent.
         let nonce_lock = self.nonce_lock(from);
         let _nonce_guard = nonce_lock.lock().await;
+        // Waiting for the lock may have outlasted every payment of this
+        // withdrawal: sign nothing for them.
+        if abandoned() {
+            return Err(abandon());
+        }
         let expiring = || {
             retryable(MppError::Http(
                 "Zone withdrawal can no longer settle before the challenge expires.".into(),
@@ -862,6 +914,11 @@ impl TempoZone {
         // undone.
         if !settles_before_expiry(challenge, self.settlement_timeout) {
             return Err(expiring());
+        }
+        // The last point a dropped payment can stop the withdrawal: once the
+        // send starts, its outcome is kept for a retry to reconcile.
+        if abandoned() {
+            return Err(abandon());
         }
         let receipt: serde_json::Value = match self
             .rpc_provider
@@ -1058,6 +1115,11 @@ impl Drop for Waiting {
             .waiters
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// The error of a payment dropped before its Zone withdrawal was sent.
+fn abandoned_error() -> MppError {
+    MppError::Http("Zone payment was cancelled before its withdrawal was sent.".into())
 }
 
 /// Whether `challenge` has expired.

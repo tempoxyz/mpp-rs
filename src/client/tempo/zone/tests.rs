@@ -1720,3 +1720,65 @@ fn test_settlement_pending_message_omits_unknown_sender_tag() {
         "Zone 3 withdrawal for challenge \"zone-challenge\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again."
     );
 }
+
+/// Waits until the Zone RPC has been asked for `method`.
+async fn called(calls: &Mutex<Vec<String>>, method: &str) {
+    while !calls.lock().unwrap().iter().any(|call| call == method) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_payment_cancelled_before_sending_sends_nothing() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, zone_calls) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    let challenge = challenge_with(json!({}), None);
+
+    // Cancel the payment while it looks up the withdrawal fee.
+    tokio::select! {
+        result = provider.pay(&challenge) => panic!("payment was not cancelled: {result:?}"),
+        () = called(&zone_calls, "eth_call") => {}
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(sent.lock().unwrap().is_empty());
+
+    // Nothing was sent, so a retry withdraws.
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_cancelled_payment_does_not_stop_a_concurrent_one() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, zone_calls) = spawn_rpc(recording_zone_handler(sent.clone())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    let challenge = challenge_with(json!({}), None);
+
+    let waiting = {
+        let provider = provider.clone();
+        let challenge = challenge.clone();
+        tokio::spawn(async move { provider.pay(&challenge).await })
+    };
+    // The other payment of the same challenge is dropped mid-request.
+    tokio::select! {
+        result = provider.pay(&challenge) => panic!("payment was not cancelled: {result:?}"),
+        () = called(&zone_calls, "eth_call") => {}
+    }
+    let error = waiting.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
