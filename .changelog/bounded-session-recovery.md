@@ -2,4 +2,4 @@
 mpp: patch
 ---
 
-Restoring sessions no longer authorizes an extra request, and recovered or closing vouchers respect the local spending cap. Management error responses now have a bounded body size.
+Fixed session restoration authorizing an extra request and recovery or close operations exceeding the local spending cap. Bounded management error response bodies.
