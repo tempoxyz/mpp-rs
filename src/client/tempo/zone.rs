@@ -148,6 +148,9 @@ struct PendingWithdrawal {
     redeemed_late: Mutex<Option<String>>,
     /// Payments waiting on this withdrawal for a Credential right now.
     waiters: std::sync::atomic::AtomicUsize,
+    /// Set before its transaction is sent: from then on its outcome is kept
+    /// for a retry to reconcile, so it is never forgotten as abandoned.
+    sending: std::sync::atomic::AtomicBool,
     /// The first Tempo block the first wait for its settlement searched: a
     /// resumed wait searches from there again, so a settlement older than
     /// the lookback window is still found.
@@ -534,6 +537,7 @@ impl TempoZone {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if withdrawal.waiters.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && !withdrawal.sending.load(std::sync::atomic::Ordering::SeqCst)
             && !withdrawal.request.initialized()
             && pending
                 .get(key)
@@ -583,7 +587,7 @@ impl TempoZone {
         // paying again. Concurrent payments share the request, which is stored
         // before it is sent.
         let own_key = self.pending_key(challenge, signer, signing_mode);
-        let (key, withdrawal, waiting) = {
+        let (key, withdrawal, waiting, inserted) = {
             // One lock covers the lookup and the insertion, so two payments
             // for the same terms never both find nothing and both withdraw.
             let mut pending = self
@@ -593,15 +597,17 @@ impl TempoZone {
             match self.find_pending_in(&mut pending, challenge, signer, signing_mode)? {
                 Some((key, entry)) => {
                     let waiting = Waiting::new(&entry);
-                    (key, entry, waiting)
+                    (key, entry, waiting, false)
                 }
                 None => {
                     // With nothing outstanding, an expired challenge can't be
                     // paid: its server refuses any Credential for it.
                     ensure_unexpired(challenge)?;
+                    let mut inserted = false;
                     let entry = pending
                         .entry(own_key.clone())
                         .or_insert_with(|| {
+                            inserted = true;
                             Arc::new(PendingWithdrawal {
                                 challenge: challenge.clone(),
                                 origin: origin.map(str::to_owned),
@@ -609,6 +615,7 @@ impl TempoZone {
                                 request: OnceCell::new(),
                                 redeemed_late: Mutex::default(),
                                 waiters: Default::default(),
+                                sending: Default::default(),
                                 settlement_cursor: Mutex::default(),
                             })
                         })
@@ -616,7 +623,7 @@ impl TempoZone {
                     // Counted while the map is locked, so a concurrent payment
                     // for the same terms never shares it.
                     let waiting = Waiting::new(&entry);
-                    (own_key.clone(), entry, waiting)
+                    (own_key.clone(), entry, waiting, inserted)
                 }
             }
         };
@@ -657,9 +664,13 @@ impl TempoZone {
             Ok(recipient) => recipient,
             Err(error) => {
                 // Nothing was requested: a withdrawal this payment stored, and
-                // no other payment waits on, is forgotten.
+                // no other payment waits on, is forgotten. One an earlier
+                // payment stored is left alone, since its request may be in
+                // flight.
                 drop(waiting);
-                self.forget_abandoned(&key, &withdrawal);
+                if inserted {
+                    self.forget_abandoned(&key, &withdrawal);
+                }
                 return Err(error);
             }
         };
@@ -679,6 +690,20 @@ impl TempoZone {
             tokio::spawn(async move {
                 let abandoned =
                     || withdrawal.waiters.load(std::sync::atomic::Ordering::SeqCst) == 0;
+                // Marks the withdrawal as sending before the last abandonment
+                // check, so no payment forgets it once the send may start.
+                let begin_send = || {
+                    withdrawal
+                        .sending
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    if abandoned() {
+                        withdrawal
+                            .sending
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                        return false;
+                    }
+                    true
+                };
                 let mut own_error = None;
                 let outcome = withdrawal
                     .request
@@ -696,6 +721,7 @@ impl TempoZone {
                                 &signer,
                                 &signing_mode,
                                 &abandoned,
+                                &begin_send,
                             )
                             .await
                         {
@@ -806,7 +832,7 @@ impl TempoZone {
     /// bound to the challenge by its memo, and returns its sender tag.
     // The error pairs the cached failure with the caller's own error; it is
     // returned once per withdrawal, so boxing it buys nothing.
-    #[allow(clippy::result_large_err)]
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     async fn request_withdrawal(
         &self,
         challenge: &PaymentChallenge,
@@ -815,6 +841,7 @@ impl TempoZone {
         signer: &TempoPrimitiveSigner,
         signing_mode: &TempoSigningMode,
         abandoned: &(dyn Fn() -> bool + Sync),
+        begin_send: &(dyn Fn() -> bool + Sync),
     ) -> Result<B256, (WithdrawalFailure, MppError)> {
         let abandon = || (WithdrawalFailure::Abandoned, abandoned_error());
         let retryable = |error: MppError| (WithdrawalFailure::Retryable(error.to_string()), error);
@@ -943,7 +970,7 @@ impl TempoZone {
         }
         // The last point a dropped payment can stop the withdrawal: once the
         // send starts, its outcome is kept for a retry to reconcile.
-        if abandoned() {
+        if !begin_send() {
             return Err(abandon());
         }
         let receipt: serde_json::Value = match self

@@ -258,6 +258,10 @@ where
 
     /// Pin the route `opaque` for issuance and verification: challenge helpers
     /// emit it, and verification rejects any credential that doesn't match.
+    ///
+    /// Pass a JSON object, as mppx's string-keyed `meta`: issuance adds
+    /// reserved keys to it, such as the Zone Credential grace marker, which a
+    /// value of any other type can't carry.
     pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
         Arc::make_mut(&mut self.config).opaque = Some(opaque);
         self

@@ -1461,6 +1461,7 @@ async fn test_withdrawal_past_its_redemption_window_is_never_paid_again() {
             request: OnceCell::new(),
             redeemed_late: Mutex::default(),
             waiters: Default::default(),
+            sending: Default::default(),
             settlement_cursor: Mutex::default(),
         }),
     );
@@ -1507,6 +1508,7 @@ fn insert_withdrawal(
         request: OnceCell::new_with(Some(Ok(sender_tag))),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
+        sending: Default::default(),
         settlement_cursor: Mutex::default(),
     });
     zone.pending.lock().unwrap().insert(
@@ -1805,4 +1807,73 @@ async fn test_challenge_without_a_recipient_stores_no_withdrawal() {
         .lock()
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn test_payment_under_another_origin_keeps_an_earlier_withdrawal() {
+    let (provider, sent, _) = resumable_provider().await;
+    let zone = provider.zone.as_ref().unwrap();
+    let earlier = same_terms(json!({}), "zone-challenge");
+    let signer = TempoPrimitiveSigner::from(payer());
+    let signing_mode = TempoSigningMode::Direct;
+    // A withdrawal an earlier payment started and whose request has not yet
+    // returned, as one whose caller was dropped mid-send would be.
+    let entry = Arc::new(PendingWithdrawal {
+        challenge: earlier.clone(),
+        origin: Some("https://api.example.com".into()),
+        terms: zone.terms_key(&earlier, &signer, &signing_mode),
+        request: OnceCell::new(),
+        redeemed_late: Mutex::default(),
+        waiters: Default::default(),
+        sending: Default::default(),
+        settlement_cursor: Mutex::default(),
+    });
+    zone.pending.lock().unwrap().insert(
+        zone.pending_key(&earlier, &signer, &signing_mode),
+        entry.clone(),
+    );
+    let next = same_terms(json!({}), "zone-challenge-2");
+    let error = provider
+        .pay_with_context(&next, context_for("https://other.example.com/paid"))
+        .await
+        .unwrap_err();
+    assert_eq!(pending_challenge_id(error), earlier.id);
+    assert!(sent.lock().unwrap().is_empty());
+    assert!(zone
+        .pending
+        .lock()
+        .unwrap()
+        .values()
+        .any(|current| Arc::ptr_eq(current, &entry)));
+}
+
+#[tokio::test]
+async fn test_withdrawal_being_sent_is_never_forgotten_as_abandoned() {
+    let (provider, _, _) = resumable_provider().await;
+    let zone = provider.zone.as_ref().unwrap();
+    let challenge = same_terms(json!({}), "zone-challenge");
+    let signer = TempoPrimitiveSigner::from(payer());
+    let signing_mode = TempoSigningMode::Direct;
+    let key = zone.pending_key(&challenge, &signer, &signing_mode);
+    let entry = Arc::new(PendingWithdrawal {
+        challenge: challenge.clone(),
+        origin: None,
+        terms: zone.terms_key(&challenge, &signer, &signing_mode),
+        request: OnceCell::new(),
+        redeemed_late: Mutex::default(),
+        waiters: Default::default(),
+        sending: std::sync::atomic::AtomicBool::new(true),
+        settlement_cursor: Mutex::default(),
+    });
+    zone.pending
+        .lock()
+        .unwrap()
+        .insert(key.clone(), entry.clone());
+    zone.forget_abandoned(&key, &entry);
+    assert!(zone.pending.lock().unwrap().contains_key(&key));
+    entry
+        .sending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    zone.forget_abandoned(&key, &entry);
+    assert!(!zone.pending.lock().unwrap().contains_key(&key));
 }

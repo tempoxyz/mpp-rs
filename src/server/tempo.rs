@@ -272,6 +272,11 @@ impl TempoBuilder {
     /// block is older than the expiry; every other Credential type gets no
     /// grace. [`Mpp::create()`](super::Mpp::create) rejects a grace above
     /// [`MAX_ZONE_CREDENTIAL_GRACE`](crate::protocol::methods::tempo::zone::MAX_ZONE_CREDENTIAL_GRACE).
+    ///
+    /// The grace marker is a key of the challenge's `opaque` object, so a
+    /// route `opaque` pinned with [`Mpp::with_opaque`](super::Mpp::with_opaque)
+    /// must be a JSON object for the grace to apply; any other value is issued
+    /// unchanged and its challenges get no grace.
     pub fn zone_credential_grace(mut self, grace: std::time::Duration) -> Self {
         self.zone_credential_grace = grace;
         self
