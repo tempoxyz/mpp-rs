@@ -662,6 +662,7 @@ async fn test_precompile_vouchers_still_accept_p256_primitives() {
 
     // As before configurable vouchers: P-256 primitives verify under the
     // defaults and on a zero snapshot, with or without configurable vouchers.
+    // Session servers accepted them before this change, so they still do.
     assert!(verify(VoucherVerifyOptions::default()));
     for configurable in [false, true] {
         assert!(verify(VoucherVerifyOptions {
@@ -673,5 +674,41 @@ async fn test_precompile_vouchers_still_accept_p256_primitives() {
             configurable,
             signer_snapshot: Some(B256::repeat_byte(0x42)),
         }));
+    }
+
+    // Through the server, on a channel stored with or without its snapshot
+    // and with configurable vouchers off (the default) or on.
+    for (snapshot, configurable) in [
+        (Some(B256::ZERO), false),
+        (None, false),
+        (Some(B256::ZERO), true),
+    ] {
+        let channel_id_hex = channel_id.to_string();
+        let mut state = test_channel_state(&channel_id_hex);
+        state.escrow_contract = PRECOMPILE;
+        state.authorized_signer = signer.address();
+        state.signer_snapshot = snapshot;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id_hex, state);
+        let asserter = alloy::providers::mock::Asserter::new();
+        if snapshot.is_none() {
+            // The lookup finds a zero commitment for the P-256 key.
+            asserter.push_success(&commitment_result(B256::ZERO));
+        }
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_configurable_vouchers(configurable);
+        let accepted = method
+            .verify_and_accept_voucher(
+                &channel_id_hex,
+                None,
+                1_000,
+                &alloy::hex::encode_prefixed(&signature),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.highest_voucher_amount, 1_000);
+        assert_eq!(accepted.signer_snapshot, Some(B256::ZERO));
+        assert!(asserter.read_q().is_empty());
     }
 }
