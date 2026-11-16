@@ -3072,7 +3072,31 @@ impl TempoSessionProvider {
     /// signed while the top-up was submitted may have advanced.
     /// `previous` is the deposit before the top-up when it was already raised
     /// in memory, so the deposit is still reported.
+    ///
+    /// The server already accepted the deposit, so a failure to record it
+    /// reports an unknown outcome and blocks further top-ups of the channel,
+    /// rather than a configuration error a caller could answer by paying
+    /// another offer.
     async fn record_top_up(
+        &self,
+        url: &str,
+        prepared: &PreparedTopUp,
+        previous: Option<u128>,
+    ) -> Result<(), MppError> {
+        self.store_top_up(url, prepared, previous)
+            .await
+            .map_err(|error| {
+                self.uncertain_top_ups
+                    .lock()
+                    .unwrap()
+                    .insert(prepared.channel_id);
+                MppError::SessionPaymentOutcomeUnknown {
+                    context: format!("accepted top-up could not be recorded: {error}"),
+                }
+            })
+    }
+
+    async fn store_top_up(
         &self,
         url: &str,
         prepared: &PreparedTopUp,
@@ -4247,15 +4271,23 @@ impl TempoSessionProvider {
                                 .await?;
                             }
                         }
-                        entry.deposit = self
+                        let deposit = self
                             .channels
                             .lock()
                             .unwrap()
                             .get(&key)
-                            .ok_or_else(|| {
-                                MppError::InvalidConfig("channel disappeared after top-up".into())
-                            })?
-                            .deposit;
+                            .map(|entry| entry.deposit);
+                        // The top-up was accepted: never report it as a
+                        // configuration error another offer could answer.
+                        entry.deposit = deposit.ok_or_else(|| {
+                            self.uncertain_top_ups
+                                .lock()
+                                .unwrap()
+                                .insert(entry.channel_id);
+                            MppError::SessionPaymentOutcomeUnknown {
+                                context: "channel disappeared after an accepted top-up".into(),
+                            }
+                        })?;
                     }
                 }
 
@@ -7691,6 +7723,127 @@ mod tests {
         assert!(error.to_string().contains("reconcile the pending payment"));
         assert_eq!(*sends.lock().unwrap(), 1);
         assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
+    }
+
+    #[tokio::test]
+    async fn unrecorded_top_up_stops_mcp_offer_fallback() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::store::{ChannelStoreError, ChannelStoreResult};
+        use crate::mcp::client::McpPayment;
+
+        /// Reads nothing back and refuses every write, so an accepted top-up
+        /// cannot be recorded.
+        struct ReadOnlyStore;
+
+        #[async_trait::async_trait]
+        impl ChannelStore for ReadOnlyStore {
+            async fn get(&self, _: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
+                Ok(None)
+            }
+
+            async fn set(&self, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                Err(ChannelStoreError::Io("read-only".into()))
+            }
+
+            async fn set_at(&self, _: &str, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                Err(ChannelStoreError::Io("read-only".into()))
+            }
+
+            async fn find_channel(&self, _: B256) -> ChannelStoreResult<Option<String>> {
+                Ok(None)
+            }
+
+            async fn delete(&self, _: &str) -> ChannelStoreResult<()> {
+                Ok(())
+            }
+        }
+
+        /// Accepts every management credential, as a server that applied the top-up.
+        struct Accepting(Arc<Mutex<usize>>);
+        impl ManagementTransport for Accepting {
+            fn send<'a>(
+                &'a self,
+                _challenge: &'a PaymentChallenge,
+                _credential: &'a PaymentCredential,
+            ) -> crate::client::ManagementFuture<'a> {
+                *self.0.lock().unwrap() += 1;
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        /// The fallback charge offer's provider, which must never be asked to pay.
+        #[derive(Clone)]
+        struct Charge(Arc<Mutex<usize>>);
+        impl PaymentProvider for Charge {
+            fn supports(&self, method: &str, intent: &str) -> bool {
+                method == "tempo" && intent == "charge"
+            }
+            async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+                *self.0.lock().unwrap() += 1;
+                Err(MppError::InvalidConfig("fallback offer was paid".into()))
+            }
+        }
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut session = make_test_provider().with_channel_store(Arc::new(ReadOnlyStore));
+        // The channel's deposit is spent, so the call needs a top-up first.
+        let channel_id = seed_precompile_channel(&session, payee, currency, 1_000, 1_000);
+        mock_rpc(
+            &mut session,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let offer = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let charge_offer = PaymentChallenge::new(
+            "charge-offer",
+            "test-realm",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": format!("{:#x}", currency),
+                "recipient": format!("{:#x}", payee),
+                "methodDetails": { "chainId": 42431 }
+            }))
+            .unwrap(),
+        );
+        let sends = Arc::new(Mutex::new(0));
+        let charges = Arc::new(Mutex::new(0));
+        let payment = McpPayment::new(
+            crate::client::MultiProvider::new()
+                .with(session.clone())
+                .with(Charge(charges.clone())),
+            PaymentContext {
+                // The offers' realm, so the session offer is not refused as cross-realm.
+                url: "https://test-realm/mcp".parse().unwrap(),
+                headers: reqwest::header::HeaderMap::new(),
+                http_client: None,
+            },
+        );
+
+        let error = payment
+            .prepare_with_management(&[offer, charge_offer], &Accepting(sends.clone()))
+            .await
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(error, MppError::SessionPaymentOutcomeUnknown { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("could not be recorded"),
+            "{error}"
+        );
+        assert_eq!(*sends.lock().unwrap(), 1);
+        assert_eq!(*charges.lock().unwrap(), 0);
+        // The channel takes no further top-up until it is reconciled.
+        assert!(session
+            .uncertain_top_ups
+            .lock()
+            .unwrap()
+            .contains(&channel_id));
     }
 
     #[tokio::test]
