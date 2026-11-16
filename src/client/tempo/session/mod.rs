@@ -2160,7 +2160,6 @@ impl TempoSessionProvider {
             },
             state,
         )?;
-        self.assert_within_max_deposit(recovered.cumulative_amount)?;
         // A channel kept in another namespace is not copied into this one.
         if self
             .channel_store
@@ -6382,11 +6381,24 @@ mod tests {
             .bootstrap(&reqwest::Client::new(), &url)
             .await
             .unwrap()
-            .is_none());
-        assert!(provider.channels().is_empty());
+            .is_some());
+        assert_eq!(provider.cumulative(), 1_000);
         let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
         let key = provider.expected_channel_key(&challenge).unwrap().0;
-        assert!(provider.channel_store.get(&key).await.unwrap().is_none());
+        assert!(provider.channel_store.get(&key).await.unwrap().is_some());
+        let error = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 100)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("max_deposit"));
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("max_deposit"));
+        assert_eq!(provider.cumulative(), 1_000);
+        assert_eq!(provider.channels().len(), 1);
+        provider
+            .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
+            .await
+            .unwrap();
         provider.max_deposit = Some(1_000);
         mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
         assert!(provider
