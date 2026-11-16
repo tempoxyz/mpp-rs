@@ -127,6 +127,12 @@ where
     /// challenge in preference order is paid instead, such as the server's
     /// one-time charge. The first failure is returned when none can be paid.
     ///
+    /// A failure that cannot prove no payment happened stops here instead of
+    /// trying another offer: [`MppError::PaymentOutcomeUnknown`],
+    /// [`MppError::SessionPaymentOutcomeUnknown`],
+    /// [`MppError::UnknownPaymentOutcome`] and [`MppError::Http`], whose
+    /// lost response may hide a payment that went through.
+    ///
     /// Returns `Ok(None)` when the provider supports none of the challenges,
     /// so the caller can preserve the original MCP result or error.
     pub async fn prepare(
@@ -234,9 +240,12 @@ where
                         credential,
                     )));
                 }
+                // Paying another offer after an uncertain outcome could pay twice.
                 Err(
                     error @ (MppError::PaymentOutcomeUnknown { .. }
-                    | MppError::SessionPaymentOutcomeUnknown { .. }),
+                    | MppError::SessionPaymentOutcomeUnknown { .. }
+                    | MppError::UnknownPaymentOutcome { .. }
+                    | MppError::Http(_)),
                 ) => return Err(error),
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -948,6 +957,87 @@ mod tests {
             ));
             assert_eq!(provider.0.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// Fails every payment with the error `fail` builds, counting attempts.
+    #[derive(Clone)]
+    struct FailingProvider {
+        attempts: Arc<Mutex<Vec<String>>>,
+        fail: fn() -> MppError,
+    }
+
+    impl FailingProvider {
+        fn new(fail: fn() -> MppError) -> Self {
+            Self {
+                attempts: Arc::default(),
+                fail,
+            }
+        }
+    }
+
+    impl PaymentProvider for FailingProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            method == "tempo" && intent == "charge"
+        }
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.attempts.lock().unwrap().push(challenge.id.clone());
+            Err((self.fail)())
+        }
+    }
+
+    fn two_offers() -> [PaymentChallenge; 2] {
+        let first = challenge();
+        let mut second = challenge();
+        second.id = "second-offer".into();
+        [first, second]
+    }
+
+    #[tokio::test]
+    async fn uncertain_failures_do_not_try_another_offer() {
+        let cases: [fn() -> MppError; 3] = [
+            || MppError::UnknownPaymentOutcome { reference: None },
+            || MppError::UnknownPaymentOutcome {
+                reference: Some("req-1".into()),
+            },
+            || MppError::Http("response lost".into()),
+        ];
+        for fail in cases {
+            let provider = FailingProvider::new(fail);
+            let payment = McpPayment::new(provider.clone(), context());
+            let error = payment.prepare(&two_offers()).await.err().unwrap();
+            assert_eq!(error.to_string(), fail().to_string());
+            assert_eq!(
+                *provider.attempts.lock().unwrap(),
+                vec!["challenge-1".to_owned()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn definitive_failures_still_try_another_offer() {
+        let provider = FailingProvider::new(|| MppError::InsufficientBalance(Some("empty".into())));
+        let payment = McpPayment::new(provider.clone(), context());
+        let error = payment.prepare(&two_offers()).await.err().unwrap();
+        assert!(matches!(error, MppError::InsufficientBalance(_)));
+        assert_eq!(
+            *provider.attempts.lock().unwrap(),
+            vec!["challenge-1".to_owned(), "second-offer".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unknown_payment_outcome_names_its_reference() {
+        assert_eq!(
+            MppError::UnknownPaymentOutcome { reference: None }.to_string(),
+            "payment outcome unknown; reconcile before retrying"
+        );
+        assert_eq!(
+            MppError::UnknownPaymentOutcome {
+                reference: Some("req-1".into())
+            }
+            .to_string(),
+            "payment outcome unknown (ref req-1); reconcile before retrying"
+        );
     }
 
     #[tokio::test]
