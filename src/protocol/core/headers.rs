@@ -513,7 +513,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
         parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
     }
 
-    if let Some(header) = super::parse_advertised_credential_header(challenge.header.as_deref())? {
+    if let Some(header) = super::binding::local_credential_header(challenge.header.as_deref())? {
         parts.push(format!("header=\"{}\"", escape_quoted_value(&header)?));
     }
 
@@ -1648,17 +1648,59 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_omits_default_authorization_header() {
-        let header = concat!(
-            r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
-            r#"request="e30", header="Authorization""#,
-        );
-        let parsed = parse_www_authenticate(header).unwrap();
-        assert!(parsed.header.is_none());
-        assert_eq!(parsed.credential_header(), "Authorization");
-        assert!(!format_www_authenticate(&parsed)
-            .unwrap()
-            .contains("header="));
+    fn test_parse_www_authenticate_validates_raw_credential_header() {
+        let base =
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30""#;
+        let cases: [(Option<&str>, Option<&str>); 6] = [
+            (None, None),
+            (Some("Payment-Authorization"), Some("Payment-Authorization")),
+            (Some("payment-authorization"), Some("Payment-Authorization")),
+            (Some("Authorization"), None),
+            (Some(""), None),
+            (Some("X-Payment"), None),
+        ];
+        for (raw, expected) in cases {
+            let header = match raw {
+                Some(raw) => format!(r#"{base}, header="{raw}""#),
+                None => base.to_string(),
+            };
+            match (raw, parse_www_authenticate(&header)) {
+                (None, Ok(parsed)) => {
+                    assert!(parsed.header.is_none());
+                    assert_eq!(parsed.credential_header(), "Authorization");
+                }
+                (Some(_), Ok(parsed)) if expected.is_some() => {
+                    assert_eq!(parsed.header.as_deref(), expected, "{raw:?}");
+                    assert_eq!(parsed.credential_header(), "Payment-Authorization");
+                }
+                (Some(raw), Err(err)) if expected.is_none() => {
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("challenges may only select Payment-Authorization"),
+                        "{raw:?}: {message}"
+                    );
+                    assert!(!message.contains("X-Payment"), "{message}");
+                }
+                (raw, result) => panic!("{raw:?}: unexpected {result:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_keeps_valid_challenge_beside_unsupported_header() {
+        for unsupported in ["Authorization", "", "X-Payment"] {
+            let header = format!(
+                concat!(
+                    r#"Payment id="bad", realm="api", method="tempo", intent="charge", request="e30", header="{}", "#,
+                    r#"Payment id="good", realm="api", method="tempo", intent="charge", request="e30""#,
+                ),
+                unsupported
+            );
+            let all = parse_www_authenticate_all([header.as_str()]);
+            assert_eq!(all.len(), 2, "{unsupported:?}");
+            assert!(all[0].is_err(), "{unsupported:?}");
+            assert_eq!(all[1].as_ref().unwrap().id, "good", "{unsupported:?}");
+        }
     }
 
     #[test]
@@ -1682,21 +1724,62 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_keeps_credential_header_spelling() {
+    fn test_parse_www_authenticate_canonicalizes_credential_header() {
         let header = concat!(
             r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
             r#"request="e30", header="payment-authorization""#,
         );
         let parsed = parse_www_authenticate(header).unwrap();
-        assert_eq!(parsed.header.as_deref(), Some("payment-authorization"));
-        assert_eq!(parsed.credential_header(), "payment-authorization");
+        assert_eq!(parsed.header.as_deref(), Some("Payment-Authorization"));
+        assert_eq!(parsed.credential_header(), "Payment-Authorization");
     }
 
     #[test]
     fn test_format_www_authenticate_rejects_unsupported_credential_header() {
-        let mut challenge = test_challenge();
-        challenge.header = Some("Cookie".to_string());
-        assert!(format_www_authenticate(&challenge).is_err());
+        for name in ["Cookie", "X-Payment", ""] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            assert!(format_www_authenticate(&challenge).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_credential_header_shorthand() {
+        for name in ["Authorization", "authorization"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            let formatted = format_www_authenticate(&challenge).unwrap();
+            assert!(!formatted.contains("header="), "{name}: {formatted}");
+        }
+        for name in ["Payment-Authorization", "PAYMENT-AUTHORIZATION"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            let formatted = format_www_authenticate(&challenge).unwrap();
+            assert!(
+                formatted.contains(r#"header="Payment-Authorization""#),
+                "{name}: {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_authorization_rejects_echoed_default_credential_header() {
+        for name in ["Authorization", ""] {
+            assert!(
+                matches!(
+                    parse_wire_challenge_as_echo(&wire_challenge(&[("header", name)])),
+                    Err(MppError::MalformedCredential(_))
+                ),
+                "{name:?}"
+            );
+        }
+        let echoed =
+            parse_wire_challenge_as_echo(&wire_challenge(&[("header", "payment-authorization")]))
+                .unwrap();
+        assert_eq!(
+            echoed.challenge.header.as_deref(),
+            Some("Payment-Authorization")
+        );
     }
 
     #[test]
@@ -1816,11 +1899,23 @@ mod tests {
         assert!(parse_wire_challenge_as_header(&challenge).is_err());
         assert!(serde_json::from_value::<PaymentChallenge>(challenge).is_err());
 
-        let challenge = wire_challenge(&[("header", "Authorization")]);
+        for name in ["Authorization", ""] {
+            let challenge = wire_challenge(&[("header", name)]);
+            assert!(
+                parse_wire_challenge_as_header(&challenge).is_err(),
+                "{name:?}"
+            );
+            assert!(
+                serde_json::from_value::<PaymentChallenge>(challenge).is_err(),
+                "{name:?}"
+            );
+        }
+
+        let challenge = wire_challenge(&[("header", "payment-authorization")]);
         let from_header = parse_wire_challenge_as_header(&challenge).unwrap();
         let from_serde: PaymentChallenge = serde_json::from_value(challenge).unwrap();
-        assert_eq!(from_header.header, None);
-        assert_eq!(from_serde.header, None);
+        assert_eq!(from_header.header.as_deref(), Some("Payment-Authorization"));
+        assert_eq!(from_serde.header, from_header.header);
     }
 
     /// Without field validation the `|`-joined HMAC input is ambiguous: a

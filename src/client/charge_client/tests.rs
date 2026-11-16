@@ -387,7 +387,7 @@ async fn provider_refresh_uses_owned_client_and_never_follows_redirects() {
 }
 
 #[tokio::test]
-async fn custom_header_casing_is_preserved_for_initial_and_prepared_challenges() {
+async fn credential_header_is_echoed_canonically_for_initial_and_prepared_challenges() {
     for header in ["payment-authorization", "PAYMENT-AUTHORIZATION"] {
         for replace in [false, true] {
             let offered = challenge(
@@ -396,7 +396,7 @@ async fn custom_header_casing_is_preserved_for_initial_and_prepared_challenges()
                 if replace { "Authorization" } else { header },
             );
             let replacement = challenge("prepared", "charge", header);
-            let expected_header = header.to_owned();
+            let expected_header = "Payment-Authorization".to_owned();
             let url = server(Router::new().route(
                 "/",
                 get(move |headers: HeaderMap| {
