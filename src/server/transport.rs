@@ -131,22 +131,14 @@ impl Transport for HttpTransport {
     }
 
     fn get_credential(&self, input: &Self::Input) -> Result<Option<PaymentCredential>, MppError> {
-        let Some(header) = input.headers().get(self.credential_header()) else {
+        // More than one Payment credential is a bad-request error; one in the
+        // field the challenge did not select, or a bare "Payment", is absent.
+        let Some(payment) =
+            crate::server::credential_from_headers(input.headers(), self.credential_header())?
+        else {
             return Ok(None);
         };
-
-        let header_str = header
-            .to_str()
-            .map_err(|e| MppError::MalformedCredential(Some(format!("invalid header: {e}"))))?;
-
-        let Some(payment) = crate::protocol::core::extract_payment_scheme(header_str) else {
-            return Ok(None);
-        };
-
-        // extract_payment_scheme returns the full "Payment ..." fragment
-        let credential = crate::protocol::core::parse_authorization(payment)?;
-
-        Ok(Some(credential))
+        crate::protocol::core::parse_authorization(&payment).map(Some)
     }
 
     fn respond_challenge(&self, ctx: ChallengeContext<'_, Self::Input>) -> Self::ChallengeOutput {
@@ -172,7 +164,10 @@ impl Transport for HttpTransport {
         let mut problem = error.to_problem_details(None);
         let status = http_types::StatusCode::from_u16(problem.status)
             .unwrap_or(http_types::StatusCode::INTERNAL_SERVER_ERROR);
-        let retryable = !status.is_server_error() && status != http_types::StatusCode::FORBIDDEN;
+        // More than one credential is a bad request, answered without a challenge.
+        let retryable = !status.is_server_error()
+            && status != http_types::StatusCode::FORBIDDEN
+            && !matches!(error, MppError::BadRequest(_));
         // Name the challenge only when it is sent in `WWW-Authenticate`.
         if www_auth.is_some() && retryable {
             problem = problem.with_challenge_id(ctx.challenge.id.as_str());
@@ -463,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_http_respond_challenge_replay_omits_offer() {
+    fn test_http_respond_challenge_replay_is_invalid_challenge() {
         let transport = http();
         let challenge = PaymentChallenge::new(
             "test-id",
@@ -487,12 +482,69 @@ mod tests {
             error: Some(&error),
         });
 
-        assert_eq!(resp.status(), http_types::StatusCode::FORBIDDEN);
-        assert!(!resp
+        // A replay is answered like any invalid challenge: 402 with a fresh one.
+        assert_eq!(resp.status(), http_types::StatusCode::PAYMENT_REQUIRED);
+        assert!(resp
             .headers()
             .contains_key(http_types::header::WWW_AUTHENTICATE));
         let body: serde_json::Value = serde_json::from_str(resp.body()).unwrap();
-        assert!(body.get("challengeId").is_none());
+        assert!(body["type"]
+            .as_str()
+            .unwrap()
+            .ends_with("/invalid-challenge"));
+        assert_eq!(body["challengeId"], "test-id");
+    }
+
+    #[test]
+    fn test_http_get_credential_follows_core_spec_selection() {
+        let request = |headers: &[(&str, &str)]| {
+            let mut builder = http_types::Request::builder().uri("/test");
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            builder.body(()).unwrap()
+        };
+        let transport = http();
+        // A bare "Payment" with no token is absent.
+        assert!(transport
+            .get_credential(&request(&[("Authorization", "Payment")]))
+            .unwrap()
+            .is_none());
+        // A credential in the field the challenge did not select is ignored.
+        assert!(transport
+            .get_credential(&request(&[("Payment-Authorization", "Payment abc")]))
+            .unwrap()
+            .is_none());
+        // A token that is not base64url JSON is malformed.
+        assert!(matches!(
+            transport.get_credential(&request(&[("Authorization", "Payment !!!")])),
+            Err(MppError::MalformedCredential(_))
+        ));
+        // More than one credential, across fields or comma-joined, is a bad request.
+        for headers in [
+            &[
+                ("Authorization", "Payment abc"),
+                ("Payment-Authorization", "Payment def"),
+            ][..],
+            &[("Authorization", "Payment abc, Payment def")][..],
+            &[
+                ("Authorization", "Payment abc"),
+                ("Authorization", "Payment def"),
+            ][..],
+        ] {
+            assert!(matches!(
+                transport.get_credential(&request(headers)),
+                Err(MppError::BadRequest(_))
+            ));
+        }
+        // A Bearer credential next to the Payment one is not a Payment credential.
+        assert!(matches!(
+            http().requires_auth(true).get_credential(&request(&[
+                ("Authorization", "Bearer app-token"),
+                ("Payment-Authorization", "Payment !!!"),
+            ])),
+            Err(MppError::MalformedCredential(_))
+        ));
     }
 
     #[test]

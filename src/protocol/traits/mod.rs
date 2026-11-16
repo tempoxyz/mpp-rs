@@ -62,8 +62,8 @@ pub enum ErrorCode {
     /// The payment behind the credential was already used, is being settled
     /// by a concurrent request, or is bound to another challenge.
     ///
-    /// Reported as `verification-failed` with status 403 and no challenge,
-    /// since paying again would not help.
+    /// Reported as `invalid-challenge` with status 402 and a fresh challenge,
+    /// as the core spec requires for a replayed Credential.
     CredentialReplayed,
 }
 
@@ -526,14 +526,11 @@ mod tests {
             (ErrorCode::InvalidChallenge, "invalid-challenge"),
             (ErrorCode::Internal, "internal-payment-error"),
             (ErrorCode::PaymentActionRequired, "payment-action-required"),
-            (ErrorCode::CredentialReplayed, "verification-failed"),
+            (ErrorCode::CredentialReplayed, "invalid-challenge"),
         ];
         for (code, suffix) in codes {
             let label = format!("{code:?}");
             assert_eq!(code.spec_code(), suffix, "{label}");
-            if code == ErrorCode::CredentialReplayed {
-                continue;
-            }
             let error = VerificationError::with_code("message", code);
             assert_spec_problem(&label, error.to_problem_details(None), suffix);
         }
@@ -562,22 +559,19 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_replayed_is_final_verification_failure() {
+    fn test_credential_replayed_is_invalid_challenge() {
         let problem =
             VerificationError::credential_replayed("Transaction hash has already been used")
                 .to_problem_details(None);
         assert_eq!(
             problem.problem_type,
-            format!(
-                "{}/verification-failed",
-                crate::error::CORE_PROBLEM_TYPE_BASE
-            )
+            format!("{}/invalid-challenge", crate::error::CORE_PROBLEM_TYPE_BASE)
         );
-        assert_eq!(problem.title, "VerificationFailedError");
-        assert_eq!(problem.status, 403);
+        assert_eq!(problem.title, "Invalid Challenge");
+        assert_eq!(problem.status, 402);
         assert_eq!(
             problem.detail,
-            "Payment verification failed: Transaction hash has already been used."
+            "Challenge was already used: Transaction hash has already been used."
         );
     }
 }

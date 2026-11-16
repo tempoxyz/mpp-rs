@@ -80,8 +80,8 @@ use http_types::{header, HeaderValue, StatusCode};
 use crate::error::{MppError, PaymentError, PaymentErrorDetails};
 use crate::protocol::core::headers::parse_authorization;
 use crate::protocol::core::headers::{
-    extract_payment_scheme, format_receipt, format_www_authenticate, with_private_cache_control,
-    PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER,
+    format_receipt, format_www_authenticate, with_private_cache_control, PAYMENT_RECEIPT_HEADER,
+    WWW_AUTHENTICATE_HEADER,
 };
 use crate::protocol::core::{PaymentChallenge, Receipt};
 
@@ -132,14 +132,14 @@ impl IntoResponse for PaymentOffers {
 ///
 /// Payment problems (expired, invalid challenge, failed verification, …) are
 /// answered with the problem's status and one fresh `WWW-Authenticate`
-/// challenge per offer. A server-side failure (`5xx`) or a final `403` (such
-/// as a replayed credential) is answered without a challenge, so that clients
-/// do not pay again when paying would not help.
+/// challenge per offer. A server-side failure (`5xx`), a final `403` or a
+/// `bad-request` (more than one credential) is answered without a
+/// challenge, so that clients do not pay again when paying would not help.
 #[derive(Debug)]
 pub struct PaymentProblem {
     /// Problem details sent as the `application/problem+json` body.
     pub problem: PaymentErrorDetails,
-    /// Fresh challenges for retry. Not sent with a `5xx` or `403` problem.
+    /// Fresh challenges for retry. Not sent with a `5xx`, `403` or `bad-request` problem.
     pub offers: Vec<PaymentChallenge>,
 }
 
@@ -147,11 +147,11 @@ impl PaymentProblem {
     /// Build the response for `error`, retryable with `offers`.
     ///
     /// The problem references the first offer's challenge id. A problem
-    /// answered without a challenge (`5xx` or `403`) drops the offers and
+    /// answered without a challenge (`5xx`, `403` or `bad-request`) drops the offers and
     /// references none.
     pub fn new(error: &impl PaymentError, offers: Vec<PaymentChallenge>) -> Self {
         let problem = error.to_problem_details(None);
-        if !sends_challenges(problem.status) {
+        if !sends_challenges(&problem) {
             return Self {
                 problem,
                 offers: Vec::new(),
@@ -163,18 +163,20 @@ impl PaymentProblem {
 }
 
 /// Whether a problem with `status` is answered with fresh challenges: a
-/// server-side failure or a final `403` (such as a replayed credential) is
-/// not, since paying again would not help.
-fn sends_challenges(status: u16) -> bool {
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    !(status.is_server_error() || status == StatusCode::FORBIDDEN)
+/// server-side failure, a final `403` or a `bad-request` (more than one
+/// credential, which the core spec answers without a challenge) is not.
+fn sends_challenges(problem: &PaymentErrorDetails) -> bool {
+    let status = StatusCode::from_u16(problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    !(status.is_server_error()
+        || status == StatusCode::FORBIDDEN
+        || problem.problem_type.ends_with("/bad-request"))
 }
 
 impl IntoResponse for PaymentProblem {
     fn into_response(self) -> axum_core::response::Response {
         let status =
             StatusCode::from_u16(self.problem.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let values = if !sends_challenges(self.problem.status) {
+        let values = if !sends_challenges(&self.problem) {
             Vec::new()
         } else {
             match challenge_header_values(&self.offers) {
@@ -380,13 +382,13 @@ impl MppChargeRejection {
     /// Build the rejection for a credential that failed with `error`.
     ///
     /// `offers` generates the fresh challenges; it is only called for payment
-    /// problems a new payment can resolve, since a server-side failure or a
-    /// replayed credential is not answered with a challenge.
+    /// problems a new payment can resolve, since a server-side failure, a
+    /// `403` or a `bad-request` is not answered with a challenge.
     fn from_error(
         error: MppError,
         offers: impl FnOnce() -> Result<Vec<PaymentChallenge>, String>,
     ) -> Self {
-        if !error.is_payment_problem() || matches!(error, MppError::CredentialReplayed(_)) {
+        if !error.is_payment_problem() || !sends_challenges(&error.to_problem_details(None)) {
             return Self::Problem(PaymentProblem::new(&error, Vec::new()));
         }
         match offers() {
@@ -662,12 +664,12 @@ pub trait ChargeChallenger: Send + Sync + 'static {
     }
 }
 
-/// Verify a credential string against the route's expected challenge.
+/// Verify a credential string against the route's expected charge request.
 #[cfg(any(feature = "stripe", feature = "tempo"))]
 fn verify_expected<M, S>(
     mpp: &super::Mpp<M, S>,
     credential_str: &str,
-    expected: crate::error::Result<PaymentChallenge>,
+    expected: crate::error::Result<crate::protocol::intents::ChargeRequest>,
     body: Option<&[u8]>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
 where
@@ -682,14 +684,14 @@ where
     })
 }
 
-/// Verify a credential string against the route's expected challenge,
+/// Verify a credential string against the route's expected charge request,
 /// settling it only if `gate` admits it. `None` when the gate refuses.
 #[cfg(any(feature = "stripe", feature = "tempo"))]
 #[allow(clippy::type_complexity)]
 fn verify_expected_gated<M, S>(
     mpp: &super::Mpp<M, S>,
     credential_str: &str,
-    expected: crate::error::Result<PaymentChallenge>,
+    expected: crate::error::Result<crate::protocol::intents::ChargeRequest>,
     body: Option<&[u8]>,
     gate: Option<Arc<dyn super::CredentialGate>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>>
@@ -697,10 +699,8 @@ where
     M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    let prepared = parse_authorization(credential_str).and_then(|credential| {
-        let expected_request = expected?.request.decode()?;
-        Ok((credential, expected_request))
-    });
+    let prepared =
+        parse_authorization(credential_str).and_then(|credential| Ok((credential, expected?)));
     let mpp = mpp.clone();
     let body = body.map(<[u8]>::to_vec);
     Box::pin(async move {
@@ -807,21 +807,11 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.expected_charge_request(amount, Default::default()) {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -864,21 +854,11 @@ where
             }
         };
 
-        let expected_challenge = match self.charge(amount).map(|mut offers| offers.remove(0)) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.expected_charge_request(amount, Default::default()) {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -934,15 +914,13 @@ where
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
     {
         let mpp = self.for_request_realm(request_realm);
-        let expected = mpp
-            .charge_with_options(
-                amount,
-                super::ChargeOptions {
-                    mppx_scope: mppx_scope.as_ref(),
-                    ..Default::default()
-                },
-            )
-            .map(|mut offers| offers.remove(0));
+        let expected = mpp.expected_charge_request(
+            amount,
+            super::ChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        );
         verify_expected(&mpp, credential_str, expected, body)
     }
 
@@ -959,15 +937,13 @@ where
         Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>,
     > {
         let mpp = self.for_request_realm(request_realm);
-        let expected = mpp
-            .charge_with_options(
-                amount,
-                super::ChargeOptions {
-                    mppx_scope: mppx_scope.as_ref(),
-                    ..Default::default()
-                },
-            )
-            .map(|mut offers| offers.remove(0));
+        let expected = mpp.expected_charge_request(
+            amount,
+            super::ChargeOptions {
+                mppx_scope: mppx_scope.as_ref(),
+                ..Default::default()
+            },
+        );
         verify_expected_gated(&mpp, credential_str, expected, body, Some(Arc::new(gate)))
     }
 
@@ -1089,21 +1065,12 @@ where
             }
         };
 
-        let expected_challenge = match self.stripe_charge(amount) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.stripe_expected_charge_request(amount, Default::default())
+        {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -1146,21 +1113,12 @@ where
             }
         };
 
-        let expected_challenge = match self.stripe_charge(amount) {
-            Ok(challenge) => challenge,
-            Err(e) => {
-                return Box::pin(std::future::ready(Err(format!(
-                    "Failed to generate expected challenge: {}",
-                    e
-                ))))
-            }
-        };
-
-        let expected_request = match expected_challenge.request.decode() {
+        let expected_request = match self.stripe_expected_charge_request(amount, Default::default())
+        {
             Ok(request) => request,
             Err(e) => {
                 return Box::pin(std::future::ready(Err(format!(
-                    "Failed to decode expected request: {}",
+                    "Failed to generate expected request: {}",
                     e
                 ))))
             }
@@ -1216,7 +1174,7 @@ where
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Receipt, MppError>> + Send>>
     {
         let mpp = self.for_request_realm(request_realm);
-        let expected = mpp.stripe_charge_with_options(
+        let expected = mpp.stripe_expected_charge_request(
             amount,
             super::StripeChargeOptions {
                 mppx_scope: mppx_scope.as_ref(),
@@ -1239,7 +1197,7 @@ where
         Box<dyn std::future::Future<Output = Result<Option<Receipt>, MppError>> + Send>,
     > {
         let mpp = self.for_request_realm(request_realm);
-        let expected = mpp.stripe_charge_with_options(
+        let expected = mpp.stripe_expected_charge_request(
             amount,
             super::StripeChargeOptions {
                 mppx_scope: mppx_scope.as_ref(),
@@ -1325,7 +1283,7 @@ async fn verify_route(
     challenger: Arc<dyn ChargeChallenger>,
     amount: &'static str,
     options: ChallengeOptions,
-    credential_str: Option<String>,
+    credential: Result<Option<String>, MppError>,
     body: Option<&[u8]>,
     identity: RouteIdentityInput,
 ) -> Result<(Receipt, Identified), MppChargeRejection> {
@@ -1358,6 +1316,16 @@ async fn verify_route(
     #[cfg(not(feature = "identity"))]
     let () = identity;
 
+    let credential_str = match credential {
+        // More than one Payment credential: 400 without a challenge.
+        Err(error) => {
+            return Err(MppChargeRejection::Problem(PaymentProblem::new(
+                &error,
+                Vec::new(),
+            )))
+        }
+        Ok(credential_str) => credential_str,
+    };
     let Some(credential_str) = credential_str else {
         let offers = route_offers(challenger.as_ref(), amount, options, body)
             .map_err(MppChargeRejection::InternalError)?;
@@ -1461,12 +1429,8 @@ where
         let challenger: Arc<dyn ChargeChallenger> = FromRef::from_ref(state);
         let mppx_scope = mppx_scope_from_parts(parts);
         let request_realm = request_realm_from_parts(parts);
-        let auth_header = parts
-            .headers
-            .get(challenger.credential_header())
-            .and_then(|v| v.to_str().ok())
-            .and_then(extract_payment_scheme)
-            .map(|s| s.to_string());
+        let credential =
+            super::credential_from_headers(&parts.headers, challenger.credential_header());
         let identity = route_identity(parts);
 
         async move {
@@ -1476,15 +1440,8 @@ where
                 request_realm,
             };
             #[allow(clippy::let_unit_value)]
-            let (receipt, identified) = verify_route(
-                challenger,
-                C::amount(),
-                options,
-                auth_header,
-                None,
-                identity,
-            )
-            .await?;
+            let (receipt, identified) =
+                verify_route(challenger, C::amount(), options, credential, None, identity).await?;
             #[cfg(not(feature = "identity"))]
             let () = identified;
             Ok(MppCharge {
@@ -1513,12 +1470,8 @@ where
         let (parts, body) = req.into_parts();
         let mppx_scope = mppx_scope_from_parts(&parts);
         let request_realm = request_realm_from_parts(&parts);
-        let auth_header = parts
-            .headers
-            .get(challenger.credential_header())
-            .and_then(|v| v.to_str().ok())
-            .and_then(extract_payment_scheme)
-            .map(|s| s.to_string());
+        let credential =
+            super::credential_from_headers(&parts.headers, challenger.credential_header());
         let identity = route_identity(&parts);
         let req = Request::from_parts(parts, body);
 
@@ -1537,7 +1490,7 @@ where
                 challenger,
                 C::amount(),
                 options,
-                auth_header,
+                credential,
                 Some(&body),
                 identity,
             )

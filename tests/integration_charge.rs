@@ -1846,14 +1846,14 @@ async fn test_tx_hash_replay_rejected() {
         .await
         .expect("replay request failed");
 
-    // The transaction already settled, so the replay is final: 403 with no
-    // fresh challenge, so the client does not pay again.
+    // A rejected credential gets 402 with a fresh challenge, as the core spec
+    // requires; clients that just sent a credential do not pay it again.
     assert_eq!(
         resp3.status(),
-        403,
+        402,
         "replayed tx hash with different challenge should be rejected"
     );
-    assert!(resp3.headers().get("www-authenticate").is_none());
+    assert!(resp3.headers().get("www-authenticate").is_some());
     assert_eq!(
         resp3
             .headers()
@@ -1950,14 +1950,14 @@ async fn test_hash_credential_with_extra_transfer_rejected() {
         .await
         .expect("request failed");
 
-    // A settled receipt whose memo is not bound to this challenge is answered
-    // as a replay: 403 with no fresh challenge.
+    // A push payment without attribution bound to this challenge fails
+    // verification: 402 with a fresh challenge.
     assert_eq!(
         resp.status(),
-        403,
+        402,
         "transaction with extra transfers (and no challenge-bound memo) should be rejected"
     );
-    assert!(resp.headers().get("www-authenticate").is_none());
+    assert!(resp.headers().get("www-authenticate").is_some());
 
     handle.abort();
     let _ = handle.await;

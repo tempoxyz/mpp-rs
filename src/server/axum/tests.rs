@@ -217,15 +217,15 @@ fn test_rejection_internal_error() {
 }
 
 #[test]
-fn test_payment_problem_new_drops_offers_for_final_403() {
-    let error = MppError::CredentialReplayed(Some("Transaction hash has already been used".into()));
+fn test_payment_problem_new_drops_offers_for_bad_request() {
+    let error = MppError::bad_request("more than one Payment credential in the request");
     let problem = PaymentProblem::new(&error, vec![test_challenge()]);
-    assert_eq!(problem.problem.status, 403);
+    assert_eq!(problem.problem.status, 400);
     assert!(problem.problem.challenge_id.is_none());
     assert!(problem.offers.is_empty());
 
     let resp = problem.into_response();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(!resp.headers().contains_key(WWW_AUTHENTICATE_HEADER));
 }
 
@@ -236,19 +236,23 @@ fn test_rejection_problem_challenges_only_when_paying_again_helps() {
             MppError::verification_failed("amount mismatch"),
             StatusCode::PAYMENT_REQUIRED,
             true,
+            "verification-failed",
         ),
+        // A replay is an invalid challenge, answered with a fresh one.
         (
             MppError::CredentialReplayed(Some("Transaction hash has already been used".into())),
-            StatusCode::FORBIDDEN,
-            false,
+            StatusCode::PAYMENT_REQUIRED,
+            true,
+            "invalid-challenge",
         ),
         (
-            MppError::CredentialReplayed(Some("memo is not bound to this challenge".into())),
-            StatusCode::FORBIDDEN,
+            MppError::bad_request("more than one Payment credential in the request"),
+            StatusCode::BAD_REQUEST,
             false,
+            "bad-request",
         ),
     ];
-    for (error, status, challenged) in cases {
+    for (error, status, challenged, suffix) in cases {
         let label = format!("{error:?}");
         let rejection = MppChargeRejection::from_error(error, || Ok(vec![test_challenge()]));
         let MppChargeRejection::Problem(problem) = &rejection else {
@@ -256,10 +260,7 @@ fn test_rejection_problem_challenges_only_when_paying_again_helps() {
         };
         assert_eq!(
             problem.problem.problem_type,
-            format!(
-                "{}/verification-failed",
-                crate::error::CORE_PROBLEM_TYPE_BASE
-            ),
+            format!("{}/{suffix}", crate::error::CORE_PROBLEM_TYPE_BASE),
             "{label}"
         );
         assert_eq!(
@@ -1681,7 +1682,7 @@ mod currency_offers {
         )
         .remove(0);
         assert_eq!(first.realm, "api.example.test");
-        assert_eq!(mpp.realm(), "MPP Payment");
+        assert_eq!(mpp.realm(), "localhost");
 
         let credential =
             PaymentCredential::new(first.to_echo(), PaymentPayload::hash("0xdeadbeef"));
@@ -1730,7 +1731,7 @@ mod currency_offers {
                 .unwrap_err(),
         )
         .remove(0);
-        assert_eq!(offer.realm, "MPP Payment");
+        assert_eq!(offer.realm, "localhost");
     }
 
     #[tokio::test]
@@ -1881,6 +1882,65 @@ mod currency_offers {
             body: &[u8],
         ) -> Result<Vec<PaymentChallenge>, String> {
             self.0.challenges_with_body(amount, options, body)
+        }
+    }
+}
+
+mod core_spec_credentials {
+    use super::*;
+
+    async fn run_with_headers(
+        headers: &[(&str, &str)],
+    ) -> Result<MppCharge<OneCent>, MppChargeRejection> {
+        let state: Arc<dyn ChargeChallenger> = Arc::new(MockChallenger { accept: true });
+        let mut builder = http_types::Request::builder().uri("/test");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (mut parts, _body) = builder.body(()).unwrap().into_parts();
+        MppCharge::<OneCent>::from_request_parts(&mut parts, &state).await
+    }
+
+    async fn body_json(response: axum_core::response::Response) -> serde_json::Value {
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_more_than_one_credential_is_400_without_challenge() {
+        for headers in [
+            &[
+                ("Authorization", "Payment abc"),
+                ("Payment-Authorization", "Payment def"),
+            ][..],
+            &[("Authorization", "Payment abc, Payment def")][..],
+        ] {
+            let response = run_with_headers(headers).await.unwrap_err().into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(!response.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+            let body = body_json(response).await;
+            assert!(body["type"].as_str().unwrap().ends_with("/bad-request"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unselected_field_and_bare_scheme_count_as_absent() {
+        for headers in [
+            &[("Payment-Authorization", "Payment abc")][..],
+            &[("Authorization", "Payment")][..],
+        ] {
+            let response = run_with_headers(headers).await.unwrap_err().into_response();
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+            assert!(response.headers().contains_key(WWW_AUTHENTICATE_HEADER));
+            let body = body_json(response).await;
+            assert!(body["type"]
+                .as_str()
+                .unwrap()
+                .ends_with("/payment-required"));
+            assert_eq!(body["title"], "Payment Required");
         }
     }
 }

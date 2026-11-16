@@ -28,6 +28,20 @@ const MAX_TOKEN_LEN: usize = 16 * 1024;
 /// base64url encoding.
 const MAX_AUTHORIZATION_LEN: usize = 64 * 1024;
 
+/// Most `Authorization` and `Payment-Authorization` field values one request
+/// may carry when selecting its Payment credential.
+const MAX_AUTHORIZATION_VALUES: usize = 32;
+
+/// Most bytes of those field values tokenized, in all, when selecting the
+/// Payment credential: room for one value at the limit beside another.
+const MAX_SCANNED_AUTHORIZATION_LEN: usize = 2 * MAX_AUTHORIZATION_LEN;
+
+/// The reason of the `bad-request` error for a request whose credential
+/// fields exceed [`MAX_AUTHORIZATION_VALUES`] or
+/// [`MAX_SCANNED_AUTHORIZATION_LEN`].
+const TOO_MANY_AUTHORIZATION_VALUES_REASON: &str =
+    "too many Authorization or Payment-Authorization field values";
+
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {
     ($params:expr, $key:literal) => {
@@ -75,6 +89,88 @@ pub fn extract_payment_scheme(header: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Pick the Payment credential a request carries, following steps 1 and 2 of
+/// the core spec's credential processing.
+///
+/// Counts Payment credentials across every `Authorization` and
+/// `Payment-Authorization` field line and within comma-separated values:
+/// more than one is a `bad-request` error, answered with 400 and no
+/// challenge. Otherwise returns the credential (its `Payment <token>`
+/// fragment, to pass to [`parse_authorization`]) when it is in `selected`,
+/// the field the challenge selects. A credential in the other field, or a
+/// bare `Payment` with no token, counts as absent.
+///
+/// A value longer than 64 KiB is not tokenized and carries no credential, as
+/// [`extract_payment_scheme`] treats it. Scanning stops at the second
+/// credential, and a request with more than 32 values, or more than 128 KiB
+/// of values to tokenize, is also a `bad-request` error.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::protocol::core::select_payment_credential;
+///
+/// let found = select_payment_credential(["Payment abc"], [], "Authorization").unwrap();
+/// assert_eq!(found, Some("Payment abc"));
+///
+/// // A credential in a field the challenge didn't select is ignored.
+/// let found = select_payment_credential([], ["Payment abc"], "Authorization").unwrap();
+/// assert_eq!(found, None);
+///
+/// // Two credentials are refused.
+/// assert!(select_payment_credential(["Payment a, Payment b"], [], "Authorization").is_err());
+/// ```
+pub fn select_payment_credential<'a>(
+    authorization: impl IntoIterator<Item = &'a str>,
+    payment_authorization: impl IntoIterator<Item = &'a str>,
+    selected: &str,
+) -> Result<Option<&'a str>> {
+    let too_many = || MppError::bad_request(TOO_MANY_AUTHORIZATION_VALUES_REASON);
+    let fields = authorization
+        .into_iter()
+        .map(|value| (false, value))
+        .chain(payment_authorization.into_iter().map(|value| (true, value)));
+    let mut scanned = 0usize;
+    // The credential found so far, and whether it is in Payment-Authorization.
+    let mut found: Option<(bool, &'a str)> = None;
+    for (count, (in_payment_authorization, value)) in fields.enumerate() {
+        if count >= MAX_AUTHORIZATION_VALUES {
+            return Err(too_many());
+        }
+        if value.len() > MAX_AUTHORIZATION_LEN {
+            continue;
+        }
+        scanned += value.len();
+        if scanned > MAX_SCANNED_AUTHORIZATION_LEN {
+            return Err(too_many());
+        }
+        let mut tokens = Tokenizer::new(value);
+        while let Some(token) = tokens.next() {
+            match token {
+                Ok(token) if token.is_payment_scheme() => {
+                    let Some(credential) = tokens.credentials() else {
+                        continue;
+                    };
+                    if found.is_some() {
+                        return Err(MppError::bad_request(
+                            crate::error::MULTIPLE_CREDENTIALS_REASON,
+                        ));
+                    }
+                    found = Some((in_payment_authorization, credential));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    let want_payment_authorization = selected.eq_ignore_ascii_case(PAYMENT_AUTHORIZATION_HEADER);
+    Ok(found
+        .filter(|(in_payment_authorization, _)| {
+            *in_payment_authorization == want_payment_authorization
+        })
+        .map(|(_, credential)| credential))
 }
 
 /// Header name for payment challenges (from server)
@@ -189,15 +285,9 @@ fn is_valid_intent_name(value: &str) -> bool {
     !value.is_empty() && !value.contains('|')
 }
 
-/// Validate the method identifier grammar used by mppx.
-fn is_valid_method_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-        && chars.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, ':' | '_' | '-')
-        })
+/// Validate the core spec's method identifier grammar, `1*LOWERALPHA`.
+pub(super) fn is_valid_method_name(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
 /// Validate that a `request` parameter is a base64url-encoded JSON object.
@@ -302,7 +392,7 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
     let method_raw = require_param!(params, "method").clone();
     if !is_valid_method_name(&method_raw) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be one or more lowercase letters (a-z).",
             method_raw
         )));
     }
@@ -467,7 +557,7 @@ fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     if !is_valid_method_name(challenge.method.as_str()) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be one or more lowercase letters (a-z).",
             challenge.method
         )));
     }
@@ -1107,6 +1197,72 @@ mod tests {
     }
 
     #[test]
+    fn test_oversized_field_values_carry_no_credential() {
+        let oversized = format!("Bearer {}, Payment abc", "a".repeat(MAX_AUTHORIZATION_LEN));
+        let found = select_payment_credential([oversized.as_str()], [], "Authorization").unwrap();
+        assert_eq!(found, None);
+        let found = select_payment_credential(
+            [oversized.as_str()],
+            ["Payment abc"],
+            "Payment-Authorization",
+        )
+        .unwrap();
+        assert_eq!(found, Some("Payment abc"));
+    }
+
+    #[test]
+    fn test_credential_selection_bounds_the_values_it_scans() {
+        // Up to the value limit, values without a credential are scanned.
+        let bearers = vec!["Bearer token"; MAX_AUTHORIZATION_VALUES - 1];
+        let found =
+            select_payment_credential(bearers, ["Payment abc"], "Payment-Authorization").unwrap();
+        assert_eq!(found, Some("Payment abc"));
+
+        // One more value is refused, oversized ones included.
+        let oversized = "a".repeat(MAX_AUTHORIZATION_LEN + 1);
+        let mut values = vec!["Bearer token"; MAX_AUTHORIZATION_VALUES];
+        values[0] = oversized.as_str();
+        let err = select_payment_credential(values, ["Payment abc"], "Payment-Authorization")
+            .unwrap_err();
+        assert!(matches!(err, MppError::BadRequest(_)), "{err}");
+
+        // Values under the per-value limit are refused once their total
+        // exceeds what is tokenized in all.
+        let large = format!("Bearer {}", "a".repeat(MAX_AUTHORIZATION_LEN - 7));
+        assert_eq!(large.len(), MAX_AUTHORIZATION_LEN);
+        let found =
+            select_payment_credential([large.as_str(), large.as_str()], [], "Authorization")
+                .unwrap();
+        assert_eq!(found, None);
+        let err = select_payment_credential(
+            [large.as_str(), large.as_str()],
+            ["Payment abc"],
+            "Payment-Authorization",
+        )
+        .unwrap_err();
+        assert!(matches!(err, MppError::BadRequest(_)), "{err}");
+    }
+
+    #[test]
+    fn test_credential_selection_stops_at_the_second_credential() {
+        // The second credential is refused before later values are read: the
+        // values after it, which would exceed the limits, are never reached.
+        let large = "a".repeat(MAX_AUTHORIZATION_LEN);
+        let values = ["Payment a", "Payment b", large.as_str(), large.as_str()];
+        let multiple = MppError::bad_request(crate::error::MULTIPLE_CREDENTIALS_REASON).to_string();
+        let err = select_payment_credential(values, [], "Authorization").unwrap_err();
+        assert_eq!(err.to_string(), multiple);
+        // A credential in each field is two credentials too.
+        let err =
+            select_payment_credential(["Payment a"], ["Payment b"], "Authorization").unwrap_err();
+        assert_eq!(err.to_string(), multiple);
+        // A bare Payment carries no credential and does not count.
+        let found =
+            select_payment_credential(["Payment, Payment abc"], [], "Authorization").unwrap();
+        assert_eq!(found, Some("Payment abc"));
+    }
+
+    #[test]
     fn test_authorization_accepts_credential_echoing_request_at_the_limit() {
         let mut challenge = test_challenge();
         challenge.request =
@@ -1269,12 +1425,22 @@ mod tests {
 
     #[test]
     fn test_parse_www_authenticate_accepts_canonical_method_names() {
-        for method in ["tempo", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+        for method in ["tempo", "stripe", "a"] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
             );
             let challenge = parse_www_authenticate(&header).unwrap();
             assert_eq!(challenge.method.as_str(), method);
+        }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_non_lowercase_alpha_methods() {
+        for method in ["x402", "tempo-v2", "a:b", "a_b"] {
+            let mut challenge = test_challenge();
+            challenge.method = MethodName::new(method);
+            let err = format_www_authenticate(&challenge).unwrap_err();
+            assert!(err.to_string().contains("Invalid method"), "{method}");
         }
     }
 
@@ -1289,7 +1455,8 @@ mod tests {
     #[test]
     fn test_parse_www_authenticate_rejects_invalid_method_names() {
         for method in [
-            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo",
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo", "x402", "tempo-v2",
+            "a:b", "a_b", "a1:b_2-c",
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#

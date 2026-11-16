@@ -476,7 +476,7 @@ mod tests {
         let challenge = test_challenge();
         // Caller does NOT set challenge_id — the function binds it automatically.
         let problem = PaymentErrorDetails::core("verification-failed")
-            .with_title("VerificationFailedError")
+            .with_title("Payment Verification Failed")
             .with_status(402)
             .with_detail("Payment verification failed: bad signature.");
 
@@ -503,7 +503,7 @@ mod tests {
             p.problem_type,
             "https://paymentauth.org/problems/verification-failed"
         );
-        assert_eq!(p.title, "VerificationFailedError");
+        assert_eq!(p.title, "Payment Verification Failed");
         assert_eq!(p.status, 402);
         assert_eq!(p.detail, "Payment verification failed: bad signature.");
         assert_eq!(p.challenge_id.as_deref(), Some("ch_test_123"));
@@ -1113,7 +1113,7 @@ mod tests {
                 "challenges": [mppx_challenge()],
                 "problem": {
                     "type": "https://paymentauth.org/problems/verification-failed",
-                    "title": "Verification Failed",
+                    "title": "Payment Verification Failed",
                     "status": 402,
                     "detail": "Payment verification failed: bad signature.",
                     "challengeId": MPPX_CHALLENGE_ID
@@ -1126,7 +1126,7 @@ mod tests {
         assert!(challenges[0].verify(MPPX_SECRET_KEY));
 
         let problem = crate::error::PaymentErrorDetails::core("verification-failed")
-            .with_title("Verification Failed")
+            .with_title("Payment Verification Failed")
             .with_detail("Payment verification failed: bad signature.");
         assert_eq!(
             serde_json::to_value(payment_required_error_with_problem(&challenges[0], problem))

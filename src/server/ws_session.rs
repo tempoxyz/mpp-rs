@@ -801,8 +801,9 @@ mod tests {
     /// and an error that ends processing for a rejected or malformed one.
     #[tokio::test]
     async fn test_process_vouchers_reports_results() {
-        let mpp = crate::server::Mpp::new(MockCharge, "ws.test", "secret")
-            .with_session_method(MockSession);
+        let mpp =
+            crate::server::Mpp::new(MockCharge, "ws.test", "test-secret-key-at-least-32-bytes")
+                .with_session_method(MockSession);
         let voucher = |amount: &str, signature: &str| {
             let challenge = mpp
                 .session_challenge(
@@ -937,8 +938,9 @@ mod tests {
                 "Invalid signature: invalid voucher signature.",
             ),
         ] {
-            let mpp = crate::server::Mpp::new(MockCharge, "ws.test", "secret")
-                .with_session_method(FailingSession(error.clone()));
+            let mpp =
+                crate::server::Mpp::new(MockCharge, "ws.test", "test-secret-key-at-least-32-bytes")
+                    .with_session_method(FailingSession(error.clone()));
             let challenge = mpp
                 .session_challenge(
                     "100",
@@ -996,7 +998,8 @@ mod tests {
         let session = CountingSession::default();
         let verified = session.0.clone();
         let mpp =
-            crate::server::Mpp::new(MockCharge, "ws.test", "secret").with_session_method(session);
+            crate::server::Mpp::new(MockCharge, "ws.test", "test-secret-key-at-least-32-bytes")
+                .with_session_method(session);
         let challenge = mpp
             .session_challenge(
                 "100",
