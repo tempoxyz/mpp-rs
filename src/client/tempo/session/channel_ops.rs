@@ -34,6 +34,30 @@ use crate::protocol::methods::tempo::session::{
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
 use crate::protocol::methods::tempo::CHAIN_ID;
 
+use super::configurable::ConfigurableVoucherSigner;
+
+alloy::sol! {
+    /// TIP-1166 (T15) additions to the TIP-1034 channel reserve precompile.
+    #[derive(Debug, PartialEq, Eq)]
+    interface ITIP1166ChannelReserve {
+        /// `open` cached the voucher signer's configurable account
+        /// commitment, which the descriptor's salt holds, as the channel's
+        /// signer snapshot.
+        event SignerSnapshotCached(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
+        /// A nonzero `topUp` after the snapshotted signer's configuration changed.
+        error SignerConfigChanged(address signer);
+        /// `open` with a salt other than the voucher signer's nonzero commitment.
+        error SaltNotSignerCommitment(address signer, bytes32 commitment);
+        /// A nonzero `topUp` after a signer with no commitment at open gained one.
+        error RootKeyRetired(address signer);
+    }
+
+    /// Read side of the TIP-1107 configurable account precompile.
+    interface IConfigurableAccount {
+        function getConfigCommitment(address account) external view returns (bytes32 commitment);
+    }
+}
+
 #[cfg(feature = "tempo")]
 const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
 
@@ -325,6 +349,39 @@ pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
     })
 }
 
+/// Voucher payload for TIP-1034 signed by a TIP-1166 configurable account
+/// (`0x05`). Servers accept it only when they advertise
+/// `configurableVouchers` and the chain runs T15.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_with_descriptor_configurable(
+    signer: &ConfigurableVoucherSigner,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    let signature = signer
+        .sign_precompile_voucher(
+            channel_id,
+            cumulative_amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id,
+        )
+        .await?;
+
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        settlement_route: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
+}
+
 /// Voucher payload for TIP-1034 with an explicit escrow/precompile address.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_voucher_payload_with_descriptor_and_escrow(
@@ -490,6 +547,56 @@ pub async fn create_precompile_close_payload_with_descriptor_primitive(
     .await?;
     let close = sign_precompile_close_authorization_primitive_with_escrow(
         signer,
+        channel_id,
+        cumulative_amount,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )
+    .await?;
+
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        settlement_route: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+        close_signature: Some(alloy::hex::encode_prefixed(&close)),
+    })
+}
+
+/// Close payload for TIP-1034 whose final voucher is signed by a TIP-1166
+/// configurable account (`0x05`) and whose close authorization is signed by
+/// `close_signer`, the payer's primitive key.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_with_descriptor_configurable(
+    voucher_signer: &ConfigurableVoucherSigner,
+    close_signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let expected_channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    if expected_channel_id != channel_id {
+        return Err(MppError::InvalidConfig(
+            "TIP-1034 close descriptor does not match channel_id".to_string(),
+        ));
+    }
+
+    let signature = voucher_signer
+        .sign_precompile_voucher(
+            channel_id,
+            cumulative_amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id,
+        )
+        .await?;
+    let close = sign_precompile_close_authorization_primitive_with_escrow(
+        close_signer,
         channel_id,
         cumulative_amount,
         TIP20_CHANNEL_RESERVE_ADDRESS,
@@ -1067,6 +1174,37 @@ where
     P: Provider<TempoNetwork>,
     S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
 {
+    create_precompile_open_payload_with_voucher_signer(
+        provider,
+        signer,
+        signing_mode,
+        payer,
+        options,
+        None,
+    )
+    .await
+}
+
+/// [`create_precompile_open_payload`] whose initial voucher is signed by
+/// `voucher_signer`, a TIP-1166 configurable account, when given.
+///
+/// The configurable account becomes the channel's authorized signer, and
+/// unless `options.salt` is set the salt is the account's on-chain
+/// configuration commitment when it has one (T15 requires it), else random.
+/// Without `voucher_signer` this is [`create_precompile_open_payload`].
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_open_payload_with_voucher_signer<P, S>(
+    provider: &P,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
+    payer: Address,
+    options: OpenPrecompilePayloadOptions,
+    voucher_signer: Option<&ConfigurableVoucherSigner>,
+) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
+where
+    P: Provider<TempoNetwork>,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
+{
     if options.deposit > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
         return Err(MppError::InvalidConfig(format!(
             "deposit {} exceeds precompile uint96 max",
@@ -1085,8 +1223,29 @@ where
     let primitive_signer = signer.clone().into();
     let signature_type = primitive_signer.signature_type();
 
-    let authorized_signer = options.authorized_signer.unwrap_or(payer);
-    let salt = options.salt.unwrap_or_else(B256::random);
+    let authorized_signer = match voucher_signer {
+        Some(voucher_signer) => {
+            let account = voucher_signer.account();
+            if options
+                .authorized_signer
+                .is_some_and(|authorized| authorized != account)
+            {
+                return Err(MppError::InvalidConfig(format!(
+                    "authorized signer must be the configurable account {account}"
+                )));
+            }
+            account
+        }
+        None => options.authorized_signer.unwrap_or(payer),
+    };
+    let salt = match (options.salt, voucher_signer) {
+        (Some(salt), _) => salt,
+        (None, Some(voucher_signer)) => voucher_signer
+            .open_salt(provider)
+            .await?
+            .unwrap_or_else(B256::random),
+        (None, None) => B256::random(),
+    };
 
     let open_data = ITIP20ChannelReserve::openCall::new((
         options.payee,
@@ -1204,13 +1363,27 @@ where
     };
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
-    let voucher_sig = sign_precompile_voucher_primitive(
-        &primitive_signer,
-        channel_id,
-        options.initial_amount,
-        options.chain_id,
-    )
-    .await?;
+    let voucher_sig = match voucher_signer {
+        Some(voucher_signer) => {
+            voucher_signer
+                .sign_precompile_voucher(
+                    channel_id,
+                    options.initial_amount,
+                    TIP20_CHANNEL_RESERVE_ADDRESS,
+                    options.chain_id,
+                )
+                .await?
+        }
+        None => {
+            sign_precompile_voucher_primitive(
+                &primitive_signer,
+                channel_id,
+                options.initial_amount,
+                options.chain_id,
+            )
+            .await?
+        }
+    };
 
     let entry = ChannelEntry {
         channel_id,
