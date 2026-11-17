@@ -263,6 +263,22 @@ pub enum MppError {
         context: String,
     },
 
+    /// A payment of any method may have taken effect, but its outcome is
+    /// unknown, so the payer must reconcile it before paying again.
+    ///
+    /// Providers return this when they cannot prove that no payment happened,
+    /// for example when a submission timed out, and have no transaction hash
+    /// to report. Clients that try alternative offers stop on it rather than
+    /// risk paying twice, and a session top-up that fails with it is treated
+    /// like one whose management response was lost: no further top-up is
+    /// signed for that channel until it is reconciled.
+    #[error("payment outcome unknown{}; reconcile before retrying", reference.as_deref().map(|r| format!(" (ref {r})")).unwrap_or_default())]
+    UnknownPaymentOutcome {
+        /// Optional provider reference to correlate the payment when reconciling,
+        /// such as a payment intent or request ID.
+        reference: Option<String>,
+    },
+
     // ==================== HTTP Errors ====================
     /// HTTP request/response error
     #[error("HTTP error: {0}")]
